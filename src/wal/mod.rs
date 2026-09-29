@@ -1671,7 +1671,6 @@ pub struct Wal {
     batch_first_lsn: u64,
     /// Bytes appended since the last upload capture.
     batch_start_offset: u64,
-    current_database: crate::storage::DatabaseOid,
 }
 
 struct TransactionStage {
@@ -1747,6 +1746,7 @@ fn append_record(buffer: &mut FixedBuf, lsn: u64, operation: &WalOp) -> Result<(
 impl Wal {
     /// Opens (creating and preallocating if needed) `<data_dir>/journal.wal`.
     pub fn open(config: &Config, budget: &mut Budget) -> Result<Self, WalSetupError> {
+        crate::sql::set_execution_database_oid(crate::storage::DatabaseOid::POSTGRES);
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| WalSetupError::Io("create data_dir", e))?;
         let path = format!("{}/journal.wal", config.data_dir);
@@ -1790,7 +1790,6 @@ impl Wal {
             dirty: false,
             batch_first_lsn: 0,
             batch_start_offset: 0,
-            current_database: crate::storage::DatabaseOid::POSTGRES,
         })
     }
 
@@ -1900,7 +1899,7 @@ impl Wal {
 
     fn stage_index_or_claim(&mut self, transaction_id: u32) -> Result<usize, SqlError> {
         if let Some(index) = self.stage_index(transaction_id) {
-            if self.stages[index].database != self.current_database {
+            if self.stages[index].database != crate::sql::execution_database_oid() {
                 return Err(sql_err!(
                     sqlstate::INVALID_TRANSACTION_TERMINATION,
                     "transaction WAL cannot cross database catalogs"
@@ -1920,13 +1919,13 @@ impl Wal {
             ));
         };
         self.stages[index].transaction_id = transaction_id;
-        self.stages[index].database = self.current_database;
+        self.stages[index].database = crate::sql::execution_database_oid();
         self.stages[index].buffer.clear();
         Ok(index)
     }
 
     pub(crate) fn select_database(&mut self, database: crate::storage::DatabaseOid) {
-        self.current_database = database;
+        crate::sql::set_execution_database_oid(database);
     }
 
     /// Byte position inside one transaction's private stage. Savepoints use
@@ -2014,7 +2013,7 @@ impl Wal {
                 &mut self.stages[index].buffer,
                 provisional_lsn,
                 &WalOp::DatabaseScope {
-                    oid: self.current_database.get(),
+                    oid: crate::sql::execution_database_oid().get(),
                 },
             )?;
         }

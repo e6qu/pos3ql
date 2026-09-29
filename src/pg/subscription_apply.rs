@@ -276,7 +276,7 @@ impl SubscriptionApply {
         engine: &mut crate::sql::Engine,
         confirmed_lsn: u64,
     ) -> Result<(), SqlError> {
-        engine.begin_subscription_apply(&mut self.txn, &self.guc);
+        engine.begin_subscription_apply(self.stream.database_oid(), &mut self.txn, &self.guc)?;
         let result = engine
             .stage_subscription_advance(&mut self.txn, self.stream, confirmed_lsn)
             .and_then(|advanced| {
@@ -300,7 +300,7 @@ impl SubscriptionApply {
         &mut self,
         engine: &mut crate::sql::Engine,
     ) -> Result<(), SqlError> {
-        engine.begin_subscription_apply(&mut self.txn, &self.guc);
+        engine.begin_subscription_apply(self.stream.database_oid(), &mut self.txn, &self.guc)?;
         self.txn.mode = crate::sql::txn::TxnMode::Explicit;
         engine.begin_subscription_relation_refresh(&mut self.txn, self.stream)
     }
@@ -551,13 +551,21 @@ impl SubscriptionApply {
                         configured: false,
                     };
                 } else if self.behavior.skip_lsn == Some(final_lsn) {
-                    engine.begin_subscription_apply(&mut self.txn, &self.guc);
+                    engine.begin_subscription_apply(
+                        self.stream.database_oid(),
+                        &mut self.txn,
+                        &self.guc,
+                    )?;
                     self.remote = RemoteTransaction::Skipping {
                         final_lsn,
                         configured: true,
                     };
                 } else {
-                    engine.begin_subscription_apply(&mut self.txn, &self.guc);
+                    engine.begin_subscription_apply(
+                        self.stream.database_oid(),
+                        &mut self.txn,
+                        &self.guc,
+                    )?;
                     self.remote = RemoteTransaction::Applying { final_lsn };
                 }
                 Ok(ApplyResult::None)
@@ -861,7 +869,11 @@ impl SubscriptionApply {
                 match self.remote {
                     RemoteTransaction::Idle if first_segment => {
                         self.arena.reset();
-                        engine.begin_subscription_apply(&mut self.txn, &self.guc);
+                        engine.begin_subscription_apply(
+                            self.stream.database_oid(),
+                            &mut self.txn,
+                            &self.guc,
+                        )?;
                         self.remote = RemoteTransaction::Streaming {
                             xid,
                             segment_open: true,

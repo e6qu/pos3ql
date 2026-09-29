@@ -99,9 +99,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   bounded FIFO handoff cannot alias a workspace and removes disconnected
   waiters. Each workspace retains backend identity and republishes it through
   fixed thread-local execution context, removing Storage's shared connection
-  selector. Statement execution remains serialized while database selection
-  and dispatch move to workers. Logical subscription apply and bootstrap COPY
-  use the subscription worker's fixed arena and DML scratch independently.
+  selector. Database identity follows the same boundary for catalog access and
+  WAL staging. Statement execution remains serialized while dispatch moves to
+  workers. Logical subscription apply and bootstrap COPY use the subscription
+  worker's fixed arena and DML scratch independently.
 - Streamed COPY transition rows are retained in fixed connection-private and
   subscription-worker-private buffers. Interleaved streams preserve the exact
   row set for statement transition triggers without runtime allocation.

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::pg::auth::{AuthMode, SCRAM_ITERATIONS, ScramServer};
 use crate::pg::conn::{After, AuthContext, CancelRequest, Conn, PendingResponse};
-use crate::sql::{Engine, QueryWorkspaceId};
+use crate::sql::{Engine, ExecutionIdentity, QueryWorkspaceId};
 
 const LISTENER_TOKEN: u64 = u64::MAX;
 const SHUTDOWN_TOKEN: u64 = u64::MAX - 1;
@@ -96,7 +96,25 @@ struct Slot {
     generation: u32,
     want_read: bool,
     want_write: bool,
-    pending_response: Option<PendingResponse>,
+    pending_response: Option<PendingQueryResponse>,
+}
+
+/// Engine work returned to the reactor with the exact lease and session
+/// identity that produced it.
+struct QueryDispatchCompletion {
+    owner: usize,
+    generation: u32,
+    workspace: QueryWorkspaceId,
+    identity: ExecutionIdentity,
+    response: PendingResponse,
+    cancel_request: Option<CancelRequest>,
+}
+
+/// A response waiting at the shared publication barrier after its statement
+/// workspace has been released.
+struct PendingQueryResponse {
+    response: PendingResponse,
+    identity: ExecutionIdentity,
 }
 
 /// Exclusive ownership of the engine's startup-reserved query workspaces.
@@ -178,6 +196,19 @@ impl QueryWorkspaceLeases {
         self.remove_waiter(0);
         self.owners[workspace] = Some(next_owner);
         Some((next_owner, QueryWorkspaceId::from_index(workspace)))
+    }
+
+    fn release_workspace(
+        &mut self,
+        owner: usize,
+        workspace: QueryWorkspaceId,
+    ) -> Option<(usize, QueryWorkspaceId)> {
+        assert_eq!(
+            self.owners[workspace.index()],
+            Some(owner),
+            "query completion must release its exact workspace lease"
+        );
+        self.release(owner)
     }
 
     fn cancel(&mut self, owner: usize) -> Option<(usize, QueryWorkspaceId)> {
@@ -1244,48 +1275,37 @@ impl Server {
             self.complete_dispatch(index, After::Close);
             return;
         }
-        let workspace = if readable {
+        if readable {
             let Some(workspace) = self.query_workspaces.acquire(index) else {
                 self.park_for_query_workspace(index);
                 return;
             };
             self.engine.select_query_workspace(workspace);
-            Some(workspace)
-        } else {
-            None
-        };
-        let slot = &mut self.slots[index];
-        let (after, cancel_request) = if readable {
-            let pending = slot.conn.on_readable(
+            let slot = &mut self.slots[index];
+            let response = slot.conn.on_readable(
                 &mut self.engine,
                 &self.cancel_key,
                 &self.auth,
                 self.tls_config.as_ref(),
             );
-            let after = if pending.closes() {
-                // Session teardown is visible immediately: a later event in
-                // this reactor turn must not observe temporary objects or
-                // locks owned by a client that already sent Terminate/EOF.
-                Some(slot.conn.finish_response(pending, None))
-            } else {
-                slot.pending_response = Some(pending);
-                None
+            let completion = QueryDispatchCompletion {
+                owner: index,
+                generation,
+                workspace,
+                identity: self.engine.execution_identity(),
+                response,
+                cancel_request: slot.conn.take_cancel_request(),
             };
-            (after, slot.conn.take_cancel_request())
-        } else if writable {
-            (Some(slot.conn.on_writable()), None)
+            self.complete_query_execution(completion);
+            return;
+        }
+        let slot = &mut self.slots[index];
+        let after = if writable {
+            slot.conn.on_writable()
         } else {
-            (Some(After::Continue), None)
+            After::Continue
         };
-        if workspace.is_some() {
-            self.release_query_workspace(index);
-        }
-        if let Some(request) = cancel_request {
-            self.cancel(request);
-        }
-        if let Some(after) = after {
-            self.complete_dispatch(index, after);
-        }
+        self.complete_dispatch(index, after);
     }
 
     fn park_for_query_workspace(&mut self, index: usize) {
@@ -1304,9 +1324,44 @@ impl Server {
         }
     }
 
-    fn release_query_workspace(&mut self, owner: usize) {
-        let handoff = self.query_workspaces.release(owner);
+    fn release_query_workspace(&mut self, owner: usize, workspace: QueryWorkspaceId) {
+        let handoff = self.query_workspaces.release_workspace(owner, workspace);
         self.wake_query_workspace_handoff(handoff);
+    }
+
+    /// Accepts one completed engine dispatch. The workspace becomes reusable
+    /// here, while the response retains only the session identity required by
+    /// later publication and transport completion.
+    fn complete_query_execution(&mut self, completion: QueryDispatchCompletion) {
+        self.release_query_workspace(completion.owner, completion.workspace);
+        if self.slots[completion.owner].generation != completion.generation
+            || !self.slots[completion.owner].conn.is_open()
+        {
+            return;
+        }
+        let after = if completion.response.closes() {
+            // Session teardown is visible immediately: a later event in this
+            // reactor turn must not observe temporary objects or locks owned
+            // by a client that already sent Terminate/EOF.
+            self.engine.restore_execution_identity(completion.identity);
+            Some(
+                self.slots[completion.owner]
+                    .conn
+                    .finish_response(completion.response, None),
+            )
+        } else {
+            self.slots[completion.owner].pending_response = Some(PendingQueryResponse {
+                response: completion.response,
+                identity: completion.identity,
+            });
+            None
+        };
+        if let Some(request) = completion.cancel_request {
+            self.cancel(request);
+        }
+        if let Some(after) = after {
+            self.complete_dispatch(completion.owner, after);
+        }
     }
 
     fn wake_query_workspace_handoff(&mut self, mut handoff: Option<(usize, QueryWorkspaceId)>) {
@@ -1361,9 +1416,10 @@ impl Server {
             let Some(pending) = self.slots[index].pending_response.take() else {
                 continue;
             };
+            self.engine.restore_execution_identity(pending.identity);
             let after = self.slots[index]
                 .conn
-                .finish_response(pending, publication_error.as_ref());
+                .finish_response(pending.response, publication_error.as_ref());
             self.complete_dispatch(index, after);
         }
         (true, publication_error.is_none())
@@ -1435,6 +1491,8 @@ impl Server {
                 {
                     continue;
                 }
+                self.engine
+                    .restore_execution_identity(self.slots[index].conn.execution_identity());
                 {
                     let slot = &mut self.slots[index];
                     self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
@@ -1449,12 +1507,16 @@ impl Server {
     }
 
     fn cancel(&mut self, request: CancelRequest) {
-        if let Some(index) = self
+        let Some(index) = self
             .slots
             .iter()
             .position(|slot| request.matches(slot.conn.id(), &self.cancel_key))
-            && self.slots[index].conn.cancel_parked(&mut self.engine)
-        {
+        else {
+            return;
+        };
+        self.engine
+            .restore_execution_identity(self.slots[index].conn.execution_identity());
+        if self.slots[index].conn.cancel_parked(&mut self.engine) {
             self.sync_write_interest(index);
         }
     }
@@ -1472,6 +1534,8 @@ impl Server {
             else {
                 continue;
             };
+            self.engine
+                .restore_execution_identity(self.slots[index].conn.execution_identity());
             if terminate {
                 {
                     let slot = &mut self.slots[index];
@@ -2383,14 +2447,24 @@ impl Server {
                     continue;
                 };
                 self.engine.select_query_workspace(workspace);
-                if let Some(pending) = self.slots[index].conn.retry_parked(
+                let response = self.slots[index].conn.retry_parked(
                     &mut self.engine,
                     generation,
                     retry_io_waiters,
-                ) {
-                    self.slots[index].pending_response = Some(pending);
+                );
+                if let Some(response) = response {
+                    let completion = QueryDispatchCompletion {
+                        owner: index,
+                        generation: self.slots[index].generation,
+                        workspace,
+                        identity: self.engine.execution_identity(),
+                        response,
+                        cancel_request: None,
+                    };
+                    self.complete_query_execution(completion);
+                } else {
+                    self.release_query_workspace(index, workspace);
                 }
-                self.release_query_workspace(index);
             }
             if self.engine.lock_generation() == generation {
                 break;
@@ -2472,6 +2546,8 @@ impl Server {
         // Every transport exit reaches this choke point. Roll back here so an
         // I/O-interest failure, notification overflow, or replication close
         // cannot strand transaction state or locks.
+        self.engine
+            .restore_execution_identity(self.slots[index].conn.execution_identity());
         let workspace_handoff = self.query_workspaces.cancel(index);
         let slot = &mut self.slots[index];
         self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
@@ -3503,14 +3579,14 @@ mod tests {
             assert_eq!(leases.used(), 2);
             assert_eq!(leases.waiting(), 2);
 
-            assert_eq!(leases.release(0), Some((2, first)));
+            assert_eq!(leases.release_workspace(0, first), Some((2, first)));
             assert_eq!(leases.acquire(2), Some(first));
             assert_eq!(leases.waiting(), 1);
             assert_eq!(leases.cancel(2), Some((3, first)));
             assert_eq!(leases.acquire(3), Some(first));
             assert_eq!(leases.waiting(), 0);
-            assert_eq!(leases.release(1), None);
-            assert_eq!(leases.release(3), None);
+            assert_eq!(leases.release_workspace(1, second), None);
+            assert_eq!(leases.release_workspace(3, first), None);
             assert_eq!(leases.used(), 0);
         });
     }

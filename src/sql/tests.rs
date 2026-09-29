@@ -89,6 +89,7 @@ fn execution_identity_is_thread_private() {
     set_execution_query_workspace(QueryWorkspaceId::from_index(1));
     set_execution_connection_id(41);
     set_execution_database_oid(crate::storage::DatabaseOid::parse(16_384).unwrap());
+    let parent = execution_identity();
     std::thread::spawn(|| {
         assert_eq!(execution_query_workspace(), QueryWorkspaceId::from_index(0));
         assert_eq!(execution_connection_id(), 0);
@@ -102,15 +103,27 @@ fn execution_identity_is_thread_private() {
         assert_eq!(execution_query_workspace(), QueryWorkspaceId::from_index(2));
         assert_eq!(execution_connection_id(), 73);
         assert_eq!(execution_database_oid().get(), 16_385);
+        assert_eq!(
+            execution_identity(),
+            ExecutionIdentity {
+                connection_id: 73,
+                database_oid: crate::storage::DatabaseOid::parse(16_385).unwrap(),
+            }
+        );
     })
     .join()
     .unwrap();
     assert_eq!(execution_query_workspace(), QueryWorkspaceId::from_index(1));
     assert_eq!(execution_connection_id(), 41);
     assert_eq!(execution_database_oid().get(), 16_384);
+    assert_eq!(execution_identity(), parent);
     set_execution_query_workspace(QueryWorkspaceId::from_index(0));
     set_execution_connection_id(0);
     set_execution_database_oid(crate::storage::DatabaseOid::POSTGRES);
+    let reset = execution_identity();
+    publish_execution_identity(parent);
+    assert_eq!(execution_identity(), parent);
+    publish_execution_identity(reset);
 }
 
 #[test]

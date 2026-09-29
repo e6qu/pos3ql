@@ -13,7 +13,6 @@ use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::pg::auth::{AuthMode, ScramFlow, ScramServer, ScramStep};
-use crate::sql::Engine;
 use crate::sql::eval::SqlError;
 use crate::sql::eval::sqlstate;
 use crate::sql::guc::GucState;
@@ -21,6 +20,7 @@ use crate::sql::parser::Parser;
 use crate::sql::prep::SqlPreparedPool;
 use crate::sql::txn::TxnState;
 use crate::sql::types::Datum;
+use crate::sql::{Engine, ExecutionIdentity};
 use crate::sql_err;
 use crate::stack_format;
 use crate::storage::SqlName;
@@ -599,6 +599,16 @@ impl Conn {
     /// NotificationResponse).
     pub fn id(&self) -> i32 {
         self.id
+    }
+
+    pub(crate) fn execution_identity(&self) -> ExecutionIdentity {
+        ExecutionIdentity::new(
+            self.id,
+            self.auth_database
+                .map_or(crate::storage::DatabaseOid::POSTGRES, |database| {
+                    database.oid
+                }),
+        )
     }
 
     pub(crate) fn authenticated_role(&self) -> Option<u16> {

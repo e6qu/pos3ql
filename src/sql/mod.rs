@@ -99,6 +99,31 @@ pub(crate) fn execution_database_oid() -> crate::storage::DatabaseOid {
     EXECUTION_DATABASE_OID.with(core::cell::Cell::get)
 }
 
+/// Backend and database identity needed after statement scratch is released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExecutionIdentity {
+    connection_id: i32,
+    database_oid: crate::storage::DatabaseOid,
+}
+
+impl ExecutionIdentity {
+    pub(crate) const fn new(connection_id: i32, database_oid: crate::storage::DatabaseOid) -> Self {
+        Self {
+            connection_id,
+            database_oid,
+        }
+    }
+}
+
+fn execution_identity() -> ExecutionIdentity {
+    ExecutionIdentity::new(execution_connection_id(), execution_database_oid())
+}
+
+fn publish_execution_identity(identity: ExecutionIdentity) {
+    set_execution_connection_id(identity.connection_id);
+    set_execution_database_oid(identity.database_oid);
+}
+
 use ast::{Delete, Expr, Insert, Stmt, TransactionIsolation, TransactionTarget, Update};
 use eval::{
     EvalHooks, NO_HOOKS, NO_PARAMS, NoColumns, SequenceAccess, SqlError, SqlState, eval, sqlstate,
@@ -2271,6 +2296,15 @@ impl Engine {
     pub(crate) fn select_query_workspace(&mut self, workspace: QueryWorkspaceId) {
         self.work.select(workspace);
         self.wal.select_database(self.work.database_oid());
+    }
+
+    pub(crate) fn execution_identity(&self) -> ExecutionIdentity {
+        execution_identity()
+    }
+
+    pub(crate) fn restore_execution_identity(&mut self, identity: ExecutionIdentity) {
+        publish_execution_identity(identity);
+        self.wal.select_database(identity.database_oid);
     }
 
     pub(crate) fn operational_snapshot(&self) -> OperationalSnapshot {

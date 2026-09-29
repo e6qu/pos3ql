@@ -288,11 +288,15 @@ bootstrap workers own the same fixed state independently. Interleaved client
 streams therefore cannot clear or mix the row set observed by statement-level
 transition triggers; every buffer is charged from `txn_rows` at startup.
 Logical subscription apply and bootstrap COPY execution use the worker's own
-arena and DML scratch rather than a client workspace. The synchronous reactor
-currently releases each lease when its dispatch call returns. Parallel dispatch
-must move engine execution behind worker completion and retain a lease through
-that completion while preserving transaction retry, object I/O parking, group
-publication, and response barriers.
+arena and DML scratch rather than a client workspace. A readable dispatch or
+parked retry now produces one typed completion carrying its exact workspace
+lease and backend and database identity. The reactor validates and releases the
+lease when engine work completes, retains only the session identity through the
+shared publication barrier, and restores it before response cleanup. Connection
+release and cross-session cancellation also restore the target identity at
+their choke points. Parallel dispatch must move engine execution to fixed
+workers and return the same typed completions to the reactor while preserving
+transaction retry, object I/O parking, group publication, and response barriers.
 
 ### Performance qualification
 

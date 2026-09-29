@@ -124,7 +124,7 @@ pub(crate) struct ExternalRunContext<'a> {
 
 impl ExternalRunReader {
     pub(crate) fn budget_bytes() -> usize {
-        core::mem::size_of::<std::cell::RefCell<Self>>() + 7 * MAX_PAYLOAD
+        core::mem::size_of::<std::sync::Mutex<Self>>() + 7 * MAX_PAYLOAD
     }
 
     pub(crate) fn new() -> Self {

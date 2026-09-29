@@ -28,17 +28,16 @@
 //! `POS3QL_STORAGE_VOPR_SEEDS` and `POS3QL_STORAGE_VOPR_STEPS` scaling the
 //! sweep past the checked-in defaults.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
-use std::rc::Rc;
+use std::sync::MutexGuard;
 
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::Budget;
 use crate::mem::buffer::FixedBuf;
-use crate::object_store::sim::{SimNamespace, drop_namespace, open_namespace};
+use crate::object_store::sim::{SimNamespace, SimNamespaceHandle, drop_namespace, open_namespace};
 use crate::pg::respond::Responder;
 use crate::prng::Pcg32;
 use crate::sql::Engine;
@@ -85,7 +84,7 @@ struct World {
     seed: u64,
     rng: Pcg32,
     config: Config,
-    namespace: Rc<RefCell<SimNamespace>>,
+    namespace: SimNamespaceHandle,
     session: Option<Session>,
     /// Committed state a client was told about, id → row.
     model: BTreeMap<i64, Row>,
@@ -227,8 +226,10 @@ impl World {
         outcome
     }
 
-    fn faults(&self) -> std::cell::RefMut<'_, SimNamespace> {
-        self.namespace.borrow_mut()
+    fn faults(&self) -> MutexGuard<'_, SimNamespace> {
+        self.namespace
+            .lock()
+            .expect("simulated namespace lock poisoned")
     }
 
     fn clear_faults(&mut self) {
@@ -431,7 +432,12 @@ impl World {
             "seed {} [{context}]: recovered state diverges from the model",
             self.seed
         );
-        let blind = self.namespace.borrow().blind_overwrites.clone();
+        let blind = self
+            .namespace
+            .lock()
+            .expect("simulated namespace lock poisoned")
+            .blind_overwrites
+            .clone();
         assert!(
             blind.is_empty(),
             "seed {} [{context}]: blind overwrites changed object bytes: {blind:?}",
@@ -496,7 +502,11 @@ impl World {
         self.start_engine();
         self.verify("cold start");
         assert!(
-            self.namespace.borrow().object_count() > 0,
+            self.namespace
+                .lock()
+                .expect("simulated namespace lock poisoned")
+                .object_count()
+                > 0,
             "seed {}: a cold start recovered from an empty bucket",
             self.seed
         );
@@ -737,7 +747,7 @@ fn run_storage_vopr(stack_bytes: usize) -> Result<(), String> {
                             "storage vopr seed {seed}: {} steps, {} rows live, {} objects in the bucket",
                             world.steps_taken,
                             world.model.len(),
-                            world.namespace.borrow().object_count(),
+                            world.namespace.lock().expect("simulated namespace lock poisoned").object_count(),
                         );
                     }
                 })

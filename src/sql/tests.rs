@@ -7,6 +7,21 @@
 use super::*;
 
 #[test]
+fn engine_ownership_is_thread_transferable() {
+    let (engine, budget) = test_engine();
+    std::thread::spawn(move || {
+        let mut engine = engine;
+        let mut budget = budget;
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, "SELECT 1")),
+            ["1"]
+        );
+    })
+    .join()
+    .expect("engine worker completes");
+}
+
+#[test]
 fn query_workspaces_are_startup_bounded_and_isolated() {
     let mut config = Config::default_dev();
     config.query_workspace_slots = 3;

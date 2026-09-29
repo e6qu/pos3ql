@@ -26,8 +26,7 @@
 //! This module allocates freely (a growing map of objects is the point);
 //! it exists for simulation tests, and `main` refuses `object_store = sim`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
@@ -64,7 +63,7 @@ struct StoredObject {
     etag: u64,
 }
 
-/// The shared namespace state. One per name, held behind `Rc<RefCell<..>>` by
+/// The shared namespace state. One per name, held behind `Arc<Mutex<..>>` by
 /// every [`SimClient`] opened on it and by the test harness steering faults.
 pub(crate) struct SimNamespace {
     /// Sorted by key, matching S3's lexicographic listing order.
@@ -80,6 +79,29 @@ pub(crate) struct SimNamespace {
     rng: Pcg32,
     /// Keys whose bytes an unconditional PUT changed — see the module doc.
     pub(crate) blind_overwrites: Vec<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SimNamespaceHandle(Arc<Mutex<SimNamespace>>);
+
+impl SimNamespaceHandle {
+    fn new(seed: u64) -> Self {
+        Self(Arc::new(Mutex::new(SimNamespace::new(seed))))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn borrow(&self) -> MutexGuard<'_, SimNamespace> {
+        self.0.lock().expect("simulated namespace lock poisoned")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn borrow_mut(&self) -> MutexGuard<'_, SimNamespace> {
+        self.borrow()
+    }
+
+    pub(crate) fn lock(&self) -> LockResult<MutexGuard<'_, SimNamespace>> {
+        self.0.lock()
+    }
 }
 
 impl SimNamespace {
@@ -147,32 +169,32 @@ fn entity_tag(etag: u64) -> EntityTag {
         .expect("simulated ETag has portable syntax")
 }
 
-thread_local! {
-    /// One namespace per name per thread. Tests run on their own threads and
-    /// name namespaces uniquely, so incarnations of the same engine (restart,
-    /// cold start) find the same namespace while tests stay isolated.
-    static NAMESPACES: RefCell<Vec<(String, Rc<RefCell<SimNamespace>>)>> =
-        const { RefCell::new(Vec::new()) };
-}
+/// One namespace per process-wide name. Tests name namespaces uniquely, so
+/// incarnations of the same engine find the same namespace across restarts,
+/// cold starts, and ownership transfers while tests stay isolated.
+static NAMESPACES: Mutex<Vec<(String, SimNamespaceHandle)>> = Mutex::new(Vec::new());
 
 /// Opens (or creates) the named namespace. The harness opens it first to hold
 /// the fault-steering handle; the engine's clients then share it.
-pub(crate) fn open_namespace(name: &str, seed: u64) -> Rc<RefCell<SimNamespace>> {
-    NAMESPACES.with(|namespaces| {
-        let mut namespaces = namespaces.borrow_mut();
-        if let Some((_, namespace)) = namespaces.iter().find(|(n, _)| n == name) {
-            return Rc::clone(namespace);
-        }
-        let namespace = Rc::new(RefCell::new(SimNamespace::new(seed)));
-        namespaces.push((name.to_string(), Rc::clone(&namespace)));
-        namespace
-    })
+pub(crate) fn open_namespace(name: &str, seed: u64) -> SimNamespaceHandle {
+    let mut namespaces = NAMESPACES
+        .lock()
+        .expect("simulated namespace registry lock poisoned");
+    if let Some((_, namespace)) = namespaces.iter().find(|(n, _)| n == name) {
+        return namespace.clone();
+    }
+    let namespace = SimNamespaceHandle::new(seed);
+    namespaces.push((name.to_string(), namespace.clone()));
+    namespace
 }
 
 /// Drops the named namespace, so a harness can start a world from nothing.
 #[cfg(test)]
 pub(crate) fn drop_namespace(name: &str) {
-    NAMESPACES.with(|namespaces| namespaces.borrow_mut().retain(|(n, _)| n != name));
+    NAMESPACES
+        .lock()
+        .expect("simulated namespace registry lock poisoned")
+        .retain(|(n, _)| n != name);
 }
 
 /// The client half: what [`crate::object_store::Client::Simulator`] holds.
@@ -182,7 +204,7 @@ pub(crate) fn drop_namespace(name: &str) {
 /// statuses, DELETE of a missing key succeeding, LIST in key order with the
 /// configured key prefix stripped.
 pub(crate) struct SimClient {
-    namespace: Rc<RefCell<SimNamespace>>,
+    namespace: SimNamespaceHandle,
     key_prefix: String,
     body: FixedBuf,
 }
@@ -219,7 +241,10 @@ impl SimClient {
         precondition: Precondition,
     ) -> Result<EntityTag, Error> {
         let full = self.full_key(key)?;
-        let mut bucket = self.namespace.borrow_mut();
+        let mut bucket = self
+            .namespace
+            .lock()
+            .expect("simulated namespace lock poisoned");
         bucket.operation_gate()?;
         let position = bucket.find(full.as_str());
         match (&precondition, &position) {
@@ -270,7 +295,10 @@ impl SimClient {
 
     pub(crate) fn get(&mut self, key: &str, range: Option<ByteRange>) -> Result<GetResult, Error> {
         let full = self.full_key(key)?;
-        let mut bucket = self.namespace.borrow_mut();
+        let mut bucket = self
+            .namespace
+            .lock()
+            .expect("simulated namespace lock poisoned");
         bucket.operation_gate()?;
         let at = match bucket.find(full.as_str()) {
             Ok(at) => at,
@@ -321,7 +349,10 @@ impl SimClient {
 
     pub(crate) fn delete(&mut self, key: &str) -> Result<(), Error> {
         let full = self.full_key(key)?;
-        let mut bucket = self.namespace.borrow_mut();
+        let mut bucket = self
+            .namespace
+            .lock()
+            .expect("simulated namespace lock poisoned");
         bucket.operation_gate()?;
         if let Ok(at) = bucket.find(full.as_str()) {
             bucket.objects.remove(at);
@@ -335,7 +366,10 @@ impl SimClient {
         mut each: impl FnMut(&str),
     ) -> Result<usize, Error> {
         let full_prefix = self.full_key(prefix)?;
-        let mut bucket = self.namespace.borrow_mut();
+        let mut bucket = self
+            .namespace
+            .lock()
+            .expect("simulated namespace lock poisoned");
         bucket.operation_gate()?;
         #[cfg(test)]
         {
@@ -363,7 +397,10 @@ impl SimClient {
         }
         let full_prefix = self.full_key(prefix)?;
         let full_after = self.full_key(after)?;
-        let mut bucket = self.namespace.borrow_mut();
+        let mut bucket = self
+            .namespace
+            .lock()
+            .expect("simulated namespace lock poisoned");
         bucket.operation_gate()?;
         #[cfg(test)]
         {
@@ -404,7 +441,7 @@ fn status(code: u16, message: &str) -> Error {
 mod tests {
     use super::*;
 
-    fn client(name: &str) -> (SimClient, Rc<RefCell<SimNamespace>>) {
+    fn client(name: &str) -> (SimClient, SimNamespaceHandle) {
         drop_namespace(name);
         let bucket = open_namespace(name, 7);
         let mut config = Config::default_dev();
@@ -413,6 +450,18 @@ mod tests {
         config.object_store_response_bytes = 64;
         let mut budget = Budget::new(1 << 20);
         (SimClient::new(&config, &mut budget).unwrap(), bucket)
+    }
+
+    #[test]
+    fn namespace_identity_survives_a_thread_transfer() {
+        let name = "sim-thread-transfer";
+        drop_namespace(name);
+        let first = open_namespace(name, 7);
+        let second = std::thread::spawn(move || open_namespace(name, 11))
+            .join()
+            .expect("namespace worker completes");
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        drop_namespace(name);
     }
 
     #[test]

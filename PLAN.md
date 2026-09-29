@@ -308,6 +308,18 @@ dispatch must replace the local queue drain with fixed workers and make that
 shared engine state safe while preserving transaction retry, object I/O
 parking, group publication, and response barriers.
 
+Engine ownership can now cross an operating-system thread boundary. Durable
+and temporary block stores use shared mutex ownership between checkpoint and
+spill paths, immutable external-run readers use a synchronized fixed pool, and
+the deterministic object-store namespace uses a process-wide transferable
+handle.
+The owned POSIX locale records its single-owner transfer invariant explicitly.
+A live-engine test moves ownership to another thread, executes SQL there, and
+drops its storage and locale state on that thread. The engine remains one
+owner at a time and reactor-serialized. Fixed workers still require shared
+catalog, cache, lock, foreign transport, and statistics state to be partitioned
+or synchronized before dispatch can overlap.
+
 ### Performance qualification
 
 The [256-row](benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)

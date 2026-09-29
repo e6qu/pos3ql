@@ -547,6 +547,16 @@ draining only at the end of a reactor turn capped group commit width at the
 workspace count and amplified concurrent commit PUTs. Capacity pressure now
 drains queued scheduler chunks while retaining their responses for the turn's
 single publication barrier.
+The engine-transfer audit found five compiler-enforced blockers: reference-
+counted durable and temporary block stores, the simulated namespace, immutable
+external-run readers, and the owned POSIX locale handle. The stores and readers
+now use synchronized shared ownership, lock poison fails loudly instead of
+masquerading as pool exhaustion, the simulator exposes a transferable handle,
+and its registry is process-wide so a later client opened on another thread
+resolves the same namespace. Locale transfer is confined to its owned wrapper.
+A live engine now moves to another operating-system thread, executes SQL, and
+drops there in the test suite. This establishes single-owner transfer; shared
+engine mutation remains the next fixed-worker boundary in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

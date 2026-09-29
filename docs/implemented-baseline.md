@@ -113,6 +113,13 @@ active production roadmap is [PLAN.md](../PLAN.md).
   still being prepared for fixed workers. Logical subscription apply and
   bootstrap COPY use the subscription worker's fixed arena and DML scratch
   independently.
+  Whole-engine ownership is transferable across operating-system threads:
+  checkpoint and spill block stores, external-run readers, the deterministic
+  process-wide object-store namespace, and the owned POSIX locale all have
+  explicit transfer-safe ownership. A live-engine test executes SQL after
+  moving the owner to another thread. Engine mutation remains single-owner and
+  serialized while catalog, cache, lock, foreign transport, and statistics
+  sharing is prepared.
 - Streamed COPY transition rows are retained in fixed connection-private and
   subscription-worker-private buffers. Interleaved streams preserve the exact
   row set for statement transition triggers without runtime allocation.

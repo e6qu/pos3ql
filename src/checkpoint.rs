@@ -653,7 +653,7 @@ fn push_slot_list(list: &mut SlotList, prior: PrevSst) -> Result<(), SqlError> {
 }
 
 pub(crate) struct TemporarySpiller {
-    blocks: std::rc::Rc<std::cell::RefCell<crate::store::EphemeralBlockStore>>,
+    blocks: std::sync::Arc<std::sync::Mutex<crate::store::EphemeralBlockStore>>,
     handles: Vec<SstHandle>,
     sst_arena: Arena,
     writer: SstWriter,
@@ -680,7 +680,7 @@ impl TemporarySpiller {
                     CheckpointSetupError::ObjectStore(format!("temporary spill store: {error}"))
                 })?;
         Ok(Self {
-            blocks: std::rc::Rc::new(std::cell::RefCell::new(blocks)),
+            blocks: std::sync::Arc::new(std::sync::Mutex::new(blocks)),
             handles: Vec::with_capacity(
                 crate::storage::table_slot_capacity(config)
                     .saturating_mul(config.max_spill_generations_per_table),
@@ -693,8 +693,8 @@ impl TemporarySpiller {
 
     pub(crate) fn block_store(
         &self,
-    ) -> std::rc::Rc<std::cell::RefCell<crate::store::EphemeralBlockStore>> {
-        std::rc::Rc::clone(&self.blocks)
+    ) -> std::sync::Arc<std::sync::Mutex<crate::store::EphemeralBlockStore>> {
+        std::sync::Arc::clone(&self.blocks)
     }
 
     /// Flushes one dirty temporary table into the process-local block store.
@@ -784,12 +784,19 @@ impl TemporarySpiller {
                     if let Some(location) = home {
                         storage.with_row_bytes(slot, rowid, location, |row| {
                             writer
-                                .append_version(&mut *blocks.borrow_mut(), key, row)
+                                .append_version(
+                                    &mut *blocks.lock().expect("block store lock poisoned"),
+                                    key,
+                                    row,
+                                )
                                 .map_err(temporary_sst_to_sql)
                         })?
                     } else {
                         writer
-                            .append_tombstone_version(&mut *blocks.borrow_mut(), key)
+                            .append_tombstone_version(
+                                &mut *blocks.lock().expect("block store lock poisoned"),
+                                key,
+                            )
                             .map_err(temporary_sst_to_sql)?
                     }
                     Ok(())
@@ -804,7 +811,7 @@ impl TemporarySpiller {
             }
         }
         let handle = writer
-            .finish(&mut *blocks.borrow_mut())
+            .finish(&mut *blocks.lock().expect("block store lock poisoned"))
             .map_err(temporary_sst_to_sql)?;
         match (delta, handle) {
             (true, Some(handle)) => storage.append_spill(slot, handle),
@@ -820,7 +827,10 @@ impl TemporarySpiller {
 
     #[cfg(test)]
     pub(crate) fn block_count(&self) -> usize {
-        self.blocks.borrow().block_count()
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .block_count()
     }
 
     pub(crate) fn cleanup(&mut self, storage: &Storage) {
@@ -855,11 +865,15 @@ impl TemporarySpiller {
             }
         }
         if self.handles.is_empty() {
-            self.blocks.borrow_mut().clear();
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .clear();
             return Ok(());
         }
         self.blocks
-            .borrow_mut()
+            .lock()
+            .expect("temporary block store lock poisoned")
             .retain(&self.handles)
             .map_err(temporary_store_to_sql)
     }
@@ -872,8 +886,9 @@ pub(crate) struct Checkpointer {
     /// `disk_cache_bytes` finally sized to something. SST reads and writes go
     /// through here; writes populate the tiers on the way out, so a cold
     /// start warms what a later read wants. Shared with the storage layer's
-    /// spilled-row reader (single-threaded engine, short borrows).
-    blocks: std::rc::Rc<std::cell::RefCell<TieredStore<OwnedObjectStore>>>,
+    /// spilled-row reader. The engine has one owner today, and the mutex keeps
+    /// that ownership transferable to a worker without aliasing the stack.
+    blocks: std::sync::Arc<std::sync::Mutex<TieredStore<OwnedObjectStore>>>,
     /// Scratch for SST writers and readers, reset per table.
     sst_arena: Arena,
     /// Spill-list updates computed during a checkpoint, applied to storage
@@ -1028,7 +1043,13 @@ const VALUE_SORT_ROWS_PER_CHUNK: usize = 8192;
 impl Checkpointer {
     #[cfg(feature = "checkpoint-profile")]
     pub(crate) fn profile_start(&self) -> (CheckpointProfileStart, crate::store::BlockIoStats) {
-        (checkpoint_profile_start(), self.blocks.borrow().io_stats())
+        (
+            checkpoint_profile_start(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
+        )
     }
 
     #[cfg(feature = "checkpoint-profile")]
@@ -1045,7 +1066,10 @@ impl Checkpointer {
             None,
             started,
             before,
-            self.blocks.borrow().io_stats(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
             0,
         );
     }
@@ -1141,7 +1165,10 @@ impl Checkpointer {
                 MergePhase::Write { .. } => "row_merge_write",
             },
             checkpoint_profile_start(),
-            self.blocks.borrow().io_stats(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
         );
         let outcome = match job.phase {
             MergePhase::Schedule { rank, resume_lo } => {
@@ -1156,7 +1183,10 @@ impl Checkpointer {
             Some(job.slot),
             started,
             before,
-            self.blocks.borrow().io_stats(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
             0,
         );
         match outcome {
@@ -1282,7 +1312,7 @@ impl Checkpointer {
         let mut overflow = false;
         let next = reader
             .scan_versions_bounded(
-                &mut *blocks.borrow_mut(),
+                &mut *blocks.lock().expect("block store lock poisoned"),
                 &member.handle,
                 resume_lo,
                 MERGE_SCHEDULE_BEAT_BLOCKS,
@@ -1374,7 +1404,11 @@ impl Checkpointer {
         let writer = &mut self.merge_writer;
         let scratch = &self.merge_scratch;
         let start_blocks = writer.roster_so_far().len();
-        let start_reads = blocks.borrow().io_stats().object_gets;
+        let start_reads = blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .io_stats()
+            .object_gets;
         let mut cursor = cursor;
         let mut processed = 0usize;
         while cursor < job.schedule_len {
@@ -1382,7 +1416,8 @@ impl Checkpointer {
                 || writer.roster_so_far().len() - start_blocks >= MERGE_WRITE_BEAT_BLOCKS
                 || (processed > 0
                     && blocks
-                        .borrow()
+                        .lock()
+                        .expect("block store lock poisoned")
                         .io_stats()
                         .object_gets
                         .saturating_sub(start_reads)
@@ -1403,7 +1438,7 @@ impl Checkpointer {
                 .as_mut()
                 .expect("merge source cursor initialized with the job")
                 .load_reusable_pax_group(
-                    &mut *blocks.borrow_mut(),
+                    &mut *blocks.lock().expect("block store lock poisoned"),
                     key,
                     &mut self.merge_source_index,
                     &mut self.merge_source_raw,
@@ -1441,7 +1476,7 @@ impl Checkpointer {
                 if reusable && at == group.data_len() && entries > 0 {
                     let reused = writer
                         .append_reused_pax_group(
-                            &mut *blocks.borrow_mut(),
+                            &mut *blocks.lock().expect("block store lock poisoned"),
                             group.reference(),
                             &self.merge_source_raw[..group.raw_len()],
                         )
@@ -1470,7 +1505,7 @@ impl Checkpointer {
                         if !tombstone {
                             let len = len as usize;
                             copy_block_entry_at(
-                                &mut *blocks.borrow_mut(),
+                                &mut *blocks.lock().expect("block store lock poisoned"),
                                 &decoded[..group.data_len()],
                                 at,
                                 &mut self.merge_row[..len],
@@ -1504,7 +1539,10 @@ impl Checkpointer {
                     header[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
                     job.crc.update(&header);
                     writer
-                        .append_tombstone_version(&mut *blocks.borrow_mut(), key)
+                        .append_tombstone_version(
+                            &mut *blocks.lock().expect("block store lock poisoned"),
+                            key,
+                        )
                         .map_err(sst_to_sql)?;
                     job.count += 1;
                 }
@@ -1514,7 +1552,7 @@ impl Checkpointer {
                 .as_mut()
                 .expect("merge source cursor initialized with the job")
                 .copy_exact(
-                    &mut *blocks.borrow_mut(),
+                    &mut *blocks.lock().expect("block store lock poisoned"),
                     key,
                     &mut self.merge_source_index,
                     &mut self.merge_source_raw,
@@ -1539,7 +1577,11 @@ impl Checkpointer {
             job.crc.update(&header);
             job.crc.update(&self.merge_row[..len]);
             writer
-                .append_version(&mut *blocks.borrow_mut(), key, &self.merge_row[..len])
+                .append_version(
+                    &mut *blocks.lock().expect("block store lock poisoned"),
+                    key,
+                    &self.merge_row[..len],
+                )
                 .map_err(sst_to_sql)?;
             job.count += 1;
         }
@@ -1547,7 +1589,7 @@ impl Checkpointer {
             return Ok(MergeBeatOutcome::Finished(None));
         }
         let handle = writer
-            .finish(&mut *blocks.borrow_mut())
+            .finish(&mut *blocks.lock().expect("block store lock poisoned"))
             .map_err(sst_to_sql)?
             .ok_or_else(|| sql_err!(SQLSTATE_IO, "merge wrote rows but produced no SST"))?;
         Ok(MergeBeatOutcome::Finished(Some(PrevSst {
@@ -1583,7 +1625,7 @@ impl Checkpointer {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| CheckpointSetupError::ObjectStore(format!("create data_dir: {e}")))?;
         let cache_dir = std::path::Path::new(&config.data_dir);
-        let blocks = std::rc::Rc::new(std::cell::RefCell::new(
+        let blocks = std::sync::Arc::new(std::sync::Mutex::new(
             crate::store::build_tiers(budget, base, plan, cache_dir).map_err(|e| {
                 CheckpointSetupError::ObjectStore(format!("block cache stack: {e:?}"))
             })?,
@@ -1729,8 +1771,8 @@ impl Checkpointer {
     /// The shared block stack, for the storage layer's spilled-row reader.
     pub(crate) fn block_stack(
         &self,
-    ) -> std::rc::Rc<std::cell::RefCell<TieredStore<OwnedObjectStore>>> {
-        std::rc::Rc::clone(&self.blocks)
+    ) -> std::sync::Arc<std::sync::Mutex<TieredStore<OwnedObjectStore>>> {
+        std::sync::Arc::clone(&self.blocks)
     }
 
     #[cfg(test)]
@@ -1780,38 +1822,62 @@ impl Checkpointer {
     }
 
     pub(crate) fn enable_async_block_reads(&mut self) {
-        self.blocks.borrow_mut().enable_async_gets();
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .enable_async_gets();
     }
 
     pub(crate) fn disable_async_block_reads(&mut self) {
-        self.blocks.borrow_mut().disable_async_gets();
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .disable_async_gets();
     }
 
     pub(crate) fn block_read_slots(&self) -> usize {
-        self.blocks.borrow().async_read_slots()
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .async_read_slots()
     }
 
     pub(crate) fn block_reads_busy(&self) -> bool {
-        self.blocks.borrow().async_reads_busy()
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .async_reads_busy()
     }
 
     pub(crate) fn pending_block_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
-        self.blocks.borrow().pending_read_fd(slot)
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .pending_read_fd(slot)
     }
 
     pub(crate) fn advance_pending_block_read(
         &mut self,
         slot: usize,
     ) -> Result<bool, crate::store::StoreError> {
-        self.blocks.borrow_mut().advance_pending_read(slot)
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .advance_pending_read(slot)
     }
 
     pub(crate) fn next_block_read_hedge_deadline(&self) -> Option<std::time::Instant> {
-        self.blocks.borrow().next_hedge_deadline()
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .next_hedge_deadline()
     }
 
     pub(crate) fn issue_due_block_read_hedges(&mut self, now: std::time::Instant) {
-        self.blocks.borrow_mut().issue_due_hedges(now);
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .issue_due_hedges(now);
     }
 
     fn claim_writer(&mut self) -> Result<(), CheckpointSetupError> {
@@ -1880,7 +1946,12 @@ impl Checkpointer {
         &mut self,
         credentials: crate::object_store::Credentials,
     ) -> Result<(), SqlError> {
-        if self.blocks.borrow().async_reads_busy() {
+        if self
+            .blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .async_reads_busy()
+        {
             return Err(sql_err!(
                 SQLSTATE_IO,
                 "object-store credential rotation is waiting for active reads"
@@ -1898,7 +1969,8 @@ impl Checkpointer {
             return Err(error);
         }
         self.blocks
-            .borrow_mut()
+            .lock()
+            .expect("block store lock poisoned")
             .base_mut()
             .replace_credentials(credentials);
         Ok(())
@@ -2346,7 +2418,11 @@ impl Checkpointer {
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
-        let before = self.blocks.borrow().io_stats();
+        let before = self
+            .blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .io_stats();
         #[cfg(feature = "checkpoint-profile")]
         let mut deleted = 0;
         // Scan into the larger fixed staging batch once, then retain it while
@@ -2434,7 +2510,10 @@ impl Checkpointer {
             None,
             started,
             before,
-            self.blocks.borrow().io_stats(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
             deleted,
         );
         Ok(done)
@@ -7486,7 +7565,7 @@ impl Checkpointer {
             .sst_arena
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| CheckpointSetupError::Corrupt("sst reader scratch"))?;
-        let mut blocks = self.blocks.borrow_mut();
+        let mut blocks = self.blocks.lock().expect("block store lock poisoned");
         let block_count = crate::store::data_block_total(&mut *blocks, handle, index_buf)
             .map_err(|_| CheckpointSetupError::Corrupt("sst index unreachable"))?;
         if block_count == 0 {
@@ -7724,7 +7803,11 @@ impl Checkpointer {
         #[cfg(feature = "checkpoint-profile")]
         let publish_started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
-        let publish_before = self.blocks.borrow().io_stats();
+        let publish_before = self
+            .blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .io_stats();
         let published = self.publish(storage, lsn);
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
@@ -7733,7 +7816,10 @@ impl Checkpointer {
             None,
             publish_started,
             publish_before,
-            self.blocks.borrow().io_stats(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
             0,
         );
         published?;
@@ -11231,7 +11317,11 @@ impl Checkpointer {
         #[cfg(feature = "checkpoint-profile")]
         let row_started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
-        let row_before = self.blocks.borrow().io_stats();
+        let row_before = self
+            .blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .io_stats();
         if !clean {
             // Collect rowids; each rowid expands to its current image plus
             // every snapshot-retained committed version. The scratch remains
@@ -11337,12 +11427,19 @@ impl Checkpointer {
                         storage.with_row_bytes(slot, rowid, location, |row| {
                             crc.update(row);
                             writer
-                                .append_version(&mut *blocks.borrow_mut(), key, row)
+                                .append_version(
+                                    &mut *blocks.lock().expect("block store lock poisoned"),
+                                    key,
+                                    row,
+                                )
                                 .map_err(sst_to_sql)
                         })?
                     } else {
                         writer
-                            .append_tombstone_version(&mut *blocks.borrow_mut(), key)
+                            .append_tombstone_version(
+                                &mut *blocks.lock().expect("block store lock poisoned"),
+                                key,
+                            )
                             .map_err(sst_to_sql)?
                     }
                     count += 1;
@@ -11359,7 +11456,7 @@ impl Checkpointer {
             }
             let crc = crc.finish();
             let handle = writer
-                .finish(&mut *blocks.borrow_mut())
+                .finish(&mut *blocks.lock().expect("block store lock poisoned"))
                 .map_err(sst_to_sql)?;
 
             // Storage is not touched yet: the list installs (and the
@@ -11423,7 +11520,10 @@ impl Checkpointer {
                 Some(slot),
                 row_started,
                 row_before,
-                self.blocks.borrow().io_stats(),
+                self.blocks
+                    .lock()
+                    .expect("block store lock poisoned")
+                    .io_stats(),
                 0,
             );
         }
@@ -11516,7 +11616,11 @@ impl Checkpointer {
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
-        let before = self.blocks.borrow().io_stats();
+        let before = self
+            .blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .io_stats();
         let through_lsn = storage.lsn();
         let dirty_lsn = storage
             .value_binding_dirty_lsn(slot, binding)
@@ -11535,7 +11639,7 @@ impl Checkpointer {
             if let Some(previous) = storage.value_binding_handle(slot, binding) {
                 let known = &mut self.roster_scratch;
                 let complete = crate::store::walk_value_roster(
-                    &mut *self.blocks.borrow_mut(),
+                    &mut *self.blocks.lock().expect("block store lock poisoned"),
                     previous.roster,
                     roster_read,
                     |id, kind| {
@@ -11590,7 +11694,10 @@ impl Checkpointer {
             Some(slot),
             started,
             before,
-            self.blocks.borrow().io_stats(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
             0,
         );
         if result.is_err() {
@@ -11979,13 +12086,18 @@ impl Checkpointer {
             let end = begin + row.length as usize;
             self.slice_writer
                 .append(
-                    &mut *self.blocks.borrow_mut(),
+                    &mut *self.blocks.lock().expect("block store lock poisoned"),
                     position as u64 + 1,
                     &self.value_source[begin..end],
                 )
                 .map_err(sst_to_sql)?;
             position += 1;
-            let io = self.blocks.borrow().io_stats().saturating_sub(before);
+            let io = self
+                .blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats()
+                .saturating_sub(before);
             if position - start >= VALUE_INDEX_WRITE_BEAT_ENTRIES
                 || io.object_puts >= VALUE_INDEX_SCHEDULE_BEAT_BLOCKS
             {
@@ -11995,7 +12107,8 @@ impl Checkpointer {
         }
         if self
             .blocks
-            .borrow()
+            .lock()
+            .expect("block store lock poisoned")
             .io_stats()
             .saturating_sub(before)
             .object_puts
@@ -12007,7 +12120,7 @@ impl Checkpointer {
         let rows = job.row_count as u64;
         let handle = self
             .slice_writer
-            .finish(&mut *self.blocks.borrow_mut())
+            .finish(&mut *self.blocks.lock().expect("block store lock poisoned"))
             .map_err(sst_to_sql)?
             .expect("non-empty value-index run");
         if let Some(pending) = job.pending {
@@ -12032,8 +12145,10 @@ impl Checkpointer {
         right: ExternalRun,
         destination: ValueMergeDestination,
     ) -> Result<(), SqlError> {
-        self.value_sort_reader
-            .start(&mut *self.blocks.borrow_mut(), left)?;
+        self.value_sort_reader.start(
+            &mut *self.blocks.lock().expect("block store lock poisoned"),
+            left,
+        )?;
         self.sst_arena.reset();
         let index = self
             .sst_arena
@@ -12050,7 +12165,7 @@ impl Checkpointer {
         let mut right_cursor = right.cursor();
         let right_len = right_cursor
             .next_copy(
-                &mut *self.blocks.borrow_mut(),
+                &mut *self.blocks.lock().expect("block store lock poisoned"),
                 index,
                 data,
                 bounce,
@@ -12124,21 +12239,25 @@ impl Checkpointer {
                     .prefixed_row()
                     .expect("chosen left row");
                 self.slice_writer
-                    .append(&mut *self.blocks.borrow_mut(), output, row)
+                    .append(
+                        &mut *self.blocks.lock().expect("block store lock poisoned"),
+                        output,
+                        row,
+                    )
                     .map_err(sst_to_sql)?;
                 self.value_sort_reader
-                    .advance(&mut *self.blocks.borrow_mut())?;
+                    .advance(&mut *self.blocks.lock().expect("block store lock poisoned"))?;
             } else {
                 self.slice_writer
                     .append(
-                        &mut *self.blocks.borrow_mut(),
+                        &mut *self.blocks.lock().expect("block store lock poisoned"),
                         output,
                         &self.value_entry[..right_len],
                     )
                     .map_err(sst_to_sql)?;
                 right_len = right_cursor
                     .next_copy(
-                        &mut *self.blocks.borrow_mut(),
+                        &mut *self.blocks.lock().expect("block store lock poisoned"),
                         index,
                         data,
                         bounce,
@@ -12149,7 +12268,12 @@ impl Checkpointer {
             }
             processed += 1;
             output += 1;
-            let io = self.blocks.borrow().io_stats().saturating_sub(before);
+            let io = self
+                .blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats()
+                .saturating_sub(before);
             if processed >= VALUE_INDEX_WRITE_BEAT_ENTRIES
                 || io.object_puts >= VALUE_INDEX_SCHEDULE_BEAT_BLOCKS
                 || io.object_gets >= VALUE_INDEX_SCHEDULE_BEAT_READS
@@ -12165,7 +12289,14 @@ impl Checkpointer {
                 return Ok(());
             }
         }
-        if self.blocks.borrow().io_stats().saturating_sub(before) != Default::default() {
+        if self
+            .blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .io_stats()
+            .saturating_sub(before)
+            != Default::default()
+        {
             right_cursor.detach_buffer();
             job.phase = ValueSchedulePhase::Merge {
                 destination,
@@ -12178,7 +12309,7 @@ impl Checkpointer {
         }
         let handle = self
             .slice_writer
-            .finish(&mut *self.blocks.borrow_mut())
+            .finish(&mut *self.blocks.lock().expect("block store lock poisoned"))
             .map_err(sst_to_sql)?
             .expect("merged value-index run is non-empty");
         Self::install_value_run(job, ExternalRun::from_checkpoint(handle, rows), destination)
@@ -12265,7 +12396,11 @@ impl Checkpointer {
         }
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
-        let before = self.blocks.borrow().io_stats();
+        let before = self
+            .blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .io_stats();
         let phase = core::mem::replace(&mut job.phase, ValueSchedulePhase::Collect);
         let result = match phase {
             ValueSchedulePhase::Collect => self.value_collect_beat(storage, &mut job),
@@ -12308,7 +12443,10 @@ impl Checkpointer {
             Some(job.slot),
             started,
             before,
-            self.blocks.borrow().io_stats(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
             0,
         );
         match result {
@@ -12385,7 +12523,11 @@ impl Checkpointer {
         }
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
-        let before = self.blocks.borrow().io_stats();
+        let before = self
+            .blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .io_stats();
         let result = self.write_value_index_entries(storage, &mut job, before);
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
@@ -12394,7 +12536,10 @@ impl Checkpointer {
             Some(job.slot),
             started,
             before,
-            self.blocks.borrow().io_stats(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
             0,
         );
         match result {
@@ -12442,8 +12587,10 @@ impl Checkpointer {
         if let ValueIndexSource::External { run, started } = &mut job.source
             && !*started
         {
-            self.value_sort_reader
-                .start(&mut *self.blocks.borrow_mut(), *run)?;
+            self.value_sort_reader.start(
+                &mut *self.blocks.lock().expect("block store lock poisoned"),
+                *run,
+            )?;
             *started = true;
         }
         let mut processed = 0usize;
@@ -12467,7 +12614,12 @@ impl Checkpointer {
                 ValueIndexSource::InMemory { .. } => 0,
             };
             while job.base_len == 0 && !job.base_done {
-                let io = self.blocks.borrow().io_stats().saturating_sub(before);
+                let io = self
+                    .blocks
+                    .lock()
+                    .expect("block store lock poisoned")
+                    .io_stats()
+                    .saturating_sub(before);
                 let reserve_delta_read =
                     usize::from(matches!(job.source, ValueIndexSource::External { .. }));
                 let remaining = (VALUE_INDEX_WRITE_BEAT_READS.saturating_sub(io.object_gets))
@@ -12476,7 +12628,7 @@ impl Checkpointer {
                 let step = self
                     .value_base_stream
                     .next_copy(
-                        &mut *self.blocks.borrow_mut(),
+                        &mut *self.blocks.lock().expect("block store lock poisoned"),
                         remaining,
                         &mut self.value_base_entry,
                     )
@@ -12496,7 +12648,7 @@ impl Checkpointer {
             }
             if delta_len == 0 && job.base_len == 0 {
                 let handle = {
-                    let mut blocks = self.blocks.borrow_mut();
+                    let mut blocks = self.blocks.lock().expect("block store lock poisoned");
                     let mut published = PublishedValueBlockStore {
                         inner: &mut *blocks,
                         known_blocks: &self.roster_scratch,
@@ -12586,7 +12738,7 @@ impl Checkpointer {
                     None
                 };
                 let write = {
-                    let mut blocks = self.blocks.borrow_mut();
+                    let mut blocks = self.blocks.lock().expect("block store lock poisoned");
                     let mut published = PublishedValueBlockStore {
                         inner: &mut *blocks,
                         known_blocks: &self.roster_scratch,
@@ -12634,11 +12786,16 @@ impl Checkpointer {
                     ValueIndexSource::InMemory { position, .. } => *position += 1,
                     ValueIndexSource::External { .. } => self
                         .value_sort_reader
-                        .advance(&mut *self.blocks.borrow_mut())?,
+                        .advance(&mut *self.blocks.lock().expect("block store lock poisoned"))?,
                 }
             }
             processed += 1;
-            let io = self.blocks.borrow().io_stats().saturating_sub(before);
+            let io = self
+                .blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats()
+                .saturating_sub(before);
             if processed >= VALUE_INDEX_WRITE_BEAT_ENTRIES
                 || io.object_puts >= VALUE_INDEX_WRITE_BEAT_BLOCKS
                 || io.object_gets >= VALUE_INDEX_WRITE_BEAT_READS
@@ -12665,7 +12822,11 @@ impl Checkpointer {
             #[cfg(feature = "checkpoint-profile")]
             let keep_started = checkpoint_profile_start();
             #[cfg(feature = "checkpoint-profile")]
-            let keep_before = self.blocks.borrow().io_stats();
+            let keep_before = self
+                .blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats();
             self.roster_scratch.clear();
             self.ensure_backup_names_loaded()?;
             self.sst_arena.reset();
@@ -12699,7 +12860,8 @@ impl Checkpointer {
                 self.roster_scratch.push((h.roster, None));
                 let n = self
                     .blocks
-                    .borrow_mut()
+                    .lock()
+                    .expect("block store lock poisoned")
                     .get(&h.roster, scratch)
                     .map(|(n, _)| n)
                     .map_err(|e| sql_err!(SQLSTATE_IO, "gc roster read: {:?}", e))?;
@@ -12728,7 +12890,7 @@ impl Checkpointer {
                         continue;
                     };
                     let complete = crate::store::walk_value_roster(
-                        &mut *self.blocks.borrow_mut(),
+                        &mut *self.blocks.lock().expect("block store lock poisoned"),
                         handle.roster,
                         scratch,
                         |id, _| {
@@ -12784,7 +12946,10 @@ impl Checkpointer {
                 None,
                 keep_started,
                 keep_before,
-                self.blocks.borrow().io_stats(),
+                self.blocks
+                    .lock()
+                    .expect("block store lock poisoned")
+                    .io_stats(),
                 0,
             );
             self.doomed_blocks.clear();
@@ -12794,7 +12959,11 @@ impl Checkpointer {
             #[cfg(feature = "checkpoint-profile")]
             let list_started = checkpoint_profile_start();
             #[cfg(feature = "checkpoint-profile")]
-            let list_before = self.blocks.borrow().io_stats();
+            let list_before = self
+                .blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats();
             if let Err(error) = self.client.list("blocks/", |key| {
                 let hex = key.strip_prefix("blocks/").unwrap_or(key);
                 let known = parse_block_id(hex)
@@ -12818,7 +12987,10 @@ impl Checkpointer {
                 None,
                 list_started,
                 list_before,
-                self.blocks.borrow().io_stats(),
+                self.blocks
+                    .lock()
+                    .expect("block store lock poisoned")
+                    .io_stats(),
                 0,
             );
             self.block_garbage_overflow = overflow;
@@ -12827,7 +12999,11 @@ impl Checkpointer {
         #[cfg(feature = "checkpoint-profile")]
         let delete_started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
-        let delete_before = self.blocks.borrow().io_stats();
+        let delete_before = self
+            .blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .io_stats();
         #[cfg(feature = "checkpoint-profile")]
         let mut deleted = 0;
         for _ in 0..self.delete_objects_per_beat.min(self.doomed_blocks.len()) {
@@ -12859,7 +13035,10 @@ impl Checkpointer {
             None,
             delete_started,
             delete_before,
-            self.blocks.borrow().io_stats(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
             deleted,
         );
         Ok(done)
@@ -12873,7 +13052,11 @@ impl Checkpointer {
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
-        let before = self.blocks.borrow().io_stats();
+        let before = self
+            .blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .io_stats();
         // Retain the fixed staging batch across paced delete beats so a large
         // legacy namespace is listed once per staging batch.
         if !self.legacy_garbage_loaded {
@@ -12924,7 +13107,10 @@ impl Checkpointer {
             None,
             started,
             before,
-            self.blocks.borrow().io_stats(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
             deleted,
         );
         Ok(done)
@@ -13098,7 +13284,7 @@ fn retain_block(keep: &mut Vec<(BlockId, Option<BlockType>)>, id: BlockId) -> Re
 }
 
 fn retain_manifest_blocks(
-    blocks: &std::rc::Rc<std::cell::RefCell<TieredStore<OwnedObjectStore>>>,
+    blocks: &std::sync::Arc<std::sync::Mutex<TieredStore<OwnedObjectStore>>>,
     keep: &mut Vec<(BlockId, Option<BlockType>)>,
     scratch: &mut [u8],
     bytes: &[u8],
@@ -13133,7 +13319,8 @@ fn retain_manifest_blocks(
                     .map_err(|_| sql_err!(SQLSTATE_IO, "backup manifest has a bad dsst roster"))?;
                 retain_block(keep, roster)?;
                 let n = blocks
-                    .borrow_mut()
+                    .lock()
+                    .expect("block store lock poisoned")
                     .get(&roster, scratch)
                     .map(|(n, _)| n)
                     .map_err(|error| {
@@ -13184,7 +13371,7 @@ fn retain_manifest_blocks(
                         })
                     })?;
                 let complete = crate::store::walk_value_roster(
-                    &mut *blocks.borrow_mut(),
+                    &mut *blocks.lock().expect("block store lock poisoned"),
                     roster,
                     scratch,
                     |id, _| retain_block(keep, id).is_ok(),

@@ -11888,9 +11888,23 @@ struct CollationScratch {
 }
 
 struct CollationRuntime {
-    locale: libc::locale_t,
+    locale: OwnedLocale,
     name: StackStr<128>,
     scratch: std::cell::RefCell<CollationScratch>,
+}
+
+struct OwnedLocale(libc::locale_t);
+
+// SAFETY: `newlocale` creates an independently owned locale object without
+// thread affinity. The engine moves it as one owner and only passes the
+// unchanged handle to `strcoll_l` before freeing it exactly once.
+// POSIX rationale: https://pubs.opengroup.org/onlinepubs/9699919799.2008edition/xrat/V4_port.html
+unsafe impl Send for OwnedLocale {}
+
+impl Drop for OwnedLocale {
+    fn drop(&mut self) {
+        unsafe { libc::freelocale(self.0) };
+    }
 }
 
 impl CollationRuntime {
@@ -11955,7 +11969,7 @@ impl CollationRuntime {
             })?,
         };
         Ok(Self {
-            locale,
+            locale: OwnedLocale(locale),
             name: StackStr::from_str(config.database_collation_locale.as_str()),
             scratch: std::cell::RefCell::new(scratch),
         })
@@ -11988,7 +12002,7 @@ impl CollationRuntime {
             strcoll_l(
                 scratch.left.readable().as_ptr().cast(),
                 scratch.right.readable().as_ptr().cast(),
-                self.locale,
+                self.locale.0,
             )
         };
         Ok(compared.cmp(&0))
@@ -12005,13 +12019,6 @@ impl CollationRuntime {
     }
 }
 
-impl Drop for CollationRuntime {
-    fn drop(&mut self) {
-        // SAFETY: locale is owned by this runtime and freed exactly once.
-        unsafe { libc::freelocale(self.locale) };
-    }
-}
-
 unsafe extern "C" {
     fn strcoll_l(
         left: *const libc::c_char,
@@ -12022,12 +12029,13 @@ unsafe extern "C" {
 
 /// Fetches spilled rows back through the cache tiers. The buffers are owned
 /// and startup-reserved; the stack is shared with the checkpointer through a
-/// `RefCell` (single-threaded engine, short borrows).
+/// mutex. The engine is currently single-owner, so every lock is short and
+/// uncontended; the synchronization keeps ownership transferable to a worker.
 pub(crate) struct SpillReader {
     blocks: Option<
-        std::rc::Rc<std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
+        std::sync::Arc<std::sync::Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
     >,
-    temporary_blocks: Option<std::rc::Rc<std::cell::RefCell<crate::store::EphemeralBlockStore>>>,
+    temporary_blocks: Option<std::sync::Arc<std::sync::Mutex<crate::store::EphemeralBlockStore>>>,
     /// Two scratch sets so one consume-in-place fetch may nest inside another
     /// (a validation scan holding one row while checking it against the
     /// rest). Deeper nesting is a loud error, not a deadlock.
@@ -12053,12 +12061,12 @@ pub(crate) struct SpillReader {
     /// Immutable-run cursors leased by nested materialized row sources.
     /// Their scratch is independent from the sorter, so consuming a completed
     /// run never prevents a deeper operator from producing another.
-    external_readers: std::rc::Rc<[std::cell::RefCell<crate::sql::external::ExternalRunReader>]>,
+    external_readers: std::sync::Arc<[std::sync::Mutex<crate::sql::external::ExternalRunReader>]>,
 }
 
 /// Copyable access to immutable external runs.
 ///
-/// The pointed-to allocations are owned by `Rc`s in [`SpillReader`] and never
+/// The pointed-to allocations are owned by `Arc`s in [`SpillReader`] and never
 /// move or detach after engine startup. The handle deliberately does not
 /// borrow [`Storage`], so an immutable run can remain readable while a DML
 /// executor mutates catalog or row state. It is crate-private and may only be
@@ -12066,24 +12074,28 @@ pub(crate) struct SpillReader {
 /// were reserved during startup.
 #[derive(Clone, Copy)]
 pub(crate) struct ExternalRunAccess {
-    blocks: *const std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
-    readers: *const [std::cell::RefCell<crate::sql::external::ExternalRunReader>],
+    blocks: *const std::sync::Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
+    readers: *const [std::sync::Mutex<crate::sql::external::ExternalRunReader>],
 }
 
 impl ExternalRunAccess {
     pub(crate) fn reader(
         &self,
     ) -> Result<
-        std::cell::RefMut<'_, crate::sql::external::ExternalRunReader>,
+        std::sync::MutexGuard<'_, crate::sql::external::ExternalRunReader>,
         crate::sql::eval::SqlError,
     > {
-        // SAFETY: both allocations are pinned by `SpillReader`'s `Rc`s for
+        // SAFETY: both allocations are pinned by `SpillReader`'s `Arc`s for
         // the engine lifetime; the crate-private handle is only installed in
         // executor state that cannot outlive that engine.
         let readers = unsafe { &*self.readers };
         for reader in readers.iter() {
-            if let Ok(lease) = reader.try_borrow_mut() {
-                return Ok(lease);
+            match reader.try_lock() {
+                Ok(lease) => return Ok(lease),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    panic!("external run reader lock poisoned: {error}")
+                }
             }
         }
         Err(crate::sql_err!(
@@ -12097,8 +12109,10 @@ impl ExternalRunAccess {
         &self,
         operation: impl FnOnce(&mut dyn crate::store::BlockStore) -> R,
     ) -> R {
-        // SAFETY: see `reader`; access is serialized by the `RefCell`.
-        let mut blocks = unsafe { &*self.blocks }.borrow_mut();
+        // SAFETY: see `reader`; access is serialized by the mutex.
+        let mut blocks = unsafe { &*self.blocks }
+            .lock()
+            .expect("block store lock poisoned");
         operation(&mut *blocks)
     }
 }
@@ -12245,12 +12259,12 @@ impl SpillReader {
         budget: &mut Budget,
         max_spill_generations: usize,
         blocks: Option<
-            std::rc::Rc<
-                std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
+            std::sync::Arc<
+                std::sync::Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
             >,
         >,
         temporary_blocks: Option<
-            std::rc::Rc<std::cell::RefCell<crate::store::EphemeralBlockStore>>,
+            std::sync::Arc<std::sync::Mutex<crate::store::EphemeralBlockStore>>,
         >,
     ) -> Result<Self, BudgetError> {
         let durable = blocks.is_some();
@@ -12300,7 +12314,7 @@ impl SpillReader {
                 "external query run readers",
             )?;
             (0..EXTERNAL_RUN_CONTEXTS)
-                .map(|_| std::cell::RefCell::new(crate::sql::external::ExternalRunReader::new()))
+                .map(|_| std::sync::Mutex::new(crate::sql::external::ExternalRunReader::new()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
                 .into()
@@ -12401,22 +12415,24 @@ impl SpillReader {
                 self.temporary_blocks
                     .as_ref()
                     .expect("spilled temporary table has a temporary block store")
-                    .borrow_mut(),
+                    .lock()
+                    .expect("temporary block store lock poisoned"),
             )
         } else {
             RelationBlockStore::Durable(
                 self.blocks
                     .as_ref()
                     .expect("durable spilled table has a durable block stack")
-                    .borrow_mut(),
+                    .lock()
+                    .expect("block store lock poisoned"),
             )
         }
     }
 }
 
 enum RelationBlockStore<'a> {
-    Durable(std::cell::RefMut<'a, crate::store::TieredStore<crate::store::OwnedObjectStore>>),
-    Temporary(std::cell::RefMut<'a, crate::store::EphemeralBlockStore>),
+    Durable(std::sync::MutexGuard<'a, crate::store::TieredStore<crate::store::OwnedObjectStore>>),
+    Temporary(std::sync::MutexGuard<'a, crate::store::EphemeralBlockStore>),
 }
 
 impl core::ops::Deref for RelationBlockStore<'_> {
@@ -24369,7 +24385,7 @@ impl Storage {
         self.spill
             .as_ref()
             .and_then(|reader| reader.blocks.as_ref())
-            .map(|blocks| blocks.borrow().io_stats())
+            .map(|blocks| blocks.lock().expect("block store lock poisoned").io_stats())
             .unwrap_or_default()
     }
 
@@ -24404,7 +24420,7 @@ impl Storage {
     pub(crate) fn external_run_reader(
         &self,
     ) -> Result<
-        std::cell::RefMut<'_, crate::sql::external::ExternalRunReader>,
+        std::sync::MutexGuard<'_, crate::sql::external::ExternalRunReader>,
         crate::sql::eval::SqlError,
     > {
         let Some(spill) = self.spill.as_ref().filter(|spill| spill.blocks.is_some()) else {
@@ -24414,8 +24430,12 @@ impl Storage {
             ));
         };
         for reader in spill.external_readers.iter() {
-            if let Ok(lease) = reader.try_borrow_mut() {
-                return Ok(lease);
+            match reader.try_lock() {
+                Ok(lease) => return Ok(lease),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    panic!("external run reader lock poisoned: {error}")
+                }
             }
         }
         Err(crate::sql_err!(
@@ -24438,8 +24458,8 @@ impl Storage {
         };
         let blocks = spill.blocks.as_ref().expect("filtered above");
         Ok(ExternalRunAccess {
-            blocks: std::rc::Rc::as_ptr(blocks),
-            readers: std::rc::Rc::as_ptr(&spill.external_readers),
+            blocks: std::sync::Arc::as_ptr(blocks),
+            readers: std::sync::Arc::as_ptr(&spill.external_readers),
         })
     }
 
@@ -24452,7 +24472,11 @@ impl Storage {
         operation: impl FnOnce(&mut dyn crate::store::BlockStore) -> R,
     ) -> Option<R> {
         let reader = self.spill.as_ref()?;
-        let mut blocks = reader.blocks.as_ref()?.borrow_mut();
+        let mut blocks = reader
+            .blocks
+            .as_ref()?
+            .lock()
+            .expect("block store lock poisoned");
         Some(operation(&mut *blocks))
     }
 
@@ -27928,7 +27952,8 @@ impl Storage {
                             .blocks
                             .as_ref()
                             .expect("value-index generations are durable")
-                            .borrow_mut(),
+                            .lock()
+                            .expect("block store lock poisoned"),
                         &handle,
                         hash,
                         |rowid, _, key| {
@@ -28545,7 +28570,8 @@ impl Storage {
                         .blocks
                         .as_ref()
                         .expect("value-index generations are durable")
-                        .borrow_mut(),
+                        .lock()
+                        .expect("block store lock poisoned"),
                     &handle,
                     |_, rowid, _, key| {
                         if callback_error.is_ok()
@@ -28657,7 +28683,8 @@ impl Storage {
                         .blocks
                         .as_ref()
                         .expect("value-index generations are durable")
-                        .borrow_mut(),
+                        .lock()
+                        .expect("block store lock poisoned"),
                     &handle,
                     intersects,
                     |key| match classify(key) {
@@ -28778,7 +28805,8 @@ impl Storage {
                         .blocks
                         .as_ref()
                         .expect("value-index generations are durable")
-                        .borrow_mut(),
+                        .lock()
+                        .expect("block store lock poisoned"),
                     &handle,
                     intersects,
                     priority,
@@ -28834,7 +28862,8 @@ impl Storage {
                         .blocks
                         .as_ref()
                         .expect("value-index generations are durable")
-                        .borrow_mut(),
+                        .lock()
+                        .expect("block store lock poisoned"),
                     id,
                     covering,
                     rowid,
@@ -28908,7 +28937,8 @@ impl Storage {
             .blocks
             .as_ref()
             .expect("value-index generations are durable")
-            .borrow_mut()
+            .lock()
+            .expect("block store lock poisoned")
             .get(&handle.roster, &mut scratch.roster)
             .map_err(|error| value_index_read_error(crate::store::ValueIndexError::Store(error)))?;
         match root_kind {
@@ -28935,7 +28965,8 @@ impl Storage {
                         .blocks
                         .as_ref()
                         .expect("value-index generations are durable")
-                        .borrow_mut(),
+                        .lock()
+                        .expect("block store lock poisoned"),
                     &handle,
                     |position, summary| {
                         if position != navigation.position {

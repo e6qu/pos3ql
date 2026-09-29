@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::pg::auth::{AuthMode, SCRAM_ITERATIONS, ScramServer};
 use crate::pg::conn::{After, AuthContext, CancelRequest, Conn, PendingResponse};
-use crate::sql::Engine;
+use crate::sql::{Engine, QueryWorkspaceId};
 
 const LISTENER_TOKEN: u64 = u64::MAX;
 const SHUTDOWN_TOKEN: u64 = u64::MAX - 1;
@@ -63,6 +63,7 @@ pub struct Server {
     listener: TcpListener,
     slots: FixedVec<Slot>,
     free: FixedVec<u32>,
+    query_workspaces: QueryWorkspaceLeases,
     engine: Engine,
     /// Random key sent in BackendKeyData (16 bytes; protocol 3.0 gets the
     /// first 4). A matching CancelRequest interrupts a parked statement.
@@ -96,6 +97,110 @@ struct Slot {
     want_read: bool,
     want_write: bool,
     pending_response: Option<PendingResponse>,
+}
+
+/// Exclusive ownership of the engine's startup-reserved query workspaces.
+/// The waiting roster is bounded by the connection-slot count and preserves
+/// arrival order when dispatch workers eventually outlive a reactor turn.
+struct QueryWorkspaceLeases {
+    owners: FixedVec<Option<usize>>,
+    waiters: FixedVec<usize>,
+    next: usize,
+}
+
+impl QueryWorkspaceLeases {
+    fn new(
+        budget: &mut Budget,
+        workspace_count: usize,
+        connection_count: usize,
+    ) -> Result<Self, BudgetError> {
+        let mut owners = FixedVec::new(budget, "query_workspace_owners", workspace_count)?;
+        for _ in 0..workspace_count {
+            owners.push(None).expect("sized to query_workspace_slots");
+        }
+        Ok(Self {
+            owners,
+            waiters: FixedVec::new(budget, "query_workspace_waiters", connection_count)?,
+            next: 0,
+        })
+    }
+
+    const fn budget_bytes(workspace_count: usize, connection_count: usize) -> usize {
+        workspace_count * core::mem::size_of::<Option<usize>>()
+            + connection_count * core::mem::size_of::<usize>()
+    }
+
+    fn acquire(&mut self, owner: usize) -> Option<QueryWorkspaceId> {
+        if let Some(workspace) = self.try_acquire(owner) {
+            return Some(workspace);
+        }
+        if !self.waiters.contains(&owner) {
+            self.waiters
+                .push(owner)
+                .expect("one waiter per fixed connection slot");
+        }
+        None
+    }
+
+    fn try_acquire(&mut self, owner: usize) -> Option<QueryWorkspaceId> {
+        if let Some(index) = self
+            .owners
+            .iter()
+            .position(|candidate| *candidate == Some(owner))
+        {
+            return Some(QueryWorkspaceId::from_index(index));
+        }
+        for offset in 0..self.owners.len() {
+            let index = (self.next + offset) % self.owners.len();
+            if self.owners[index].is_none() {
+                self.owners[index] = Some(owner);
+                self.next = (index + 1) % self.owners.len();
+                if let Some(waiter) = self.waiters.iter().position(|waiter| *waiter == owner) {
+                    self.remove_waiter(waiter);
+                }
+                return Some(QueryWorkspaceId::from_index(index));
+            }
+        }
+        None
+    }
+
+    /// Releases `owner` and hands the same workspace to the oldest waiter.
+    fn release(&mut self, owner: usize) -> Option<(usize, QueryWorkspaceId)> {
+        let workspace = self
+            .owners
+            .iter()
+            .position(|candidate| *candidate == Some(owner))?;
+        self.owners[workspace] = None;
+        if self.waiters.is_empty() {
+            return None;
+        }
+        let next_owner = self.waiters[0];
+        self.remove_waiter(0);
+        self.owners[workspace] = Some(next_owner);
+        Some((next_owner, QueryWorkspaceId::from_index(workspace)))
+    }
+
+    fn cancel(&mut self, owner: usize) -> Option<(usize, QueryWorkspaceId)> {
+        if let Some(waiter) = self.waiters.iter().position(|waiter| *waiter == owner) {
+            self.remove_waiter(waiter);
+        }
+        self.release(owner)
+    }
+
+    fn remove_waiter(&mut self, index: usize) {
+        for position in index + 1..self.waiters.len() {
+            self.waiters[position - 1] = self.waiters[position];
+        }
+        self.waiters.pop();
+    }
+
+    fn used(&self) -> usize {
+        self.owners.iter().filter(|owner| owner.is_some()).count()
+    }
+
+    fn waiting(&self) -> usize {
+        self.waiters.len()
+    }
 }
 
 struct OperationsSlot {
@@ -514,6 +619,7 @@ impl Server {
                 + operations_connections,
         ) + 128
             + connections * (core::mem::size_of::<Slot>() + core::mem::size_of::<u32>())
+            + QueryWorkspaceLeases::budget_bytes(config.query_workspace_slots, connections)
             + operations_connections
                 * (core::mem::size_of::<OperationsSlot>()
                     + core::mem::size_of::<u32>()
@@ -597,6 +703,8 @@ impl Server {
 
         let mut slots = FixedVec::new(budget, "conn_slots", max_conns)?;
         let mut free = FixedVec::new(budget, "conn_free_list", max_conns)?;
+        let query_workspaces =
+            QueryWorkspaceLeases::new(budget, config.query_workspace_slots, max_conns)?;
         let mut block_read_fds = FixedVec::new(budget, "block_read_fds", block_read_slots)?;
         let mut subscriptions =
             FixedVec::new(budget, "subscription_workers", config.max_subscriptions)?;
@@ -818,6 +926,7 @@ impl Server {
             listener,
             slots,
             free,
+            query_workspaces,
             engine,
             cancel_key,
             next_conn_id: 1,
@@ -1124,18 +1233,28 @@ impl Server {
         if index >= self.slots.len() {
             return;
         }
-        let slot = &mut self.slots[index];
+        let slot = &self.slots[index];
         if slot.generation != generation || !slot.conn.is_open() {
             // Stale event for a slot that was already recycled.
             return;
         }
-        self.engine.select_query_workspace(slot.conn.id());
         if readable && !publication_ready {
             // Match the per-connection barrier's prior behavior: no command
             // is allowed to run behind an unpublished local commit.
             self.complete_dispatch(index, After::Close);
             return;
         }
+        let workspace = if readable {
+            let Some(workspace) = self.query_workspaces.acquire(index) else {
+                self.park_for_query_workspace(index);
+                return;
+            };
+            self.engine.select_query_workspace(workspace);
+            Some(workspace)
+        } else {
+            None
+        };
+        let slot = &mut self.slots[index];
         let (after, cancel_request) = if readable {
             let pending = slot.conn.on_readable(
                 &mut self.engine,
@@ -1158,11 +1277,65 @@ impl Server {
         } else {
             (Some(After::Continue), None)
         };
+        if workspace.is_some() {
+            self.release_query_workspace(index);
+        }
         if let Some(request) = cancel_request {
             self.cancel(request);
         }
         if let Some(after) = after {
             self.complete_dispatch(index, after);
+        }
+    }
+
+    fn park_for_query_workspace(&mut self, index: usize) {
+        let slot = &mut self.slots[index];
+        if !slot.want_read {
+            return;
+        }
+        let fd = slot.conn.stream().as_raw_fd();
+        let token = token_for(index as u32, slot.generation);
+        match self.reactor.set_read_interest(fd, token, false) {
+            Ok(()) => slot.want_read = false,
+            Err(error) => {
+                log_io("park for query workspace", &error);
+                self.release(index);
+            }
+        }
+    }
+
+    fn release_query_workspace(&mut self, owner: usize) {
+        let handoff = self.query_workspaces.release(owner);
+        self.wake_query_workspace_handoff(handoff);
+    }
+
+    fn wake_query_workspace_handoff(&mut self, mut handoff: Option<(usize, QueryWorkspaceId)>) {
+        while let Some((index, _workspace)) = handoff {
+            if index >= self.slots.len() || !self.slots[index].conn.is_open() {
+                handoff = self.query_workspaces.cancel(index);
+                continue;
+            }
+            if !self.slots[index].conn.wants_read() {
+                handoff = self.query_workspaces.cancel(index);
+                continue;
+            }
+            let slot = &mut self.slots[index];
+            if slot.want_read {
+                return;
+            }
+            let fd = slot.conn.stream().as_raw_fd();
+            let token = token_for(index as u32, slot.generation);
+            match self.reactor.set_read_interest(fd, token, true) {
+                Ok(()) => {
+                    slot.want_read = true;
+                    return;
+                }
+                Err(error) => {
+                    log_io("resume query workspace waiter", &error);
+                    self.release(index);
+                    return;
+                }
+            }
         }
     }
 
@@ -1264,7 +1437,6 @@ impl Server {
                 }
                 {
                     let slot = &mut self.slots[index];
-                    self.engine.select_query_workspace(slot.conn.id());
                     self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
                 }
                 if self.slots[index].conn.terminate_by_administrator() {
@@ -1281,11 +1453,7 @@ impl Server {
             .slots
             .iter()
             .position(|slot| request.matches(slot.conn.id(), &self.cancel_key))
-            && {
-                self.engine
-                    .select_query_workspace(self.slots[index].conn.id());
-                self.slots[index].conn.cancel_parked(&mut self.engine)
-            }
+            && self.slots[index].conn.cancel_parked(&mut self.engine)
         {
             self.sync_write_interest(index);
         }
@@ -1307,7 +1475,6 @@ impl Server {
             if terminate {
                 {
                     let slot = &mut self.slots[index];
-                    self.engine.select_query_workspace(slot.conn.id());
                     self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
                 }
                 if self.slots[index].conn.terminate_by_administrator() {
@@ -2212,6 +2379,10 @@ impl Server {
                 {
                     continue;
                 }
+                let Some(workspace) = self.query_workspaces.try_acquire(index) else {
+                    continue;
+                };
+                self.engine.select_query_workspace(workspace);
                 if let Some(pending) = self.slots[index].conn.retry_parked(
                     &mut self.engine,
                     generation,
@@ -2219,6 +2390,7 @@ impl Server {
                 ) {
                     self.slots[index].pending_response = Some(pending);
                 }
+                self.release_query_workspace(index);
             }
             if self.engine.lock_generation() == generation {
                 break;
@@ -2300,8 +2472,8 @@ impl Server {
         // Every transport exit reaches this choke point. Roll back here so an
         // I/O-interest failure, notification overflow, or replication close
         // cannot strand transaction state or locks.
+        let workspace_handoff = self.query_workspaces.cancel(index);
         let slot = &mut self.slots[index];
-        self.engine.select_query_workspace(slot.conn.id());
         self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
         self.slots[index].conn.stop_replication(&mut self.engine);
         self.engine.drop_connection(self.slots[index].conn.id());
@@ -2328,6 +2500,7 @@ impl Server {
             .expect("released slot cannot exceed capacity");
         self.operations_metrics.postgres_closed =
             self.operations_metrics.postgres_closed.saturating_add(1);
+        self.wake_query_workspace_handoff(workspace_handoff);
     }
 
     fn pump_replication_streams(&mut self) {
@@ -2600,6 +2773,10 @@ pos3ql_postgres_connections {postgres_active}\n\
 pos3ql_postgres_connection_capacity {}\n\
 # TYPE pos3ql_query_workspace_capacity gauge\n\
 pos3ql_query_workspace_capacity {}\n\
+# TYPE pos3ql_query_workspaces_active gauge\n\
+pos3ql_query_workspaces_active {}\n\
+# TYPE pos3ql_query_workspace_waiters gauge\n\
+pos3ql_query_workspace_waiters {}\n\
 # TYPE pos3ql_operational_connections gauge\n\
 pos3ql_operational_connections {operations_active}\n\
 # TYPE pos3ql_postgres_connections_accepted_total counter\n\
@@ -2651,6 +2828,8 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
             snapshot.lsn,
             self.capacity_limits.postgres_connections,
             self.capacity_limits.query_workspace_slots,
+            self.query_workspaces.used(),
+            self.query_workspaces.waiting(),
             self.operations_metrics.postgres_accepted,
             self.operations_metrics.postgres_refused,
             self.operations_metrics.postgres_closed,
@@ -2684,10 +2863,12 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
         let operations_used = limits.operations_connections - self.operations_free.len();
         let _ = writeln!(
             out,
-            "{{\"memory\":{{\"core_budget_bytes\":{},\"tls_budget_bytes\":{}}},\"postgres_connections\":{{\"used\":{postgres_used},\"limit\":{}}},\"query_workspace_slots\":{{\"limit\":{}}},\"operational_connections\":{{\"used\":{operations_used},\"limit\":{}}},\"wal_bytes\":{{\"used\":{},\"limit\":{}}},\"row_heap_bytes\":{{\"used\":{},\"limit\":{}}},\"cache_bytes\":{{\"memory_limit\":{},\"disk_limit\":{}}},\"temporary_spill_bytes\":{{\"limit\":{}}},\"catalog_limits\":{{\"tables\":{},\"indexes\":{},\"databases\":{},\"schemas\":{},\"roles\":{}}},\"prepared_transaction_limit\":{},\"replication_slot_limit\":{},\"subscription_limit\":{},\"object_store\":{},\"credential_rotation\":{}}}",
+            "{{\"memory\":{{\"core_budget_bytes\":{},\"tls_budget_bytes\":{}}},\"postgres_connections\":{{\"used\":{postgres_used},\"limit\":{}}},\"query_workspace_slots\":{{\"used\":{},\"waiting\":{},\"limit\":{}}},\"operational_connections\":{{\"used\":{operations_used},\"limit\":{}}},\"wal_bytes\":{{\"used\":{},\"limit\":{}}},\"row_heap_bytes\":{{\"used\":{},\"limit\":{}}},\"cache_bytes\":{{\"memory_limit\":{},\"disk_limit\":{}}},\"temporary_spill_bytes\":{{\"limit\":{}}},\"catalog_limits\":{{\"tables\":{},\"indexes\":{},\"databases\":{},\"schemas\":{},\"roles\":{}}},\"prepared_transaction_limit\":{},\"replication_slot_limit\":{},\"subscription_limit\":{},\"object_store\":{},\"credential_rotation\":{}}}",
             self.memory_reserved_bytes,
             limits.tls_budget_bytes,
             limits.postgres_connections,
+            self.query_workspaces.used(),
+            self.query_workspaces.waiting(),
             limits.query_workspace_slots,
             limits.operations_connections,
             snapshot.wal_used_bytes,
@@ -3069,8 +3250,9 @@ mod tests {
 
     use super::{
         HttpRequestError, OPERATIONS_REQUEST_BYTES, OPERATIONS_RESPONSE_BYTES, OperationsEndpoint,
-        OperationsSlot, Server, SubscriptionBinding, SubscriptionBootstrapStage,
-        SubscriptionBootstrapWork, bind_listener, parse_operations_request,
+        OperationsSlot, QueryWorkspaceLeases, Server, SubscriptionBinding,
+        SubscriptionBootstrapStage, SubscriptionBootstrapWork, bind_listener,
+        parse_operations_request,
     };
 
     fn discovery_row<'a>(
@@ -3300,6 +3482,49 @@ mod tests {
         assert_eq!(
             Server::budget_bytes(&enabled) - Server::budget_bytes(&disabled),
             expected
+        );
+    }
+
+    #[test]
+    fn query_workspace_leases_are_bounded_exclusive_and_fifo() {
+        let bytes = QueryWorkspaceLeases::budget_bytes(2, 4);
+        let mut budget = crate::mem::budget::Budget::new(bytes);
+        let mut leases = QueryWorkspaceLeases::new(&mut budget, 2, 4).unwrap();
+        assert_eq!(budget.remaining(), 0);
+
+        crate::mem::guard::forbid_alloc(|| {
+            let first = leases.acquire(0).unwrap();
+            let second = leases.acquire(1).unwrap();
+            assert_ne!(first, second);
+            assert_eq!(leases.acquire(0), Some(first));
+            assert_eq!(leases.acquire(2), None);
+            assert_eq!(leases.acquire(2), None);
+            assert_eq!(leases.acquire(3), None);
+            assert_eq!(leases.used(), 2);
+            assert_eq!(leases.waiting(), 2);
+
+            assert_eq!(leases.release(0), Some((2, first)));
+            assert_eq!(leases.acquire(2), Some(first));
+            assert_eq!(leases.waiting(), 1);
+            assert_eq!(leases.cancel(2), Some((3, first)));
+            assert_eq!(leases.acquire(3), Some(first));
+            assert_eq!(leases.waiting(), 0);
+            assert_eq!(leases.release(1), None);
+            assert_eq!(leases.release(3), None);
+            assert_eq!(leases.used(), 0);
+        });
+    }
+
+    #[test]
+    fn query_workspace_lease_memory_is_charged_exactly() {
+        let mut smaller = crate::config::Config::default_dev();
+        smaller.max_connections = 8;
+        smaller.query_workspace_slots = 1;
+        let mut larger = smaller.clone();
+        larger.query_workspace_slots = 5;
+        assert_eq!(
+            Server::budget_bytes(&larger) - Server::budget_bytes(&smaller),
+            4 * core::mem::size_of::<Option<usize>>()
         );
     }
 

@@ -34,10 +34,10 @@ pub struct Config {
     pub data_dir: String,
     /// Fixed number of client connection slots.
     pub max_connections: u32,
-    /// Startup-reserved query arenas and DML scratch buffers. Connections are
-    /// mapped deterministically onto these slots; one is the current serialized
-    /// execution topology, while larger values reserve private state for the
-    /// configured slot range.
+    /// Startup-reserved query arenas and DML scratch buffers. The dispatcher
+    /// leases these slots exclusively with bounded FIFO backpressure; one is
+    /// the current serialized execution topology, while larger values reserve
+    /// private state for the configured worker range.
     pub query_workspace_slots: usize,
     /// Authentication: trust | password | md5 | scram-sha-256.
     pub auth: String,

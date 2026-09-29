@@ -557,6 +557,13 @@ resolves the same namespace. Locale transfer is confined to its owned wrapper.
 A live engine now moves to another operating-system thread, executes SQL, and
 drops there in the test suite. This establishes single-owner transfer; shared
 engine mutation remains the next fixed-worker boundary in PLAN.md.
+The search-path audit found that Storage still held one mutable effective path
+for all name resolution. Concurrent workers could therefore redirect each
+other between schemas. The effective path now lives in fixed thread-local
+execution state, is published at each statement boundary, and is swapped and
+restored locally for nested view and schema execution. Cross-thread isolation,
+ordinary path resolution, durable stored-query identity, and live engine
+transfer retain direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

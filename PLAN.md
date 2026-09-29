@@ -320,6 +320,15 @@ owner at a time and reactor-serialized. Fixed workers still require shared
 catalog, cache, lock, foreign transport, and statistics state to be partitioned
 or synchronized before dispatch can overlap.
 
+The effective SQL search path is now worker private. Every statement publishes
+the path computed from its session settings into fixed thread-local execution
+state, while view and schema-qualified nested execution swap and restore that
+same worker's value. Storage no longer carries a shared mutable path that one
+worker could change during another worker's name resolution. Cross-thread
+isolation and live engine transfer retain direct regressions. Catalog, cache,
+lock, foreign transport, and statistics ownership remain the shared mutation
+boundaries before fixed workers can execute concurrently.
+
 ### Performance qualification
 
 The [256-row](benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)

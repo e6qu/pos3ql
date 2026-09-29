@@ -117,9 +117,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   checkpoint and spill block stores, external-run readers, the deterministic
   process-wide object-store namespace, and the owned POSIX locale all have
   explicit transfer-safe ownership. A live-engine test executes SQL after
-  moving the owner to another thread. Engine mutation remains single-owner and
-  serialized while catalog, cache, lock, foreign transport, and statistics
-  sharing is prepared.
+  moving the owner to another thread. Effective SQL search paths are fixed
+  thread-local execution state published at statement boundaries; nested view
+  and schema execution swap and restore only the current worker's value. Engine
+  mutation remains single-owner and serialized while catalog, cache, lock,
+  foreign transport, and statistics sharing is prepared.
 - Streamed COPY transition rows are retained in fixed connection-private and
   subscription-worker-private buffers. Interleaved streams preserve the exact
   row set for statement transition triggers without runtime allocation.

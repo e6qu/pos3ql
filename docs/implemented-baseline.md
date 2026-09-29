@@ -96,6 +96,9 @@ active production roadmap is [PLAN.md](../PLAN.md).
   `query_workspace_slots`, charged exactly in the fixed memory plan, selected
   by stable connection identity, and reported by the operational listener.
   Statement execution remains serialized while worker dispatch is developed.
+- Streamed COPY transition rows are retained in fixed connection-private and
+  subscription-worker-private buffers. Interleaved streams preserve the exact
+  row set for statement transition triggers without runtime allocation.
 - Checkpoint, merge, pending-install, and temporary-spill bookkeeping sized from
   the configured physical-table capacity rather than a 1,024-slot ceiling.
   Above-boundary tables, dropped identities, fresh replacement slots, repeated

@@ -269,9 +269,14 @@ The global execution arena is now a startup-bounded set selected by stable
 connection identity. `query_workspace_slots` charges every `work_arena_bytes`
 reservation in the memory plan, rejects zero or more slots than connection
 capacity, and exposes the configured count through metrics and capacity JSON.
+Streamed COPY transition rows are connection private, and logical subscription
+bootstrap workers own the same fixed state independently. Interleaved client
+streams therefore cannot clear or mix the row set observed by statement-level
+transition triggers; every buffer is charged from `txn_rows` at startup.
 The current reactor still serializes statement execution. Moving execution
-onto those private slots must retain the existing transaction retry, object I/O
-parking, group publication, and response barriers before any scaling claim.
+onto those private slots still requires worker-private ordinary DML scratch and
+must retain the existing transaction retry, object I/O parking, group
+publication, and response barriers before any scaling claim.
 
 ### Performance qualification
 

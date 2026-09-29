@@ -265,10 +265,6 @@ pub struct Engine {
     /// checkpoint sort entries because a logical partitioned relation needs
     /// its leaf owner alongside the row identifier.
     dml_scratch: exec::DmlScratch,
-    /// Physical images inserted by the active streamed COPY statement. This
-    /// stays separate from trigger DML scratch so nested trigger statements
-    /// cannot erase the AFTER STATEMENT transition relation.
-    copy_transition_scratch: exec::DmlScratch,
     /// Scratch for heap compaction: every live row image across tables.
     compact_scratch: FixedVec<(u32, u64, crate::storage::RowHeapImage, RowLoc)>,
     /// Startup-bounded slot-private execution arenas. The reactor still
@@ -332,6 +328,33 @@ pub(crate) struct CursorStatementContext<'a, 'response> {
     pub cursors: &'a mut cursor::CursorPool,
     pub guc: &'a GucState,
     pub responder: &'a mut Responder<'response>,
+}
+
+/// Mutable session state used while ingesting one streamed COPY row.
+pub struct CopyRowContext<'a, 'response> {
+    txn: &'a mut TxnState,
+    seq_session: &'a guc::SeqSession,
+    arena: &'a Arena,
+    responder: &'a mut Responder<'response>,
+    transition_rows: &'a mut exec::DmlScratch,
+}
+
+impl<'a, 'response> CopyRowContext<'a, 'response> {
+    pub fn new(
+        txn: &'a mut TxnState,
+        seq_session: &'a guc::SeqSession,
+        arena: &'a Arena,
+        responder: &'a mut Responder<'response>,
+        transition_rows: &'a mut exec::DmlScratch,
+    ) -> Self {
+        Self {
+            txn,
+            seq_session,
+            arena,
+            responder,
+            transition_rows,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2861,7 +2884,7 @@ impl Engine {
     pub fn extra_budget_bytes(config: &Config) -> usize {
         Storage::extra_budget_bytes(config)
             + exec::record_shape_pool_bytes(config.max_composites)
-            + 2 * config.table_rows * size_of::<exec::PhysicalRow>()
+            + config.table_rows * size_of::<exec::PhysicalRow>()
             + crate::storage::row_heap_image_capacity(config).saturating_mul(size_of::<(
                 u32,
                 u64,
@@ -3164,11 +3187,6 @@ impl Engine {
             wal_seg_buf: Vec::with_capacity(upload_buf),
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
             dml_scratch: FixedVec::new(budget, "dml_scratch", config.table_rows)?,
-            copy_transition_scratch: FixedVec::new(
-                budget,
-                "copy_transition_scratch",
-                config.table_rows,
-            )?,
             compact_scratch: FixedVec::new(
                 budget,
                 "compact_scratch",
@@ -8444,22 +8462,19 @@ impl Engine {
     pub fn copy_row_line(
         &mut self,
         setup: &exec::CopySetup,
-        txn: &mut TxnState,
-        seq_session: &guc::SeqSession,
-        arena: &Arena,
-        responder: &mut Responder,
         line: &[u8],
+        context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
         exec::copy_row(
             &mut self.storage,
-            txn,
-            seq_session,
+            context.txn,
+            context.seq_session,
             setup,
             line,
-            arena,
-            responder,
+            context.arena,
+            context.responder,
             &mut self.dml_scratch,
-            &mut self.copy_transition_scratch,
+            context.transition_rows,
         )
     }
 
@@ -8478,22 +8493,19 @@ impl Engine {
     pub fn copy_row_binary(
         &mut self,
         setup: &exec::CopySetup,
-        txn: &mut TxnState,
-        seq_session: &guc::SeqSession,
-        arena: &Arena,
-        responder: &mut Responder,
         row: &[u8],
+        context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
         exec::copy_row_binary(
             &mut self.storage,
-            txn,
-            seq_session,
+            context.txn,
+            context.seq_session,
             setup,
             row,
-            arena,
-            responder,
+            context.arena,
+            context.responder,
             &mut self.dml_scratch,
-            &mut self.copy_transition_scratch,
+            context.transition_rows,
         )
     }
 
@@ -8505,7 +8517,6 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
-        self.copy_transition_scratch.clear();
         exec::copy_statement_begin(
             &mut self.storage,
             txn,
@@ -8536,6 +8547,7 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
         responder: &mut Responder,
+        inserted: &exec::DmlScratch,
     ) -> Result<(), SqlError> {
         self.work.reset();
         exec::copy_statement_end(
@@ -8546,7 +8558,7 @@ impl Engine {
             &self.work,
             responder,
             &mut self.dml_scratch,
-            &self.copy_transition_scratch,
+            inserted,
         )?;
         exec::constraints::validate_deferred_constraints(&self.storage, txn, true, &self.work)?;
         exec::fire_constraint_triggers(

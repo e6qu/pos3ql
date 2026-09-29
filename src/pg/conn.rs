@@ -388,6 +388,9 @@ pub struct Conn {
     copy: Option<CopyInProgress>,
     /// Staging for one COPY data row (rows split across CopyData messages).
     copy_buf: FixedBuf,
+    /// Rows inserted by this connection's active COPY statement. Statement
+    /// transition tables retain this state across interleaved reactor turns.
+    copy_transition_scratch: crate::sql::exec::DmlScratch,
     prepared: Vec<Prepared>,
     portals: Vec<Portal>,
     phase: Phase,
@@ -490,6 +493,11 @@ impl Conn {
             )?,
             copy: None,
             copy_buf: FixedBuf::new(budget, "copy_line", config.copy_line_bytes)?,
+            copy_transition_scratch: FixedVec::new(
+                budget,
+                "copy_transition_scratch",
+                config.txn_rows,
+            )?,
             prepared,
             portals,
             phase: Phase::Startup,
@@ -544,6 +552,7 @@ impl Conn {
         self.replication_publications.clear();
         self.copy = None;
         self.copy_buf.clear();
+        self.copy_transition_scratch.clear();
         self.phase = Phase::Startup;
         self.minor = 0;
         self.id = id;
@@ -1939,6 +1948,7 @@ impl Conn {
                 let detail = crate::stack_format!(256, "COPY from stdin failed: {message}");
                 let extended = self.copy.as_ref().expect("in copy-in mode").extended;
                 engine.copy_abort(&mut self.txn, &self.guc);
+                self.copy_transition_scratch.clear();
                 self.copy = None;
                 self.copy_buf.clear();
                 engine.finish_backend_statement(&self.txn, self.id);
@@ -1964,6 +1974,7 @@ impl Conn {
             _ => {
                 let extended = self.copy.as_ref().expect("in copy-in mode").extended;
                 engine.copy_abort(&mut self.txn, &self.guc);
+                self.copy_transition_scratch.clear();
                 self.copy = None;
                 self.copy_buf.clear();
                 let mut responder = Responder::new(&mut self.send);
@@ -2305,11 +2316,14 @@ impl Conn {
                         let mut responder = Responder::new(&mut self.send);
                         engine.copy_row_line(
                             &copy.setup,
-                            &mut self.txn,
-                            self.guc.seq_session(),
-                            &self.arena,
-                            &mut responder,
                             line,
+                            crate::sql::CopyRowContext::new(
+                                &mut self.txn,
+                                self.guc.seq_session(),
+                                &self.arena,
+                                &mut responder,
+                                &mut self.copy_transition_scratch,
+                            ),
                         )
                     };
                     match outcome {
@@ -2391,11 +2405,14 @@ impl Conn {
                             let mut responder = Responder::new(&mut self.send);
                             engine.copy_row_binary(
                                 &copy.setup,
-                                &mut self.txn,
-                                self.guc.seq_session(),
-                                &self.arena,
-                                &mut responder,
                                 row,
+                                crate::sql::CopyRowContext::new(
+                                    &mut self.txn,
+                                    self.guc.seq_session(),
+                                    &self.arena,
+                                    &mut responder,
+                                    &mut self.copy_transition_scratch,
+                                ),
                             )
                         };
                         match outcome {
@@ -2443,11 +2460,14 @@ impl Conn {
                     let mut responder = Responder::new(&mut self.send);
                     engine.copy_row_line(
                         &copy.setup,
-                        &mut self.txn,
-                        self.guc.seq_session(),
-                        &self.arena,
-                        &mut responder,
                         line,
+                        crate::sql::CopyRowContext::new(
+                            &mut self.txn,
+                            self.guc.seq_session(),
+                            &self.arena,
+                            &mut responder,
+                            &mut self.copy_transition_scratch,
+                        ),
                     )
                 };
                 match outcome {
@@ -2468,10 +2488,17 @@ impl Conn {
             None => {
                 let mut responder = Responder::new(&mut self.send);
                 engine
-                    .copy_finish(&copy.setup, &mut self.txn, &self.guc, &mut responder)
+                    .copy_finish(
+                        &copy.setup,
+                        &mut self.txn,
+                        &self.guc,
+                        &mut responder,
+                        &self.copy_transition_scratch,
+                    )
                     .map(|()| copy.count)
             }
         };
+        self.copy_transition_scratch.clear();
         let failed = outcome.is_err();
         engine.finish_backend_statement(&self.txn, self.id);
         let mut responder = Responder::new(&mut self.send);
@@ -3255,6 +3282,7 @@ impl Conn {
                     engine.finish_backend_statement(&self.txn, self.id);
                     if pending_copy.is_some() {
                         engine.copy_abort(&mut self.txn, &self.guc);
+                        self.copy_transition_scratch.clear();
                     }
                     if paged {
                         // Forward the buffered error output.
@@ -3282,6 +3310,7 @@ impl Conn {
                 Err(WireFull) => {
                     if pending_copy.is_some() {
                         engine.copy_abort(&mut self.txn, &self.guc);
+                        self.copy_transition_scratch.clear();
                     }
                     return Step::Close;
                 }
@@ -3293,11 +3322,13 @@ impl Conn {
                     portal.result.clear();
                     if !bytes_ok {
                         engine.copy_abort(&mut self.txn, &self.guc);
+                        self.copy_transition_scratch.clear();
                         return Step::Close;
                     }
                 }
                 let header_pending = !matches!(setup.fmt.header, crate::sql::ast::CopyHeader::None);
                 let binary_header_pending = setup.fmt.binary;
+                self.copy_transition_scratch.clear();
                 self.copy = Some(CopyInProgress {
                     setup,
                     count: 0,
@@ -3492,6 +3523,7 @@ impl Conn {
                     let header_pending =
                         !matches!(setup.fmt.header, crate::sql::ast::CopyHeader::None);
                     let binary_header_pending = setup.fmt.binary;
+                    self.copy_transition_scratch.clear();
                     self.copy = Some(CopyInProgress {
                         setup,
                         count: 0,
@@ -3530,6 +3562,7 @@ impl Conn {
             Err(WireFull) => {
                 if engine.take_pending_copy().is_some() {
                     engine.copy_abort(&mut self.txn, &self.guc);
+                    self.copy_transition_scratch.clear();
                 }
                 let mut responder = Responder::new(&mut self.send);
                 let recovered = responder
@@ -6078,6 +6111,16 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| connection.guc.reset_session_state());
         assert_eq!(connection.guc.seq_session().currval(79, 11), None);
         assert_eq!(connection.guc.seq_session().lastval(), None);
+    }
+
+    #[test]
+    fn connection_copy_transition_state_uses_transaction_row_capacity() {
+        let mut config = Config::default_dev();
+        config.txn_rows = 37;
+        let mut budget = Budget::new(256 << 20);
+        let connection = Conn::new(&config, &mut budget).expect("connection budget");
+        assert_eq!(connection.copy_transition_scratch.capacity(), 37);
+        assert!(connection.copy_transition_scratch.is_empty());
     }
 
     #[test]

@@ -202,6 +202,7 @@ pub struct SubscriptionApply {
     arena: Arena,
     trigger_response: FixedBuf,
     trigger_scratch: crate::sql::exec::DmlScratch,
+    copy_transition_scratch: crate::sql::exec::DmlScratch,
     remote: RemoteTransaction,
     confirmed_lsn: u64,
     behavior: crate::storage::SubscriptionBehavior,
@@ -214,7 +215,7 @@ impl SubscriptionApply {
             + GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction)
             + config.subscription_arena_bytes
             + TRIGGER_RESPONSE_BYTES
-            + config.txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>()
+            + 2 * config.txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>()
             + crate::sql::guc::SeqSession::extra_budget_bytes(config.max_sequences)
     }
 
@@ -247,6 +248,11 @@ impl SubscriptionApply {
             trigger_scratch: FixedVec::new(
                 budget,
                 "subscription_trigger_scratch",
+                config.txn_rows,
+            )?,
+            copy_transition_scratch: FixedVec::new(
+                budget,
+                "subscription_copy_transition_scratch",
                 config.txn_rows,
             )?,
             remote: RemoteTransaction::Idle,
@@ -321,6 +327,7 @@ impl SubscriptionApply {
         columns: &[crate::storage::SqlName],
     ) -> Result<crate::sql::exec::CopySetup, SqlError> {
         let setup = engine.subscription_copy_setup(schema, table, columns, self.txn.txid)?;
+        self.copy_transition_scratch.clear();
         self.trigger_response.clear();
         let mut responder = Responder::new(&mut self.trigger_response);
         engine.copy_start(
@@ -345,11 +352,14 @@ impl SubscriptionApply {
         let result = engine
             .copy_row_line(
                 setup,
-                &mut self.txn,
-                self.guc.seq_session(),
-                &self.arena,
-                &mut responder,
                 line,
+                crate::sql::CopyRowContext::new(
+                    &mut self.txn,
+                    self.guc.seq_session(),
+                    &self.arena,
+                    &mut responder,
+                    &mut self.copy_transition_scratch,
+                ),
             )
             .map(|_| ());
         unsafe { self.arena.rewind_to(mark) };
@@ -368,11 +378,14 @@ impl SubscriptionApply {
         let result = engine
             .copy_row_binary(
                 setup,
-                &mut self.txn,
-                self.guc.seq_session(),
-                &self.arena,
-                &mut responder,
                 row,
+                crate::sql::CopyRowContext::new(
+                    &mut self.txn,
+                    self.guc.seq_session(),
+                    &self.arena,
+                    &mut responder,
+                    &mut self.copy_transition_scratch,
+                ),
             )
             .map(|_| ());
         unsafe { self.arena.rewind_to(mark) };
@@ -386,7 +399,15 @@ impl SubscriptionApply {
     ) -> Result<(), SqlError> {
         self.trigger_response.clear();
         let mut responder = Responder::new(&mut self.trigger_response);
-        engine.copy_finish(setup, &mut self.txn, &self.guc, &mut responder)
+        let result = engine.copy_finish(
+            setup,
+            &mut self.txn,
+            &self.guc,
+            &mut responder,
+            &self.copy_transition_scratch,
+        );
+        self.copy_transition_scratch.clear();
+        result
     }
 
     pub(crate) fn finish_bootstrap(
@@ -429,6 +450,7 @@ impl SubscriptionApply {
         self.arena.reset();
         self.trigger_response.clear();
         self.trigger_scratch.clear();
+        self.copy_transition_scratch.clear();
         Ok(())
     }
 
@@ -441,6 +463,7 @@ impl SubscriptionApply {
         self.arena.reset();
         self.trigger_response.clear();
         self.trigger_scratch.clear();
+        self.copy_transition_scratch.clear();
     }
 
     /// Stops a worker at a transport boundary.  Losing a publisher connection
@@ -460,6 +483,7 @@ impl SubscriptionApply {
         }
         self.remote = RemoteTransaction::Idle;
         self.arena.reset();
+        self.copy_transition_scratch.clear();
     }
 
     fn require_message_xid(&self, xid: Option<u32>) -> Result<(), SqlError> {

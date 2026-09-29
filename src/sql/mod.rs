@@ -200,6 +200,46 @@ pub(crate) struct ReplicationEmission<'a> {
     pub protocol: crate::pg::pgoutput::ProtocolVersion,
 }
 
+struct QueryWorkspaces {
+    slots: FixedVec<Arena>,
+    active: usize,
+}
+
+impl QueryWorkspaces {
+    fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+        let mut slots = FixedVec::new(budget, "query_workspaces", config.query_workspace_slots)?;
+        for _ in 0..config.query_workspace_slots {
+            slots
+                .push(Arena::new(
+                    budget,
+                    "query_workspace_arena",
+                    config.work_arena_bytes,
+                )?)
+                .expect("sized to query_workspace_slots");
+        }
+        Ok(Self { slots, active: 0 })
+    }
+
+    fn select_for_connection(&mut self, connection: i32) {
+        let connection = usize::try_from(connection).unwrap_or(0);
+        self.active = connection % self.slots.len();
+    }
+}
+
+impl core::ops::Deref for QueryWorkspaces {
+    type Target = Arena;
+
+    fn deref(&self) -> &Self::Target {
+        &self.slots[self.active]
+    }
+}
+
+impl core::ops::DerefMut for QueryWorkspaces {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slots[self.active]
+    }
+}
+
 /// The query engine: catalog, memtable storage, WAL, object-storage
 /// checkpointing, and statement execution.
 pub struct Engine {
@@ -231,12 +271,11 @@ pub struct Engine {
     copy_transition_scratch: exec::DmlScratch,
     /// Scratch for heap compaction: every live row image across tables.
     compact_scratch: FixedVec<(u32, u64, crate::storage::RowHeapImage, RowLoc)>,
-    /// Shared execution arena: one query's materialized rows (ORDER BY /
-    /// DISTINCT / GROUP BY buffers) live here, separate from the small
-    /// per-connection AST arena. Single-threaded execution means one
-    /// instance serves every connection; reset at the start of each
-    /// statement. This is the `work_mem` analogue.
-    work: Arena,
+    /// Startup-bounded slot-private execution arenas. The reactor still
+    /// serializes execution, but statements no longer depend on one global
+    /// workspace identity; worker parallelism can use these slots without
+    /// introducing runtime allocation.
+    work: QueryWorkspaces,
     next_txid: u32,
     max_connections: u32,
     max_prepared_transactions: usize,
@@ -2047,6 +2086,13 @@ fn cursor_result_too_large() -> SqlError {
 }
 
 impl Engine {
+    /// Selects the startup-reserved query workspace assigned to one client.
+    /// Protocol continuations such as COPY and connection teardown enter
+    /// outside the ordinary statement execution methods.
+    pub(crate) fn select_query_workspace(&mut self, connection: i32) {
+        self.work.select_for_connection(connection);
+    }
+
     pub(crate) fn operational_snapshot(&self) -> OperationalSnapshot {
         OperationalSnapshot {
             lsn: self.storage.lsn(),
@@ -2822,7 +2868,9 @@ impl Engine {
                 crate::storage::RowHeapImage,
                 RowLoc,
             )>())
-            + config.work_arena_bytes
+            + config
+                .query_workspace_slots
+                .saturating_mul(config.work_arena_bytes.saturating_add(size_of::<Arena>()))
             + config.wal_buffer_bytes
             + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
             + config.max_connections as usize * config.wal_buffer_bytes
@@ -3104,6 +3152,7 @@ impl Engine {
                 .push(EMPTY_PENDING_TRUNCATE)
                 .expect("sized to max_ddl_per_transaction");
         }
+        let work = QueryWorkspaces::new(config, budget)?;
         Ok(Self {
             storage,
             wal,
@@ -3125,7 +3174,7 @@ impl Engine {
                 "compact_scratch",
                 crate::storage::row_heap_image_capacity(config),
             )?,
-            work: Arena::new(budget, "work_arena", config.work_arena_bytes)?,
+            work,
             next_txid: recovered_transaction_id,
             max_connections: config.max_connections,
             max_prepared_transactions: config.max_prepared_transactions,
@@ -8721,6 +8770,7 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
+        self.select_query_workspace(conn_id);
         self.current_conn_id = conn_id;
         self.storage.set_current_connection_id(conn_id);
         let mut parser = match Parser::new(text, arena) {
@@ -8949,6 +8999,7 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         let _parameter_types = exec::enter_bound_parameter_types(parameter_type_oids);
+        self.select_query_workspace(conn_id);
         self.current_conn_id = conn_id;
         self.storage.set_current_connection_id(conn_id);
         let mut parser = match Parser::new(text, arena) {

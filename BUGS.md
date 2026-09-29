@@ -495,6 +495,10 @@ manifest capacity through its compact writer field.
 The release-package scenario pauses a primary, automatically starts a
 candidate, verifies empty-cache recovery, resumes the old connected session,
 and observes SQLSTATE `40001` before clean shutdown.
+The query-workspace audit found no external blocker. The former single arena is
+now an exact startup-sized slot set with stable connection selection; zero and
+over-connection configurations fail before startup. Allocation-free slot
+isolation, memory-plan charging, and operational capacity reporting are covered.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

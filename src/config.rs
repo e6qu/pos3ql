@@ -34,6 +34,11 @@ pub struct Config {
     pub data_dir: String,
     /// Fixed number of client connection slots.
     pub max_connections: u32,
+    /// Startup-reserved query execution workspaces. Connections are mapped
+    /// deterministically onto these slots; one is the current serialized
+    /// execution topology, while larger values reserve private state for the
+    /// configured slot range.
+    pub query_workspace_slots: usize,
     /// Authentication: trust | password | md5 | scram-sha-256.
     pub auth: String,
     /// Initial `postgres` role credential for password, MD5, or SCRAM authentication.
@@ -51,12 +56,10 @@ pub struct Config {
     /// rows and their fixed-width `TableDef` values are statement-owned, so a
     /// single such query legitimately draws several MiB.
     pub sql_arena_bytes: usize,
-    /// Shared execution arena for materializing a single query's rows
-    /// (ORDER BY / DISTINCT / GROUP BY buffers). Single-threaded execution
-    /// means one instance serves every connection; reset after each
-    /// statement. This is pos3ql's analogue of PostgreSQL's `work_mem`: a
-    /// sort or hash aggregate that exceeds it errors (54000) rather than
-    /// spilling to temporary files.
+    /// Bytes in each query workspace for materializing one query's rows
+    /// (ORDER BY / DISTINCT / GROUP BY buffers). This is pos3ql's analogue of
+    /// PostgreSQL's `work_mem`: a sort or hash aggregate that exceeds its
+    /// selected workspace errors (54000) rather than growing at runtime.
     pub work_arena_bytes: usize,
     /// Prepared-statement slots in each connection's wire and SQL pools.
     pub max_prepared: usize,
@@ -355,6 +358,7 @@ impl Config {
             log_format: LogFormat::Text,
             data_dir: "./data".to_string(),
             max_connections: 64,
+            query_workspace_slots: 1,
             auth: "trust".to_string(),
             password: String::new(),
             conn_recv_buffer_bytes: 64 * KIB,
@@ -586,6 +590,10 @@ impl Config {
                 "max_connections" => {
                     config.max_connections =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "query_workspace_slots" => {
+                    config.query_workspace_slots =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_replication_slots" => {
                     config.max_replication_slots =
@@ -1221,6 +1229,14 @@ impl Config {
                 0,
                 "operations_max_connections must be at least 1 when the operational listener is enabled"
                     .to_string(),
+            ));
+        }
+        if config.query_workspace_slots == 0
+            || config.query_workspace_slots > config.max_connections as usize
+        {
+            return Err(ConfigError::at(
+                0,
+                "query_workspace_slots must be between 1 and max_connections".to_string(),
             ));
         }
         // Server TLS needs a certificate and a key: refuse a half-configured
@@ -1865,6 +1881,7 @@ mod tests {
 # development overrides
 listen_addr = 0.0.0.0:5432
 max_connections = 128
+query_workspace_slots = 7
 max_ddl_per_transaction = 192
 max_catalog_versions_per_object = 24
 max_row_versions_per_row = 25
@@ -1905,6 +1922,7 @@ sql_arena_bytes = 4096
         let c = Config::parse(text).unwrap();
         assert_eq!(c.listen_addr, "0.0.0.0:5432");
         assert_eq!(c.max_connections, 128);
+        assert_eq!(c.query_workspace_slots, 7);
         assert_eq!(c.max_ddl_per_transaction, 192);
         assert_eq!(c.max_catalog_versions_per_object, 24);
         assert_eq!(c.max_row_versions_per_row, 25);
@@ -1984,6 +2002,26 @@ sql_arena_bytes = 4096
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn query_workspace_slots_are_bounded_by_connection_capacity() {
+        assert_eq!(
+            Config::parse("query_workspace_slots = 4\n")
+                .unwrap()
+                .query_workspace_slots,
+            4
+        );
+        for text in [
+            "query_workspace_slots = 0\n",
+            "max_connections = 2\nquery_workspace_slots = 3\n",
+        ] {
+            let error = Config::parse(text).unwrap_err();
+            assert_eq!(
+                error.message,
+                "query_workspace_slots must be between 1 and max_connections"
+            );
+        }
     }
 
     #[test]

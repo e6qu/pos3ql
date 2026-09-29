@@ -10,7 +10,10 @@ JSON. `tools/benchmark-report.py` derives a report from those raw files.
 
 - One server process owns one writable database state and
   serializes query execution. Startup-sized pools bound memory and make
-  saturation an explicit error.
+  saturation an explicit error. `query_workspace_slots` reserves independent
+  execution arenas and maps each connection to a stable slot; the current
+  reactor still executes one statement at a time, so additional slots provide
+  state isolation and memory accounting rather than a throughput claim.
 - Object storage is durable; memory and local disk are disposable caches.
   Immutable journal batches and a compare-and-swap commit head are published
   before success reaches a client.

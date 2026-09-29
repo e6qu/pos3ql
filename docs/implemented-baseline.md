@@ -92,6 +92,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   writer-fence ownership, and a resumed primary rejects durable publication.
   Promotion retags both mutable roots with the new process incarnation, which
   also fences providers whose ETags are derived from object content.
+- Query execution work arenas are startup-bounded by
+  `query_workspace_slots`, charged exactly in the fixed memory plan, selected
+  by stable connection identity, and reported by the operational listener.
+  Statement execution remains serialized while worker dispatch is developed.
 - Checkpoint, merge, pending-install, and temporary-spill bookkeeping sized from
   the configured physical-table capacity rather than a 1,024-slot ceiling.
   Above-boundary tables, dropped identities, fresh replacement slots, repeated

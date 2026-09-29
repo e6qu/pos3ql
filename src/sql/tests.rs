@@ -10629,6 +10629,10 @@ fn run_with_ddl_capacity(
     buffer.readable().to_vec()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper mirrors COPY row execution"
+)]
 fn copy_line(
     engine: &mut Engine,
     budget: &mut Budget,
@@ -10648,6 +10652,10 @@ fn copy_line(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper mirrors COPY row execution"
+)]
 fn copy_binary_row(
     engine: &mut Engine,
     budget: &mut Budget,

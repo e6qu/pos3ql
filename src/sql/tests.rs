@@ -61,7 +61,7 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     let mut dml_workspaces = DmlWorkspaces::new(&config, &mut budget).unwrap();
     assert_eq!(budget.remaining(), 0);
 
-    dml_workspaces.select(QueryWorkspaceId::from_index(0));
+    workspaces.select(QueryWorkspaceId::from_index(0));
     dml_workspaces
         .push(exec::PhysicalRow::Local {
             table_index: 1,
@@ -76,33 +76,39 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     assert_eq!(dml_workspaces.len(), 1);
     assert_eq!(dml_workspaces.capacity(), config.table_rows);
 
-    dml_workspaces.select(QueryWorkspaceId::from_index(1));
+    workspaces.select(QueryWorkspaceId::from_index(1));
     assert!(dml_workspaces.is_empty());
-    dml_workspaces.select(QueryWorkspaceId::from_index(0));
+    workspaces.select(QueryWorkspaceId::from_index(0));
     assert_eq!(dml_workspaces.len(), 1);
-    dml_workspaces.select(QueryWorkspaceId::from_index(2));
+    workspaces.select(QueryWorkspaceId::from_index(2));
     assert!(dml_workspaces.is_empty());
 }
 
 #[test]
 fn execution_identity_is_thread_private() {
+    set_execution_query_workspace(QueryWorkspaceId::from_index(1));
     set_execution_connection_id(41);
     set_execution_database_oid(crate::storage::DatabaseOid::parse(16_384).unwrap());
     std::thread::spawn(|| {
+        assert_eq!(execution_query_workspace(), QueryWorkspaceId::from_index(0));
         assert_eq!(execution_connection_id(), 0);
         assert_eq!(
             execution_database_oid(),
             crate::storage::DatabaseOid::POSTGRES
         );
+        set_execution_query_workspace(QueryWorkspaceId::from_index(2));
         set_execution_connection_id(73);
         set_execution_database_oid(crate::storage::DatabaseOid::parse(16_385).unwrap());
+        assert_eq!(execution_query_workspace(), QueryWorkspaceId::from_index(2));
         assert_eq!(execution_connection_id(), 73);
         assert_eq!(execution_database_oid().get(), 16_385);
     })
     .join()
     .unwrap();
+    assert_eq!(execution_query_workspace(), QueryWorkspaceId::from_index(1));
     assert_eq!(execution_connection_id(), 41);
     assert_eq!(execution_database_oid().get(), 16_384);
+    set_execution_query_workspace(QueryWorkspaceId::from_index(0));
     set_execution_connection_id(0);
     set_execution_database_oid(crate::storage::DatabaseOid::POSTGRES);
 }

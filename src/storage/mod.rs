@@ -11774,7 +11774,6 @@ pub struct Storage {
     brin_unsummarized_ranges_per_index: usize,
     databases: FixedVec<DatabaseDef>,
     current_database: DatabaseOid,
-    current_connection_id: Cell<i32>,
     backends: std::cell::RefCell<FixedVec<BackendActivity>>,
     backend_signals: std::cell::RefCell<FixedVec<BackendSignal>>,
     relation_cumulative_statistics: std::cell::RefCell<FixedVec<RelationCumulativeStatistics>>,
@@ -13502,12 +13501,8 @@ impl Storage {
         }
     }
 
-    pub(crate) fn set_current_connection_id(&self, connection_id: i32) {
-        self.current_connection_id.set(connection_id);
-    }
-
     pub(crate) fn current_connection_id(&self) -> i32 {
-        self.current_connection_id.get()
+        crate::sql::execution_connection_id()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13638,7 +13633,7 @@ impl Storage {
     }
 
     fn mark_current_backend_wait(&self, wait_event_type: &'static str, wait_event: &'static str) {
-        let pid = self.current_connection_id.get();
+        let pid = self.current_connection_id();
         if let Some(activity) = self
             .backends
             .borrow_mut()
@@ -13753,7 +13748,7 @@ impl Storage {
         let current_superuser = self.role(current_role).attributes_to(txid).superuser;
         let target_role = usize::from(target.role);
         let target_superuser = self.role(target_role).attributes_to(txid).superuser;
-        if target.pid != self.current_connection_id.get()
+        if target.pid != self.current_connection_id()
             && !current_superuser
             && (target_superuser || !self.role_is_member_of(current_role, target_role, txid))
         {
@@ -13871,7 +13866,7 @@ impl Storage {
     }
 
     pub(crate) fn temporary_schema(&self) -> Result<SqlName, SqlError> {
-        SqlName::parse(stack_format!(63, "pg_temp_{}", self.current_connection_id.get()).as_str())
+        SqlName::parse(stack_format!(63, "pg_temp_{}", self.current_connection_id()).as_str())
     }
 
     pub(crate) fn is_current_temporary_schema(&self, schema: &str) -> bool {
@@ -13886,7 +13881,7 @@ impl Storage {
     }
 
     pub(crate) fn drop_connection_temporary_relations(&mut self, connection_id: i32) {
-        self.set_current_connection_id(connection_id);
+        crate::sql::set_execution_connection_id(connection_id);
         let Ok(schema) = self.temporary_schema() else {
             return;
         };
@@ -16300,7 +16295,6 @@ impl Storage {
             brin_unsummarized_ranges_per_index: config.max_brin_unsummarized_ranges_per_index,
             databases,
             current_database: DatabaseOid::POSTGRES,
-            current_connection_id: Cell::new(0),
             backends,
             backend_signals,
             relation_cumulative_statistics: std::cell::RefCell::new(relation_cumulative_statistics),
@@ -41317,8 +41311,8 @@ impl Storage {
         active
             .push(ActiveTransactionIdentity {
                 transaction_id,
-                connection_id: (self.current_connection_id.get() > 0)
-                    .then_some(self.current_connection_id.get()),
+                connection_id: (self.current_connection_id() > 0)
+                    .then_some(self.current_connection_id()),
                 assigned: false,
             })
             .expect("transaction identity registry matches configured capacity");
@@ -41634,7 +41628,7 @@ impl Storage {
         transaction_scope: bool,
         try_only: bool,
     ) -> Result<crate::sql::lock::AdvisoryDecision, SqlError> {
-        let connection_id = self.current_connection_id.get();
+        let connection_id = self.current_connection_id();
         if connection_id <= 0 {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -41662,13 +41656,13 @@ impl Storage {
     pub(crate) fn begin_advisory_statement(&self) -> Result<(), SqlError> {
         self.advisory_locks
             .borrow_mut()
-            .begin_statement(self.current_connection_id.get())
+            .begin_statement(self.current_connection_id())
     }
 
     pub(crate) fn preserve_advisory_statement(&self) {
         self.advisory_locks
             .borrow_mut()
-            .preserve_statement(self.current_connection_id.get());
+            .preserve_statement(self.current_connection_id());
     }
 
     pub(crate) fn unlock_advisory_session(
@@ -41677,7 +41671,7 @@ impl Storage {
         mode: crate::sql::lock::AdvisoryMode,
     ) -> Result<bool, SqlError> {
         self.advisory_locks.borrow_mut().unlock_session(
-            self.current_connection_id.get(),
+            self.current_connection_id(),
             key,
             mode,
             &mut self.row_locks.borrow_mut(),
@@ -41686,7 +41680,7 @@ impl Storage {
 
     pub(crate) fn unlock_all_advisory_session(&self) -> Result<(), SqlError> {
         self.advisory_locks.borrow_mut().unlock_all_session(
-            self.current_connection_id.get(),
+            self.current_connection_id(),
             &mut self.row_locks.borrow_mut(),
         )
     }

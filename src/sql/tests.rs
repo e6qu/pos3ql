@@ -17,27 +17,35 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
         + config.table_rows * core::mem::size_of::<exec::PhysicalRow>();
     assert_eq!(
         Engine::extra_budget_bytes(&config) - Engine::extra_budget_bytes(&one),
-        2 * (config.work_arena_bytes + core::mem::size_of::<Arena>() + dml_workspace_bytes)
+        2 * (config.work_arena_bytes
+            + core::mem::size_of::<QueryWorkspace>()
+            + dml_workspace_bytes)
     );
-    let bytes =
-        config.query_workspace_slots * (config.work_arena_bytes + core::mem::size_of::<Arena>());
+    let bytes = config.query_workspace_slots
+        * (config.work_arena_bytes + core::mem::size_of::<QueryWorkspace>());
     let mut budget = Budget::new(bytes);
     let mut workspaces = QueryWorkspaces::new(&config, &mut budget).unwrap();
     assert_eq!(budget.remaining(), 0);
 
     workspaces.select(QueryWorkspaceId::from_index(0));
+    workspaces.bind_connection(41);
     workspaces.alloc_slice_with(7, |_| 1u8).unwrap();
     let first_used = workspaces.used();
     assert!(first_used >= 7);
 
     workspaces.select(QueryWorkspaceId::from_index(1));
+    workspaces.bind_connection(73);
     assert_eq!(workspaces.used(), 0);
     workspaces.alloc_slice_with(19, |_| 2u8).unwrap();
 
     workspaces.select(QueryWorkspaceId::from_index(0));
     assert_eq!(workspaces.used(), first_used);
+    assert_eq!(workspaces.connection_id(), 41);
+    workspaces.select(QueryWorkspaceId::from_index(1));
+    assert_eq!(workspaces.connection_id(), 73);
     workspaces.select(QueryWorkspaceId::from_index(2));
     assert_eq!(workspaces.used(), 0);
+    assert_eq!(workspaces.connection_id(), 0);
 
     let mut budget = Budget::new(config.query_workspace_slots * dml_workspace_bytes);
     let mut dml_workspaces = DmlWorkspaces::new(&config, &mut budget).unwrap();
@@ -64,6 +72,20 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     assert_eq!(dml_workspaces.len(), 1);
     dml_workspaces.select(QueryWorkspaceId::from_index(2));
     assert!(dml_workspaces.is_empty());
+}
+
+#[test]
+fn execution_connection_identity_is_thread_private() {
+    set_execution_connection_id(41);
+    std::thread::spawn(|| {
+        assert_eq!(execution_connection_id(), 0);
+        set_execution_connection_id(73);
+        assert_eq!(execution_connection_id(), 73);
+    })
+    .join()
+    .unwrap();
+    assert_eq!(execution_connection_id(), 41);
+    set_execution_connection_id(0);
 }
 
 #[test]

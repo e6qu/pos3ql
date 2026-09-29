@@ -72,6 +72,21 @@ use crate::stack_format;
 use crate::storage::{ColumnMeta, ColumnSet, RowHome, RowLoc, SqlName, Storage};
 use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
+std::thread_local! {
+    /// Backend identity for the worker currently executing SQL. A leased query
+    /// workspace republishes its identity whenever it is selected, so storage
+    /// helpers never depend on a process-wide mutable selector.
+    static EXECUTION_CONNECTION_ID: core::cell::Cell<i32> = const { core::cell::Cell::new(0) };
+}
+
+pub(crate) fn set_execution_connection_id(connection_id: i32) {
+    EXECUTION_CONNECTION_ID.with(|current| current.set(connection_id));
+}
+
+pub(crate) fn execution_connection_id() -> i32 {
+    EXECUTION_CONNECTION_ID.with(core::cell::Cell::get)
+}
+
 use ast::{Delete, Expr, Insert, Stmt, TransactionIsolation, TransactionTarget, Update};
 use eval::{
     EvalHooks, NO_HOOKS, NO_PARAMS, NoColumns, SequenceAccess, SqlError, SqlState, eval, sqlstate,
@@ -201,8 +216,13 @@ pub(crate) struct ReplicationEmission<'a> {
 }
 
 struct QueryWorkspaces {
-    slots: FixedVec<Arena>,
+    slots: FixedVec<QueryWorkspace>,
     active: usize,
+}
+
+struct QueryWorkspace {
+    arena: Arena,
+    connection_id: i32,
 }
 
 /// Index of one startup-reserved query workspace. The server leases these
@@ -267,11 +287,10 @@ impl QueryWorkspaces {
         let mut slots = FixedVec::new(budget, "query_workspaces", config.query_workspace_slots)?;
         for _ in 0..config.query_workspace_slots {
             slots
-                .push(Arena::new(
-                    budget,
-                    "query_workspace_arena",
-                    config.work_arena_bytes,
-                )?)
+                .push(QueryWorkspace {
+                    arena: Arena::new(budget, "query_workspace_arena", config.work_arena_bytes)?,
+                    connection_id: 0,
+                })
                 .expect("sized to query_workspace_slots");
         }
         Ok(Self { slots, active: 0 })
@@ -280,11 +299,21 @@ impl QueryWorkspaces {
     fn select(&mut self, workspace: QueryWorkspaceId) {
         assert!(workspace.index() < self.slots.len());
         self.active = workspace.index();
+        set_execution_connection_id(self.slots[self.active].connection_id);
     }
 
     fn for_connection(&self, connection: i32) -> QueryWorkspaceId {
         let connection = usize::try_from(connection).unwrap_or(0);
         QueryWorkspaceId(connection % self.slots.len())
+    }
+
+    fn bind_connection(&mut self, connection_id: i32) {
+        self.slots[self.active].connection_id = connection_id;
+        set_execution_connection_id(connection_id);
+    }
+
+    fn connection_id(&self) -> i32 {
+        self.slots[self.active].connection_id
     }
 }
 
@@ -292,13 +321,13 @@ impl core::ops::Deref for QueryWorkspaces {
     type Target = Arena;
 
     fn deref(&self) -> &Self::Target {
-        &self.slots[self.active]
+        &self.slots[self.active].arena
     }
 }
 
 impl core::ops::DerefMut for QueryWorkspaces {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.slots[self.active]
+        &mut self.slots[self.active].arena
     }
 }
 
@@ -347,10 +376,6 @@ pub struct Engine {
     /// LISTEN/NOTIFY registry and delivery outbox, shared across every
     /// connection (see [`notify`]).
     notify: notify::NotifyState,
-    /// The connection id whose message is currently being executed, set at each
-    /// `execute_simple`/`execute_extended` entry so LISTEN/UNLISTEN/NOTIFY can
-    /// stamp their buffered ops without threading the id through every arm.
-    current_conn_id: i32,
     /// Snapshot exports are connection-scoped protocol capabilities. Their
     /// fixed registry both authenticates imports and pins row history until
     /// the exporting connection advances or closes.
@@ -2433,7 +2458,7 @@ impl Engine {
         // Apply workers have transaction identities but no frontend/backend
         // process identity. Do not inherit whichever client the single-threaded
         // engine happened to dispatch most recently.
-        self.storage.set_current_connection_id(0);
+        self.work.bind_connection(0);
         self.ensure_txn(txn, TxnMode::Implicit, guc);
         txn.replication_apply = true;
         txn.begin_command();
@@ -3003,9 +3028,11 @@ impl Engine {
                 crate::storage::RowHeapImage,
                 RowLoc,
             )>())
-            + config
-                .query_workspace_slots
-                .saturating_mul(config.work_arena_bytes.saturating_add(size_of::<Arena>()))
+            + config.query_workspace_slots.saturating_mul(
+                config
+                    .work_arena_bytes
+                    .saturating_add(size_of::<QueryWorkspace>()),
+            )
             + config.wal_buffer_bytes
             + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
             + config.max_connections as usize * config.wal_buffer_bytes
@@ -3338,7 +3365,6 @@ impl Engine {
                 config.max_connections as usize * notify::CHANNELS_PER_CONN,
                 notify::OUTBOX,
             )?,
-            current_conn_id: 0,
             exported_snapshots: FixedVec::new(
                 budget,
                 "exported_snapshots",
@@ -7735,7 +7761,7 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let operation = notify::ListenOp::Listen {
-            conn_id: self.current_conn_id,
+            conn_id: self.work.connection_id(),
             channel: notify::channel(channel),
         };
         if let Err(error) = txn.buffer_listen_op(operation) {
@@ -7753,11 +7779,11 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         let operation = match channel {
             Some(name) => notify::ListenOp::Unlisten {
-                conn_id: self.current_conn_id,
+                conn_id: self.work.connection_id(),
                 channel: notify::channel(name),
             },
             None => notify::ListenOp::UnlistenAll {
-                conn_id: self.current_conn_id,
+                conn_id: self.work.connection_id(),
             },
         };
         if let Err(error) = txn.buffer_listen_op(operation) {
@@ -7782,7 +7808,7 @@ impl Engine {
             None => notify::Payload::new(),
         };
         if let Err(error) = txn.buffer_notify(
-            self.current_conn_id,
+            self.work.connection_id(),
             notify::channel(channel),
             payload.as_str(),
         ) {
@@ -8312,7 +8338,7 @@ impl Engine {
                 if let Err(error) = self.apply_role_settings(role as u16, guc) {
                     return Ok(Err(error));
                 }
-                self.notify.drop_conn(self.current_conn_id);
+                self.notify.drop_conn(self.work.connection_id());
                 self.discard_protocol_state = true;
             }
             ast::DiscardTarget::Sequences => guc.seq_session().discard(),
@@ -9016,8 +9042,7 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
-        self.current_conn_id = conn_id;
-        self.storage.set_current_connection_id(conn_id);
+        self.work.bind_connection(conn_id);
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -9276,8 +9301,7 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         let _parameter_types = exec::enter_bound_parameter_types(parameter_type_oids);
-        self.current_conn_id = conn_id;
-        self.storage.set_current_connection_id(conn_id);
+        self.work.bind_connection(conn_id);
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -9448,8 +9472,7 @@ impl Engine {
         responder: &mut Responder,
         conn_id: i32,
     ) -> Result<bool, WireFull> {
-        self.current_conn_id = conn_id;
-        self.storage.set_current_connection_id(conn_id);
+        self.work.bind_connection(conn_id);
         datetime::begin_statement();
         self.ensure_txn(txn, TxnMode::Implicit, guc);
         if txn.failed {
@@ -10586,7 +10609,7 @@ impl Engine {
                     guc,
                     responder,
                     Some(&mut sink),
-                    self.current_conn_id,
+                    self.work.connection_id(),
                 ),
             };
             match outcome {
@@ -11939,7 +11962,7 @@ impl Engine {
                             guc,
                             responder,
                             None,
-                            self.current_conn_id,
+                            self.work.connection_id(),
                         )?
                     }
                     Stmt::Merge(_) => Self::execute_merge(
@@ -12953,7 +12976,7 @@ impl Engine {
                 guc,
                 responder,
                 None,
-                self.current_conn_id,
+                self.work.connection_id(),
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
@@ -13021,7 +13044,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
-                self.current_conn_id,
+                self.work.connection_id(),
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
@@ -15759,7 +15782,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
-                self.current_conn_id,
+                self.work.connection_id(),
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,

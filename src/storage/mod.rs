@@ -11379,6 +11379,26 @@ impl PathContext {
 
 thread_local! {
     static EXECUTION_PATH: Cell<PathContext> = const { Cell::new(PathContext::public_only()) };
+    static EXECUTION_VISIBILITY: Cell<VisibilityContext> =
+        const { Cell::new(VisibilityContext::all()) };
+}
+
+#[derive(Clone, Copy)]
+struct VisibilityContext {
+    /// A row's own-transaction pending change is visible only when its command
+    /// identifier precedes this value. `SNAPSHOT_ALL` sees every own write.
+    read_snapshot: u32,
+    /// Greatest durable commit LSN visible to the running statement.
+    commit_snapshot: u64,
+}
+
+impl VisibilityContext {
+    const fn all() -> Self {
+        Self {
+            read_snapshot: SNAPSHOT_ALL,
+            commit_snapshot: u64::MAX,
+        }
+    }
 }
 
 fn execution_path() -> PathContext {
@@ -11387,6 +11407,14 @@ fn execution_path() -> PathContext {
 
 fn replace_execution_path(path: PathContext) -> PathContext {
     EXECUTION_PATH.with(|current| current.replace(path))
+}
+
+fn execution_visibility() -> VisibilityContext {
+    EXECUTION_VISIBILITY.with(Cell::get)
+}
+
+fn replace_execution_visibility(visibility: VisibilityContext) -> VisibilityContext {
+    EXECUTION_VISIBILITY.with(|current| current.replace(visibility))
 }
 
 /// What a relation name resolved to.
@@ -11833,14 +11861,6 @@ pub struct Storage {
     /// Monotonic stamp for `created_at` fields.
     catalog_seq: u64,
     next_rowid: u64,
-    /// Command snapshot for reads: a row's own-transaction pending change is
-    /// visible only if its command-id is `< read_snapshot`. [`SNAPSHOT_ALL`]
-    /// (the default, reset at every statement) sees every own write; a
-    /// data-modifying `WITH` statement lowers it to that statement's command-id
-    /// so its main query does not see its CTEs' changes.
-    read_snapshot: u32,
-    /// Durable commit-LSN snapshot for the running statement.
-    commit_snapshot: u64,
     /// Repeatable-read snapshots held by live connections. This registry is
     /// startup-sized to max_connections and drives version/WAL/SST retention.
     active_snapshots: FixedVec<(u32, u64)>,
@@ -16360,8 +16380,6 @@ impl Storage {
             parameter_acl_entries,
             comments,
             catalog_seq: 0,
-            read_snapshot: SNAPSHOT_ALL,
-            commit_snapshot: u64::MAX,
             active_snapshots,
             transaction_identities,
             recent_transaction_statuses,
@@ -16381,6 +16399,7 @@ impl Storage {
             collation: None,
         };
         replace_execution_path(PathContext::public_schema(2));
+        replace_execution_visibility(VisibilityContext::all());
         Ok(storage)
     }
 
@@ -24624,7 +24643,7 @@ impl Storage {
                 while let Some((key, tombstone, len)) = cursor.head
                     && key.rowid == rowid
                 {
-                    if key.commit_lsn <= self.commit_snapshot
+                    if key.commit_lsn <= self.commit_snapshot()
                         && verdict.is_none_or(|current| {
                             key.commit_lsn > current.commit_lsn
                                 || (key.commit_lsn == current.commit_lsn
@@ -24804,7 +24823,7 @@ impl Storage {
             for (member, cursor) in cursors[..n].iter().enumerate() {
                 if let Some((key, tombstone, len)) = cursor.head
                     && key.rowid == rowid
-                    && key.commit_lsn <= self.commit_snapshot
+                    && key.commit_lsn <= self.commit_snapshot()
                     && verdict.is_none_or(|current| {
                         key.commit_lsn > current.commit_lsn
                             || (key.commit_lsn == current.commit_lsn
@@ -25777,8 +25796,8 @@ impl Storage {
             rowid,
             state,
             txid,
-            self.read_snapshot,
-            self.commit_snapshot,
+            self.read_snapshot(),
+            self.commit_snapshot(),
         )
     }
 
@@ -27937,7 +27956,7 @@ impl Storage {
             let Some(handle) = e.durable else {
                 return Ok(false);
             };
-            if self.commit_snapshot < handle.published_lsn {
+            if self.commit_snapshot() < handle.published_lsn {
                 return Ok(false);
             }
             let Some(spill) = &self.spill else {
@@ -28041,7 +28060,7 @@ impl Storage {
                     .is_complete()
                     || enforcer
                         .durable
-                        .is_some_and(|handle| self.commit_snapshot >= handle.published_lsn))
+                        .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn))
         })
     }
 
@@ -28053,7 +28072,7 @@ impl Storage {
                 && enforcer.columns() == columns
                 && enforcer
                     .durable
-                    .is_some_and(|handle| self.commit_snapshot >= handle.published_lsn)
+                    .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn)
         })
     }
 
@@ -28351,7 +28370,7 @@ impl Storage {
                 .is_complete()
                 || enforcer
                     .durable
-                    .is_some_and(|handle| self.commit_snapshot >= handle.published_lsn)
+                    .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn)
         })
     }
 
@@ -28366,7 +28385,7 @@ impl Storage {
             && self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
                 enforcer
                     .durable
-                    .is_some_and(|handle| self.commit_snapshot >= handle.published_lsn)
+                    .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn)
             })
     }
 
@@ -28556,7 +28575,7 @@ impl Storage {
         }) else {
             return Ok(false);
         };
-        if self.commit_snapshot < handle.published_lsn {
+        if self.commit_snapshot() < handle.published_lsn {
             return Ok(false);
         }
         let Some(spill) = &self.spill else {
@@ -28669,7 +28688,7 @@ impl Storage {
         let Some(handle) = table.enforcers[binding].and_then(|enforcer| enforcer.durable) else {
             return Ok(false);
         };
-        if self.commit_snapshot < handle.published_lsn {
+        if self.commit_snapshot() < handle.published_lsn {
             return Ok(false);
         }
         let Some(spill) = &self.spill else {
@@ -28766,7 +28785,7 @@ impl Storage {
         let Some(handle) = table.enforcers[binding].and_then(|enforcer| enforcer.durable) else {
             return Ok(false);
         };
-        if self.commit_snapshot < handle.published_lsn {
+        if self.commit_snapshot() < handle.published_lsn {
             return Ok(false);
         }
         let Some(spill) = &self.spill else {
@@ -28928,7 +28947,7 @@ impl Storage {
         let Some(handle) = table.enforcers[binding].and_then(|enforcer| enforcer.durable) else {
             return Ok(false);
         };
-        if self.commit_snapshot < handle.published_lsn {
+        if self.commit_snapshot() < handle.published_lsn {
             return Ok(false);
         }
         let Some(spill) = &self.spill else {
@@ -29423,7 +29442,7 @@ impl Storage {
                 &self.pending_row_versions,
                 state.pending,
                 txid,
-                self.read_snapshot,
+                self.read_snapshot(),
             )
             .is_some()
         })
@@ -41329,17 +41348,20 @@ impl Storage {
         self.lsn
     }
 
-    /// The current command read snapshot (see [`Storage::read_snapshot`] field).
+    /// The current worker's command read snapshot.
     pub fn read_snapshot(&self) -> u32 {
-        self.read_snapshot
+        execution_visibility().read_snapshot
     }
 
     pub fn commit_snapshot(&self) -> u64 {
-        self.commit_snapshot
+        execution_visibility().commit_snapshot
     }
 
-    pub fn set_commit_snapshot(&mut self, snapshot: u64) {
-        self.commit_snapshot = snapshot;
+    /// Publishes the running statement's durable snapshot to this worker.
+    pub fn set_commit_snapshot(&self, snapshot: u64) {
+        let mut visibility = execution_visibility();
+        visibility.commit_snapshot = snapshot;
+        replace_execution_visibility(visibility);
     }
 
     pub(crate) fn begin_transaction_identity(&self, transaction_id: u32) {
@@ -45693,8 +45715,10 @@ impl Storage {
     /// Lowers reads to a command snapshot (a data-modifying `WITH` statement) or
     /// restores full own-write visibility ([`SNAPSHOT_ALL`]). Reset to
     /// `SNAPSHOT_ALL` at the start of every statement, so a snapshot never leaks.
-    pub fn set_read_snapshot(&mut self, snapshot: u32) {
-        self.read_snapshot = snapshot;
+    pub fn set_read_snapshot(&self, snapshot: u32) {
+        let mut visibility = execution_visibility();
+        visibility.read_snapshot = snapshot;
+        replace_execution_visibility(visibility);
     }
 
     /// Recovery: pins the LSN to a replayed record's.
@@ -45724,6 +45748,31 @@ mod tests {
         child.join().expect("path worker completes");
         assert_eq!(execution_path().first_schema(), Some(7));
         replace_execution_path(prior);
+    }
+
+    #[test]
+    fn visibility_snapshots_are_thread_private() {
+        let prior = replace_execution_visibility(VisibilityContext {
+            read_snapshot: 7,
+            commit_snapshot: 13,
+        });
+        let child = std::thread::spawn(|| {
+            let initial = execution_visibility();
+            assert_eq!(initial.read_snapshot, SNAPSHOT_ALL);
+            assert_eq!(initial.commit_snapshot, u64::MAX);
+            replace_execution_visibility(VisibilityContext {
+                read_snapshot: 11,
+                commit_snapshot: 17,
+            });
+            let changed = execution_visibility();
+            assert_eq!(changed.read_snapshot, 11);
+            assert_eq!(changed.commit_snapshot, 17);
+        });
+        child.join().expect("visibility worker completes");
+        let unchanged = execution_visibility();
+        assert_eq!(unchanged.read_snapshot, 7);
+        assert_eq!(unchanged.commit_snapshot, 13);
+        replace_execution_visibility(prior);
     }
 
     #[test]

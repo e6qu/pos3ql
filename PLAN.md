@@ -329,6 +329,15 @@ isolation and live engine transfer retain direct regressions. Catalog, cache,
 lock, foreign transport, and statistics ownership remain the shared mutation
 boundaries before fixed workers can execute concurrently.
 
+Command and durable commit snapshots are worker private as one fixed
+thread-local visibility context. Statement entry publishes both values, while
+data-modifying common table expressions and routine replay can lower only the
+current worker's command snapshot. Storage row, SST, and durable index reads no
+longer consult mutable engine-global snapshots. Cross-thread isolation retains
+a direct regression alongside command-history, repeatable-read, and cold
+recovery coverage. The remaining shared catalog and row mutation paths still
+require synchronization before fixed workers can overlap execution.
+
 ### Performance qualification
 
 The [256-row](benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)

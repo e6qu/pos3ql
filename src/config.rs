@@ -67,7 +67,8 @@ pub struct Config {
     pub prepared_bytes: usize,
     /// Portal slots per connection.
     pub max_portals: usize,
-    /// Rows one transaction may touch (per connection undo capacity).
+    /// Rows one transaction may touch. Each connection also reserves this
+    /// many streamed COPY transition-row identities.
     pub txn_rows: usize,
     /// Catalog mutations one transaction may stage for commit or rollback.
     pub max_ddl_per_transaction: usize,
@@ -1660,6 +1661,7 @@ impl Config {
             + self.conn_recv_buffer_bytes
             + self.conn_send_buffer_bytes
             + self.sql_arena_bytes
+            + self.txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>()
             // Wire Parse and SQL PREPARE have independent fixed slot pools.
             + 2 * self.max_prepared * self.prepared_bytes
             + self.max_portals * (self.portal_bytes + self.portal_result_bytes)
@@ -2433,8 +2435,13 @@ sql_arena_bytes = 4096
                 c.max_savepoints_per_transaction,
             );
         let sequence_session = crate::sql::guc::SeqSession::extra_budget_bytes(c.max_sequences);
-        let per_connection =
-            890 + publication_selection + cursor_pool + transaction + sequence_session;
+        let copy_transition = c.txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>();
+        let per_connection = 890
+            + copy_transition
+            + publication_selection
+            + cursor_pool
+            + transaction
+            + sequence_session;
         assert_eq!(plan.connections, per_connection * 10);
         assert_eq!(plan.total(), per_connection * 10 + 1000 + 2000 + 500 + 250);
     }

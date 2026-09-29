@@ -10519,10 +10519,15 @@ fn copy_line(
     seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
     line: &[u8],
+    inserted: &mut crate::sql::exec::DmlScratch,
 ) -> Result<crate::sql::exec::CopyRowOutcome, SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy test response", 1 << 16).unwrap();
     let mut responder = Responder::new(&mut send);
-    engine.copy_row_line(setup, txn, seq_session, arena, &mut responder, line)
+    engine.copy_row_line(
+        setup,
+        line,
+        super::CopyRowContext::new(txn, seq_session, arena, &mut responder, inserted),
+    )
 }
 
 fn copy_binary_row(
@@ -10533,10 +10538,15 @@ fn copy_binary_row(
     seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
     row: &[u8],
+    inserted: &mut crate::sql::exec::DmlScratch,
 ) -> Result<crate::sql::exec::CopyRowOutcome, SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy test response", 1 << 16).unwrap();
     let mut responder = Responder::new(&mut send);
-    engine.copy_row_binary(setup, txn, seq_session, arena, &mut responder, row)
+    engine.copy_row_binary(
+        setup,
+        row,
+        super::CopyRowContext::new(txn, seq_session, arena, &mut responder, inserted),
+    )
 }
 
 fn finish_copy(
@@ -10545,9 +10555,16 @@ fn finish_copy(
     setup: &crate::sql::exec::CopySetup,
     txn: &mut TxnState,
     guc: &GucState,
+    inserted: &mut crate::sql::exec::DmlScratch,
 ) -> Result<(), SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy finish response", 1 << 16).unwrap();
-    engine.copy_finish(setup, txn, guc, &mut Responder::new(&mut send))
+    let result = engine.copy_finish(setup, txn, guc, &mut Responder::new(&mut send), inserted);
+    inserted.clear();
+    result
+}
+
+fn copy_transition_scratch(budget: &mut Budget) -> crate::sql::exec::DmlScratch {
+    FixedVec::new(budget, "test copy transition scratch", 1024).unwrap()
 }
 
 fn run_with_arena_bytes(
@@ -15680,6 +15697,7 @@ fn row_level_security_covers_views_merge_copy_partitions_and_saved_queries() {
     );
     assert_eq!(copy_data_rows(&copied), ["1\trls_client", "3\trls_client"]);
 
+    let mut copy_transition = copy_transition_scratch(&mut budget);
     let mut send = crate::mem::FixedBuf::new(&mut budget, "rls copy send", 1 << 18).unwrap();
     let mut arena = Arena::new(&mut budget, "rls copy sql", 1 << 18).unwrap();
     let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
@@ -15714,11 +15732,20 @@ fn row_level_security_covers_views_merge_copy_partitions_and_saved_queries() {
             guc.seq_session(),
             &arena,
             b"4\trls_client\tcopy",
+            &mut copy_transition,
         )
         .unwrap(),
         crate::sql::exec::CopyRowOutcome::Stored
     );
-    finish_copy(&mut engine, &mut budget, &copy, &mut transaction, &guc).unwrap();
+    finish_copy(
+        &mut engine,
+        &mut budget,
+        &copy,
+        &mut transaction,
+        &guc,
+        &mut copy_transition,
+    )
+    .unwrap();
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -22057,6 +22084,7 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
         "{}",
         String::from_utf8_lossy(&created)
     );
+    let mut copy_transition = copy_transition_scratch(&mut budget);
     let mut send = crate::mem::FixedBuf::new(&mut budget, "copy send", 1 << 16).unwrap();
     let mut arena = Arena::new(&mut budget, "copy partition sql", 1 << 18).unwrap();
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
@@ -22093,6 +22121,7 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
         guc.seq_session(),
         &arena,
         b"1",
+        &mut copy_transition,
     )
     .unwrap();
     copy_line(
@@ -22103,9 +22132,18 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
         guc.seq_session(),
         &arena,
         b"20",
+        &mut copy_transition,
     )
     .unwrap();
-    finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap();
+    finish_copy(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        &guc,
+        &mut copy_transition,
+    )
+    .unwrap();
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -22117,6 +22155,134 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
         [
             "1", "1", "1|1", "1|2", "20|1", "20|2", "after|2", "before|0"
         ]
+    );
+}
+
+#[test]
+fn interleaved_streamed_copies_keep_transition_rows_connection_private() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copy_left (id integer); \
+         CREATE TABLE copy_right (id integer); \
+         CREATE TABLE copy_transition_audit (source text, rows bigint, total bigint); \
+         CREATE FUNCTION audit_copy_left() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO copy_transition_audit \
+              SELECT ''left'', count(*), sum(id) FROM inserted_rows; RETURN NULL; END'; \
+         CREATE FUNCTION audit_copy_right() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO copy_transition_audit \
+              SELECT ''right'', count(*), sum(id) FROM inserted_rows; RETURN NULL; END'; \
+         CREATE TRIGGER audit_copy_left AFTER INSERT ON copy_left \
+           REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT \
+           EXECUTE FUNCTION audit_copy_left(); \
+         CREATE TRIGGER audit_copy_right AFTER INSERT ON copy_right \
+           REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT \
+           EXECUTE FUNCTION audit_copy_right()",
+    );
+
+    let left_arena = Arena::new(&mut budget, "left copy sql", 1 << 18).unwrap();
+    let right_arena = Arena::new(&mut budget, "right copy sql", 1 << 18).unwrap();
+    let mut left_send = crate::mem::FixedBuf::new(&mut budget, "left copy send", 1 << 16).unwrap();
+    let mut right_send =
+        crate::mem::FixedBuf::new(&mut budget, "right copy send", 1 << 16).unwrap();
+    let mut left_txn = TxnState::new(&mut budget, 32).unwrap();
+    let mut right_txn = TxnState::new(&mut budget, 32).unwrap();
+    let mut left_pool = test_pool(&mut budget);
+    let mut right_pool = test_pool(&mut budget);
+    let mut left_cursors = test_cursors(&mut budget);
+    let mut right_cursors = test_cursors(&mut budget);
+    let mut left_guc = GucState::new();
+    let mut right_guc = GucState::new();
+    let mut left_inserted = copy_transition_scratch(&mut budget);
+    let mut right_inserted = copy_transition_scratch(&mut budget);
+
+    engine
+        .execute_simple(
+            "COPY copy_left FROM STDIN",
+            &left_arena,
+            &mut left_txn,
+            &mut left_pool,
+            &mut left_cursors,
+            &mut left_guc,
+            &mut Responder::new(&mut left_send),
+            1,
+        )
+        .unwrap();
+    let left_setup = engine.take_pending_copy().expect("left COPY starts");
+    engine
+        .execute_simple(
+            "COPY copy_right FROM STDIN",
+            &right_arena,
+            &mut right_txn,
+            &mut right_pool,
+            &mut right_cursors,
+            &mut right_guc,
+            &mut Responder::new(&mut right_send),
+            2,
+        )
+        .unwrap();
+    let right_setup = engine.take_pending_copy().expect("right COPY starts");
+
+    copy_line(
+        &mut engine,
+        &mut budget,
+        &left_setup,
+        &mut left_txn,
+        left_guc.seq_session(),
+        &left_arena,
+        b"1",
+        &mut left_inserted,
+    )
+    .unwrap();
+    copy_line(
+        &mut engine,
+        &mut budget,
+        &right_setup,
+        &mut right_txn,
+        right_guc.seq_session(),
+        &right_arena,
+        b"10",
+        &mut right_inserted,
+    )
+    .unwrap();
+    copy_line(
+        &mut engine,
+        &mut budget,
+        &left_setup,
+        &mut left_txn,
+        left_guc.seq_session(),
+        &left_arena,
+        b"2",
+        &mut left_inserted,
+    )
+    .unwrap();
+    finish_copy(
+        &mut engine,
+        &mut budget,
+        &right_setup,
+        &mut right_txn,
+        &right_guc,
+        &mut right_inserted,
+    )
+    .unwrap();
+    finish_copy(
+        &mut engine,
+        &mut budget,
+        &left_setup,
+        &mut left_txn,
+        &left_guc,
+        &mut left_inserted,
+    )
+    .unwrap();
+
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT source, rows, total FROM copy_transition_audit ORDER BY source",
+        )),
+        ["left|2|3", "right|1|10"]
     );
 }
 
@@ -26648,6 +26814,7 @@ fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
         &mut budget,
         "CREATE TABLE interval_copy_input (value interval day to minute)",
     );
+    let mut copy_transition = copy_transition_scratch(&mut budget);
     let mut send = crate::mem::FixedBuf::new(&mut budget, "interval copy send", 1 << 18).unwrap();
     let mut arena = Arena::new(&mut budget, "interval copy sql", 1 << 18).unwrap();
     let mut transaction = TxnState::new(&mut budget, 128).unwrap();
@@ -26681,9 +26848,18 @@ fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
         guc.seq_session(),
         &arena,
         b"2 days 03:04:05.6",
+        &mut copy_transition,
     )
     .unwrap();
-    finish_copy(&mut engine, &mut budget, &setup, &mut transaction, &guc).unwrap();
+    finish_copy(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut transaction,
+        &guc,
+        &mut copy_transition,
+    )
+    .unwrap();
 
     arena.reset();
     send.clear();
@@ -26719,9 +26895,18 @@ fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
         guc.seq_session(),
         &arena,
         &binary_row,
+        &mut copy_transition,
     )
     .unwrap();
-    finish_copy(&mut engine, &mut budget, &setup, &mut transaction, &guc).unwrap();
+    finish_copy(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut transaction,
+        &guc,
+        &mut copy_transition,
+    )
+    .unwrap();
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -28768,6 +28953,7 @@ fn streamed_copy_validates_immediate_deferrable_constraints_at_copy_done() {
         "CREATE TABLE copy_deferred (value integer, \
            CONSTRAINT copy_deferred_key UNIQUE (value) DEFERRABLE)",
     );
+    let mut copy_transition = copy_transition_scratch(&mut budget);
     let mut send = crate::mem::FixedBuf::new(&mut budget, "copy send", 1 << 18).unwrap();
     let arena = Arena::new(&mut budget, "copy sql", 1 << 18).unwrap();
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
@@ -28797,6 +28983,7 @@ fn streamed_copy_validates_immediate_deferrable_constraints_at_copy_done() {
         guc.seq_session(),
         &arena,
         b"1",
+        &mut copy_transition,
     )
     .unwrap();
     copy_line(
@@ -28807,9 +28994,18 @@ fn streamed_copy_validates_immediate_deferrable_constraints_at_copy_done() {
         guc.seq_session(),
         &arena,
         b"1",
+        &mut copy_transition,
     )
     .unwrap();
-    let error = finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap_err();
+    let error = finish_copy(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        &guc,
+        &mut copy_transition,
+    )
+    .unwrap_err();
     assert_eq!(error.sqlstate, "23505");
     engine.copy_abort(&mut txn, &guc);
 }
@@ -47651,6 +47847,7 @@ fn composite_domain_arrays_keep_the_domain_binary_boundary() {
         "{copy:?}"
     );
 
+    let mut copy_transition = copy_transition_scratch(&mut budget);
     let mut arena = Arena::new(&mut budget, "domain binary result", 1 << 18).unwrap();
     let mut buffer = crate::mem::FixedBuf::new(&mut budget, "domain binary send", 1 << 18).unwrap();
     let mut transaction = TxnState::new(&mut budget, 128).unwrap();
@@ -47706,9 +47903,18 @@ fn composite_domain_arrays_keep_the_domain_binary_boundary() {
         guc.seq_session(),
         &arena,
         &input_row,
+        &mut copy_transition,
     )
     .unwrap();
-    finish_copy(&mut engine, &mut budget, &setup, &mut transaction, &guc).unwrap();
+    finish_copy(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut transaction,
+        &guc,
+        &mut copy_transition,
+    )
+    .unwrap();
     engine.commit_txn(&mut transaction, &guc).unwrap();
     let selected = run_with(
         &mut engine,
@@ -73414,6 +73620,7 @@ fn arrays_of_array_domains_preserve_the_domain_element_identity() {
 #[test]
 fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
     let (mut engine, mut budget) = test_engine();
+    let mut copy_transition = copy_transition_scratch(&mut budget);
     run_with(
         &mut engine,
         &mut budget,
@@ -73461,9 +73668,18 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
         guc.seq_session(),
         &arena,
         b"5",
+        &mut copy_transition,
     )
     .unwrap();
-    finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap();
+    finish_copy(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        &guc,
+        &mut copy_transition,
+    )
+    .unwrap();
 
     let rows = data_rows(&run_with(
         &mut engine,
@@ -73482,6 +73698,7 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
 #[test]
 fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
     let (mut engine, mut budget) = test_engine();
+    let mut copy_transition = copy_transition_scratch(&mut budget);
     run_with(
         &mut engine,
         &mut budget,
@@ -73541,6 +73758,7 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
         guc.seq_session(),
         &arena,
         b"DEFAULT,loaded",
+        &mut copy_transition,
     )
     .expect("DEFAULT marker uses the column default");
     arena.reset();
@@ -73552,11 +73770,20 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
         guc.seq_session(),
         &arena,
         b"not-an-integer,rejected",
+        &mut copy_transition,
     )
     .expect_err("bad integer must remain a typed conversion error");
     assert!(crate::sql::exec::copy_ignorable_error(&conversion));
     assert!(conversion.message.as_str().contains("COPY column \"id\""));
-    finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap();
+    finish_copy(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        &guc,
+        &mut copy_transition,
+    )
+    .unwrap();
 
     assert_eq!(
         data_rows(&run_with(
@@ -73584,6 +73811,7 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
 #[test]
 fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting() {
     let (mut engine, mut budget) = test_engine();
+    let mut copy_transition = copy_transition_scratch(&mut budget);
     run_with(
         &mut engine,
         &mut budget,
@@ -73624,6 +73852,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
             guc.seq_session(),
             &arena,
             b"skip",
+            &mut copy_transition,
         )
         .unwrap(),
         crate::sql::exec::CopyRowOutcome::Filtered
@@ -73638,6 +73867,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
             guc.seq_session(),
             &arena,
             b"\\N",
+            &mut copy_transition,
         )
         .unwrap(),
         crate::sql::exec::CopyRowOutcome::Filtered,
@@ -73653,11 +73883,20 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
             guc.seq_session(),
             &arena,
             b"keep",
+            &mut copy_transition,
         )
         .unwrap(),
         crate::sql::exec::CopyRowOutcome::Stored
     );
-    finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap();
+    finish_copy(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        &guc,
+        &mut copy_transition,
+    )
+    .unwrap();
 
     let mut send =
         crate::mem::FixedBuf::new(&mut budget, "copy where binary send", 1 << 18).unwrap();
@@ -73695,11 +73934,20 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
             guc.seq_session(),
             &arena,
             &binary_row,
+            &mut copy_transition,
         )
         .unwrap(),
         crate::sql::exec::CopyRowOutcome::Filtered
     );
-    finish_copy(&mut engine, &mut budget, &setup, &mut txn, &guc).unwrap();
+    finish_copy(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut txn,
+        &guc,
+        &mut copy_transition,
+    )
+    .unwrap();
 
     assert_eq!(
         data_rows(&run_with(
@@ -73725,6 +73973,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
 #[test]
 fn binary_copy_rows_reject_malformed_frames_without_panicking() {
     let (mut engine, mut budget) = test_engine();
+    let mut copy_transition = copy_transition_scratch(&mut budget);
     run_with(
         &mut engine,
         &mut budget,
@@ -73770,6 +74019,7 @@ fn binary_copy_rows_reject_malformed_frames_without_panicking() {
             guc.seq_session(),
             &arena,
             frame,
+            &mut copy_transition,
         )
         .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
@@ -73779,6 +74029,7 @@ fn binary_copy_rows_reject_malformed_frames_without_panicking() {
 #[test]
 fn binary_copy_enforces_not_null_domain_array_elements() {
     let (mut engine, mut budget) = test_engine();
+    let mut copy_transition = copy_transition_scratch(&mut budget);
     run_with(
         &mut engine,
         &mut budget,
@@ -73834,6 +74085,7 @@ fn binary_copy_enforces_not_null_domain_array_elements() {
             guc.seq_session(),
             &arena,
             &row,
+            &mut copy_transition,
         )
         .unwrap_err()
         .sqlstate,

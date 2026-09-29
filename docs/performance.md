@@ -14,6 +14,8 @@ JSON. `tools/benchmark-report.py` derives a report from those raw files.
   execution arenas and maps each connection to a stable slot; the current
   reactor still executes one statement at a time, so additional slots provide
   state isolation and memory accounting rather than a throughput claim.
+  Long-lived COPY streams keep transition rows in their connection's fixed
+  startup buffer, so interleaved clients do not share statement state.
 - Object storage is durable; memory and local disk are disposable caches.
   Immutable journal batches and a compare-and-swap commit head are published
   before success reaches a client.

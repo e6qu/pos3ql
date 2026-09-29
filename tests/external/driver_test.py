@@ -708,6 +708,52 @@ cur.execute("SELECT to_regclass('drv_drop') IS NULL")
 assert cur.fetchone() == (True,)
 print("relation persistence extended/COPY/session boundaries ok")
 
+# COPY statement transition rows remain owned by their client while two
+# streams alternate protocol messages through the same server reactor.
+cur.execute("CREATE TABLE drv_copy_left (id integer)")
+cur.execute("CREATE TABLE drv_copy_right (id integer)")
+cur.execute(
+    "CREATE TABLE drv_copy_transition_audit "
+    "(source text, rows bigint, total bigint)"
+)
+cur.execute(
+    "CREATE FUNCTION drv_audit_copy_left() RETURNS trigger LANGUAGE plpgsql AS "
+    "'BEGIN INSERT INTO drv_copy_transition_audit "
+    "SELECT ''left'', count(*), sum(id) FROM inserted_rows; RETURN NULL; END'"
+)
+cur.execute(
+    "CREATE FUNCTION drv_audit_copy_right() RETURNS trigger LANGUAGE plpgsql AS "
+    "'BEGIN INSERT INTO drv_copy_transition_audit "
+    "SELECT ''right'', count(*), sum(id) FROM inserted_rows; RETURN NULL; END'"
+)
+cur.execute(
+    "CREATE TRIGGER drv_audit_copy_left AFTER INSERT ON drv_copy_left "
+    "REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT "
+    "EXECUTE FUNCTION drv_audit_copy_left()"
+)
+cur.execute(
+    "CREATE TRIGGER drv_audit_copy_right AFTER INSERT ON drv_copy_right "
+    "REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT "
+    "EXECUTE FUNCTION drv_audit_copy_right()"
+)
+copy_peer = psycopg.connect(
+    host="127.0.0.1", port=5433, user="postgres", dbname="postgres",
+    sslmode="disable", autocommit=True,
+)
+copy_peer_cur = copy_peer.cursor()
+with cur.copy("COPY drv_copy_left FROM STDIN") as left_copy:
+    with copy_peer_cur.copy("COPY drv_copy_right FROM STDIN") as right_copy:
+        left_copy.write_row((1,))
+        right_copy.write_row((10,))
+        left_copy.write_row((2,))
+cur.execute(
+    "SELECT source, rows, total FROM drv_copy_transition_audit ORDER BY source"
+)
+assert cur.fetchall() == [("left", 2, 3), ("right", 1, 10)]
+copy_peer_cur.close()
+copy_peer.close()
+print("interleaved COPY transition state ok")
+
 # Subscription URI conninfo is catalog text at the SQL boundary, but its
 # escaped values must become one typed bounded transport identity on restart.
 cur.execute(

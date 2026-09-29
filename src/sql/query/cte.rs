@@ -116,7 +116,7 @@ pub(crate) fn expand_stored_expression<'a>(
             storage,
             txid,
             depth: 0,
-            path: Some(*storage.path()),
+            path: Some(storage.path()),
             dependencies: Some(dependencies),
             authorization_role: None,
             qualifier: None,

@@ -11377,6 +11377,18 @@ impl PathContext {
     }
 }
 
+thread_local! {
+    static EXECUTION_PATH: Cell<PathContext> = const { Cell::new(PathContext::public_only()) };
+}
+
+fn execution_path() -> PathContext {
+    EXECUTION_PATH.with(Cell::get)
+}
+
+fn replace_execution_path(path: PathContext) -> PathContext {
+    EXECUTION_PATH.with(|current| current.replace(path))
+}
+
 /// What a relation name resolved to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedRelation {
@@ -11818,8 +11830,6 @@ pub struct Storage {
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
     /// fixed slots reused as comments are added and removed.
     comments: FixedVec<CommentEntry>,
-    /// The running statement's effective search path (see [`PathContext`]).
-    path: PathContext,
     /// Monotonic stamp for `created_at` fields.
     catalog_seq: u64,
     next_rowid: u64,
@@ -16242,7 +16252,7 @@ impl Storage {
             "serializable_snapshots",
             transaction_capacity * table_capacity,
         )?);
-        Ok(Self {
+        let storage = Self {
             heap,
             tables,
             max_row_versions_per_row: config.max_row_versions_per_row,
@@ -16349,7 +16359,6 @@ impl Storage {
             default_acl_entries,
             parameter_acl_entries,
             comments,
-            path: PathContext::public_schema(2),
             catalog_seq: 0,
             read_snapshot: SNAPSHOT_ALL,
             commit_snapshot: u64::MAX,
@@ -16370,7 +16379,9 @@ impl Storage {
             value_indexes: Some(value_indexes),
             index_arena,
             collation: None,
-        })
+        };
+        replace_execution_path(PathContext::public_schema(2));
+        Ok(storage)
     }
 
     pub(crate) fn replace_prepared_transaction_catalog(
@@ -17185,11 +17196,11 @@ impl Storage {
         };
         let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
         entries[1] = PathEntry::Schema(public as u16);
-        self.path = PathContext {
+        replace_execution_path(PathContext {
             entries,
             n: 2,
             explicit_catalog: false,
-        };
+        });
         Ok(())
     }
 
@@ -24066,15 +24077,15 @@ impl Storage {
         }
     }
 
-    pub fn path(&self) -> &PathContext {
-        &self.path
+    pub fn path(&self) -> PathContext {
+        execution_path()
     }
 
     /// Installs the running statement's path, returning the previous one so a
     /// nested resolution context (a view body under its creator's path) can
     /// restore it.
-    pub fn swap_path(&mut self, path: PathContext) -> PathContext {
-        core::mem::replace(&mut self.path, path)
+    pub fn swap_path(&self, path: PathContext) -> PathContext {
+        replace_execution_path(path)
     }
 
     /// Resolves a possibly-qualified relation name under the current path.
@@ -24086,7 +24097,8 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Option<ResolvedRelation> {
-        self.resolve_relation_under(&self.path, qualifier, name, txid)
+        let path = self.path();
+        self.resolve_relation_under(&path, qualifier, name, txid)
     }
 
     /// [`Self::resolve_relation`] under an explicit path — a view body
@@ -24137,7 +24149,7 @@ impl Storage {
     }
 
     pub(crate) fn schema_is_on_path(&self, schema: SqlName) -> bool {
-        self.path.entries().iter().any(|entry| {
+        self.path().entries().iter().any(|entry| {
             matches!(entry, PathEntry::Schema(slot) if self.schemas[*slot as usize].name == schema)
         })
     }
@@ -24223,7 +24235,7 @@ impl Storage {
         {
             return Some((temporary, kind));
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
                 let schema_name = self.schemas[*slot as usize].name;
                 if let Some(k) = self.relation_kind_in(schema_name.as_str(), name, txid) {
@@ -24273,14 +24285,15 @@ impl Storage {
         }
         // An explicit pg_catalog at the head of the path is the creation
         // target, which PostgreSQL then refuses.
-        if self.path.explicit_catalog && self.path.entries().first() == Some(&PathEntry::Catalog) {
+        let path = self.path();
+        if path.explicit_catalog && path.entries().first() == Some(&PathEntry::Catalog) {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INSUFFICIENT_PRIVILEGE,
                 "permission denied to create \"pg_catalog.{}\"",
                 relation
             ));
         }
-        let Some(slot) = self.path.first_schema() else {
+        let Some(slot) = path.first_schema() else {
             return Err(sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
                 "no schema has been selected to create in"
@@ -32477,7 +32490,7 @@ impl Storage {
         {
             return Some(found);
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
                 let schema_name = self.schemas[*slot as usize].name;
                 if let Some(found) = self.sequence_slot(schema_name.as_str(), name, txid) {
@@ -33013,7 +33026,7 @@ impl Storage {
                     && definition.name.as_str() == name
             });
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
                 let schema = self.schemas[*slot as usize].name;
                 if let Some(i) = self.domains.iter().position(|d| {
@@ -34094,7 +34107,7 @@ impl Storage {
                     && e.definition_for(txid).name.as_str() == name
             });
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
                 let schema = self.schemas[*slot as usize].name;
                 if let Some(i) = self.enums.iter().position(|e| {
@@ -34834,7 +34847,7 @@ impl Storage {
         if let Some(schema) = qualifier {
             return self.composite_slot(schema, name, txid);
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
@@ -34869,7 +34882,7 @@ impl Storage {
         if let Some(schema) = qualifier {
             return self.alter_type_target_in_schema(schema, name, txid);
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
@@ -36320,7 +36333,7 @@ impl Storage {
         if let Some((schema, routine_name)) = name.split_once('.') {
             return resolve(schema, routine_name);
         }
-        self.path.entries().iter().find_map(|entry| {
+        self.path().entries().iter().find_map(|entry| {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
@@ -36353,7 +36366,7 @@ impl Storage {
         if let Some((schema, routine_name)) = name.split_once('.') {
             return resolve(schema, routine_name);
         }
-        self.path.entries().iter().find_map(|entry| {
+        self.path().entries().iter().find_map(|entry| {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
@@ -36386,7 +36399,7 @@ impl Storage {
         if let Some((schema, routine_name)) = name.split_once('.') {
             return resolve(schema, routine_name);
         }
-        self.path.entries().iter().find_map(|entry| {
+        self.path().entries().iter().find_map(|entry| {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
@@ -36602,7 +36615,7 @@ impl Storage {
         if let Some((schema, routine_name)) = name.split_once('.') {
             return resolve(schema, routine_name);
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
@@ -36762,7 +36775,7 @@ impl Storage {
         if let Some((schema, routine_name)) = name.split_once('.') {
             return matches(schema, routine_name);
         }
-        self.path.entries().iter().any(|entry| {
+        self.path().entries().iter().any(|entry| {
             let PathEntry::Schema(slot) = entry else {
                 return false;
             };
@@ -36859,7 +36872,7 @@ impl Storage {
         if let Some((schema, routine_name)) = name.split_once('.') {
             return resolve(schema, routine_name);
         }
-        self.path.entries().iter().find_map(|entry| {
+        self.path().entries().iter().find_map(|entry| {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
@@ -36900,7 +36913,7 @@ impl Storage {
         if let Some((schema, routine_name)) = name.split_once('.') {
             return resolve(schema, routine_name);
         }
-        self.path.entries().iter().find_map(|entry| {
+        self.path().entries().iter().find_map(|entry| {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
@@ -37029,7 +37042,7 @@ impl Storage {
         if let Some((schema, routine_name)) = name.split_once('.') {
             return resolve(schema, routine_name);
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
@@ -37059,7 +37072,7 @@ impl Storage {
         if let Some((schema, name)) = name.split_once('.') {
             return self.routine_slot_in(schema, name, argument_types, txid, kind);
         }
-        self.path.entries().iter().find_map(|entry| {
+        self.path().entries().iter().find_map(|entry| {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
@@ -37083,7 +37096,7 @@ impl Storage {
         if let Some((schema, name)) = name.split_once('.') {
             return self.routine_slot_in_oids(schema, name, argument_type_oids, txid, kind);
         }
-        self.path.entries().iter().find_map(|entry| {
+        self.path().entries().iter().find_map(|entry| {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
@@ -39309,7 +39322,7 @@ impl Storage {
         if let Some(schema) = schema {
             return self.extended_statistics_slot(schema, name, txid);
         }
-        self.path.entries().iter().find_map(|entry| match entry {
+        self.path().entries().iter().find_map(|entry| match entry {
             PathEntry::Schema(slot) => self.extended_statistics_slot(
                 self.schemas[*slot as usize].name.as_str(),
                 name,
@@ -39783,7 +39796,7 @@ impl Storage {
         {
             return Some(slot);
         }
-        self.path.entries().iter().find_map(|entry| match entry {
+        self.path().entries().iter().find_map(|entry| match entry {
             PathEntry::Schema(slot) => {
                 self.index_slot(self.schemas[*slot as usize].name.as_str(), name, txid)
             }
@@ -42837,7 +42850,7 @@ impl Storage {
     ) -> Option<usize> {
         match schema {
             Some(schema) => self.text_search_slot(kind, schema, name, txid),
-            None => self.path.entries().iter().find_map(|entry| match entry {
+            None => self.path().entries().iter().find_map(|entry| match entry {
                 PathEntry::Schema(slot) => self.text_search_slot(
                     kind,
                     self.schemas[*slot as usize].name.as_str(),
@@ -42885,7 +42898,7 @@ impl Storage {
     ) -> Option<usize> {
         match schema {
             Some(schema) => self.collation_slot(schema, name, txid),
-            None => self.path.entries().iter().find_map(|entry| match entry {
+            None => self.path().entries().iter().find_map(|entry| match entry {
                 PathEntry::Schema(slot) => {
                     self.collation_slot(self.schemas[*slot as usize].name.as_str(), name, txid)
                 }
@@ -42929,7 +42942,7 @@ impl Storage {
     ) -> Option<usize> {
         match schema {
             Some(schema) => self.conversion_slot(schema, name, txid),
-            None => self.path.entries().iter().find_map(|entry| match entry {
+            None => self.path().entries().iter().find_map(|entry| match entry {
                 PathEntry::Schema(slot) => {
                     self.conversion_slot(self.schemas[*slot as usize].name.as_str(), name, txid)
                 }
@@ -42944,7 +42957,7 @@ impl Storage {
         destination: PgEncoding,
         txid: u32,
     ) -> Option<ConversionDefinition> {
-        self.path.entries().iter().find_map(|entry| {
+        self.path().entries().iter().find_map(|entry| {
             let PathEntry::Schema(schema_slot) = entry else {
                 return None;
             };
@@ -44454,7 +44467,7 @@ impl Storage {
     }
 
     fn operator_schema_matches_path(&self, schema: SqlName) -> bool {
-        self.path.entries().iter().any(|entry| match entry {
+        self.path().entries().iter().any(|entry| match entry {
             PathEntry::Schema(slot) => self.schemas[*slot as usize].name == schema,
             PathEntry::Catalog => false,
         })
@@ -44555,7 +44568,7 @@ impl Storage {
         if let Some(schema) = schema {
             return resolve(schema);
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
@@ -44597,7 +44610,7 @@ impl Storage {
         if let Some(schema) = schema {
             return resolve(schema);
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
@@ -44952,7 +44965,7 @@ impl Storage {
         if let Some(schema) = schema {
             return self.operator_family_slot_exact(schema, name, txid);
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             if let PathEntry::Schema(schema_slot) = entry {
                 let schema = self.schemas[*schema_slot as usize].name;
                 if let Some(slot) = self.operator_family_slot_exact(schema.as_str(), name, txid) {
@@ -45286,7 +45299,7 @@ impl Storage {
         if let Some(schema) = schema {
             return self.operator_class_slot_exact(schema, name, txid);
         }
-        for entry in self.path.entries() {
+        for entry in self.path().entries() {
             if let PathEntry::Schema(schema_slot) = entry {
                 let schema = self.schemas[*schema_slot as usize].name;
                 if let Some(slot) = self.operator_class_slot_exact(schema.as_str(), name, txid) {
@@ -45698,6 +45711,20 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_path_is_thread_private() {
+        let prior = replace_execution_path(PathContext::public_schema(7));
+        let child = std::thread::spawn(|| {
+            assert_eq!(execution_path().first_schema(), Some(0));
+            let prior = replace_execution_path(PathContext::public_schema(11));
+            assert_eq!(prior.first_schema(), Some(0));
+            assert_eq!(execution_path().first_schema(), Some(11));
+        });
+        child.join().expect("path worker completes");
+        assert_eq!(execution_path().first_schema(), Some(7));
+        replace_execution_path(prior);
+    }
 
     #[test]
     fn catalog_generations_reject_exhaustion_without_saturation() {

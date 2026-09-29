@@ -27071,7 +27071,7 @@ fn validate_policy_definition(
         }
     }
     let dependencies =
-        super::query::stored_query_dependencies(sql, storage, txid, *storage.path(), arena)?;
+        super::query::stored_query_dependencies(sql, storage, txid, storage.path(), arena)?;
     if storage.table_def(table, txid).persistence != crate::storage::RelationPersistence::Temporary
         && stored_query_uses_temporary_relation(storage, dependencies.view(), txid)
     {
@@ -68808,7 +68808,7 @@ pub(crate) fn require_rewrite_input_privileges(
         Some(crate::storage::ResolvedRelation::Catalog) | None => None,
     };
     let (read_dependencies, source_dependencies) =
-        super::query::dml_input_dependencies(statement, storage, txid, *storage.path(), arena)?;
+        super::query::dml_input_dependencies(statement, storage, txid, storage.path(), arena)?;
     for dependency in read_dependencies.entries() {
         if !matches!(
             dependency.class,

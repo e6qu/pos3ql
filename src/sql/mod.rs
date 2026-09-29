@@ -14205,8 +14205,8 @@ impl Engine {
         }
         self.refresh_prepared_transaction_catalog();
         // Drop any diagnostic detail a swallowed error left behind, and
-        // install this session's effective search path for the statement:
-        // every name resolution below reads it from storage.
+        // install this session's effective search path in the worker-local
+        // execution context used by every name resolution below.
         let _ = eval::take_diagnostic();
         exec::reset_record_shapes();
         for (slot, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {

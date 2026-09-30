@@ -598,6 +598,12 @@ The coverage gate also exposed that the 4,096 grouping-set capacity probe could
 outlast its 60-second socket deadline under instrumentation. The wide-capacity
 probe now uses the existing 120-second deadline class and reports the active
 case on timeout, while the workflow's 15-minute outer bound remains unchanged.
+The cumulative-statistics audit found seven independently borrowed vectors and
+shared reset timestamps that would panic or lose updates under overlapping
+workers. They now share one startup-bounded state protected by a mutex.
+Transaction finalization updates relation and database totals atomically, and
+function counter creation and increment occur under the same lock. A four-worker
+regression verifies synchronization and exact retained capacities.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -11794,6 +11794,20 @@ impl DatabaseCumulativeStatistics {
     }
 }
 
+/// Startup-bounded cumulative statistics behind one synchronization boundary.
+/// Query workers update these counters concurrently. Transaction finalization
+/// publishes relation and database totals as one atomic state transition.
+struct CumulativeStatistics {
+    relations: FixedVec<RelationCumulativeStatistics>,
+    relation_transactions: FixedVec<RelationTransactionStatistics>,
+    transaction_nesting: FixedVec<(u32, usize)>,
+    indexes: FixedVec<IndexCumulativeStatistics>,
+    databases: FixedVec<DatabaseCumulativeStatistics>,
+    functions: FixedVec<FunctionCumulativeStatistics>,
+    function_transactions: FixedVec<FunctionTransactionStatistics>,
+    reset_times: SharedStatisticsResetTimes,
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -11859,14 +11873,7 @@ pub struct Storage {
     databases: FixedVec<DatabaseDef>,
     backends: std::cell::RefCell<FixedVec<BackendActivity>>,
     backend_signals: std::cell::RefCell<FixedVec<BackendSignal>>,
-    relation_cumulative_statistics: std::cell::RefCell<FixedVec<RelationCumulativeStatistics>>,
-    relation_transaction_statistics: std::cell::RefCell<FixedVec<RelationTransactionStatistics>>,
-    cumulative_transaction_nesting: std::cell::RefCell<FixedVec<(u32, usize)>>,
-    index_cumulative_statistics: std::cell::RefCell<FixedVec<IndexCumulativeStatistics>>,
-    database_cumulative_statistics: std::cell::RefCell<FixedVec<DatabaseCumulativeStatistics>>,
-    function_cumulative_statistics: std::cell::RefCell<FixedVec<FunctionCumulativeStatistics>>,
-    function_transaction_statistics: std::cell::RefCell<FixedVec<FunctionTransactionStatistics>>,
-    shared_statistics_reset_times: Cell<SharedStatisticsResetTimes>,
+    cumulative_statistics: std::sync::Mutex<CumulativeStatistics>,
     /// Transactions that resolved a temporary relation. PREPARE TRANSACTION
     /// must reject them before state can outlive the owning connection.
     temporary_transactions: std::cell::RefCell<FixedVec<u32>>,
@@ -12855,19 +12862,18 @@ impl Storage {
         Some(state)
     }
 
-    fn cumulative_transaction_nest_level(&self, txid: u32) -> usize {
-        self.cumulative_transaction_nesting
-            .borrow()
-            .iter()
-            .find(|(candidate, _)| *candidate == txid)
-            .map_or(1, |(_, nest_level)| *nest_level)
+    fn cumulative_statistics(&self) -> std::sync::MutexGuard<'_, CumulativeStatistics> {
+        self.cumulative_statistics
+            .lock()
+            .expect("cumulative statistics lock poisoned")
     }
 
     pub(crate) fn set_cumulative_transaction_nest_level(&self, txid: u32, nest_level: usize) {
         if txid == 0 {
             return;
         }
-        let mut nesting = self.cumulative_transaction_nesting.borrow_mut();
+        let mut cumulative = self.cumulative_statistics();
+        let nesting = &mut cumulative.transaction_nesting;
         if let Some(entry) = nesting.iter_mut().find(|(candidate, _)| *candidate == txid) {
             entry.1 = nest_level;
         } else {
@@ -12886,8 +12892,13 @@ impl Storage {
         if txid == 0 || table == self.large_object_page_table as usize {
             return Ok(());
         }
-        let nest_level = self.cumulative_transaction_nest_level(txid);
-        let mut statistics = self.relation_transaction_statistics.borrow_mut();
+        let mut cumulative = self.cumulative_statistics();
+        let nest_level = cumulative
+            .transaction_nesting
+            .iter()
+            .find(|(candidate, _)| *candidate == txid)
+            .map_or(1, |(_, nest_level)| *nest_level);
+        let statistics = &mut cumulative.relation_transactions;
         let position = if let Some(position) = statistics.iter().position(|entry| {
             entry.txid == txid && entry.table as usize == table && entry.nest_level == nest_level
         }) {
@@ -12927,7 +12938,8 @@ impl Storage {
             }
         })?;
         if let Some(oid) = index_oid {
-            let mut indexes = self.index_cumulative_statistics.borrow_mut();
+            let mut cumulative = self.cumulative_statistics();
+            let indexes = &mut cumulative.indexes;
             let position = if let Some(position) = indexes.iter().position(|entry| entry.oid == oid)
             {
                 position
@@ -12969,8 +12981,8 @@ impl Storage {
         })?;
         if let Some(oid) = index_oid
             && let Some(statistics) = self
-                .index_cumulative_statistics
-                .borrow_mut()
+                .cumulative_statistics()
+                .indexes
                 .iter_mut()
                 .find(|statistics| statistics.oid == oid)
         {
@@ -13023,9 +13035,24 @@ impl Storage {
         minimum_nest_level: usize,
         committed: bool,
     ) {
-        let maximum_nest_level = self
-            .relation_transaction_statistics
-            .borrow()
+        let mut cumulative = self.cumulative_statistics();
+        self.finish_cumulative_subtransactions_locked(
+            &mut cumulative,
+            txid,
+            minimum_nest_level,
+            committed,
+        );
+    }
+
+    fn finish_cumulative_subtransactions_locked(
+        &self,
+        cumulative: &mut CumulativeStatistics,
+        txid: u32,
+        minimum_nest_level: usize,
+        committed: bool,
+    ) {
+        let maximum_nest_level = cumulative
+            .relation_transactions
             .iter()
             .filter(|statistics| statistics.txid == txid)
             .map(|statistics| statistics.nest_level)
@@ -13034,9 +13061,12 @@ impl Storage {
         if maximum_nest_level < minimum_nest_level {
             return;
         }
-        let mut transactions = self.relation_transaction_statistics.borrow_mut();
-        let mut relations = self.relation_cumulative_statistics.borrow_mut();
-        let mut databases = self.database_cumulative_statistics.borrow_mut();
+        let CumulativeStatistics {
+            relations,
+            relation_transactions: transactions,
+            databases,
+            ..
+        } = cumulative;
         for nest_level in (minimum_nest_level..=maximum_nest_level).rev() {
             while let Some(position) = transactions.iter().position(|statistics| {
                 statistics.txid == txid && statistics.nest_level == nest_level
@@ -13163,10 +13193,16 @@ impl Storage {
         if txid == 0 {
             return;
         }
-        self.finish_cumulative_subtransactions(txid, 2, committed);
-        let mut transactions = self.relation_transaction_statistics.borrow_mut();
-        let mut relations = self.relation_cumulative_statistics.borrow_mut();
-        let mut databases = self.database_cumulative_statistics.borrow_mut();
+        let mut cumulative = self.cumulative_statistics();
+        self.finish_cumulative_subtransactions_locked(&mut cumulative, txid, 2, committed);
+        let CumulativeStatistics {
+            relations,
+            relation_transactions: transactions,
+            transaction_nesting: nesting,
+            databases,
+            function_transactions: functions,
+            ..
+        } = &mut *cumulative;
         let mut position = 0usize;
         while position < transactions.len() {
             if transactions[position].txid != txid {
@@ -13261,11 +13297,9 @@ impl Storage {
                 database.xact_rollback = database.xact_rollback.saturating_add(1);
             }
         }
-        let mut nesting = self.cumulative_transaction_nesting.borrow_mut();
         if let Some(position) = nesting.iter().position(|(candidate, _)| *candidate == txid) {
             nesting.swap_remove(position);
         }
-        let mut functions = self.function_transaction_statistics.borrow_mut();
         while let Some(position) = functions.iter().position(|entry| entry.txid == txid) {
             functions.swap_remove(position);
         }
@@ -13278,29 +13312,50 @@ impl Storage {
         total_time_micros: u64,
         self_time_micros: u64,
     ) -> Result<(), SqlError> {
-        self.ensure_function_statistics(oid)?;
-        let mut cumulative = self.function_cumulative_statistics.borrow_mut();
-        let slot = cumulative
+        let database = current_database();
+        let mut cumulative = self.cumulative_statistics();
+        let CumulativeStatistics {
+            functions,
+            function_transactions: transactions,
+            ..
+        } = &mut *cumulative;
+        let slot = if let Some(slot) = functions
             .iter()
-            .position(|entry| entry.database == current_database() && entry.oid == oid)
-            .expect("function statistics were reserved before recording");
-        let entry = &mut cumulative[slot];
+            .position(|entry| entry.database == database && entry.oid == oid)
+        {
+            slot
+        } else {
+            functions
+                .push(FunctionCumulativeStatistics {
+                    database,
+                    oid,
+                    calls: 0,
+                    total_time_micros: 0,
+                    self_time_micros: 0,
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "function statistics capacity exhausted"
+                    )
+                })?;
+            functions.len() - 1
+        };
+        let entry = &mut functions[slot];
         entry.calls = entry.calls.saturating_add(1);
         entry.total_time_micros = entry.total_time_micros.saturating_add(total_time_micros);
         entry.self_time_micros = entry.self_time_micros.saturating_add(self_time_micros);
-        drop(cumulative);
 
         if txid == 0 {
             return Ok(());
         }
-        let mut transaction = self.function_transaction_statistics.borrow_mut();
-        let slot = if let Some(slot) = transaction
+        let slot = if let Some(slot) = transactions
             .iter()
             .position(|entry| entry.txid == txid && entry.oid == oid)
         {
             slot
         } else {
-            transaction
+            transactions
                 .push(FunctionTransactionStatistics {
                     txid,
                     oid,
@@ -13314,9 +13369,9 @@ impl Storage {
                         "transaction function statistics capacity exhausted"
                     )
                 })?;
-            transaction.len() - 1
+            transactions.len() - 1
         };
-        let entry = &mut transaction[slot];
+        let entry = &mut transactions[slot];
         entry.calls = entry.calls.saturating_add(1);
         entry.total_time_micros = entry.total_time_micros.saturating_add(total_time_micros);
         entry.self_time_micros = entry.self_time_micros.saturating_add(self_time_micros);
@@ -13324,16 +13379,19 @@ impl Storage {
     }
 
     pub(crate) fn ensure_function_statistics(&self, oid: i32) -> Result<(), SqlError> {
-        let mut cumulative = self.function_cumulative_statistics.borrow_mut();
+        let database = current_database();
+        let mut cumulative = self.cumulative_statistics();
         if cumulative
+            .functions
             .iter()
-            .any(|entry| entry.database == current_database() && entry.oid == oid)
+            .any(|entry| entry.database == database && entry.oid == oid)
         {
             return Ok(());
         }
         cumulative
+            .functions
             .push(FunctionCumulativeStatistics {
-                database: current_database(),
+                database,
                 oid,
                 calls: 0,
                 total_time_micros: 0,
@@ -13351,8 +13409,8 @@ impl Storage {
         &self,
         oid: i32,
     ) -> Option<FunctionCumulativeStatistics> {
-        self.function_cumulative_statistics
-            .borrow()
+        self.cumulative_statistics()
+            .functions
             .iter()
             .find(|entry| entry.database == current_database() && entry.oid == oid)
             .copied()
@@ -13363,8 +13421,8 @@ impl Storage {
         txid: u32,
         oid: i32,
     ) -> Option<FunctionCumulativeStatistics> {
-        self.function_transaction_statistics
-            .borrow()
+        self.cumulative_statistics()
+            .function_transactions
             .iter()
             .find(|entry| entry.txid == txid && entry.oid == oid)
             .map(|entry| FunctionCumulativeStatistics {
@@ -13377,7 +13435,8 @@ impl Storage {
     }
 
     pub(crate) fn reset_function_statistics(&self, oid: i32) {
-        let mut statistics = self.function_cumulative_statistics.borrow_mut();
+        let mut cumulative = self.cumulative_statistics();
+        let statistics = &mut cumulative.functions;
         if let Some(position) = statistics
             .iter()
             .position(|entry| entry.database == current_database() && entry.oid == oid)
@@ -13387,12 +13446,13 @@ impl Storage {
     }
 
     pub(crate) fn shared_statistics_reset_times(&self) -> SharedStatisticsResetTimes {
-        self.shared_statistics_reset_times.get()
+        self.cumulative_statistics().reset_times
     }
 
     pub(crate) fn reset_shared_statistics(&self, target: &str) -> bool {
         let now = crate::sql::datetime::now_micros();
-        let mut reset = self.shared_statistics_reset_times.get();
+        let mut cumulative = self.cumulative_statistics();
+        let reset = &mut cumulative.reset_times;
         match target {
             "archiver" => reset.archiver = now,
             "bgwriter" => reset.background_writer = now,
@@ -13403,7 +13463,6 @@ impl Storage {
             "wal" => reset.wal = now,
             _ => return false,
         }
-        self.shared_statistics_reset_times.set(reset);
         true
     }
 
@@ -13419,7 +13478,8 @@ impl Storage {
             "transaction",
         ];
         let now = crate::sql::datetime::now_micros();
-        let mut reset = self.shared_statistics_reset_times.get();
+        let mut cumulative = self.cumulative_statistics();
+        let reset = &mut cumulative.reset_times;
         if let Some(target) = target {
             let Some(index) = NAMES.iter().position(|name| *name == target) else {
                 return false;
@@ -13428,7 +13488,6 @@ impl Storage {
         } else {
             reset.slru = [now; 8];
         }
-        self.shared_statistics_reset_times.set(reset);
         true
     }
 
@@ -13436,7 +13495,7 @@ impl Storage {
         &self,
         table: usize,
     ) -> RelationCumulativeStatistics {
-        self.relation_cumulative_statistics.borrow()[table]
+        self.cumulative_statistics().relations[table]
     }
 
     pub(crate) fn relation_transaction_statistics(
@@ -13446,8 +13505,8 @@ impl Storage {
     ) -> RelationTransactionStatistics {
         let mut total = RelationTransactionStatistics::new(txid, table, 1);
         for statistics in self
-            .relation_transaction_statistics
-            .borrow()
+            .cumulative_statistics()
+            .relation_transactions
             .iter()
             .filter(|entry| entry.txid == txid && entry.table as usize == table)
         {
@@ -13474,8 +13533,8 @@ impl Storage {
     }
 
     pub(crate) fn index_cumulative_statistics(&self, oid: i32) -> IndexCumulativeStatistics {
-        self.index_cumulative_statistics
-            .borrow()
+        self.cumulative_statistics()
+            .indexes
             .iter()
             .find(|statistics| statistics.oid == oid)
             .copied()
@@ -13489,7 +13548,7 @@ impl Storage {
         &self,
         slot: usize,
     ) -> DatabaseCumulativeStatistics {
-        let statistics = self.database_cumulative_statistics.borrow()[slot];
+        let statistics = self.cumulative_statistics().databases[slot];
         if statistics.oid == self.databases[slot].oid {
             statistics
         } else {
@@ -13499,30 +13558,31 @@ impl Storage {
 
     pub(crate) fn reset_current_database_statistics(&self) {
         let now = crate::sql::datetime::now_micros();
+        let database = current_database();
+        let mut cumulative = self.cumulative_statistics();
         if let Some(slot) = self.database_slot_by_oid(current_database(), 0) {
-            let mut reset = DatabaseCumulativeStatistics::empty(current_database());
+            let mut reset = DatabaseCumulativeStatistics::empty(database);
             reset.stats_reset = Some(now);
-            self.database_cumulative_statistics.borrow_mut()[slot] = reset;
+            cumulative.databases[slot] = reset;
         }
         for (slot, table) in self.tables.iter().enumerate() {
-            if table.database == current_database() {
-                self.relation_cumulative_statistics.borrow_mut()[slot] =
-                    RelationCumulativeStatistics::EMPTY;
+            if table.database == database {
+                cumulative.relations[slot] = RelationCumulativeStatistics::EMPTY;
             }
         }
-        let mut indexes = self.index_cumulative_statistics.borrow_mut();
+        let indexes = &mut cumulative.indexes;
         let mut position = 0usize;
         while position < indexes.len() {
-            if indexes[position].database == current_database() {
+            if indexes[position].database == database {
                 indexes.swap_remove(position);
             } else {
                 position += 1;
             }
         }
-        let mut functions = self.function_cumulative_statistics.borrow_mut();
+        let functions = &mut cumulative.functions;
         let mut position = 0usize;
         while position < functions.len() {
-            if functions[position].database == current_database() {
+            if functions[position].database == database {
                 functions.swap_remove(position);
             } else {
                 position += 1;
@@ -13531,14 +13591,15 @@ impl Storage {
     }
 
     pub(crate) fn reset_relation_statistics(&self, table: usize) {
-        if table < self.relation_cumulative_statistics.borrow().len() {
-            self.relation_cumulative_statistics.borrow_mut()[table] =
-                RelationCumulativeStatistics::EMPTY;
+        let mut cumulative = self.cumulative_statistics();
+        if table < cumulative.relations.len() {
+            cumulative.relations[table] = RelationCumulativeStatistics::EMPTY;
         }
     }
 
     pub(crate) fn reset_index_statistics(&self, oid: i32) {
-        let mut statistics = self.index_cumulative_statistics.borrow_mut();
+        let mut cumulative = self.cumulative_statistics();
+        let statistics = &mut cumulative.indexes;
         if let Some(position) = statistics.iter().position(|entry| entry.oid == oid) {
             statistics.swap_remove(position);
         }
@@ -13547,7 +13608,8 @@ impl Storage {
     fn reset_implicit_index_statistics(&self, table: usize) {
         let first = crate::sql::catalog::index_oid(table, 0);
         let end = crate::sql::catalog::index_oid(table, 64);
-        let mut statistics = self.index_cumulative_statistics.borrow_mut();
+        let mut cumulative = self.cumulative_statistics();
+        let statistics = &mut cumulative.indexes;
         let mut position = 0usize;
         while position < statistics.len() {
             if (first..end).contains(&statistics[position].oid) {
@@ -13559,8 +13621,8 @@ impl Storage {
     }
 
     pub(crate) fn record_relation_analyze(&self, table: usize, rows: u64, elapsed_micros: u64) {
-        let mut statistics = self.relation_cumulative_statistics.borrow_mut();
-        let relation = &mut statistics[table];
+        let mut cumulative = self.cumulative_statistics();
+        let relation = &mut cumulative.relations[table];
         relation.n_live_tup = rows;
         relation.n_mod_since_analyze = 0;
         relation.last_analyze = Some(crate::sql::datetime::now_micros());
@@ -13571,8 +13633,8 @@ impl Storage {
     }
 
     pub(crate) fn record_relation_vacuum(&self, table: usize, elapsed_micros: u64) {
-        let mut statistics = self.relation_cumulative_statistics.borrow_mut();
-        let relation = &mut statistics[table];
+        let mut cumulative = self.cumulative_statistics();
+        let relation = &mut cumulative.relations[table];
         relation.n_dead_tup = 0;
         relation.n_ins_since_vacuum = 0;
         relation.last_vacuum = Some(crate::sql::datetime::now_micros());
@@ -13584,7 +13646,7 @@ impl Storage {
 
     pub(crate) fn record_deadlock(&self) {
         if let Some(slot) = self.database_slot_by_oid(current_database(), 0) {
-            let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+            let statistics = &mut self.cumulative_statistics().databases[slot];
             statistics.deadlocks = statistics.deadlocks.saturating_add(1);
         }
     }
@@ -13646,7 +13708,7 @@ impl Storage {
         })?;
         drop(backends);
         if let Some(slot) = self.database_slot_by_oid(database, 0) {
-            let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+            let statistics = &mut self.cumulative_statistics().databases[slot];
             statistics.sessions = statistics.sessions.saturating_add(1);
         }
         Ok(())
@@ -13691,7 +13753,7 @@ impl Storage {
         if let Some((database, elapsed)) = idle
             && let Some(slot) = self.database_slot_by_oid(database, 0)
         {
-            let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+            let statistics = &mut self.cumulative_statistics().databases[slot];
             statistics.idle_in_transaction_time_micros = statistics
                 .idle_in_transaction_time_micros
                 .saturating_add(elapsed);
@@ -13775,7 +13837,7 @@ impl Storage {
         if let Some((database, elapsed)) = active
             && let Some(slot) = self.database_slot_by_oid(database, 0)
         {
-            let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+            let statistics = &mut self.cumulative_statistics().databases[slot];
             statistics.active_time_micros = statistics.active_time_micros.saturating_add(elapsed);
         }
     }
@@ -13787,7 +13849,7 @@ impl Storage {
             drop(backends);
             if let Some(slot) = self.database_slot_by_oid(activity.database, 0) {
                 let now = crate::sql::datetime::now_micros();
-                let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+                let statistics = &mut self.cumulative_statistics().databases[slot];
                 statistics.session_time_micros = statistics
                     .session_time_micros
                     .saturating_add(now.saturating_sub(activity.backend_start).max(0) as u64);
@@ -13859,7 +13921,7 @@ impl Storage {
                 )
             })?;
             if terminate && let Some(slot) = self.database_slot_by_oid(target.database, 0) {
-                let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+                let statistics = &mut self.cumulative_statistics().databases[slot];
                 statistics.sessions_killed = statistics.sessions_killed.saturating_add(1);
             }
         }
@@ -16407,18 +16469,16 @@ impl Storage {
             databases,
             backends,
             backend_signals,
-            relation_cumulative_statistics: std::cell::RefCell::new(relation_cumulative_statistics),
-            relation_transaction_statistics: std::cell::RefCell::new(
-                relation_transaction_statistics,
-            ),
-            cumulative_transaction_nesting: std::cell::RefCell::new(cumulative_transaction_nesting),
-            index_cumulative_statistics: std::cell::RefCell::new(index_cumulative_statistics),
-            database_cumulative_statistics: std::cell::RefCell::new(database_cumulative_statistics),
-            function_cumulative_statistics: std::cell::RefCell::new(function_cumulative_statistics),
-            function_transaction_statistics: std::cell::RefCell::new(
-                function_transaction_statistics,
-            ),
-            shared_statistics_reset_times: Cell::new(SharedStatisticsResetTimes::new()),
+            cumulative_statistics: std::sync::Mutex::new(CumulativeStatistics {
+                relations: relation_cumulative_statistics,
+                relation_transactions: relation_transaction_statistics,
+                transaction_nesting: cumulative_transaction_nesting,
+                indexes: index_cumulative_statistics,
+                databases: database_cumulative_statistics,
+                functions: function_cumulative_statistics,
+                function_transactions: function_transaction_statistics,
+                reset_times: SharedStatisticsResetTimes::new(),
+            }),
             temporary_transactions,
             tablespaces,
             schemas,
@@ -17457,8 +17517,7 @@ impl Storage {
             },
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
-        self.database_cumulative_statistics.borrow_mut()[slot] =
-            DatabaseCumulativeStatistics::empty(oid);
+        self.cumulative_statistics().databases[slot] = DatabaseCumulativeStatistics::empty(oid);
         if let Err(error) = self.clone_database_catalog(template, oid, txid) {
             self.clear_database_catalog(oid);
             self.databases[slot].ddl_state = CatalogDdlState::Absent;
@@ -17494,8 +17553,7 @@ impl Storage {
             },
             ddl_state: CatalogDdlState::Present,
         };
-        self.database_cumulative_statistics.borrow_mut()[slot] =
-            DatabaseCumulativeStatistics::empty(oid);
+        self.cumulative_statistics().databases[slot] = DatabaseCumulativeStatistics::empty(oid);
         Ok(slot)
     }
 
@@ -30273,8 +30331,7 @@ impl Storage {
         let ownership = self.initial_ownership(pending.map_or(0, |pending| pending.txid));
         self.catalog_seq += 1;
         let stamp = self.catalog_seq;
-        self.relation_cumulative_statistics.borrow_mut()[slot] =
-            RelationCumulativeStatistics::EMPTY;
+        self.cumulative_statistics().relations[slot] = RelationCumulativeStatistics::EMPTY;
         self.reset_implicit_index_statistics(slot);
         self.clear_table_rows(slot);
         let table = &mut self.tables[slot];
@@ -46279,7 +46336,7 @@ mod tests {
             pending_table_statistics_capacity(&config)
         );
         assert_eq!(storage.databases.len(), 6);
-        assert_eq!(storage.database_cumulative_statistics.borrow().len(), 6);
+        assert_eq!(storage.cumulative_statistics().databases.len(), 6);
         assert_eq!(storage.schemas.len(), 17);
         assert_eq!(storage.sequences.len(), 18);
         assert_eq!(storage.domains.len(), 26);
@@ -46376,15 +46433,50 @@ mod tests {
         assert_eq!(storage.comments.len(), 16);
         assert_eq!(storage.foreign_sessions.capacity(), 3);
         assert!(storage.foreign_sessions.is_empty());
+        assert_eq!(storage.cumulative_statistics().functions.capacity(), 5);
         assert_eq!(
-            storage.function_cumulative_statistics.borrow().capacity(),
-            5
-        );
-        assert_eq!(
-            storage.function_transaction_statistics.borrow().capacity(),
+            storage
+                .cumulative_statistics()
+                .function_transactions
+                .capacity(),
             (config.max_connections as usize + config.max_prepared_transactions) * 5
         );
         assert_eq!(budget.used(), expected_budget);
+    }
+
+    #[test]
+    fn cumulative_statistics_are_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CumulativeStatistics>();
+
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let statistics = &storage.cumulative_statistics;
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        let mut statistics = statistics
+                            .lock()
+                            .expect("cumulative statistics lock poisoned");
+                        statistics.databases[0].sessions =
+                            statistics.databases[0].sessions.saturating_add(1);
+                    }
+                });
+            }
+        });
+        let statistics = storage.cumulative_statistics();
+        assert_eq!(statistics.databases[0].sessions, 4_000);
+        assert_eq!(
+            statistics.relations.capacity(),
+            table_slot_capacity(&config)
+        );
+        assert_eq!(
+            statistics.function_transactions.capacity(),
+            (config.max_connections as usize + config.max_prepared_transactions)
+                * config.max_routines
+        );
     }
 
     #[test]

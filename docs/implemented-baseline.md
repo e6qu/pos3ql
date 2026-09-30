@@ -125,10 +125,13 @@ active production roadmap is [PLAN.md](../PLAN.md).
   transaction identities, retained completion statuses, the replacement
   cursor, and the latest observed identity share one startup-bounded mutex;
   snapshot creation and checkpoint manifest emission observe one atomic state.
-  Engine mutation remains single-owner and serialized while catalog, cache, and
-  lock sharing is prepared. Authorization graph traversal
-  uses one exactly charged bitmap per query workspace, selected by the typed
-  worker-local lease identity. Foreign statement transaction identity,
+  Relation, row, and advisory locks share one startup-bounded mutex with their
+  wait graph and acquisition sequence, so cross-registry transitions are
+  atomic under overlapping workers. Engine mutation remains single-owner and
+  serialized while catalog, cache, and row sharing is prepared. Authorization
+  graph traversal uses one exactly charged bitmap per query workspace, selected
+  by the typed worker-local lease identity. Foreign statement transaction
+  identity,
   isolation state, and fixed savepoint rosters use the same per-workspace
   boundary and exact startup charging. Foreign transports use an exactly
   charged `max_foreign_sessions` pool keyed by local transaction and remote

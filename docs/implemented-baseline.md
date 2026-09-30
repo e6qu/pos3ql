@@ -125,7 +125,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   remains single-owner and serialized while catalog, cache, lock, foreign
   transport, and statistics sharing is prepared. Authorization graph traversal
   uses one exactly charged bitmap per query workspace, selected by the typed
-  worker-local lease identity.
+  worker-local lease identity. Foreign statement transaction identity,
+  isolation state, and fixed savepoint rosters use the same per-workspace
+  boundary and exact startup charging; the transaction-owned foreign transport
+  remains an explicit single-session capacity.
 - Streamed COPY transition rows are retained in fixed connection-private and
   subscription-worker-private buffers. Interleaved streams preserve the exact
   row set for statement transition triggers without runtime allocation.

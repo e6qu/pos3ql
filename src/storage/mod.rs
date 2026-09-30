@@ -11482,6 +11482,11 @@ struct ForeignStatementContext {
     savepoints: FixedVec<crate::util::StackStr<63>>,
 }
 
+pub(crate) fn foreign_statement_context_workspace_bytes(config: &Config) -> usize {
+    size_of::<RefCell<ForeignStatementContext>>()
+        + config.max_savepoints_per_transaction * size_of::<crate::util::StackStr<63>>()
+}
+
 #[derive(Clone, Copy)]
 struct ActiveTransactionIdentity {
     transaction_id: u32,
@@ -11803,7 +11808,7 @@ pub struct Storage {
     foreign: foreign::ForeignCatalog,
     foreign_client: std::cell::RefCell<Option<crate::pg::replication_client::ReplicationClient>>,
     foreign_session: std::cell::RefCell<Option<ForeignSession>>,
-    foreign_statement_context: RefCell<ForeignStatementContext>,
+    foreign_statement_contexts: FixedVec<RefCell<ForeignStatementContext>>,
     subscription_relations: FixedVec<SubscriptionRelation>,
     matviews: FixedVec<MatviewDef>,
     sequences: FixedVec<SequenceDef>,
@@ -15246,7 +15251,7 @@ impl Storage {
     /// Bytes drawn beyond the row heap itself, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
-            + config.max_savepoints_per_transaction * size_of::<crate::util::StackStr<63>>()
+            + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
             + 2 * config.collation_scratch_bytes
             + table_slot_capacity(config)
                 * (size_of::<Table>() + FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
@@ -16038,6 +16043,24 @@ impl Storage {
                 .push(std::cell::RefCell::new(scratch))
                 .expect("sized to query_workspace_slots");
         }
+        let mut foreign_statement_contexts = FixedVec::new(
+            budget,
+            "foreign_statement_contexts",
+            config.query_workspace_slots,
+        )?;
+        for _ in 0..config.query_workspace_slots {
+            foreign_statement_contexts
+                .push(RefCell::new(ForeignStatementContext {
+                    transaction_id: 0,
+                    serializable: false,
+                    savepoints: FixedVec::new(
+                        budget,
+                        "foreign_statement_savepoints",
+                        config.max_savepoints_per_transaction,
+                    )?,
+                }))
+                .expect("sized to query_workspace_slots");
+        }
         let mut system_settings = FixedVec::new(budget, "system_settings", MAX_SYSTEM_SETTINGS)?;
         for _ in 0..MAX_SYSTEM_SETTINGS {
             system_settings
@@ -16329,15 +16352,7 @@ impl Storage {
             foreign,
             foreign_client: std::cell::RefCell::new(None),
             foreign_session: std::cell::RefCell::new(None),
-            foreign_statement_context: RefCell::new(ForeignStatementContext {
-                transaction_id: 0,
-                serializable: false,
-                savepoints: FixedVec::new(
-                    budget,
-                    "foreign_statement_savepoints",
-                    config.max_savepoints_per_transaction,
-                )?,
-            }),
+            foreign_statement_contexts,
             subscription_relations,
             matviews,
             sequences,
@@ -16516,17 +16531,21 @@ impl Storage {
         }
     }
 
-    /// The engine publishes the currently executing transaction before a
-    /// foreign scan can open its remote counterpart.  Execution is
-    /// single-threaded, while the session identity above remains the durable
-    /// ownership check across statements.
+    fn foreign_statement_context(&self) -> &RefCell<ForeignStatementContext> {
+        &self.foreign_statement_contexts[crate::sql::execution_query_workspace().index()]
+    }
+
+    /// The engine publishes the executing transaction into its leased
+    /// workspace before a foreign scan can open its remote counterpart. The
+    /// session identity above remains the durable ownership check across
+    /// statements.
     pub(crate) fn set_foreign_statement_context(
         &self,
         transaction_id: u32,
         serializable: bool,
         savepoints: impl Iterator<Item = crate::util::StackStr<63>>,
     ) -> Result<(), SqlError> {
-        let mut context = self.foreign_statement_context.borrow_mut();
+        let mut context = self.foreign_statement_context().borrow_mut();
         context.transaction_id = transaction_id;
         context.serializable = serializable;
         context.savepoints.clear();
@@ -16542,7 +16561,7 @@ impl Storage {
     }
 
     pub(crate) fn foreign_statement_is_serializable(&self, transaction_id: u32) -> bool {
-        let context = self.foreign_statement_context.borrow();
+        let context = self.foreign_statement_context().borrow();
         context.transaction_id == transaction_id && context.serializable
     }
 
@@ -16550,7 +16569,7 @@ impl Storage {
         &self,
         transaction_id: u32,
     ) -> core::cell::Ref<'_, [crate::util::StackStr<63>]> {
-        core::cell::Ref::map(self.foreign_statement_context.borrow(), |context| {
+        core::cell::Ref::map(self.foreign_statement_context().borrow(), |context| {
             if context.transaction_id == transaction_id {
                 context.savepoints.as_slice()
             } else {
@@ -46186,6 +46205,23 @@ mod tests {
         );
         storage.role_graph_scratch[0].borrow_mut()[3] = true;
         assert!(!storage.role_graph_scratch[1].borrow()[3]);
+        assert_eq!(storage.foreign_statement_contexts.len(), 2);
+        assert!(storage.foreign_statement_contexts.iter().all(|context| {
+            context.borrow().savepoints.capacity() == config.max_savepoints_per_transaction
+        }));
+        {
+            let mut context = storage.foreign_statement_contexts[0].borrow_mut();
+            context.transaction_id = 41;
+            context.serializable = true;
+            context
+                .savepoints
+                .push(crate::util::StackStr::from_str("one"))
+                .unwrap();
+        }
+        let other_context = storage.foreign_statement_contexts[1].borrow();
+        assert_eq!(other_context.transaction_id, 0);
+        assert!(!other_context.serializable);
+        assert!(other_context.savepoints.is_empty());
         assert_eq!(storage.acl_entries.capacity(), 22);
         assert_eq!(storage.column_acl_entries.capacity(), 23);
         assert_eq!(storage.default_acl_entries.capacity(), 24);

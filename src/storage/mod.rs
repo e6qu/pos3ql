@@ -11465,15 +11465,47 @@ pub(crate) struct PreparedTransactionCatalogEntry {
     pub prepared_lsn: u64,
 }
 
-/// One transaction-owned PostgreSQL foreign session.  The transport has one
-/// startup-reserved slot, so this identity is the boundary that prevents a
+/// One transaction-owned PostgreSQL foreign session. This identity prevents a
 /// remote transaction from being reused by another local transaction or
 /// endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ForeignSession {
+struct ForeignSession {
     transaction_id: u32,
     endpoint: crate::pg::replication_client::ConnectionInfo,
     timeout: std::time::Duration,
+    active: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForeignSessionId(usize);
+
+impl ForeignSessionId {
+    const fn index(self) -> usize {
+        self.0
+    }
+}
+
+/// One validated ownership token for a fixed foreign-session slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForeignSessionLease {
+    session_id: ForeignSessionId,
+    transaction_id: u32,
+    endpoint: crate::pg::replication_client::ConnectionInfo,
+}
+
+impl ForeignSessionLease {
+    pub(crate) const fn transaction_id(self) -> u32 {
+        self.transaction_id
+    }
+}
+
+struct ForeignSessionSlot {
+    client: crate::pg::replication_client::ReplicationClient,
+    session: Option<ForeignSession>,
+}
+
+pub(crate) const fn foreign_session_slot_bytes() -> usize {
+    size_of::<RefCell<ForeignSessionSlot>>()
 }
 
 struct ForeignStatementContext {
@@ -11806,8 +11838,7 @@ pub struct Storage {
     replication_slots: FixedVec<ReplicationSlotDef>,
     subscriptions: FixedVec<SubscriptionDef>,
     foreign: foreign::ForeignCatalog,
-    foreign_client: std::cell::RefCell<Option<crate::pg::replication_client::ReplicationClient>>,
-    foreign_session: std::cell::RefCell<Option<ForeignSession>>,
+    foreign_sessions: FixedVec<RefCell<ForeignSessionSlot>>,
     foreign_statement_contexts: FixedVec<RefCell<ForeignStatementContext>>,
     subscription_relations: FixedVec<SubscriptionRelation>,
     matviews: FixedVec<MatviewDef>,
@@ -15293,6 +15324,7 @@ impl Storage {
                 * config.subscription_relation_capacity
                 * size_of::<SubscriptionRelation>()
             + foreign::ForeignCatalog::budget_bytes(config)
+            + config.max_foreign_sessions * foreign_session_slot_bytes()
             + pending_table_definition_capacity(config) * size_of::<PendingTableDefSlot>()
             + pending_table_statistics_capacity(config) * size_of::<PendingTableStatisticsSlot>()
             + config.max_large_objects * size_of::<LargeObjectDef>()
@@ -16350,8 +16382,11 @@ impl Storage {
             replication_slots,
             subscriptions,
             foreign,
-            foreign_client: std::cell::RefCell::new(None),
-            foreign_session: std::cell::RefCell::new(None),
+            foreign_sessions: FixedVec::new(
+                budget,
+                "foreign_sessions",
+                config.max_foreign_sessions,
+            )?,
             foreign_statement_contexts,
             subscription_relations,
             matviews,
@@ -16443,91 +16478,157 @@ impl Storage {
     }
 
     pub(crate) fn install_foreign_client(
-        &self,
+        &mut self,
         client: crate::pg::replication_client::ReplicationClient,
     ) {
-        *self.foreign_client.borrow_mut() = Some(client);
+        self.foreign_sessions
+            .push(RefCell::new(ForeignSessionSlot {
+                client,
+                session: None,
+            }))
+            .expect("foreign clients match max_foreign_sessions");
     }
 
     pub(crate) fn foreign_client(
         &self,
+        lease: ForeignSessionLease,
     ) -> Result<std::cell::RefMut<'_, crate::pg::replication_client::ReplicationClient>, SqlError>
     {
-        let client = self.foreign_client.borrow_mut();
-        if client.is_none() {
+        let slot = self.foreign_sessions[lease.session_id.index()].borrow_mut();
+        if !slot.session.is_some_and(|session| {
+            session.transaction_id == lease.transaction_id && session.endpoint == lease.endpoint
+        }) {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "foreign PostgreSQL transport is not initialized"
+                "foreign PostgreSQL session is not owned by this transaction"
             ));
         }
-        Ok(std::cell::RefMut::map(client, |client| {
-            client.as_mut().expect("checked foreign client")
-        }))
+        Ok(std::cell::RefMut::map(slot, |slot| &mut slot.client))
     }
 
-    /// Returns whether this transaction already owns the only configured
-    /// foreign session.  A different transaction or endpoint cannot borrow it:
-    /// that would merge two remote transaction scopes.
-    pub(crate) fn foreign_session_active(
-        &self,
-        transaction_id: u32,
-        endpoint: crate::pg::replication_client::ConnectionInfo,
-    ) -> Result<bool, SqlError> {
-        match *self.foreign_session.borrow() {
-            None => Ok(false),
-            Some(ForeignSession {
-                transaction_id: owner,
-                endpoint: active_endpoint,
-                ..
-            }) if owner == transaction_id && active_endpoint == endpoint => Ok(true),
-            Some(_) => Err(crate::sql_err!(
-                crate::sql::eval::sqlstate::TOO_MANY_CONNECTIONS,
-                "configured foreign PostgreSQL session capacity is exhausted"
-            )),
-        }
-    }
-
-    pub(crate) fn activate_foreign_session(
+    /// Reserves or finds the session for one local transaction and endpoint.
+    /// Each free slot already owns its complete wire buffers.
+    pub(crate) fn reserve_foreign_session(
         &self,
         transaction_id: u32,
         endpoint: crate::pg::replication_client::ConnectionInfo,
         timeout: std::time::Duration,
-    ) {
-        let prior = self.foreign_session.replace(Some(ForeignSession {
+    ) -> Result<(ForeignSessionLease, bool), SqlError> {
+        let mut vacant = None;
+        for (index, slot) in self.foreign_sessions.iter().enumerate() {
+            let session = slot.borrow().session;
+            match session {
+                Some(session)
+                    if session.transaction_id == transaction_id && session.endpoint == endpoint =>
+                {
+                    if !session.active {
+                        return Err(sql_err!(
+                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            "foreign PostgreSQL session is still opening"
+                        ));
+                    }
+                    return Ok((
+                        ForeignSessionLease {
+                            session_id: ForeignSessionId(index),
+                            transaction_id,
+                            endpoint,
+                        },
+                        true,
+                    ));
+                }
+                None if vacant.is_none() => vacant = Some(index),
+                _ => {}
+            }
+        }
+        let index = vacant.ok_or_else(|| {
+            sql_err!(
+                sqlstate::TOO_MANY_CONNECTIONS,
+                "configured foreign PostgreSQL session capacity is exhausted"
+            )
+        })?;
+        self.foreign_sessions[index].borrow_mut().session = Some(ForeignSession {
             transaction_id,
             endpoint,
             timeout,
-        }));
-        assert!(
-            prior.is_none(),
-            "foreign session was checked before activation"
-        );
+            active: false,
+        });
+        Ok((
+            ForeignSessionLease {
+                session_id: ForeignSessionId(index),
+                transaction_id,
+                endpoint,
+            },
+            false,
+        ))
     }
 
-    pub(crate) fn foreign_session_endpoint(
-        &self,
-        transaction_id: u32,
-    ) -> Option<crate::pg::replication_client::ConnectionInfo> {
-        self.foreign_session
-            .borrow()
-            .filter(|session| session.transaction_id == transaction_id)
-            .map(|session| session.endpoint)
+    pub(crate) fn activate_foreign_session(&self, lease: ForeignSessionLease) {
+        let mut slot = self.foreign_sessions[lease.session_id.index()].borrow_mut();
+        let session = slot
+            .session
+            .as_mut()
+            .expect("foreign session was reserved before activation");
+        assert_eq!(session.transaction_id, lease.transaction_id);
+        assert_eq!(session.endpoint, lease.endpoint);
+        assert!(!session.active);
+        session.active = true;
+    }
+
+    pub(crate) fn has_foreign_session(&self, transaction_id: u32) -> bool {
+        self.foreign_sessions.iter().any(|slot| {
+            slot.borrow()
+                .session
+                .is_some_and(|session| session.transaction_id == transaction_id && session.active)
+        })
     }
 
     pub(crate) fn foreign_session_timeout(
         &self,
-        transaction_id: u32,
+        lease: ForeignSessionLease,
     ) -> Option<std::time::Duration> {
-        self.foreign_session
+        self.foreign_sessions[lease.session_id.index()]
             .borrow()
-            .filter(|session| session.transaction_id == transaction_id)
+            .session
+            .filter(|session| {
+                session.transaction_id == lease.transaction_id
+                    && session.endpoint == lease.endpoint
+                    && session.active
+            })
             .map(|session| session.timeout)
     }
 
-    pub(crate) fn clear_foreign_session(&self, transaction_id: u32) {
-        let mut session = self.foreign_session.borrow_mut();
-        if session.is_some_and(|active| active.transaction_id == transaction_id) {
-            *session = None;
+    pub(crate) fn foreign_sessions(
+        &self,
+        transaction_id: u32,
+    ) -> impl Iterator<Item = ForeignSessionLease> + '_ {
+        self.foreign_sessions
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, slot)| {
+                let session = slot.borrow().session?;
+                (session.transaction_id == transaction_id && session.active).then_some(
+                    ForeignSessionLease {
+                        session_id: ForeignSessionId(index),
+                        transaction_id,
+                        endpoint: session.endpoint,
+                    },
+                )
+            })
+    }
+
+    pub(crate) fn foreign_sessions_used(&self) -> usize {
+        self.foreign_sessions
+            .iter()
+            .filter(|slot| slot.borrow().session.is_some())
+            .count()
+    }
+
+    pub(crate) fn clear_foreign_session(&self, lease: ForeignSessionLease) {
+        let mut slot = self.foreign_sessions[lease.session_id.index()].borrow_mut();
+        if slot.session.is_some_and(|session| {
+            session.transaction_id == lease.transaction_id && session.endpoint == lease.endpoint
+        }) {
+            slot.session = None;
         }
     }
 
@@ -46148,6 +46249,7 @@ mod tests {
         config.max_event_triggers = 14;
         config.max_tablespaces = 15;
         config.max_comments = 16;
+        config.max_foreign_sessions = 3;
         let expected_budget = config.memtable_bytes + Storage::extra_budget_bytes(&config);
         let mut budget = Budget::new(expected_budget);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
@@ -46272,6 +46374,8 @@ mod tests {
         );
         assert_eq!(storage.tablespaces.len(), 15);
         assert_eq!(storage.comments.len(), 16);
+        assert_eq!(storage.foreign_sessions.capacity(), 3);
+        assert!(storage.foreign_sessions.is_empty());
         assert_eq!(
             storage.function_cumulative_statistics.borrow().capacity(),
             5
@@ -46281,6 +46385,101 @@ mod tests {
             (config.max_connections as usize + config.max_prepared_transactions) * 5
         );
         assert_eq!(budget.used(), expected_budget);
+    }
+
+    #[test]
+    fn foreign_session_pool_is_endpoint_keyed_and_startup_bounded() {
+        let mut config = test_config();
+        config.max_foreign_sessions = 2;
+        config.foreign_receive_bytes = 256;
+        config.foreign_send_bytes = 128;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        for _ in 0..config.max_foreign_sessions {
+            let client = crate::pg::replication_client::ReplicationClient::new_unbound(
+                &mut budget,
+                1,
+                config.foreign_receive_bytes,
+                config.foreign_send_bytes,
+                None,
+            )
+            .unwrap();
+            storage.install_foreign_client(client);
+        }
+        let first = crate::pg::replication_client::ConnectionInfo::parse(
+            "host=127.0.0.1 port=5432 user=postgres dbname=postgres sslmode=disable",
+        )
+        .unwrap();
+        let second = crate::pg::replication_client::ConnectionInfo::parse(
+            "host=127.0.0.2 port=5432 user=postgres dbname=postgres sslmode=disable",
+        )
+        .unwrap();
+        let third = crate::pg::replication_client::ConnectionInfo::parse(
+            "host=127.0.0.3 port=5432 user=postgres dbname=postgres sslmode=disable",
+        )
+        .unwrap();
+
+        let (first_id, active) = storage
+            .reserve_foreign_session(41, first, std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(!active);
+        storage.activate_foreign_session(first_id);
+        assert_eq!(
+            storage
+                .reserve_foreign_session(41, first, std::time::Duration::from_secs(1))
+                .unwrap(),
+            (first_id, true)
+        );
+
+        let (second_id, active) = storage
+            .reserve_foreign_session(41, second, std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(!active);
+        storage.activate_foreign_session(second_id);
+        assert_ne!(first_id, second_id);
+        assert_eq!(storage.foreign_sessions(41).count(), 2);
+        assert_eq!(storage.foreign_sessions_used(), 2);
+        assert_eq!(
+            storage
+                .reserve_foreign_session(73, first, std::time::Duration::from_secs(1))
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::TOO_MANY_CONNECTIONS
+        );
+        let wrong_owner = ForeignSessionLease {
+            session_id: first_id.session_id,
+            transaction_id: 73,
+            endpoint: first,
+        };
+        assert_eq!(
+            storage.foreign_client(wrong_owner).err().unwrap().sqlstate,
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+        );
+
+        storage.clear_foreign_session(first_id);
+        let (replacement, active) = storage
+            .reserve_foreign_session(41, third, std::time::Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(replacement.session_id, first_id.session_id);
+        assert!(!active);
+        assert_eq!(
+            storage.foreign_client(first_id).err().unwrap().sqlstate,
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+        );
+        storage.activate_foreign_session(replacement);
+
+        for session_id in storage.foreign_sessions(41) {
+            storage.clear_foreign_session(session_id);
+        }
+        assert_eq!(storage.foreign_sessions(41).count(), 0);
+        assert_eq!(storage.foreign_sessions_used(), 0);
+        let (reused, active) = storage
+            .reserve_foreign_session(73, first, std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(reused.session_id, first_id.session_id);
+        assert_eq!(reused.transaction_id(), 73);
+        assert!(!active);
+        assert_eq!(storage.foreign_sessions_used(), 1);
     }
 
     #[test]

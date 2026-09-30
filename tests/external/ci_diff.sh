@@ -425,6 +425,41 @@ else
   bad "foreign scan driver behavior"
   cat "$WORK/foreign_driver.out"
 fi
+foreign_session_pool=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -Atq -v ON_ERROR_STOP=1 <<SQL 2>/dev/null
+CREATE SERVER reference_server_second FOREIGN DATA WRAPPER postgres_fdw
+  OPTIONS (host '$PGHOST', port '$PGPORT', dbname 'postgres', sslmode 'disable',
+           application_name 'pos3ql-second');
+CREATE USER MAPPING FOR CURRENT_USER SERVER reference_server_second
+  OPTIONS (user '$PGUSER');
+CREATE FOREIGN TABLE pos3ql_fdw_source_second (
+  id integer,
+  scores integer[],
+  pair public.pos3ql_fdw_pair,
+  note text
+) SERVER reference_server_second
+  OPTIONS (schema_name 'public', table_name 'pos3ql_fdw_source');
+BEGIN;
+SELECT count(*) FROM pos3ql_fdw_source;
+SELECT count(*) FROM pos3ql_fdw_source_second;
+SAVEPOINT both_foreign_sessions;
+INSERT INTO pos3ql_fdw_source (id, scores, pair, note)
+  VALUES (1001, ARRAY[1], ROW(1,'first')::public.pos3ql_fdw_pair, 'first');
+INSERT INTO pos3ql_fdw_source_second (id, scores, pair, note)
+  VALUES (1002, ARRAY[2], ROW(2,'second')::public.pos3ql_fdw_pair, 'second');
+ROLLBACK TO SAVEPOINT both_foreign_sessions;
+COMMIT;
+SELECT count(*) FROM pos3ql_fdw_source WHERE id >= 1000;
+DROP FOREIGN TABLE pos3ql_fdw_source_second;
+DROP SERVER reference_server_second CASCADE;
+SQL
+)
+if [[ "$foreign_session_pool" == $'3\n3\n0' ]]; then
+  ok "foreign session pool isolates endpoints and broadcasts savepoint state"
+else
+  bad "foreign session pool transaction behavior"
+  printf 'pos3ql:\n%s\n' "$foreign_session_pool"
+fi
 foreign_mutation=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -Atq -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null
 BEGIN;

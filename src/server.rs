@@ -337,6 +337,7 @@ struct CapacityLimits {
     prepared_transactions: usize,
     replication_slots: usize,
     subscriptions: usize,
+    foreign_sessions: usize,
     object_store: bool,
     credential_rotation: bool,
     tls_budget_bytes: usize,
@@ -1060,6 +1061,7 @@ impl Server {
                 prepared_transactions: config.max_prepared_transactions,
                 replication_slots: config.max_replication_slots,
                 subscriptions: config.max_subscriptions,
+                foreign_sessions: config.max_foreign_sessions,
                 object_store: config.object_store_on,
                 credential_rotation: !config.object_store_credentials_file.is_empty(),
                 tls_budget_bytes: config.tls_pool_bytes
@@ -3006,6 +3008,10 @@ pos3ql_query_workspace_capacity {}\n\
 pos3ql_query_workspaces_active {}\n\
 # TYPE pos3ql_query_workspace_waiters gauge\n\
 pos3ql_query_workspace_waiters {}\n\
+# TYPE pos3ql_foreign_session_capacity gauge\n\
+pos3ql_foreign_session_capacity {}\n\
+# TYPE pos3ql_foreign_sessions_used gauge\n\
+pos3ql_foreign_sessions_used {}\n\
 # TYPE pos3ql_operational_connections gauge\n\
 pos3ql_operational_connections {operations_active}\n\
 # TYPE pos3ql_postgres_connections_accepted_total counter\n\
@@ -3059,6 +3065,8 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
             self.capacity_limits.query_workspace_slots,
             self.query_workspaces.used(),
             self.query_workspaces.waiting(),
+            self.capacity_limits.foreign_sessions,
+            snapshot.foreign_sessions_used,
             self.operations_metrics.postgres_accepted,
             self.operations_metrics.postgres_refused,
             self.operations_metrics.postgres_closed,
@@ -3092,13 +3100,15 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
         let operations_used = limits.operations_connections - self.operations_free.len();
         let _ = writeln!(
             out,
-            "{{\"memory\":{{\"core_budget_bytes\":{},\"tls_budget_bytes\":{}}},\"postgres_connections\":{{\"used\":{postgres_used},\"limit\":{}}},\"query_workspace_slots\":{{\"used\":{},\"waiting\":{},\"limit\":{}}},\"operational_connections\":{{\"used\":{operations_used},\"limit\":{}}},\"wal_bytes\":{{\"used\":{},\"limit\":{}}},\"row_heap_bytes\":{{\"used\":{},\"limit\":{}}},\"cache_bytes\":{{\"memory_limit\":{},\"disk_limit\":{}}},\"temporary_spill_bytes\":{{\"limit\":{}}},\"catalog_limits\":{{\"tables\":{},\"indexes\":{},\"databases\":{},\"schemas\":{},\"roles\":{}}},\"prepared_transaction_limit\":{},\"replication_slot_limit\":{},\"subscription_limit\":{},\"object_store\":{},\"credential_rotation\":{}}}",
+            "{{\"memory\":{{\"core_budget_bytes\":{},\"tls_budget_bytes\":{}}},\"postgres_connections\":{{\"used\":{postgres_used},\"limit\":{}}},\"query_workspace_slots\":{{\"used\":{},\"waiting\":{},\"limit\":{}}},\"foreign_sessions\":{{\"used\":{},\"limit\":{}}},\"operational_connections\":{{\"used\":{operations_used},\"limit\":{}}},\"wal_bytes\":{{\"used\":{},\"limit\":{}}},\"row_heap_bytes\":{{\"used\":{},\"limit\":{}}},\"cache_bytes\":{{\"memory_limit\":{},\"disk_limit\":{}}},\"temporary_spill_bytes\":{{\"limit\":{}}},\"catalog_limits\":{{\"tables\":{},\"indexes\":{},\"databases\":{},\"schemas\":{},\"roles\":{}}},\"prepared_transaction_limit\":{},\"replication_slot_limit\":{},\"subscription_limit\":{},\"object_store\":{},\"credential_rotation\":{}}}",
             self.memory_reserved_bytes,
             limits.tls_budget_bytes,
             limits.postgres_connections,
             self.query_workspaces.used(),
             self.query_workspaces.waiting(),
             limits.query_workspace_slots,
+            snapshot.foreign_sessions_used,
+            limits.foreign_sessions,
             limits.operations_connections,
             snapshot.wal_used_bytes,
             snapshot.wal_capacity_bytes,

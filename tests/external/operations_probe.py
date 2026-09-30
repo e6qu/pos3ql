@@ -55,6 +55,8 @@ for sample in [
     f"pos3ql_query_workspace_capacity {QUERY_WORKSPACES}",
     "pos3ql_query_workspaces_active 0",
     "pos3ql_query_workspace_waiters 0",
+    "pos3ql_foreign_session_capacity",
+    "pos3ql_foreign_sessions_used 0",
     "pos3ql_wal_capacity_bytes",
     "pos3ql_row_heap_capacity_bytes",
     "pos3ql_block_object_gets_total",
@@ -68,6 +70,8 @@ assert capacity["postgres_connections"]["limit"] == POSTGRES_CONNECTIONS
 assert capacity["query_workspace_slots"]["limit"] == QUERY_WORKSPACES
 assert capacity["query_workspace_slots"]["used"] == 0
 assert capacity["query_workspace_slots"]["waiting"] == 0
+assert capacity["foreign_sessions"]["used"] == 0
+assert capacity["foreign_sessions"]["limit"] > 0
 assert capacity["operational_connections"]["limit"] == 4
 assert capacity["object_store"] is OBJECT_STORE
 assert capacity["memory"]["core_budget_bytes"] > 0

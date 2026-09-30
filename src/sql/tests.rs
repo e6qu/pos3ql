@@ -107,6 +107,26 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
 }
 
 #[test]
+fn foreign_sessions_are_startup_bounded_and_exactly_charged() {
+    let mut config = Config::default_dev();
+    config.max_foreign_sessions = 3;
+    config.foreign_receive_bytes = 1024;
+    config.foreign_send_bytes = 512;
+    let mut one = config.clone();
+    one.max_foreign_sessions = 1;
+    let session_bytes = crate::storage::foreign_session_slot_bytes()
+        + crate::pg::replication_client::ReplicationClient::budget_bytes(
+            1,
+            config.foreign_receive_bytes,
+            config.foreign_send_bytes,
+        );
+    assert_eq!(
+        Engine::extra_budget_bytes(&config) - Engine::extra_budget_bytes(&one),
+        2 * session_bytes
+    );
+}
+
+#[test]
 fn execution_identity_is_thread_private() {
     set_execution_query_workspace(QueryWorkspaceId::from_index(1));
     set_execution_connection_id(41);

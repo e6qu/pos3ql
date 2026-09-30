@@ -583,9 +583,21 @@ isolation flag, and savepoint roster published before remote execution. A
 worker could therefore replace the context another worker was about to consume.
 Each leased query workspace now owns an independently allocated context and
 fixed savepoint roster selected by the typed worker-local identity. Exact
-memory-plan charging and workspace isolation retain direct coverage. The
-transaction-owned foreign transport remains an explicit single-session
-capacity with named exhaustion.
+memory-plan charging and workspace isolation retain direct coverage. Transport
+ownership was audited separately below.
+The foreign-session audit found that the single transport slot rejected a
+second local transaction or remote endpoint even when startup memory could
+bound both. Foreign transports now use an explicit `max_foreign_sessions` pool
+keyed by local transaction and endpoint. Every slot reserves its client buffers
+at startup, reuse validates the typed owner, exhaustion returns SQLSTATE
+`53300`, and transaction savepoint, rollback, and commit commands cover all of
+the owner's remote sessions. Exact memory-plan charging, endpoint isolation,
+slot reuse, operational capacity reporting, and live two-endpoint transaction
+behavior retain direct coverage.
+The coverage gate also exposed that the 4,096 grouping-set capacity probe could
+outlast its 60-second socket deadline under instrumentation. The wide-capacity
+probe now uses the existing 120-second deadline class and reports the active
+case on timeout, while the workflow's 15-minute outer bound remains unchanged.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

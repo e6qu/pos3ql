@@ -208,6 +208,8 @@ pub struct Config {
     pub max_foreign_servers: usize,
     /// Database-local foreign user-mapping catalog slots.
     pub max_user_mappings: usize,
+    /// Concurrent transaction-owned postgres_fdw sessions.
+    pub max_foreign_sessions: usize,
     /// Fixed receive buffer for postgres_fdw queries.
     pub foreign_receive_bytes: usize,
     /// Fixed send buffer for postgres_fdw queries.
@@ -433,6 +435,7 @@ impl Config {
             max_foreign_data_wrappers: 16,
             max_foreign_servers: 32,
             max_user_mappings: 64,
+            max_foreign_sessions: 16,
             foreign_receive_bytes: 256 * KIB,
             foreign_send_bytes: 64 * KIB,
             foreign_tls_ca_file: String::new(),
@@ -614,6 +617,10 @@ impl Config {
                 }
                 "max_user_mappings" => {
                     config.max_user_mappings =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_foreign_sessions" => {
+                    config.max_foreign_sessions =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "foreign_receive_bytes" => {
@@ -1634,10 +1641,13 @@ impl Config {
                 ));
             }
         }
-        if config.foreign_receive_bytes == 0 || config.foreign_send_bytes == 0 {
+        if config.max_foreign_sessions == 0
+            || config.foreign_receive_bytes == 0
+            || config.foreign_send_bytes == 0
+        {
             return Err(ConfigError::at(
                 0,
-                "foreign PostgreSQL buffers must be greater than zero".to_string(),
+                "foreign PostgreSQL session capacities must be greater than zero".to_string(),
             ));
         }
         if config.subscription_receive_bytes == 0
@@ -2189,6 +2199,7 @@ sql_arena_bytes = 4096
         assert!(Config::parse("max_indexes = 0\n").is_err());
         assert!(Config::parse("max_extended_statistics = 0\n").is_err());
         assert!(Config::parse("max_brin_unsummarized_ranges_per_index = 0\n").is_err());
+        assert!(Config::parse("max_foreign_sessions = 0\n").is_err());
         assert!(Config::parse("max_brin_unsummarized_ranges_per_index = 256\n").is_err());
         for name in [
             "max_views",

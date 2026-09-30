@@ -11504,8 +11504,45 @@ struct ForeignSessionSlot {
     session: Option<ForeignSession>,
 }
 
+struct ForeignSessionPool {
+    /// Serializes slot assignment so a transaction and endpoint cannot be
+    /// installed in two slots while another slot is being released.
+    assignment: std::sync::Mutex<()>,
+    slots: FixedVec<std::sync::Mutex<ForeignSessionSlot>>,
+}
+
+pub(crate) struct ForeignClientGuard<'a> {
+    slot: std::sync::MutexGuard<'a, ForeignSessionSlot>,
+}
+
+impl core::ops::Deref for ForeignClientGuard<'_> {
+    type Target = crate::pg::replication_client::ReplicationClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.slot.client
+    }
+}
+
+impl core::ops::DerefMut for ForeignClientGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slot.client
+    }
+}
+
+impl ForeignClientGuard<'_> {
+    pub(crate) fn activate(&mut self) {
+        let session = self
+            .slot
+            .session
+            .as_mut()
+            .expect("foreign session was reserved before activation");
+        assert!(!session.active);
+        session.active = true;
+    }
+}
+
 pub(crate) const fn foreign_session_slot_bytes() -> usize {
-    size_of::<RefCell<ForeignSessionSlot>>()
+    size_of::<std::sync::Mutex<ForeignSessionSlot>>()
 }
 
 struct ForeignStatementContext {
@@ -11852,7 +11889,7 @@ pub struct Storage {
     replication_slots: FixedVec<ReplicationSlotDef>,
     subscriptions: FixedVec<SubscriptionDef>,
     foreign: foreign::ForeignCatalog,
-    foreign_sessions: FixedVec<RefCell<ForeignSessionSlot>>,
+    foreign_sessions: ForeignSessionPool,
     foreign_statement_contexts: FixedVec<RefCell<ForeignStatementContext>>,
     subscription_relations: FixedVec<SubscriptionRelation>,
     matviews: FixedVec<MatviewDef>,
@@ -16444,11 +16481,10 @@ impl Storage {
             replication_slots,
             subscriptions,
             foreign,
-            foreign_sessions: FixedVec::new(
-                budget,
-                "foreign_sessions",
-                config.max_foreign_sessions,
-            )?,
+            foreign_sessions: ForeignSessionPool {
+                assignment: std::sync::Mutex::new(()),
+                slots: FixedVec::new(budget, "foreign_sessions", config.max_foreign_sessions)?,
+            },
             foreign_statement_contexts,
             subscription_relations,
             matviews,
@@ -16542,7 +16578,8 @@ impl Storage {
         client: crate::pg::replication_client::ReplicationClient,
     ) {
         self.foreign_sessions
-            .push(RefCell::new(ForeignSessionSlot {
+            .slots
+            .push(std::sync::Mutex::new(ForeignSessionSlot {
                 client,
                 session: None,
             }))
@@ -16552,9 +16589,10 @@ impl Storage {
     pub(crate) fn foreign_client(
         &self,
         lease: ForeignSessionLease,
-    ) -> Result<std::cell::RefMut<'_, crate::pg::replication_client::ReplicationClient>, SqlError>
-    {
-        let slot = self.foreign_sessions[lease.session_id.index()].borrow_mut();
+    ) -> Result<ForeignClientGuard<'_>, SqlError> {
+        let slot = self.foreign_sessions.slots[lease.session_id.index()]
+            .lock()
+            .expect("foreign session lock poisoned");
         if !slot.session.is_some_and(|session| {
             session.transaction_id == lease.transaction_id && session.endpoint == lease.endpoint
         }) {
@@ -16563,7 +16601,7 @@ impl Storage {
                 "foreign PostgreSQL session is not owned by this transaction"
             ));
         }
-        Ok(std::cell::RefMut::map(slot, |slot| &mut slot.client))
+        Ok(ForeignClientGuard { slot })
     }
 
     /// Reserves or finds the session for one local transaction and endpoint.
@@ -16574,9 +16612,14 @@ impl Storage {
         endpoint: crate::pg::replication_client::ConnectionInfo,
         timeout: std::time::Duration,
     ) -> Result<(ForeignSessionLease, bool), SqlError> {
+        let _assignment = self
+            .foreign_sessions
+            .assignment
+            .lock()
+            .expect("foreign session assignment lock poisoned");
         let mut vacant = None;
-        for (index, slot) in self.foreign_sessions.iter().enumerate() {
-            let session = slot.borrow().session;
+        for (index, slot) in self.foreign_sessions.slots.iter().enumerate() {
+            let session = slot.lock().expect("foreign session lock poisoned").session;
             match session {
                 Some(session)
                     if session.transaction_id == transaction_id && session.endpoint == endpoint =>
@@ -16606,7 +16649,10 @@ impl Storage {
                 "configured foreign PostgreSQL session capacity is exhausted"
             )
         })?;
-        self.foreign_sessions[index].borrow_mut().session = Some(ForeignSession {
+        self.foreign_sessions.slots[index]
+            .lock()
+            .expect("foreign session lock poisoned")
+            .session = Some(ForeignSession {
             transaction_id,
             endpoint,
             timeout,
@@ -16622,21 +16668,10 @@ impl Storage {
         ))
     }
 
-    pub(crate) fn activate_foreign_session(&self, lease: ForeignSessionLease) {
-        let mut slot = self.foreign_sessions[lease.session_id.index()].borrow_mut();
-        let session = slot
-            .session
-            .as_mut()
-            .expect("foreign session was reserved before activation");
-        assert_eq!(session.transaction_id, lease.transaction_id);
-        assert_eq!(session.endpoint, lease.endpoint);
-        assert!(!session.active);
-        session.active = true;
-    }
-
     pub(crate) fn has_foreign_session(&self, transaction_id: u32) -> bool {
-        self.foreign_sessions.iter().any(|slot| {
-            slot.borrow()
+        self.foreign_sessions.slots.iter().any(|slot| {
+            slot.lock()
+                .expect("foreign session lock poisoned")
                 .session
                 .is_some_and(|session| session.transaction_id == transaction_id && session.active)
         })
@@ -16646,8 +16681,9 @@ impl Storage {
         &self,
         lease: ForeignSessionLease,
     ) -> Option<std::time::Duration> {
-        self.foreign_sessions[lease.session_id.index()]
-            .borrow()
+        self.foreign_sessions.slots[lease.session_id.index()]
+            .lock()
+            .expect("foreign session lock poisoned")
             .session
             .filter(|session| {
                 session.transaction_id == lease.transaction_id
@@ -16662,10 +16698,14 @@ impl Storage {
         transaction_id: u32,
     ) -> impl Iterator<Item = ForeignSessionLease> + '_ {
         self.foreign_sessions
+            .slots
             .iter()
             .enumerate()
             .filter_map(move |(index, slot)| {
-                let session = slot.borrow().session?;
+                let session = slot
+                    .lock()
+                    .expect("foreign session lock poisoned")
+                    .session?;
                 (session.transaction_id == transaction_id && session.active).then_some(
                     ForeignSessionLease {
                         session_id: ForeignSessionId(index),
@@ -16678,13 +16718,26 @@ impl Storage {
 
     pub(crate) fn foreign_sessions_used(&self) -> usize {
         self.foreign_sessions
+            .slots
             .iter()
-            .filter(|slot| slot.borrow().session.is_some())
+            .filter(|slot| {
+                slot.lock()
+                    .expect("foreign session lock poisoned")
+                    .session
+                    .is_some()
+            })
             .count()
     }
 
     pub(crate) fn clear_foreign_session(&self, lease: ForeignSessionLease) {
-        let mut slot = self.foreign_sessions[lease.session_id.index()].borrow_mut();
+        let _assignment = self
+            .foreign_sessions
+            .assignment
+            .lock()
+            .expect("foreign session assignment lock poisoned");
+        let mut slot = self.foreign_sessions.slots[lease.session_id.index()]
+            .lock()
+            .expect("foreign session lock poisoned");
         if slot.session.is_some_and(|session| {
             session.transaction_id == lease.transaction_id && session.endpoint == lease.endpoint
         }) {
@@ -46431,8 +46484,8 @@ mod tests {
         );
         assert_eq!(storage.tablespaces.len(), 15);
         assert_eq!(storage.comments.len(), 16);
-        assert_eq!(storage.foreign_sessions.capacity(), 3);
-        assert!(storage.foreign_sessions.is_empty());
+        assert_eq!(storage.foreign_sessions.slots.capacity(), 3);
+        assert!(storage.foreign_sessions.slots.is_empty());
         assert_eq!(storage.cumulative_statistics().functions.capacity(), 5);
         assert_eq!(
             storage
@@ -46481,6 +46534,9 @@ mod tests {
 
     #[test]
     fn foreign_session_pool_is_endpoint_keyed_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ForeignSessionPool>();
+
         let mut config = test_config();
         config.max_foreign_sessions = 2;
         config.foreign_receive_bytes = 256;
@@ -46515,19 +46571,33 @@ mod tests {
             .reserve_foreign_session(41, first, std::time::Duration::from_secs(1))
             .unwrap();
         assert!(!active);
-        storage.activate_foreign_session(first_id);
+        storage.foreign_client(first_id).unwrap().activate();
         assert_eq!(
             storage
                 .reserve_foreign_session(41, first, std::time::Duration::from_secs(1))
                 .unwrap(),
             (first_id, true)
         );
+        let client = storage.foreign_client(first_id).unwrap();
+        std::thread::scope(|scope| {
+            let slot = &storage.foreign_sessions.slots[first_id.session_id.index()];
+            scope
+                .spawn(move || {
+                    assert!(matches!(
+                        slot.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                })
+                .join()
+                .unwrap();
+        });
+        drop(client);
 
         let (second_id, active) = storage
             .reserve_foreign_session(41, second, std::time::Duration::from_secs(2))
             .unwrap();
         assert!(!active);
-        storage.activate_foreign_session(second_id);
+        storage.foreign_client(second_id).unwrap().activate();
         assert_ne!(first_id, second_id);
         assert_eq!(storage.foreign_sessions(41).count(), 2);
         assert_eq!(storage.foreign_sessions_used(), 2);
@@ -46558,7 +46628,7 @@ mod tests {
             storage.foreign_client(first_id).err().unwrap().sqlstate,
             sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
         );
-        storage.activate_foreign_session(replacement);
+        storage.foreign_client(replacement).unwrap().activate();
 
         for session_id in storage.foreign_sessions(41) {
             storage.clear_foreign_session(session_id);

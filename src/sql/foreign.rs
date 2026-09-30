@@ -280,8 +280,7 @@ fn enter_session(
         storage.clear_foreign_session(session);
         return Err(error);
     }
-    drop(client);
-    storage.activate_foreign_session(session);
+    client.activate();
     Ok(session)
 }
 

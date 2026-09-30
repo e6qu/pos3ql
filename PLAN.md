@@ -302,8 +302,8 @@ This prevents separate read and write readiness events from racing one queued
 dispatch. When one reactor turn has more ready connections than workspaces, it
 drains queued scheduler chunks but retains every response for the turn's single
 publication barrier. Queue capacity therefore does not reduce group commit
-width. Engine execution remains reactor-serialized because catalog, cache,
-lock, and foreign transport ownership is not thread safe. Parallel
+width. Engine execution remains reactor-serialized because catalog, cache, and
+lock ownership is not thread safe. Parallel
 dispatch must replace the local queue drain with fixed workers and make that
 shared engine state safe while preserving transaction retry, object I/O
 parking, group publication, and response barriers.
@@ -317,7 +317,7 @@ The owned POSIX locale records its single-owner transfer invariant explicitly.
 A live-engine test moves ownership to another thread, executes SQL there, and
 drops its storage and locale state on that thread. The engine remains one
 owner at a time and reactor-serialized. Fixed workers still require shared
-catalog, cache, lock, and foreign transport state to be partitioned
+catalog, cache, and lock state to be partitioned
 or synchronized before dispatch can overlap.
 
 The effective SQL search path is now worker private. Every statement publishes
@@ -326,7 +326,7 @@ state, while view and schema-qualified nested execution swap and restore that
 same worker's value. Storage no longer carries a shared mutable path that one
 worker could change during another worker's name resolution. Cross-thread
 isolation and live engine transfer retain direct regressions. Catalog, cache,
-lock, and foreign transport ownership remain the shared mutation
+and lock ownership remain the shared mutation
 boundaries before fixed workers can execute concurrently.
 
 Command and durable commit snapshots are worker private as one fixed
@@ -356,8 +356,12 @@ remote endpoint. Each slot reserves its complete wire buffers at startup;
 opening a second transaction or endpoint uses a distinct slot, while exhaustion
 returns SQLSTATE `53300`. Savepoint, rollback, and commit commands visit every
 remote session owned by the local transaction. Metrics and capacity JSON report
-the configured and occupied slots. Concurrent socket driving still requires
-synchronized per-slot ownership before engine execution can overlap.
+the configured and occupied slots. Each complete client and its ownership
+record share a per-slot mutex, while assignment and release share one pool lock
+so concurrent reservations cannot duplicate an endpoint or claim the same
+capacity. A typed client guard retains the slot lock through remote activation.
+Operations on one session serialize while distinct slots can drive their
+sockets concurrently.
 
 Cumulative relation, index, database, and function statistics now share one
 fixed state protected by a mutex. Transaction nesting and pending counters use

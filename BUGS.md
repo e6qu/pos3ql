@@ -578,6 +578,14 @@ mutable borrow or overwrite a traversal in progress. Each leased query
 workspace now owns an independently allocated bitmap selected by the typed
 worker-local identity. Exact memory-plan charging, workspace isolation, role
 membership, object privileges, and column privileges retain direct coverage.
+The foreign-statement audit found one engine-global transaction identity,
+isolation flag, and savepoint roster published before remote execution. A
+worker could therefore replace the context another worker was about to consume.
+Each leased query workspace now owns an independently allocated context and
+fixed savepoint roster selected by the typed worker-local identity. Exact
+memory-plan charging and workspace isolation retain direct coverage. The
+transaction-owned foreign transport remains an explicit single-session
+capacity with named exhaustion.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

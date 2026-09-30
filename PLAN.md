@@ -346,6 +346,15 @@ other's traversal. `query_workspace_slots` charges the bitmap and its container
 exactly in the fixed memory plan. Shared role and ACL catalog mutation remains
 serialized with the other catalog write paths.
 
+Foreign statement context now follows the same workspace boundary. Each leased
+workspace owns the transaction identity, isolation flag, and fixed savepoint
+roster used while opening or resuming a remote transaction, with exact startup
+charging through `query_workspace_slots`. A worker can no longer overwrite the
+context consumed by another worker's foreign scan. The foreign transport and
+remote transaction session remain one explicit transaction-owned capacity;
+overlapping foreign transactions require a fixed transaction-keyed session pool
+before engine execution can run concurrently.
+
 ### Performance qualification
 
 The [256-row](benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)

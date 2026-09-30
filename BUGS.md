@@ -604,6 +604,15 @@ workers. They now share one startup-bounded state protected by a mutex.
 Transaction finalization updates relation and database totals atomically, and
 function counter creation and increment occur under the same lock. A four-worker
 regression verifies synchronization and exact retained capacities.
+The foreign-transport ownership audit found that each startup-bounded client
+and its session record still used `RefCell`, so overlapping workers would panic
+instead of serializing socket access. Each complete slot now uses a mutex and a
+typed guard that retains ownership through remote activation. Reservation and
+release share a pool assignment lock, preventing concurrent scans from
+duplicating a transaction/endpoint session or claiming the same vacant slot.
+The pool is compiler-checked as `Send + Sync`; endpoint isolation, typed lease
+validation, exhaustion, reuse, and exact startup charging retain direct
+coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

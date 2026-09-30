@@ -122,8 +122,8 @@ active production roadmap is [PLAN.md](../PLAN.md).
   and schema execution swap and restore only the current worker's value.
   Command and durable commit snapshots likewise form one worker-local
   visibility context used by row, SST, and durable index reads. Engine mutation
-  remains single-owner and serialized while catalog, cache, lock, and foreign
-  transport sharing is prepared. Authorization graph traversal
+  remains single-owner and serialized while catalog, cache, and lock sharing is
+  prepared. Authorization graph traversal
   uses one exactly charged bitmap per query workspace, selected by the typed
   worker-local lease identity. Foreign statement transaction identity,
   isolation state, and fixed savepoint rosters use the same per-workspace
@@ -131,7 +131,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   charged `max_foreign_sessions` pool keyed by local transaction and remote
   endpoint; savepoint, rollback, and commit commands cover every remote session
   owned by the transaction, SQLSTATE `53300` reports pool exhaustion, and the
-  operational endpoints report configured and occupied slots. Relation, index,
+  operational endpoints report configured and occupied slots. Each complete
+  client and ownership record share a per-slot mutex and typed client guard;
+  assignment and release use one pool lock so operations serialize within a
+  session while distinct slots can drive concurrently. Relation, index,
   database, and function cumulative statistics, including transaction nesting
   and shared reset timestamps, use one startup-bounded state protected by a
   mutex; commit and rollback publish relation and database totals atomically.

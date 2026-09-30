@@ -572,6 +572,12 @@ seen by another worker. Both snapshots now form one fixed thread-local
 visibility context initialized and published at statement boundaries.
 Cross-thread isolation, command-history visibility, repeatable reads, and cold
 recovery retain direct coverage.
+The authorization audit found one engine-global role-graph bitmap reused by
+all membership and privilege checks. Concurrent workers could collide on its
+mutable borrow or overwrite a traversal in progress. Each leased query
+workspace now owns an independently allocated bitmap selected by the typed
+worker-local identity. Exact memory-plan charging, workspace isolation, role
+membership, object privileges, and column privileges retain direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

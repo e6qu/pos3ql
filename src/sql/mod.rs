@@ -282,8 +282,12 @@ fn set_execution_query_workspace(workspace: QueryWorkspaceId) {
     EXECUTION_QUERY_WORKSPACE.with(|active| active.set(workspace.index()));
 }
 
-fn execution_query_workspace() -> QueryWorkspaceId {
+pub(crate) fn execution_query_workspace() -> QueryWorkspaceId {
     QueryWorkspaceId::from_index(EXECUTION_QUERY_WORKSPACE.with(core::cell::Cell::get))
+}
+
+pub(crate) fn reset_execution_query_workspace() {
+    set_execution_query_workspace(QueryWorkspaceId::from_index(0));
 }
 
 struct DmlWorkspaces {
@@ -323,7 +327,7 @@ impl core::ops::DerefMut for DmlWorkspaces {
 
 impl QueryWorkspaces {
     fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
-        set_execution_query_workspace(QueryWorkspaceId::from_index(0));
+        reset_execution_query_workspace();
         let mut slots = FixedVec::new(budget, "query_workspaces", config.query_workspace_slots)?;
         for _ in 0..config.query_workspace_slots {
             slots

@@ -338,6 +338,14 @@ a direct regression alongside command-history, repeatable-read, and cold
 recovery coverage. The remaining shared catalog and row mutation paths still
 require synchronization before fixed workers can overlap execution.
 
+Authorization graph traversal now has one startup-sized bitmap per query
+workspace. Every role membership, object privilege, grant-option, and column
+privilege check selects scratch through the typed worker-local lease identity,
+so overlapping workers cannot collide on one mutable borrow or overwrite each
+other's traversal. `query_workspace_slots` charges the bitmap and its container
+exactly in the fixed memory plan. Shared role and ACL catalog mutation remains
+serialized with the other catalog write paths.
+
 ### Performance qualification
 
 The [256-row](benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)

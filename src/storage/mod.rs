@@ -11846,9 +11846,8 @@ pub struct Storage {
     roles: FixedVec<RoleDef>,
     role_memberships: FixedVec<RoleMembership>,
     role_settings: FixedVec<RoleSetting>,
-    /// Reused authorization-graph bitmap. Query execution is currently
-    /// serialized, so one startup-sized scratch area serves every traversal.
-    role_graph_scratch: std::cell::RefCell<FixedVec<bool>>,
+    /// One startup-sized authorization-graph bitmap per leased query workspace.
+    role_graph_scratch: FixedVec<std::cell::RefCell<FixedVec<bool>>>,
     system_settings: FixedVec<SystemSetting>,
     prepared_transactions: FixedVec<PreparedTransactionCatalogEntry>,
     acl_entries: FixedVec<AclEntry>,
@@ -15304,7 +15303,9 @@ impl Storage {
             + config.max_roles * size_of::<RoleDef>()
             + config.max_role_memberships * size_of::<RoleMembership>()
             + config.max_role_settings * size_of::<RoleSetting>()
-            + config.max_roles * size_of::<bool>()
+            + config.query_workspace_slots
+                * (size_of::<std::cell::RefCell<FixedVec<bool>>>()
+                    + config.max_roles * size_of::<bool>())
             + MAX_SYSTEM_SETTINGS * size_of::<SystemSetting>()
             + config.max_prepared_transactions * size_of::<PreparedTransactionCatalogEntry>()
             + config.max_acl_entries * size_of::<AclEntry>()
@@ -16023,9 +16024,19 @@ impl Storage {
                 .push(RoleSetting::EMPTY)
                 .expect("sized to max_role_settings");
         }
-        let mut role_graph_scratch = FixedVec::new(budget, "role_graph_scratch", config.max_roles)?;
-        for _ in 0..config.max_roles {
-            role_graph_scratch.push(false).expect("sized to max_roles");
+        let mut role_graph_scratch = FixedVec::new(
+            budget,
+            "role_graph_workspaces",
+            config.query_workspace_slots,
+        )?;
+        for _ in 0..config.query_workspace_slots {
+            let mut scratch = FixedVec::new(budget, "role_graph_scratch", config.max_roles)?;
+            for _ in 0..config.max_roles {
+                scratch.push(false).expect("sized to max_roles");
+            }
+            role_graph_scratch
+                .push(std::cell::RefCell::new(scratch))
+                .expect("sized to query_workspace_slots");
         }
         let mut system_settings = FixedVec::new(budget, "system_settings", MAX_SYSTEM_SETTINGS)?;
         for _ in 0..MAX_SYSTEM_SETTINGS {
@@ -16371,7 +16382,7 @@ impl Storage {
             roles,
             role_memberships,
             role_settings,
-            role_graph_scratch: std::cell::RefCell::new(role_graph_scratch),
+            role_graph_scratch,
             system_settings,
             prepared_transactions,
             acl_entries,
@@ -16398,6 +16409,7 @@ impl Storage {
             index_arena,
             collation: None,
         };
+        crate::sql::reset_execution_query_workspace();
         replace_execution_path(PathContext::public_schema(2));
         replace_execution_visibility(VisibilityContext::all());
         Ok(storage)
@@ -21215,6 +21227,11 @@ impl Storage {
         }
     }
 
+    fn role_graph_scratch(&self) -> core::cell::RefMut<'_, FixedVec<bool>> {
+        let workspace = crate::sql::execution_query_workspace().index();
+        self.role_graph_scratch[workspace].borrow_mut()
+    }
+
     pub(crate) fn has_column_privilege(
         &self,
         target: ColumnPrivilegeTarget,
@@ -21225,7 +21242,7 @@ impl Storage {
         if self.has_object_privilege(target.relation, role, privilege, txid) {
             return true;
         }
-        let mut roles = self.role_graph_scratch.borrow_mut();
+        let mut roles = self.role_graph_scratch();
         self.reachable_roles(role, txid, true, false, &mut roles);
         let mut effective = self.column_acl_to(target, PUBLIC_ROLE, txid).0;
         for (slot, inherited) in roles.iter().copied().enumerate() {
@@ -21246,7 +21263,7 @@ impl Storage {
         if self.has_object_grant_option(target.relation, role, privilege, txid) {
             return true;
         }
-        let mut roles = self.role_graph_scratch.borrow_mut();
+        let mut roles = self.role_graph_scratch();
         self.reachable_roles(role, txid, true, false, &mut roles);
         let mut effective = self.column_acl_to(target, PUBLIC_ROLE, txid).1;
         for (slot, inherited) in roles.iter().copied().enumerate() {
@@ -21305,7 +21322,7 @@ impl Storage {
         if self.role(current).attributes_to(txid).superuser {
             return true;
         }
-        let mut roles = self.role_graph_scratch.borrow_mut();
+        let mut roles = self.role_graph_scratch();
         self.reachable_roles(current, txid, true, false, &mut roles);
         roles.get(role as usize).copied().unwrap_or(false)
     }
@@ -21321,7 +21338,7 @@ impl Storage {
         {
             return true;
         }
-        let mut roles = self.role_graph_scratch.borrow_mut();
+        let mut roles = self.role_graph_scratch();
         self.reachable_roles(role, txid, true, false, &mut roles);
         let acl_defined = self.acl_entries.iter().any(|entry| {
             entry.object == object
@@ -21653,7 +21670,7 @@ impl Storage {
         {
             return true;
         }
-        let mut roles = self.role_graph_scratch.borrow_mut();
+        let mut roles = self.role_graph_scratch();
         self.reachable_roles(role, txid, true, false, &mut roles);
         let mut effective = self.acl_to(object, PUBLIC_ROLE, txid).1;
         for (slot, inherited) in roles.iter().copied().enumerate() {
@@ -22354,7 +22371,7 @@ impl Storage {
         if member == target {
             return true;
         }
-        let mut visited = self.role_graph_scratch.borrow_mut();
+        let mut visited = self.role_graph_scratch();
         self.reachable_roles(member, txid, false, require_set, &mut visited);
         visited.get(target).copied().unwrap_or(false)
     }
@@ -46072,6 +46089,7 @@ mod tests {
     #[test]
     fn catalog_object_pools_follow_their_independent_startup_capacities() {
         let mut config = test_config();
+        config.query_workspace_slots = 2;
         config.max_tables = 2;
         config.max_databases = 6;
         config.max_schemas = 17;
@@ -46159,7 +46177,15 @@ mod tests {
         assert_eq!(storage.roles.len(), 19);
         assert_eq!(storage.role_memberships.len(), 20);
         assert_eq!(storage.role_settings.len(), 21);
-        assert_eq!(storage.role_graph_scratch.borrow().len(), 19);
+        assert_eq!(storage.role_graph_scratch.len(), 2);
+        assert!(
+            storage
+                .role_graph_scratch
+                .iter()
+                .all(|scratch| scratch.borrow().len() == 19)
+        );
+        storage.role_graph_scratch[0].borrow_mut()[3] = true;
+        assert!(!storage.role_graph_scratch[1].borrow()[3]);
         assert_eq!(storage.acl_entries.capacity(), 22);
         assert_eq!(storage.column_acl_entries.capacity(), 23);
         assert_eq!(storage.default_acl_entries.capacity(), 24);

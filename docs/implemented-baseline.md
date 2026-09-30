@@ -123,7 +123,9 @@ active production roadmap is [PLAN.md](../PLAN.md).
   Command and durable commit snapshots likewise form one worker-local
   visibility context used by row, SST, and durable index reads. Engine mutation
   remains single-owner and serialized while catalog, cache, lock, foreign
-  transport, and statistics sharing is prepared.
+  transport, and statistics sharing is prepared. Authorization graph traversal
+  uses one exactly charged bitmap per query workspace, selected by the typed
+  worker-local lease identity.
 - Streamed COPY transition rows are retained in fixed connection-private and
   subscription-worker-private buffers. Interleaved streams preserve the exact
   row set for statement transition triggers without runtime allocation.

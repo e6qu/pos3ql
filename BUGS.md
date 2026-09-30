@@ -613,6 +613,15 @@ duplicating a transaction/endpoint session or claiming the same vacant slot.
 The pool is compiler-checked as `Send + Sync`; endpoint isolation, typed lease
 validation, exhaustion, reuse, and exact startup charging retain direct
 coverage.
+The transaction-identity audit found active identities, recent completion
+statuses, their replacement cursor, and the latest observed identity split
+across independent `RefCell` and `Cell` values. Overlapping workers could panic,
+lose begin/finish updates, or construct a snapshot and checkpoint manifest from
+different registry moments. One startup-bounded mutex now owns the complete
+state. Identity transitions, status queries, snapshot construction, and
+manifest traversal use one coherent lock boundary. A four-worker regression
+and a `Send + Sync` assertion cover concurrent updates and exact retained
+capacities.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

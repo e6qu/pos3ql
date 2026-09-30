@@ -180,19 +180,20 @@ fn poll_client(
     Ok(())
 }
 
-/// Enters the remote transaction corresponding to `txid`.  The transport has
-/// one startup-reserved session, and Storage records its typed owner before any
-/// later foreign operation can reuse it.
+/// Enters the remote transaction corresponding to `txid` and `endpoint`.
+/// Storage reserves the fixed session slot before the socket opens, so no
+/// other local transaction can reuse its buffers while setup is in progress.
 fn enter_session(
     storage: &Storage,
     txid: u32,
     endpoint: ConnectionInfo,
     timeout: Duration,
-) -> Result<(), SqlError> {
-    if storage.foreign_session_active(txid, endpoint)? {
-        return Ok(());
+) -> Result<crate::storage::ForeignSessionLease, SqlError> {
+    let (session, active) = storage.reserve_foreign_session(txid, endpoint, timeout)?;
+    if active {
+        return Ok(session);
     }
-    let mut client = storage.foreign_client()?;
+    let mut client = storage.foreign_client(session)?;
     let result = (|| {
         client.bind_sql(endpoint).map_err(client_error)?;
         let deadline = Instant::now() + timeout;
@@ -275,24 +276,29 @@ fn enter_session(
     })();
     if let Err(error) = result {
         client.unbind();
+        drop(client);
+        storage.clear_foreign_session(session);
         return Err(error);
     }
     drop(client);
-    storage.activate_foreign_session(txid, endpoint, timeout);
-    Ok(())
+    storage.activate_foreign_session(session);
+    Ok(session)
 }
 
 fn session_command(
     storage: &Storage,
-    txid: u32,
+    session: crate::storage::ForeignSessionLease,
     command: &str,
     completion: &str,
     transaction_status: u8,
 ) -> Result<(), SqlError> {
-    let Some(timeout) = storage.foreign_session_timeout(txid) else {
-        return Ok(());
-    };
-    let mut client = storage.foreign_client()?;
+    let timeout = storage.foreign_session_timeout(session).ok_or_else(|| {
+        sql_err!(
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "foreign PostgreSQL session is not active"
+        )
+    })?;
+    let mut client = storage.foreign_client(session)?;
     (|| {
         client.query(command).map_err(client_error)?;
         let deadline = Instant::now() + timeout;
@@ -317,27 +323,37 @@ fn session_command(
     })()
 }
 
-fn close_session(storage: &Storage, txid: u32, command: &str) -> Result<(), SqlError> {
-    let result = session_command(storage, txid, command, command, b'I');
-    if storage.foreign_session_endpoint(txid).is_none() {
-        return result;
-    }
-    let mut client = storage.foreign_client()?;
+fn close_session(
+    storage: &Storage,
+    session: crate::storage::ForeignSessionLease,
+    command: &str,
+) -> Result<(), SqlError> {
+    let result = session_command(storage, session, command, command, b'I');
+    let mut client = storage.foreign_client(session)?;
     client.unbind();
     drop(client);
-    storage.clear_foreign_session(txid);
+    storage.clear_foreign_session(session);
     result
 }
 
 pub(crate) fn commit_session(storage: &Storage, txid: u32) -> Result<(), SqlError> {
-    close_session(storage, txid, "COMMIT")
+    let mut result = Ok(());
+    for session in storage.foreign_sessions(txid) {
+        let closed = close_session(storage, session, "COMMIT");
+        if result.is_ok() {
+            result = closed;
+        }
+    }
+    result
 }
 
-/// ROLLBACK has no error channel in PostgreSQL's command protocol.  If the
-/// wire exchange cannot complete, dropping its sole transport forces the
-/// remote backend to abort the transaction before the session slot is reused.
+/// ROLLBACK has no error channel in PostgreSQL's command protocol. If a wire
+/// exchange cannot complete, unbinding that transport forces the remote
+/// backend to abort before the fixed slot is reused.
 pub(crate) fn abort_session(storage: &Storage, txid: u32) {
-    let _ = close_session(storage, txid, "ROLLBACK");
+    for session in storage.foreign_sessions(txid) {
+        let _ = close_session(storage, session, "ROLLBACK");
+    }
 }
 
 fn savepoint_command(
@@ -346,9 +362,6 @@ fn savepoint_command(
     prefix: &str,
     name: &str,
 ) -> Result<(), SqlError> {
-    if storage.foreign_session_endpoint(txid).is_none() {
-        return Ok(());
-    }
     let mut command = StackStr::<256>::new();
     let _ = command.write_str(prefix);
     quote_identifier(&mut command, name);
@@ -364,7 +377,10 @@ fn savepoint_command(
         "ROLLBACK TO SAVEPOINT " => "ROLLBACK",
         _ => unreachable!("foreign savepoint command has a fixed prefix"),
     };
-    session_command(storage, txid, command.as_str(), completion, b'T')
+    for session in storage.foreign_sessions(txid) {
+        session_command(storage, session, command.as_str(), completion, b'T')?;
+    }
+    Ok(())
 }
 
 pub(crate) fn savepoint(storage: &Storage, txid: u32, name: &str) -> Result<(), SqlError> {
@@ -528,9 +544,9 @@ pub(crate) fn import_commands<'a>(
     let mut count = 0usize;
     let mut capacity = 0usize;
     let mut response_error = None;
-    enter_session(storage, txid, endpoint, timeout)?;
+    let session = enter_session(storage, txid, endpoint, timeout)?;
     let mut ready = false;
-    let mut client = storage.foreign_client()?;
+    let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
         let deadline = Instant::now() + timeout;
         client.query(query.as_str()).map_err(client_error)?;
@@ -870,9 +886,9 @@ pub(crate) fn materialize<'a>(
     let mut row_count = 0usize;
     let mut row_capacity = 0usize;
     let mut conversion_error = None;
-    enter_session(storage, txid, endpoint, timeout)?;
+    let session = enter_session(storage, txid, endpoint, timeout)?;
     let mut ready = false;
-    let mut client = storage.foreign_client()?;
+    let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
         let deadline = Instant::now() + timeout;
         client.query(query.as_str()).map_err(client_error)?;
@@ -1014,10 +1030,10 @@ pub(crate) fn visit_mutable_rows<'arena>(
         ));
     }
 
-    enter_session(storage, txid, endpoint, timeout)?;
+    let session = enter_session(storage, txid, endpoint, timeout)?;
     let mut ready = false;
     let mut response_error = None;
-    let mut client = storage.foreign_client()?;
+    let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
         client.query(query.as_str()).map_err(client_error)?;
         let deadline = Instant::now() + timeout;
@@ -1186,11 +1202,11 @@ pub(crate) fn insert_row<'a>(
     for (column, value) in values.iter().enumerate() {
         parameters[column] = Responder::datum_wire_text(value, render, arena)?;
     }
-    enter_session(storage, txid, endpoint, timeout)?;
+    let session = enter_session(storage, txid, endpoint, timeout)?;
     let mut returned = None;
     let mut response_error = None;
     let mut ready = false;
-    let mut client = storage.foreign_client()?;
+    let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
         client
             .query_params(query.as_str(), &parameters[..table.n_columns])
@@ -1287,23 +1303,24 @@ pub(crate) fn insert_row<'a>(
 
 fn remote_returning_row<'a>(
     storage: &Storage,
+    session: crate::storage::ForeignSessionLease,
     table: &TableDef,
-    txid: u32,
     arena: &'a Arena,
     query: &str,
     parameters: &[Option<&[u8]>],
     operation: &str,
 ) -> Result<Option<&'a [u8]>, SqlError> {
+    let txid = session.transaction_id();
     let mut returned = None;
     let mut response_error = None;
     let mut ready = false;
-    let mut client = storage.foreign_client()?;
-    let timeout = storage.foreign_session_timeout(txid).ok_or_else(|| {
+    let timeout = storage.foreign_session_timeout(session).ok_or_else(|| {
         sql_err!(
             sqlstate::INTERNAL_ERROR,
             "foreign mutation has no transaction-owned remote session"
         )
     })?;
+    let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
         client
             .query_params(query, parameters)
@@ -1423,11 +1440,11 @@ pub(crate) fn fetch_row<'a>(
     }
     let mut parameter = StackStr::<32>::new();
     tuple_id.write_text(&mut parameter);
-    enter_session(storage, txid, endpoint, timeout)?;
+    let session = enter_session(storage, txid, endpoint, timeout)?;
     remote_returning_row(
         storage,
+        session,
         &table,
-        txid,
         arena,
         query.as_str(),
         &[Some(parameter.as_str().as_bytes())],
@@ -1508,11 +1525,11 @@ pub(crate) fn update_row<'data>(
     let mut identity = StackStr::<32>::new();
     tuple_id.write_text(&mut identity);
     parameters[target_columns.len()] = Some(identity.as_str().as_bytes());
-    enter_session(storage, txid, endpoint, timeout)?;
+    let session = enter_session(storage, txid, endpoint, timeout)?;
     let Some(row) = remote_returning_row(
         storage,
+        session,
         &table,
-        txid,
         arena,
         query.as_str(),
         &parameters[..target_columns.len() + 1],
@@ -1565,11 +1582,11 @@ pub(crate) fn delete_row<'a>(
     }
     let mut parameter = StackStr::<32>::new();
     tuple_id.write_text(&mut parameter);
-    enter_session(storage, txid, endpoint, timeout)?;
+    let session = enter_session(storage, txid, endpoint, timeout)?;
     remote_returning_row(
         storage,
+        session,
         &table,
-        txid,
         arena,
         query.as_str(),
         &[Some(parameter.as_str().as_bytes())],
@@ -1584,10 +1601,10 @@ fn execute_command(
     timeout: Duration,
     command: &str,
 ) -> Result<(), SqlError> {
-    enter_session(storage, txid, endpoint, timeout)?;
+    let session = enter_session(storage, txid, endpoint, timeout)?;
     let mut ready = false;
     let mut complete = false;
-    let mut client = storage.foreign_client()?;
+    let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
         client.query(command).map_err(client_error)?;
         let deadline = Instant::now() + timeout;

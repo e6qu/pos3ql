@@ -127,8 +127,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   uses one exactly charged bitmap per query workspace, selected by the typed
   worker-local lease identity. Foreign statement transaction identity,
   isolation state, and fixed savepoint rosters use the same per-workspace
-  boundary and exact startup charging; the transaction-owned foreign transport
-  remains an explicit single-session capacity.
+  boundary and exact startup charging. Foreign transports use an exactly
+  charged `max_foreign_sessions` pool keyed by local transaction and remote
+  endpoint; savepoint, rollback, and commit commands cover every remote session
+  owned by the transaction, SQLSTATE `53300` reports pool exhaustion, and the
+  operational endpoints report configured and occupied slots.
 - Streamed COPY transition rows are retained in fixed connection-private and
   subscription-worker-private buffers. Interleaved streams preserve the exact
   row set for statement transition triggers without runtime allocation.

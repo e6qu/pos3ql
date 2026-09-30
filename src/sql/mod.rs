@@ -459,6 +459,7 @@ pub(crate) struct OperationalSnapshot {
     pub(crate) wal_capacity_bytes: u64,
     pub(crate) row_heap_used_bytes: usize,
     pub(crate) row_heap_capacity_bytes: usize,
+    pub(crate) foreign_sessions_used: usize,
     pub(crate) block_io: crate::store::BlockIoStats,
     pub(crate) checkpoint_pending: bool,
 }
@@ -2318,6 +2319,7 @@ impl Engine {
             wal_capacity_bytes: self.wal.capacity_bytes(),
             row_heap_used_bytes: self.storage.heap.used(),
             row_heap_capacity_bytes: self.storage.heap.capacity(),
+            foreign_sessions_used: self.storage.foreign_sessions_used(),
             block_io: self.storage.block_io_stats(),
             checkpoint_pending: self.checkpoint_work_pending(),
         }
@@ -3125,10 +3127,12 @@ impl Engine {
                     .saturating_add(size_of::<u32>()),
             )
             + two_phase::PreparedTransactions::budget_bytes(config)
-            + crate::pg::replication_client::ReplicationClient::budget_bytes(
-                1,
-                config.foreign_receive_bytes,
-                config.foreign_send_bytes,
+            + config.max_foreign_sessions.saturating_mul(
+                crate::pg::replication_client::ReplicationClient::budget_bytes(
+                    1,
+                    config.foreign_receive_bytes,
+                    config.foreign_send_bytes,
+                ),
             )
             + if config.temporary_spill_bytes == 0 {
                 0
@@ -3354,15 +3358,17 @@ impl Engine {
         let foreign_tls =
             crate::object_store::tls::build_client_config(&config.foreign_tls_ca_file)
                 .map_err(EngineSetupError::ForeignTransport)?;
-        let foreign_client = crate::pg::replication_client::ReplicationClient::new_unbound(
-            budget,
-            1,
-            config.foreign_receive_bytes,
-            config.foreign_send_bytes,
-            Some(&foreign_tls),
-        )
-        .map_err(|error| EngineSetupError::ForeignTransport(error.to_string()))?;
-        storage.install_foreign_client(foreign_client);
+        for _ in 0..config.max_foreign_sessions {
+            let foreign_client = crate::pg::replication_client::ReplicationClient::new_unbound(
+                budget,
+                1,
+                config.foreign_receive_bytes,
+                config.foreign_send_bytes,
+                Some(&foreign_tls),
+            )
+            .map_err(|error| EngineSetupError::ForeignTransport(error.to_string()))?;
+            storage.install_foreign_client(foreign_client);
+        }
         // The upload buffer must hold at least one full WAL batch.
         let upload_buf = config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes);
         let mut database_connections =
@@ -6625,7 +6631,7 @@ impl Engine {
                 ),
             ));
         }
-        if self.storage.foreign_session_endpoint(txn.txid).is_some() {
+        if self.storage.has_foreign_session(txn.txid) {
             return Err(fail(
                 self,
                 txn,

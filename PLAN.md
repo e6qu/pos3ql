@@ -350,10 +350,14 @@ Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint
 roster used while opening or resuming a remote transaction, with exact startup
 charging through `query_workspace_slots`. A worker can no longer overwrite the
-context consumed by another worker's foreign scan. The foreign transport and
-remote transaction session remain one explicit transaction-owned capacity;
-overlapping foreign transactions require a fixed transaction-keyed session pool
-before engine execution can run concurrently.
+context consumed by another worker's foreign scan. Foreign transports now form
+an exactly charged `max_foreign_sessions` pool keyed by local transaction and
+remote endpoint. Each slot reserves its complete wire buffers at startup;
+opening a second transaction or endpoint uses a distinct slot, while exhaustion
+returns SQLSTATE `53300`. Savepoint, rollback, and commit commands visit every
+remote session owned by the local transaction. Metrics and capacity JSON report
+the configured and occupied slots. Concurrent socket driving still requires
+synchronized per-slot ownership before engine execution can overlap.
 
 ### Performance qualification
 

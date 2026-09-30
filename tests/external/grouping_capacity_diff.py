@@ -6,6 +6,8 @@ import socket
 import struct
 import sys
 
+QUERY_TIMEOUT_SECONDS = 120
+
 
 def recv_exact(stream, length):
     output = bytearray()
@@ -55,8 +57,12 @@ def error_fields(payload):
 
 class Connection:
     def __init__(self, host, port):
-        self.stream = socket.create_connection((host, port), timeout=60)
-        self.stream.settimeout(60)
+        self.host = host
+        self.port = port
+        self.stream = socket.create_connection(
+            (host, port), timeout=QUERY_TIMEOUT_SECONDS
+        )
+        self.stream.settimeout(QUERY_TIMEOUT_SECONDS)
         startup = b"user\x00postgres\x00database\x00postgres\x00\x00"
         self.stream.sendall(struct.pack("!ii", len(startup) + 8, 3 << 16) + startup)
         while True:
@@ -158,7 +164,16 @@ def cases():
 def run(host, port, probes):
     connection = Connection(host, port)
     try:
-        return [(name, connection.query(sql)) for name, sql, _ in probes]
+        results = []
+        for name, sql, _ in probes:
+            try:
+                result = connection.query(sql)
+            except TimeoutError as error:
+                raise TimeoutError(
+                    f"timed out waiting for {host}:{port} while running {name}"
+                ) from error
+            results.append((name, result))
+        return results
     finally:
         connection.close()
 

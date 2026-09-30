@@ -121,9 +121,12 @@ active production roadmap is [PLAN.md](../PLAN.md).
   thread-local execution state published at statement boundaries; nested view
   and schema execution swap and restore only the current worker's value.
   Command and durable commit snapshots likewise form one worker-local
-  visibility context used by row, SST, and durable index reads. Engine mutation
-  remains single-owner and serialized while catalog, cache, and lock sharing is
-  prepared. Authorization graph traversal
+  visibility context used by row, SST, and durable index reads. Active
+  transaction identities, retained completion statuses, the replacement
+  cursor, and the latest observed identity share one startup-bounded mutex;
+  snapshot creation and checkpoint manifest emission observe one atomic state.
+  Engine mutation remains single-owner and serialized while catalog, cache, and
+  lock sharing is prepared. Authorization graph traversal
   uses one exactly charged bitmap per query workspace, selected by the typed
   worker-local lease identity. Foreign statement transaction identity,
   isolation state, and fixed savepoint rosters use the same per-workspace

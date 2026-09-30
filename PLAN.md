@@ -335,8 +335,13 @@ data-modifying common table expressions and routine replay can lower only the
 current worker's command snapshot. Storage row, SST, and durable index reads no
 longer consult mutable engine-global snapshots. Cross-thread isolation retains
 a direct regression alongside command-history, repeatable-read, and cold
-recovery coverage. The remaining shared catalog and row mutation paths still
-require synchronization before fixed workers can overlap execution.
+recovery coverage. Active transaction identities, retained completion statuses,
+their replacement cursor, and the latest observed identity now share one
+startup-bounded mutex. Snapshot construction and checkpoint manifest emission
+observe that registry atomically, while concurrent begin, assignment, finish,
+restore, and status queries cannot collide on interior borrows or lose updates.
+The remaining shared catalog and row mutation paths still require
+synchronization before fixed workers can overlap execution.
 
 Authorization graph traversal now has one startup-sized bitmap per query
 workspace. Every role membership, object privilege, grant-option, and column

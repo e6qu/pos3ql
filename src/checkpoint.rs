@@ -18,7 +18,7 @@ use crate::stack_format;
 use crate::storage::{
     CheckpointValueCursor, ColumnDefault, ColumnMeta, MAX_COLUMNS, MAX_RELATION_COLUMNS,
     OwnedDatum, PartitionBound, PartitionBoundValue, PartitionDef, PartitionStrategy, RowHome,
-    SerializedStoredQueryDependency, SqlName, Storage, TableDef,
+    SerializedStoredQueryDependency, SqlName, Storage, TableDef, TransactionIdentityRecord,
 };
 use crate::store::{
     BlockId, BlockStore, BlockType, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore, RowSstFormat,
@@ -7905,27 +7905,30 @@ impl Checkpointer {
             &mut self.manifest_buf,
             format_args!("next_rowid {}", storage.peek_next_rowid()),
         )?;
-        write_manifest(
-            &mut self.manifest_buf,
-            format_args!(
-                "latest_transaction_id {}",
-                storage.latest_transaction_identity()
-            ),
-        )?;
-        let mut status_result = Ok(());
-        storage.visit_recent_transaction_statuses(|transaction_id, committed| {
-            if status_result.is_ok() {
-                status_result = write_manifest(
+        let mut identity_result = Ok(());
+        storage.visit_transaction_identity_state(|record| {
+            if identity_result.is_err() {
+                return;
+            }
+            identity_result = match record {
+                TransactionIdentityRecord::Latest(transaction_id) => write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!("latest_transaction_id {transaction_id}"),
+                ),
+                TransactionIdentityRecord::Recent {
+                    transaction_id,
+                    committed,
+                } => write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
                         "transaction_status {} {}",
                         transaction_id,
                         if committed { "committed" } else { "aborted" }
                     ),
-                );
-            }
+                ),
+            };
         });
-        status_result?;
+        identity_result?;
         match storage.next_large_object_oid() {
             Some(oid) => write_manifest(
                 &mut self.manifest_buf,

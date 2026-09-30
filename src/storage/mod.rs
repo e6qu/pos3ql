@@ -11569,6 +11569,22 @@ struct RecentTransactionStatus {
     committed: bool,
 }
 
+struct TransactionIdentityState {
+    active: FixedVec<ActiveTransactionIdentity>,
+    recent: FixedVec<RecentTransactionStatus>,
+    recent_cursor: usize,
+    latest: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TransactionIdentityRecord {
+    Latest(u64),
+    Recent {
+        transaction_id: u64,
+        committed: bool,
+    },
+}
+
 /// One live client backend.  This is process state, not catalog state: the
 /// fixed registry is rebuilt as connections authenticate and is never written
 /// to WAL or checkpoints.
@@ -11946,10 +11962,7 @@ pub struct Storage {
     /// Assigned top-level transaction identities visible to SQL snapshots.
     /// The registry includes prepared transactions and is startup-bounded by
     /// the same connection/prepared-transaction capacity as MVCC snapshots.
-    transaction_identities: std::cell::RefCell<FixedVec<ActiveTransactionIdentity>>,
-    recent_transaction_statuses: std::cell::RefCell<FixedVec<RecentTransactionStatus>>,
-    recent_transaction_status_cursor: Cell<usize>,
-    latest_transaction_id: Cell<u64>,
+    transaction_identities: std::sync::Mutex<TransactionIdentityState>,
     /// PostgreSQL relation locks. Each mode is tracked independently because
     /// SHARE and SHARE UPDATE EXCLUSIVE are incomparable, and savepoint
     /// rollback releases only modes acquired by the rolled-back
@@ -16349,16 +16362,13 @@ impl Storage {
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         let active_snapshots = FixedVec::new(budget, "active_snapshots", transaction_capacity)?;
-        let transaction_identities = std::cell::RefCell::new(FixedVec::new(
-            budget,
-            "transaction_identities",
-            transaction_capacity,
-        )?);
-        let recent_transaction_statuses = std::cell::RefCell::new(FixedVec::new(
+        let transaction_identities =
+            FixedVec::new(budget, "transaction_identities", transaction_capacity)?;
+        let recent_transaction_statuses = FixedVec::new(
             budget,
             "recent_transaction_statuses",
             transaction_capacity.saturating_mul(8).max(64),
-        )?);
+        )?;
         let temporary_transactions = std::cell::RefCell::new(FixedVec::new(
             budget,
             "temporary_transactions",
@@ -16538,10 +16548,12 @@ impl Storage {
             comments,
             catalog_seq: 0,
             active_snapshots,
-            transaction_identities,
-            recent_transaction_statuses,
-            recent_transaction_status_cursor: Cell::new(0),
-            latest_transaction_id: Cell::new(0),
+            transaction_identities: std::sync::Mutex::new(TransactionIdentityState {
+                active: transaction_identities,
+                recent: recent_transaction_statuses,
+                recent_cursor: 0,
+                latest: 0,
+            }),
             table_locks,
             row_locks,
             advisory_locks,
@@ -41611,32 +41623,36 @@ impl Storage {
         replace_execution_visibility(visibility);
     }
 
+    fn transaction_identity_state(&self) -> std::sync::MutexGuard<'_, TransactionIdentityState> {
+        self.transaction_identities
+            .lock()
+            .expect("transaction identity lock poisoned")
+    }
+
     pub(crate) fn begin_transaction_identity(&self, transaction_id: u32) {
-        self.latest_transaction_id.set(
-            self.latest_transaction_id
-                .get()
-                .max(u64::from(transaction_id)),
-        );
-        let mut active = self.transaction_identities.borrow_mut();
-        if active
+        let connection_id = self.current_connection_id();
+        let mut identities = self.transaction_identity_state();
+        identities.latest = identities.latest.max(u64::from(transaction_id));
+        if identities
+            .active
             .iter()
             .any(|identity| identity.transaction_id == transaction_id)
         {
             return;
         }
-        active
+        identities
+            .active
             .push(ActiveTransactionIdentity {
                 transaction_id,
-                connection_id: (self.current_connection_id() > 0)
-                    .then_some(self.current_connection_id()),
+                connection_id: (connection_id > 0).then_some(connection_id),
                 assigned: false,
             })
             .expect("transaction identity registry matches configured capacity");
     }
 
     fn transaction_wait_owner(&self, transaction_id: u32) -> crate::sql::lock::WaitOwner {
-        self.transaction_identities
-            .borrow()
+        self.transaction_identity_state()
+            .active
             .iter()
             .find(|identity| identity.transaction_id == transaction_id)
             .and_then(|identity| identity.connection_id)
@@ -41647,8 +41663,9 @@ impl Storage {
     pub(crate) fn prepare_transaction_locks(&self, transaction_id: u32) {
         let prepared_owner = crate::sql::lock::prepared_wait_owner(transaction_id);
         let prior_owner = {
-            let mut identities = self.transaction_identities.borrow_mut();
+            let mut identities = self.transaction_identity_state();
             let Some(identity) = identities
+                .active
                 .iter_mut()
                 .find(|identity| identity.transaction_id == transaction_id)
             else {
@@ -41681,17 +41698,18 @@ impl Storage {
     }
 
     pub(crate) fn latest_transaction_identity(&self) -> u64 {
-        self.latest_transaction_id.get()
+        self.transaction_identity_state().latest
     }
 
     pub(crate) fn observe_transaction_identity(&self, transaction_id: u64) {
-        self.latest_transaction_id
-            .set(self.latest_transaction_id.get().max(transaction_id));
+        let mut identities = self.transaction_identity_state();
+        identities.latest = identities.latest.max(transaction_id);
     }
 
     pub(crate) fn assign_transaction_identity(&self, transaction_id: u32) -> u64 {
-        let mut active = self.transaction_identities.borrow_mut();
-        if let Some(identity) = active
+        let mut identities = self.transaction_identity_state();
+        if let Some(identity) = identities
+            .active
             .iter_mut()
             .find(|identity| identity.transaction_id == transaction_id)
         {
@@ -41701,8 +41719,8 @@ impl Storage {
     }
 
     pub(crate) fn assigned_transaction_identity(&self, transaction_id: u32) -> Option<u64> {
-        self.transaction_identities
-            .borrow()
+        self.transaction_identity_state()
+            .active
             .iter()
             .find(|identity| identity.transaction_id == transaction_id && identity.assigned)
             .map(|identity| u64::from(identity.transaction_id))
@@ -41713,15 +41731,15 @@ impl Storage {
         transaction_id: u32,
         arena: &'a crate::mem::arena::Arena,
     ) -> Result<crate::sql::snapshot::Snapshot<'a>, SqlError> {
-        let active = self.transaction_identities.borrow();
-        let minimum_active = active
+        let identities = self.transaction_identity_state();
+        let minimum_active = identities
+            .active
             .iter()
             .filter(|identity| identity.assigned)
             .map(|identity| u64::from(identity.transaction_id))
             .min();
-        let completed_xmax = self
-            .recent_transaction_statuses
-            .borrow()
+        let completed_xmax = identities
+            .recent
             .iter()
             .map(|status| status.transaction_id)
             .max()
@@ -41732,7 +41750,8 @@ impl Storage {
         // transactions can leave gaps, so an active identity is also the
         // lower bound needed to keep the canonical snapshot range valid.
         let xmax = completed_xmax.max(minimum_active.unwrap_or(0)).max(1);
-        let count = active
+        let count = identities
+            .active
             .iter()
             .filter(|identity| {
                 identity.assigned
@@ -41745,7 +41764,7 @@ impl Storage {
             xmin,
             xmax,
             count,
-            active.iter().filter_map(|identity| {
+            identities.active.iter().filter_map(|identity| {
                 (identity.assigned
                     && identity.transaction_id != transaction_id
                     && u64::from(identity.transaction_id) < xmax)
@@ -41756,41 +41775,45 @@ impl Storage {
     }
 
     pub(crate) fn finish_transaction_identity(&self, transaction_id: u32, committed: bool) {
-        let mut active = self.transaction_identities.borrow_mut();
-        let assigned = active
+        let mut identities = self.transaction_identity_state();
+        let assigned = identities
+            .active
             .iter()
             .position(|identity| identity.transaction_id == transaction_id)
-            .map(|index| active.swap_remove(index).assigned)
+            .map(|index| identities.active.swap_remove(index).assigned)
             .unwrap_or(false);
-        drop(active);
         if !assigned {
             return;
         }
-        self.record_transaction_status(u64::from(transaction_id), committed);
+        Self::record_transaction_status(&mut identities, u64::from(transaction_id), committed);
     }
 
-    fn record_transaction_status(&self, transaction_id: u64, committed: bool) {
+    fn record_transaction_status(
+        identities: &mut TransactionIdentityState,
+        transaction_id: u64,
+        committed: bool,
+    ) {
         let status = RecentTransactionStatus {
             transaction_id,
             committed,
         };
-        let mut recent = self.recent_transaction_statuses.borrow_mut();
-        if let Some(existing) = recent
+        if let Some(existing) = identities
+            .recent
             .iter_mut()
             .find(|existing| existing.transaction_id == transaction_id)
         {
             existing.committed = committed;
             return;
         }
-        if recent.len() < recent.capacity() {
-            recent
+        if identities.recent.len() < identities.recent.capacity() {
+            identities
+                .recent
                 .push(status)
                 .expect("transaction status registry has free capacity");
         } else {
-            let cursor = self.recent_transaction_status_cursor.get();
-            recent[cursor] = status;
-            self.recent_transaction_status_cursor
-                .set((cursor + 1) % recent.capacity());
+            let cursor = identities.recent_cursor;
+            identities.recent[cursor] = status;
+            identities.recent_cursor = (cursor + 1) % identities.recent.capacity();
         }
     }
 
@@ -41799,9 +41822,9 @@ impl Storage {
         transaction_id: u64,
         committed: bool,
     ) -> Result<(), SqlError> {
-        if self
-            .recent_transaction_statuses
-            .borrow()
+        let mut identities = self.transaction_identity_state();
+        if identities
+            .recent
             .iter()
             .any(|status| status.transaction_id == transaction_id)
         {
@@ -41810,14 +41833,22 @@ impl Storage {
                 "duplicate retained transaction status"
             ));
         }
-        self.observe_transaction_identity(transaction_id);
-        self.record_transaction_status(transaction_id, committed);
+        identities.latest = identities.latest.max(transaction_id);
+        Self::record_transaction_status(&mut identities, transaction_id, committed);
         Ok(())
     }
 
-    pub(crate) fn visit_recent_transaction_statuses(&self, mut visit: impl FnMut(u64, bool)) {
-        for status in self.recent_transaction_statuses.borrow().iter() {
-            visit(status.transaction_id, status.committed);
+    pub(crate) fn visit_transaction_identity_state(
+        &self,
+        mut visit: impl FnMut(TransactionIdentityRecord),
+    ) {
+        let identities = self.transaction_identity_state();
+        visit(TransactionIdentityRecord::Latest(identities.latest));
+        for status in identities.recent.iter() {
+            visit(TransactionIdentityRecord::Recent {
+                transaction_id: status.transaction_id,
+                committed: status.committed,
+            });
         }
     }
 
@@ -41825,21 +41856,21 @@ impl Storage {
         &self,
         transaction_id: u64,
     ) -> Result<Option<&'static str>, SqlError> {
-        if transaction_id > self.latest_transaction_id.get() {
+        let identities = self.transaction_identity_state();
+        if transaction_id > identities.latest {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 "transaction ID {} is in the future",
                 transaction_id
             ));
         }
-        if self.transaction_identities.borrow().iter().any(|identity| {
+        if identities.active.iter().any(|identity| {
             identity.assigned && u64::from(identity.transaction_id) == transaction_id
         }) {
             return Ok(Some("in progress"));
         }
-        Ok(self
-            .recent_transaction_statuses
-            .borrow()
+        Ok(identities
+            .recent
             .iter()
             .find(|status| status.transaction_id == transaction_id)
             .map(|status| {
@@ -46495,6 +46526,57 @@ mod tests {
             (config.max_connections as usize + config.max_prepared_transactions) * 5
         );
         assert_eq!(budget.used(), expected_budget);
+    }
+
+    #[test]
+    fn transaction_identity_state_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TransactionIdentityState>();
+
+        let config = test_config();
+        let transaction_capacity =
+            config.max_connections as usize + config.max_prepared_transactions;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let identities = &storage.transaction_identities;
+        std::thread::scope(|scope| {
+            for worker in 0..4u64 {
+                scope.spawn(move || {
+                    for offset in 0..8u64 {
+                        let transaction_id = 100 + worker * 8 + offset;
+                        let mut identities = identities
+                            .lock()
+                            .expect("transaction identity lock poisoned");
+                        identities.latest = identities.latest.max(transaction_id);
+                        Storage::record_transaction_status(
+                            &mut identities,
+                            transaction_id,
+                            worker % 2 == 0,
+                        );
+                    }
+                });
+            }
+        });
+        let identities = storage.transaction_identity_state();
+        assert_eq!(identities.latest, 131);
+        assert_eq!(identities.active.capacity(), transaction_capacity);
+        assert_eq!(
+            identities.recent.capacity(),
+            transaction_capacity.saturating_mul(8).max(64)
+        );
+        assert_eq!(identities.recent.len(), 32);
+        assert!(
+            identities
+                .recent
+                .iter()
+                .any(|status| status.transaction_id == 100 && status.committed)
+        );
+        assert!(
+            identities
+                .recent
+                .iter()
+                .any(|status| status.transaction_id == 131 && !status.committed)
+        );
     }
 
     #[test]

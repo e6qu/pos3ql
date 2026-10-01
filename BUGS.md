@@ -719,6 +719,16 @@ startup-bounded mutex now owns the complete catalog. Iterators copy one entry
 and release the lock before resolving referenced objects, preventing recursive
 lock stalls. Four-worker publication, nested-reader progress, exact configured
 capacity, and `Send + Sync` have direct coverage.
+The ACL catalog audit found object, column, default, and parameter privilege
+entries in four unsynchronized fixed vectors. Overlapping GRANT, REVOKE,
+commit, rollback, replay, clone, role cleanup, checkpoint, privilege, and
+catalog operations could lose updates or combine fields from different entry
+images. One startup-bounded mutex now owns all four catalogs. Iterators copy
+one entry and release the lock before nested role or object resolution,
+preventing recursive lock stalls. Four-worker publication across every ACL
+family, nested-reader progress, exact retained capacities, loud exhaustion,
+and `Send + Sync` have direct coverage. The same audit fixed recovery role
+cleanup omitting column and parameter ACL entries.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

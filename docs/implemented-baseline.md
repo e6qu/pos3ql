@@ -152,9 +152,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   complete entries before nested ownership or ACL lookup. Object comments and
   their transaction-private text and identity overlays also share one
   startup-bounded mutex; catalog and checkpoint iterators copy each entry
-  before resolving its referenced object. Engine mutation remains single-owner
-  and serialized while the other catalog definition containers, cache, and row
-  sharing are prepared. Authorization graph
+  before resolving its referenced object. Object, column, default, and
+  parameter ACL entries share another startup-bounded mutex; readers copy
+  complete entries before nested role or object resolution. Engine mutation
+  remains single-owner and serialized while the other catalog definition
+  containers, cache, and row sharing are prepared. Authorization graph
   traversal uses one exactly charged bitmap per query workspace, selected by
   the typed worker-local lease identity. Foreign statement transaction
   identity, isolation state, and fixed savepoint rosters use the same

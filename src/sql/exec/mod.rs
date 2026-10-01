@@ -5682,7 +5682,7 @@ fn rewrite_object_acl_owner(
     }
     let acl_count = storage.acl_entry_count();
     for slot in 0..acl_count {
-        let entry = *storage.acl_entry(slot);
+        let entry = storage.acl_entry(slot);
         if entry.object != object || entry.object.slot == u16::MAX {
             continue;
         }
@@ -5714,7 +5714,7 @@ fn rewrite_object_acl_owner(
     }
     let column_acl_count = storage.column_acl_entry_count();
     for slot in 0..column_acl_count {
-        let entry = *storage.column_acl_entry(slot);
+        let entry = storage.column_acl_entry(slot);
         if entry.target.relation() != object {
             continue;
         }
@@ -5755,7 +5755,7 @@ fn preserve_object_acl(
 ) -> Result<(), SqlError> {
     let acl_count = storage.acl_entry_count();
     for acl_slot in 0..acl_count {
-        let entry = *storage.acl_entry(acl_slot);
+        let entry = storage.acl_entry(acl_slot);
         if entry.object != old_object {
             continue;
         }
@@ -5779,7 +5779,7 @@ fn preserve_object_acl(
     }
     let column_acl_count = storage.column_acl_entry_count();
     for acl_slot in 0..column_acl_count {
-        let entry = *storage.column_acl_entry(acl_slot);
+        let entry = storage.column_acl_entry(acl_slot);
         if entry.target.relation() != old_object {
             continue;
         }
@@ -5813,7 +5813,7 @@ fn remap_table_column_acls(
 ) -> Result<(), SqlError> {
     let entry_count = storage.column_acl_entry_count();
     for slot in 0..entry_count {
-        let entry = *storage.column_acl_entry(slot);
+        let entry = storage.column_acl_entry(slot);
         if entry.target.relation() != object {
             continue;
         }
@@ -8603,7 +8603,7 @@ fn record_acl_removal(
     txn: &mut TxnState,
     slot: usize,
 ) -> Result<crate::storage::PrivilegeSet, SqlError> {
-    let entry = *storage.acl_entry(slot);
+    let entry = storage.acl_entry(slot);
     let (grantee, grantor) = storage.acl_identity(slot, txn.txid);
     let (_, grant_options) = storage.acl_state(slot, txn.txid);
     let (changed, prior) = storage.change_acl(
@@ -8665,7 +8665,7 @@ fn drop_owned_privileges(
     let mut queue_count = 0usize;
 
     for slot in 0..storage.acl_entry_count() {
-        let entry = *storage.acl_entry(slot);
+        let entry = storage.acl_entry(slot);
         let (grantee, grantor) = storage.acl_identity(slot, txn.txid);
         let (privileges, _) = storage.acl_state(slot, txn.txid);
         if privileges.0 == 0
@@ -8698,7 +8698,7 @@ fn drop_owned_privileges(
         let dependent_count =
             storage.dependent_acl_slots(object, grantor, lost, txn.txid, &mut *dependent);
         for slot in dependent[..dependent_count].iter().copied() {
-            let entry = *storage.acl_entry(slot);
+            let entry = storage.acl_entry(slot);
             let (grantee, _) = storage.acl_identity(slot, txn.txid);
             let (privileges, _) = storage.acl_state(slot, txn.txid);
             if privileges.0 == 0 {
@@ -8723,7 +8723,7 @@ fn drop_owned_privileges(
 
     let column_acl_count = storage.column_acl_entry_count();
     for slot in 0..column_acl_count {
-        let entry = *storage.column_acl_entry(slot);
+        let entry = storage.column_acl_entry(slot);
         let (grantee, grantor) = storage.column_acl_identity(slot, txn.txid);
         let (privileges, grant_options) = storage.column_acl_state(slot, txn.txid);
         if privileges.0 == 0
@@ -8760,7 +8760,7 @@ fn drop_owned_privileges(
 
     let default_count = storage.default_acl_entry_count();
     for slot in 0..default_count {
-        let entry = *storage.default_acl_entry(slot);
+        let entry = storage.default_acl_entry(slot);
         if entry.database != storage.current_database_oid() {
             continue;
         }
@@ -10210,7 +10210,7 @@ fn revoke_dependent_column_privileges(
             &mut *scratch.dependent,
         );
         for dependent_slot in &scratch.dependent[..dependent_count] {
-            let entry = *storage.column_acl_entry(*dependent_slot);
+            let entry = storage.column_acl_entry(*dependent_slot);
             let (dependent_grantee, dependent_grantor) =
                 storage.column_acl_identity(*dependent_slot, txn.txid);
             let (dependent_privileges, dependent_options) =
@@ -10618,7 +10618,7 @@ pub fn revoke_privileges(
                             &mut *dependent,
                         );
                         for dependent_slot in &dependent[..dependent_count] {
-                            let entry = *storage.acl_entry(*dependent_slot);
+                            let entry = storage.acl_entry(*dependent_slot);
                             let (dependent_grantee, dependent_grantor) =
                                 storage.acl_identity(*dependent_slot, txn.txid);
                             let (dependent_privileges, dependent_options) =
@@ -10981,7 +10981,7 @@ fn cascade_parameter_acl_grants(
             ));
         }
         for slot in &scratch.dependent[..dependent_count] {
-            let entry = *storage.parameter_acl_entry(*slot);
+            let entry = storage.parameter_acl_entry(*slot);
             let (grantee, grantor) = storage.parameter_acl_identity(*slot, txn.txid);
             let (old_privileges, old_options) = storage.parameter_acl_state(*slot, txn.txid);
             let removed = crate::sql::ast::ParameterPrivileges::from_bits(

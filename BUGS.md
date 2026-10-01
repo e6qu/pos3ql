@@ -685,6 +685,13 @@ walk identity. The immutable locale and every fixed reader pool now have
 mutex-protected ownership; pool exhaustion remains a named error. Four-worker
 mutation, exact memory charging and capacities, and `Send + Sync` assertions
 have direct coverage.
+The index-expression scratch audit found the shared parser and evaluator arena
+using an unsynchronized allocation frontier. Overlapping index maintenance or
+rebuild work could race allocations and rewinds, while the arena prevented the
+complete `Storage` state from being `Sync`. One mutex now retains the arena
+through each nested parse, predicate, key, and spilled-row evaluation chain.
+Four-worker mutation, exact retained capacity, and a `Storage: Send + Sync`
+assertion have direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

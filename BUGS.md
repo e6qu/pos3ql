@@ -622,6 +622,14 @@ state. Identity transitions, status queries, snapshot construction, and
 manifest traversal use one coherent lock boundary. A four-worker regression
 and a `Send + Sync` assertion cover concurrent updates and exact retained
 capacities.
+The shared-lock audit found relation, row, and advisory lock state split across
+three `RefCell` values while their wait graph and acquisition sequence formed
+one consistency domain. Overlapping workers could panic on nested borrows, lose
+sequence updates, or observe a partial savepoint, prepare, release, or wait-edge
+transition. One startup-bounded mutex now owns all three registries and the
+sequence. A four-worker regression and a `Send + Sync` assertion cover atomic
+mutation and exact retained relation-lock capacity; existing functional suites
+retain relation, row, advisory, deadlock, rollback, and prepared-lock coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

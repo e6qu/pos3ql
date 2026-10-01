@@ -11447,6 +11447,20 @@ impl TableLock {
     }
 }
 
+struct LockState {
+    table: FixedVec<TableLock>,
+    row: crate::sql::lock::LockManager,
+    advisory: crate::sql::lock::AdvisoryLockManager,
+    sequence: u64,
+}
+
+impl LockState {
+    fn next_sequence(&mut self) -> u64 {
+        self.sequence = self.sequence.wrapping_add(1).max(1);
+        self.sequence
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ReplayTableRewrite {
     table: usize,
@@ -11963,20 +11977,9 @@ pub struct Storage {
     /// The registry includes prepared transactions and is startup-bounded by
     /// the same connection/prepared-transaction capacity as MVCC snapshots.
     transaction_identities: std::sync::Mutex<TransactionIdentityState>,
-    /// PostgreSQL relation locks. Each mode is tracked independently because
-    /// SHARE and SHARE UPDATE EXCLUSIVE are incomparable, and savepoint
-    /// rollback releases only modes acquired by the rolled-back
-    /// subtransaction.
-    table_locks: std::cell::RefCell<FixedVec<TableLock>>,
-    /// PostgreSQL row locks and their wait-for graph. The registry is sized at
-    /// startup from the per-transaction row bound and connection count.
-    row_locks: std::cell::RefCell<crate::sql::lock::LockManager>,
-    /// Session- and transaction-owned advisory locks share the global wait
-    /// graph with relation and row locks.
-    advisory_locks: std::cell::RefCell<crate::sql::lock::AdvisoryLockManager>,
-    /// Shared acquisition clock for table and row locks. It lets a savepoint
-    /// restore both registries to one exact transaction boundary.
-    lock_sequence: Cell<u64>,
+    /// Relation, row, and advisory locks share one wait graph and acquisition
+    /// sequence. One boundary keeps cross-registry transitions atomic.
+    locks: std::sync::Mutex<LockState>,
     /// Table generations captured at a SERIALIZABLE transaction's first
     /// snapshot. Scans mark entries read; a read-write transaction validates
     /// them before WAL publication to reject phantoms and write skew.
@@ -13811,12 +13814,22 @@ impl Storage {
     }
 
     pub(crate) fn park_backend_statement(&self, pid: i32, object_io: bool) {
+        let lock_wait = if object_io {
+            None
+        } else {
+            let locks = self.lock_state();
+            if locks.advisory.blocker_pid_count(pid) != 0 {
+                Some("advisory")
+            } else if locks.row.blocker_pid_count(pid) != 0 {
+                Some("transactionid")
+            } else {
+                None
+            }
+        };
         let wait = if object_io {
             (Some("Extension"), Some("ObjectStorageRead"))
-        } else if self.advisory_locks.borrow().blocker_pid_count(pid) != 0 {
-            (Some("Lock"), Some("advisory"))
-        } else if self.row_locks.borrow().blocker_pid_count(pid) != 0 {
-            (Some("Lock"), Some("transactionid"))
+        } else if let Some(wait_event) = lock_wait {
+            (Some("Lock"), Some(wait_event))
         } else {
             (None, None)
         };
@@ -13846,9 +13859,9 @@ impl Storage {
     }
 
     pub(crate) fn cancel_backend_wait(&self, pid: i32) {
-        self.advisory_locks
-            .borrow_mut()
-            .cancel_statement(pid, &mut self.row_locks.borrow_mut());
+        let mut locks = self.lock_state();
+        let LockState { advisory, row, .. } = &mut *locks;
+        advisory.cancel_statement(pid, row);
     }
 
     pub(crate) fn finish_backend_statement(
@@ -16427,21 +16440,18 @@ impl Storage {
             "function_transaction_statistics",
             transaction_capacity * config.max_routines,
         )?;
-        let table_locks = std::cell::RefCell::new(FixedVec::new(
-            budget,
-            "table_locks",
-            transaction_capacity * table_capacity,
-        )?);
-        let row_locks = std::cell::RefCell::new(crate::sql::lock::LockManager::new(
+        let table_locks =
+            FixedVec::new(budget, "table_locks", transaction_capacity * table_capacity)?;
+        let row_locks = crate::sql::lock::LockManager::new(
             budget,
             transaction_capacity * config.txn_rows,
             config.max_connections as usize,
-        )?);
-        let advisory_locks = std::cell::RefCell::new(crate::sql::lock::AdvisoryLockManager::new(
+        )?;
+        let advisory_locks = crate::sql::lock::AdvisoryLockManager::new(
             budget,
             transaction_capacity * config.max_locks_per_transaction,
             config.max_connections as usize,
-        )?);
+        )?;
         let serializable_snapshots = std::cell::RefCell::new(FixedVec::new(
             budget,
             "serializable_snapshots",
@@ -16554,10 +16564,12 @@ impl Storage {
                 recent_cursor: 0,
                 latest: 0,
             }),
-            table_locks,
-            row_locks,
-            advisory_locks,
-            lock_sequence: Cell::new(0),
+            locks: std::sync::Mutex::new(LockState {
+                table: table_locks,
+                row: row_locks,
+                advisory: advisory_locks,
+                sequence: 0,
+            }),
             serializable_snapshots,
             next_rowid: 1,
             lsn: 0,
@@ -41629,6 +41641,10 @@ impl Storage {
             .expect("transaction identity lock poisoned")
     }
 
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, LockState> {
+        self.locks.lock().expect("lock state lock poisoned")
+    }
+
     pub(crate) fn begin_transaction_identity(&self, transaction_id: u32) {
         let connection_id = self.current_connection_id();
         let mut identities = self.transaction_identity_state();
@@ -41681,19 +41697,17 @@ impl Storage {
         if prior_owner == prepared_owner {
             return;
         }
-        for lock in self
-            .table_locks
-            .borrow_mut()
+        let mut locks = self.lock_state();
+        for lock in locks
+            .table
             .iter_mut()
             .filter(|lock| lock.owner == transaction_id)
         {
             lock.wait_owner = prepared_owner;
         }
-        self.row_locks
-            .borrow_mut()
-            .rebind_wait_owner(prior_owner, prepared_owner);
-        self.advisory_locks
-            .borrow_mut()
+        locks.row.rebind_wait_owner(prior_owner, prepared_owner);
+        locks
+            .advisory
             .rebind_transaction_wait_owner(transaction_id, prior_owner, prepared_owner);
     }
 
@@ -41911,9 +41925,8 @@ impl Storage {
         self.active_snapshots.swap_remove(index);
         // Schema waits can be blocked by a historical snapshot even when the
         // reader holds no row lock. Wake the shared wait graph when it ends.
-        self.row_locks
-            .borrow_mut()
-            .resource_released(self.transaction_wait_owner(txid));
+        let wait_owner = self.transaction_wait_owner(txid);
+        self.lock_state().row.resource_released(wait_owner);
         let oldest = self.oldest_snapshot();
         let (tables, versions, free) = (
             &mut self.tables,
@@ -41988,28 +42001,20 @@ impl Storage {
         } else {
             crate::sql::lock::AdvisoryOwner::Session(connection_id)
         };
-        let sequence = self.next_lock_sequence();
-        self.advisory_locks.borrow_mut().acquire(
-            key,
-            owner,
-            wait_owner,
-            mode,
-            try_only,
-            sequence,
-            &mut self.row_locks.borrow_mut(),
-        )
+        let mut locks = self.lock_state();
+        let sequence = locks.next_sequence();
+        let LockState { advisory, row, .. } = &mut *locks;
+        advisory.acquire(key, owner, wait_owner, mode, try_only, sequence, row)
     }
 
     pub(crate) fn begin_advisory_statement(&self) -> Result<(), SqlError> {
-        self.advisory_locks
-            .borrow_mut()
-            .begin_statement(self.current_connection_id())
+        let connection_id = self.current_connection_id();
+        self.lock_state().advisory.begin_statement(connection_id)
     }
 
     pub(crate) fn preserve_advisory_statement(&self) {
-        self.advisory_locks
-            .borrow_mut()
-            .preserve_statement(self.current_connection_id());
+        let connection_id = self.current_connection_id();
+        self.lock_state().advisory.preserve_statement(connection_id);
     }
 
     pub(crate) fn unlock_advisory_session(
@@ -42017,53 +42022,51 @@ impl Storage {
         key: crate::sql::lock::AdvisoryKey,
         mode: crate::sql::lock::AdvisoryMode,
     ) -> Result<bool, SqlError> {
-        self.advisory_locks.borrow_mut().unlock_session(
-            self.current_connection_id(),
-            key,
-            mode,
-            &mut self.row_locks.borrow_mut(),
-        )
+        let connection_id = self.current_connection_id();
+        let mut locks = self.lock_state();
+        let LockState { advisory, row, .. } = &mut *locks;
+        advisory.unlock_session(connection_id, key, mode, row)
     }
 
     pub(crate) fn unlock_all_advisory_session(&self) -> Result<(), SqlError> {
-        self.advisory_locks.borrow_mut().unlock_all_session(
-            self.current_connection_id(),
-            &mut self.row_locks.borrow_mut(),
-        )
+        let connection_id = self.current_connection_id();
+        let mut locks = self.lock_state();
+        let LockState { advisory, row, .. } = &mut *locks;
+        advisory.unlock_all_session(connection_id, row)
     }
 
     pub(crate) fn release_advisory_transaction_locks(&self, transaction_id: u32) {
         let wait_owner = self.transaction_wait_owner(transaction_id);
-        self.advisory_locks.borrow_mut().release_transaction(
-            transaction_id,
-            wait_owner,
-            &mut self.row_locks.borrow_mut(),
-        );
+        let mut locks = self.lock_state();
+        let LockState { advisory, row, .. } = &mut *locks;
+        advisory.release_transaction(transaction_id, wait_owner, row);
     }
 
     pub(crate) fn release_connection_advisory_locks(&self, connection_id: i32) {
-        let mut advisory_locks = self.advisory_locks.borrow_mut();
-        advisory_locks.drop_connection(connection_id);
-        advisory_locks
-            .unlock_all_session(connection_id, &mut self.row_locks.borrow_mut())
+        let mut locks = self.lock_state();
+        let LockState { advisory, row, .. } = &mut *locks;
+        advisory.drop_connection(connection_id);
+        advisory
+            .unlock_all_session(connection_id, row)
             .expect("connection cleanup does not enter statement replay");
     }
 
     pub(crate) fn blocking_backend_pids(&self, backend_pid: i32, output: &mut [i32]) -> usize {
-        let advisory = self.advisory_locks.borrow();
-        if advisory.blocker_pid_count(backend_pid) != 0 {
-            advisory.blocker_pids(backend_pid, output)
+        let locks = self.lock_state();
+        if locks.advisory.blocker_pid_count(backend_pid) != 0 {
+            locks.advisory.blocker_pids(backend_pid, output)
         } else {
-            self.row_locks.borrow().blocker_pids(backend_pid, output)
+            locks.row.blocker_pids(backend_pid, output)
         }
     }
 
     pub(crate) fn blocking_backend_pid_count(&self, backend_pid: i32) -> usize {
-        let advisory_count = self.advisory_locks.borrow().blocker_pid_count(backend_pid);
+        let locks = self.lock_state();
+        let advisory_count = locks.advisory.blocker_pid_count(backend_pid);
         if advisory_count != 0 {
             advisory_count
         } else {
-            self.row_locks.borrow().blocker_pid_count(backend_pid)
+            locks.row.blocker_pid_count(backend_pid)
         }
     }
 
@@ -42071,18 +42074,18 @@ impl Storage {
         &self,
         visit: impl FnMut(crate::sql::lock::AdvisoryLockView),
     ) {
-        self.advisory_locks.borrow().visit(visit);
+        self.lock_state().advisory.visit(visit);
     }
 
     pub(crate) fn advisory_lock_view_count(&self) -> usize {
-        self.advisory_locks.borrow().view_count()
+        self.lock_state().advisory.view_count()
     }
 
     pub(crate) fn visit_table_locks(
         &self,
         mut visit: impl FnMut(u32, crate::sql::lock::WaitOwner, usize, crate::sql::ast::TableLockMode),
     ) {
-        for lock in self.table_locks.borrow().iter() {
+        for lock in self.lock_state().table.iter() {
             for (mode, acquired_at) in lock.modes.iter().enumerate() {
                 if *acquired_at == 0 {
                     continue;
@@ -42103,8 +42106,8 @@ impl Storage {
     }
 
     pub(crate) fn table_lock_view_count(&self) -> usize {
-        self.table_locks
-            .borrow()
+        self.lock_state()
+            .table
             .iter()
             .map(|lock| lock.modes.iter().filter(|sequence| **sequence != 0).count())
             .sum()
@@ -42206,46 +42209,52 @@ impl Storage {
             ) || matches!(right, AccessExclusive)
         }
 
-        let mut table_locks = self.table_locks.borrow_mut();
         let wait_owner = self.transaction_wait_owner(txid);
+        let mut locks = self.lock_state();
         let requested = mode_bit(mode);
-        let own_index = table_locks
+        let own_index = locks
+            .table
             .iter()
             .position(|lock| lock.owner == txid && lock.table == table as u32);
-        if own_index.is_some_and(|index| table_locks[index].mask() & requested != 0) {
+        if own_index.is_some_and(|index| locks.table[index].mask() & requested != 0) {
             return Ok(());
         }
         let combined = own_index
-            .map(|index| table_locks[index].mask() | requested)
+            .map(|index| locks.table[index].mask() | requested)
             .unwrap_or(requested);
-        if let Some(blocker) = table_locks.iter().find(|lock| {
-            lock.owner != txid
-                && lock.table == table as u32
-                && modes_conflict(combined, lock.mask())
-        }) {
+        let blocker = locks
+            .table
+            .iter()
+            .find(|lock| {
+                lock.owner != txid
+                    && lock.table == table as u32
+                    && modes_conflict(combined, lock.mask())
+            })
+            .map(|lock| lock.wait_owner);
+        if let Some(blocker) = blocker {
             if nowait {
                 return Err(sql_err!(
                     sqlstate::LOCK_NOT_AVAILABLE,
                     "could not obtain lock on relation"
                 ));
             }
-            self.row_locks
-                .borrow_mut()
-                .wait_for(wait_owner, blocker.wait_owner)?;
+            locks.row.wait_for(wait_owner, blocker)?;
+            drop(locks);
             self.mark_current_backend_wait("Lock", "relation");
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for a relation lock"
             ));
         }
-        let sequence = self.next_lock_sequence();
+        let sequence = locks.next_sequence();
         if let Some(index) = own_index {
-            table_locks[index].modes[mode as usize] = sequence;
+            locks.table[index].modes[mode as usize] = sequence;
             return Ok(());
         }
         let mut modes = [0; 8];
         modes[mode as usize] = sequence;
-        table_locks
+        locks
+            .table
             .push(TableLock {
                 owner: txid,
                 wait_owner,
@@ -42256,19 +42265,13 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "table-lock registry is full ({} locks)",
-                    table_locks.capacity()
+                    locks.table.capacity()
                 )
             })
     }
 
-    fn next_lock_sequence(&self) -> u64 {
-        let next = self.lock_sequence.get().wrapping_add(1).max(1);
-        self.lock_sequence.set(next);
-        next
-    }
-
     pub(crate) fn lock_mark(&self) -> u64 {
-        self.lock_sequence.get()
+        self.lock_state().sequence
     }
 
     pub(crate) fn encode_transaction_locks(
@@ -42302,12 +42305,8 @@ impl Storage {
         }
 
         output.clear();
-        for lock in self
-            .table_locks
-            .borrow()
-            .iter()
-            .filter(|lock| lock.owner == txid)
-        {
+        let locks = self.lock_state();
+        for lock in locks.table.iter().filter(|lock| lock.owner == txid) {
             let table = &self.tables[lock.table as usize];
             if !table.live {
                 continue;
@@ -42325,25 +42324,23 @@ impl Storage {
                 }
             }
         }
-        self.row_locks
-            .borrow()
-            .visit_owner(txid, |table_slot, rowid, strength| {
-                let table = &self.tables[table_slot];
-                if !table.live {
-                    return Ok(());
-                }
-                append_lock(
-                    output,
-                    1,
-                    strength as u8,
-                    rowid,
-                    table.def.schema.as_str(),
-                    table.def.name.as_str(),
-                )
-            })?;
+        locks.row.visit_owner(txid, |table_slot, rowid, strength| {
+            let table = &self.tables[table_slot];
+            if !table.live {
+                return Ok(());
+            }
+            append_lock(
+                output,
+                1,
+                strength as u8,
+                rowid,
+                table.def.schema.as_str(),
+                table.def.name.as_str(),
+            )
+        })?;
         let mut advisory_result = Ok(());
-        self.advisory_locks
-            .borrow()
+        locks
+            .advisory
             .visit_transaction(txid, |key, advisory_mode| {
                 if advisory_result.is_err() {
                     return;
@@ -42491,14 +42488,17 @@ impl Storage {
                         object_sub_id: if mode < 2 { 1 } else { 2 },
                     };
                     let wait_owner = crate::sql::lock::prepared_wait_owner(txid);
-                    let decision = self.advisory_locks.borrow_mut().acquire(
+                    let mut locks = self.lock_state();
+                    let sequence = locks.next_sequence();
+                    let LockState { advisory, row, .. } = &mut *locks;
+                    let decision = advisory.acquire(
                         key,
                         crate::sql::lock::AdvisoryOwner::Transaction(txid),
                         wait_owner,
                         advisory_mode,
                         false,
-                        self.next_lock_sequence(),
-                        &mut self.row_locks.borrow_mut(),
+                        sequence,
+                        row,
                     )?;
                     if decision != crate::sql::lock::AdvisoryDecision::Acquired {
                         return Err(sql_err!(
@@ -42520,53 +42520,49 @@ impl Storage {
 
     pub(crate) fn rollback_locks_to(&self, txid: u32, mark: u64) {
         let wait_owner = self.transaction_wait_owner(txid);
-        let mut table_locks = self.table_locks.borrow_mut();
+        let mut locks = self.lock_state();
         let mut table_changed = false;
         let mut index = 0usize;
-        while index < table_locks.len() {
-            if table_locks[index].owner != txid {
+        while index < locks.table.len() {
+            if locks.table[index].owner != txid {
                 index += 1;
                 continue;
             }
-            for acquired_at in &mut table_locks[index].modes {
+            for acquired_at in &mut locks.table[index].modes {
                 if *acquired_at > mark {
                     *acquired_at = 0;
                     table_changed = true;
                 }
             }
-            if table_locks[index].mask() == 0 {
-                table_locks.swap_remove(index);
+            if locks.table[index].mask() == 0 {
+                locks.table.swap_remove(index);
             } else {
                 index += 1;
             }
         }
-        drop(table_locks);
-        let mut row_locks = self.row_locks.borrow_mut();
-        row_locks.rollback_to(txid, wait_owner, mark);
-        self.advisory_locks
-            .borrow_mut()
-            .rollback_to(txid, wait_owner, mark, &mut row_locks);
+        let LockState { advisory, row, .. } = &mut *locks;
+        row.rollback_to(txid, wait_owner, mark);
+        advisory.rollback_to(txid, wait_owner, mark, row);
         if table_changed {
-            row_locks.resource_released(wait_owner);
+            row.resource_released(wait_owner);
         }
     }
 
     pub fn release_table_locks(&self, txid: u32) {
         let wait_owner = self.transaction_wait_owner(txid);
-        let mut table_locks = self.table_locks.borrow_mut();
+        let mut locks = self.lock_state();
         let mut changed = false;
         let mut index = 0usize;
-        while index < table_locks.len() {
-            if table_locks[index].owner == txid {
-                table_locks.swap_remove(index);
+        while index < locks.table.len() {
+            if locks.table[index].owner == txid {
+                locks.table.swap_remove(index);
                 changed = true;
             } else {
                 index += 1;
             }
         }
-        drop(table_locks);
         if changed {
-            self.row_locks.borrow_mut().resource_released(wait_owner);
+            locks.row.resource_released(wait_owner);
         }
     }
 
@@ -42578,20 +42574,21 @@ impl Storage {
         strength: crate::sql::ast::LockStrength,
         wait: crate::sql::ast::LockWait,
     ) -> Result<crate::sql::lock::LockDecision, SqlError> {
-        let sequence = self.next_lock_sequence();
         let wait_owner = self.transaction_wait_owner(txid);
-        self.row_locks
-            .borrow_mut()
+        let mut locks = self.lock_state();
+        let sequence = locks.next_sequence();
+        locks
+            .row
             .acquire(table, rowid, txid, wait_owner, strength, wait, sequence)
     }
 
     pub(crate) fn release_row_locks(&self, txid: u32) {
         let wait_owner = self.transaction_wait_owner(txid);
-        self.row_locks.borrow_mut().release(txid, wait_owner);
+        self.lock_state().row.release(txid, wait_owner);
     }
 
     pub(crate) fn lock_generation(&self) -> u64 {
-        self.row_locks.borrow().generation()
+        self.lock_state().row.generation()
     }
 
     pub(crate) fn begin_serializable(&self, txid: u32) -> Result<(), SqlError> {
@@ -42649,23 +42646,22 @@ impl Storage {
     }
 
     pub fn has_access_share_locks(&self) -> bool {
-        !self.table_locks.borrow().is_empty()
+        !self.lock_state().table.is_empty()
     }
 
     pub(crate) fn schema_lock_blocker(&self, txid: u32) -> Option<u32> {
-        let table_locks = self.table_locks.borrow();
+        let locks = self.lock_state();
         self.active_snapshots
             .iter()
             .map(|(owner, _)| *owner)
-            .chain(table_locks.iter().map(|lock| lock.owner))
+            .chain(locks.table.iter().map(|lock| lock.owner))
             .find(|owner| *owner != txid)
     }
 
     pub(crate) fn wait_for_transaction(&self, waiter: u32, blocker: u32) -> Result<(), SqlError> {
-        self.row_locks.borrow_mut().wait_for(
-            self.transaction_wait_owner(waiter),
-            self.transaction_wait_owner(blocker),
-        )
+        let waiter = self.transaction_wait_owner(waiter);
+        let blocker = self.transaction_wait_owner(blocker);
+        self.lock_state().row.wait_for(waiter, blocker)
     }
 
     fn catalog_ddl_wait_error(&self, waiter: u32, blocker: u32, name: &str) -> SqlError {
@@ -46577,6 +46573,51 @@ mod tests {
                 .iter()
                 .any(|status| status.transaction_id == 131 && !status.committed)
         );
+    }
+
+    #[test]
+    fn lock_state_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<LockState>();
+
+        let config = test_config();
+        let transaction_capacity =
+            config.max_connections as usize + config.max_prepared_transactions;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let locks = &storage.locks;
+        std::thread::scope(|scope| {
+            for worker in 0..4u32 {
+                scope.spawn(move || {
+                    for offset in 0..1_000u32 {
+                        let mut locks = locks.lock().expect("lock state lock poisoned");
+                        let sequence = locks.next_sequence();
+                        if offset == 0 {
+                            let owner = 100 + worker;
+                            let mut modes = [0; 8];
+                            modes[0] = sequence;
+                            locks
+                                .table
+                                .push(TableLock {
+                                    owner,
+                                    wait_owner: crate::sql::lock::prepared_wait_owner(owner),
+                                    table: 0,
+                                    modes,
+                                })
+                                .unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        let locks = storage.lock_state();
+        assert_eq!(locks.sequence, 4_000);
+        assert_eq!(locks.table.len(), 4);
+        assert_eq!(
+            locks.table.capacity(),
+            transaction_capacity * table_slot_capacity(&config)
+        );
+        assert!(locks.table.iter().all(|lock| lock.modes[0] != 0));
     }
 
     #[test]

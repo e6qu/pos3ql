@@ -303,7 +303,7 @@ dispatch. When one reactor turn has more ready connections than workspaces, it
 drains queued scheduler chunks but retains every response for the turn's single
 publication barrier. Queue capacity therefore does not reduce group commit
 width. Engine execution remains reactor-serialized because catalog, cache, and
-lock ownership is not thread safe. Parallel
+row mutation are not thread safe. Parallel
 dispatch must replace the local queue drain with fixed workers and make that
 shared engine state safe while preserving transaction retry, object I/O
 parking, group publication, and response barriers.
@@ -317,7 +317,7 @@ The owned POSIX locale records its single-owner transfer invariant explicitly.
 A live-engine test moves ownership to another thread, executes SQL there, and
 drops its storage and locale state on that thread. The engine remains one
 owner at a time and reactor-serialized. Fixed workers still require shared
-catalog, cache, and lock state to be partitioned
+catalog, cache, and row state to be partitioned
 or synchronized before dispatch can overlap.
 
 The effective SQL search path is now worker private. Every statement publishes
@@ -326,7 +326,7 @@ state, while view and schema-qualified nested execution swap and restore that
 same worker's value. Storage no longer carries a shared mutable path that one
 worker could change during another worker's name resolution. Cross-thread
 isolation and live engine transfer retain direct regressions. Catalog, cache,
-and lock ownership remain the shared mutation
+and row ownership remain the shared mutation
 boundaries before fixed workers can execute concurrently.
 
 Command and durable commit snapshots are worker private as one fixed
@@ -340,6 +340,12 @@ their replacement cursor, and the latest observed identity now share one
 startup-bounded mutex. Snapshot construction and checkpoint manifest emission
 observe that registry atomically, while concurrent begin, assignment, finish,
 restore, and status queries cannot collide on interior borrows or lose updates.
+Relation, row, and advisory lock registries now share one startup-bounded mutex
+with their common wait graph and acquisition sequence. Conflict detection,
+wait-edge publication, savepoint rollback, prepared-transaction transfer, and
+lock inventory traversal therefore observe one atomic state across all three
+lock kinds. Concurrent mutation and exact retained relation-lock capacity have
+direct coverage, and the complete state is compiler-checked as `Send + Sync`.
 The remaining shared catalog and row mutation paths still require
 synchronization before fixed workers can overlap execution.
 

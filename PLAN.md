@@ -368,6 +368,13 @@ and catalog reads observe complete value images instead of independent cells.
 Publication clears a dirty marker only when its staged generation still matches,
 so a later concurrent advance remains pending. Concurrent reservation, exact
 retained capacity, and `Send + Sync` have direct coverage.
+Foreign statement transaction identity, isolation mode, and savepoints now use
+one mutex per startup-bounded query workspace. Allocation-free savepoint access
+retains that guard through remote transaction setup. The startup-bounded
+temporary-object transaction registry has its own mutex, so temporary relation
+resolution, PREPARE eligibility checks, commit, and rollback cannot collide on
+an interior borrow or lose an owner. Concurrent updates, exact capacities, and
+`Send + Sync` have direct coverage.
 The remaining shared catalog and row mutation paths still require
 synchronization before fixed workers can overlap execution.
 

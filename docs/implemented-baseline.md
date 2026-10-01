@@ -134,6 +134,9 @@ active production roadmap is [PLAN.md](../PLAN.md).
   metadata and unsummarized ranges share one fixed mutex, including coherent
   WAL and checkpoint images. Committed and staged sequence value images share
   another fixed mutex across reservation, restart, replay, and publication.
+  Foreign transaction metadata uses one mutex per fixed query workspace, and
+  temporary-object transaction ownership uses a fixed shared mutex across
+  PREPARE checks and cleanup.
   Engine mutation remains single-owner and serialized while catalog, cache, and
   row sharing is prepared.
   Authorization

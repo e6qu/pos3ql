@@ -215,7 +215,8 @@ fn enter_session(
         }
         // postgres_fdw mirrors SERIALIZABLE and otherwise uses REPEATABLE
         // READ, preserving one remote snapshot across local statements.
-        let begin = if storage.foreign_statement_is_serializable(txid) {
+        let statement_context = storage.foreign_statement_context_for(txid);
+        let begin = if statement_context.is_serializable() {
             "BEGIN ISOLATION LEVEL SERIALIZABLE"
         } else {
             "BEGIN ISOLATION LEVEL REPEATABLE READ"
@@ -242,8 +243,7 @@ fn enter_session(
         // established before the first foreign access so later RELEASE and
         // ROLLBACK TO operate on the same transaction shape locally and
         // remotely.
-        let savepoints = storage.foreign_statement_savepoints(txid);
-        for name in savepoints.iter() {
+        for name in statement_context.savepoints() {
             let mut command = StackStr::<256>::new();
             let _ = command.write_str("SAVEPOINT ");
             quote_identifier(&mut command, name.as_str());

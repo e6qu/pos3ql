@@ -662,6 +662,14 @@ and staged images for every configured sequence. A four-worker reservation
 regression also proves that publishing an older generation cannot clear a
 later advance; `Send + Sync` assertions cover atomic mutation and exact retained
 capacity.
+The transaction-workspace audit found each foreign statement context and the
+temporary-object transaction registry behind `RefCell`. Overlapping workers
+could panic while publishing foreign transaction identity, isolation mode, or
+savepoints, and temporary relation use could collide with PREPARE eligibility
+or cleanup. Each fixed query workspace now owns a mutex-protected foreign
+context, while one startup-bounded mutex owns the temporary transaction roster.
+Allocation-free savepoint guards, four-worker mutation, `Send + Sync`, and exact
+retained capacities have direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

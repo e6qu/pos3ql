@@ -9284,6 +9284,11 @@ impl BrinMaintenanceState {
     };
 }
 
+struct BrinMaintenance {
+    states: FixedVec<BrinMaintenanceState>,
+    unsummarized_ranges: FixedVec<u64>,
+}
+
 /// Comparison contract selected for one explicit btree index key.
 ///
 /// An omitted class remains `None` in [`IndexDef`] so `pg_get_indexdef` can
@@ -11944,8 +11949,7 @@ pub struct Storage {
     composites: FixedVec<CompositeDef>,
     domain_graph_scratch: std::cell::RefCell<FixedVec<u8>>,
     indexes: FixedVec<IndexDef>,
-    brin_maintenance: std::cell::RefCell<FixedVec<BrinMaintenanceState>>,
-    brin_unsummarized_ranges: std::cell::RefCell<FixedVec<u64>>,
+    brin_maintenance: std::sync::Mutex<BrinMaintenance>,
     brin_unsummarized_ranges_per_index: usize,
     databases: FixedVec<DatabaseDef>,
     backend_state: std::sync::Mutex<BackendState>,
@@ -16554,8 +16558,10 @@ impl Storage {
             composites,
             domain_graph_scratch: std::cell::RefCell::new(domain_graph_scratch),
             indexes,
-            brin_maintenance: std::cell::RefCell::new(brin_maintenance),
-            brin_unsummarized_ranges: std::cell::RefCell::new(brin_unsummarized_ranges),
+            brin_maintenance: std::sync::Mutex::new(BrinMaintenance {
+                states: brin_maintenance,
+                unsummarized_ranges: brin_unsummarized_ranges,
+            }),
             brin_unsummarized_ranges_per_index: config.max_brin_unsummarized_ranges_per_index,
             databases,
             backend_state: std::sync::Mutex::new(BackendState {
@@ -28399,7 +28405,7 @@ impl Storage {
         })
     }
 
-    fn brin_logical_page_count(&self, index_slot: usize, txid: u32) -> Result<u64, SqlError> {
+    fn brin_geometry(&self, index_slot: usize, txid: u32) -> Result<(u64, u64, u32), SqlError> {
         let index = self
             .index_visible_to(index_slot, txid)
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
@@ -28412,45 +28418,48 @@ impl Storage {
                 index.name_for(txid).as_str()
             ));
         }
-        let table = self
-            .index_table_slot_to(index_slot, txid)
-            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index table does not exist"))?;
-        let rows = self.visible_row_count(table, txid)?;
-        Ok((rows as u64).div_ceil(128))
-    }
-
-    fn brin_range_start(
-        &self,
-        index_slot: usize,
-        block: u64,
-        txid: u32,
-    ) -> Result<Option<u64>, SqlError> {
-        let pages = self.brin_logical_page_count(index_slot, txid)?;
-        if block >= pages {
-            return Ok(None);
-        }
-        let pages_per_range = u64::from(self.brin_maintenance.borrow()[index_slot].pages_per_range);
-        debug_assert_ne!(pages_per_range, 0, "visible BRIN has build geometry");
-        Ok(Some(block / pages_per_range * pages_per_range))
-    }
-
-    fn brin_discover_new_ranges(&self, index_slot: usize, txid: u32) -> Result<(), SqlError> {
-        let pages = self.brin_logical_page_count(index_slot, txid)?;
-        let index = self
-            .index_visible_to(index_slot, txid)
-            .expect("BRIN page count validated the index");
         let created_at = index.created_at;
-        let configured_pages_per_range = index
+        let pages_per_range = index
             .mutable_for(txid)
             .options
             .pages_per_range
             .unwrap_or(128);
-        let range_start = index_slot * self.brin_unsummarized_ranges_per_index;
-        let range_end = range_start + self.brin_unsummarized_ranges_per_index;
-        let mut ranges = self.brin_unsummarized_ranges.borrow_mut();
-        let ranges = &mut ranges[range_start..range_end];
-        let mut states = self.brin_maintenance.borrow_mut();
-        let state = &mut states[index_slot];
+        let table = self
+            .index_table_slot_to(index_slot, txid)
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index table does not exist"))?;
+        let rows = self.visible_row_count(table, txid)?;
+        Ok(((rows as u64).div_ceil(128), created_at, pages_per_range))
+    }
+
+    fn brin_maintenance(&self) -> std::sync::MutexGuard<'_, BrinMaintenance> {
+        self.brin_maintenance
+            .lock()
+            .expect("BRIN maintenance lock poisoned")
+    }
+
+    fn brin_entry_mut(
+        maintenance: &mut BrinMaintenance,
+        index_slot: usize,
+        ranges_per_index: usize,
+    ) -> (&mut BrinMaintenanceState, &mut [u64]) {
+        let start = index_slot * ranges_per_index;
+        let BrinMaintenance {
+            states,
+            unsummarized_ranges,
+        } = maintenance;
+        (
+            &mut states[index_slot],
+            &mut unsummarized_ranges[start..start + ranges_per_index],
+        )
+    }
+
+    fn discover_brin_ranges(
+        state: &mut BrinMaintenanceState,
+        ranges: &mut [u64],
+        pages: u64,
+        created_at: u64,
+        configured_pages_per_range: u32,
+    ) -> Result<(), SqlError> {
         if state.index_created_at != created_at {
             let pages_per_range = u64::from(configured_pages_per_range);
             let covered_end = pages.max(1).div_ceil(pages_per_range) * pages_per_range;
@@ -28494,24 +28503,20 @@ impl Storage {
         block: u64,
         txid: u32,
     ) -> Result<(), SqlError> {
-        self.brin_discover_new_ranges(index_slot, txid)?;
-        let Some(range) = self.brin_range_start(index_slot, block, txid)? else {
+        let (pages, created_at, pages_per_range) = self.brin_geometry(index_slot, txid)?;
+        let mut maintenance = self.brin_maintenance();
+        let (state, ranges) = Self::brin_entry_mut(
+            &mut maintenance,
+            index_slot,
+            self.brin_unsummarized_ranges_per_index,
+        );
+        Self::discover_brin_ranges(state, ranges, pages, created_at, pages_per_range)?;
+        if block >= pages {
             return Ok(());
-        };
-        let created_at = self.indexes[index_slot].created_at;
-        let range_start = index_slot * self.brin_unsummarized_ranges_per_index;
-        let range_end = range_start + self.brin_unsummarized_ranges_per_index;
-        let mut ranges = self.brin_unsummarized_ranges.borrow_mut();
-        let ranges = &mut ranges[range_start..range_end];
-        let mut states = self.brin_maintenance.borrow_mut();
-        let state = &mut states[index_slot];
-        if state.index_created_at != created_at {
-            *state = BrinMaintenanceState {
-                index_created_at: created_at,
-                ..BrinMaintenanceState::EMPTY
-            };
-            ranges.fill(0);
         }
+        let pages_per_range = u64::from(state.pages_per_range);
+        debug_assert_ne!(pages_per_range, 0, "visible BRIN has build geometry");
+        let range = block / pages_per_range * pages_per_range;
         if ranges[..usize::from(state.count)].contains(&range) {
             return Ok(());
         }
@@ -28534,16 +28539,20 @@ impl Storage {
         block: u64,
         txid: u32,
     ) -> Result<i32, SqlError> {
-        self.brin_discover_new_ranges(index_slot, txid)?;
-        let Some(range) = self.brin_range_start(index_slot, block, txid)? else {
+        let (pages, created_at, pages_per_range) = self.brin_geometry(index_slot, txid)?;
+        let mut maintenance = self.brin_maintenance();
+        let (state, ranges) = Self::brin_entry_mut(
+            &mut maintenance,
+            index_slot,
+            self.brin_unsummarized_ranges_per_index,
+        );
+        Self::discover_brin_ranges(state, ranges, pages, created_at, pages_per_range)?;
+        if block >= pages {
             return Ok(0);
-        };
-        let range_start = index_slot * self.brin_unsummarized_ranges_per_index;
-        let range_end = range_start + self.brin_unsummarized_ranges_per_index;
-        let mut ranges = self.brin_unsummarized_ranges.borrow_mut();
-        let ranges = &mut ranges[range_start..range_end];
-        let mut states = self.brin_maintenance.borrow_mut();
-        let state = &mut states[index_slot];
+        }
+        let pages_per_range = u64::from(state.pages_per_range);
+        debug_assert_ne!(pages_per_range, 0, "visible BRIN has build geometry");
+        let range = block / pages_per_range * pages_per_range;
         let Some(position) = ranges[..usize::from(state.count)]
             .iter()
             .position(|candidate| *candidate == range)
@@ -28563,15 +28572,17 @@ impl Storage {
         index_slot: usize,
         txid: u32,
     ) -> Result<i32, SqlError> {
-        self.brin_discover_new_ranges(index_slot, txid)?;
-        let range_start = index_slot * self.brin_unsummarized_ranges_per_index;
-        let range_end = range_start + self.brin_unsummarized_ranges_per_index;
-        let mut ranges = self.brin_unsummarized_ranges.borrow_mut();
-        let mut states = self.brin_maintenance.borrow_mut();
-        let state = &mut states[index_slot];
+        let (pages, created_at, pages_per_range) = self.brin_geometry(index_slot, txid)?;
+        let mut maintenance = self.brin_maintenance();
+        let (state, ranges) = Self::brin_entry_mut(
+            &mut maintenance,
+            index_slot,
+            self.brin_unsummarized_ranges_per_index,
+        );
+        Self::discover_brin_ranges(state, ranges, pages, created_at, pages_per_range)?;
         let count = i32::from(state.count);
         if count != 0 {
-            ranges[range_start..range_end].fill(0);
+            ranges.fill(0);
             state.count = 0;
             state.wal_dirty = true;
         }
@@ -28579,15 +28590,20 @@ impl Storage {
     }
 
     pub(crate) fn brin_maintenance_state(&self, index_slot: usize) -> BrinMaintenanceState {
-        self.brin_maintenance.borrow()[index_slot]
+        self.brin_maintenance().states[index_slot]
     }
 
-    pub(crate) fn brin_unsummarized_ranges(&self, index_slot: usize) -> std::cell::Ref<'_, [u64]> {
+    pub(crate) fn brin_maintenance_image(
+        &self,
+        index_slot: usize,
+    ) -> (BrinMaintenanceState, [u64; MAX_BRIN_UNSUMMARIZED_RANGES]) {
+        let maintenance = self.brin_maintenance();
+        let state = maintenance.states[index_slot];
         let start = index_slot * self.brin_unsummarized_ranges_per_index;
-        let count = usize::from(self.brin_maintenance.borrow()[index_slot].count);
-        std::cell::Ref::map(self.brin_unsummarized_ranges.borrow(), |ranges| {
-            &ranges[start..start + count]
-        })
+        let count = usize::from(state.count);
+        let mut ranges = [0; MAX_BRIN_UNSUMMARIZED_RANGES];
+        ranges[..count].copy_from_slice(&maintenance.unsummarized_ranges[start..start + count]);
+        (state, ranges)
     }
 
     pub(crate) fn rebuild_brin_maintenance(
@@ -28595,32 +28611,27 @@ impl Storage {
         index_slot: usize,
         txid: u32,
     ) -> Result<(), SqlError> {
-        let pages = self.brin_logical_page_count(index_slot, txid)?.max(1);
-        let index = self
-            .index_visible_to(index_slot, txid)
-            .expect("BRIN page count validated the index");
-        let pages_per_range = index
-            .mutable_for(txid)
-            .options
-            .pages_per_range
-            .unwrap_or(128);
-        self.brin_maintenance.borrow_mut()[index_slot] = BrinMaintenanceState {
-            index_created_at: index.created_at,
+        let (pages, created_at, pages_per_range) = self.brin_geometry(index_slot, txid)?;
+        let mut maintenance = self.brin_maintenance();
+        let (state, ranges) = Self::brin_entry_mut(
+            &mut maintenance,
+            index_slot,
+            self.brin_unsummarized_ranges_per_index,
+        );
+        *state = BrinMaintenanceState {
+            index_created_at: created_at,
             pages_per_range,
-            summarized_until_page: pages.div_ceil(u64::from(pages_per_range))
+            summarized_until_page: pages.max(1).div_ceil(u64::from(pages_per_range))
                 * u64::from(pages_per_range),
             wal_dirty: true,
             ..BrinMaintenanceState::EMPTY
         };
-        let start = index_slot * self.brin_unsummarized_ranges_per_index;
-        self.brin_unsummarized_ranges.borrow_mut()
-            [start..start + self.brin_unsummarized_ranges_per_index]
-            .fill(0);
+        ranges.fill(0);
         Ok(())
     }
 
     pub(crate) fn clear_brin_maintenance_dirty(&self, index_slot: usize) {
-        self.brin_maintenance.borrow_mut()[index_slot].wal_dirty = false;
+        self.brin_maintenance().states[index_slot].wal_dirty = false;
     }
 
     pub(crate) fn restore_brin_maintenance(
@@ -28646,15 +28657,16 @@ impl Storage {
                 "invalid BRIN maintenance state"
             ));
         }
-        let mut states = self.brin_maintenance.borrow_mut();
-        let state = &mut states[index_slot];
-        state.index_created_at = self.indexes[index_slot].created_at;
+        let created_at = self.indexes[index_slot].created_at;
+        let mut maintenance = self.brin_maintenance();
+        let (state, stored_ranges) = Self::brin_entry_mut(
+            &mut maintenance,
+            index_slot,
+            self.brin_unsummarized_ranges_per_index,
+        );
+        state.index_created_at = created_at;
         state.pages_per_range = pages_per_range;
         state.summarized_until_page = summarized_until_page;
-        let start = index_slot * self.brin_unsummarized_ranges_per_index;
-        let mut stored_ranges = self.brin_unsummarized_ranges.borrow_mut();
-        let stored_ranges =
-            &mut stored_ranges[start..start + self.brin_unsummarized_ranges_per_index];
         stored_ranges.fill(0);
         stored_ranges[..ranges.len()].copy_from_slice(ranges);
         state.count = ranges.len() as u8;
@@ -40536,16 +40548,16 @@ impl Storage {
             ddl_state: CatalogDdlState::PendingCreate { txid },
             ..def
         };
-        self.brin_maintenance.borrow_mut()[i] = BrinMaintenanceState {
+        let mut maintenance = self.brin_maintenance();
+        let (state, ranges) =
+            Self::brin_entry_mut(&mut maintenance, i, self.brin_unsummarized_ranges_per_index);
+        *state = BrinMaintenanceState {
             index_created_at: created_at,
             pages_per_range: def.mutable.options.pages_per_range.unwrap_or(128),
             summarized_until_page: brin_summarized_until_page,
             ..BrinMaintenanceState::EMPTY
         };
-        let range_start = i * self.brin_unsummarized_ranges_per_index;
-        self.brin_unsummarized_ranges.borrow_mut()
-            [range_start..range_start + self.brin_unsummarized_ranges_per_index]
-            .fill(0);
+        ranges.fill(0);
         Ok(i)
     }
 
@@ -46520,8 +46532,10 @@ mod tests {
         assert_eq!(storage.parameter_acl_entries.capacity(), 25);
         assert_eq!(storage.indexes.len(), 6);
         assert_eq!(storage.extended_statistics.len(), 31);
-        assert_eq!(storage.brin_maintenance.borrow().len(), 6);
-        assert_eq!(storage.brin_unsummarized_ranges.borrow().len(), 6 * 70);
+        let brin_maintenance = storage.brin_maintenance();
+        assert_eq!(brin_maintenance.states.len(), 6);
+        assert_eq!(brin_maintenance.unsummarized_ranges.len(), 6 * 70);
+        drop(brin_maintenance);
         assert_eq!(storage.views.len(), 3);
         assert_eq!(storage.matviews.len(), 4);
         assert_eq!(storage.routines.len(), 5);
@@ -46788,6 +46802,43 @@ mod tests {
                 .serializable
                 .iter()
                 .all(|entry| entry.2 == 999 && entry.3)
+        );
+    }
+
+    #[test]
+    fn brin_maintenance_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BrinMaintenance>();
+
+        let mut config = test_config();
+        config.max_brin_unsummarized_ranges_per_index = 4;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let maintenance = &storage.brin_maintenance;
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        let mut maintenance =
+                            maintenance.lock().expect("BRIN maintenance lock poisoned");
+                        maintenance.states[0].summarized_until_page += 1;
+                        maintenance.unsummarized_ranges[worker] += 1;
+                    }
+                });
+            }
+        });
+        let maintenance = storage.brin_maintenance();
+        assert_eq!(maintenance.states.capacity(), config.max_indexes);
+        assert_eq!(maintenance.states.len(), config.max_indexes);
+        assert_eq!(
+            maintenance.unsummarized_ranges.capacity(),
+            config.max_indexes * config.max_brin_unsummarized_ranges_per_index
+        );
+        assert_eq!(maintenance.states[0].summarized_until_page, 4_000);
+        assert!(
+            maintenance.unsummarized_ranges[..4]
+                .iter()
+                .all(|updates| *updates == 1_000)
         );
     }
 

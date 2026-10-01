@@ -357,6 +357,11 @@ share one startup-bounded mutex. Snapshot registration, release, oldest-snapshot
 selection, history-retention decisions, schema-blocker inspection, and
 serializable validation no longer collide on mutable state. Concurrent updates,
 exact retained capacities, and `Send + Sync` have direct coverage.
+BRIN maintenance metadata and its configured unsummarized-range pool now share
+one startup-bounded mutex. Range discovery, summarize and desummarize changes,
+rebuild, recovery, WAL images, and checkpoint images observe one coherent
+state. Concurrent mutation, exact retained capacities, and `Send + Sync` have
+direct coverage.
 The remaining shared catalog and row mutation paths still require
 synchronization before fixed workers can overlap execution.
 

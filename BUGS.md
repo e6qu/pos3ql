@@ -645,6 +645,14 @@ recording and validating serializable reads. One startup-bounded mutex now owns
 both registries; schema blocker inspection observes snapshot and relation-lock
 state in a fixed lock order. A four-worker regression and `Send + Sync`
 assertion cover concurrent mutation and exact retained capacities.
+The BRIN-maintenance audit found per-index metadata and unsummarized ranges in
+separate `RefCell` pools. Overlapping discovery, summarize, desummarize,
+rebuild, recovery, WAL, and checkpoint work could panic or pair metadata with a
+different range image. One startup-bounded mutex now owns both pools, and every
+mutation holds it across the complete state transition. WAL and checkpoint
+callers copy one coherent fixed-size image. A four-worker regression and
+`Send + Sync` assertion cover concurrent mutation and exact retained
+capacities.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

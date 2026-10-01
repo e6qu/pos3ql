@@ -130,8 +130,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   atomic under overlapping workers. Live backend activity, LISTEN registrations,
   and pending signals share another fixed mutex; signal publication revalidates
   the target in that same state. Repeatable-read retention and serializable
-  read tracking share a startup-bounded snapshot mutex. Engine mutation remains
-  single-owner and serialized while catalog, cache, and row sharing is prepared.
+  read tracking share a startup-bounded snapshot mutex. BRIN maintenance
+  metadata and unsummarized ranges share one fixed mutex, including coherent
+  WAL and checkpoint images. Engine mutation remains single-owner and serialized
+  while catalog, cache, and row sharing is prepared.
   Authorization
   graph traversal uses one exactly charged bitmap per query workspace, selected
   by the typed worker-local lease identity. Foreign statement transaction

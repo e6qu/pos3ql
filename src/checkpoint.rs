@@ -10524,11 +10524,10 @@ impl Checkpointer {
             let mut operator_class_options =
                 StackStr::<{ crate::storage::MAX_INDEX_COLS * 64 }>::new();
             let mut statistics = StackStr::<{ crate::storage::MAX_INDEX_COLS * 8 }>::new();
-            let maintenance = storage.brin_maintenance_state(index_slot);
-            let ranges = storage.brin_unsummarized_ranges(index_slot);
+            let (maintenance, ranges) = storage.brin_maintenance_image(index_slot);
             let mut unsummarized_ranges =
                 StackStr::<{ crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES * 22 }>::new();
-            for range in ranges.iter() {
+            for range in ranges.iter().take(usize::from(maintenance.count)) {
                 let _ = write!(unsummarized_ranges, " {range}");
             }
             let mut maintenance_suffix =

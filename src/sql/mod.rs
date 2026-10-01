@@ -5121,7 +5121,7 @@ impl Engine {
             let Some(index) = self.storage.index_visible_to(slot, txn.txid) else {
                 continue;
             };
-            let state = self.storage.brin_maintenance_state(slot);
+            let (state, unsummarized_ranges) = self.storage.brin_maintenance_image(slot);
             if !state.wal_dirty || state.index_created_at != index.created_at {
                 continue;
             }
@@ -5133,10 +5133,6 @@ impl Engine {
             {
                 continue;
             }
-            let ranges = self.storage.brin_unsummarized_ranges(slot);
-            let mut unsummarized_ranges = [0u64; crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES];
-            unsummarized_ranges[..ranges.len()].copy_from_slice(&ranges);
-            drop(ranges);
             let lsn = self.storage.lsn() + 1;
             if let Err(error) = self.wal.stage(
                 txn.txid,

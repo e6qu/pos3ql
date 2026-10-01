@@ -6044,11 +6044,12 @@ impl Checkpointer {
                             ))
                         })?;
                     storage.commit_sequence_create(slot);
-                    let seq = storage.sequence(slot);
-                    seq.last_value.set(last_value);
-                    seq.is_called.set(is_called != 0);
-                    seq.log_count.set(log_count);
-                    seq.dirty.set(false);
+                    storage.restore_sequence_value_image(
+                        slot,
+                        last_value,
+                        is_called != 0,
+                        log_count,
+                    );
                 }
                 tag @ (Some("dom") | Some("dom2") | Some("dom3") | Some("dom4")) => {
                     let has_parent = matches!(tag, Some("dom2") | Some("dom3") | Some("dom4"));
@@ -9481,7 +9482,7 @@ impl Checkpointer {
         // Sequences: hex schema/name, then the numeric parameters and the live
         // value state. A sequence stores no rows, so
         // this line is its whole durable form.
-        for seq in storage.checkpoint_sequences() {
+        for (slot, seq) in storage.checkpoint_sequences_with_slots() {
             write_database_context(&mut self.manifest_buf, &mut database_context, seq.database)?;
             use core::fmt::Write;
             let mut hschema = StackStr::<130>::new();
@@ -9528,6 +9529,8 @@ impl Checkpointer {
                 let _ = write!(generator_table, "0");
                 let _ = write!(generator_column, "0");
             }
+            let (last_value, is_called, log_count, _, _) =
+                storage.sequence_value_image_for(slot, 0);
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
@@ -9542,9 +9545,9 @@ impl Checkpointer {
                     seq.start_value,
                     seq.cache,
                     u8::from(seq.cycle),
-                    seq.last_value.get(),
-                    u8::from(seq.is_called.get()),
-                    seq.log_count.get(),
+                    last_value,
+                    u8::from(is_called),
+                    log_count,
                     owner_schema.as_str(),
                     owner_table.as_str(),
                     owner_column.as_str(),

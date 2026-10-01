@@ -362,6 +362,12 @@ one startup-bounded mutex. Range discovery, summarize and desummarize changes,
 rebuild, recovery, WAL images, and checkpoint images observe one coherent
 state. Concurrent mutation, exact retained capacities, and `Send + Sync` have
 direct coverage.
+Committed and staged sequence values now share one startup-bounded mutex.
+`nextval` reservation, `setval`, restart, rollback, replay, WAL, checkpoint,
+and catalog reads observe complete value images instead of independent cells.
+Publication clears a dirty marker only when its staged generation still matches,
+so a later concurrent advance remains pending. Concurrent reservation, exact
+retained capacity, and `Send + Sync` have direct coverage.
 The remaining shared catalog and row mutation paths still require
 synchronization before fixed workers can overlap execution.
 

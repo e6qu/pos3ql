@@ -132,8 +132,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   the target in that same state. Repeatable-read retention and serializable
   read tracking share a startup-bounded snapshot mutex. BRIN maintenance
   metadata and unsummarized ranges share one fixed mutex, including coherent
-  WAL and checkpoint images. Engine mutation remains single-owner and serialized
-  while catalog, cache, and row sharing is prepared.
+  WAL and checkpoint images. Committed and staged sequence value images share
+  another fixed mutex across reservation, restart, replay, and publication.
+  Engine mutation remains single-owner and serialized while catalog, cache, and
+  row sharing is prepared.
   Authorization
   graph traversal uses one exactly charged bitmap per query workspace, selected
   by the typed worker-local lease identity. Foreign statement transaction

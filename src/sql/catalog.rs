@@ -9923,25 +9923,27 @@ fn pg_largeobject_metadata<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_largeobject_metadata", false);
-    let count = storage.large_objects_visible_to(txid).count();
+    let capacity = storage.access_class_slots(crate::storage::AccessClass::LargeObject);
     let rows = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (index, (slot, object)) in storage.large_objects_visible_to(txid).enumerate() {
+    let mut count = 0;
+    for (slot, object) in storage.large_objects_visible_to(txid) {
         let access = crate::storage::AccessObject {
             class: crate::storage::AccessClass::LargeObject,
             slot: slot as u16,
         };
-        rows[index] = row(
+        rows[count] = row(
             &[
                 Datum::Oid(object.oid.get()),
-                Datum::Oid(Storage::role_oid(storage.object_owner(access, txid)) as u32),
+                Datum::Oid(Storage::role_oid(object.ownership.owner_to(txid) as usize) as u32),
                 acl(storage, access, txid, arena)?,
             ],
             arena,
         )?;
+        count += 1;
     }
-    finish(definition, rows, arena)
+    finish(definition, &rows[..count], arena)
 }
 
 fn pg_largeobject<'a>(

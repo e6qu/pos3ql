@@ -10471,6 +10471,91 @@ impl LargeObjectDef {
     }
 }
 
+struct LargeObjectCatalog {
+    definitions: FixedVec<LargeObjectDef>,
+    next_oid: Option<LargeObjectOid>,
+}
+
+impl LargeObjectCatalog {
+    fn allocate_oid(&mut self, database: DatabaseOid) -> Result<LargeObjectOid, SqlError> {
+        let mut candidate = self.next_oid.ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "no large-object OIDs remain"
+            )
+        })?;
+        loop {
+            self.next_oid = candidate
+                .get()
+                .checked_add(1)
+                .and_then(LargeObjectOid::parse);
+            if !self.definitions.iter().any(|object| {
+                object.database == database
+                    && object.ddl_state != CatalogDdlState::Absent
+                    && object.oid == candidate
+            }) {
+                return Ok(candidate);
+            }
+            candidate = self.next_oid.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "no large-object OIDs remain"
+                )
+            })?;
+        }
+    }
+
+    fn observe_allocated_oid(&mut self, oid: LargeObjectOid) {
+        let next = oid.get().checked_add(1).and_then(LargeObjectOid::parse);
+        self.next_oid = match (self.next_oid, next) {
+            (None, _) | (_, None) => None,
+            (Some(current), Some(next)) => Some(if current.get() < next.get() {
+                next
+            } else {
+                current
+            }),
+        };
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LargeObjectFilter {
+    Visible { database: DatabaseOid, txid: u32 },
+    Checkpoint,
+}
+
+struct LargeObjectIter<'a> {
+    catalog: &'a std::sync::Mutex<LargeObjectCatalog>,
+    filter: LargeObjectFilter,
+    next_slot: usize,
+}
+
+impl Iterator for LargeObjectIter<'_> {
+    type Item = (usize, LargeObjectDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("large object catalog lock poisoned");
+        while self.next_slot < catalog.definitions.len() {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            let object = catalog.definitions[slot];
+            let selected = match self.filter {
+                LargeObjectFilter::Visible { database, txid } => {
+                    object.database == database && object.visible_to(txid)
+                }
+                LargeObjectFilter::Checkpoint => object.ddl_state == CatalogDdlState::Present,
+            };
+            if selected {
+                return Some((slot, object));
+            }
+        }
+        None
+    }
+}
+
 /// Object classes addressable by ALTER DEFAULT PRIVILEGES.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -12009,8 +12094,7 @@ pub struct Storage {
     pending_row_version_free: Option<usize>,
     committed_row_versions: FixedVec<CommittedVersionSlot>,
     committed_row_version_free: Option<usize>,
-    large_objects: FixedVec<LargeObjectDef>,
-    next_large_object_oid: Option<LargeObjectOid>,
+    large_objects: std::sync::Mutex<LargeObjectCatalog>,
     large_object_page_table: u32,
     max_catalog_versions_per_object: u32,
     pending_table_defs: FixedVec<PendingTableDefSlot>,
@@ -16638,8 +16722,10 @@ impl Storage {
             pending_row_version_free: None,
             committed_row_versions,
             committed_row_version_free: None,
-            large_objects,
-            next_large_object_oid: LargeObjectOid::parse(16_384),
+            large_objects: std::sync::Mutex::new(LargeObjectCatalog {
+                definitions: large_objects,
+                next_oid: LargeObjectOid::parse(16_384),
+            }),
             large_object_page_table,
             max_catalog_versions_per_object: config.max_catalog_versions_per_object as u32,
             pending_table_defs,
@@ -18941,7 +19027,11 @@ impl Storage {
                     self.event_triggers[usize::from(entry.object.slot)].database
                 }
                 AccessClass::LargeObject => {
-                    self.large_objects[usize::from(entry.object.slot)].database
+                    self.large_objects
+                        .lock()
+                        .expect("large object catalog lock poisoned")
+                        .definitions[usize::from(entry.object.slot)]
+                    .database
                 }
                 AccessClass::ForeignDataWrapper => {
                     self.foreign
@@ -19386,7 +19476,9 @@ impl Storage {
             },
             AccessClass::EventTrigger => &self.event_triggers[slot].definition.ownership,
             AccessClass::Database => &self.databases[slot].ownership,
-            AccessClass::LargeObject => &self.large_objects[slot].ownership,
+            AccessClass::LargeObject => {
+                unreachable!("large object ownership is synchronized separately")
+            }
             AccessClass::ForeignDataWrapper => &self.foreign.entry_wrapper(slot).ownership,
             AccessClass::ForeignServer => &self.foreign.entry_server(slot).ownership,
             AccessClass::Language => {
@@ -19416,7 +19508,9 @@ impl Storage {
             }
             AccessClass::EventTrigger => &mut self.event_triggers[slot].definition.ownership,
             AccessClass::Database => &mut self.databases[slot].ownership,
-            AccessClass::LargeObject => &mut self.large_objects[slot].ownership,
+            AccessClass::LargeObject => {
+                unreachable!("large object ownership is synchronized separately")
+            }
             AccessClass::ForeignDataWrapper => &mut self.foreign.entry_wrapper_mut(slot).ownership,
             AccessClass::ForeignServer => &mut self.foreign.entry_server_mut(slot).ownership,
             AccessClass::Language => {
@@ -19443,6 +19537,12 @@ impl Storage {
         if object.class == AccessClass::Language {
             return usize::from(BOOTSTRAP_ROLE);
         }
+        if object.class == AccessClass::LargeObject {
+            return self
+                .large_object(usize::from(object.slot))
+                .ownership
+                .owner_to(txid) as usize;
+        }
         self.ownership(object).owner_to(txid) as usize
     }
 
@@ -19452,7 +19552,11 @@ impl Storage {
     }
 
     pub(crate) fn large_object_slot(&self, oid: LargeObjectOid, txid: u32) -> Option<usize> {
-        self.large_objects.iter().position(|object| {
+        let catalog = self
+            .large_objects
+            .lock()
+            .expect("large object catalog lock poisoned");
+        catalog.definitions.iter().position(|object| {
             object.database == current_database() && object.oid == oid && object.visible_to(txid)
         })
     }
@@ -19461,27 +19565,31 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, LargeObjectDef)> + '_ {
-        self.large_objects
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(move |(_, object)| {
-                object.database == current_database() && object.visible_to(txid)
-            })
+        LargeObjectIter {
+            catalog: &self.large_objects,
+            filter: LargeObjectFilter::Visible {
+                database: current_database(),
+                txid,
+            },
+            next_slot: 0,
+        }
     }
 
     pub(crate) fn checkpoint_large_objects(
         &self,
     ) -> impl Iterator<Item = (usize, LargeObjectDef)> + '_ {
-        self.large_objects
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, object)| object.ddl_state == CatalogDdlState::Present)
+        LargeObjectIter {
+            catalog: &self.large_objects,
+            filter: LargeObjectFilter::Checkpoint,
+            next_slot: 0,
+        }
     }
 
     pub(crate) fn large_object(&self, slot: usize) -> LargeObjectDef {
-        self.large_objects[slot]
+        self.large_objects
+            .lock()
+            .expect("large object catalog lock poisoned")
+            .definitions[slot]
     }
 
     pub(crate) fn create_large_object(
@@ -19489,72 +19597,70 @@ impl Storage {
         requested: Option<LargeObjectOid>,
         txid: u32,
     ) -> Result<(usize, LargeObjectOid), SqlError> {
-        let (oid, allocated) = match requested {
-            Some(oid) => {
-                if self.large_object_slot(oid, txid).is_some() {
-                    return Err(sql_err!(
-                        sqlstate::DUPLICATE_OBJECT,
-                        "large object {} already exists",
-                        oid.get()
-                    ));
-                }
-                (oid, false)
-            }
-            None => {
-                let mut candidate = self.next_large_object_oid.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "no large-object OIDs remain"
-                    )
-                })?;
-                loop {
-                    self.next_large_object_oid = candidate
-                        .get()
-                        .checked_add(1)
-                        .and_then(LargeObjectOid::parse);
-                    if !self.large_objects.iter().any(|object| {
-                        object.database == current_database()
-                            && object.ddl_state != CatalogDdlState::Absent
-                            && object.oid == candidate
+        let database = current_database();
+        let (oid, allocated, blocker) = {
+            let mut catalog = self
+                .large_objects
+                .lock()
+                .expect("large object catalog lock poisoned");
+            let (oid, allocated) = match requested {
+                Some(oid) => {
+                    if catalog.definitions.iter().any(|object| {
+                        object.database == database && object.oid == oid && object.visible_to(txid)
                     }) {
-                        break (candidate, true);
+                        return Err(sql_err!(
+                            sqlstate::DUPLICATE_OBJECT,
+                            "large object {} already exists",
+                            oid.get()
+                        ));
                     }
-                    candidate = self.next_large_object_oid.ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "no large-object OIDs remain"
-                        )
-                    })?;
+                    (oid, false)
                 }
-            }
+                None => {
+                    let oid = catalog.allocate_oid(database)?;
+                    (oid, true)
+                }
+            };
+            let blocker = catalog.definitions.iter().find_map(|object| {
+                (object.database == database && object.oid == oid)
+                    .then_some(object.ddl_state.pending_txid()?)
+                    .filter(|owner| *owner != txid)
+            });
+            (oid, allocated, blocker)
         };
-        if let Some(owner) = self.large_objects.iter().find_map(|object| {
-            (object.database == current_database() && object.oid == oid)
-                .then_some(object.ddl_state.pending_txid()?)
-                .filter(|owner| *owner != txid)
-        }) {
+        if let Some(owner) = blocker {
             return Err(self.catalog_ddl_wait_error(txid, owner, "large object"));
         }
-        let slot = self
-            .large_objects
-            .iter()
-            .position(|object| object.ddl_state == CatalogDdlState::Absent)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many large objects (limit {})",
-                    self.large_objects.len()
-                )
-            })?;
+        let slot = {
+            let catalog = self
+                .large_objects
+                .lock()
+                .expect("large object catalog lock poisoned");
+            catalog
+                .definitions
+                .iter()
+                .position(|object| object.ddl_state == CatalogDdlState::Absent)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many large objects (limit {})",
+                        catalog.definitions.len()
+                    )
+                })?
+        };
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::LargeObject,
             slot: slot as u16,
         });
         let created_at = self.catalog_sequence.next();
-        self.large_objects[slot] = LargeObjectDef {
-            database: current_database(),
+        let ownership = self.initial_ownership(txid);
+        self.large_objects
+            .lock()
+            .expect("large object catalog lock poisoned")
+            .definitions[slot] = LargeObjectDef {
+            database,
             oid,
-            ownership: self.initial_ownership(txid),
+            ownership,
             created_at,
             allocated,
             ddl_state: if txid == 0 {
@@ -19567,27 +19673,42 @@ impl Storage {
     }
 
     pub(crate) fn drop_large_object(
-        &mut self,
+        &self,
         oid: LargeObjectOid,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        let Some(slot) = self.large_object_slot(oid, txid) else {
+        let database = current_database();
+        let mut catalog = self
+            .large_objects
+            .lock()
+            .expect("large object catalog lock poisoned");
+        let Some(slot) = catalog.definitions.iter().position(|object| {
+            object.database == database && object.oid == oid && object.visible_to(txid)
+        }) else {
             return Ok(None);
         };
-        self.large_objects[slot].ddl_state = self.large_objects[slot].ddl_state.drop_by(txid);
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.drop_by(txid);
         Ok(Some(slot))
     }
 
-    pub(crate) fn commit_large_object_create(&mut self, slot: usize) {
-        self.large_objects[slot].ddl_state = self.large_objects[slot].ddl_state.commit_create();
+    pub(crate) fn commit_large_object_create(&self, slot: usize) {
+        let mut catalog = self
+            .large_objects
+            .lock()
+            .expect("large object catalog lock poisoned");
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_create();
     }
 
-    pub(crate) fn rollback_large_object_create(&mut self, slot: usize) {
-        self.large_objects[slot].ddl_state = self.large_objects[slot].ddl_state.rollback_create();
+    pub(crate) fn rollback_large_object_create(&self, slot: usize) {
+        let mut catalog = self
+            .large_objects
+            .lock()
+            .expect("large object catalog lock poisoned");
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.rollback_create();
     }
 
     pub(crate) fn commit_large_object_drop(&mut self, slot: usize) {
-        let oid = self.large_objects[slot].oid;
+        let oid = self.large_object(slot).oid;
         self.drop_object_comments(
             CommentClass::LargeObject,
             "",
@@ -19597,11 +19718,20 @@ impl Storage {
             class: AccessClass::LargeObject,
             slot: slot as u16,
         });
-        self.large_objects[slot].ddl_state = self.large_objects[slot].ddl_state.commit_drop();
+        let mut catalog = self
+            .large_objects
+            .lock()
+            .expect("large object catalog lock poisoned");
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_drop();
     }
 
-    pub(crate) fn rollback_large_object_drop(&mut self, slot: usize, txid: u32) {
-        self.large_objects[slot].ddl_state = self.large_objects[slot].ddl_state.rollback_drop(txid);
+    pub(crate) fn rollback_large_object_drop(&self, slot: usize, txid: u32) {
+        let mut catalog = self
+            .large_objects
+            .lock()
+            .expect("large object catalog lock poisoned");
+        catalog.definitions[slot].ddl_state =
+            catalog.definitions[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn large_object_page_table(&self) -> usize {
@@ -19609,11 +19739,17 @@ impl Storage {
     }
 
     pub(crate) fn next_large_object_oid(&self) -> Option<LargeObjectOid> {
-        self.next_large_object_oid
+        self.large_objects
+            .lock()
+            .expect("large object catalog lock poisoned")
+            .next_oid
     }
 
-    pub(crate) fn restore_next_large_object_oid(&mut self, oid: Option<LargeObjectOid>) {
-        self.next_large_object_oid = oid;
+    pub(crate) fn restore_next_large_object_oid(&self, oid: Option<LargeObjectOid>) {
+        self.large_objects
+            .lock()
+            .expect("large object catalog lock poisoned")
+            .next_oid = oid;
     }
 
     pub(crate) fn is_large_object_page_relation(&self, schema: &str, name: &str) -> bool {
@@ -19639,18 +19775,16 @@ impl Storage {
         allocated: bool,
     ) -> Result<usize, SqlError> {
         let (slot, _) = self.create_large_object(Some(oid), 0)?;
-        self.large_objects[slot].created_at = created_at;
-        self.large_objects[slot].allocated = allocated;
-        if allocated {
-            let next = oid.get().checked_add(1).and_then(LargeObjectOid::parse);
-            self.next_large_object_oid = match (self.next_large_object_oid, next) {
-                (None, _) | (_, None) => None,
-                (Some(current), Some(next)) => Some(if current.get() < next.get() {
-                    next
-                } else {
-                    current
-                }),
-            };
+        {
+            let mut catalog = self
+                .large_objects
+                .lock()
+                .expect("large object catalog lock poisoned");
+            catalog.definitions[slot].created_at = created_at;
+            catalog.definitions[slot].allocated = allocated;
+            if allocated {
+                catalog.observe_allocated_oid(oid);
+            }
         }
         self.catalog_sequence.observe(created_at);
         Ok(slot)
@@ -19814,7 +19948,7 @@ impl Storage {
                 self.databases[slot].definition_for(txid).name,
             ),
             AccessClass::LargeObject => {
-                let name = crate::stack_format!(16, "{}", self.large_objects[slot].oid.get());
+                let name = crate::stack_format!(16, "{}", self.large_object(slot).oid.get());
                 (
                     SqlName::EMPTY,
                     SqlName::parse(name.as_str()).expect("large-object OID fits a SQL name"),
@@ -19865,7 +19999,7 @@ impl Storage {
             }
             AccessClass::Database => self.databases[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::LargeObject => {
-                self.large_objects[slot].ddl_state == CatalogDdlState::Present
+                self.large_object(slot).ddl_state == CatalogDdlState::Present
             }
             AccessClass::ForeignDataWrapper => {
                 self.foreign.entry_wrapper(slot).ddl_state == CatalogDdlState::Present
@@ -19901,7 +20035,7 @@ impl Storage {
             AccessClass::Trigger => self.triggers[slot].visible_to(txid),
             AccessClass::EventTrigger => self.event_triggers[slot].visible_to(txid),
             AccessClass::Database => self.databases[slot].visible_to(txid),
-            AccessClass::LargeObject => self.large_objects[slot].visible_to(txid),
+            AccessClass::LargeObject => self.large_object(slot).visible_to(txid),
             AccessClass::ForeignDataWrapper => self.foreign.entry_wrapper(slot).visible_to(txid),
             AccessClass::ForeignServer => self.foreign.entry_server(slot).visible_to(txid),
             AccessClass::Language => {
@@ -19932,7 +20066,7 @@ impl Storage {
             AccessClass::Extension => Some(self.extensions[slot].database),
             AccessClass::Trigger => Some(self.triggers[slot].database),
             AccessClass::EventTrigger => Some(self.event_triggers[slot].database),
-            AccessClass::LargeObject => Some(self.large_objects[slot].database),
+            AccessClass::LargeObject => Some(self.large_object(slot).database),
             AccessClass::ForeignDataWrapper => Some(self.foreign.entry_wrapper(slot).database),
             AccessClass::ForeignServer => Some(self.foreign.entry_server(slot).database),
             AccessClass::Tablespace | AccessClass::Database | AccessClass::Language => None,
@@ -20037,8 +20171,12 @@ impl Storage {
                 })?
             }
             AccessClass::LargeObject => {
-                let oid = self.large_objects[source_slot].oid;
-                self.large_objects.iter().position(|candidate| {
+                let catalog = self
+                    .large_objects
+                    .lock()
+                    .expect("large object catalog lock poisoned");
+                let oid = catalog.definitions[source_slot].oid;
+                catalog.definitions.iter().position(|candidate| {
                     candidate.database == target_database
                         && candidate.ddl_state != CatalogDdlState::Absent
                         && candidate.oid == oid
@@ -20378,7 +20516,12 @@ impl Storage {
             AccessClass::Trigger => self.triggers.len(),
             AccessClass::EventTrigger => self.event_triggers.len(),
             AccessClass::Database => self.databases.len(),
-            AccessClass::LargeObject => self.large_objects.len(),
+            AccessClass::LargeObject => self
+                .large_objects
+                .lock()
+                .expect("large object catalog lock poisoned")
+                .definitions
+                .len(),
             AccessClass::ForeignDataWrapper => self.foreign.wrapper_capacity(),
             AccessClass::ForeignServer => self.foreign.server_capacity(),
             AccessClass::Language => 0,
@@ -20430,6 +20573,10 @@ impl Storage {
             (AccessClass::Statistics, self.extended_statistics.len()),
             (AccessClass::Extension, self.extensions.len()),
             (AccessClass::EventTrigger, self.event_triggers.len()),
+            (
+                AccessClass::LargeObject,
+                self.access_class_slots(AccessClass::LargeObject),
+            ),
             (
                 AccessClass::ForeignDataWrapper,
                 self.foreign.wrapper_capacity(),
@@ -20522,6 +20669,24 @@ impl Storage {
         owner: usize,
         txid: u32,
     ) -> Option<PendingOwnership> {
+        if object.class == AccessClass::LargeObject {
+            let mut catalog = self
+                .large_objects
+                .lock()
+                .expect("large object catalog lock poisoned");
+            let ownership = &mut catalog.definitions[usize::from(object.slot)].ownership;
+            let prior = ownership.pending;
+            if txid == 0 {
+                ownership.owner = owner as u16;
+                ownership.pending = None;
+            } else {
+                ownership.pending = Some(PendingOwnership {
+                    txid,
+                    owner: owner as u16,
+                });
+            }
+            return prior;
+        }
         let ownership = self.ownership_mut(object);
         let prior = ownership.pending;
         if txid == 0 {
@@ -20537,6 +20702,20 @@ impl Storage {
     }
 
     pub(crate) fn commit_object_owner(&mut self, object: AccessObject, txid: u32) {
+        if object.class == AccessClass::LargeObject {
+            let mut catalog = self
+                .large_objects
+                .lock()
+                .expect("large object catalog lock poisoned");
+            let ownership = &mut catalog.definitions[usize::from(object.slot)].ownership;
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            return;
+        }
         let ownership = self.ownership_mut(object);
         if let Some(pending) = ownership.pending
             && pending.txid == txid
@@ -20551,6 +20730,15 @@ impl Storage {
         object: AccessObject,
         prior: Option<PendingOwnership>,
     ) {
+        if object.class == AccessClass::LargeObject {
+            self.large_objects
+                .lock()
+                .expect("large object catalog lock poisoned")
+                .definitions[usize::from(object.slot)]
+            .ownership
+            .pending = prior;
+            return;
+        }
         self.ownership_mut(object).pending = prior;
     }
 
@@ -47086,6 +47274,83 @@ mod tests {
         let bounded = CatalogSequence::new(1);
         assert_eq!(bounded.next_bounded(2, "test").unwrap(), 2);
         assert!(bounded.next_bounded(2, "test").is_err());
+    }
+
+    #[test]
+    fn large_object_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<LargeObjectCatalog>>();
+        assert_send_sync::<LargeObjectIter<'_>>();
+
+        const WORKERS: usize = 4;
+        const ADVANCES_PER_WORKER: usize = 1_000;
+        const ADVANCES: usize = WORKERS * ADVANCES_PER_WORKER;
+        const FIRST_OID: u32 = 16_384;
+        let mut config = test_config();
+        config.max_large_objects = WORKERS;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let catalog = &storage.large_objects;
+        let claimed: [std::sync::atomic::AtomicBool; ADVANCES] =
+            std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let claimed = &claimed;
+                scope.spawn(move || {
+                    let mut last = LargeObjectOid::parse(FIRST_OID).unwrap();
+                    for _ in 0..ADVANCES_PER_WORKER {
+                        let oid = catalog
+                            .lock()
+                            .expect("large object catalog lock poisoned")
+                            .allocate_oid(DatabaseOid::POSTGRES)
+                            .unwrap();
+                        let offset = (oid.get() - FIRST_OID) as usize;
+                        assert!(offset < ADVANCES);
+                        assert!(!claimed[offset].swap(true, std::sync::atomic::Ordering::Relaxed));
+                        last = oid;
+                    }
+                    catalog
+                        .lock()
+                        .expect("large object catalog lock poisoned")
+                        .definitions[worker] = LargeObjectDef {
+                        database: DatabaseOid::POSTGRES,
+                        oid: last,
+                        ownership: Ownership::BOOTSTRAP,
+                        created_at: worker as u64 + 1,
+                        allocated: true,
+                        ddl_state: CatalogDdlState::Present,
+                    };
+                });
+            }
+        });
+        assert!(
+            claimed
+                .iter()
+                .all(|value| value.load(std::sync::atomic::Ordering::Relaxed))
+        );
+        let catalog = catalog.lock().expect("large object catalog lock poisoned");
+        assert_eq!(catalog.definitions.len(), WORKERS);
+        assert_eq!(catalog.definitions.capacity(), WORKERS);
+        assert_eq!(catalog.next_oid.unwrap().get(), FIRST_OID + ADVANCES as u32);
+        drop(catalog);
+
+        let mut seen = 0;
+        for (slot, object) in storage.checkpoint_large_objects() {
+            assert_eq!(storage.large_object(slot).oid, object.oid);
+            seen += 1;
+        }
+        assert_eq!(seen, WORKERS);
+        storage
+            .large_objects
+            .lock()
+            .expect("large object catalog lock poisoned")
+            .definitions[0]
+            .ownership
+            .owner = 1;
+        assert_eq!(
+            storage.role_object_dependency(1, 0),
+            Some(RoleObjectDependency::OwnedObject)
+        );
     }
 
     #[test]

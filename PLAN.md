@@ -414,6 +414,18 @@ Concurrent uniqueness, replay observation, and bounded exhaustion have direct
 coverage. Catalog definition containers and row mutation state remain the
 shared write boundaries before fixed workers can overlap execution.
 
+Large object definitions and their OID allocation frontier now share one
+startup-bounded mutex. Create, drop, ownership, recovery, checkpoint, ACL, and
+catalog reads observe complete definition images, and automatic OID allocation
+cannot duplicate or lose advances under overlapping workers. Iterators copy one
+entry while holding the mutex and release it before nested ownership or ACL
+lookups. Large object catalog materialization uses the fixed configured roster
+so concurrent visibility changes cannot overrun a prior count. Four-worker
+allocation, nested-reader progress, exact retained
+capacity, and `Send + Sync` have direct coverage. Adjacent ACL and comment
+catalog mutation remains reactor-serialized with the other catalog families.
+Role dependency checks now include owned large objects before `DROP ROLE`.
+
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint
 roster used while opening or resuming a remote transaction, with exact startup

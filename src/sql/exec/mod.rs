@@ -3842,16 +3842,13 @@ fn copy_like_comments(
         let source = *storage.table_def(source_slot, txn.txid);
         if like.comments {
             for subid in 1..=source.n_columns {
-                let source_comment = match storage.comment_text(
+                let source_comment = storage.comment_text(
                     CommentClass::Relation,
                     source.schema.as_str(),
                     source.name.as_str(),
                     subid as u32,
                     txn.txid,
-                ) {
-                    Some(text) => Some(crate::storage::comment_stackstr(text)?),
-                    None => None,
-                };
+                );
                 let Some(text) = source_comment else {
                     continue;
                 };
@@ -3975,7 +3972,6 @@ fn copy_comment_if_present(
     ) else {
         return Ok(());
     };
-    let text = crate::storage::comment_stackstr(text)?;
     stage_comment(storage, wal, txn, target, Some(text.as_str()))
 }
 
@@ -66382,20 +66378,14 @@ fn alter_table_relation(
             Ok(name) => name,
             Err(error) => return sql_fail(error),
         };
-        let text = match storage
-            .comment_text(
-                crate::storage::CommentClass::Constraint,
-                def.schema.as_str(),
-                old_name.as_str(),
-                table_index as u32,
-                txn.txid,
-            )
-            .map(crate::storage::comment_stackstr)
-            .transpose()
-        {
-            Ok(Some(text)) => text,
-            Ok(None) => continue,
-            Err(error) => return sql_fail(error),
+        let Some(text) = storage.comment_text(
+            crate::storage::CommentClass::Constraint,
+            def.schema.as_str(),
+            old_name.as_str(),
+            table_index as u32,
+            txn.txid,
+        ) else {
+            continue;
         };
         if def.persistence != crate::storage::RelationPersistence::Temporary {
             let lsn = storage.bump_lsn();

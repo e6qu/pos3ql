@@ -11339,6 +11339,117 @@ pub struct CommentEntry {
     pending_identity: Option<PendingCommentIdentity>,
 }
 
+struct CommentCatalog {
+    entries: FixedVec<CommentEntry>,
+}
+
+impl CommentCatalog {
+    fn reap(&mut self, slot: usize) {
+        let comment = &mut self.entries[slot];
+        if comment.live.is_none() && comment.pending.is_none() && comment.pending_identity.is_none()
+        {
+            *comment = CommentEntry::empty();
+        }
+    }
+}
+
+struct LiveCommentIter<'a> {
+    catalog: &'a std::sync::Mutex<CommentCatalog>,
+    database: DatabaseOid,
+    next_slot: usize,
+}
+
+struct CheckpointCommentIter<'a> {
+    catalog: &'a std::sync::Mutex<CommentCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for CheckpointCommentIter<'_> {
+    type Item = CommentEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("comment catalog lock poisoned");
+        while self.next_slot < catalog.entries.len() {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            let comment = catalog.entries[slot];
+            if comment.used
+                && comment.live.is_some()
+                && !comment.schema.as_str().starts_with("pg_temp_")
+            {
+                return Some(comment);
+            }
+        }
+        None
+    }
+}
+
+impl Iterator for LiveCommentIter<'_> {
+    type Item = CommentEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("comment catalog lock poisoned");
+        while self.next_slot < catalog.entries.len() {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            let comment = catalog.entries[slot];
+            if comment.used
+                && comment.live.is_some()
+                && comment
+                    .database
+                    .is_none_or(|database| database == self.database)
+            {
+                return Some(comment);
+            }
+        }
+        None
+    }
+}
+
+struct VisibleCommentIter<'a> {
+    catalog: &'a std::sync::Mutex<CommentCatalog>,
+    database: DatabaseOid,
+    txid: u32,
+    next_slot: usize,
+}
+
+impl Iterator for VisibleCommentIter<'_> {
+    type Item = (CommentClass, SqlName, SqlName, u32, StackStr<COMMENT_MAX>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("comment catalog lock poisoned");
+        while self.next_slot < catalog.entries.len() {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            let comment = catalog.entries[slot];
+            if !comment.used
+                || comment
+                    .database
+                    .is_some_and(|database| database != self.database)
+            {
+                continue;
+            }
+            let identity = comment
+                .pending_identity
+                .filter(|identity| identity.txid == self.txid);
+            let Some(text) = (match comment.pending {
+                Some(pending) if pending.txid == self.txid => pending.text,
+                _ => comment.live,
+            }) else {
+                continue;
+            };
+            return Some((
+                comment.class,
+                identity.map_or(comment.schema, |identity| identity.schema),
+                identity.map_or(comment.name, |identity| identity.name),
+                comment.subid,
+                text,
+            ));
+        }
+        None
+    }
+}
+
 impl CommentEntry {
     fn empty() -> Self {
         Self {
@@ -11395,15 +11506,6 @@ impl CommentEntry {
                 .map_or(self.name, |identity| identity.name)
                 .as_str()
                 == name
-    }
-
-    /// The text `txid` sees: its own uncommitted overlay when present, else the
-    /// committed value.
-    fn visible_text(&self, txid: u32) -> Option<&str> {
-        match &self.pending {
-            Some(p) if p.txid == txid => p.text.as_ref().map(StackStr::as_str),
-            _ => self.live.as_ref().map(StackStr::as_str),
-        }
     }
 }
 
@@ -12175,7 +12277,7 @@ pub struct Storage {
     parameter_acl_entries: FixedVec<ParameterAclEntry>,
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
     /// fixed slots reused as comments are added and removed.
-    comments: FixedVec<CommentEntry>,
+    comments: std::sync::Mutex<CommentCatalog>,
     /// Monotonic stamp shared by every catalog's `created_at` fields.
     catalog_sequence: CatalogSequence,
     next_rowid: u64,
@@ -16819,7 +16921,7 @@ impl Storage {
             column_acl_entries,
             default_acl_entries,
             parameter_acl_entries,
-            comments,
+            comments: std::sync::Mutex::new(CommentCatalog { entries: comments }),
             catalog_sequence: CatalogSequence::new(0),
             snapshots: std::sync::Mutex::new(SnapshotState {
                 active: active_snapshots,
@@ -18934,8 +19036,9 @@ impl Storage {
                     0,
                 )?;
             }
-            for source_slot in 0..self.comments.len() {
-                let mut entry = self.comments[source_slot];
+            let mut comments = self.comment_catalog();
+            for source_slot in 0..comments.entries.len() {
+                let mut entry = comments.entries[source_slot];
                 if !entry.used
                     || entry.database != Some(source)
                     || entry.live.is_none()
@@ -18943,8 +19046,8 @@ impl Storage {
                 {
                     continue;
                 }
-                let target_slot = self
-                    .comments
+                let target_slot = comments
+                    .entries
                     .iter()
                     .position(|candidate| !candidate.used)
                     .ok_or_else(|| {
@@ -18953,8 +19056,9 @@ impl Storage {
                 entry.database = Some(target);
                 entry.pending = None;
                 entry.pending_identity = None;
-                self.comments[target_slot] = entry;
+                comments.entries[target_slot] = entry;
             }
+            drop(comments);
 
             // Partition links are runtime table slots. Rebind them only after
             // every target relation exists; names are the durable identity.
@@ -19076,7 +19180,7 @@ impl Storage {
                 entry.pending = None;
             }
         }
-        for entry in self.comments.iter_mut() {
+        for entry in self.comment_catalog().entries.iter_mut() {
             if entry.database == Some(database) {
                 *entry = CommentEntry::empty();
             }
@@ -19320,7 +19424,7 @@ impl Storage {
             let old_name = self.databases[slot].definition.name;
             self.databases[slot].definition = pending.definition;
             self.databases[slot].pending = None;
-            for comment in self.comments.iter_mut() {
+            for comment in self.comment_catalog().entries.iter_mut() {
                 if comment.used
                     && comment.class == CommentClass::Database
                     && comment.name == old_name
@@ -20455,10 +20559,11 @@ impl Storage {
         })
     }
 
-    pub(crate) fn checkpoint_comments(&self) -> impl Iterator<Item = &CommentEntry> {
-        self.comments.iter().filter(|value| {
-            value.used && value.live.is_some() && !value.schema.as_str().starts_with("pg_temp_")
-        })
+    pub(crate) fn checkpoint_comments(&self) -> impl Iterator<Item = CommentEntry> + '_ {
+        CheckpointCommentIter {
+            catalog: &self.comments,
+            next_slot: 0,
+        }
     }
 
     pub(crate) fn checkpoint_default_acls(
@@ -23069,6 +23174,10 @@ impl Storage {
         )
     }
 
+    fn comment_catalog(&self) -> std::sync::MutexGuard<'_, CommentCatalog> {
+        self.comments.lock().expect("comment catalog lock poisoned")
+    }
+
     /// The comment text `txid` sees on this object, or `None` for none. Reads
     /// the transaction's own uncommitted overlay when present, else committed.
     pub fn comment_text(
@@ -23078,8 +23187,10 @@ impl Storage {
         name: &str,
         subid: u32,
         txid: u32,
-    ) -> Option<&str> {
-        self.comments
+    ) -> Option<StackStr<COMMENT_MAX>> {
+        let comments = self.comment_catalog();
+        comments
+            .entries
             .iter()
             .find(|c| {
                 c.matches_to(
@@ -23091,19 +23202,20 @@ impl Storage {
                     txid,
                 )
             })
-            .and_then(|c| c.visible_text(txid))
+            .and_then(|comment| match comment.pending {
+                Some(pending) if pending.txid == txid => pending.text,
+                _ => comment.live,
+            })
     }
 
     /// Committed comment entries carrying text, for the checkpoint and
     /// `pg_description`.
-    pub fn live_comments(&self) -> impl Iterator<Item = &CommentEntry> {
-        self.comments.iter().filter(|comment| {
-            comment.used
-                && comment.live.is_some()
-                && comment
-                    .database
-                    .is_none_or(|database| database == current_database())
-        })
+    pub fn live_comments(&self) -> impl Iterator<Item = CommentEntry> + '_ {
+        LiveCommentIter {
+            catalog: &self.comments,
+            database: current_database(),
+            next_slot: 0,
+        }
     }
 
     /// Comments `txid` can see (own uncommitted overlay, else committed) that
@@ -23112,27 +23224,18 @@ impl Storage {
     pub fn comments_visible(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (CommentClass, &str, &str, u32, &str)> {
-        self.comments.iter().filter_map(move |c| {
-            if !c.used
-                || c.database
-                    .is_some_and(|database| database != current_database())
-            {
-                return None;
-            }
-            let identity = c
-                .pending_identity
-                .as_ref()
-                .filter(|identity| identity.txid == txid);
-            let schema = identity.map_or(c.schema.as_str(), |identity| identity.schema.as_str());
-            let name = identity.map_or(c.name.as_str(), |identity| identity.name.as_str());
-            c.visible_text(txid)
-                .map(|t| (c.class, schema, name, c.subid, t))
-        })
+    ) -> impl Iterator<Item = (CommentClass, SqlName, SqlName, u32, StackStr<COMMENT_MAX>)> + '_
+    {
+        VisibleCommentIter {
+            catalog: &self.comments,
+            database: current_database(),
+            txid,
+            next_slot: 0,
+        }
     }
 
     pub(crate) fn comment_capacity(&self) -> usize {
-        self.comments.len()
+        self.comment_catalog().entries.len()
     }
 
     pub(crate) fn comment_for_event_trigger(
@@ -23140,11 +23243,12 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> Option<(CommentClass, SqlName, SqlName, u32)> {
-        let comment = self
-            .comments
+        let comments = self.comment_catalog();
+        let comment = comments
+            .entries
             .get(slot)?
             .used
-            .then_some(&self.comments[slot])?;
+            .then_some(&comments.entries[slot])?;
         let identity = comment
             .pending_identity
             .filter(|identity| identity.txid == txid);
@@ -23160,7 +23264,7 @@ impl Storage {
     /// The table slot is durable for the life of the relation; the current
     /// constraint catalog OID is derived only when exposing pg_catalog.
     pub(crate) fn stage_constraint_comment_rename(
-        &mut self,
+        &self,
         table: usize,
         schema: SqlName,
         old_name: SqlName,
@@ -23168,7 +23272,8 @@ impl Storage {
         txid: u32,
     ) -> Option<(usize, Option<PendingCommentIdentity>)> {
         let database = Some(current_database());
-        let slot = self.comments.iter().position(|comment| {
+        let mut comments = self.comment_catalog();
+        let slot = comments.entries.iter().position(|comment| {
             comment.matches_to(
                 database,
                 CommentClass::Constraint,
@@ -23178,8 +23283,8 @@ impl Storage {
                 txid,
             )
         })?;
-        let prior = self.comments[slot].pending_identity;
-        self.comments[slot].pending_identity = Some(PendingCommentIdentity {
+        let prior = comments.entries[slot].pending_identity;
+        comments.entries[slot].pending_identity = Some(PendingCommentIdentity {
             txid,
             schema,
             name: new_name,
@@ -23188,22 +23293,24 @@ impl Storage {
     }
 
     pub(crate) fn restore_comment_identity_pending(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingCommentIdentity>,
     ) {
-        self.comments[slot].pending_identity = prior;
-        self.reap_comment(slot);
+        let mut comments = self.comment_catalog();
+        comments.entries[slot].pending_identity = prior;
+        comments.reap(slot);
     }
 
     fn stage_trigger_comment_rename(
-        &mut self,
+        &self,
         old_name: SqlName,
         new_name: SqlName,
         subid: u32,
         txid: u32,
     ) {
-        for comment in self.comments.iter_mut().filter(|comment| {
+        let mut comments = self.comment_catalog();
+        for comment in comments.entries.iter_mut().filter(|comment| {
             comment.matches_to(
                 Some(current_database()),
                 CommentClass::Trigger,
@@ -23222,7 +23329,7 @@ impl Storage {
     }
 
     fn stage_object_comment_identity(
-        &mut self,
+        &self,
         class: CommentClass,
         old_schema: SqlName,
         old_name: SqlName,
@@ -23231,7 +23338,8 @@ impl Storage {
         txid: u32,
     ) {
         let database = Some(current_database());
-        for comment in self.comments.iter_mut().filter(|comment| {
+        let mut comments = self.comment_catalog();
+        for comment in comments.entries.iter_mut().filter(|comment| {
             comment.used
                 && comment.database == database
                 && comment.class == class
@@ -23252,14 +23360,15 @@ impl Storage {
     }
 
     fn commit_object_comment_identity(
-        &mut self,
+        &self,
         class: CommentClass,
         old_schema: SqlName,
         old_name: SqlName,
         txid: u32,
     ) {
         let database = Some(current_database());
-        for comment in self.comments.iter_mut().filter(|comment| {
+        let mut comments = self.comment_catalog();
+        for comment in comments.entries.iter_mut().filter(|comment| {
             comment.used
                 && comment.database == database
                 && comment.class == class
@@ -23279,7 +23388,7 @@ impl Storage {
     }
 
     fn replay_object_comment_identity(
-        &mut self,
+        &self,
         class: CommentClass,
         old_schema: SqlName,
         old_name: SqlName,
@@ -23290,7 +23399,8 @@ impl Storage {
             return;
         }
         let database = Some(current_database());
-        for comment in self.comments.iter_mut().filter(|comment| {
+        let mut comments = self.comment_catalog();
+        for comment in comments.entries.iter_mut().filter(|comment| {
             comment.used
                 && comment.database == database
                 && comment.class == class
@@ -23308,7 +23418,7 @@ impl Storage {
     /// transaction's undo log. A fresh key claims a free slot; exhausting the
     /// slab is a loud error.
     pub fn set_comment(
-        &mut self,
+        &self,
         class: CommentClass,
         schema: SqlName,
         name: SqlName,
@@ -23317,25 +23427,26 @@ impl Storage {
         txid: u32,
     ) -> Result<(usize, Option<PendingComment>), SqlError> {
         let database = self.comment_database(class);
-        if let Some(slot) = self.comments.iter().position(|c| {
+        let mut comments = self.comment_catalog();
+        if let Some(slot) = comments.entries.iter().position(|c| {
             c.database == database
                 && c.class == class
                 && c.subid == subid
                 && (Self::comment_identity_uses_subid(class)
                     || c.matches_to(database, class, schema.as_str(), name.as_str(), subid, txid))
         }) {
-            let prior = self.comments[slot].pending.take();
-            self.comments[slot].pending = Some(PendingComment { txid, text });
+            let prior = comments.entries[slot].pending.take();
+            comments.entries[slot].pending = Some(PendingComment { txid, text });
             return Ok((slot, prior));
         }
-        let Some(slot) = self.comments.iter().position(|c| !c.used) else {
+        let Some(slot) = comments.entries.iter().position(|c| !c.used) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many object comments (limit {})",
-                self.comments.capacity()
+                comments.entries.capacity()
             ));
         };
-        self.comments[slot] = CommentEntry {
+        comments.entries[slot] = CommentEntry {
             used: true,
             database,
             class,
@@ -23351,15 +23462,16 @@ impl Storage {
 
     /// Rollback: restores the comment slot's prior uncommitted overlay,
     /// freeing the slot if it now holds nothing.
-    pub fn restore_comment_pending(&mut self, slot: usize, prior: Option<PendingComment>) {
-        self.comments[slot].pending = prior;
-        self.reap_comment(slot);
+    pub fn restore_comment_pending(&self, slot: usize, prior: Option<PendingComment>) {
+        let mut comments = self.comment_catalog();
+        comments.entries[slot].pending = prior;
+        comments.reap(slot);
     }
 
     /// Commit: promotes `txid`'s overlay to the committed value and returns the
     /// object identity plus the new committed text, for journaling.
     pub fn commit_comment(
-        &mut self,
+        &self,
         slot: usize,
         txid: u32,
     ) -> Option<(
@@ -23369,7 +23481,8 @@ impl Storage {
         u32,
         Option<StackStr<COMMENT_MAX>>,
     )> {
-        let entry = &mut self.comments[slot];
+        let mut comments = self.comment_catalog();
+        let entry = &mut comments.entries[slot];
         match entry.pending {
             Some(p) if p.txid == txid => {
                 if let Some(identity) = entry
@@ -23389,7 +23502,7 @@ impl Storage {
                     entry.subid,
                     entry.live,
                 );
-                self.reap_comment(slot);
+                comments.reap(slot);
                 Some(out)
             }
             _ => None,
@@ -23399,7 +23512,7 @@ impl Storage {
     /// Committed apply (journal replay and checkpoint load): sets the committed
     /// text directly, with no transactional overlay.
     pub fn apply_comment(
-        &mut self,
+        &self,
         class: CommentClass,
         schema: SqlName,
         name: SqlName,
@@ -23407,28 +23520,29 @@ impl Storage {
         text: Option<StackStr<COMMENT_MAX>>,
     ) -> Result<(), SqlError> {
         let database = self.comment_database(class);
-        if let Some(slot) = self.comments.iter().position(|c| {
+        let mut comments = self.comment_catalog();
+        if let Some(slot) = comments.entries.iter().position(|c| {
             c.database == database
                 && c.class == class
                 && c.subid == subid
                 && (Self::comment_identity_uses_subid(class)
                     || c.matches(database, class, schema.as_str(), name.as_str(), subid))
         }) {
-            self.comments[slot].live = text;
-            self.reap_comment(slot);
+            comments.entries[slot].live = text;
+            comments.reap(slot);
             return Ok(());
         }
         if text.is_none() {
             return Ok(());
         }
-        let Some(slot) = self.comments.iter().position(|c| !c.used) else {
+        let Some(slot) = comments.entries.iter().position(|c| !c.used) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many object comments (limit {})",
-                self.comments.capacity()
+                comments.entries.capacity()
             ));
         };
-        self.comments[slot] = CommentEntry {
+        comments.entries[slot] = CommentEntry {
             used: true,
             database,
             class,
@@ -23444,10 +23558,11 @@ impl Storage {
 
     /// Drops every comment on a relation (all columns and the relation itself)
     /// or a schema, for when the object is dropped. Committed removal.
-    pub fn drop_object_comments(&mut self, class: CommentClass, schema: &str, name: &str) {
+    pub fn drop_object_comments(&self, class: CommentClass, schema: &str, name: &str) {
         let database = self.comment_database(class);
-        for slot in 0..self.comments.len() {
-            let c = &self.comments[slot];
+        let mut comments = self.comment_catalog();
+        for slot in 0..comments.entries.len() {
+            let c = &comments.entries[slot];
             if c.used
                 && c.database == database
                 && c.class == class
@@ -23455,34 +23570,26 @@ impl Storage {
                 && c.name.as_str() == name
                 && c.schema.as_str() == schema
             {
-                self.comments[slot].live = None;
-                self.reap_comment(slot);
+                comments.entries[slot].live = None;
+                comments.reap(slot);
             }
         }
     }
 
-    fn drop_comments_by_subid(&mut self, class: CommentClass, subid: u32) {
+    fn drop_comments_by_subid(&self, class: CommentClass, subid: u32) {
         let database = self.comment_database(class);
-        for slot in 0..self.comments.len() {
-            let comment = &self.comments[slot];
+        let mut comments = self.comment_catalog();
+        for slot in 0..comments.entries.len() {
+            let comment = &comments.entries[slot];
             if comment.used
                 && comment.database == database
                 && comment.class == class
                 && comment.pending.is_none()
                 && comment.subid == subid
             {
-                self.comments[slot].live = None;
-                self.reap_comment(slot);
+                comments.entries[slot].live = None;
+                comments.reap(slot);
             }
-        }
-    }
-
-    /// Frees a comment slot that holds neither a committed value nor an
-    /// uncommitted overlay.
-    fn reap_comment(&mut self, slot: usize) {
-        let c = &mut self.comments[slot];
-        if c.live.is_none() && c.pending.is_none() && c.pending_identity.is_none() {
-            *c = CommentEntry::empty();
         }
     }
 
@@ -24024,7 +24131,7 @@ impl Storage {
                 rename_dependency_schema(self.pending_dependencies_mut(slot as u32), prior, name);
             }
         }
-        for comment in self.comments.iter_mut() {
+        for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used && comment.database == Some(current_database()) {
                 if comment.class == CommentClass::Schema && comment.name == prior {
                     comment.name = name;
@@ -30681,7 +30788,7 @@ impl Storage {
         let committed = self.tables[index].def;
         let visible = *self.table_def(index, txid);
         let changed = committed.schema != visible.schema || committed.name != visible.name;
-        for comment in self.comments.iter_mut() {
+        for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
                 && comment.database == database
                 && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
@@ -30733,7 +30840,7 @@ impl Storage {
     }
 
     fn commit_constraint_comment_identities(&mut self, table: usize, txid: u32) {
-        for comment in self.comments.iter_mut().filter(|comment| {
+        for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
             comment.used
                 && comment.database == Some(current_database())
                 && comment.class == CommentClass::Constraint
@@ -34743,7 +34850,7 @@ impl Storage {
                 domain.base_domain = Some(UserTypeName { schema, name });
             }
         }
-        for comment in self.comments.iter_mut() {
+        for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
                 && comment.class == CommentClass::Type
                 && comment.schema == old_schema
@@ -35464,7 +35571,7 @@ impl Storage {
                 });
             }
         }
-        for comment in self.comments.iter_mut() {
+        for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
                 && comment.class == CommentClass::Type
                 && comment.schema == old_schema
@@ -35899,7 +36006,7 @@ impl Storage {
                 });
             }
         }
-        for comment in self.comments.iter_mut() {
+        for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
                 && comment.class == CommentClass::Type
                 && comment.schema == old_schema
@@ -36528,7 +36635,7 @@ impl Storage {
             moved_rule |= changed;
         }
         if moved_rule {
-            for comment in self.comments.iter_mut().filter(|comment| {
+            for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
                 comment.used
                     && comment.database == Some(current_database())
                     && comment.class == CommentClass::Rule
@@ -36552,7 +36659,7 @@ impl Storage {
         if moved_trigger {
             let old_subid = old_trigger_target.comment_subid();
             let new_subid = new_trigger_target.comment_subid();
-            for comment in self.comments.iter_mut().filter(|comment| {
+            for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
                 comment.used
                     && comment.database == Some(current_database())
                     && comment.class == CommentClass::Trigger
@@ -39717,7 +39824,7 @@ impl Storage {
             let subid = trigger.target.comment_subid();
             trigger.apply_definition(pending.definition);
             trigger.pending_definition = None;
-            for comment in self.comments.iter_mut().filter(|comment| {
+            for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
                 comment.used
                     && comment.class == CommentClass::Trigger
                     && comment.subid == subid
@@ -39746,7 +39853,7 @@ impl Storage {
             .unwrap_or(committed_name);
         let subid = self.triggers[slot].target.comment_subid();
         if let Some(current) = current {
-            for comment in self.comments.iter_mut().filter(|comment| {
+            for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
                 comment.used
                     && comment.class == CommentClass::Trigger
                     && comment.subid == subid
@@ -39848,26 +39955,28 @@ impl Storage {
                 *state = PartitionTriggerState::EMPTY;
             }
         }
-        for comment_slot in 0..self.comments.len() {
-            let comment = &self.comments[comment_slot];
+        let mut comments = self.comment_catalog();
+        for comment_slot in 0..comments.entries.len() {
+            let comment = &comments.entries[comment_slot];
             if comment.used
                 && comment.class == CommentClass::Trigger
                 && comment.name == trigger.name
                 && comment.subid == trigger.target.comment_subid()
             {
-                self.comments[comment_slot].live = None;
-                self.reap_comment(comment_slot);
+                comments.entries[comment_slot].live = None;
+                comments.reap(comment_slot);
             }
         }
     }
 
     fn drop_trigger_comments_for_target(&mut self, target: TriggerTarget) {
         let subid = target.comment_subid();
-        for slot in 0..self.comments.len() {
-            let comment = &self.comments[slot];
+        let mut comments = self.comment_catalog();
+        for slot in 0..comments.entries.len() {
+            let comment = &comments.entries[slot];
             if comment.used && comment.class == CommentClass::Trigger && comment.subid == subid {
-                self.comments[slot].live = None;
-                self.reap_comment(slot);
+                comments.entries[slot].live = None;
+                comments.reap(slot);
             }
         }
     }
@@ -40593,7 +40702,7 @@ impl Storage {
             index.pending_name = None;
             (index.schema, old_name, pending.name)
         };
-        for comment in self.comments.iter_mut() {
+        for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
                 && comment.class == CommentClass::Relation
                 && comment.schema == schema
@@ -41774,7 +41883,7 @@ impl Storage {
             self.tablespaces[slot].name = pending.name;
             self.tablespaces[slot].options = pending.options;
             self.tablespaces[slot].pending = None;
-            for comment in self.comments.iter_mut() {
+            for comment in self.comment_catalog().entries.iter_mut() {
                 if comment.used
                     && comment.class == CommentClass::Tablespace
                     && comment.name == old_name
@@ -41877,7 +41986,7 @@ impl Storage {
                 t.mark_dirty();
             }
         }
-        for comment in self.comments.iter_mut() {
+        for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
                 && comment.database == database
                 && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
@@ -41946,7 +42055,7 @@ impl Storage {
                     table.mark_dirty();
                 }
             }
-            for comment in self.comments.iter_mut() {
+            for comment in self.comment_catalog().entries.iter_mut() {
                 if comment.used
                     && comment.database == database
                     && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
@@ -44710,7 +44819,7 @@ impl Storage {
         });
         if old.name != definition.name {
             let subid = definition.target.comment_subid();
-            for comment in self.comments.iter_mut().filter(|comment| {
+            for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
                 comment.matches_to(
                     Some(current_database()),
                     CommentClass::Rule,
@@ -44776,7 +44885,7 @@ impl Storage {
             self.rules[slot].definition = pending.definition;
             self.rules[slot].pending = None;
             let subid = pending.definition.target.comment_subid();
-            for comment in self.comments.iter_mut().filter(|comment| {
+            for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
                 comment.used
                     && comment.class == CommentClass::Rule
                     && comment.subid == subid
@@ -44803,7 +44912,7 @@ impl Storage {
         if let Some(current) = current {
             self.release_pending_dependencies(current.dependency_slot);
             let subid = current.definition.target.comment_subid();
-            for comment in self.comments.iter_mut().filter(|comment| {
+            for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
                 comment.used
                     && comment.class == CommentClass::Rule
                     && comment.subid == subid
@@ -44825,7 +44934,7 @@ impl Storage {
     pub(crate) fn commit_rule_drop(&mut self, slot: usize) {
         let definition = self.rules[slot].definition;
         let subid = definition.target.comment_subid();
-        for comment in self.comments.iter_mut() {
+        for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
                 && comment.database == Some(current_database())
                 && comment.class == CommentClass::Rule
@@ -44857,7 +44966,7 @@ impl Storage {
                 continue;
             }
             let subid = rule.definition.target.comment_subid();
-            for comment in self.comments.iter_mut() {
+            for comment in self.comment_catalog().entries.iter_mut() {
                 if comment.used
                     && comment.database == Some(current_database())
                     && comment.class == CommentClass::Rule
@@ -44956,7 +45065,7 @@ impl Storage {
     pub(crate) fn replay_drop_rule(&mut self, target: RuleTarget, name: &str) {
         if let Some(slot) = self.rule_slot(target, name, 0) {
             let subid = target.comment_subid();
-            for comment in self.comments.iter_mut() {
+            for comment in self.comment_catalog().entries.iter_mut() {
                 if comment.used
                     && comment.database == Some(current_database())
                     && comment.class == CommentClass::Rule
@@ -46975,7 +47084,7 @@ mod tests {
             pending_extended_statistics_capacity(&config)
         );
         assert_eq!(storage.tablespaces.len(), 15);
-        assert_eq!(storage.comments.len(), 16);
+        assert_eq!(storage.comment_capacity(), 16);
         assert_eq!(storage.foreign_sessions.slots.capacity(), 3);
         assert!(storage.foreign_sessions.slots.is_empty());
         assert_eq!(storage.cumulative_statistics().functions.capacity(), 5);
@@ -47351,6 +47460,75 @@ mod tests {
             storage.role_object_dependency(1, 0),
             Some(RoleObjectDependency::OwnedObject)
         );
+    }
+
+    #[test]
+    fn comment_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<CommentCatalog>>();
+        assert_send_sync::<LiveCommentIter<'_>>();
+        assert_send_sync::<CheckpointCommentIter<'_>>();
+        assert_send_sync::<VisibleCommentIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let names = ["comment_a", "comment_b", "comment_c", "comment_d"];
+        let texts = ["text a", "text b", "text c", "text d"];
+        let mut config = test_config();
+        config.max_comments = WORKERS;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let txid = worker as u32 + 1;
+                    let (slot, prior) = storage
+                        .set_comment(
+                            CommentClass::Schema,
+                            SqlName::EMPTY,
+                            SqlName::parse(names[worker]).unwrap(),
+                            0,
+                            Some(comment_stackstr(texts[worker]).unwrap()),
+                            txid,
+                        )
+                        .unwrap();
+                    assert!(prior.is_none());
+                    assert!(storage.commit_comment(slot, txid).is_some());
+                });
+            }
+        });
+
+        assert_eq!(storage.comment_capacity(), WORKERS);
+        assert_eq!(storage.live_comments().count(), WORKERS);
+        assert!(
+            storage
+                .set_comment(
+                    CommentClass::Schema,
+                    SqlName::EMPTY,
+                    SqlName::parse("comment_e").unwrap(),
+                    0,
+                    Some(comment_stackstr("text e").unwrap()),
+                    5,
+                )
+                .is_err()
+        );
+
+        let mut seen = 0;
+        for (class, schema, name, subid, text) in storage.comments_visible(0) {
+            assert_eq!(class, CommentClass::Schema);
+            assert_eq!(schema, SqlName::EMPTY);
+            assert_eq!(subid, 0);
+            assert_eq!(
+                storage
+                    .comment_text(class, schema.as_str(), name.as_str(), subid, 0)
+                    .unwrap()
+                    .as_str(),
+                text.as_str()
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, WORKERS);
     }
 
     #[test]

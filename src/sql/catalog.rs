@@ -13770,6 +13770,9 @@ fn pg_description<'a>(
         .map_err(|_| arena_full())?;
     let mut n = 0;
     for (class, schema, name, subid, description) in storage.comments_visible(txid) {
+        let schema = schema.as_str();
+        let name = name.as_str();
+        let description = description.as_str();
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_description"));
         }
@@ -14069,6 +14072,8 @@ fn pg_shdescription<'a>(
         .map_err(|_| arena_full())?;
     let mut count = 0;
     for (class, _, name, subid, description) in storage.comments_visible(txid) {
+        let name = name.as_str();
+        let description = description.as_str();
         if !matches!(
             class,
             crate::storage::CommentClass::Tablespace
@@ -14370,6 +14375,9 @@ pub fn comment_text_for<'a>(
 ) -> Result<Option<&'a str>, SqlError> {
     let signed_oid = i32::try_from(oid).ok();
     for (class, schema, name, csub, text) in storage.comments_visible(txid) {
+        let schema = schema.as_str();
+        let name = name.as_str();
+        let text = text.as_str();
         let hit = match catalog_name {
             "pg_namespace" => {
                 class == crate::storage::CommentClass::Schema

@@ -8,7 +8,7 @@
 pub(crate) mod foreign;
 pub(crate) mod rowenc;
 
-use core::cell::{Cell, RefCell};
+use core::cell::Cell;
 use core::hash::{Hash, Hasher};
 
 use crate::config::Config;
@@ -11579,8 +11579,27 @@ struct ForeignStatementContext {
     savepoints: FixedVec<crate::util::StackStr<63>>,
 }
 
+pub(crate) struct ForeignStatementContextGuard<'a> {
+    context: std::sync::MutexGuard<'a, ForeignStatementContext>,
+    transaction_id: u32,
+}
+
+impl ForeignStatementContextGuard<'_> {
+    pub(crate) fn is_serializable(&self) -> bool {
+        self.context.transaction_id == self.transaction_id && self.context.serializable
+    }
+
+    pub(crate) fn savepoints(&self) -> &[crate::util::StackStr<63>] {
+        if self.context.transaction_id == self.transaction_id {
+            self.context.savepoints.as_slice()
+        } else {
+            &[]
+        }
+    }
+}
+
 pub(crate) fn foreign_statement_context_workspace_bytes(config: &Config) -> usize {
-    size_of::<RefCell<ForeignStatementContext>>()
+    size_of::<std::sync::Mutex<ForeignStatementContext>>()
         + config.max_savepoints_per_transaction * size_of::<crate::util::StackStr<63>>()
 }
 
@@ -11607,6 +11626,37 @@ struct TransactionIdentityState {
 struct SnapshotState {
     active: FixedVec<(u32, u64)>,
     serializable: FixedVec<(u32, u32, u64, bool)>,
+}
+
+struct TemporaryTransactionState {
+    transactions: FixedVec<u32>,
+}
+
+impl TemporaryTransactionState {
+    fn mark(&mut self, transaction_id: u32) {
+        if transaction_id == 0 {
+            return;
+        }
+        if !self.transactions.contains(&transaction_id) {
+            self.transactions
+                .push(transaction_id)
+                .expect("temporary transaction registry is sized to transaction capacity");
+        }
+    }
+
+    fn contains(&self, transaction_id: u32) -> bool {
+        self.transactions.contains(&transaction_id)
+    }
+
+    fn clear(&mut self, transaction_id: u32) {
+        if let Some(index) = self
+            .transactions
+            .iter()
+            .position(|candidate| *candidate == transaction_id)
+        {
+            self.transactions.swap_remove(index);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -11944,7 +11994,7 @@ pub struct Storage {
     subscriptions: FixedVec<SubscriptionDef>,
     foreign: foreign::ForeignCatalog,
     foreign_sessions: ForeignSessionPool,
-    foreign_statement_contexts: FixedVec<RefCell<ForeignStatementContext>>,
+    foreign_statement_contexts: FixedVec<std::sync::Mutex<ForeignStatementContext>>,
     subscription_relations: FixedVec<SubscriptionRelation>,
     matviews: FixedVec<MatviewDef>,
     sequences: FixedVec<SequenceDef>,
@@ -11966,7 +12016,7 @@ pub struct Storage {
     cumulative_statistics: std::sync::Mutex<CumulativeStatistics>,
     /// Transactions that resolved a temporary relation. PREPARE TRANSACTION
     /// must reject them before state can outlive the owning connection.
-    temporary_transactions: std::cell::RefCell<FixedVec<u32>>,
+    temporary_transactions: std::sync::Mutex<TemporaryTransactionState>,
     tablespaces: FixedVec<TablespaceDef>,
     schemas: FixedVec<SchemaDef>,
     extensions: FixedVec<ExtensionDef>,
@@ -14112,26 +14162,26 @@ impl Storage {
     }
 
     fn mark_temporary_transaction(&self, txid: u32) {
-        if txid == 0 {
-            return;
-        }
-        let mut transactions = self.temporary_transactions.borrow_mut();
-        if !transactions.contains(&txid) {
-            transactions
-                .push(txid)
-                .expect("temporary transaction registry is sized to transaction capacity");
-        }
+        let mut state = self
+            .temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned");
+        state.mark(txid);
     }
 
     pub(crate) fn transaction_used_temporary_relation(&self, txid: u32) -> bool {
-        self.temporary_transactions.borrow().contains(&txid)
+        self.temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned")
+            .contains(txid)
     }
 
     pub(crate) fn clear_temporary_transaction(&self, txid: u32) {
-        let mut transactions = self.temporary_transactions.borrow_mut();
-        if let Some(index) = transactions.iter().position(|candidate| *candidate == txid) {
-            transactions.swap_remove(index);
-        }
+        let mut state = self
+            .temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned");
+        state.clear(txid);
     }
 
     pub(crate) fn temporary_schema(&self) -> Result<SqlName, SqlError> {
@@ -16257,7 +16307,7 @@ impl Storage {
         )?;
         for _ in 0..config.query_workspace_slots {
             foreign_statement_contexts
-                .push(RefCell::new(ForeignStatementContext {
+                .push(std::sync::Mutex::new(ForeignStatementContext {
                     transaction_id: 0,
                     serializable: false,
                     savepoints: FixedVec::new(
@@ -16432,11 +16482,9 @@ impl Storage {
             "recent_transaction_statuses",
             transaction_capacity.saturating_mul(8).max(64),
         )?;
-        let temporary_transactions = std::cell::RefCell::new(FixedVec::new(
-            budget,
-            "temporary_transactions",
-            transaction_capacity,
-        )?);
+        let temporary_transactions = std::sync::Mutex::new(TemporaryTransactionState {
+            transactions: FixedVec::new(budget, "temporary_transactions", transaction_capacity)?,
+        });
         let backends = FixedVec::new(budget, "backend_activity", config.max_connections as usize)?;
         let backend_signals =
             FixedVec::new(budget, "backend_signals", config.max_connections as usize)?;
@@ -16819,8 +16867,10 @@ impl Storage {
         }
     }
 
-    fn foreign_statement_context(&self) -> &RefCell<ForeignStatementContext> {
-        &self.foreign_statement_contexts[crate::sql::execution_query_workspace().index()]
+    fn foreign_statement_context(&self) -> std::sync::MutexGuard<'_, ForeignStatementContext> {
+        self.foreign_statement_contexts[crate::sql::execution_query_workspace().index()]
+            .lock()
+            .expect("foreign statement context lock poisoned")
     }
 
     /// The engine publishes the executing transaction into its leased
@@ -16833,7 +16883,7 @@ impl Storage {
         serializable: bool,
         savepoints: impl Iterator<Item = crate::util::StackStr<63>>,
     ) -> Result<(), SqlError> {
-        let mut context = self.foreign_statement_context().borrow_mut();
+        let mut context = self.foreign_statement_context();
         context.transaction_id = transaction_id;
         context.serializable = serializable;
         context.savepoints.clear();
@@ -16848,22 +16898,14 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn foreign_statement_is_serializable(&self, transaction_id: u32) -> bool {
-        let context = self.foreign_statement_context().borrow();
-        context.transaction_id == transaction_id && context.serializable
-    }
-
-    pub(crate) fn foreign_statement_savepoints(
+    pub(crate) fn foreign_statement_context_for(
         &self,
         transaction_id: u32,
-    ) -> core::cell::Ref<'_, [crate::util::StackStr<63>]> {
-        core::cell::Ref::map(self.foreign_statement_context().borrow(), |context| {
-            if context.transaction_id == transaction_id {
-                context.savepoints.as_slice()
-            } else {
-                &[]
-            }
-        })
+    ) -> ForeignStatementContextGuard<'_> {
+        ForeignStatementContextGuard {
+            context: self.foreign_statement_context(),
+            transaction_id,
+        }
     }
 
     pub(crate) fn prepared_transaction_catalog(&self) -> &[PreparedTransactionCatalogEntry] {
@@ -46557,10 +46599,17 @@ mod tests {
         assert!(!storage.role_graph_scratch[1].borrow()[3]);
         assert_eq!(storage.foreign_statement_contexts.len(), 2);
         assert!(storage.foreign_statement_contexts.iter().all(|context| {
-            context.borrow().savepoints.capacity() == config.max_savepoints_per_transaction
+            context
+                .lock()
+                .expect("foreign statement context lock poisoned")
+                .savepoints
+                .capacity()
+                == config.max_savepoints_per_transaction
         }));
         {
-            let mut context = storage.foreign_statement_contexts[0].borrow_mut();
+            let mut context = storage.foreign_statement_contexts[0]
+                .lock()
+                .expect("foreign statement context lock poisoned");
             context.transaction_id = 41;
             context.serializable = true;
             context
@@ -46568,10 +46617,21 @@ mod tests {
                 .push(crate::util::StackStr::from_str("one"))
                 .unwrap();
         }
-        let other_context = storage.foreign_statement_contexts[1].borrow();
+        let other_context = storage.foreign_statement_contexts[1]
+            .lock()
+            .expect("foreign statement context lock poisoned");
         assert_eq!(other_context.transaction_id, 0);
         assert!(!other_context.serializable);
         assert!(other_context.savepoints.is_empty());
+        assert_eq!(
+            storage
+                .temporary_transactions
+                .lock()
+                .expect("temporary transaction lock poisoned")
+                .transactions
+                .capacity(),
+            config.max_connections as usize + config.max_prepared_transactions
+        );
         assert_eq!(storage.acl_entries.capacity(), 22);
         assert_eq!(storage.column_acl_entries.capacity(), 23);
         assert_eq!(storage.default_acl_entries.capacity(), 24);
@@ -46783,6 +46843,99 @@ mod tests {
                 .signals
                 .iter()
                 .all(|signal| matches!(signal, BackendSignal::Terminate(_)))
+        );
+    }
+
+    #[test]
+    fn transaction_workspaces_are_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ForeignStatementContext>();
+        assert_send_sync::<TemporaryTransactionState>();
+
+        let mut config = test_config();
+        config.max_connections = 4;
+        config.query_workspace_slots = 4;
+        let transaction_capacity =
+            config.max_connections as usize + config.max_prepared_transactions;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let temporary = &storage.temporary_transactions;
+        let foreign = &storage.foreign_statement_contexts[0];
+        std::thread::scope(|scope| {
+            for worker in 0..4u32 {
+                scope.spawn(move || {
+                    let transaction_id = 100 + worker;
+                    for iteration in 0..1_000 {
+                        temporary
+                            .lock()
+                            .expect("temporary transaction lock poisoned")
+                            .mark(transaction_id);
+                        let mut context = foreign
+                            .lock()
+                            .expect("foreign statement context lock poisoned");
+                        context.transaction_id = 73;
+                        context.serializable = true;
+                        if iteration == 0 {
+                            let name = match worker {
+                                0 => "one",
+                                1 => "two",
+                                2 => "three",
+                                _ => "four",
+                            };
+                            context
+                                .savepoints
+                                .push(crate::util::StackStr::from_str(name))
+                                .unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        let temporary = storage
+            .temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned");
+        assert_eq!(temporary.transactions.capacity(), transaction_capacity);
+        assert_eq!(temporary.transactions.len(), 4);
+        assert!((100..104).all(|transaction_id| temporary.contains(transaction_id)));
+        drop(temporary);
+        let context = storage.foreign_statement_contexts[0]
+            .lock()
+            .expect("foreign statement context lock poisoned");
+        assert_eq!(context.transaction_id, 73);
+        assert!(context.serializable);
+        assert_eq!(
+            context.savepoints.capacity(),
+            config.max_savepoints_per_transaction
+        );
+        assert_eq!(context.savepoints.len(), 4);
+        drop(context);
+        let context = storage.foreign_statement_context_for(73);
+        assert!(context.is_serializable());
+        assert_eq!(context.savepoints().len(), 4);
+        drop(context);
+        let stale = storage.foreign_statement_context_for(74);
+        assert!(!stale.is_serializable());
+        assert!(stale.savepoints().is_empty());
+        drop(stale);
+        let temporary = &storage.temporary_transactions;
+        std::thread::scope(|scope| {
+            for transaction_id in 100..104 {
+                scope.spawn(move || {
+                    temporary
+                        .lock()
+                        .expect("temporary transaction lock poisoned")
+                        .clear(transaction_id);
+                });
+            }
+        });
+        assert!(
+            storage
+                .temporary_transactions
+                .lock()
+                .expect("temporary transaction lock poisoned")
+                .transactions
+                .is_empty()
         );
     }
 

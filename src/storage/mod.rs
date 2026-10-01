@@ -12084,7 +12084,8 @@ struct CollationScratch {
 struct CollationRuntime {
     locale: OwnedLocale,
     name: StackStr<128>,
-    scratch: std::cell::RefCell<CollationScratch>,
+    scratch_capacity: usize,
+    scratch: std::sync::Mutex<CollationScratch>,
 }
 
 struct OwnedLocale(libc::locale_t);
@@ -12094,6 +12095,11 @@ struct OwnedLocale(libc::locale_t);
 // unchanged handle to `strcoll_l` before freeing it exactly once.
 // POSIX rationale: https://pubs.opengroup.org/onlinepubs/9699919799.2008edition/xrat/V4_port.html
 unsafe impl Send for OwnedLocale {}
+// SAFETY: the locale object is immutable after startup. `strcoll_l` only
+// reads it, and Drop cannot run while a shared `CollationRuntime` reference
+// exists. Linux documents locale comparison as MT-Safe locale.
+// https://man7.org/linux/man-pages/man3/strcoll.3.html
+unsafe impl Sync for OwnedLocale {}
 
 impl Drop for OwnedLocale {
     fn drop(&mut self) {
@@ -12165,19 +12171,18 @@ impl CollationRuntime {
         Ok(Self {
             locale: OwnedLocale(locale),
             name: StackStr::from_str(config.database_collation_locale.as_str()),
-            scratch: std::cell::RefCell::new(scratch),
+            scratch_capacity: config.collation_scratch_bytes,
+            scratch: std::sync::Mutex::new(scratch),
         })
     }
 
     fn compare(&self, left: &str, right: &str) -> Result<core::cmp::Ordering, SqlError> {
         self.validate(left)?;
         self.validate(right)?;
-        let mut scratch = self.scratch.try_borrow_mut().map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "locale comparison scratch is already in use"
-            )
-        })?;
+        let mut scratch = self
+            .scratch
+            .lock()
+            .expect("collation scratch lock poisoned");
         scratch.left.clear();
         scratch.right.clear();
         if !scratch.left.append(left.as_bytes())
@@ -12203,7 +12208,7 @@ impl CollationRuntime {
     }
 
     fn validate(&self, value: &str) -> Result<(), SqlError> {
-        if value.len().saturating_add(1) > self.scratch.borrow().left.capacity() {
+        if value.len().saturating_add(1) > self.scratch_capacity {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "text value exceeds configured collation scratch capacity"
@@ -12221,10 +12226,10 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-/// Fetches spilled rows back through the cache tiers. The buffers are owned
-/// and startup-reserved; the stack is shared with the checkpointer through a
-/// mutex. The engine is currently single-owner, so every lock is short and
-/// uncontended; the synchronization keeps ownership transferable to a worker.
+/// Fetches spilled rows back through the cache tiers. Every buffer pool is
+/// startup-reserved and mutex-protected; exhaustion remains a named error.
+/// The block stacks are shared with checkpoint and spill writers through the
+/// same synchronization boundary.
 pub(crate) struct SpillReader {
     blocks: Option<
         std::sync::Arc<std::sync::Mutex<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
@@ -12233,25 +12238,25 @@ pub(crate) struct SpillReader {
     /// Two scratch sets so one consume-in-place fetch may nest inside another
     /// (a validation scan holding one row while checking it against the
     /// rest). Deeper nesting is a loud error, not a deadlock.
-    scratch: [std::cell::RefCell<SpillScratch>; 2],
+    scratch: [std::sync::Mutex<SpillScratch>; 2],
     /// Merged-enumeration contexts: one per concurrently-live row-state
     /// walk (a join scans a table per depth, and a constraint scan can run
     /// inside another walk's callback). Each holds a resident data block
     /// per spill-list member plus an index buffer for cursor advances.
     /// Exhaustion is a loud error naming the bound.
-    scan_contexts: Box<[std::cell::RefCell<ScanContext>]>,
+    scan_contexts: Box<[std::sync::Mutex<ScanContext>]>,
     /// Logical cursor state remains leased across row callbacks while block
     /// buffers are released for nested scans. The parser's query-list bound
     /// is also the maximum possible nested row-source depth.
-    cursor_contexts: Box<[std::cell::RefCell<Box<[MemberCursor]>>]>,
-    next_walk_id: std::cell::Cell<u64>,
+    cursor_contexts: Box<[std::sync::Mutex<Box<[MemberCursor]>>]>,
+    next_walk_id: std::sync::Mutex<u64>,
     /// Independent buffers for persistent value probes. A probe may invoke an
     /// authoritative spilled-row recheck, so it must not borrow row scratch.
-    value_scratch: Option<[std::cell::RefCell<ValueIndexScratch>; 2]>,
+    value_scratch: Option<[std::sync::Mutex<ValueIndexScratch>; 2]>,
     /// Nested materializers lease independent external-run producers. Their
     /// buffers and merge fan-in are fixed at startup; run blocks travel
     /// through `blocks`, never a provider-specific path.
-    external_sorters: Box<[std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>]>,
+    external_sorters: Box<[std::sync::Mutex<Box<crate::sql::external::ExternalSorter>>]>,
     /// Immutable-run cursors leased by nested materialized row sources.
     /// Their scratch is independent from the sorter, so consuming a completed
     /// run never prevents a deeper operator from producing another.
@@ -12447,6 +12452,22 @@ struct ValueIndexScratch {
     data: Box<[u8]>,
 }
 
+fn try_mutex_pool<'a, T>(
+    pool: &'a [std::sync::Mutex<T>],
+    name: &str,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    for candidate in pool {
+        match candidate.try_lock() {
+            Ok(lease) => return Some(lease),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                panic!("{name} lock poisoned: {error}")
+            }
+        }
+    }
+    None
+}
+
 impl SpillReader {
     /// Startup-only: reserves the reader scratch from the budget.
     pub(crate) fn new(
@@ -12472,7 +12493,7 @@ impl SpillReader {
             SCAN_CONTEXTS
                 * ((2 * max_spill_generations + 4) * crate::store::MAX_PAYLOAD
                     + 2 * max_spill_generations * core::mem::size_of::<Box<[u8]>>()
-                    + core::mem::size_of::<std::cell::RefCell<ScanContext>>()),
+                    + core::mem::size_of::<std::sync::Mutex<ScanContext>>()),
             "row-state walk contexts",
         )?;
         budget.draw_array(
@@ -12482,7 +12503,7 @@ impl SpillReader {
         )?;
         budget.draw_array(
             MAX_ROW_WALK_NESTING,
-            core::mem::size_of::<std::cell::RefCell<Box<[MemberCursor]>>>(),
+            core::mem::size_of::<std::sync::Mutex<Box<[MemberCursor]>>>(),
             "row-state walk cursor slots",
         )?;
         let mut external_sorters = Vec::new();
@@ -12493,13 +12514,12 @@ impl SpillReader {
             )?;
             budget.draw_array(
                 EXTERNAL_RUN_CONTEXTS,
-                core::mem::size_of::<std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>>(
-                ),
+                core::mem::size_of::<std::sync::Mutex<Box<crate::sql::external::ExternalSorter>>>(),
                 "external query run producer slots",
             )?;
             external_sorters.reserve_exact(EXTERNAL_RUN_CONTEXTS);
             for _ in 0..EXTERNAL_RUN_CONTEXTS {
-                external_sorters.push(std::cell::RefCell::new(Box::new(
+                external_sorters.push(std::sync::Mutex::new(Box::new(
                     crate::sql::external::ExternalSorter::new(budget)?,
                 )));
             }
@@ -12516,7 +12536,7 @@ impl SpillReader {
             Vec::new().into_boxed_slice().into()
         };
         let fresh = || {
-            std::cell::RefCell::new(SpillScratch {
+            std::sync::Mutex::new(SpillScratch {
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 data_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 decoded_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -12527,7 +12547,7 @@ impl SpillReader {
             })
         };
         let context = || {
-            std::cell::RefCell::new(ScanContext {
+            std::sync::Mutex::new(ScanContext {
                 owner: 0,
                 member_blocks: (0..max_spill_generations)
                     .map(|_| vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice())
@@ -12546,7 +12566,7 @@ impl SpillReader {
             })
         };
         let value = || {
-            std::cell::RefCell::new(ValueIndexScratch {
+            std::sync::Mutex::new(ValueIndexScratch {
                 roster: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 data: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             })
@@ -12557,7 +12577,7 @@ impl SpillReader {
         }
         let cursor_contexts = (0..MAX_ROW_WALK_NESTING)
             .map(|_| {
-                std::cell::RefCell::new(
+                std::sync::Mutex::new(
                     vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
                 )
             })
@@ -12569,7 +12589,7 @@ impl SpillReader {
             scratch: [fresh(), fresh()],
             scan_contexts: scan_contexts.into_boxed_slice(),
             cursor_contexts,
-            next_walk_id: std::cell::Cell::new(1),
+            next_walk_id: std::sync::Mutex::new(1),
             value_scratch: durable.then(|| [value(), value()]),
             external_sorters: external_sorters.into_boxed_slice(),
             external_readers,
@@ -12585,22 +12605,32 @@ impl SpillReader {
             + SCAN_CONTEXTS
                 * ((2 * max_spill_generations + 4) * crate::store::MAX_PAYLOAD
                     + 2 * max_spill_generations * core::mem::size_of::<Box<[u8]>>()
-                    + core::mem::size_of::<std::cell::RefCell<ScanContext>>())
+                    + core::mem::size_of::<std::sync::Mutex<ScanContext>>())
             + MAX_ROW_WALK_NESTING
                 * (max_spill_generations * core::mem::size_of::<MemberCursor>()
-                    + core::mem::size_of::<std::cell::RefCell<Box<[MemberCursor]>>>());
+                    + core::mem::size_of::<std::sync::Mutex<Box<[MemberCursor]>>>());
         if durable {
             row_reader
                 + 4 * crate::store::MAX_PAYLOAD
                 + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalSorter::budget_bytes()
                 + EXTERNAL_RUN_CONTEXTS
                     * core::mem::size_of::<
-                        std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>,
+                        std::sync::Mutex<Box<crate::sql::external::ExternalSorter>>,
                     >()
                 + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalRunReader::budget_bytes()
         } else {
             row_reader
         }
+    }
+
+    fn next_walk_id(&self) -> u64 {
+        let mut next = self
+            .next_walk_id
+            .lock()
+            .expect("spill walk identifier lock poisoned");
+        let id = *next;
+        *next = id.wrapping_add(1).max(1);
+        id
     }
 
     fn relation_blocks<'a>(&'a self, table: &Table) -> RelationBlockStore<'a> {
@@ -24790,7 +24820,7 @@ impl Storage {
     pub(crate) fn external_sorter(
         &self,
     ) -> Result<
-        std::cell::RefMut<'_, Box<crate::sql::external::ExternalSorter>>,
+        std::sync::MutexGuard<'_, Box<crate::sql::external::ExternalSorter>>,
         crate::sql::eval::SqlError,
     > {
         let Some(spill) = self.spill.as_ref().filter(|spill| spill.blocks.is_some()) else {
@@ -24799,10 +24829,8 @@ impl Storage {
                 "external query runs require durable object storage"
             ));
         };
-        for sorter in spill.external_sorters.iter() {
-            if let Ok(lease) = sorter.try_borrow_mut() {
-                return Ok(lease);
-            }
+        if let Some(lease) = try_mutex_pool(&spill.external_sorters, "external sorter") {
+            return Ok(lease);
         }
         Err(crate::sql_err!(
             crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -24938,13 +24966,8 @@ impl Storage {
                 "table has spill SSTs but no spill reader is attached"
             ));
         };
-        let walk_id = spill.next_walk_id.get();
-        spill.next_walk_id.set(walk_id.wrapping_add(1).max(1));
-        let Some(mut cursor_lease) = spill
-            .cursor_contexts
-            .iter()
-            .find_map(|candidate| candidate.try_borrow_mut().ok())
-        else {
+        let walk_id = spill.next_walk_id();
+        let Some(mut cursor_lease) = try_mutex_pool(&spill.cursor_contexts, "spill cursor") else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "row-state cursor nesting exceeds the statement-list boundary"
@@ -24953,10 +24976,7 @@ impl Storage {
         cursor_lease.fill(MemberCursor::EMPTY);
         let cursors: &mut [MemberCursor] = &mut cursor_lease;
         {
-            let Some(mut context) = spill
-                .scan_contexts
-                .iter()
-                .find_map(|candidate| candidate.try_borrow_mut().ok())
+            let Some(mut context) = try_mutex_pool(&spill.scan_contexts, "spill scan context")
             else {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -24977,10 +24997,7 @@ impl Storage {
                 }
             }
             let Some(rowid) = min else { return Ok(()) };
-            let Some(mut context) = spill
-                .scan_contexts
-                .iter()
-                .find_map(|candidate| candidate.try_borrow_mut().ok())
+            let Some(mut context) = try_mutex_pool(&spill.scan_contexts, "spill scan context")
             else {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -25086,16 +25103,12 @@ impl Storage {
                 (cursors, walk_id, initialized, max_rows, max_object_gets)
             } else {
                 cursor_lease = Some(
-                    spill
-                        .cursor_contexts
-                        .iter()
-                        .find_map(|candidate| candidate.try_borrow_mut().ok())
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "row-state cursor nesting exceeds the statement-list boundary"
-                            )
-                        })?,
+                    try_mutex_pool(&spill.cursor_contexts, "spill cursor").ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "row-state cursor nesting exceeds the statement-list boundary"
+                        )
+                    })?,
                 );
                 (
                     &mut ***cursor_lease.as_mut().expect("installed cursor lease"),
@@ -25106,17 +25119,13 @@ impl Storage {
                 )
             };
         if *walk_id == 0 {
-            *walk_id = spill.next_walk_id.get();
-            spill.next_walk_id.set((*walk_id).wrapping_add(1).max(1));
+            *walk_id = spill.next_walk_id();
             cursors.fill(MemberCursor::EMPTY);
             *initialized = 0;
         }
         let io_before = self.block_io_stats();
         if *initialized < n {
-            let Some(mut context) = spill
-                .scan_contexts
-                .iter()
-                .find_map(|candidate| candidate.try_borrow_mut().ok())
+            let Some(mut context) = try_mutex_pool(&spill.scan_contexts, "spill scan context")
             else {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -25161,10 +25170,7 @@ impl Storage {
             }
             let Some(rowid) = min else { return Ok(true) };
             walked += 1;
-            let Some(mut context) = spill
-                .scan_contexts
-                .iter()
-                .find_map(|candidate| candidate.try_borrow_mut().ok())
+            let Some(mut context) = try_mutex_pool(&spill.scan_contexts, "spill scan context")
             else {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -25777,7 +25783,7 @@ impl Storage {
                 "table has spill SSTs but no spill reader is attached"
             ));
         };
-        let Some(mut scratch) = spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok()) else {
+        let Some(mut scratch) = try_mutex_pool(&spill.scratch, "spill row scratch") else {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "spill fetches nested deeper than the reader scratch"
@@ -26597,8 +26603,7 @@ impl Storage {
                 })?;
                 // Both borrows are per-fetch; the copy into the arena ends
                 // them before returning.
-                let Some(mut scratch) = spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok())
-                else {
+                let Some(mut scratch) = try_mutex_pool(&spill.scratch, "spill row scratch") else {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "spilled-row fetches nested deeper than the reader supports"
@@ -26686,8 +26691,7 @@ impl Storage {
                         "row is spilled but its table has no spill SST"
                     ));
                 };
-                let Some(mut scratch) = spill.scratch.iter().find_map(|c| c.try_borrow_mut().ok())
-                else {
+                let Some(mut scratch) = try_mutex_pool(&spill.scratch, "spill row scratch") else {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "spilled-row fetches nested deeper than the reader supports"
@@ -28326,13 +28330,13 @@ impl Storage {
             let Some(spill) = &self.spill else {
                 return Ok(false);
             };
-            let Some(mut scratch) = spill
-                .value_scratch
-                .as_ref()
-                .expect("durable value indexes have reader scratch")
-                .iter()
-                .find_map(|candidate| candidate.try_borrow_mut().ok())
-            else {
+            let Some(mut scratch) = try_mutex_pool(
+                spill
+                    .value_scratch
+                    .as_ref()
+                    .expect("durable value indexes have reader scratch"),
+                "persistent value scratch",
+            ) else {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "persistent value probes nested deeper than reader scratch"
@@ -28951,13 +28955,13 @@ impl Storage {
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
-        let Some(mut scratch) = spill
-            .value_scratch
-            .as_ref()
-            .expect("durable value indexes have reader scratch")
-            .iter()
-            .find_map(|candidate| candidate.try_borrow_mut().ok())
-        else {
+        let Some(mut scratch) = try_mutex_pool(
+            spill
+                .value_scratch
+                .as_ref()
+                .expect("durable value indexes have reader scratch"),
+            "persistent value scratch",
+        ) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "persistent value scans nested deeper than reader scratch"
@@ -29064,13 +29068,13 @@ impl Storage {
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
-        let Some(mut scratch) = spill
-            .value_scratch
-            .as_ref()
-            .expect("durable value indexes have reader scratch")
-            .iter()
-            .find_map(|candidate| candidate.try_borrow_mut().ok())
-        else {
+        let Some(mut scratch) = try_mutex_pool(
+            spill
+                .value_scratch
+                .as_ref()
+                .expect("durable value indexes have reader scratch"),
+            "persistent value scratch",
+        ) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "persistent value scans nested deeper than reader scratch"
@@ -29161,13 +29165,13 @@ impl Storage {
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
-        let Some(mut scratch) = spill
-            .value_scratch
-            .as_ref()
-            .expect("durable value indexes have reader scratch")
-            .iter()
-            .find_map(|candidate| candidate.try_borrow_mut().ok())
-        else {
+        let Some(mut scratch) = try_mutex_pool(
+            spill
+                .value_scratch
+                .as_ref()
+                .expect("durable value indexes have reader scratch"),
+            "persistent value scratch",
+        ) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "persistent value scans nested deeper than reader scratch"
@@ -29244,13 +29248,13 @@ impl Storage {
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
-        let Some(mut scratch) = spill
-            .value_scratch
-            .as_ref()
-            .expect("durable value indexes have reader scratch")
-            .iter()
-            .find_map(|candidate| candidate.try_borrow_mut().ok())
-        else {
+        let Some(mut scratch) = try_mutex_pool(
+            spill
+                .value_scratch
+                .as_ref()
+                .expect("durable value indexes have reader scratch"),
+            "persistent value scratch",
+        ) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "persistent value scans nested deeper than reader scratch"
@@ -29323,13 +29327,13 @@ impl Storage {
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
-        let Some(mut scratch) = spill
-            .value_scratch
-            .as_ref()
-            .expect("durable value indexes have reader scratch")
-            .iter()
-            .find_map(|candidate| candidate.try_borrow_mut().ok())
-        else {
+        let Some(mut scratch) = try_mutex_pool(
+            spill
+                .value_scratch
+                .as_ref()
+                .expect("durable value indexes have reader scratch"),
+            "persistent value scratch",
+        ) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "persistent value scans nested deeper than reader scratch"
@@ -46996,6 +47000,101 @@ mod tests {
             .expect("domain graph scratch lock poisoned");
         assert_eq!(domains.capacity(), config.max_domains);
         assert!(domains.iter().all(|visits| *visits == 232));
+    }
+
+    #[test]
+    fn reader_scratch_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CollationRuntime>();
+        assert_send_sync::<SpillReader>();
+
+        let config = test_config();
+        let mut collation_budget = Budget::new(2 * config.collation_scratch_bytes);
+        let collation = CollationRuntime::new(&config, &mut collation_budget).unwrap();
+        assert_eq!(collation_budget.used(), 2 * config.collation_scratch_bytes);
+        assert_eq!(
+            collation
+                .scratch
+                .lock()
+                .expect("collation scratch lock poisoned")
+                .left
+                .capacity(),
+            config.collation_scratch_bytes
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..1_000 {
+                        assert_eq!(
+                            collation.compare("alpha", "beta").unwrap(),
+                            core::cmp::Ordering::Less
+                        );
+                    }
+                });
+            }
+        });
+
+        let max_spill_generations = 1;
+        let expected_budget = SpillReader::budget_bytes(false, max_spill_generations);
+        let mut spill_budget = Budget::new(expected_budget);
+        let spill = SpillReader::new(&mut spill_budget, max_spill_generations, None, None).unwrap();
+        assert_eq!(spill_budget.used(), expected_budget);
+        assert_eq!(spill.scratch.len(), 2);
+        assert_eq!(spill.scan_contexts.len(), SCAN_CONTEXTS);
+        assert_eq!(spill.cursor_contexts.len(), MAX_ROW_WALK_NESTING);
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let spill = &spill;
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        let mut scratch = spill.scratch[worker % 2]
+                            .lock()
+                            .expect("spill row scratch lock poisoned");
+                        scratch.index_buf[worker] = scratch.index_buf[worker].wrapping_add(1);
+                        drop(scratch);
+                        spill.scan_contexts[0]
+                            .lock()
+                            .expect("spill scan context lock poisoned")
+                            .owner += 1;
+                        spill.cursor_contexts[worker]
+                            .lock()
+                            .expect("spill cursor lock poisoned")[0]
+                            .ordinal += 1;
+                        let _ = spill.next_walk_id();
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            *spill
+                .next_walk_id
+                .lock()
+                .expect("spill walk identifier lock poisoned"),
+            4_001
+        );
+        assert_eq!(
+            spill.scan_contexts[0]
+                .lock()
+                .expect("spill scan context lock poisoned")
+                .owner,
+            4_000
+        );
+        for worker in 0..4 {
+            assert_eq!(
+                spill.scratch[worker % 2]
+                    .lock()
+                    .expect("spill row scratch lock poisoned")
+                    .index_buf[worker],
+                232
+            );
+            assert_eq!(
+                spill.cursor_contexts[worker]
+                    .lock()
+                    .expect("spill cursor lock poisoned")[0]
+                    .ordinal,
+                1_000
+            );
+        }
     }
 
     #[test]

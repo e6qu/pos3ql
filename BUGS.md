@@ -638,6 +638,13 @@ startup-bounded mutex now owns both registries, and signal publication
 revalidates the live process identity inside that state. A four-worker
 regression and `Send + Sync` assertion cover concurrent mutation and both exact
 retained capacities.
+The transaction-snapshot audit found repeatable-read retention in an
+unsynchronized vector and serializable table-generation reads in a `RefCell`.
+Overlapping workers could race history-retention decisions or panic while
+recording and validating serializable reads. One startup-bounded mutex now owns
+both registries; schema blocker inspection observes snapshot and relation-lock
+state in a fixed lock order. A four-worker regression and `Send + Sync`
+assertion cover concurrent mutation and exact retained capacities.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

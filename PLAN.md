@@ -352,6 +352,11 @@ process identity while publishing into the same state, and activity scans,
 statement transitions, disconnect, LISTEN changes, and signal consumption no
 longer collide on interior borrows. Concurrent mutation, exact retained
 capacities, and `Send + Sync` have direct coverage.
+Repeatable-read retention snapshots and serializable table-generation reads now
+share one startup-bounded mutex. Snapshot registration, release, oldest-snapshot
+selection, history-retention decisions, schema-blocker inspection, and
+serializable validation no longer collide on mutable state. Concurrent updates,
+exact retained capacities, and `Send + Sync` have direct coverage.
 The remaining shared catalog and row mutation paths still require
 synchronization before fixed workers can overlap execution.
 

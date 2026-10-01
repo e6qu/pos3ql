@@ -11590,6 +11590,11 @@ struct TransactionIdentityState {
     latest: u64,
 }
 
+struct SnapshotState {
+    active: FixedVec<(u32, u64)>,
+    serializable: FixedVec<(u32, u32, u64, bool)>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum TransactionIdentityRecord {
     Latest(u64),
@@ -11974,9 +11979,9 @@ pub struct Storage {
     /// Monotonic stamp for `created_at` fields.
     catalog_seq: u64,
     next_rowid: u64,
-    /// Repeatable-read snapshots held by live connections. This registry is
-    /// startup-sized to max_connections and drives version/WAL/SST retention.
-    active_snapshots: FixedVec<(u32, u64)>,
+    /// Repeatable-read retention and serializable read tracking share one
+    /// startup-bounded transaction snapshot state.
+    snapshots: std::sync::Mutex<SnapshotState>,
     /// Assigned top-level transaction identities visible to SQL snapshots.
     /// The registry includes prepared transactions and is startup-bounded by
     /// the same connection/prepared-transaction capacity as MVCC snapshots.
@@ -11984,10 +11989,6 @@ pub struct Storage {
     /// Relation, row, and advisory locks share one wait graph and acquisition
     /// sequence. One boundary keeps cross-registry transitions atomic.
     locks: std::sync::Mutex<LockState>,
-    /// Table generations captured at a SERIALIZABLE transaction's first
-    /// snapshot. Scans mark entries read; a read-write transaction validates
-    /// them before WAL publication to reject phantoms and write skew.
-    serializable_snapshots: std::cell::RefCell<FixedVec<(u32, u32, u64, bool)>>,
     /// Log sequence number of the latest write; becomes the WAL position.
     lsn: u64,
     /// ALTER TABLE replay is encoded as a compact identity/mapping marker
@@ -16486,11 +16487,11 @@ impl Storage {
             transaction_capacity * config.max_locks_per_transaction,
             config.max_connections as usize,
         )?;
-        let serializable_snapshots = std::cell::RefCell::new(FixedVec::new(
+        let serializable_snapshots = FixedVec::new(
             budget,
             "serializable_snapshots",
             transaction_capacity * table_capacity,
-        )?);
+        )?;
         let storage = Self {
             heap,
             tables,
@@ -16593,7 +16594,10 @@ impl Storage {
             parameter_acl_entries,
             comments,
             catalog_seq: 0,
-            active_snapshots,
+            snapshots: std::sync::Mutex::new(SnapshotState {
+                active: active_snapshots,
+                serializable: serializable_snapshots,
+            }),
             transaction_identities: std::sync::Mutex::new(TransactionIdentityState {
                 active: transaction_identities,
                 recent: recent_transaction_statuses,
@@ -16606,7 +16610,6 @@ impl Storage {
                 advisory: advisory_locks,
                 sequence: 0,
             }),
-            serializable_snapshots,
             next_rowid: 1,
             lsn: 0,
             replay_table_rewrite: None,
@@ -27904,7 +27907,7 @@ impl Storage {
             }
         }
 
-        let retain_history = !self.active_snapshots.is_empty();
+        let retain_history = !self.snapshot_state().active.is_empty();
         {
             let (tables, committed_versions, committed_free, pending_versions, pending_free) = (
                 &mut self.tables,
@@ -41681,6 +41684,10 @@ impl Storage {
         self.locks.lock().expect("lock state lock poisoned")
     }
 
+    fn snapshot_state(&self) -> std::sync::MutexGuard<'_, SnapshotState> {
+        self.snapshots.lock().expect("snapshot state lock poisoned")
+    }
+
     pub(crate) fn begin_transaction_identity(&self, transaction_id: u32) {
         let connection_id = self.current_connection_id();
         let mut identities = self.transaction_identity_state();
@@ -41933,37 +41940,42 @@ impl Storage {
     }
 
     pub fn register_snapshot(&mut self, txid: u32, snapshot: u64) -> Result<(), SqlError> {
-        if let Some((_, existing)) = self
-            .active_snapshots
+        let mut snapshots = self.snapshot_state();
+        if let Some((_, existing)) = snapshots
+            .active
             .iter_mut()
             .find(|(owner, _)| *owner == txid)
         {
             *existing = snapshot;
             return Ok(());
         }
-        self.active_snapshots.push((txid, snapshot)).map_err(|_| {
+        let capacity = snapshots.active.capacity();
+        snapshots.active.push((txid, snapshot)).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "more than {} active historical snapshots",
-                self.active_snapshots.capacity()
+                capacity
             )
         })
     }
 
     pub fn release_snapshot(&mut self, txid: u32) {
-        let Some(index) = self
-            .active_snapshots
-            .iter()
-            .position(|(owner, _)| *owner == txid)
-        else {
-            return;
+        let oldest = {
+            let mut snapshots = self.snapshot_state();
+            let Some(index) = snapshots
+                .active
+                .iter()
+                .position(|(owner, _)| *owner == txid)
+            else {
+                return;
+            };
+            snapshots.active.swap_remove(index);
+            snapshots.active.iter().map(|(_, snapshot)| *snapshot).min()
         };
-        self.active_snapshots.swap_remove(index);
         // Schema waits can be blocked by a historical snapshot even when the
         // reader holds no row lock. Wake the shared wait graph when it ends.
         let wait_owner = self.transaction_wait_owner(txid);
         self.lock_state().row.resource_released(wait_owner);
-        let oldest = self.oldest_snapshot();
         let (tables, versions, free) = (
             &mut self.tables,
             &mut self.committed_row_versions,
@@ -42006,14 +42018,15 @@ impl Storage {
     }
 
     pub fn oldest_snapshot(&self) -> Option<u64> {
-        self.active_snapshots
+        self.snapshot_state()
+            .active
             .iter()
             .map(|(_, snapshot)| *snapshot)
             .min()
     }
 
     pub fn has_active_snapshots(&self) -> bool {
-        !self.active_snapshots.is_empty()
+        !self.snapshot_state().active.is_empty()
     }
 
     pub(crate) fn acquire_advisory_lock(
@@ -42628,18 +42641,20 @@ impl Storage {
     }
 
     pub(crate) fn begin_serializable(&self, txid: u32) -> Result<(), SqlError> {
-        let mut snapshots = self.serializable_snapshots.borrow_mut();
-        if snapshots.iter().any(|entry| entry.0 == txid) {
+        let mut snapshots = self.snapshot_state();
+        if snapshots.serializable.iter().any(|entry| entry.0 == txid) {
             return Ok(());
         }
+        let capacity = snapshots.serializable.capacity();
         for (table, definition) in self.tables.iter().enumerate() {
             snapshots
+                .serializable
                 .push((txid, table as u32, definition.generation, false))
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "serializable snapshot registry is full ({} table snapshots)",
-                        snapshots.capacity()
+                        capacity
                     )
                 })?;
         }
@@ -42648,8 +42663,8 @@ impl Storage {
 
     pub(crate) fn record_serializable_read(&self, txid: u32, table: usize) {
         if let Some(entry) = self
-            .serializable_snapshots
-            .borrow_mut()
+            .snapshot_state()
+            .serializable
             .iter_mut()
             .find(|entry| entry.0 == txid && entry.1 == table as u32)
         {
@@ -42658,7 +42673,7 @@ impl Storage {
     }
 
     pub(crate) fn validate_serializable(&self, txid: u32) -> Result<(), SqlError> {
-        for &(owner, table, generation, read) in self.serializable_snapshots.borrow().iter() {
+        for &(owner, table, generation, read) in self.snapshot_state().serializable.iter() {
             if owner == txid && read && self.tables[table as usize].generation != generation {
                 return Err(sql_err!(
                     sqlstate::SERIALIZATION_FAILURE,
@@ -42670,11 +42685,11 @@ impl Storage {
     }
 
     pub(crate) fn release_serializable(&self, txid: u32) {
-        let mut snapshots = self.serializable_snapshots.borrow_mut();
+        let mut snapshots = self.snapshot_state();
         let mut index = 0usize;
-        while index < snapshots.len() {
-            if snapshots[index].0 == txid {
-                snapshots.swap_remove(index);
+        while index < snapshots.serializable.len() {
+            if snapshots.serializable[index].0 == txid {
+                snapshots.serializable.swap_remove(index);
             } else {
                 index += 1;
             }
@@ -42686,8 +42701,10 @@ impl Storage {
     }
 
     pub(crate) fn schema_lock_blocker(&self, txid: u32) -> Option<u32> {
+        let snapshots = self.snapshot_state();
         let locks = self.lock_state();
-        self.active_snapshots
+        snapshots
+            .active
             .iter()
             .map(|(owner, _)| *owner)
             .chain(locks.table.iter().map(|lock| lock.owner))
@@ -46706,6 +46723,71 @@ mod tests {
                 .signals
                 .iter()
                 .all(|signal| matches!(signal, BackendSignal::Terminate(_)))
+        );
+    }
+
+    #[test]
+    fn snapshot_state_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SnapshotState>();
+
+        let mut config = test_config();
+        config.max_connections = 4;
+        let transaction_capacity =
+            config.max_connections as usize + config.max_prepared_transactions;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let snapshots = &storage.snapshots;
+        std::thread::scope(|scope| {
+            for worker in 0..4u32 {
+                scope.spawn(move || {
+                    let txid = 100 + worker;
+                    for value in 0..1_000u64 {
+                        let mut snapshots = snapshots.lock().expect("snapshot state lock poisoned");
+                        if value == 0 {
+                            snapshots.active.push((txid, value)).unwrap();
+                            snapshots
+                                .serializable
+                                .push((txid, 0, value, false))
+                                .unwrap();
+                        } else {
+                            snapshots
+                                .active
+                                .iter_mut()
+                                .find(|(owner, _)| *owner == txid)
+                                .unwrap()
+                                .1 = value;
+                            let serializable = snapshots
+                                .serializable
+                                .iter_mut()
+                                .find(|entry| entry.0 == txid)
+                                .unwrap();
+                            serializable.2 = value;
+                            serializable.3 = value % 2 != 0;
+                        }
+                    }
+                });
+            }
+        });
+        let snapshots = storage.snapshot_state();
+        assert_eq!(snapshots.active.capacity(), transaction_capacity);
+        assert_eq!(snapshots.active.len(), 4);
+        assert!(
+            snapshots
+                .active
+                .iter()
+                .all(|(_, snapshot)| *snapshot == 999)
+        );
+        assert_eq!(
+            snapshots.serializable.capacity(),
+            transaction_capacity * table_slot_capacity(&config)
+        );
+        assert_eq!(snapshots.serializable.len(), 4);
+        assert!(
+            snapshots
+                .serializable
+                .iter()
+                .all(|entry| entry.2 == 999 && entry.3)
         );
     }
 

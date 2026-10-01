@@ -26887,109 +26887,114 @@ fn pg_stat_activity<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_stat_activity", false);
-    let rows = arena
-        .alloc_slice_with(storage.backend_count(), |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let current_name = crate::sql::eval::funcs::system::current_user_owned();
-    let current_role = storage.find_role_visible(current_name.as_str(), txid);
-    let see_all = current_role.is_some_and(|role| storage.role(role).attributes_to(txid).superuser);
-    let mut count = 0usize;
-    let mut found_error = None;
-    storage.visit_backends(|activity| {
-        if found_error.is_some() {
-            return;
-        }
-        let database_name = storage
-            .database_slot_by_oid(activity.database, txid)
-            .map(|slot| storage.database_definition(slot, txid).name);
-        let role_name = storage.role_name(usize::from(activity.role), txid);
-        let visible = activity.pid == storage.current_connection_id()
-            || see_all
-            || current_role == Some(usize::from(activity.role));
-        let query = if visible {
-            activity.query.as_str()
-        } else {
-            "<insufficient privilege>"
-        };
-        let encoded = (|| -> Result<&[Datum], SqlError> {
-            let values = [
-                Datum::Oid(activity.database.get() as u32),
-                match database_name {
-                    Some(name) => text(name.as_str(), arena)?,
-                    None => Datum::Null,
-                },
-                Datum::Int4(activity.pid),
-                Datum::Null,
-                Datum::Oid(Storage::role_oid(usize::from(activity.role)) as u32),
-                text(role_name.as_str(), arena)?,
-                text(activity.application_name.as_str(), arena)?,
-                activity.client_addr.map_or(Datum::Null, Datum::Inet),
-                Datum::Null,
-                Datum::Int4(activity.client_port),
-                Datum::Timestamptz(activity.backend_start),
-                activity.xact_start.map_or(Datum::Null, Datum::Timestamptz),
-                activity.query_start.map_or(Datum::Null, Datum::Timestamptz),
-                Datum::Timestamptz(activity.state_change),
-                activity.wait_event_type.map_or(Datum::Null, Datum::Text),
-                activity.wait_event.map_or(Datum::Null, Datum::Text),
-                Datum::Text(activity.state.as_str()),
-                activity
-                    .backend_xid
-                    .map_or(Datum::Null, |xid| Datum::Int4(xid as i32)),
-                Datum::Null,
-                Datum::Null,
-                text(query, arena)?,
-                Datum::Text("client backend"),
-            ];
-            row(&values, arena)
-        })();
-        match encoded {
-            Ok(encoded) => {
-                rows[count] = encoded;
-                count += 1;
+    storage.with_backend_activities(|activities| {
+        let rows = arena
+            .alloc_slice_with(activities.len(), |_| &[] as &[Datum])
+            .map_err(|_| arena_full())?;
+        let current_name = crate::sql::eval::funcs::system::current_user_owned();
+        let current_role = storage.find_role_visible(current_name.as_str(), txid);
+        let see_all =
+            current_role.is_some_and(|role| storage.role(role).attributes_to(txid).superuser);
+        let mut count = 0usize;
+        let mut found_error = None;
+        for &activity in activities {
+            if found_error.is_some() {
+                break;
             }
-            Err(error) => found_error = Some(error),
+            let database_name = storage
+                .database_slot_by_oid(activity.database, txid)
+                .map(|slot| storage.database_definition(slot, txid).name);
+            let role_name = storage.role_name(usize::from(activity.role), txid);
+            let visible = activity.pid == storage.current_connection_id()
+                || see_all
+                || current_role == Some(usize::from(activity.role));
+            let query = if visible {
+                activity.query.as_str()
+            } else {
+                "<insufficient privilege>"
+            };
+            let encoded = (|| -> Result<&[Datum], SqlError> {
+                let values = [
+                    Datum::Oid(activity.database.get() as u32),
+                    match database_name {
+                        Some(name) => text(name.as_str(), arena)?,
+                        None => Datum::Null,
+                    },
+                    Datum::Int4(activity.pid),
+                    Datum::Null,
+                    Datum::Oid(Storage::role_oid(usize::from(activity.role)) as u32),
+                    text(role_name.as_str(), arena)?,
+                    text(activity.application_name.as_str(), arena)?,
+                    activity.client_addr.map_or(Datum::Null, Datum::Inet),
+                    Datum::Null,
+                    Datum::Int4(activity.client_port),
+                    Datum::Timestamptz(activity.backend_start),
+                    activity.xact_start.map_or(Datum::Null, Datum::Timestamptz),
+                    activity.query_start.map_or(Datum::Null, Datum::Timestamptz),
+                    Datum::Timestamptz(activity.state_change),
+                    activity.wait_event_type.map_or(Datum::Null, Datum::Text),
+                    activity.wait_event.map_or(Datum::Null, Datum::Text),
+                    Datum::Text(activity.state.as_str()),
+                    activity
+                        .backend_xid
+                        .map_or(Datum::Null, |xid| Datum::Int4(xid as i32)),
+                    Datum::Null,
+                    Datum::Null,
+                    text(query, arena)?,
+                    Datum::Text("client backend"),
+                ];
+                row(&values, arena)
+            })();
+            match encoded {
+                Ok(encoded) => {
+                    rows[count] = encoded;
+                    count += 1;
+                }
+                Err(error) => found_error = Some(error),
+            }
         }
-    });
-    if let Some(error) = found_error {
-        return Err(error);
-    }
-    finish(definition, &rows[..count], arena)
+        if let Some(error) = found_error {
+            return Err(error);
+        }
+        finish(definition, &rows[..count], arena)
+    })
 }
 
 fn pg_stat_ssl<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_stat_ssl", false);
-    let rows = arena
-        .alloc_slice_with(storage.backend_count(), |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0usize;
-    let mut found_error = None;
-    storage.visit_backends(|activity| {
-        if found_error.is_some() {
-            return;
-        }
-        let values = [
-            Datum::Int4(activity.pid),
-            Datum::Bool(activity.ssl),
-            activity.ssl_version.map_or(Datum::Null, Datum::Text),
-            activity.ssl_cipher.map_or(Datum::Null, Datum::Text),
-            activity.ssl_bits.map_or(Datum::Null, Datum::Int4),
-            Datum::Null,
-            Datum::Null,
-            Datum::Null,
-        ];
-        match row(&values, arena) {
-            Ok(encoded) => {
-                rows[count] = encoded;
-                count += 1;
+    storage.with_backend_activities(|activities| {
+        let rows = arena
+            .alloc_slice_with(activities.len(), |_| &[] as &[Datum])
+            .map_err(|_| arena_full())?;
+        let mut count = 0usize;
+        let mut found_error = None;
+        for &activity in activities {
+            if found_error.is_some() {
+                break;
             }
-            Err(error) => found_error = Some(error),
+            let values = [
+                Datum::Int4(activity.pid),
+                Datum::Bool(activity.ssl),
+                activity.ssl_version.map_or(Datum::Null, Datum::Text),
+                activity.ssl_cipher.map_or(Datum::Null, Datum::Text),
+                activity.ssl_bits.map_or(Datum::Null, Datum::Int4),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+            ];
+            match row(&values, arena) {
+                Ok(encoded) => {
+                    rows[count] = encoded;
+                    count += 1;
+                }
+                Err(error) => found_error = Some(error),
+            }
         }
-    });
-    if let Some(error) = found_error {
-        return Err(error);
-    }
-    finish(definition, &rows[..count], arena)
+        if let Some(error) = found_error {
+            return Err(error);
+        }
+        finish(definition, &rows[..count], arena)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -27388,36 +27393,38 @@ fn pg_stat_recovery_prefetch<'a>(
 
 fn pg_stat_gssapi<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_stat_gssapi", false);
-    let rows = arena
-        .alloc_slice_with(storage.backend_count(), |_| &[] as &[Datum])
-        .map_err(|_| arena_full())?;
-    let mut count = 0usize;
-    let mut error = None;
-    storage.visit_backends(|activity| {
-        if error.is_some() {
-            return;
-        }
-        match row(
-            &[
-                Datum::Int4(activity.pid),
-                Datum::Bool(false),
-                Datum::Null,
-                Datum::Bool(false),
-                Datum::Bool(false),
-            ],
-            arena,
-        ) {
-            Ok(encoded) => {
-                rows[count] = encoded;
-                count += 1;
+    storage.with_backend_activities(|activities| {
+        let rows = arena
+            .alloc_slice_with(activities.len(), |_| &[] as &[Datum])
+            .map_err(|_| arena_full())?;
+        let mut count = 0usize;
+        let mut error = None;
+        for &activity in activities {
+            if error.is_some() {
+                break;
             }
-            Err(found) => error = Some(found),
+            match row(
+                &[
+                    Datum::Int4(activity.pid),
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Bool(false),
+                    Datum::Bool(false),
+                ],
+                arena,
+            ) {
+                Ok(encoded) => {
+                    rows[count] = encoded;
+                    count += 1;
+                }
+                Err(found) => error = Some(found),
+            }
         }
-    });
-    if let Some(error) = error {
-        return Err(error);
-    }
-    finish(definition, &rows[..count], arena)
+        if let Some(error) = error {
+            return Err(error);
+        }
+        finish(definition, &rows[..count], arena)
+    })
 }
 
 fn pg_stat_functions<'a>(
@@ -27688,11 +27695,11 @@ fn pg_stat_database<'a>(
         crate::storage::DatabaseCumulativeStatistics::empty_for_catalog(),
     )?;
     for (slot, database) in storage.databases_visible_to(txid) {
-        let mut backends = 0i32;
-        storage.visit_backends(|activity| {
-            if activity.database == database.oid {
-                backends = backends.saturating_add(1);
-            }
+        let backends = storage.with_backend_activities(|activities| {
+            activities
+                .iter()
+                .filter(|activity| activity.database == database.oid)
+                .fold(0i32, |count, _| count.saturating_add(1))
         });
         append(
             Datum::Oid(database.oid.get() as u32),

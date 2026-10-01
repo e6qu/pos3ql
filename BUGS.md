@@ -630,6 +630,14 @@ transition. One startup-bounded mutex now owns all three registries and the
 sequence. A four-worker regression and a `Send + Sync` assertion cover atomic
 mutation and exact retained relation-lock capacity; existing functional suites
 retain relation, row, advisory, deadlock, rollback, and prepared-lock coverage.
+The backend-state audit found live activity and pending signal queues in
+separate `RefCell` registries. Overlapping statement transitions, activity
+views, LISTEN changes, disconnect, and signal processing could panic, while a
+signal target could change between lookup and queue publication. One
+startup-bounded mutex now owns both registries, and signal publication
+revalidates the live process identity inside that state. A four-worker
+regression and `Send + Sync` assertion cover concurrent mutation and both exact
+retained capacities.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

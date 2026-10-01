@@ -11652,6 +11652,11 @@ pub(crate) enum BackendSignal {
     Terminate(i32),
 }
 
+struct BackendState {
+    activities: FixedVec<BackendActivity>,
+    signals: FixedVec<BackendSignal>,
+}
+
 /// Executor counters behind PostgreSQL's cumulative table-statistics views.
 /// They are deliberately not durable: like PostgreSQL's collector state,
 /// they describe this server lifetime rather than the authoritative rows.
@@ -11938,8 +11943,7 @@ pub struct Storage {
     brin_unsummarized_ranges: std::cell::RefCell<FixedVec<u64>>,
     brin_unsummarized_ranges_per_index: usize,
     databases: FixedVec<DatabaseDef>,
-    backends: std::cell::RefCell<FixedVec<BackendActivity>>,
-    backend_signals: std::cell::RefCell<FixedVec<BackendSignal>>,
+    backend_state: std::sync::Mutex<BackendState>,
     cumulative_statistics: std::sync::Mutex<CumulativeStatistics>,
     /// Transactions that resolved a temporary relation. PREPARE TRANSACTION
     /// must reject them before state can outlive the owning connection.
@@ -13708,6 +13712,12 @@ impl Storage {
         crate::sql::execution_connection_id()
     }
 
+    fn backend_state(&self) -> std::sync::MutexGuard<'_, BackendState> {
+        self.backend_state
+            .lock()
+            .expect("backend state lock poisoned")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_backend(
         &self,
@@ -13748,12 +13758,16 @@ impl Storage {
                 crate::sql::notify::CHANNELS_PER_CONN],
             listening_channel_count: 0,
         };
-        let mut backends = self.backends.borrow_mut();
-        if let Some(existing) = backends.iter().position(|entry| entry.pid == pid) {
-            backends[existing] = activity;
+        let mut backends = self.backend_state();
+        if let Some(existing) = backends
+            .activities
+            .iter()
+            .position(|entry| entry.pid == pid)
+        {
+            backends.activities[existing] = activity;
             return Ok(());
         }
-        backends.push(activity).map_err(|_| {
+        backends.activities.push(activity).map_err(|_| {
             sql_err!(
                 sqlstate::TOO_MANY_CONNECTIONS,
                 "backend activity registry is full"
@@ -13778,8 +13792,8 @@ impl Storage {
         let now = crate::sql::datetime::statement_micros();
         let mut idle = None;
         if let Some(activity) = self
-            .backends
-            .borrow_mut()
+            .backend_state()
+            .activities
             .iter_mut()
             .find(|activity| activity.pid == pid)
         {
@@ -13834,8 +13848,8 @@ impl Storage {
             (None, None)
         };
         if let Some(activity) = self
-            .backends
-            .borrow_mut()
+            .backend_state()
+            .activities
             .iter_mut()
             .find(|activity| activity.pid == pid)
             && (object_io || activity.wait_event_type.is_none())
@@ -13848,8 +13862,8 @@ impl Storage {
     fn mark_current_backend_wait(&self, wait_event_type: &'static str, wait_event: &'static str) {
         let pid = self.current_connection_id();
         if let Some(activity) = self
-            .backends
-            .borrow_mut()
+            .backend_state()
+            .activities
             .iter_mut()
             .find(|activity| activity.pid == pid)
         {
@@ -13874,8 +13888,8 @@ impl Storage {
         let now = crate::sql::datetime::now_micros();
         let mut active = None;
         if let Some(activity) = self
-            .backends
-            .borrow_mut()
+            .backend_state()
+            .activities
             .iter_mut()
             .find(|activity| activity.pid == pid)
         {
@@ -13906,37 +13920,39 @@ impl Storage {
     }
 
     pub(crate) fn unregister_backend(&self, pid: i32) {
-        let mut backends = self.backends.borrow_mut();
-        if let Some(index) = backends.iter().position(|activity| activity.pid == pid) {
-            let activity = backends.swap_remove(index);
-            drop(backends);
-            if let Some(slot) = self.database_slot_by_oid(activity.database, 0) {
-                let now = crate::sql::datetime::now_micros();
-                let statistics = &mut self.cumulative_statistics().databases[slot];
-                statistics.session_time_micros = statistics
-                    .session_time_micros
-                    .saturating_add(now.saturating_sub(activity.backend_start).max(0) as u64);
-                if matches!(
-                    activity.state,
-                    BackendActivityState::IdleInTransaction
-                        | BackendActivityState::IdleInTransactionAborted
-                ) {
-                    statistics.idle_in_transaction_time_micros = statistics
-                        .idle_in_transaction_time_micros
-                        .saturating_add(now.saturating_sub(activity.state_change).max(0) as u64);
-                }
+        let activity = {
+            let mut backends = self.backend_state();
+            backends
+                .activities
+                .iter()
+                .position(|activity| activity.pid == pid)
+                .map(|index| backends.activities.swap_remove(index))
+        };
+        if let Some(activity) = activity
+            && let Some(slot) = self.database_slot_by_oid(activity.database, 0)
+        {
+            let now = crate::sql::datetime::now_micros();
+            let statistics = &mut self.cumulative_statistics().databases[slot];
+            statistics.session_time_micros = statistics
+                .session_time_micros
+                .saturating_add(now.saturating_sub(activity.backend_start).max(0) as u64);
+            if matches!(
+                activity.state,
+                BackendActivityState::IdleInTransaction
+                    | BackendActivityState::IdleInTransactionAborted
+            ) {
+                statistics.idle_in_transaction_time_micros = statistics
+                    .idle_in_transaction_time_micros
+                    .saturating_add(now.saturating_sub(activity.state_change).max(0) as u64);
             }
         }
     }
 
-    pub(crate) fn backend_count(&self) -> usize {
-        self.backends.borrow().len()
-    }
-
-    pub(crate) fn visit_backends(&self, mut visit: impl FnMut(BackendActivity)) {
-        for &activity in self.backends.borrow().iter() {
-            visit(activity);
-        }
+    pub(crate) fn with_backend_activities<R>(
+        &self,
+        inspect: impl FnOnce(&[BackendActivity]) -> R,
+    ) -> R {
+        inspect(self.backend_state().activities.as_slice())
     }
 
     pub(crate) fn request_backend_signal(
@@ -13946,8 +13962,8 @@ impl Storage {
         txid: u32,
     ) -> Result<bool, SqlError> {
         let Some(target) = self
-            .backends
-            .borrow()
+            .backend_state()
+            .activities
             .iter()
             .find(|activity| activity.pid == pid)
             .copied()
@@ -13975,24 +13991,45 @@ impl Storage {
         } else {
             BackendSignal::Cancel(pid)
         };
-        let mut signals = self.backend_signals.borrow_mut();
-        if !signals.contains(&signal) {
-            signals.push(signal).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many pending backend signals"
-                )
-            })?;
-            if terminate && let Some(slot) = self.database_slot_by_oid(target.database, 0) {
-                let statistics = &mut self.cumulative_statistics().databases[slot];
-                statistics.sessions_killed = statistics.sessions_killed.saturating_add(1);
+        let inserted = {
+            let mut backends = self.backend_state();
+            let Some(live_target) = backends
+                .activities
+                .iter()
+                .find(|activity| activity.pid == pid)
+            else {
+                return Ok(false);
+            };
+            if live_target.backend_start != target.backend_start
+                || live_target.database != target.database
+                || live_target.role != target.role
+            {
+                return Ok(false);
             }
+            if backends.signals.contains(&signal) {
+                false
+            } else {
+                backends.signals.push(signal).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many pending backend signals"
+                    )
+                })?;
+                true
+            }
+        };
+        if inserted
+            && terminate
+            && let Some(slot) = self.database_slot_by_oid(target.database, 0)
+        {
+            let statistics = &mut self.cumulative_statistics().databases[slot];
+            statistics.sessions_killed = statistics.sessions_killed.saturating_add(1);
         }
         Ok(true)
     }
 
     pub(crate) fn take_backend_signal(&self) -> Option<BackendSignal> {
-        self.backend_signals.borrow_mut().pop()
+        self.backend_state().signals.pop()
     }
 
     pub(crate) fn apply_backend_listen(&self, operation: crate::sql::notify::ListenOp) {
@@ -14005,8 +14042,12 @@ impl Storage {
             }
             crate::sql::notify::ListenOp::UnlistenAll { conn_id } => (conn_id, None, true),
         };
-        let mut backends = self.backends.borrow_mut();
-        let Some(activity) = backends.iter_mut().find(|activity| activity.pid == pid) else {
+        let mut backends = self.backend_state();
+        let Some(activity) = backends
+            .activities
+            .iter_mut()
+            .find(|activity| activity.pid == pid)
+        else {
             return;
         };
         if clear_all {
@@ -14032,8 +14073,8 @@ impl Storage {
     }
 
     pub(crate) fn listening_channel_count(&self, pid: i32) -> usize {
-        self.backends
-            .borrow()
+        self.backend_state()
+            .activities
             .iter()
             .find(|activity| activity.pid == pid)
             .map_or(0, |activity| activity.listening_channel_count)
@@ -14044,8 +14085,8 @@ impl Storage {
         pid: i32,
         index: usize,
     ) -> Option<crate::sql::notify::Channel> {
-        self.backends
-            .borrow()
+        self.backend_state()
+            .activities
             .iter()
             .find(|activity| activity.pid == pid)
             .and_then(|activity| {
@@ -16387,16 +16428,9 @@ impl Storage {
             "temporary_transactions",
             transaction_capacity,
         )?);
-        let backends = std::cell::RefCell::new(FixedVec::new(
-            budget,
-            "backend_activity",
-            config.max_connections as usize,
-        )?);
-        let backend_signals = std::cell::RefCell::new(FixedVec::new(
-            budget,
-            "backend_signals",
-            config.max_connections as usize,
-        )?);
+        let backends = FixedVec::new(budget, "backend_activity", config.max_connections as usize)?;
+        let backend_signals =
+            FixedVec::new(budget, "backend_signals", config.max_connections as usize)?;
         let mut relation_cumulative_statistics =
             FixedVec::new(budget, "relation_cumulative_statistics", table_capacity)?;
         for _ in 0..table_capacity {
@@ -16523,8 +16557,10 @@ impl Storage {
             brin_unsummarized_ranges: std::cell::RefCell::new(brin_unsummarized_ranges),
             brin_unsummarized_ranges_per_index: config.max_brin_unsummarized_ranges_per_index,
             databases,
-            backends,
-            backend_signals,
+            backend_state: std::sync::Mutex::new(BackendState {
+                activities: backends,
+                signals: backend_signals,
+            }),
             cumulative_statistics: std::sync::Mutex::new(CumulativeStatistics {
                 relations: relation_cumulative_statistics,
                 relation_transactions: relation_transaction_statistics,
@@ -46618,6 +46654,59 @@ mod tests {
             transaction_capacity * table_slot_capacity(&config)
         );
         assert!(locks.table.iter().all(|lock| lock.modes[0] != 0));
+    }
+
+    #[test]
+    fn backend_state_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BackendState>();
+
+        let mut config = test_config();
+        config.max_connections = 4;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let backends = &storage.backend_state;
+        std::thread::scope(|scope| {
+            for worker in 0..4i32 {
+                scope.spawn(move || {
+                    let pid = 100 + worker;
+                    for offset in 0..1_000 {
+                        let mut backends = backends.lock().expect("backend state lock poisoned");
+                        if offset == 0 {
+                            backends.signals.push(BackendSignal::Cancel(pid)).unwrap();
+                        } else {
+                            let signal = backends
+                                .signals
+                                .iter()
+                                .position(|signal| {
+                                    matches!(
+                                        signal,
+                                        BackendSignal::Cancel(candidate)
+                                            | BackendSignal::Terminate(candidate)
+                                            if *candidate == pid
+                                    )
+                                })
+                                .unwrap();
+                            backends.signals[signal] = if offset % 2 == 0 {
+                                BackendSignal::Cancel(pid)
+                            } else {
+                                BackendSignal::Terminate(pid)
+                            };
+                        }
+                    }
+                });
+            }
+        });
+        let backends = storage.backend_state();
+        assert_eq!(backends.activities.capacity(), 4);
+        assert_eq!(backends.signals.capacity(), 4);
+        assert_eq!(backends.signals.len(), 4);
+        assert!(
+            backends
+                .signals
+                .iter()
+                .all(|signal| matches!(signal, BackendSignal::Terminate(_)))
+        );
     }
 
     #[test]

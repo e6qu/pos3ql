@@ -127,7 +127,9 @@ active production roadmap is [PLAN.md](../PLAN.md).
   snapshot creation and checkpoint manifest emission observe one atomic state.
   Relation, row, and advisory locks share one startup-bounded mutex with their
   wait graph and acquisition sequence, so cross-registry transitions are
-  atomic under overlapping workers. Engine mutation remains single-owner and
+  atomic under overlapping workers. Live backend activity, LISTEN registrations,
+  and pending signals share another fixed mutex; signal publication revalidates
+  the target in that same state. Engine mutation remains single-owner and
   serialized while catalog, cache, and row sharing is prepared. Authorization
   graph traversal uses one exactly charged bitmap per query workspace, selected
   by the typed worker-local lease identity. Foreign statement transaction

@@ -346,6 +346,12 @@ wait-edge publication, savepoint rollback, prepared-transaction transfer, and
 lock inventory traversal therefore observe one atomic state across all three
 lock kinds. Concurrent mutation and exact retained relation-lock capacity have
 direct coverage, and the complete state is compiler-checked as `Send + Sync`.
+Live backend activity, LISTEN registrations, and pending cancel or terminate
+signals now share one startup-bounded mutex. Signaling revalidates the target's
+process identity while publishing into the same state, and activity scans,
+statement transitions, disconnect, LISTEN changes, and signal consumption no
+longer collide on interior borrows. Concurrent mutation, exact retained
+capacities, and `Send + Sync` have direct coverage.
 The remaining shared catalog and row mutation paths still require
 synchronization before fixed workers can overlap execution.
 

@@ -388,6 +388,15 @@ container exactly in the fixed memory plan. Concurrent mutation, exact
 capacities, and `Send + Sync` have direct coverage. Shared role, domain, and ACL
 catalog mutation remains serialized with the other catalog write paths.
 
+Locale comparisons and spilled-row reads now use synchronized, startup-bounded
+scratch. The immutable POSIX locale handle is shared only with `strcoll_l`, and
+its two fixed buffers serialize comparisons. Spill row buffers, merged-scan
+contexts, cursor rosters, persistent value-index buffers, external sorters, and
+walk identifiers use mutex-protected fixed pools. Nested operations retain
+their existing named exhaustion instead of aliasing an active lease. Exact
+memory-plan charging, concurrent mutation, retained capacities, and
+`Send + Sync` have direct coverage.
+
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint
 roster used while opening or resuming a remote transaction, with exact startup

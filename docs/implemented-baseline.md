@@ -138,6 +138,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   temporary-object transaction ownership uses a fixed shared mutex across
   PREPARE checks and cleanup. Role reachability scratch uses one fixed mutex per
   query workspace, and domain rebinding markers use a fixed shared mutex.
+  Locale comparisons serialize their two startup-sized buffers around the
+  immutable POSIX locale handle. Spilled-row buffers, merged-scan contexts,
+  cursor rosters, persistent value-index buffers, external sorters, and walk
+  identifiers use synchronized fixed pools with named exhaustion.
   Engine mutation remains single-owner and serialized while catalog, cache, and
   row sharing is prepared.
   Authorization

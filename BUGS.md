@@ -677,6 +677,14 @@ the scratch boundary from being `Sync`. Each fixed query workspace now owns a
 mutex-protected role bitmap, while domain rebinding uses one mutex-protected
 fixed marker vector. Four-worker mutation, `Send + Sync`, and exact retained
 capacities have direct coverage.
+The reader-scratch audit found locale comparison buffers and the spill reader's
+row buffers, merged-scan contexts, cursor rosters, value-index buffers,
+external sorters, and walk identifier behind `RefCell` or `Cell`. Overlapping
+workers could panic on mutable borrows, reuse a live buffer, or duplicate a
+walk identity. The immutable locale and every fixed reader pool now have
+mutex-protected ownership; pool exhaustion remains a named error. Four-worker
+mutation, exact memory charging and capacities, and `Send + Sync` assertions
+have direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

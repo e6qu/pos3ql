@@ -142,6 +142,9 @@ active production roadmap is [PLAN.md](../PLAN.md).
   immutable POSIX locale handle. Spilled-row buffers, merged-scan contexts,
   cursor rosters, persistent value-index buffers, external sorters, and walk
   identifiers use synchronized fixed pools with named exhaustion.
+  Durable index expression and partial-index predicate evaluation retain one
+  arena mutex through each nested parse and evaluation chain, including
+  spilled-row walks, and rewind the startup-sized arena at the outer boundary.
   Engine mutation remains single-owner and serialized while catalog, cache, and
   row sharing is prepared.
   Authorization

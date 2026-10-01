@@ -12067,9 +12067,9 @@ pub struct Storage {
     /// walk (which borrows the rest of `self`) and put it back.
     value_indexes: Option<ValueIndexPool>,
     /// Parser/evaluator scratch for durable expression and partial-index keys.
-    /// Every use rewinds to its entry mark, so runtime evaluation is bounded
-    /// and cannot accumulate across rows or checkpoints.
-    index_arena: Arena,
+    /// The lock retains one allocation frontier through nested evaluation;
+    /// every use rewinds to its entry mark.
+    index_arena: std::sync::Mutex<Arena>,
     /// The process-independent locale state selected at engine startup.
     collation: Option<CollationRuntime>,
 }
@@ -16704,7 +16704,7 @@ impl Storage {
             replay_table_rewrite: None,
             spill: None,
             value_indexes: Some(value_indexes),
-            index_arena,
+            index_arena: std::sync::Mutex::new(index_arena),
             collation: None,
         };
         crate::sql::reset_execution_query_workspace();
@@ -28091,20 +28091,25 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = self.tables[table_index].def.schema(&mut schema);
-        let mark = self.index_arena.mark();
+        let arena = self
+            .index_arena
+            .lock()
+            .expect("index expression arena lock poisoned");
+        let mark = arena.mark();
         let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            self.values_enforcer_hashes(table_index, &values[..n_columns], out)
+            self.values_enforcer_hashes(&arena, table_index, &values[..n_columns], out)
         });
         // SAFETY: callers receive only hashes and binding ordinals; expression
         // evaluation cannot retain values allocated above this row-local mark.
-        unsafe { self.index_arena.rewind_to(mark) };
+        unsafe { arena.rewind_to(mark) };
         result
     }
 
     fn values_enforcer_hashes(
         &self,
+        arena: &Arena,
         table_index: usize,
         values: &[Datum],
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
@@ -28112,23 +28117,30 @@ impl Storage {
         let n_enforcers = self.tables[table_index].n_enforcers;
         let mut n_out = 0;
         for binding in 0..n_enforcers {
-            self.with_value_binding_values(table_index, binding, values, |key, _, enforcer| {
-                let Some(key) = key else { return Ok(()) };
-                if key.iter().any(Datum::is_null) {
-                    return Ok(());
-                }
-                let compact = core::array::from_fn::<u16, MAX_INDEX_COLS, _>(|index| index as u16);
-                out[n_out] = (
-                    binding,
-                    hash_key_collated(
-                        key,
-                        &compact[..enforcer.n_cols],
-                        &enforcer.collations[..enforcer.n_cols],
-                    ),
-                );
-                n_out += 1;
-                Ok(())
-            })?;
+            self.with_value_binding_values(
+                arena,
+                table_index,
+                binding,
+                values,
+                |key, _, enforcer| {
+                    let Some(key) = key else { return Ok(()) };
+                    if key.iter().any(Datum::is_null) {
+                        return Ok(());
+                    }
+                    let compact =
+                        core::array::from_fn::<u16, MAX_INDEX_COLS, _>(|index| index as u16);
+                    out[n_out] = (
+                        binding,
+                        hash_key_collated(
+                            key,
+                            &compact[..enforcer.n_cols],
+                            &enforcer.collations[..enforcer.n_cols],
+                        ),
+                    );
+                    n_out += 1;
+                    Ok(())
+                },
+            )?;
         }
         Ok(n_out)
     }
@@ -28144,20 +28156,31 @@ impl Storage {
         let table = &self.tables[table_index];
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = table.def.schema(&mut schema);
-        let mark = self.index_arena.mark();
+        let arena = self
+            .index_arena
+            .lock()
+            .expect("index expression arena lock poisoned");
+        let mark = arena.mark();
         let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            self.with_value_binding_values(table_index, binding, &values[..n_columns], visit)
+            self.with_value_binding_values(
+                &arena,
+                table_index,
+                binding,
+                &values[..n_columns],
+                visit,
+            )
         });
         // SAFETY: `visit` cannot return a borrowed key, and all expression
         // values have been encoded or hashed before this row-local rewind.
-        unsafe { self.index_arena.rewind_to(mark) };
+        unsafe { arena.rewind_to(mark) };
         result
     }
 
     fn with_value_binding_values<R>(
         &self,
+        arena: &Arena,
         table_index: usize,
         binding: usize,
         values: &[Datum],
@@ -28182,14 +28205,14 @@ impl Storage {
                     )
                 })?;
             if let Some(source) = index.predicate {
-                let predicate = crate::sql::parser::parse_expr(source.as_str(), &self.index_arena)?;
+                let predicate = crate::sql::parser::parse_expr(source.as_str(), arena)?;
                 if !crate::sql::exec::constraints::index_predicate_matches(
                     self,
                     enforcer.evaluation_txid,
                     &table.def,
                     values,
                     predicate,
-                    &self.index_arena,
+                    arena,
                 )? {
                     return visit(None, values, &enforcer);
                 }
@@ -28197,10 +28220,8 @@ impl Storage {
             let mut expressions = [None; MAX_INDEX_COLS];
             for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
                 if let Some(source) = source {
-                    expressions[position] = Some(crate::sql::parser::parse_expr(
-                        source.as_str(),
-                        &self.index_arena,
-                    )?);
+                    expressions[position] =
+                        Some(crate::sql::parser::parse_expr(source.as_str(), arena)?);
                 }
             }
             key = crate::sql::exec::constraints::index_key_values(
@@ -28210,7 +28231,7 @@ impl Storage {
                 values,
                 &index.columns[..index.n_cols],
                 &expressions[..index.n_cols],
-                &self.index_arena,
+                arena,
             )?;
         } else {
             for (position, column) in enforcer.columns().iter().enumerate() {
@@ -29626,15 +29647,20 @@ impl Storage {
         values: &[Datum],
         output: &mut [u8],
     ) -> Result<Option<(usize, usize, u64)>, SqlError> {
-        let mark = self.index_arena.mark();
+        let arena = self
+            .index_arena
+            .lock()
+            .expect("index expression arena lock poisoned");
+        let mark = arena.mark();
         let result = self.with_value_binding_values(
+            &arena,
             table_index,
             binding,
             values,
             |key, values, enforcer| Self::encode_value_binding_parts(key, values, enforcer, output),
         );
         // SAFETY: the encoded key and payload own their bytes in `output`.
-        unsafe { self.index_arena.rewind_to(mark) };
+        unsafe { arena.rewind_to(mark) };
         result
     }
 
@@ -30034,14 +30060,18 @@ impl Storage {
             want[n_want].collations[..columns.len()]
                 .copy_from_slice(&index.collations[..columns.len()]);
             want[n_want].dependency_mask = key_mask | include_mask;
-            let mark = self.index_arena.mark();
+            let arena = self
+                .index_arena
+                .lock()
+                .expect("index expression arena lock poisoned");
+            let mark = arena.mark();
             let type_result = (|| {
                 for (position, expression) in index.expressions[..index.n_cols].iter().enumerate() {
                     want[n_want].key_types[position] = match expression {
                         None => table_definition.columns[columns[position] as usize].ctype,
                         Some(source) => {
                             let expression =
-                                crate::sql::parser::parse_expr(source.as_str(), &self.index_arena)?;
+                                crate::sql::parser::parse_expr(source.as_str(), &arena)?;
                             want[n_want].dependency_mask |=
                                 crate::sql::exec::check_referenced_columns(
                                     expression,
@@ -30065,8 +30095,7 @@ impl Storage {
                     };
                 }
                 if let Some(source) = index.predicate {
-                    let predicate =
-                        crate::sql::parser::parse_expr(source.as_str(), &self.index_arena)?;
+                    let predicate = crate::sql::parser::parse_expr(source.as_str(), &arena)?;
                     want[n_want].dependency_mask |=
                         crate::sql::exec::check_referenced_columns(predicate, &table_definition)?;
                 }
@@ -30074,7 +30103,8 @@ impl Storage {
             })();
             // SAFETY: inferred expression metadata does not retain parser
             // nodes or values allocated above this row-local mark.
-            unsafe { self.index_arena.rewind_to(mark) };
+            unsafe { arena.rewind_to(mark) };
+            drop(arena);
             type_result?;
             want[n_want].include_mask = include_mask;
             n_want += 1;
@@ -30186,16 +30216,20 @@ impl Storage {
                 column < n_columns && dependency_mask.contains(column)
             });
             let demanded_count = demanded[..n_columns].iter().filter(|&&set| set).count();
+            let arena = self
+                .index_arena
+                .lock()
+                .expect("index expression arena lock poisoned");
             self.spill_merged_walk_bytes(
                 table_index,
-                &self.index_arena,
+                &arena,
                 true,
                 Some(&demanded),
                 demanded_count.saturating_mul(2) >= n_columns,
                 SpillOverlayMode::VisibleScan,
                 None,
                 &mut |rowid, _commit_lsn, representation| {
-                    let mark = self.index_arena.mark();
+                    let mark = arena.mark();
                     let mut decoded = [Datum::Null; MAX_COLUMNS];
                     let values = match representation {
                         SpilledRowRepresentation::Encoded(bytes) => {
@@ -30204,10 +30238,10 @@ impl Storage {
                         }
                         SpilledRowRepresentation::Values(values) => values,
                     };
-                    let hashes = self.values_enforcer_hashes(table_index, values, &mut buf);
+                    let hashes = self.values_enforcer_hashes(&arena, table_index, values, &mut buf);
                     // SAFETY: `hashes` retains only fixed hash values and
                     // binding ordinals from expression evaluation.
-                    unsafe { self.index_arena.rewind_to(mark) };
+                    unsafe { arena.rewind_to(mark) };
                     let count = hashes?;
                     Ok(insert_hashes(rowid, &buf[..count]))
                 },
@@ -47095,6 +47129,42 @@ mod tests {
                 1_000
             );
         }
+    }
+
+    #[test]
+    fn index_expression_scratch_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<Arena>>();
+        assert_send_sync::<Storage>();
+
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0..4u8 {
+                let arena = &storage.index_arena;
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        let arena = arena.lock().expect("index expression arena lock poisoned");
+                        let mark = arena.mark();
+                        let bytes = arena
+                            .alloc_slice_copy(&[worker; 16])
+                            .expect("index expression scratch capacity");
+                        assert!(bytes.iter().all(|byte| *byte == worker));
+                        // SAFETY: this worker retains the arena lock and no
+                        // allocation above the mark escapes the iteration.
+                        unsafe { arena.rewind_to(mark) };
+                    }
+                });
+            }
+        });
+        let arena = storage
+            .index_arena
+            .lock()
+            .expect("index expression arena lock poisoned");
+        assert_eq!(arena.capacity(), INDEX_ARENA_BYTES);
+        assert_eq!(arena.used(), 0);
+        assert!(arena.high_water() >= 16);
     }
 
     #[test]

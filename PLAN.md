@@ -397,6 +397,13 @@ their existing named exhaustion instead of aliasing an active lease. Exact
 memory-plan charging, concurrent mutation, retained capacities, and
 `Send + Sync` have direct coverage.
 
+Durable index expression and partial-index predicate evaluation now retain one
+mutex guard across their complete nested parse and evaluation chain. Resident
+rows, spilled rows, index definition analysis, and value-index encoding reuse
+the same startup-sized arena under that guard, then rewind to their entry mark.
+Concurrent mutation, exact retained capacity, and a compiler assertion that
+the complete `Storage` state is `Send + Sync` have direct coverage.
+
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint
 roster used while opening or resuming a remote transaction, with exact startup

@@ -701,6 +701,16 @@ every restored identity. Bounded trigger and index generations use the same
 compare-and-exchange boundary and retain SQLSTATE `54000` at exhaustion.
 Four-worker uniqueness, concurrent recovery observation, bounded exhaustion,
 and `Send + Sync` have direct coverage.
+The large-object catalog audit found the fixed definition pool and automatic
+OID frontier in separate unsynchronized fields. Overlapping create, drop,
+ownership, recovery, checkpoint, ACL, and catalog reads could lose OID advances
+or combine a definition with another transition. One startup-bounded mutex now
+owns both fields. Iterators copy each entry and release the guard before nested
+catalog lookups, preventing recursive-lock stalls. `pg_largeobject_metadata`
+uses the fixed configured roster instead of a racy count-then-fill pass. Four-worker allocation,
+nested-reader progress, exact retained capacity, and `Send + Sync` have direct
+coverage. The same audit found and fixed role dependency checks omitting owned
+large objects, which could otherwise allow `DROP ROLE` to orphan their owner.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

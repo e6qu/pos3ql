@@ -147,22 +147,23 @@ active production roadmap is [PLAN.md](../PLAN.md).
   spilled-row walks, and rewind the startup-sized arena at the outer boundary.
   Every catalog family reserves and restores its monotonic `created_at`
   identity through one atomic sequence; bounded trigger and index generations
-  use the same compare-and-exchange boundary. Engine mutation remains
-  single-owner and serialized while catalog definition containers, cache, and
-  row sharing are prepared.
-  Authorization
-  graph traversal uses one exactly charged bitmap per query workspace, selected
-  by the typed worker-local lease identity. Foreign statement transaction
-  identity,
-  isolation state, and fixed savepoint rosters use the same per-workspace
-  boundary and exact startup charging. Foreign transports use an exactly
-  charged `max_foreign_sessions` pool keyed by local transaction and remote
-  endpoint; savepoint, rollback, and commit commands cover every remote session
-  owned by the transaction, SQLSTATE `53300` reports pool exhaustion, and the
-  operational endpoints report configured and occupied slots. Each complete
-  client and ownership record share a per-slot mutex and typed client guard;
-  assignment and release use one pool lock so operations serialize within a
-  session while distinct slots can drive concurrently. Relation, index,
+  use the same compare-and-exchange boundary. Large object definitions and
+  their automatic OID frontier share one startup-bounded mutex; readers copy
+  complete entries before nested ownership or ACL lookup. Engine mutation
+  remains single-owner and serialized while the other catalog definition
+  containers, cache, and row sharing are prepared. Authorization graph
+  traversal uses one exactly charged bitmap per query workspace, selected by
+  the typed worker-local lease identity. Foreign statement transaction
+  identity, isolation state, and fixed savepoint rosters use the same
+  per-workspace boundary and exact startup charging. Foreign transports use an
+  exactly charged `max_foreign_sessions` pool keyed by local transaction and
+  remote endpoint; savepoint, rollback, and commit commands cover every remote
+  session owned by the transaction, SQLSTATE `53300` reports pool exhaustion,
+  and the operational endpoints report configured and occupied slots. Each
+  complete client and ownership record share a per-slot mutex and typed client
+  guard; assignment and release use one pool lock so operations serialize
+  within a session while distinct slots can drive concurrently. Relation,
+  index,
   database, and function cumulative statistics, including transaction nesting
   and shared reset timestamps, use one startup-bounded state protected by a
   mutex; commit and rollback publish relation and database totals atomically.

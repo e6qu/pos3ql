@@ -39420,19 +39420,19 @@ fn journal_full_keeps_sequence_advance_dirty_for_retry() {
         String::from_utf8_lossy(&created)
     );
     let slot = engine.storage.sequence_slot("public", "s", 0).unwrap();
-    assert!(!engine.storage.sequence(slot).dirty.get());
+    assert!(!engine.storage.sequence_value_image_for(slot, 0).3);
 
     let failed = run_with(&mut engine, &mut budget, "SELECT nextval('s')");
     assert!(String::from_utf8_lossy(&failed).contains("53100"));
-    assert_eq!(engine.storage.sequence(slot).last_value.get(), 1);
-    assert!(engine.storage.sequence(slot).dirty.get());
+    assert_eq!(engine.storage.sequence_value_for(slot, 0).0, 1);
+    assert!(engine.storage.sequence_value_image_for(slot, 0).3);
 
     // Model the journal space a successful checkpoint makes available. A
     // later read-only commit must retry the absolute sequence position.
     engine.wal.reset_after_checkpoint();
     let retried = run_with(&mut engine, &mut budget, "SELECT 1");
     assert!(!String::from_utf8_lossy(&retried).contains("ERROR"));
-    assert!(!engine.storage.sequence(slot).dirty.get());
+    assert!(!engine.storage.sequence_value_image_for(slot, 0).3);
 }
 
 #[test]

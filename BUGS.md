@@ -653,6 +653,15 @@ mutation holds it across the complete state transition. WAL and checkpoint
 callers copy one coherent fixed-size image. A four-worker regression and
 `Send + Sync` assertion cover concurrent mutation and exact retained
 capacities.
+The sequence-value audit found committed and staged last-value, called,
+prelog-count, and dirty fields stored in eight independent `Cell`s per catalog
+entry. Concurrent `nextval`, `setval`, restart, rollback, replay, WAL,
+checkpoint, and catalog reads could lose updates or combine fields from
+different transitions. One startup-bounded mutex now owns complete committed
+and staged images for every configured sequence. A four-worker reservation
+regression also proves that publishing an older generation cannot clear a
+later advance; `Send + Sync` assertions cover atomic mutation and exact retained
+capacity.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

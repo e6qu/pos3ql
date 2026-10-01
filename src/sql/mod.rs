@@ -5084,12 +5084,14 @@ impl Engine {
             }
         }
         // Journal sequence advances (this transaction's or ones a rolled-back
-        // transaction left dirty). Absolute positions, like serial advances, and
+        // transaction left dirty). Absolute positions, like serial advances, are
         // deliberately non-transactional: a `nextval` in a rolled-back
         // transaction still consumes its number, matching PostgreSQL's gaps.
         for i in 0..self.storage.sequence_count() {
             let seq = self.storage.sequence_for(i, txn.txid);
-            if !seq.visible_to(txn.txid) || !self.storage.sequence_value_dirty_for(i, txn.txid) {
+            let (last, is_called, _, dirty, generation) =
+                self.storage.sequence_value_image_for(i, txn.txid);
+            if !seq.visible_to(txn.txid) || !dirty {
                 continue;
             }
             if seq.persistence == crate::storage::RelationPersistence::Temporary {
@@ -5097,7 +5099,6 @@ impl Engine {
             }
             let schema = seq.schema;
             let name = seq.name;
-            let (last, is_called) = self.storage.sequence_value_for(i, txn.txid);
             let lsn = self.storage.lsn() + 1;
             if let Err(e) = self.wal.stage(
                 txn.txid,
@@ -5113,6 +5114,8 @@ impl Engine {
                 return Err(e);
             }
             self.storage.set_lsn(lsn);
+            self.storage
+                .mark_sequence_value_staged(i, txn.txid, generation);
         }
         // BRIN summarize/desummarize operations are deliberately
         // nontransactional. Publish their absolute state on this or any later
@@ -19203,6 +19206,13 @@ fn replay_transaction_batches(
                                     last,
                                     is_called,
                                 )?;
+                                let generation =
+                                    storage.sequence_value_image_for(sequence, transaction_id).4;
+                                storage.mark_sequence_value_staged(
+                                    sequence,
+                                    transaction_id,
+                                    generation,
+                                );
                                 storage.clear_sequence_value_dirty(sequence, transaction_id);
                             } else {
                                 storage.apply_sequence_advance(schema, name, last, is_called);

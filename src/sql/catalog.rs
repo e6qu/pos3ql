@@ -10510,8 +10510,7 @@ pub(crate) fn sequence_state_by_oid(storage: &Storage, oid: i32, txid: u32) -> O
     if slot >= storage.sequence_count() || !storage.sequence_slot_visible_to(slot, txid) {
         return None;
     }
-    let sequence = storage.sequence_for(slot, txid);
-    Some((sequence.last_value.get(), sequence.is_called.get()))
+    Some(storage.sequence_value_for(slot, txid))
 }
 
 /// Plain views get OIDs from their own range so `'view'::regclass` resolves and

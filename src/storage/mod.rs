@@ -11949,6 +11949,58 @@ struct CumulativeStatistics {
     reset_times: SharedStatisticsResetTimes,
 }
 
+/// Process-wide monotonic identity shared by every catalog family.
+///
+/// Catalog containers acquire their own synchronization boundaries. Keeping
+/// their common sequence atomic prevents distinct families from publishing the
+/// same `created_at` stamp while those boundaries are held independently.
+struct CatalogSequence(std::sync::atomic::AtomicU64);
+
+impl CatalogSequence {
+    const fn new(value: u64) -> Self {
+        Self(std::sync::atomic::AtomicU64::new(value))
+    }
+
+    fn next(&self) -> u64 {
+        let prior = self
+            .0
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |value| value.checked_add(1),
+            )
+            .expect("catalog sequence exhausted");
+        prior.checked_add(1).expect("catalog sequence exhausted")
+    }
+
+    fn next_bounded(&self, maximum: u64, object: &str) -> Result<u64, SqlError> {
+        let mut current = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next =
+                bounded_catalog_generation(current.checked_add(1).unwrap_or(0), maximum, object)?;
+            match self.0.compare_exchange_weak(
+                current,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(next),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn observe(&self, value: u64) {
+        self.0
+            .fetch_max(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn current(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -12040,8 +12092,8 @@ pub struct Storage {
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
     /// fixed slots reused as comments are added and removed.
     comments: FixedVec<CommentEntry>,
-    /// Monotonic stamp for `created_at` fields.
-    catalog_seq: u64,
+    /// Monotonic stamp shared by every catalog's `created_at` fields.
+    catalog_sequence: CatalogSequence,
     next_rowid: u64,
     /// Repeatable-read retention and serializable read tracking share one
     /// startup-bounded transaction snapshot state.
@@ -14620,7 +14672,7 @@ impl Storage {
         definition: foreign::ForeignDataWrapperDefinition,
         owner: u16,
     ) -> Result<(), SqlError> {
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.foreign
             .restore_wrapper(slot, current_database(), created_at, definition, owner)
     }
@@ -14632,7 +14684,7 @@ impl Storage {
         definition: foreign::ForeignServerDefinition,
         owner: u16,
     ) -> Result<(), SqlError> {
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.foreign
             .restore_server(slot, current_database(), created_at, definition, owner)
     }
@@ -14643,7 +14695,7 @@ impl Storage {
         created_at: u64,
         definition: foreign::UserMappingDefinition,
     ) -> Result<(), SqlError> {
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.foreign
             .restore_mapping(slot, current_database(), created_at, definition)
     }
@@ -14654,7 +14706,7 @@ impl Storage {
         created_at: u64,
         definition: foreign::ForeignTableDefinition,
     ) -> Result<(), SqlError> {
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.foreign
             .restore_table(slot, current_database(), created_at, definition)
     }
@@ -14666,7 +14718,7 @@ impl Storage {
         owner: u16,
         definition: Option<foreign::ForeignDataWrapperDefinition>,
     ) -> Result<(), SqlError> {
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.foreign
             .replay_set_wrapper(slot, current_database(), created_at, owner, definition)
     }
@@ -14678,7 +14730,7 @@ impl Storage {
         owner: u16,
         definition: Option<foreign::ForeignServerDefinition>,
     ) -> Result<(), SqlError> {
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.foreign
             .replay_set_server(slot, current_database(), created_at, owner, definition)
     }
@@ -14689,7 +14741,7 @@ impl Storage {
         created_at: u64,
         definition: Option<foreign::UserMappingDefinition>,
     ) -> Result<(), SqlError> {
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.foreign
             .replay_set_mapping(slot, current_database(), created_at, definition)
     }
@@ -14700,7 +14752,7 @@ impl Storage {
         created_at: u64,
         definition: Option<foreign::ForeignTableDefinition>,
     ) -> Result<(), SqlError> {
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.foreign
             .replay_set_table(slot, current_database(), created_at, definition)
     }
@@ -14742,10 +14794,10 @@ impl Storage {
         definition: foreign::ForeignDataWrapperDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        let created_at = self.catalog_sequence.next();
         let slot = self.foreign.create_wrapper(
             current_database(),
-            self.catalog_seq,
+            created_at,
             definition,
             self.initial_ownership(txid),
             txid,
@@ -14762,10 +14814,10 @@ impl Storage {
         definition: foreign::ForeignServerDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        let created_at = self.catalog_sequence.next();
         let slot = self.foreign.create_server(
             current_database(),
-            self.catalog_seq,
+            created_at,
             definition,
             self.initial_ownership(txid),
             txid,
@@ -14782,9 +14834,9 @@ impl Storage {
         definition: foreign::UserMappingDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        let created_at = self.catalog_sequence.next();
         self.foreign
-            .create_mapping(current_database(), self.catalog_seq, definition, txid)
+            .create_mapping(current_database(), created_at, definition, txid)
     }
 
     pub(crate) fn create_foreign_table_binding(
@@ -14792,10 +14844,10 @@ impl Storage {
         definition: foreign::ForeignTableDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        let created_at = self.catalog_sequence.next();
         self.foreign.create_table(
             current_database(),
-            self.catalog_seq,
+            created_at,
             definition,
             self.initial_ownership(txid),
             txid,
@@ -16682,7 +16734,7 @@ impl Storage {
             default_acl_entries,
             parameter_acl_entries,
             comments,
-            catalog_seq: 0,
+            catalog_sequence: CatalogSequence::new(0),
             snapshots: std::sync::Mutex::new(SnapshotState {
                 active: active_snapshots,
                 serializable: serializable_snapshots,
@@ -19498,12 +19550,12 @@ impl Storage {
             class: AccessClass::LargeObject,
             slot: slot as u16,
         });
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.large_objects[slot] = LargeObjectDef {
             database: current_database(),
             oid,
             ownership: self.initial_ownership(txid),
-            created_at: self.catalog_seq,
+            created_at,
             allocated,
             ddl_state: if txid == 0 {
                 CatalogDdlState::Present
@@ -19600,7 +19652,7 @@ impl Storage {
                 }),
             };
         }
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         Ok(slot)
     }
 
@@ -23866,8 +23918,7 @@ impl Storage {
             class: AccessClass::Extension,
             slot: slot as u16,
         });
-        self.catalog_seq = self.catalog_seq.saturating_add(1);
-        let created_at = self.catalog_seq;
+        let created_at = self.catalog_sequence.next();
         self.extensions[slot] = ExtensionDef {
             database: current_database(),
             created_at,
@@ -23933,7 +23984,7 @@ impl Storage {
             pending: None,
             ddl_state: CatalogDdlState::Present,
         };
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         Ok(slot)
     }
 
@@ -30542,8 +30593,8 @@ impl Storage {
             slot: slot as u16,
         });
         let ownership = self.initial_ownership(pending.map_or(0, |pending| pending.txid));
-        self.catalog_seq += 1;
-        let stamp = self.catalog_seq;
+        let created_at = self.catalog_sequence.next();
+        let stamp = created_at;
         self.cumulative_statistics().relations[slot] = RelationCumulativeStatistics::EMPTY;
         self.reset_implicit_index_statistics(slot);
         self.clear_table_rows(slot);
@@ -31615,10 +31666,10 @@ impl Storage {
         };
         let mut publications = [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS];
         publications[..spec.publications.len()].copy_from_slice(spec.publications);
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.subscriptions[slot] = SubscriptionDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             definition_generation: 1,
             name: spec.name,
             pending_name: None,
@@ -31705,7 +31756,7 @@ impl Storage {
         let subscription = &mut self.subscriptions[slot];
         subscription.created_at = created_at;
         subscription.definition_generation = definition_generation;
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         Ok(())
     }
 
@@ -32427,10 +32478,10 @@ impl Storage {
         let table_filters = PublicationFilters::from_sql(spec.table_filter_sql)?;
         let mut schemas = [u8::MAX; MAX_PUBLICATION_SCHEMAS];
         schemas[..spec.schemas.len()].copy_from_slice(spec.schemas);
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.publications[slot] = PublicationDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             name: spec.name,
             pending_name: None,
             all_tables: spec.all_tables,
@@ -32702,10 +32753,10 @@ impl Storage {
         });
         let image = self.matview_dependency_image(new);
         let dependency_count = self.write_dependency_image(image, query.dependencies.view())?;
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.matviews[new] = MatviewDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             backing_table: backing_table as u16,
             sql: query.sql,
             creation_path: query.creation_path,
@@ -32980,10 +33031,10 @@ impl Storage {
             class: AccessClass::Sequence,
             slot: new as u16,
         });
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.sequences[new] = SequenceDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             cache_generation: 0,
             schema,
             name,
@@ -33971,7 +34022,7 @@ impl Storage {
                 self.domains.len()
             ));
         };
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         let ownership = self.initial_ownership(txid);
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Domain,
@@ -33979,7 +34030,7 @@ impl Storage {
         });
         self.domains[new] = DomainDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             schema,
             name,
             ownership,
@@ -34890,7 +34941,7 @@ impl Storage {
                 self.enums.len()
             ));
         };
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         let ownership = self.initial_ownership(txid);
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Enum,
@@ -34899,7 +34950,7 @@ impl Storage {
         let member_count = self.write_enum_member_image(new, spec.members)?;
         self.enums[new] = EnumDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             schema,
             name,
             ownership,
@@ -35964,14 +36015,14 @@ impl Storage {
                 field.ctype = ctype;
             }
         }
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Composite,
             slot: slot as u16,
         });
         self.composites[slot] = CompositeDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             schema,
             name,
             ownership: self.initial_ownership(txid),
@@ -36108,10 +36159,10 @@ impl Storage {
             class: AccessClass::View,
             slot: new as u16,
         });
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.views[new] = ViewDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             schema,
             name,
             persistence: definition.persistence,
@@ -38453,14 +38504,14 @@ impl Storage {
         self.clear_object_acl_entries(Self::routine_access_object(slot));
         let (created_at, ownership) = match identity {
             RoutineIdentity::Allocate => {
-                self.catalog_seq += 1;
-                (self.catalog_seq, self.initial_ownership(txid))
+                let created_at = self.catalog_sequence.next();
+                (created_at, self.initial_ownership(txid))
             }
             RoutineIdentity::Preserve {
                 created_at,
                 ownership,
             } => {
-                self.catalog_seq = self.catalog_seq.max(created_at);
+                self.catalog_sequence.observe(created_at);
                 (created_at, ownership)
             }
         };
@@ -38781,10 +38832,10 @@ impl Storage {
             ));
         };
         let role_count = self.write_policy_role_image(slot, spec.roles)?;
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.policies[slot] = PolicyDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             name: spec.name,
             table: u16::try_from(spec.table).map_err(|_| {
                 sql_err!(
@@ -39009,10 +39060,10 @@ impl Storage {
                     self.policies.len()
                 ));
             };
-            self.catalog_seq += 1;
+            let created_at = self.catalog_sequence.next();
             self.policies[slot] = PolicyDef {
                 database: current_database(),
-                created_at: self.catalog_seq,
+                created_at,
                 name: spec.name,
                 table: u16::try_from(spec.table).map_err(|_| {
                     sql_err!(
@@ -39061,7 +39112,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         let slot = self.replay_set_policy(spec, roles, dependencies)?;
         self.policies[slot].created_at = created_at;
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         Ok(())
     }
 
@@ -39353,15 +39404,12 @@ impl Storage {
                 self.triggers.len()
             ));
         };
-        let created_at = bounded_catalog_generation(
-            self.catalog_seq.saturating_add(1),
-            MAX_TRIGGER_OID_GENERATION,
-            "trigger",
-        )?;
-        self.catalog_seq = created_at;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_TRIGGER_OID_GENERATION, "trigger")?;
         self.triggers[slot] = TriggerDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             name: spec.name,
             target: spec.target,
             kind: spec.kind,
@@ -39568,7 +39616,7 @@ impl Storage {
                 "too many triggers in checkpoint"
             ));
         };
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.triggers[slot] = TriggerDef {
             database: current_database(),
             created_at,
@@ -39853,10 +39901,9 @@ impl Storage {
             ));
         };
         let created_at = if spec.created_at == 0 {
-            self.catalog_seq = self.catalog_seq.saturating_add(1);
-            self.catalog_seq
+            self.catalog_sequence.next()
         } else {
-            self.catalog_seq = self.catalog_seq.max(spec.created_at);
+            self.catalog_sequence.observe(spec.created_at);
             spec.created_at
         };
         self.extended_statistics[slot] = ExtendedStatisticsDef {
@@ -40380,15 +40427,9 @@ impl Storage {
     /// transaction; returns its slot. Errors on a duplicate visible name or
     /// another transaction's uncommitted DDL on the name.
     pub fn create_index(&mut self, mut def: IndexDef, txid: u32) -> Result<usize, SqlError> {
-        let created_at = bounded_catalog_generation(
-            if def.created_at == 0 {
-                self.catalog_seq.saturating_add(1)
-            } else {
-                def.created_at
-            },
-            MAX_INDEX_OID_GENERATION,
-            "index",
-        )?;
+        let created_at = (def.created_at != 0)
+            .then(|| bounded_catalog_generation(def.created_at, MAX_INDEX_OID_GENERATION, "index"))
+            .transpose()?;
         def.database = current_database();
         self.require_schema_create(def.schema.as_str(), txid)?;
         match def.method {
@@ -40670,7 +40711,15 @@ impl Storage {
             class: AccessClass::Index,
             slot: i as u16,
         });
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        let created_at = match created_at {
+            Some(created_at) => {
+                self.catalog_sequence.observe(created_at);
+                created_at
+            }
+            None => self
+                .catalog_sequence
+                .next_bounded(MAX_INDEX_OID_GENERATION, "index")?,
+        };
         self.indexes[i] = IndexDef {
             created_at,
             ownership,
@@ -41224,10 +41273,9 @@ impl Storage {
                 )
             })?;
         let created_at = if created_at == 0 {
-            self.catalog_seq = self.catalog_seq.saturating_add(1);
-            self.catalog_seq
+            self.catalog_sequence.next()
         } else {
-            self.catalog_seq = self.catalog_seq.max(created_at);
+            self.catalog_sequence.observe(created_at);
             created_at
         };
         self.access_methods[slot] = AccessMethodDef {
@@ -41428,10 +41476,9 @@ impl Storage {
 
     fn install_tablespace(&mut self, slot: usize, image: TablespaceImage, txid: u32) {
         let created_at = if image.created_at == 0 {
-            self.catalog_seq = self.catalog_seq.saturating_add(1);
-            self.catalog_seq
+            self.catalog_sequence.next()
         } else {
-            self.catalog_seq = self.catalog_seq.max(image.created_at);
+            self.catalog_sequence.observe(image.created_at);
             image.created_at
         };
         self.tablespaces[slot] = TablespaceDef {
@@ -43173,10 +43220,10 @@ impl Storage {
                 self.casts.len()
             ));
         };
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.casts[slot] = CastDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             source,
             target,
             method,
@@ -43210,7 +43257,7 @@ impl Storage {
                 self.casts.len()
             ));
         };
-        self.catalog_seq = self.catalog_seq.max(definition.created_at);
+        self.catalog_sequence.observe(definition.created_at);
         definition.ddl_state = CatalogDdlState::Present;
         self.casts[slot] = definition;
         Ok(slot)
@@ -43503,10 +43550,10 @@ impl Storage {
                     self.collations.len()
                 )
             })?;
-        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        let created_at = self.catalog_sequence.next();
         self.collations[slot] = CollationDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             definition,
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -43556,10 +43603,10 @@ impl Storage {
                     self.conversions.len()
                 )
             })?;
-        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        let created_at = self.catalog_sequence.next();
         self.conversions[slot] = ConversionDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             definition,
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -43613,10 +43660,10 @@ impl Storage {
             crate::sql::ast::TextSearchObjectKind::Configuration => 313_000,
         };
         definition.set_oid(base + slot as i32);
-        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        let created_at = self.catalog_sequence.next();
         self.text_search_objects[slot] = TextSearchDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             definition,
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -43812,7 +43859,7 @@ impl Storage {
                 );
             }
         }
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.text_search_objects[slot] = TextSearchDef {
             database: current_database(),
             created_at,
@@ -44112,7 +44159,7 @@ impl Storage {
             definition.schema,
             definition.name,
         );
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.collations[slot] = CollationDef {
             database: current_database(),
             created_at,
@@ -44170,7 +44217,7 @@ impl Storage {
                 definition.name,
             );
         }
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.conversions[slot] = ConversionDef {
             database: current_database(),
             created_at,
@@ -44421,10 +44468,10 @@ impl Storage {
                     self.rules.len()
                 )
             })?;
-        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        let created_at = self.catalog_sequence.next();
         self.rules[slot] = RuleDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             definition,
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -44714,7 +44761,7 @@ impl Storage {
         if let RuleTarget::Table(table) = definition.target {
             self.tables[usize::from(table)].def.has_rules = true;
         }
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         Ok(())
     }
 
@@ -44763,10 +44810,10 @@ impl Storage {
                     self.event_triggers.len()
                 )
             })?;
-        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        let created_at = self.catalog_sequence.next();
         self.event_triggers[slot] = EventTriggerDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             definition,
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -44907,7 +44954,7 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.event_triggers[slot] = EventTriggerDef {
             database: current_database(),
             created_at,
@@ -45260,10 +45307,10 @@ impl Storage {
                 self.operators.len()
             ));
         };
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.operators[slot] = OperatorDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             definition,
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -45324,7 +45371,7 @@ impl Storage {
                     )
                 })?,
         };
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.operators[slot] = OperatorDef {
             database: current_database(),
             created_at,
@@ -45605,10 +45652,10 @@ impl Storage {
                 self.operator_families.len()
             ));
         };
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.operator_families[slot] = OperatorFamilyDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             definition,
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -45656,7 +45703,7 @@ impl Storage {
                     )
                 })?,
         };
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.operator_families[slot] = OperatorFamilyDef {
             database: current_database(),
             created_at,
@@ -46051,10 +46098,10 @@ impl Storage {
                 self.operator_classes.len()
             ));
         };
-        self.catalog_seq += 1;
+        let created_at = self.catalog_sequence.next();
         self.operator_classes[slot] = OperatorClassDef {
             database: current_database(),
-            created_at: self.catalog_seq,
+            created_at,
             definition,
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -46104,7 +46151,7 @@ impl Storage {
                     )
                 })?,
         };
-        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.catalog_sequence.observe(created_at);
         self.operator_classes[slot] = OperatorClassDef {
             database: current_database(),
             created_at,
@@ -46994,6 +47041,51 @@ mod tests {
                 .transactions
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn catalog_sequence_is_concurrent_monotonic_and_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CatalogSequence>();
+
+        const WORKERS: usize = 4;
+        const ADVANCES_PER_WORKER: usize = 1_000;
+        const ADVANCES: usize = WORKERS * ADVANCES_PER_WORKER;
+        let sequence = CatalogSequence::new(0);
+        let claimed: [std::sync::atomic::AtomicBool; ADVANCES + 1] =
+            std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let sequence = &sequence;
+                let claimed = &claimed;
+                scope.spawn(move || {
+                    for _ in 0..ADVANCES_PER_WORKER {
+                        let value = sequence.next() as usize;
+                        assert!(value <= ADVANCES);
+                        assert!(!claimed[value].swap(true, std::sync::atomic::Ordering::Relaxed));
+                    }
+                });
+            }
+        });
+        assert_eq!(sequence.current(), ADVANCES as u64);
+        assert!(
+            claimed[1..]
+                .iter()
+                .all(|value| value.load(std::sync::atomic::Ordering::Relaxed))
+        );
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let sequence = &sequence;
+                scope.spawn(move || sequence.observe(5_000 + worker as u64));
+            }
+        });
+        assert_eq!(sequence.current(), 5_003);
+        assert_eq!(sequence.next(), 5_004);
+
+        let bounded = CatalogSequence::new(1);
+        assert_eq!(bounded.next_bounded(2, "test").unwrap(), 2);
+        assert!(bounded.next_bounded(2, "test").is_err());
     }
 
     #[test]

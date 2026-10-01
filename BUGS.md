@@ -692,6 +692,15 @@ complete `Storage` state from being `Sync`. One mutex now retains the arena
 through each nested parse, predicate, key, and spilled-row evaluation chain.
 Four-worker mutation, exact retained capacity, and a `Storage: Send + Sync`
 assertion have direct coverage.
+The catalog-identity audit found every catalog family incrementing or restoring
+one plain `catalog_seq` value. Independent catalog synchronization would let
+concurrent creates lose increments and publish the same `created_at` identity,
+while recovery could move the sequence backward relative to live allocation.
+One atomic monotonic sequence now reserves every new identity and observes
+every restored identity. Bounded trigger and index generations use the same
+compare-and-exchange boundary and retain SQLSTATE `54000` at exhaustion.
+Four-worker uniqueness, concurrent recovery observation, bounded exhaustion,
+and `Send + Sync` have direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

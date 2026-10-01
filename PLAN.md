@@ -375,8 +375,8 @@ temporary-object transaction registry has its own mutex, so temporary relation
 resolution, PREPARE eligibility checks, commit, and rollback cannot collide on
 an interior borrow or lose an owner. Concurrent updates, exact capacities, and
 `Send + Sync` have direct coverage.
-The remaining shared catalog and row mutation paths still require
-synchronization before fixed workers can overlap execution.
+The remaining catalog definition containers and row mutation paths still
+require synchronization before fixed workers can overlap execution.
 
 Authorization graph traversal now has one mutex-protected, startup-sized bitmap
 per query workspace. Every role membership, object privilege, grant-option,
@@ -403,6 +403,16 @@ rows, spilled rows, index definition analysis, and value-index encoding reuse
 the same startup-sized arena under that guard, then rewind to their entry mark.
 Concurrent mutation, exact retained capacity, and a compiler assertion that
 the complete `Storage` state is `Send + Sync` have direct coverage.
+
+Catalog identity allocation now crosses every catalog family through one
+atomic monotonic sequence. Concurrent creates reserve distinct `created_at`
+stamps even when their definition containers use independent synchronization
+boundaries, while replay and recovery advance the sequence without moving it
+backward. Trigger and index OID generation reserves through the same atomic
+compare-and-exchange boundary and retains its named exhaustion error.
+Concurrent uniqueness, replay observation, and bounded exhaustion have direct
+coverage. Catalog definition containers and row mutation state remain the
+shared write boundaries before fixed workers can overlap execution.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

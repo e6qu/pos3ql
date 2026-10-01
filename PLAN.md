@@ -385,7 +385,7 @@ identity, while the mutex makes accidental overlapping ownership safe and
 compiler-visible. Domain base rebinding uses a fixed mutex-protected marker
 vector as well. `query_workspace_slots` charges each role bitmap and mutex
 container exactly in the fixed memory plan. Concurrent mutation, exact
-capacities, and `Send + Sync` have direct coverage. Shared role, domain, and ACL
+capacities, and `Send + Sync` have direct coverage. Shared role and domain
 catalog mutation remains serialized with the other catalog write paths.
 
 Locale comparisons and spilled-row reads now use synchronized, startup-bounded
@@ -432,8 +432,18 @@ object rename and drop, replay, database cloning, checkpoint reads, and
 and release the mutex before resolving its referenced object, so nested comment
 lookups cannot recursively lock the catalog. Four-worker publication,
 nested-reader progress, exact configured capacity, and `Send + Sync` have
-direct coverage. ACL catalog mutation remains reactor-serialized with the
-other catalog definition containers.
+direct coverage.
+
+Object, column, default, and parameter ACL entries now share one
+startup-bounded mutex. GRANT and REVOKE changes, transaction commit and
+rollback, identity changes, database cloning and removal, role cleanup, WAL
+replay, checkpoints, privilege checks, and PostgreSQL catalog reads observe
+complete entry images. Iterators copy one fixed entry and release the mutex
+before nested role or object resolution. Four-worker publication across all
+four ACL families, nested-reader progress, exact retained capacities, loud
+exhaustion, and `Send + Sync` have direct coverage. The remaining catalog
+definition containers and row mutation paths still require synchronization
+before fixed workers can overlap execution.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

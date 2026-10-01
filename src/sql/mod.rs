@@ -5577,7 +5577,7 @@ impl Engine {
             ) {
                 continue;
             }
-            let entry = *self.storage.column_acl_entry(slot as usize);
+            let entry = self.storage.column_acl_entry(slot as usize);
             let relation = entry.target.relation();
             if self.storage.access_object_is_temporary(relation, txn.txid) {
                 continue;
@@ -5642,7 +5642,7 @@ impl Engine {
             ) {
                 continue;
             }
-            let entry = *self.storage.parameter_acl_entry(slot as usize);
+            let entry = self.storage.parameter_acl_entry(slot as usize);
             let (grantee, grantor) = self.storage.parameter_acl_identity(slot as usize, txn.txid);
             if txn.ddl()[..position].iter().any(|earlier| {
                 let DdlUndo::ParameterAclChanged {
@@ -5694,7 +5694,7 @@ impl Engine {
             ) {
                 continue;
             }
-            let entry = *self.storage.default_acl_entry(slot as usize);
+            let entry = self.storage.default_acl_entry(slot as usize);
             let (defined, privileges, grant_options) = self.storage.default_acl_state(
                 entry.owner,
                 entry.schema,
@@ -21744,7 +21744,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             let old_owner = storage.object_owner(object, 0) as u16;
             let acl_count = storage.acl_entry_count();
             for slot in 0..acl_count {
-                let entry = *storage.acl_entry(slot);
+                let entry = storage.acl_entry(slot);
                 if entry.object != object || entry.object.slot == u16::MAX {
                     continue;
                 }
@@ -21768,7 +21768,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             }
             let column_acl_count = storage.column_acl_entry_count();
             for slot in 0..column_acl_count {
-                let entry = *storage.column_acl_entry(slot);
+                let entry = storage.column_acl_entry(slot);
                 if entry.target.relation() != object {
                     continue;
                 }

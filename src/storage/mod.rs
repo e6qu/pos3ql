@@ -10879,6 +10879,168 @@ pub(crate) struct DefaultAclEntry {
     pub pending: Option<PendingDefaultAcl>,
 }
 
+/// The four PostgreSQL ACL catalogs share one synchronization boundary.
+/// Cross-catalog ownership and dependency changes therefore observe complete
+/// privilege images, while every fixed vector retains its startup capacity.
+struct AclCatalog {
+    objects: FixedVec<AclEntry>,
+    columns: FixedVec<ColumnAclEntry>,
+    defaults: FixedVec<DefaultAclEntry>,
+    parameters: FixedVec<ParameterAclEntry>,
+}
+
+struct ObjectAclIter<'a> {
+    storage: &'a Storage,
+    next_slot: usize,
+    checkpoint: bool,
+}
+
+impl Iterator for ObjectAclIter<'_> {
+    type Item = (usize, AclEntry);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (slot, entry) = {
+                let catalog = self
+                    .storage
+                    .acl_catalog
+                    .lock()
+                    .expect("ACL catalog lock poisoned");
+                if self.next_slot >= catalog.objects.len() {
+                    return None;
+                }
+                let slot = self.next_slot;
+                self.next_slot += 1;
+                (slot, catalog.objects[slot])
+            };
+            let include = if self.checkpoint {
+                entry.object.slot != u16::MAX
+                    && !self.storage.access_object_is_temporary(entry.object, 0)
+                    && (entry.live
+                        || (entry.object.class == AccessClass::Schema
+                            && entry.grantee == PUBLIC_ROLE
+                            && entry.grantor == 0)
+                        || (matches!(
+                            entry.object.class,
+                            AccessClass::Domain
+                                | AccessClass::Enum
+                                | AccessClass::Composite
+                                | AccessClass::Routine
+                                | AccessClass::Language
+                        ) && entry.grantee == PUBLIC_ROLE))
+            } else {
+                entry.object.slot != u16::MAX
+                    && self.storage.access_object_in_current_database(entry.object)
+            };
+            if include {
+                return Some((slot, entry));
+            }
+        }
+    }
+}
+
+struct ColumnAclIter<'a> {
+    storage: &'a Storage,
+    next_slot: usize,
+    checkpoint: bool,
+}
+
+impl Iterator for ColumnAclIter<'_> {
+    type Item = (usize, ColumnAclEntry);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (slot, entry) = {
+                let catalog = self
+                    .storage
+                    .acl_catalog
+                    .lock()
+                    .expect("ACL catalog lock poisoned");
+                if self.next_slot >= catalog.columns.len() {
+                    return None;
+                }
+                let slot = self.next_slot;
+                self.next_slot += 1;
+                (slot, catalog.columns[slot])
+            };
+            let include = if self.checkpoint {
+                entry.live
+                    && !self
+                        .storage
+                        .access_object_is_temporary(entry.target.relation, 0)
+            } else {
+                entry.target.relation.slot != u16::MAX
+                    && self
+                        .storage
+                        .access_object_in_current_database(entry.target.relation)
+            };
+            if include {
+                return Some((slot, entry));
+            }
+        }
+    }
+}
+
+struct DefaultAclIter<'a> {
+    catalog: &'a std::sync::Mutex<AclCatalog>,
+    database: Option<DatabaseOid>,
+    next_slot: usize,
+}
+
+impl Iterator for DefaultAclIter<'_> {
+    type Item = (usize, DefaultAclEntry);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("ACL catalog lock poisoned");
+        while self.next_slot < catalog.defaults.len() {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            let entry = catalog.defaults[slot];
+            let include = self
+                .database
+                .map_or(entry.defined, |database| entry.database == database);
+            if include {
+                return Some((slot, entry));
+            }
+        }
+        None
+    }
+}
+
+enum ParameterAclIterMode {
+    Visible(u32),
+    Checkpoint,
+}
+
+struct ParameterAclIter<'a> {
+    catalog: &'a std::sync::Mutex<AclCatalog>,
+    next_slot: usize,
+    mode: ParameterAclIterMode,
+}
+
+impl Iterator for ParameterAclIter<'_> {
+    type Item = (usize, ParameterAclEntry);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("ACL catalog lock poisoned");
+        while self.next_slot < catalog.parameters.len() {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            let entry = catalog.parameters[slot];
+            let include = match self.mode {
+                ParameterAclIterMode::Visible(txid) => {
+                    Storage::parameter_acl_visible(&entry, txid).0
+                }
+                ParameterAclIterMode::Checkpoint => entry.live,
+            };
+            if include {
+                return Some((slot, entry));
+            }
+        }
+        None
+    }
+}
+
 /// Startup-bounded PostgreSQL role catalog. Role metadata is catalog state and
 /// therefore follows the same transaction/WAL/manifest lifecycle as schemas;
 /// it never lives in a process-global authentication side table.
@@ -12271,10 +12433,7 @@ pub struct Storage {
     role_graph_scratch: FixedVec<std::sync::Mutex<FixedVec<bool>>>,
     system_settings: FixedVec<SystemSetting>,
     prepared_transactions: FixedVec<PreparedTransactionCatalogEntry>,
-    acl_entries: FixedVec<AclEntry>,
-    column_acl_entries: FixedVec<ColumnAclEntry>,
-    default_acl_entries: FixedVec<DefaultAclEntry>,
-    parameter_acl_entries: FixedVec<ParameterAclEntry>,
+    acl_catalog: std::sync::Mutex<AclCatalog>,
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
     /// fixed slots reused as comments are added and removed.
     comments: std::sync::Mutex<CommentCatalog>,
@@ -16917,10 +17076,12 @@ impl Storage {
             role_graph_scratch,
             system_settings,
             prepared_transactions,
-            acl_entries,
-            column_acl_entries,
-            default_acl_entries,
-            parameter_acl_entries,
+            acl_catalog: std::sync::Mutex::new(AclCatalog {
+                objects: acl_entries,
+                columns: column_acl_entries,
+                defaults: default_acl_entries,
+                parameters: parameter_acl_entries,
+            }),
             comments: std::sync::Mutex::new(CommentCatalog { entries: comments }),
             catalog_sequence: CatalogSequence::new(0),
             snapshots: std::sync::Mutex::new(SnapshotState {
@@ -18963,8 +19124,8 @@ impl Storage {
                 };
             }
 
-            for source_slot in 0..self.acl_entries.len() {
-                let entry = self.acl_entries[source_slot];
+            for source_slot in 0..self.acl_entry_count() {
+                let entry = self.acl_entry(source_slot);
                 if !entry.live
                     || self.access_object_database(entry.object) != Some(source)
                     || self.access_object_is_temporary(entry.object, 0)
@@ -18983,8 +19144,8 @@ impl Storage {
                     0,
                 )?;
             }
-            for source_slot in 0..self.column_acl_entries.len() {
-                let entry = self.column_acl_entries[source_slot];
+            for source_slot in 0..self.column_acl_entry_count() {
+                let entry = self.column_acl_entry(source_slot);
                 if !entry.live
                     || self.access_object_database(entry.target.relation()) != Some(source)
                     || self.access_object_is_temporary(entry.target.relation(), 0)
@@ -19004,8 +19165,8 @@ impl Storage {
                     0,
                 )?;
             }
-            for source_slot in 0..self.default_acl_entries.len() {
-                let entry = self.default_acl_entries[source_slot];
+            for source_slot in 0..self.default_acl_entry_count() {
+                let entry = self.default_acl_entry(source_slot);
                 if entry.database != source || !entry.defined {
                     continue;
                 }
@@ -19105,7 +19266,9 @@ impl Storage {
     }
 
     fn clear_database_catalog(&mut self, database: DatabaseOid) {
-        for entry in self.acl_entries.iter_mut() {
+        for slot in 0..self.acl_entry_count() {
+            let prior = self.acl_entry(slot);
+            let entry = prior;
             if entry.object.slot == u16::MAX {
                 continue;
             }
@@ -19150,12 +19313,19 @@ impl Storage {
                 AccessClass::Tablespace | AccessClass::Database | AccessClass::Language => continue,
             };
             if object_database == database {
+                let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+                let entry = &mut catalog.objects[slot];
+                if entry.object != prior.object {
+                    continue;
+                }
                 entry.object.slot = u16::MAX;
                 entry.live = false;
                 entry.pending = None;
             }
         }
-        for entry in self.column_acl_entries.iter_mut() {
+        for slot in 0..self.column_acl_entry_count() {
+            let prior = self.column_acl_entry(slot);
+            let entry = prior;
             if entry.target.relation.slot == u16::MAX {
                 continue;
             }
@@ -19167,13 +19337,30 @@ impl Storage {
                 _ => continue,
             };
             if object_database == database {
+                let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+                let entry = &mut catalog.columns[slot];
+                if entry.target != prior.target {
+                    continue;
+                }
                 entry.target.relation.slot = u16::MAX;
                 entry.live = false;
                 entry.pending = None;
             }
         }
-        for entry in self.default_acl_entries.iter_mut() {
+        for slot in 0..self.default_acl_entry_count() {
+            let prior = self.default_acl_entry(slot);
+            let entry = prior;
             if entry.database == database {
+                let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+                let entry = &mut catalog.defaults[slot];
+                if entry.database != prior.database
+                    || entry.owner != prior.owner
+                    || entry.schema != prior.schema
+                    || entry.class != prior.class
+                    || entry.grantee != prior.grantee
+                {
+                    continue;
+                }
                 entry.database = DatabaseOid::POSTGRES;
                 entry.owner = PUBLIC_ROLE;
                 entry.defined = false;
@@ -20568,39 +20755,30 @@ impl Storage {
 
     pub(crate) fn checkpoint_default_acls(
         &self,
-    ) -> impl Iterator<Item = (usize, &DefaultAclEntry)> {
-        self.default_acl_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.defined)
+    ) -> impl Iterator<Item = (usize, DefaultAclEntry)> + '_ {
+        DefaultAclIter {
+            catalog: &self.acl_catalog,
+            database: None,
+            next_slot: 0,
+        }
     }
 
-    pub(crate) fn checkpoint_acls(&self) -> impl Iterator<Item = (usize, &AclEntry)> {
-        self.acl_entries.iter().enumerate().filter(|(_, value)| {
-            value.object.slot != u16::MAX
-                && !self.access_object_is_temporary(value.object, 0)
-                && (value.live
-                    || (value.object.class == AccessClass::Schema
-                        && value.grantee == PUBLIC_ROLE
-                        && value.grantor == 0)
-                    || (matches!(
-                        value.object.class,
-                        AccessClass::Domain
-                            | AccessClass::Enum
-                            | AccessClass::Composite
-                            | AccessClass::Routine
-                            | AccessClass::Language
-                    ) && value.grantee == PUBLIC_ROLE))
-        })
+    pub(crate) fn checkpoint_acls(&self) -> impl Iterator<Item = (usize, AclEntry)> + '_ {
+        ObjectAclIter {
+            storage: self,
+            next_slot: 0,
+            checkpoint: true,
+        }
     }
 
-    pub(crate) fn checkpoint_column_acls(&self) -> impl Iterator<Item = (usize, &ColumnAclEntry)> {
-        self.column_acl_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| {
-                value.live && !self.access_object_is_temporary(value.target.relation, 0)
-            })
+    pub(crate) fn checkpoint_column_acls(
+        &self,
+    ) -> impl Iterator<Item = (usize, ColumnAclEntry)> + '_ {
+        ColumnAclIter {
+            storage: self,
+            next_slot: 0,
+            checkpoint: true,
+        }
     }
 
     pub(crate) fn access_class_slots(&self, class: AccessClass) -> usize {
@@ -20637,8 +20815,9 @@ impl Storage {
     /// reused. ACL identity includes the fixed registry slot, so retaining a
     /// dropped object's rows would otherwise grant privileges on an unrelated
     /// object later allocated into the same slot.
-    fn clear_object_acl_entries(&mut self, object: AccessObject) {
-        for entry in self.acl_entries.iter_mut() {
+    fn clear_object_acl_entries(&self, object: AccessObject) {
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        for entry in catalog.objects.iter_mut() {
             if entry.object == object {
                 entry.live = false;
                 entry.privileges = PrivilegeSet::NONE;
@@ -20647,7 +20826,7 @@ impl Storage {
                 entry.object.slot = u16::MAX;
             }
         }
-        for entry in self.column_acl_entries.iter_mut() {
+        for entry in catalog.columns.iter_mut() {
             if entry.target.relation == object {
                 entry.live = false;
                 entry.privileges = PrivilegeSet::NONE;
@@ -20720,48 +20899,36 @@ impl Storage {
         if owned_catalog {
             return Some(RoleObjectDependency::OwnedCatalogObject);
         }
-        if self.acl_entries.iter().any(|entry| {
-            let (visible, grantee, grantor, _, _) = Self::acl_visible(entry, txid);
-            visible
-                && self.access_object_visible_to(entry.object, txid)
-                && (grantee == role as u16 || grantor == role as u16)
-        }) {
-            return Some(RoleObjectDependency::ObjectPrivilege);
-        }
-        if self.parameter_acl_entries.iter().any(|entry| {
-            let (visible, grantee, grantor, _, _) = Self::parameter_acl_visible(entry, txid);
-            visible && (grantee == role as u16 || grantor == role as u16)
-        }) {
-            return Some(RoleObjectDependency::ParameterPrivilege);
-        }
-        if self.default_acl_entries.iter().any(|entry| {
-            let (defined, _, _) = Self::default_acl_visible(entry, txid);
-            defined && (entry.owner == role as u16 || entry.grantee == role as u16)
-        }) {
-            return Some(RoleObjectDependency::DefaultPrivilege);
-        }
-        if self.column_acl_entries.iter().any(|entry| {
-            let (visible, grantee, grantor, _, _) = match entry.pending {
-                Some(pending) if pending.txid == txid => (
-                    pending.privileges.0 != 0,
-                    pending.grantee,
-                    pending.grantor,
-                    pending.privileges,
-                    pending.grant_options,
-                ),
-                _ => (
-                    entry.live,
-                    entry.grantee,
-                    entry.grantor,
-                    entry.privileges,
-                    entry.grant_options,
-                ),
-            };
-            visible
-                && self.access_object_visible_to(entry.target.relation, txid)
-                && (grantee == role as u16 || grantor == role as u16)
-        }) {
-            return Some(RoleObjectDependency::ColumnPrivilege);
+        {
+            let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+            if catalog.objects.iter().any(|entry| {
+                let (visible, grantee, grantor, _, _) = Self::acl_visible(entry, txid);
+                visible
+                    && self.access_object_visible_to(entry.object, txid)
+                    && (grantee == role as u16 || grantor == role as u16)
+            }) {
+                return Some(RoleObjectDependency::ObjectPrivilege);
+            }
+            if catalog.parameters.iter().any(|entry| {
+                let (visible, grantee, grantor, _, _) = Self::parameter_acl_visible(entry, txid);
+                visible && (grantee == role as u16 || grantor == role as u16)
+            }) {
+                return Some(RoleObjectDependency::ParameterPrivilege);
+            }
+            if catalog.defaults.iter().any(|entry| {
+                let (defined, _, _) = Self::default_acl_visible(entry, txid);
+                defined && (entry.owner == role as u16 || entry.grantee == role as u16)
+            }) {
+                return Some(RoleObjectDependency::DefaultPrivilege);
+            }
+            if catalog.columns.iter().any(|entry| {
+                let (visible, grantee, grantor, _, _) = Self::column_acl_visible(entry, txid);
+                visible
+                    && self.access_object_visible_to(entry.target.relation, txid)
+                    && (grantee == role as u16 || grantor == role as u16)
+            }) {
+                return Some(RoleObjectDependency::ColumnPrivilege);
+            }
         }
         self.policies_with_slots_visible_to(txid)
             .any(|(slot, _)| self.policy_roles(slot, txid).contains(&(role as u16)))
@@ -20867,7 +21034,7 @@ impl Storage {
     }
 
     pub(crate) fn change_acl(
-        &mut self,
+        &self,
         object: AccessObject,
         grantee: u16,
         grantor: u16,
@@ -20875,8 +21042,9 @@ impl Storage {
         grant_options: PrivilegeSet,
         txid: u32,
     ) -> Result<(usize, Option<PendingAcl>), SqlError> {
-        let slot = self
-            .acl_entries
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let slot = catalog
+            .objects
             .iter()
             .position(|entry| {
                 let (_, visible_grantee, visible_grantor, _, _) = Self::acl_visible(entry, txid);
@@ -20886,13 +21054,14 @@ impl Storage {
                     && (entry.live || entry.pending.is_some())
             })
             .or_else(|| {
-                self.acl_entries.iter().position(|entry| {
+                catalog.objects.iter().position(|entry| {
                     entry.object.slot == u16::MAX && !entry.live && entry.pending.is_none()
                 })
             })
-            .unwrap_or(self.acl_entries.len());
-        if slot == self.acl_entries.len() {
-            self.acl_entries
+            .unwrap_or(catalog.objects.len());
+        if slot == catalog.objects.len() {
+            catalog
+                .objects
                 .push(AclEntry {
                     object,
                     grantee,
@@ -20906,15 +21075,15 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many object privilege entries (limit {})",
-                        self.acl_entries.capacity()
+                        catalog.objects.capacity()
                     )
                 })?;
-        } else if self.acl_entries[slot].object.slot == u16::MAX {
-            self.acl_entries[slot].object = object;
-            self.acl_entries[slot].grantee = grantee;
-            self.acl_entries[slot].grantor = grantor;
+        } else if catalog.objects[slot].object.slot == u16::MAX {
+            catalog.objects[slot].object = object;
+            catalog.objects[slot].grantee = grantee;
+            catalog.objects[slot].grantor = grantor;
         }
-        let entry = &mut self.acl_entries[slot];
+        let entry = &mut catalog.objects[slot];
         let prior = entry.pending;
         if txid == 0 {
             entry.grantee = grantee;
@@ -20935,13 +21104,13 @@ impl Storage {
         Ok((slot, prior))
     }
 
-    pub(crate) fn acl_to(
-        &self,
+    fn acl_to_entries(
+        entries: &[AclEntry],
         object: AccessObject,
         grantee: u16,
         txid: u32,
     ) -> (PrivilegeSet, PrivilegeSet) {
-        self.acl_entries
+        entries
             .iter()
             .filter(|entry| {
                 let (_, visible_grantee, _, _, _) = Self::acl_visible(entry, txid);
@@ -20971,7 +21140,9 @@ impl Storage {
         grantor: u16,
         txid: u32,
     ) -> (PrivilegeSet, PrivilegeSet) {
-        self.acl_entries
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        catalog
+            .objects
             .iter()
             .filter(|entry| {
                 let (_, visible_grantee, visible_grantor, _, _) = Self::acl_visible(entry, txid);
@@ -20998,8 +21169,9 @@ impl Storage {
     }
 
     pub(crate) fn acl_state(&self, slot: usize, txid: u32) -> (PrivilegeSet, PrivilegeSet) {
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let (visible, _, _, privileges, grant_options) =
-            Self::acl_visible(&self.acl_entries[slot], txid);
+            Self::acl_visible(&catalog.objects[slot], txid);
         if visible {
             (privileges, grant_options)
         } else {
@@ -21008,18 +21180,20 @@ impl Storage {
     }
 
     pub(crate) fn acl_entry_visible(&self, slot: usize, txid: u32) -> bool {
-        Self::acl_visible(&self.acl_entries[slot], txid).0
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        Self::acl_visible(&catalog.objects[slot], txid).0
     }
 
-    pub(crate) fn commit_acl(&mut self, slot: usize, txid: u32) {
-        let Some(pending) = self.acl_entries[slot]
+    pub(crate) fn commit_acl(&self, slot: usize, txid: u32) {
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let Some(pending) = catalog.objects[slot]
             .pending
             .filter(|pending| pending.txid == txid)
         else {
             return;
         };
         {
-            let entry = &mut self.acl_entries[slot];
+            let entry = &mut catalog.objects[slot];
             entry.grantee = pending.grantee;
             entry.grantor = pending.grantor;
             entry.privileges = pending.privileges;
@@ -21027,45 +21201,41 @@ impl Storage {
             entry.live = pending.privileges.0 != 0;
             entry.pending = None;
         }
-        self.deduplicate_acl(slot);
+        Self::deduplicate_acl(&mut catalog.objects, slot);
     }
 
-    fn deduplicate_acl(&mut self, slot: usize) {
-        let object = self.acl_entries[slot].object;
-        let grantee = self.acl_entries[slot].grantee;
-        let grantor = self.acl_entries[slot].grantor;
-        let Some(canonical) = self
-            .acl_entries
-            .iter()
-            .enumerate()
-            .find_map(|(candidate, entry)| {
-                (candidate != slot
-                    && entry.object == object
-                    && entry.grantee == grantee
-                    && entry.grantor == grantor
-                    && entry.object.slot != u16::MAX
-                    && entry.pending.is_none())
-                .then_some(candidate)
-            })
-        else {
+    fn deduplicate_acl(entries: &mut FixedVec<AclEntry>, slot: usize) {
+        let object = entries[slot].object;
+        let grantee = entries[slot].grantee;
+        let grantor = entries[slot].grantor;
+        let Some(canonical) = entries.iter().enumerate().find_map(|(candidate, entry)| {
+            (candidate != slot
+                && entry.object == object
+                && entry.grantee == grantee
+                && entry.grantor == grantor
+                && entry.object.slot != u16::MAX
+                && entry.pending.is_none())
+            .then_some(candidate)
+        }) else {
             return;
         };
-        let privileges = self.acl_entries[slot].privileges;
-        let grant_options = self.acl_entries[slot].grant_options;
-        self.acl_entries[canonical].privileges =
-            self.acl_entries[canonical].privileges.union(privileges);
-        self.acl_entries[canonical].grant_options = self.acl_entries[canonical]
-            .grant_options
-            .union(grant_options);
-        self.acl_entries[canonical].live = self.acl_entries[canonical].privileges.0 != 0;
-        self.acl_entries[slot].object.slot = u16::MAX;
-        self.acl_entries[slot].privileges = PrivilegeSet::NONE;
-        self.acl_entries[slot].grant_options = PrivilegeSet::NONE;
-        self.acl_entries[slot].live = false;
+        let privileges = entries[slot].privileges;
+        let grant_options = entries[slot].grant_options;
+        entries[canonical].privileges = entries[canonical].privileges.union(privileges);
+        entries[canonical].grant_options = entries[canonical].grant_options.union(grant_options);
+        entries[canonical].live = entries[canonical].privileges.0 != 0;
+        entries[slot].object.slot = u16::MAX;
+        entries[slot].privileges = PrivilegeSet::NONE;
+        entries[slot].grant_options = PrivilegeSet::NONE;
+        entries[slot].live = false;
     }
 
-    pub(crate) fn restore_acl_pending(&mut self, slot: usize, prior: Option<PendingAcl>) {
-        self.acl_entries[slot].pending = prior;
+    pub(crate) fn restore_acl_pending(&self, slot: usize, prior: Option<PendingAcl>) {
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .objects[slot]
+            .pending = prior;
     }
 
     fn parameter_acl_visible(
@@ -21097,7 +21267,7 @@ impl Storage {
     }
 
     pub(crate) fn change_parameter_acl(
-        &mut self,
+        &self,
         parameter: crate::sql::ast::ParameterName,
         grantee: u16,
         grantor: u16,
@@ -21105,8 +21275,9 @@ impl Storage {
         grant_options: crate::sql::ast::ParameterPrivileges,
         txid: u32,
     ) -> Result<(usize, Option<PendingParameterAcl>), SqlError> {
-        let slot = self
-            .parameter_acl_entries
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let slot = catalog
+            .parameters
             .iter()
             .position(|entry| {
                 let (_, visible_grantee, visible_grantor, _, _) =
@@ -21117,13 +21288,14 @@ impl Storage {
                     && (entry.live || entry.pending.is_some())
             })
             .or_else(|| {
-                self.parameter_acl_entries.iter().position(|entry| {
+                catalog.parameters.iter().position(|entry| {
                     entry.parameter.is_empty() && !entry.live && entry.pending.is_none()
                 })
             })
-            .unwrap_or(self.parameter_acl_entries.len());
-        if slot == self.parameter_acl_entries.len() {
-            self.parameter_acl_entries
+            .unwrap_or(catalog.parameters.len());
+        if slot == catalog.parameters.len() {
+            catalog
+                .parameters
                 .push(ParameterAclEntry {
                     parameter,
                     grantee,
@@ -21137,15 +21309,15 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many parameter privilege entries (limit {})",
-                        self.parameter_acl_entries.capacity()
+                        catalog.parameters.capacity()
                     )
                 })?;
-        } else if self.parameter_acl_entries[slot].parameter.is_empty() {
-            self.parameter_acl_entries[slot].parameter = parameter;
-            self.parameter_acl_entries[slot].grantee = grantee;
-            self.parameter_acl_entries[slot].grantor = grantor;
+        } else if catalog.parameters[slot].parameter.is_empty() {
+            catalog.parameters[slot].parameter = parameter;
+            catalog.parameters[slot].grantee = grantee;
+            catalog.parameters[slot].grantor = grantor;
         }
-        let entry = &mut self.parameter_acl_entries[slot];
+        let entry = &mut catalog.parameters[slot];
         let prior = entry.pending;
         if txid == 0 {
             entry.grantee = grantee;
@@ -21176,7 +21348,9 @@ impl Storage {
         crate::sql::ast::ParameterPrivileges,
         crate::sql::ast::ParameterPrivileges,
     ) {
-        self.parameter_acl_entries
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        catalog
+            .parameters
             .iter()
             .filter(|entry| {
                 let (_, visible_grantee, visible_grantor, _, _) =
@@ -21205,8 +21379,8 @@ impl Storage {
             )
     }
 
-    fn parameter_acl_to(
-        &self,
+    fn parameter_acl_to_entries(
+        entries: &[ParameterAclEntry],
         parameter: crate::sql::ast::ParameterName,
         grantee: u16,
         txid: u32,
@@ -21214,7 +21388,7 @@ impl Storage {
         crate::sql::ast::ParameterPrivileges,
         crate::sql::ast::ParameterPrivileges,
     ) {
-        self.parameter_acl_entries
+        entries
             .iter()
             .filter(|entry| {
                 let (_, visible_grantee, _, _, _) = Self::parameter_acl_visible(entry, txid);
@@ -21247,11 +21421,22 @@ impl Storage {
         required: crate::sql::ast::ParameterPrivileges,
         txid: u32,
     ) -> bool {
-        let mut effective = self.parameter_acl_to(parameter, PUBLIC_ROLE, txid).0;
-        for candidate in 0..self.roles.len() {
-            if candidate == role || self.role_is_member_of(role, candidate, txid) {
-                effective =
-                    effective.union(self.parameter_acl_to(parameter, candidate as u16, txid).0);
+        let mut roles = self.role_graph_scratch();
+        self.reachable_roles(role, txid, false, false, &mut roles);
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let mut effective =
+            Self::parameter_acl_to_entries(&catalog.parameters, parameter, PUBLIC_ROLE, txid).0;
+        for (candidate, inherited) in roles.iter().copied().enumerate() {
+            if inherited {
+                effective = effective.union(
+                    Self::parameter_acl_to_entries(
+                        &catalog.parameters,
+                        parameter,
+                        candidate as u16,
+                        txid,
+                    )
+                    .0,
+                );
             }
         }
         effective.contains(required)
@@ -21264,11 +21449,22 @@ impl Storage {
         required: crate::sql::ast::ParameterPrivileges,
         txid: u32,
     ) -> bool {
-        let mut effective = self.parameter_acl_to(parameter, PUBLIC_ROLE, txid).1;
-        for candidate in 0..self.roles.len() {
-            if candidate == role || self.role_is_member_of(role, candidate, txid) {
-                effective =
-                    effective.union(self.parameter_acl_to(parameter, candidate as u16, txid).1);
+        let mut roles = self.role_graph_scratch();
+        self.reachable_roles(role, txid, false, false, &mut roles);
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let mut effective =
+            Self::parameter_acl_to_entries(&catalog.parameters, parameter, PUBLIC_ROLE, txid).1;
+        for (candidate, inherited) in roles.iter().copied().enumerate() {
+            if inherited {
+                effective = effective.union(
+                    Self::parameter_acl_to_entries(
+                        &catalog.parameters,
+                        parameter,
+                        candidate as u16,
+                        txid,
+                    )
+                    .1,
+                );
             }
         }
         effective.contains(required)
@@ -21282,8 +21478,9 @@ impl Storage {
         txid: u32,
         output: &mut [usize],
     ) -> usize {
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let mut count = 0usize;
-        for (slot, entry) in self.parameter_acl_entries.iter().enumerate() {
+        for (slot, entry) in catalog.parameters.iter().enumerate() {
             let (visible, _, entry_grantor, entry_privileges, _) =
                 Self::parameter_acl_visible(entry, txid);
             if visible
@@ -21298,13 +21495,16 @@ impl Storage {
         count
     }
 
-    pub(crate) fn parameter_acl_entry(&self, slot: usize) -> &ParameterAclEntry {
-        &self.parameter_acl_entries[slot]
+    pub(crate) fn parameter_acl_entry(&self, slot: usize) -> ParameterAclEntry {
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .parameters[slot]
     }
 
     pub(crate) fn parameter_acl_identity(&self, slot: usize, txid: u32) -> (u16, u16) {
         let (_, grantee, grantor, _, _) =
-            Self::parameter_acl_visible(&self.parameter_acl_entries[slot], txid);
+            Self::parameter_acl_visible(&self.parameter_acl_entry(slot), txid);
         (grantee, grantor)
     }
 
@@ -21317,41 +21517,48 @@ impl Storage {
         crate::sql::ast::ParameterPrivileges,
     ) {
         let (_, _, _, privileges, grant_options) =
-            Self::parameter_acl_visible(&self.parameter_acl_entries[slot], txid);
+            Self::parameter_acl_visible(&self.parameter_acl_entry(slot), txid);
         (privileges, grant_options)
     }
 
     pub(crate) fn parameter_acl_entries_visible(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &ParameterAclEntry)> {
-        self.parameter_acl_entries
-            .iter()
-            .enumerate()
-            .filter(move |(_, entry)| Self::parameter_acl_visible(entry, txid).0)
+    ) -> impl Iterator<Item = (usize, ParameterAclEntry)> + '_ {
+        ParameterAclIter {
+            catalog: &self.acl_catalog,
+            next_slot: 0,
+            mode: ParameterAclIterMode::Visible(txid),
+        }
     }
 
     pub(crate) fn parameter_acl_entry_count(&self) -> usize {
-        self.parameter_acl_entries.len()
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .parameters
+            .len()
     }
 
     pub(crate) fn checkpoint_parameter_acls(
         &self,
-    ) -> impl Iterator<Item = (usize, &ParameterAclEntry)> {
-        self.parameter_acl_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.live)
+    ) -> impl Iterator<Item = (usize, ParameterAclEntry)> + '_ {
+        ParameterAclIter {
+            catalog: &self.acl_catalog,
+            next_slot: 0,
+            mode: ParameterAclIterMode::Checkpoint,
+        }
     }
 
-    pub(crate) fn commit_parameter_acl(&mut self, slot: usize, txid: u32) {
-        let Some(pending) = self.parameter_acl_entries[slot].pending else {
+    pub(crate) fn commit_parameter_acl(&self, slot: usize, txid: u32) {
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let Some(pending) = catalog.parameters[slot].pending else {
             return;
         };
         if pending.txid != txid {
             return;
         }
-        let entry = &mut self.parameter_acl_entries[slot];
+        let entry = &mut catalog.parameters[slot];
         entry.grantee = pending.grantee;
         entry.grantor = pending.grantor;
         entry.privileges = pending.privileges;
@@ -21366,29 +21573,32 @@ impl Storage {
     }
 
     pub(crate) fn restore_parameter_acl_pending(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingParameterAcl>,
     ) {
-        self.parameter_acl_entries[slot].pending = prior;
-        if !self.parameter_acl_entries[slot].live && prior.is_none() {
-            self.parameter_acl_entries[slot].parameter = crate::sql::ast::ParameterName::EMPTY;
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        catalog.parameters[slot].pending = prior;
+        if !catalog.parameters[slot].live && prior.is_none() {
+            catalog.parameters[slot].parameter = crate::sql::ast::ParameterName::EMPTY;
         }
     }
 
     pub(crate) fn acl_identity(&self, slot: usize, txid: u32) -> (u16, u16) {
-        let (_, grantee, grantor, _, _) = Self::acl_visible(&self.acl_entries[slot], txid);
+        let entry = self.acl_entry(slot);
+        let (_, grantee, grantor, _, _) = Self::acl_visible(&entry, txid);
         (grantee, grantor)
     }
 
     pub(crate) fn change_acl_identity(
-        &mut self,
+        &self,
         slot: usize,
         grantee: u16,
         grantor: u16,
         txid: u32,
     ) -> Option<PendingAcl> {
-        let entry = &mut self.acl_entries[slot];
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let entry = &mut catalog.objects[slot];
         let prior = entry.pending;
         let (_, _, _, privileges, grant_options) = Self::acl_visible(entry, txid);
         if txid == 0 {
@@ -21405,7 +21615,7 @@ impl Storage {
             });
         }
         if txid == 0 {
-            self.deduplicate_acl(slot);
+            Self::deduplicate_acl(&mut catalog.objects, slot);
         }
         prior
     }
@@ -21449,7 +21659,10 @@ impl Storage {
         grantee: u16,
         txid: u32,
     ) -> (bool, PrivilegeSet, PrivilegeSet) {
-        self.default_acl_entries
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .defaults
             .iter()
             .find(|entry| {
                 entry.database == current_database()
@@ -21480,7 +21693,7 @@ impl Storage {
     }
 
     pub(crate) fn change_default_acl(
-        &mut self,
+        &self,
         key: DefaultAclKey,
         defined: bool,
         privileges: PrivilegeSet,
@@ -21493,8 +21706,9 @@ impl Storage {
             class,
             grantee,
         } = key;
-        let slot = self
-            .default_acl_entries
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let slot = catalog
+            .defaults
             .iter()
             .position(|entry| {
                 entry.database == current_database()
@@ -21504,13 +21718,15 @@ impl Storage {
                     && entry.grantee == grantee
             })
             .or_else(|| {
-                self.default_acl_entries
+                catalog
+                    .defaults
                     .iter()
                     .position(|entry| entry.owner == PUBLIC_ROLE && entry.pending.is_none())
             })
-            .unwrap_or(self.default_acl_entries.len());
-        if slot == self.default_acl_entries.len() {
-            self.default_acl_entries
+            .unwrap_or(catalog.defaults.len());
+        if slot == catalog.defaults.len() {
+            catalog
+                .defaults
                 .push(DefaultAclEntry {
                     database: current_database(),
                     owner,
@@ -21526,11 +21742,11 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many default privilege entries (limit {})",
-                        self.default_acl_entries.capacity()
+                        catalog.defaults.capacity()
                     )
                 })?;
-        } else if self.default_acl_entries[slot].owner == PUBLIC_ROLE {
-            let entry = &mut self.default_acl_entries[slot];
+        } else if catalog.defaults[slot].owner == PUBLIC_ROLE {
+            let entry = &mut catalog.defaults[slot];
             entry.database = current_database();
             entry.owner = owner;
             entry.schema = schema;
@@ -21540,7 +21756,7 @@ impl Storage {
             entry.privileges = PrivilegeSet::NONE;
             entry.grant_options = PrivilegeSet::NONE;
         }
-        let entry = &mut self.default_acl_entries[slot];
+        let entry = &mut catalog.defaults[slot];
         let prior = entry.pending;
         if txid == 0 {
             entry.defined = defined;
@@ -21561,23 +21777,34 @@ impl Storage {
         Ok((slot, prior))
     }
 
-    pub(crate) fn default_acl_entry(&self, slot: usize) -> &DefaultAclEntry {
-        &self.default_acl_entries[slot]
+    pub(crate) fn default_acl_entry(&self, slot: usize) -> DefaultAclEntry {
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .defaults[slot]
     }
 
     pub(crate) fn default_acl_entry_count(&self) -> usize {
-        self.default_acl_entries.len()
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .defaults
+            .len()
     }
 
-    pub(crate) fn default_acl_entries(&self) -> impl Iterator<Item = (usize, &DefaultAclEntry)> {
-        self.default_acl_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.database == current_database())
+    pub(crate) fn default_acl_entries(
+        &self,
+    ) -> impl Iterator<Item = (usize, DefaultAclEntry)> + '_ {
+        DefaultAclIter {
+            catalog: &self.acl_catalog,
+            database: Some(current_database()),
+            next_slot: 0,
+        }
     }
 
-    pub(crate) fn commit_default_acl(&mut self, slot: usize, txid: u32) {
-        let entry = &mut self.default_acl_entries[slot];
+    pub(crate) fn commit_default_acl(&self, slot: usize, txid: u32) {
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let entry = &mut catalog.defaults[slot];
         if let Some(pending) = entry.pending
             && pending.txid == txid
         {
@@ -21592,29 +21819,39 @@ impl Storage {
     }
 
     pub(crate) fn restore_default_acl_pending(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingDefaultAcl>,
     ) {
-        let entry = &mut self.default_acl_entries[slot];
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let entry = &mut catalog.defaults[slot];
         entry.pending = prior;
         if prior.is_none() && !entry.defined {
             entry.owner = PUBLIC_ROLE;
         }
     }
 
-    pub(crate) fn acl_entry(&self, slot: usize) -> &AclEntry {
-        &self.acl_entries[slot]
+    pub(crate) fn acl_entry(&self, slot: usize) -> AclEntry {
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .objects[slot]
     }
 
     pub(crate) fn acl_entry_count(&self) -> usize {
-        self.acl_entries.len()
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .objects
+            .len()
     }
 
-    pub(crate) fn acl_entries(&self) -> impl Iterator<Item = (usize, &AclEntry)> {
-        self.acl_entries.iter().enumerate().filter(|(_, entry)| {
-            entry.object.slot != u16::MAX && self.access_object_in_current_database(entry.object)
-        })
+    pub(crate) fn acl_entries(&self) -> impl Iterator<Item = (usize, AclEntry)> + '_ {
+        ObjectAclIter {
+            storage: self,
+            next_slot: 0,
+            checkpoint: false,
+        }
     }
 
     pub(crate) fn dependent_acl_slots(
@@ -21625,8 +21862,9 @@ impl Storage {
         txid: u32,
         output: &mut [usize],
     ) -> usize {
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let mut count = 0usize;
-        for (slot, entry) in self.acl_entries.iter().enumerate() {
+        for (slot, entry) in catalog.objects.iter().enumerate() {
             let (visible, _, entry_grantor, entry_privileges, _) = Self::acl_visible(entry, txid);
             if visible
                 && entry.object == object
@@ -21663,7 +21901,7 @@ impl Storage {
     }
 
     pub(crate) fn change_column_acl(
-        &mut self,
+        &self,
         target: ColumnPrivilegeTarget,
         grantee: u16,
         grantor: u16,
@@ -21671,8 +21909,9 @@ impl Storage {
         grant_options: PrivilegeSet,
         txid: u32,
     ) -> Result<(usize, Option<PendingAcl>), SqlError> {
-        let slot = self
-            .column_acl_entries
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let slot = catalog
+            .columns
             .iter()
             .position(|entry| {
                 let (_, visible_grantee, visible_grantor, _, _) =
@@ -21683,13 +21922,14 @@ impl Storage {
                     && (entry.live || entry.pending.is_some())
             })
             .or_else(|| {
-                self.column_acl_entries.iter().position(|entry| {
+                catalog.columns.iter().position(|entry| {
                     entry.target.relation.slot == u16::MAX && !entry.live && entry.pending.is_none()
                 })
             })
-            .unwrap_or(self.column_acl_entries.len());
-        if slot == self.column_acl_entries.len() {
-            self.column_acl_entries
+            .unwrap_or(catalog.columns.len());
+        if slot == catalog.columns.len() {
+            catalog
+                .columns
                 .push(ColumnAclEntry {
                     target,
                     grantee,
@@ -21703,16 +21943,16 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many column privilege entries (limit {})",
-                        self.column_acl_entries.capacity()
+                        catalog.columns.capacity()
                     )
                 })?;
-        } else if self.column_acl_entries[slot].target.relation.slot == u16::MAX {
-            let entry = &mut self.column_acl_entries[slot];
+        } else if catalog.columns[slot].target.relation.slot == u16::MAX {
+            let entry = &mut catalog.columns[slot];
             entry.target = target;
             entry.grantee = grantee;
             entry.grantor = grantor;
         }
-        let entry = &mut self.column_acl_entries[slot];
+        let entry = &mut catalog.columns[slot];
         let prior = entry.pending;
         if txid == 0 {
             entry.grantee = grantee;
@@ -21740,7 +21980,9 @@ impl Storage {
         grantor: u16,
         txid: u32,
     ) -> (PrivilegeSet, PrivilegeSet) {
-        self.column_acl_entries
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        catalog
+            .columns
             .iter()
             .filter(|entry| {
                 let (_, visible_grantee, visible_grantor, _, _) =
@@ -21764,13 +22006,13 @@ impl Storage {
             )
     }
 
-    fn column_acl_to(
-        &self,
+    fn column_acl_to_entries(
+        entries: &[ColumnAclEntry],
         target: ColumnPrivilegeTarget,
         grantee: u16,
         txid: u32,
     ) -> (PrivilegeSet, PrivilegeSet) {
-        self.column_acl_entries
+        entries
             .iter()
             .filter(|entry| {
                 let (_, visible_grantee, _, _, _) = Self::column_acl_visible(entry, txid);
@@ -21793,18 +22035,20 @@ impl Storage {
             )
     }
 
-    pub(crate) fn column_acl_entries(&self) -> impl Iterator<Item = (usize, &ColumnAclEntry)> {
-        self.column_acl_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                entry.target.relation.slot != u16::MAX
-                    && self.access_object_in_current_database(entry.target.relation)
-            })
+    pub(crate) fn column_acl_entries(&self) -> impl Iterator<Item = (usize, ColumnAclEntry)> + '_ {
+        ColumnAclIter {
+            storage: self,
+            next_slot: 0,
+            checkpoint: false,
+        }
     }
 
     pub(crate) fn column_acl_entry_count(&self) -> usize {
-        self.column_acl_entries.len()
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .columns
+            .len()
     }
 
     /// Enumerate the durable column-ACL targets attached to one relation.
@@ -21817,8 +22061,9 @@ impl Storage {
         txid: u32,
         output: &mut [ColumnPrivilegeTarget],
     ) -> usize {
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let mut count = 0usize;
-        for entry in self.column_acl_entries.iter() {
+        for entry in catalog.columns.iter() {
             let (visible, _, _, _, _) = Self::column_acl_visible(entry, txid);
             if !visible
                 || entry.target.relation != relation
@@ -21843,12 +22088,17 @@ impl Storage {
         privilege: PrivilegeSet,
         txid: u32,
     ) -> bool {
-        self.column_acl_entries.iter().any(|entry| {
-            let (visible, _, _, _, _) = Self::column_acl_visible(entry, txid);
-            visible
+        for slot in 0..self.column_acl_entry_count() {
+            let entry = self.column_acl_entry(slot);
+            let (visible, _, _, _, _) = Self::column_acl_visible(&entry, txid);
+            if visible
                 && entry.target.relation == relation
                 && self.has_column_privilege(entry.target, role, privilege, txid)
-        })
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub(crate) fn dependent_column_acl_slots(
@@ -21859,8 +22109,9 @@ impl Storage {
         txid: u32,
         output: &mut [usize],
     ) -> usize {
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
         let mut count = 0usize;
-        for (slot, entry) in self.column_acl_entries.iter().enumerate() {
+        for (slot, entry) in catalog.columns.iter().enumerate() {
             let (visible, _, entry_grantor, entry_privileges, _) =
                 Self::column_acl_visible(entry, txid);
             if visible
@@ -21875,19 +22126,22 @@ impl Storage {
         count
     }
 
-    pub(crate) fn column_acl_entry(&self, slot: usize) -> &ColumnAclEntry {
-        &self.column_acl_entries[slot]
+    pub(crate) fn column_acl_entry(&self, slot: usize) -> ColumnAclEntry {
+        self.acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned")
+            .columns[slot]
     }
 
     pub(crate) fn column_acl_identity(&self, slot: usize, txid: u32) -> (u16, u16) {
-        let (_, grantee, grantor, _, _) =
-            Self::column_acl_visible(&self.column_acl_entries[slot], txid);
+        let entry = self.column_acl_entry(slot);
+        let (_, grantee, grantor, _, _) = Self::column_acl_visible(&entry, txid);
         (grantee, grantor)
     }
 
     pub(crate) fn column_acl_state(&self, slot: usize, txid: u32) -> (PrivilegeSet, PrivilegeSet) {
-        let (visible, _, _, privileges, options) =
-            Self::column_acl_visible(&self.column_acl_entries[slot], txid);
+        let entry = self.column_acl_entry(slot);
+        let (visible, _, _, privileges, options) = Self::column_acl_visible(&entry, txid);
         if visible {
             (privileges, options)
         } else {
@@ -21896,13 +22150,14 @@ impl Storage {
     }
 
     pub(crate) fn change_column_acl_identity(
-        &mut self,
+        &self,
         slot: usize,
         grantee: u16,
         grantor: u16,
         txid: u32,
     ) -> Option<PendingAcl> {
-        let entry = &mut self.column_acl_entries[slot];
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let entry = &mut catalog.columns[slot];
         let prior = entry.pending;
         let (_, _, _, privileges, grant_options) = Self::column_acl_visible(entry, txid);
         if txid == 0 {
@@ -21921,14 +22176,15 @@ impl Storage {
         prior
     }
 
-    pub(crate) fn commit_column_acl(&mut self, slot: usize, txid: u32) {
-        let Some(pending) = self.column_acl_entries[slot]
+    pub(crate) fn commit_column_acl(&self, slot: usize, txid: u32) {
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let Some(pending) = catalog.columns[slot]
             .pending
             .filter(|pending| pending.txid == txid)
         else {
             return;
         };
-        let entry = &mut self.column_acl_entries[slot];
+        let entry = &mut catalog.columns[slot];
         entry.grantee = pending.grantee;
         entry.grantor = pending.grantor;
         entry.privileges = pending.privileges;
@@ -21940,10 +22196,11 @@ impl Storage {
         }
     }
 
-    pub(crate) fn restore_column_acl_pending(&mut self, slot: usize, prior: Option<PendingAcl>) {
-        self.column_acl_entries[slot].pending = prior;
-        if prior.is_none() && !self.column_acl_entries[slot].live {
-            self.column_acl_entries[slot].target.relation.slot = u16::MAX;
+    pub(crate) fn restore_column_acl_pending(&self, slot: usize, prior: Option<PendingAcl>) {
+        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        catalog.columns[slot].pending = prior;
+        if prior.is_none() && !catalog.columns[slot].live {
+            catalog.columns[slot].target.relation.slot = u16::MAX;
         }
     }
 
@@ -21966,10 +22223,14 @@ impl Storage {
         }
         let mut roles = self.role_graph_scratch();
         self.reachable_roles(role, txid, true, false, &mut roles);
-        let mut effective = self.column_acl_to(target, PUBLIC_ROLE, txid).0;
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let mut effective =
+            Self::column_acl_to_entries(&catalog.columns, target, PUBLIC_ROLE, txid).0;
         for (slot, inherited) in roles.iter().copied().enumerate() {
             if inherited {
-                effective = effective.union(self.column_acl_to(target, slot as u16, txid).0);
+                effective = effective.union(
+                    Self::column_acl_to_entries(&catalog.columns, target, slot as u16, txid).0,
+                );
             }
         }
         effective.contains(privilege)
@@ -21987,10 +22248,14 @@ impl Storage {
         }
         let mut roles = self.role_graph_scratch();
         self.reachable_roles(role, txid, true, false, &mut roles);
-        let mut effective = self.column_acl_to(target, PUBLIC_ROLE, txid).1;
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let mut effective =
+            Self::column_acl_to_entries(&catalog.columns, target, PUBLIC_ROLE, txid).1;
         for (slot, inherited) in roles.iter().copied().enumerate() {
             if inherited {
-                effective = effective.union(self.column_acl_to(target, slot as u16, txid).1);
+                effective = effective.union(
+                    Self::column_acl_to_entries(&catalog.columns, target, slot as u16, txid).1,
+                );
             }
         }
         effective.contains(privilege)
@@ -22062,7 +22327,8 @@ impl Storage {
         }
         let mut roles = self.role_graph_scratch();
         self.reachable_roles(role, txid, true, false, &mut roles);
-        let acl_defined = self.acl_entries.iter().any(|entry| {
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let acl_defined = catalog.objects.iter().any(|entry| {
             entry.object == object
                 && entry.object.slot != u16::MAX
                 && (entry.live || entry.pending.is_some())
@@ -22070,11 +22336,12 @@ impl Storage {
         let mut effective = if !acl_defined {
             default_public_object_privileges(object.class)
         } else {
-            self.acl_to(object, PUBLIC_ROLE, txid).0
+            Self::acl_to_entries(&catalog.objects, object, PUBLIC_ROLE, txid).0
         };
         for (slot, inherited) in roles.iter().copied().enumerate() {
             if inherited {
-                effective = effective.union(self.acl_to(object, slot as u16, txid).0);
+                effective = effective
+                    .union(Self::acl_to_entries(&catalog.objects, object, slot as u16, txid).0);
             }
         }
         effective.contains(privilege)
@@ -22394,10 +22661,12 @@ impl Storage {
         }
         let mut roles = self.role_graph_scratch();
         self.reachable_roles(role, txid, true, false, &mut roles);
-        let mut effective = self.acl_to(object, PUBLIC_ROLE, txid).1;
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let mut effective = Self::acl_to_entries(&catalog.objects, object, PUBLIC_ROLE, txid).1;
         for (slot, inherited) in roles.iter().copied().enumerate() {
             if inherited {
-                effective = effective.union(self.acl_to(object, slot as u16, txid).1);
+                effective = effective
+                    .union(Self::acl_to_entries(&catalog.objects, object, slot as u16, txid).1);
             }
         }
         effective.contains(privilege)
@@ -22604,7 +22873,8 @@ impl Storage {
     pub fn remove_role(&mut self, name: &str) {
         if let Some(slot) = self.find_role(name) {
             self.drop_comments_by_subid(CommentClass::Role, Self::role_oid(slot) as u32);
-            for entry in self.acl_entries.iter_mut() {
+            let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+            for entry in catalog.objects.iter_mut() {
                 if entry.grantee == slot as u16 || entry.grantor == slot as u16 {
                     entry.object.slot = u16::MAX;
                     entry.live = false;
@@ -22613,7 +22883,25 @@ impl Storage {
                     entry.pending = None;
                 }
             }
-            for entry in self.default_acl_entries.iter_mut() {
+            for entry in catalog.columns.iter_mut() {
+                if entry.grantee == slot as u16 || entry.grantor == slot as u16 {
+                    entry.target.relation.slot = u16::MAX;
+                    entry.live = false;
+                    entry.privileges = PrivilegeSet::NONE;
+                    entry.grant_options = PrivilegeSet::NONE;
+                    entry.pending = None;
+                }
+            }
+            for entry in catalog.parameters.iter_mut() {
+                if entry.grantee == slot as u16 || entry.grantor == slot as u16 {
+                    entry.parameter = crate::sql::ast::ParameterName::EMPTY;
+                    entry.live = false;
+                    entry.privileges = crate::sql::ast::ParameterPrivileges::NONE;
+                    entry.grant_options = crate::sql::ast::ParameterPrivileges::NONE;
+                    entry.pending = None;
+                }
+            }
+            for entry in catalog.defaults.iter_mut() {
                 if entry.owner == slot as u16 || entry.grantee == slot as u16 {
                     entry.owner = PUBLIC_ROLE;
                     entry.defined = false;
@@ -22622,6 +22910,7 @@ impl Storage {
                     entry.pending = None;
                 }
             }
+            drop(catalog);
             self.roles[slot] = RoleDef {
                 name: SqlName::EMPTY,
                 attributes: RoleAttributes::ORDINARY,
@@ -47033,10 +47322,14 @@ mod tests {
                 .capacity(),
             config.max_connections as usize + config.max_prepared_transactions
         );
-        assert_eq!(storage.acl_entries.capacity(), 22);
-        assert_eq!(storage.column_acl_entries.capacity(), 23);
-        assert_eq!(storage.default_acl_entries.capacity(), 24);
-        assert_eq!(storage.parameter_acl_entries.capacity(), 25);
+        let catalog = storage
+            .acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned");
+        assert_eq!(catalog.objects.capacity(), 22);
+        assert_eq!(catalog.columns.capacity(), 23);
+        assert_eq!(catalog.defaults.capacity(), 24);
+        assert_eq!(catalog.parameters.capacity(), 25);
         assert_eq!(storage.indexes.len(), 6);
         assert_eq!(storage.extended_statistics.len(), 31);
         let brin_maintenance = storage.brin_maintenance();
@@ -47459,6 +47752,133 @@ mod tests {
         assert_eq!(
             storage.role_object_dependency(1, 0),
             Some(RoleObjectDependency::OwnedObject)
+        );
+    }
+
+    #[test]
+    fn acl_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<AclCatalog>>();
+        assert_send_sync::<ObjectAclIter<'_>>();
+        assert_send_sync::<ColumnAclIter<'_>>();
+        assert_send_sync::<DefaultAclIter<'_>>();
+        assert_send_sync::<ParameterAclIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let parameters = ["acl.a", "acl.b", "acl.c", "acl.d"];
+        let mut config = test_config();
+        config.max_acl_entries = 3 + WORKERS;
+        config.max_column_acl_entries = WORKERS;
+        config.max_default_acl_entries = WORKERS;
+        config.max_parameter_acl_entries = WORKERS;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let txid = worker as u32 + 1;
+                    let grantee = worker as u16 + 1;
+                    let object = AccessObject {
+                        class: AccessClass::Database,
+                        slot: 0,
+                    };
+                    let (object_slot, _) = storage
+                        .change_acl(
+                            object,
+                            grantee,
+                            BOOTSTRAP_ROLE,
+                            PrivilegeSet::USAGE,
+                            PrivilegeSet::NONE,
+                            txid,
+                        )
+                        .unwrap();
+                    storage.commit_acl(object_slot, txid);
+
+                    let target = ColumnPrivilegeTarget::new(
+                        AccessObject {
+                            class: AccessClass::Table,
+                            slot: worker as u16,
+                        },
+                        1,
+                    )
+                    .unwrap();
+                    let (column_slot, _) = storage
+                        .change_column_acl(
+                            target,
+                            grantee,
+                            BOOTSTRAP_ROLE,
+                            PrivilegeSet::SELECT,
+                            PrivilegeSet::NONE,
+                            txid,
+                        )
+                        .unwrap();
+                    storage.commit_column_acl(column_slot, txid);
+
+                    let (default_slot, _) = storage
+                        .change_default_acl(
+                            DefaultAclKey {
+                                owner: grantee,
+                                schema: DEFAULT_ACL_ALL_SCHEMAS,
+                                class: DefaultPrivilegeClass::Table,
+                                grantee,
+                            },
+                            true,
+                            PrivilegeSet::SELECT,
+                            PrivilegeSet::NONE,
+                            txid,
+                        )
+                        .unwrap();
+                    storage.commit_default_acl(default_slot, txid);
+
+                    let parameter = crate::sql::ast::ParameterName::parse(parameters[worker])
+                        .expect("parameter name fits");
+                    let (parameter_slot, _) = storage
+                        .change_parameter_acl(
+                            parameter,
+                            grantee,
+                            BOOTSTRAP_ROLE,
+                            crate::sql::ast::ParameterPrivileges::SET,
+                            crate::sql::ast::ParameterPrivileges::NONE,
+                            txid,
+                        )
+                        .unwrap();
+                    storage.commit_parameter_acl(parameter_slot, txid);
+                });
+            }
+        });
+
+        let catalog = storage
+            .acl_catalog
+            .lock()
+            .expect("ACL catalog lock poisoned");
+        assert_eq!(catalog.objects.capacity(), 3 + WORKERS);
+        assert_eq!(catalog.columns.capacity(), WORKERS);
+        assert_eq!(catalog.defaults.capacity(), WORKERS);
+        assert_eq!(catalog.parameters.capacity(), WORKERS);
+        drop(catalog);
+
+        let mut seen = 0;
+        for (slot, entry) in storage.checkpoint_acls() {
+            assert_eq!(storage.acl_entry(slot).object, entry.object);
+            seen += usize::from(entry.grantee != PUBLIC_ROLE);
+        }
+        assert_eq!(seen, WORKERS);
+        assert_eq!(storage.checkpoint_column_acls().count(), WORKERS);
+        assert_eq!(storage.checkpoint_default_acls().count(), WORKERS);
+        assert_eq!(storage.checkpoint_parameter_acls().count(), WORKERS);
+        assert!(
+            storage
+                .change_parameter_acl(
+                    crate::sql::ast::ParameterName::parse("acl.e").unwrap(),
+                    5,
+                    BOOTSTRAP_ROLE,
+                    crate::sql::ast::ParameterPrivileges::SET,
+                    crate::sql::ast::ParameterPrivileges::NONE,
+                    0,
+                )
+                .is_err()
         );
     }
 

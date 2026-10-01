@@ -154,11 +154,13 @@ active production roadmap is [PLAN.md](../PLAN.md).
   startup-bounded mutex; catalog and checkpoint iterators copy each entry
   before resolving its referenced object. Object, column, default, and
   parameter ACL entries share another startup-bounded mutex; readers copy
-  complete entries before nested role or object resolution. Engine mutation
-  remains single-owner and serialized while the other catalog definition
-  containers, cache, and row sharing are prepared. Authorization graph
-  traversal uses one exactly charged bitmap per query workspace, selected by
-  the typed worker-local lease identity. Foreign statement transaction
+  complete entries before nested role or object resolution. Role definitions,
+  memberships, and per-role settings share one startup-bounded mutex; readers
+  copy complete entries before nested authorization or catalog resolution.
+  Engine mutation remains single-owner and serialized while the other catalog
+  definition containers, cache, and row sharing are prepared. Authorization
+  graph traversal uses one exactly charged bitmap per query workspace,
+  selected by the typed worker-local lease identity. Foreign statement transaction
   identity, isolation state, and fixed savepoint rosters use the same
   per-workspace boundary and exact startup charging. Foreign transports use an
   exactly charged `max_foreign_sessions` pool keyed by local transaction and

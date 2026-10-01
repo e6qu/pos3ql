@@ -441,9 +441,19 @@ replay, checkpoints, privilege checks, and PostgreSQL catalog reads observe
 complete entry images. Iterators copy one fixed entry and release the mutex
 before nested role or object resolution. Four-worker publication across all
 four ACL families, nested-reader progress, exact retained capacities, loud
-exhaustion, and `Send + Sync` have direct coverage. The remaining catalog
-definition containers and row mutation paths still require synchronization
-before fixed workers can overlap execution.
+exhaustion, and `Send + Sync` have direct coverage.
+
+Role definitions, memberships, and per-role settings now share one
+startup-bounded mutex. Role DDL, membership and setting publication, rollback,
+replay, checkpoint and catalog reads, authorization traversal, database
+cleanup, and recovery role removal observe complete images across all three
+families. Iterators copy one fixed entry and release the mutex before nested
+role, ACL, or catalog resolution. Four-worker publication, nested-reader
+progress, exact retained capacities, loud exhaustion, and `Send + Sync` have
+direct coverage. Recovery role removal also clears memberships and settings
+that reference the removed slot. The remaining catalog definition containers
+and row mutation paths still require synchronization before fixed workers can
+overlap execution.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

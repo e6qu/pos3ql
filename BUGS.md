@@ -729,6 +729,16 @@ preventing recursive lock stalls. Four-worker publication across every ACL
 family, nested-reader progress, exact retained capacities, loud exhaustion,
 and `Send + Sync` have direct coverage. The same audit fixed recovery role
 cleanup omitting column and parameter ACL entries.
+The role catalog audit found role definitions, memberships, and per-role
+settings in three unsynchronized fixed vectors. Overlapping role DDL,
+membership or setting changes, replay, checkpoint, catalog, and authorization
+work could lose updates or combine fields from different transitions. One
+startup-bounded mutex now owns all three families. Iterators copy one entry and
+release the lock before nested role, ACL, or catalog resolution. Four-worker
+publication, nested-reader progress, exact retained capacities, loud
+exhaustion, and `Send + Sync` have direct coverage. The same audit fixed
+recovery role removal retaining memberships and settings that referenced the
+reusable role slot.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

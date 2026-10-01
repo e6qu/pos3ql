@@ -6932,7 +6932,7 @@ pub fn alter_role_setting(
                     (setting.visible_to(txn.txid)
                         && setting.scope == scope
                         && name.is_none_or(|name| setting.name.as_str().eq_ignore_ascii_case(name)))
-                    .then_some((slot, *setting))
+                    .then_some((slot, setting))
                 });
                 let Some((_, setting)) = next else { break };
                 if let Err(error) = stage_role_setting(storage, wal, txn, scope, setting.name, None)
@@ -7252,7 +7252,7 @@ pub fn drop_role(
         // removal a normal transactional catalog transition so WAL/recovery
         // and savepoint rollback cannot retain a dangling role slot.
         for membership_slot in 0..storage.role_membership_count() {
-            let membership = *storage.role_membership(membership_slot);
+            let membership = storage.role_membership(membership_slot);
             if !membership.visible_to(txn.txid)
                 || (membership.role as usize != slot && membership.member as usize != slot)
             {
@@ -7298,7 +7298,7 @@ pub fn drop_role(
                         .scope
                         .role()
                         .is_some_and(|role| role as usize == slot))
-                .then_some(*setting)
+                .then_some(setting)
             });
             let Some(setting) = setting else { break };
             if let Err(error) =
@@ -49532,7 +49532,7 @@ pub fn alter_database(
                         && setting.scope
                             == crate::storage::RoleSettingScope::AllRolesInDatabase(database)
                         && name.is_none_or(|name| setting.name.as_str().eq_ignore_ascii_case(name)))
-                    .then_some(*setting)
+                    .then_some(setting)
                 });
                 let Some(setting) = setting else { break };
                 if let Err(error) =

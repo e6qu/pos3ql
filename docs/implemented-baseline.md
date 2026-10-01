@@ -145,8 +145,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   Durable index expression and partial-index predicate evaluation retain one
   arena mutex through each nested parse and evaluation chain, including
   spilled-row walks, and rewind the startup-sized arena at the outer boundary.
-  Engine mutation remains single-owner and serialized while catalog, cache, and
-  row sharing is prepared.
+  Every catalog family reserves and restores its monotonic `created_at`
+  identity through one atomic sequence; bounded trigger and index generations
+  use the same compare-and-exchange boundary. Engine mutation remains
+  single-owner and serialized while catalog definition containers, cache, and
+  row sharing are prepared.
   Authorization
   graph traversal uses one exactly charged bitmap per query workspace, selected
   by the typed worker-local lease identity. Foreign statement transaction

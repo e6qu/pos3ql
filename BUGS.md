@@ -670,6 +670,13 @@ or cleanup. Each fixed query workspace now owns a mutex-protected foreign
 context, while one startup-bounded mutex owns the temporary transaction roster.
 Allocation-free savepoint guards, four-worker mutation, `Send + Sync`, and exact
 retained capacities have direct coverage.
+The catalog-graph scratch audit found role reachability bitmaps and domain base
+rebinding markers behind `RefCell`. A duplicated workspace lease or overlapping
+catalog traversal could panic on a mutable borrow, and the containers prevented
+the scratch boundary from being `Sync`. Each fixed query workspace now owns a
+mutex-protected role bitmap, while domain rebinding uses one mutex-protected
+fixed marker vector. Four-worker mutation, `Send + Sync`, and exact retained
+capacities have direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

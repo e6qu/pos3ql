@@ -149,9 +149,12 @@ active production roadmap is [PLAN.md](../PLAN.md).
   identity through one atomic sequence; bounded trigger and index generations
   use the same compare-and-exchange boundary. Large object definitions and
   their automatic OID frontier share one startup-bounded mutex; readers copy
-  complete entries before nested ownership or ACL lookup. Engine mutation
-  remains single-owner and serialized while the other catalog definition
-  containers, cache, and row sharing are prepared. Authorization graph
+  complete entries before nested ownership or ACL lookup. Object comments and
+  their transaction-private text and identity overlays also share one
+  startup-bounded mutex; catalog and checkpoint iterators copy each entry
+  before resolving its referenced object. Engine mutation remains single-owner
+  and serialized while the other catalog definition containers, cache, and row
+  sharing are prepared. Authorization graph
   traversal uses one exactly charged bitmap per query workspace, selected by
   the typed worker-local lease identity. Foreign statement transaction
   identity, isolation state, and fixed savepoint rosters use the same

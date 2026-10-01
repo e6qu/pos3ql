@@ -422,9 +422,18 @@ entry while holding the mutex and release it before nested ownership or ACL
 lookups. Large object catalog materialization uses the fixed configured roster
 so concurrent visibility changes cannot overrun a prior count. Four-worker
 allocation, nested-reader progress, exact retained
-capacity, and `Send + Sync` have direct coverage. Adjacent ACL and comment
-catalog mutation remains reactor-serialized with the other catalog families.
-Role dependency checks now include owned large objects before `DROP ROLE`.
+capacity, and `Send + Sync` have direct coverage. Role dependency checks now
+include owned large objects before `DROP ROLE`.
+
+Object comments and their transaction-private text and identity overlays now
+share one startup-bounded mutex. COMMENT writes, commit and rollback, catalog
+object rename and drop, replay, database cloning, checkpoint reads, and
+`pg_description` observe complete entry images. Iterators copy one fixed entry
+and release the mutex before resolving its referenced object, so nested comment
+lookups cannot recursively lock the catalog. Four-worker publication,
+nested-reader progress, exact configured capacity, and `Send + Sync` have
+direct coverage. ACL catalog mutation remains reactor-serialized with the
+other catalog definition containers.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

@@ -711,6 +711,14 @@ uses the fixed configured roster instead of a racy count-then-fill pass. Four-wo
 nested-reader progress, exact retained capacity, and `Send + Sync` have direct
 coverage. The same audit found and fixed role dependency checks omitting owned
 large objects, which could otherwise allow `DROP ROLE` to orphan their owner.
+The object-comment catalog audit found committed text, transaction-private text
+and identity overlays, and reusable slots in one unsynchronized fixed vector.
+Overlapping COMMENT, rename, drop, replay, clone, checkpoint, and catalog reads
+could lose a slot update or observe parts of different entry images. One
+startup-bounded mutex now owns the complete catalog. Iterators copy one entry
+and release the lock before resolving referenced objects, preventing recursive
+lock stalls. Four-worker publication, nested-reader progress, exact configured
+capacity, and `Send + Sync` have direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

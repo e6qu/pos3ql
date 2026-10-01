@@ -378,13 +378,15 @@ an interior borrow or lose an owner. Concurrent updates, exact capacities, and
 The remaining shared catalog and row mutation paths still require
 synchronization before fixed workers can overlap execution.
 
-Authorization graph traversal now has one startup-sized bitmap per query
-workspace. Every role membership, object privilege, grant-option, and column
-privilege check selects scratch through the typed worker-local lease identity,
-so overlapping workers cannot collide on one mutable borrow or overwrite each
-other's traversal. `query_workspace_slots` charges the bitmap and its container
-exactly in the fixed memory plan. Shared role and ACL catalog mutation remains
-serialized with the other catalog write paths.
+Authorization graph traversal now has one mutex-protected, startup-sized bitmap
+per query workspace. Every role membership, object privilege, grant-option,
+and column privilege check selects scratch through the typed worker-local lease
+identity, while the mutex makes accidental overlapping ownership safe and
+compiler-visible. Domain base rebinding uses a fixed mutex-protected marker
+vector as well. `query_workspace_slots` charges each role bitmap and mutex
+container exactly in the fixed memory plan. Concurrent mutation, exact
+capacities, and `Send + Sync` have direct coverage. Shared role, domain, and ACL
+catalog mutation remains serialized with the other catalog write paths.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

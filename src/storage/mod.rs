@@ -12007,7 +12007,7 @@ pub struct Storage {
     enum_member_pending_base: usize,
     enum_member_replay_image: usize,
     composites: FixedVec<CompositeDef>,
-    domain_graph_scratch: std::cell::RefCell<FixedVec<u8>>,
+    domain_graph_scratch: std::sync::Mutex<FixedVec<u8>>,
     indexes: FixedVec<IndexDef>,
     brin_maintenance: std::sync::Mutex<BrinMaintenance>,
     brin_unsummarized_ranges_per_index: usize,
@@ -12029,8 +12029,8 @@ pub struct Storage {
     roles: FixedVec<RoleDef>,
     role_memberships: FixedVec<RoleMembership>,
     role_settings: FixedVec<RoleSetting>,
-    /// One startup-sized authorization-graph bitmap per leased query workspace.
-    role_graph_scratch: FixedVec<std::cell::RefCell<FixedVec<bool>>>,
+    /// One mutex-protected authorization bitmap per fixed query workspace.
+    role_graph_scratch: FixedVec<std::sync::Mutex<FixedVec<bool>>>,
     system_settings: FixedVec<SystemSetting>,
     prepared_transactions: FixedVec<PreparedTransactionCatalogEntry>,
     acl_entries: FixedVec<AclEntry>,
@@ -15570,7 +15570,7 @@ impl Storage {
             + config.max_role_memberships * size_of::<RoleMembership>()
             + config.max_role_settings * size_of::<RoleSetting>()
             + config.query_workspace_slots
-                * (size_of::<std::cell::RefCell<FixedVec<bool>>>()
+                * (size_of::<std::sync::Mutex<FixedVec<bool>>>()
                     + config.max_roles * size_of::<bool>())
             + MAX_SYSTEM_SETTINGS * size_of::<SystemSetting>()
             + config.max_prepared_transactions * size_of::<PreparedTransactionCatalogEntry>()
@@ -16297,7 +16297,7 @@ impl Storage {
                 scratch.push(false).expect("sized to max_roles");
             }
             role_graph_scratch
-                .push(std::cell::RefCell::new(scratch))
+                .push(std::sync::Mutex::new(scratch))
                 .expect("sized to query_workspace_slots");
         }
         let mut foreign_statement_contexts = FixedVec::new(
@@ -16609,7 +16609,7 @@ impl Storage {
             enum_member_pending_base,
             enum_member_replay_image,
             composites,
-            domain_graph_scratch: std::cell::RefCell::new(domain_graph_scratch),
+            domain_graph_scratch: std::sync::Mutex::new(domain_graph_scratch),
             indexes,
             brin_maintenance: std::sync::Mutex::new(BrinMaintenance {
                 states: brin_maintenance,
@@ -21572,9 +21572,11 @@ impl Storage {
         }
     }
 
-    fn role_graph_scratch(&self) -> core::cell::RefMut<'_, FixedVec<bool>> {
+    fn role_graph_scratch(&self) -> std::sync::MutexGuard<'_, FixedVec<bool>> {
         let workspace = crate::sql::execution_query_workspace().index();
-        self.role_graph_scratch[workspace].borrow_mut()
+        self.role_graph_scratch[workspace]
+            .lock()
+            .expect("role graph scratch lock poisoned")
     }
 
     pub(crate) fn has_column_privilege(
@@ -33976,7 +33978,10 @@ impl Storage {
         let domains = &mut self.domains;
         let enums = &self.enums;
         let composites = &self.composites;
-        let mut state = self.domain_graph_scratch.borrow_mut();
+        let mut state = self
+            .domain_graph_scratch
+            .lock()
+            .expect("domain graph scratch lock poisoned");
         let mut remaining = 0usize;
         for (slot, marker) in state.iter_mut().enumerate() {
             let domain = domains[slot];
@@ -46573,7 +46578,14 @@ mod tests {
         assert_eq!(storage.sequences.len(), 18);
         assert_eq!(storage.sequence_values().capacity(), 18);
         assert_eq!(storage.domains.len(), 26);
-        assert_eq!(storage.domain_graph_scratch.borrow().len(), 26);
+        assert_eq!(
+            storage
+                .domain_graph_scratch
+                .lock()
+                .expect("domain graph scratch lock poisoned")
+                .len(),
+            26
+        );
         assert_eq!(storage.enums.len(), 28);
         assert_eq!(storage.enum_members_per_image, 96);
         assert_eq!(
@@ -46589,14 +46601,21 @@ mod tests {
         assert_eq!(storage.role_memberships.len(), 20);
         assert_eq!(storage.role_settings.len(), 21);
         assert_eq!(storage.role_graph_scratch.len(), 2);
+        assert!(storage.role_graph_scratch.iter().all(|scratch| {
+            scratch
+                .lock()
+                .expect("role graph scratch lock poisoned")
+                .len()
+                == 19
+        }));
+        storage.role_graph_scratch[0]
+            .lock()
+            .expect("role graph scratch lock poisoned")[3] = true;
         assert!(
-            storage
-                .role_graph_scratch
-                .iter()
-                .all(|scratch| scratch.borrow().len() == 19)
+            !storage.role_graph_scratch[1]
+                .lock()
+                .expect("role graph scratch lock poisoned")[3]
         );
-        storage.role_graph_scratch[0].borrow_mut()[3] = true;
-        assert!(!storage.role_graph_scratch[1].borrow()[3]);
         assert_eq!(storage.foreign_statement_contexts.len(), 2);
         assert!(storage.foreign_statement_contexts.iter().all(|context| {
             context
@@ -46937,6 +46956,46 @@ mod tests {
                 .transactions
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn catalog_graph_scratch_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<FixedVec<bool>>>();
+        assert_send_sync::<std::sync::Mutex<FixedVec<u8>>>();
+
+        let mut config = test_config();
+        config.max_domains = 4;
+        config.max_roles = 4;
+        config.query_workspace_slots = 2;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let roles = &storage.role_graph_scratch[0];
+        let domains = &storage.domain_graph_scratch;
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        roles.lock().expect("role graph scratch lock poisoned")[worker] = true;
+                        let mut domains =
+                            domains.lock().expect("domain graph scratch lock poisoned");
+                        domains[worker] = domains[worker].wrapping_add(1);
+                    }
+                });
+            }
+        });
+        let roles = storage.role_graph_scratch[0]
+            .lock()
+            .expect("role graph scratch lock poisoned");
+        assert_eq!(roles.capacity(), config.max_roles);
+        assert!(roles.iter().all(|visited| *visited));
+        drop(roles);
+        let domains = storage
+            .domain_graph_scratch
+            .lock()
+            .expect("domain graph scratch lock poisoned");
+        assert_eq!(domains.capacity(), config.max_domains);
+        assert!(domains.iter().all(|visits| *visits == 232));
     }
 
     #[test]

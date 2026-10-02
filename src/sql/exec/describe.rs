@@ -38,22 +38,48 @@ pub fn describe_items<'q>(
     table_alias: Option<&str>,
     storage: Option<&'q crate::storage::Storage>,
     txid: u32,
+    arena: &'q crate::mem::arena::Arena,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
-    describe_items_with_output_aliases(items, def, table_alias, &[], storage, txid, out)
+    describe_items_with_output_aliases(
+        items,
+        DescribeContext {
+            def,
+            table_alias,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+        out,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct DescribeContext<'q, 'scope> {
+    def: Option<&'q TableDef>,
+    table_alias: Option<&'scope str>,
+    output_aliases: &'scope [&'scope str],
+    storage: Option<&'q crate::storage::Storage>,
+    txid: u32,
+    arena: &'q crate::mem::arena::Arena,
 }
 
 /// Single-target descriptor with names that exist only in a DML `RETURNING`
 /// output scope (`old`/`new`, or aliases supplied by `WITH`).
-pub(crate) fn describe_items_with_output_aliases<'q>(
+fn describe_items_with_output_aliases<'q>(
     items: &[SelectItem<'q>],
-    def: Option<&'q TableDef>,
-    table_alias: Option<&str>,
-    output_aliases: &[&str],
-    storage: Option<&'q crate::storage::Storage>,
-    txid: u32,
+    context: DescribeContext<'q, '_>,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
+    let DescribeContext {
+        def,
+        table_alias,
+        output_aliases,
+        storage,
+        txid,
+        ..
+    } = context;
     struct DescribeCatalog<'a> {
         storage: &'a crate::storage::Storage,
         txid: u32,
@@ -190,15 +216,7 @@ pub(crate) fn describe_items_with_output_aliases<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                describe_record_star(
-                    base,
-                    def,
-                    table_alias,
-                    output_aliases,
-                    storage,
-                    txid,
-                    &mut push,
-                )?;
+                describe_record_star(base, context, &mut push)?;
             }
             SelectItem::Expr { expression, alias } => {
                 let catalog_resolver;
@@ -295,16 +313,20 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     target_alias: Option<&'q str>,
     storage: Option<&'storage crate::storage::Storage>,
     txid: u32,
+    arena: &'q crate::mem::arena::Arena,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
     let output_aliases = [returning.old_name(), returning.new_name()];
     describe_items_with_output_aliases(
         returning.items,
-        definition,
-        target_alias,
-        &output_aliases,
-        storage,
-        txid,
+        DescribeContext {
+            def: definition,
+            table_alias: target_alias,
+            output_aliases: &output_aliases,
+            storage,
+            txid,
+            arena,
+        },
         out,
     )
 }
@@ -622,13 +644,17 @@ impl ColTypeResolver for CatalogCols<'_> {
 /// names and types at the caller's `'q` lifetime (single-table describe path).
 fn describe_record_star<'q>(
     base: &Expr<'q>,
-    def: Option<&'q TableDef>,
-    table_alias: Option<&str>,
-    output_aliases: &[&str],
-    storage: Option<&'q crate::storage::Storage>,
-    txid: u32,
+    context: DescribeContext<'q, '_>,
     push: &mut impl FnMut(ColDesc<'q>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    let DescribeContext {
+        def,
+        table_alias,
+        output_aliases,
+        storage,
+        txid,
+        arena,
+    } = context;
     match base {
         Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => {
             let catalog_resolver;
@@ -721,11 +747,7 @@ fn describe_record_star<'q>(
                         "populate_record argument count"
                     )
                 })?,
-                def,
-                table_alias,
-                output_aliases,
-                storage,
-                txid,
+                context,
                 push,
             )
         }
@@ -815,13 +837,16 @@ fn describe_record_star<'q>(
                 _ => None,
             };
             if let Some(slot) = slot {
-                for field in storage
-                    .expect("checked")
-                    .composite(slot as usize)
-                    .active_fields_for(txid)
-                {
+                let composite = storage.expect("checked").composite(slot as usize);
+                for field in composite.active_fields_for(txid) {
+                    let name = arena.alloc_str(field.name.as_str()).map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "record description exceeds the statement arena"
+                        )
+                    })?;
                     push(
-                        ColDesc::of_type(field.name.as_str(), field.ctype)
+                        ColDesc::of_type(name, field.ctype)
                             .with_type_mod(field.type_mod)
                             .with_collation(field.collation),
                     )?;

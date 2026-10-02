@@ -10259,6 +10259,7 @@ impl Engine {
             target_alias,
             Some(&self.storage),
             txn.txid,
+            arena,
             columns,
         )
     }
@@ -10602,6 +10603,7 @@ impl Engine {
                         },
                         Some(&self.storage),
                         txn.txid,
+                        arena,
                         &mut local,
                     )?;
                     for index in 0..count {

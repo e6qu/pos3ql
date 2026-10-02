@@ -6175,7 +6175,7 @@ impl Checkpointer {
                     if n_members > storage.enum_label_capacity() {
                         return Err(CheckpointSetupError::Corrupt("too many enum labels"));
                     }
-                    let members = storage.enum_replay_members(n_members).map_err(|error| {
+                    let mut members = storage.enum_replay_members(n_members).map_err(|error| {
                         CheckpointSetupError::ObjectStore(error.message.as_str().to_string())
                     })?;
                     for member in members.iter_mut() {
@@ -6186,6 +6186,7 @@ impl Checkpointer {
                             sort: f64::from_bits(sort_bits),
                         };
                     }
+                    drop(members);
                     storage
                         .finish_enum_replay(sql_name(&schema)?, sql_name(&name)?, n_members)
                         .map_err(|e| {

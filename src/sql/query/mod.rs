@@ -6298,7 +6298,8 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         Err(e) => return sql_fail(e),
     };
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n = match describe_catalog_items(statement.items, None, storage, txid, &mut columns) {
+    let n = match describe_catalog_items(statement.items, None, storage, txid, arena, &mut columns)
+    {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
@@ -6494,6 +6495,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
                         None,
                         Some(storage),
                         txid,
+                        arena,
                         &mut described,
                     ) {
                         Ok(width) => width,
@@ -7861,9 +7863,10 @@ pub fn describe_catalog_items<'q>(
     definition: Option<&'q TableDef>,
     storage: &'q Storage,
     txid: u32,
+    arena: &'q Arena,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
-    describe_catalog_items_as(items, definition, None, storage, txid, out)
+    describe_catalog_items_as(items, definition, None, storage, txid, arena, out)
 }
 
 pub fn describe_catalog_items_as<'q>(
@@ -7872,6 +7875,7 @@ pub fn describe_catalog_items_as<'q>(
     alias: Option<&str>,
     storage: &'q Storage,
     txid: u32,
+    arena: &'q Arena,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
     // User-defined casts carry identity and, for named composites, field
@@ -7906,6 +7910,7 @@ pub fn describe_catalog_items_as<'q>(
             alias,
             Some(storage),
             txid,
+            arena,
             &mut out[count..],
         )?;
         count += width;
@@ -7948,7 +7953,7 @@ pub fn describe_select_items<'q>(
 ) -> Result<usize, SqlError> {
     let count = match scope {
         Some(scope) => describe_scope_items(items, scope, None, storage, txid, arena, out)?,
-        None => describe_catalog_items(items, None, storage, txid, out)?,
+        None => describe_catalog_items(items, None, storage, txid, arena, out)?,
     };
     let mut column = 0;
     for item in items {

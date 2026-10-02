@@ -6990,6 +6990,66 @@ struct OperatorClassIter<'a> {
     next_slot: usize,
 }
 
+#[derive(Debug)]
+struct TypeCatalog {
+    domains: FixedVec<DomainDef>,
+    enums: FixedVec<EnumDef>,
+    enum_members: FixedVec<EnumMember>,
+    pending_enum_members: FixedVec<PendingEnumMemberSlot>,
+    composites: FixedVec<CompositeDef>,
+}
+
+struct DomainIter<'a> {
+    catalog: &'a std::sync::Mutex<TypeCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for DomainIter<'_> {
+    type Item = (usize, DomainDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("type catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.domains.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
+struct EnumIter<'a> {
+    catalog: &'a std::sync::Mutex<TypeCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for EnumIter<'_> {
+    type Item = (usize, EnumDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("type catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.enums.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
+struct CompositeIter<'a> {
+    catalog: &'a std::sync::Mutex<TypeCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for CompositeIter<'_> {
+    type Item = (usize, CompositeDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("type catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.composites.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
 impl Iterator for OperatorClassIter<'_> {
     type Item = (usize, OperatorClassDef);
 
@@ -8771,29 +8831,84 @@ impl PendingEnumMemberSlot {
 /// startup-sized catalog slab, so copying this view never copies label data.
 #[derive(Debug, Clone, Copy)]
 pub struct EnumDefinition<'a> {
+    catalog: &'a std::sync::Mutex<TypeCatalog>,
+    member_image: usize,
+    member_count: usize,
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
     pub ownership: Ownership,
-    members: &'a [EnumMember],
     pub ddl_state: CatalogDdlState,
 }
 
 impl EnumDefinition<'_> {
-    pub fn members(&self) -> &[EnumMember] {
-        self.members
+    pub fn members(&self) -> EnumMemberIter<'_> {
+        EnumMemberIter {
+            catalog: self.catalog,
+            next_slot: self.member_image,
+            end_slot: self.member_image + self.member_count,
+        }
     }
 
     pub fn sort_of(&self, label: &str) -> Option<f64> {
-        self.members
-            .iter()
+        self.members()
             .find(|member| member.label.as_str() == label)
             .map(|member| member.sort)
     }
 
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
+    }
+}
+
+pub struct EnumMemberIter<'a> {
+    catalog: &'a std::sync::Mutex<TypeCatalog>,
+    next_slot: usize,
+    end_slot: usize,
+}
+
+impl Iterator for EnumMemberIter<'_> {
+    type Item = EnumMember;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_slot == self.end_slot {
+            return None;
+        }
+        let member = self
+            .catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .enum_members[self.next_slot];
+        self.next_slot += 1;
+        Some(member)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.end_slot - self.next_slot;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for EnumMemberIter<'_> {}
+
+pub(crate) struct EnumReplayMembers<'a> {
+    catalog: std::sync::MutexGuard<'a, TypeCatalog>,
+    start: usize,
+    count: usize,
+}
+
+impl std::ops::Deref for EnumReplayMembers<'_> {
+    type Target = [EnumMember];
+
+    fn deref(&self) -> &Self::Target {
+        &self.catalog.enum_members[self.start..self.start + self.count]
+    }
+}
+
+impl std::ops::DerefMut for EnumReplayMembers<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.catalog.enum_members[self.start..self.start + self.count]
     }
 }
 
@@ -12546,14 +12661,10 @@ pub struct Storage {
     matviews: FixedVec<MatviewDef>,
     sequences: FixedVec<SequenceDef>,
     sequence_values: std::sync::Mutex<FixedVec<SequenceValues>>,
-    domains: FixedVec<DomainDef>,
-    enums: FixedVec<EnumDef>,
-    enum_members: FixedVec<EnumMember>,
+    type_catalog: std::sync::Mutex<TypeCatalog>,
     enum_members_per_image: usize,
-    pending_enum_members: FixedVec<PendingEnumMemberSlot>,
     enum_member_pending_base: usize,
     enum_member_replay_image: usize,
-    composites: FixedVec<CompositeDef>,
     domain_graph_scratch: std::sync::Mutex<FixedVec<u8>>,
     indexes: FixedVec<IndexDef>,
     brin_maintenance: std::sync::Mutex<BrinMaintenance>,
@@ -17177,14 +17288,16 @@ impl Storage {
             matviews,
             sequences,
             sequence_values: std::sync::Mutex::new(sequence_values),
-            domains,
-            enums,
-            enum_members,
+            type_catalog: std::sync::Mutex::new(TypeCatalog {
+                domains,
+                enums,
+                enum_members,
+                pending_enum_members,
+                composites,
+            }),
             enum_members_per_image,
-            pending_enum_members,
             enum_member_pending_base,
             enum_member_replay_image,
-            composites,
             domain_graph_scratch: std::sync::Mutex::new(domain_graph_scratch),
             indexes,
             brin_maintenance: std::sync::Mutex::new(BrinMaintenance {
@@ -18405,13 +18518,17 @@ impl Storage {
                 self.conversions[target_slot] = definition;
             }
 
-            for source_slot in 0..self.domains.len() {
-                let mut definition = self.domains[source_slot];
+            let mut type_catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            for source_slot in 0..type_catalog.domains.len() {
+                let mut definition = type_catalog.domains[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let target_slot = self
+                let target_slot = type_catalog
                     .domains
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -18422,15 +18539,15 @@ impl Storage {
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.domains[target_slot] = definition;
+                type_catalog.domains[target_slot] = definition;
             }
-            for source_slot in 0..self.enums.len() {
-                let mut definition = self.enums[source_slot];
+            for source_slot in 0..type_catalog.enums.len() {
+                let mut definition = type_catalog.enums[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let target_slot = self
+                let target_slot = type_catalog
                     .enums
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -18441,20 +18558,21 @@ impl Storage {
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.enums[target_slot] = definition;
+                type_catalog.enums[target_slot] = definition;
                 let count = definition.member_count as usize;
                 let source = source_slot * self.enum_members_per_image;
                 let target = target_slot * self.enum_members_per_image;
-                self.enum_members
+                type_catalog
+                    .enum_members
                     .copy_within(source..source + count, target);
             }
-            for source_slot in 0..self.composites.len() {
-                let mut definition = self.composites[source_slot];
+            for source_slot in 0..type_catalog.composites.len() {
+                let mut definition = type_catalog.composites[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let target_slot = self
+                let target_slot = type_catalog
                     .composites
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -18480,8 +18598,9 @@ impl Storage {
                         field.collation = Collation::Catalog(target);
                     }
                 }
-                self.composites[target_slot] = definition;
+                type_catalog.composites[target_slot] = definition;
             }
+            drop(type_catalog);
 
             for source_slot in 0..self.tables.len() {
                 if self.tables[source_slot].database != source || !self.tables[source_slot].live {
@@ -19434,11 +19553,11 @@ impl Storage {
                 }
                 AccessClass::Sequence => self.sequences[usize::from(entry.object.slot)].database,
                 AccessClass::Schema => self.schemas[usize::from(entry.object.slot)].database,
-                AccessClass::Domain => self.domains[usize::from(entry.object.slot)].database,
-                AccessClass::Enum => self.enums[usize::from(entry.object.slot)].database,
+                AccessClass::Domain => self.domain(usize::from(entry.object.slot)).database,
+                AccessClass::Enum => self.enum_for(usize::from(entry.object.slot), 0).database,
                 AccessClass::Index => self.indexes[usize::from(entry.object.slot)].database,
                 AccessClass::Routine => self.routines[usize::from(entry.object.slot)].database,
-                AccessClass::Composite => self.composites[usize::from(entry.object.slot)].database,
+                AccessClass::Composite => self.composite(usize::from(entry.object.slot)).database,
                 AccessClass::Statistics => {
                     self.extended_statistics[usize::from(entry.object.slot)].database
                 }
@@ -19593,11 +19712,37 @@ impl Storage {
         clear_catalog!(subscriptions);
         clear_catalog!(matviews);
         clear_catalog!(sequences);
-        clear_catalog!(domains);
-        clear_catalog!(enums);
-        clear_catalog!(composites);
         clear_catalog!(indexes);
         clear_catalog!(extensions);
+        {
+            let mut catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            for definition in catalog.domains.iter_mut() {
+                if definition.database == database {
+                    definition.database = DatabaseOid::POSTGRES;
+                    definition.ddl_state = CatalogDdlState::Absent;
+                }
+            }
+            for slot in 0..catalog.enums.len() {
+                if catalog.enums[slot].database == database {
+                    let pending = catalog.enums[slot]
+                        .pending_definition
+                        .take()
+                        .map(|pending| pending.member_slot);
+                    Self::clear_pending_enum_member_chain(&mut catalog, pending);
+                    catalog.enums[slot].database = DatabaseOid::POSTGRES;
+                    catalog.enums[slot].ddl_state = CatalogDdlState::Absent;
+                }
+            }
+            for definition in catalog.composites.iter_mut() {
+                if definition.database == database {
+                    definition.database = DatabaseOid::POSTGRES;
+                    definition.ddl_state = CatalogDdlState::Absent;
+                }
+            }
+        }
         {
             let mut catalog = self
                 .operator_catalog
@@ -19750,11 +19895,35 @@ impl Storage {
         commit_catalog!(subscriptions);
         commit_catalog!(matviews);
         commit_catalog!(sequences);
-        commit_catalog!(domains);
-        commit_catalog!(enums);
-        commit_catalog!(composites);
         commit_catalog!(indexes);
         commit_catalog!(extensions);
+        {
+            let mut catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            for definition in catalog.domains.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+            for definition in catalog.enums.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+            for definition in catalog.composites.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         {
             let mut catalog = self
                 .operator_catalog
@@ -19989,33 +20158,33 @@ impl Storage {
             })
     }
 
-    fn ownership(&self, object: AccessObject) -> &Ownership {
+    fn ownership(&self, object: AccessObject) -> Ownership {
         let slot = object.slot as usize;
         match object.class {
-            AccessClass::Table => &self.tables[slot].ownership,
-            AccessClass::View => &self.views[slot].ownership,
-            AccessClass::MaterializedView => &self.matviews[slot].ownership,
-            AccessClass::Sequence => &self.sequences[slot].ownership,
-            AccessClass::Schema => &self.schemas[slot].ownership,
-            AccessClass::Domain => &self.domains[slot].ownership,
-            AccessClass::Enum => &self.enums[slot].ownership,
-            AccessClass::Index => &self.indexes[slot].ownership,
-            AccessClass::Routine => &self.routines[slot].ownership,
-            AccessClass::Composite => &self.composites[slot].ownership,
-            AccessClass::Tablespace => &self.tablespaces[slot].ownership,
-            AccessClass::Statistics => &self.extended_statistics[slot].ownership,
-            AccessClass::Extension => &self.extensions[slot].ownership,
+            AccessClass::Table => self.tables[slot].ownership,
+            AccessClass::View => self.views[slot].ownership,
+            AccessClass::MaterializedView => self.matviews[slot].ownership,
+            AccessClass::Sequence => self.sequences[slot].ownership,
+            AccessClass::Schema => self.schemas[slot].ownership,
+            AccessClass::Domain => self.domain(slot).ownership,
+            AccessClass::Enum => self.enum_for(slot, 0).ownership,
+            AccessClass::Index => self.indexes[slot].ownership,
+            AccessClass::Routine => self.routines[slot].ownership,
+            AccessClass::Composite => self.composite(slot).ownership,
+            AccessClass::Tablespace => self.tablespaces[slot].ownership,
+            AccessClass::Statistics => self.extended_statistics[slot].ownership,
+            AccessClass::Extension => self.extensions[slot].ownership,
             AccessClass::Trigger => match self.triggers[slot].target {
-                TriggerTarget::Table(table) => &self.tables[usize::from(table)].ownership,
-                TriggerTarget::View(view) => &self.views[usize::from(view)].ownership,
+                TriggerTarget::Table(table) => self.tables[usize::from(table)].ownership,
+                TriggerTarget::View(view) => self.views[usize::from(view)].ownership,
             },
-            AccessClass::EventTrigger => &self.event_triggers[slot].definition.ownership,
-            AccessClass::Database => &self.databases[slot].ownership,
+            AccessClass::EventTrigger => self.event_triggers[slot].definition.ownership,
+            AccessClass::Database => self.databases[slot].ownership,
             AccessClass::LargeObject => {
                 unreachable!("large object ownership is synchronized separately")
             }
-            AccessClass::ForeignDataWrapper => &self.foreign.entry_wrapper(slot).ownership,
-            AccessClass::ForeignServer => &self.foreign.entry_server(slot).ownership,
+            AccessClass::ForeignDataWrapper => self.foreign.entry_wrapper(slot).ownership,
+            AccessClass::ForeignServer => self.foreign.entry_server(slot).ownership,
             AccessClass::Language => {
                 unreachable!("built-in procedural languages have bootstrap ownership")
             }
@@ -20030,11 +20199,11 @@ impl Storage {
             AccessClass::MaterializedView => &mut self.matviews[slot].ownership,
             AccessClass::Sequence => &mut self.sequences[slot].ownership,
             AccessClass::Schema => &mut self.schemas[slot].ownership,
-            AccessClass::Domain => &mut self.domains[slot].ownership,
-            AccessClass::Enum => &mut self.enums[slot].ownership,
+            AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => {
+                unreachable!("type ownership is synchronized separately")
+            }
             AccessClass::Index => &mut self.indexes[slot].ownership,
             AccessClass::Routine => &mut self.routines[slot].ownership,
-            AccessClass::Composite => &mut self.composites[slot].ownership,
             AccessClass::Tablespace => &mut self.tablespaces[slot].ownership,
             AccessClass::Statistics => &mut self.extended_statistics[slot].ownership,
             AccessClass::Extension => &mut self.extensions[slot].ownership,
@@ -20518,11 +20687,11 @@ impl Storage {
             }
             AccessClass::Sequence => self.sequences[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Schema => self.schemas[slot].ddl_state == CatalogDdlState::Present,
-            AccessClass::Domain => self.domains[slot].ddl_state == CatalogDdlState::Present,
-            AccessClass::Enum => self.enums[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Domain => self.domain(slot).ddl_state == CatalogDdlState::Present,
+            AccessClass::Enum => self.enum_for(slot, 0).ddl_state == CatalogDdlState::Present,
             AccessClass::Index => self.indexes[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Routine => self.routines[slot].ddl_state == CatalogDdlState::Present,
-            AccessClass::Composite => self.composites[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Composite => self.composite(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Tablespace => self.tablespaces[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Statistics => {
                 self.extended_statistics[slot].ddl_state == CatalogDdlState::Present
@@ -20559,11 +20728,11 @@ impl Storage {
             AccessClass::MaterializedView => self.matviews[slot].visible_to(txid),
             AccessClass::Sequence => self.sequences[slot].visible_to(txid),
             AccessClass::Schema => self.schemas[slot].visible_to(txid),
-            AccessClass::Domain => self.domains[slot].visible_to(txid),
-            AccessClass::Enum => self.enums[slot].visible_to(txid),
+            AccessClass::Domain => self.domain(slot).visible_to(txid),
+            AccessClass::Enum => self.enum_for(slot, txid).visible_to(txid),
             AccessClass::Index => self.indexes[slot].visible_to(txid),
             AccessClass::Routine => self.routines[slot].visible_to(txid),
-            AccessClass::Composite => self.composites[slot].visible_to(txid),
+            AccessClass::Composite => self.composite(slot).visible_to(txid),
             AccessClass::Tablespace => self.tablespaces[slot].visible_to(txid),
             AccessClass::Statistics => self.extended_statistics[slot].visible_to(txid),
             AccessClass::Extension => self.extensions[slot].visible_to(txid),
@@ -20592,11 +20761,11 @@ impl Storage {
             AccessClass::MaterializedView => Some(self.matviews[slot].database),
             AccessClass::Sequence => Some(self.sequences[slot].database),
             AccessClass::Schema => Some(self.schemas[slot].database),
-            AccessClass::Domain => Some(self.domains[slot].database),
-            AccessClass::Enum => Some(self.enums[slot].database),
+            AccessClass::Domain => Some(self.domain(slot).database),
+            AccessClass::Enum => Some(self.enum_for(slot, 0).database),
             AccessClass::Index => Some(self.indexes[slot].database),
             AccessClass::Routine => Some(self.routines[slot].database),
-            AccessClass::Composite => Some(self.composites[slot].database),
+            AccessClass::Composite => Some(self.composite(slot).database),
             AccessClass::Statistics => Some(self.extended_statistics[slot].database),
             AccessClass::Extension => Some(self.extensions[slot].database),
             AccessClass::Trigger => Some(self.triggers[slot].database),
@@ -20652,21 +20821,36 @@ impl Storage {
                 })?
             }
             AccessClass::Domain => {
-                let created_at = self.domains[source_slot].created_at;
-                self.domains.iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
+                let created_at = self.domain(source_slot).created_at;
+                DomainIter {
+                    catalog: &self.type_catalog,
+                    next_slot: 0,
+                }
+                .find_map(|(slot, candidate)| {
+                    (candidate.database == target_database && candidate.created_at == created_at)
+                        .then_some(slot)
                 })?
             }
             AccessClass::Enum => {
-                let created_at = self.enums[source_slot].created_at;
-                self.enums.iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
+                let created_at = self.enum_for(source_slot, 0).created_at;
+                EnumIter {
+                    catalog: &self.type_catalog,
+                    next_slot: 0,
+                }
+                .find_map(|(slot, candidate)| {
+                    (candidate.database == target_database && candidate.created_at == created_at)
+                        .then_some(slot)
                 })?
             }
             AccessClass::Composite => {
-                let created_at = self.composites[source_slot].created_at;
-                self.composites.iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
+                let created_at = self.composite(source_slot).created_at;
+                CompositeIter {
+                    catalog: &self.type_catalog,
+                    next_slot: 0,
+                }
+                .find_map(|(slot, candidate)| {
+                    (candidate.database == target_database && candidate.created_at == created_at)
+                        .then_some(slot)
                 })?
             }
             AccessClass::Index => {
@@ -20752,25 +20936,28 @@ impl Storage {
             .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
-    pub(crate) fn checkpoint_domains(&self) -> impl Iterator<Item = (usize, &DomainDef)> {
-        self.domains
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    pub(crate) fn checkpoint_domains(&self) -> impl Iterator<Item = (usize, DomainDef)> + '_ {
+        DomainIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
-    pub(crate) fn checkpoint_enums(&self) -> impl Iterator<Item = (usize, &EnumDef)> {
-        self.enums
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    pub(crate) fn checkpoint_enums(&self) -> impl Iterator<Item = (usize, EnumDef)> + '_ {
+        EnumIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
-    pub(crate) fn checkpoint_composites(&self) -> impl Iterator<Item = (usize, &CompositeDef)> {
-        self.composites
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    pub(crate) fn checkpoint_composites(&self) -> impl Iterator<Item = (usize, CompositeDef)> + '_ {
+        CompositeIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_views(&self) -> impl Iterator<Item = (usize, &ViewDef)> {
@@ -21036,11 +21223,11 @@ impl Storage {
             AccessClass::MaterializedView => self.matviews.len(),
             AccessClass::Sequence => self.sequences.len(),
             AccessClass::Schema => self.schemas.len(),
-            AccessClass::Domain => self.domains.len(),
-            AccessClass::Enum => self.enums.len(),
+            AccessClass::Domain => self.domain_count(),
+            AccessClass::Enum => self.enum_count(),
             AccessClass::Index => self.indexes.len(),
             AccessClass::Routine => self.routines.len(),
-            AccessClass::Composite => self.composites.len(),
+            AccessClass::Composite => self.composite_count(),
             AccessClass::Tablespace => self.tablespaces.len(),
             AccessClass::Statistics => self.extended_statistics.len(),
             AccessClass::Extension => self.extensions.len(),
@@ -21096,11 +21283,11 @@ impl Storage {
             (AccessClass::MaterializedView, self.matviews.len()),
             (AccessClass::Sequence, self.sequences.len()),
             (AccessClass::Schema, self.schemas.len()),
-            (AccessClass::Domain, self.domains.len()),
-            (AccessClass::Enum, self.enums.len()),
+            (AccessClass::Domain, self.domain_count()),
+            (AccessClass::Enum, self.enum_count()),
             (AccessClass::Index, self.indexes.len()),
             (AccessClass::Routine, self.routines.len()),
-            (AccessClass::Composite, self.composites.len()),
+            (AccessClass::Composite, self.composite_count()),
             (AccessClass::Tablespace, self.tablespaces.len()),
             (AccessClass::Statistics, self.extended_statistics.len()),
             (AccessClass::Extension, self.extensions.len()),
@@ -21207,6 +21394,34 @@ impl Storage {
             }
             return prior;
         }
+        if matches!(
+            object.class,
+            AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
+        ) {
+            let mut catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            let ownership = match object.class {
+                AccessClass::Domain => &mut catalog.domains[usize::from(object.slot)].ownership,
+                AccessClass::Enum => &mut catalog.enums[usize::from(object.slot)].ownership,
+                AccessClass::Composite => {
+                    &mut catalog.composites[usize::from(object.slot)].ownership
+                }
+                _ => unreachable!(),
+            };
+            let prior = ownership.pending;
+            if txid == 0 {
+                ownership.owner = owner as u16;
+                ownership.pending = None;
+            } else {
+                ownership.pending = Some(PendingOwnership {
+                    txid,
+                    owner: owner as u16,
+                });
+            }
+            return prior;
+        }
         let ownership = self.ownership_mut(object);
         let prior = ownership.pending;
         if txid == 0 {
@@ -21236,6 +21451,30 @@ impl Storage {
             }
             return;
         }
+        if matches!(
+            object.class,
+            AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
+        ) {
+            let mut catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            let ownership = match object.class {
+                AccessClass::Domain => &mut catalog.domains[usize::from(object.slot)].ownership,
+                AccessClass::Enum => &mut catalog.enums[usize::from(object.slot)].ownership,
+                AccessClass::Composite => {
+                    &mut catalog.composites[usize::from(object.slot)].ownership
+                }
+                _ => unreachable!(),
+            };
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            return;
+        }
         let ownership = self.ownership_mut(object);
         if let Some(pending) = ownership.pending
             && pending.txid == txid
@@ -21257,6 +21496,30 @@ impl Storage {
                 .definitions[usize::from(object.slot)]
             .ownership
             .pending = prior;
+            return;
+        }
+        if matches!(
+            object.class,
+            AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
+        ) {
+            let mut catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            match object.class {
+                AccessClass::Domain => {
+                    catalog.domains[usize::from(object.slot)].ownership.pending = prior
+                }
+                AccessClass::Enum => {
+                    catalog.enums[usize::from(object.slot)].ownership.pending = prior
+                }
+                AccessClass::Composite => {
+                    catalog.composites[usize::from(object.slot)]
+                        .ownership
+                        .pending = prior
+                }
+                _ => unreachable!(),
+            }
             return;
         }
         self.ownership_mut(object).pending = prior;
@@ -24515,7 +24778,11 @@ impl Storage {
                 tail = pending.previous;
             }
         }
-        for definition in self.domains.iter().filter(|definition| {
+        for (_, definition) in (DomainIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        })
+        .filter(|(_, definition)| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -24619,7 +24886,11 @@ impl Storage {
                 rename_schema_qualified_sql(predicate, prior, name)?;
             }
         }
-        for definition in self.domains.iter_mut().filter(|definition| {
+        let mut type_catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        for definition in type_catalog.domains.iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -24638,7 +24909,7 @@ impl Storage {
                 rename_schema_name(&mut identity.schema, prior, name);
             }
         }
-        for definition in self.enums.iter_mut().filter(|definition| {
+        for definition in type_catalog.enums.iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -24647,7 +24918,7 @@ impl Storage {
                 rename_schema_name(&mut pending.schema, prior, name);
             }
         }
-        for definition in self.composites.iter_mut().filter(|definition| {
+        for definition in type_catalog.composites.iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -24662,6 +24933,7 @@ impl Storage {
                 }
             }
         }
+        drop(type_catalog);
         for definition in self.routines.iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
@@ -34559,23 +34831,33 @@ impl Storage {
 
     fn find_domain_slot(&self, qualifier: Option<&str>, name: &str, txid: u32) -> Option<usize> {
         if let Some(schema) = qualifier {
-            return self.domains.iter().position(|d| {
+            return DomainIter {
+                catalog: &self.type_catalog,
+                next_slot: 0,
+            }
+            .find_map(|(slot, d)| {
                 let definition = d.definition_for(txid);
-                d.database == current_database()
+                (d.database == current_database()
                     && d.visible_to(txid)
                     && definition.schema.as_str() == schema
-                    && definition.name.as_str() == name
+                    && definition.name.as_str() == name)
+                    .then_some(slot)
             });
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
                 let schema = self.schemas[*slot as usize].name;
-                if let Some(i) = self.domains.iter().position(|d| {
+                if let Some(i) = (DomainIter {
+                    catalog: &self.type_catalog,
+                    next_slot: 0,
+                })
+                .find_map(|(slot, d)| {
                     let definition = d.definition_for(txid);
-                    d.database == current_database()
+                    (d.database == current_database()
                         && d.visible_to(txid)
                         && definition.schema.as_str() == schema.as_str()
-                        && definition.name.as_str() == name
+                        && definition.name.as_str() == name)
+                        .then_some(slot)
                 }) {
                     return Some(i);
                 }
@@ -34598,24 +34880,31 @@ impl Storage {
     /// for enforcing a column's domain constraints, where the column stores
     /// only the domain's name.
     pub fn domain_by_name(&self, name: &str, txid: u32) -> Option<DomainDef> {
-        self.domains
-            .iter()
-            .position(|domain| {
-                domain.database == current_database()
-                    && domain.visible_to(txid)
-                    && domain.definition_for(txid).name.as_str() == name
-            })
-            .map(|slot| self.domain_for(slot, txid))
+        DomainIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .find_map(|(_, domain)| {
+            (domain.database == current_database()
+                && domain.visible_to(txid)
+                && domain.definition_for(txid).name.as_str() == name)
+                .then(|| domain.definition_for(txid))
+        })
     }
 
     /// The domain named `(schema, name)` visible to `txid`, by slot.
     pub fn domain_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        self.domains.iter().position(|d| {
+        DomainIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .find_map(|(slot, d)| {
             let definition = d.definition_for(txid);
-            d.database == current_database()
+            (d.database == current_database()
                 && d.visible_to(txid)
                 && definition.schema.as_str() == schema
-                && definition.name.as_str() == name
+                && definition.name.as_str() == name)
+                .then_some(slot)
         })
     }
 
@@ -34629,14 +34918,19 @@ impl Storage {
         txid: u32,
     ) -> Option<usize> {
         self.domain_slot(schema, name, txid).or_else(|| {
-            self.domains.iter().position(|domain| {
-                domain.database == current_database()
+            DomainIter {
+                catalog: &self.type_catalog,
+                next_slot: 0,
+            }
+            .find_map(|(slot, domain)| {
+                (domain.database == current_database()
                     && domain.visible_to(txid)
                     && domain.schema.as_str() == schema
                     && domain.name.as_str() == name
                     && domain
                         .pending_definition
-                        .is_some_and(|pending| pending.txid == txid && pending.identity.is_some())
+                        .is_some_and(|pending| pending.txid == txid && pending.identity.is_some()))
+                .then_some(slot)
             })
         })
     }
@@ -34801,22 +35095,34 @@ impl Storage {
         ))
     }
 
-    pub fn domain(&self, slot: usize) -> &DomainDef {
-        &self.domains[slot]
+    pub fn domain(&self, slot: usize) -> DomainDef {
+        self.type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .domains[slot]
     }
 
     pub(crate) fn domain_count(&self) -> usize {
-        self.domains.len()
+        self.type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .domains
+            .len()
     }
 
     pub(crate) fn domain_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.domains[slot].database == current_database() && self.domains[slot].visible_to(txid)
+        let domain = self.domain(slot);
+        domain.database == current_database() && domain.visible_to(txid)
     }
 
     /// Committed domains carrying their slot indices, for the checkpoint and
     /// `pg_type`.
-    pub fn live_domains(&self) -> impl Iterator<Item = (usize, &DomainDef)> {
-        self.domains.iter().enumerate().filter(|(_, d)| {
+    pub fn live_domains(&self) -> impl Iterator<Item = (usize, DomainDef)> + '_ {
+        DomainIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, d)| {
             d.database == current_database() && d.ddl_state == CatalogDdlState::Present
         })
     }
@@ -34876,8 +35182,8 @@ impl Storage {
             spec.base = match spec.base {
                 ColType::Enum(slot)
                     if slot != ColType::ENUM_SLOT_UNRESOLVED
-                        && (slot as usize) < self.enums.len()
-                        && self.enums[slot as usize].database == current_database()
+                        && (slot as usize) < self.enum_count()
+                        && self.enum_for(slot as usize, txid).database == current_database()
                         && self.enum_for(slot as usize, txid).visible_to(txid) =>
                 {
                     // WAL preserves the catalog slot. Its spelling can be stale
@@ -34907,8 +35213,9 @@ impl Storage {
                 }
                 ColType::Composite(slot)
                     if slot != ColType::COMPOSITE_SLOT_UNRESOLVED
-                        && (slot as usize) < self.composites.len()
-                        && self.composites[slot as usize].database == current_database()
+                        && (slot as usize) < self.composite_count()
+                        && self.composite_for(slot as usize, txid).database
+                            == current_database()
                         && self.composite_for(slot as usize, txid).visible_to(txid) =>
                 {
                     // See the enum case: slot identity is durable; names are a
@@ -34947,7 +35254,13 @@ impl Storage {
             };
         }
         self.require_schema_create(schema.as_str(), txid)?;
-        if let Some(blocker) = self.domains.iter().find_map(|d| {
+        let created_at = self.catalog_sequence.next();
+        let ownership = self.initial_ownership(txid);
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if let Some(blocker) = catalog.domains.iter().find_map(|d| {
             (d.database == current_database()
                 && (d.schema == schema && d.name == name
                     || d.pending_definition
@@ -34965,7 +35278,7 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if let Some(blocker) = self.enums.iter().find_map(|e| {
+        if let Some(blocker) = catalog.enums.iter().find_map(|e| {
             (e.database == current_database()
                 && (e.schema == schema && e.name == name
                     || e.pending_definition
@@ -34980,7 +35293,7 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if let Some(blocker) = self.composites.iter().find_map(|composite| {
+        if let Some(blocker) = catalog.composites.iter().find_map(|composite| {
             (composite.database == current_database()
                 && (composite.schema == schema && composite.name == name
                     || composite
@@ -34997,7 +35310,7 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if self.domains.iter().any(|domain| {
+        if catalog.domains.iter().any(|domain| {
             domain.database == current_database()
                 && domain.visible_to(txid)
                 && domain.definition_for(txid).schema == schema
@@ -35009,7 +35322,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if self.enums.iter().any(|e| {
+        if catalog.enums.iter().any(|e| {
             e.database == current_database()
                 && e.visible_to(txid)
                 && e.definition_for(txid).schema == schema
@@ -35021,7 +35334,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if self.composites.iter().any(|composite| {
+        if catalog.composites.iter().any(|composite| {
             composite.database == current_database()
                 && composite.visible_to(txid)
                 && composite.definition_for(txid).schema == schema
@@ -35033,7 +35346,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let Some(new) = self
+        let Some(new) = catalog
             .domains
             .iter()
             .position(|d| d.ddl_state == CatalogDdlState::Absent)
@@ -35041,16 +35354,14 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many domains (limit {})",
-                self.domains.len()
+                catalog.domains.len()
             ));
         };
-        let created_at = self.catalog_sequence.next();
-        let ownership = self.initial_ownership(txid);
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Domain,
             slot: new as u16,
         });
-        self.domains[new] = DomainDef {
+        catalog.domains[new] = DomainDef {
             database: current_database(),
             created_at,
             schema,
@@ -35075,7 +35386,7 @@ impl Storage {
     }
 
     pub(crate) fn domain_for(&self, slot: usize, txid: u32) -> DomainDef {
-        self.domains[slot].definition_for(txid)
+        self.domain(slot).definition_for(txid)
     }
 
     /// Finishes manifest-time user-type binding once every catalog definition
@@ -35086,9 +35397,16 @@ impl Storage {
 
     fn rebind_domain_base_types_to(&mut self, txid: u32) -> Result<(), SqlError> {
         let current_database = current_database();
-        let domains = &mut self.domains;
-        let enums = &self.enums;
-        let composites = &self.composites;
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let TypeCatalog {
+            domains,
+            enums,
+            composites,
+            ..
+        } = &mut *catalog;
         let mut state = self
             .domain_graph_scratch
             .lock()
@@ -35264,23 +35582,28 @@ impl Storage {
             self.bind_user_type_columns_to(&mut definition, txid)?;
             self.tables[table].def = definition;
         }
-        for composite in 0..self.composites.len() {
-            if self.composites[composite].database != current_database()
-                || !self.composites[composite].visible_to(txid)
-            {
+        for composite in 0..self.composite_count() {
+            let definition = self.composite_for(composite, txid);
+            if definition.database != current_database() || !definition.visible_to(txid) {
                 continue;
             }
-            let n_fields = self.composites[composite].n_fields;
+            let n_fields = definition.n_fields;
             for field in 0..n_fields {
-                let definition = self.composites[composite].fields[field];
-                if definition.dropped {
+                let field_definition = definition.fields[field];
+                if field_definition.dropped {
                     continue;
                 }
-                let Some(identity) = definition.user_type else {
+                let Some(identity) = field_definition.user_type else {
                     continue;
                 };
-                let rebound = self.rebind_declared_user_type(definition.ctype, identity, txid)?;
-                self.composites[composite].fields[field].ctype = rebound;
+                let rebound =
+                    self.rebind_declared_user_type(field_definition.ctype, identity, txid)?;
+                self.type_catalog
+                    .lock()
+                    .expect("type catalog lock poisoned")
+                    .composites[composite]
+                    .fields[field]
+                    .ctype = rebound;
             }
         }
         Ok(())
@@ -35406,7 +35729,11 @@ impl Storage {
         spec: DomainSpec,
         txid: u32,
     ) -> Result<Option<PendingDomainDefinition>, SqlError> {
-        let domain = &mut self.domains[slot];
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let domain = &mut catalog.domains[slot];
         if let Some(pending) = domain.pending_definition
             && pending.txid != txid
         {
@@ -35434,49 +35761,60 @@ impl Storage {
     ) -> Result<Option<PendingDomainDefinition>, SqlError> {
         let current = self.domain_for(slot, txid);
         if current.schema == schema && current.name == name {
-            return Ok(self.domains[slot].pending_definition);
+            return Ok(self.domain(slot).pending_definition);
         }
-        if let Some(blocker) = self
-            .domains
-            .iter()
-            .enumerate()
-            .find_map(|(other_slot, domain)| {
-                let definition = domain.definition_for(txid);
-                (other_slot != slot
-                    && domain.database == current_database()
-                    && definition.schema == schema
-                    && definition.name == name)
-                    .then(|| {
-                        domain
-                            .pending_definition
-                            .map(|pending| pending.txid)
-                            .or_else(|| domain.ddl_state.pending_txid())
-                    })
-                    .flatten()
-                    .filter(|&owner| owner != txid)
-            })
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if let Some(blocker) =
+            catalog
+                .domains
+                .iter()
+                .enumerate()
+                .find_map(|(other_slot, domain)| {
+                    let definition = domain.definition_for(txid);
+                    (other_slot != slot
+                        && domain.database == current_database()
+                        && definition.schema == schema
+                        && definition.name == name)
+                        .then(|| {
+                            domain
+                                .pending_definition
+                                .map(|pending| pending.txid)
+                                .or_else(|| domain.ddl_state.pending_txid())
+                        })
+                        .flatten()
+                        .filter(|&owner| owner != txid)
+                })
         {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if self.domains.iter().enumerate().any(|(other_slot, domain)| {
-            other_slot != slot
-                && domain.database == current_database()
-                && domain.visible_to(txid)
-                && domain.definition_for(txid).schema == schema
-                && domain.definition_for(txid).name == name
-        }) || self.enums.iter().any(|enumeration| {
-            enumeration.database == current_database()
-                && enumeration.visible_to(txid)
-                && enumeration.schema == schema
-                && enumeration.definition_for(txid).name == name
-        }) {
+        if catalog
+            .domains
+            .iter()
+            .enumerate()
+            .any(|(other_slot, domain)| {
+                other_slot != slot
+                    && domain.database == current_database()
+                    && domain.visible_to(txid)
+                    && domain.definition_for(txid).schema == schema
+                    && domain.definition_for(txid).name == name
+            })
+            || catalog.enums.iter().any(|enumeration| {
+                enumeration.database == current_database()
+                    && enumeration.visible_to(txid)
+                    && enumeration.schema == schema
+                    && enumeration.definition_for(txid).name == name
+            })
+        {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "type \"{}\" already exists",
                 name.as_str()
             ));
         }
-        let domain = &mut self.domains[slot];
+        let domain = &mut catalog.domains[slot];
         if let Some(pending) = domain.pending_definition
             && pending.txid != txid
         {
@@ -35509,18 +35847,30 @@ impl Storage {
     }
 
     pub(crate) fn commit_domain_alter(&mut self, slot: usize, txid: u32) {
-        if self.domains[slot]
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-            .is_some()
-        {
-            let definition = self.domains[slot].definition_for(txid);
-            if definition.schema != self.domains[slot].schema
-                || definition.name != self.domains[slot].name
+        let rename = {
+            let mut catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            let domain = catalog.domains[slot];
+            if domain
+                .pending_definition
+                .filter(|pending| pending.txid == txid)
+                .is_none()
             {
-                self.rename_domain_references(slot, definition.schema, definition.name);
+                return;
             }
-            self.domains[slot] = definition;
+            let definition = domain.definition_for(txid);
+            catalog.domains[slot] = definition;
+            (definition.schema != domain.schema || definition.name != domain.name).then_some((
+                domain.schema,
+                domain.name,
+                definition.schema,
+                definition.name,
+            ))
+        };
+        if let Some((old_schema, old_name, schema, name)) = rename {
+            self.rename_domain_references(slot, old_schema, old_name, schema, name);
         }
     }
 
@@ -35529,18 +35879,28 @@ impl Storage {
         slot: usize,
         prior: Option<PendingDomainDefinition>,
     ) {
-        self.domains[slot].pending_definition = prior;
+        self.type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .domains[slot]
+            .pending_definition = prior;
     }
 
     pub fn restore_domain(&mut self, slot: usize, prior: DomainDef) {
-        self.domains[slot] = prior;
+        self.type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .domains[slot] = prior;
     }
 
-    fn rename_domain_references(&mut self, slot: usize, schema: SqlName, name: SqlName) {
-        let old_schema = self.domains[slot].schema;
-        let old_name = self.domains[slot].name;
-        self.domains[slot].schema = schema;
-        self.domains[slot].name = name;
+    fn rename_domain_references(
+        &mut self,
+        slot: usize,
+        old_schema: SqlName,
+        old_name: SqlName,
+        schema: SqlName,
+        name: SqlName,
+    ) {
         for table in self
             .tables
             .iter_mut()
@@ -35567,7 +35927,11 @@ impl Storage {
                 table.mark_dirty();
             }
         }
-        for domain in self.domains.iter_mut() {
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        for domain in catalog.domains.iter_mut() {
             if domain.base_domain
                 == Some(UserTypeName {
                     schema: old_schema,
@@ -35577,6 +35941,7 @@ impl Storage {
                 domain.base_domain = Some(UserTypeName { schema, name });
             }
         }
+        drop(catalog);
         for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
                 && comment.class == CommentClass::Type
@@ -35597,7 +35962,11 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if let Some(blocker) = self.domains.iter().find_map(|d| {
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if let Some(blocker) = catalog.domains.iter().find_map(|d| {
             (d.database == current_database()
                 && d.schema.as_str() == schema
                 && d.name.as_str() == name)
@@ -35606,7 +35975,7 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
-        let Some(i) = self.domains.iter().position(|d| {
+        let Some(i) = catalog.domains.iter().position(|d| {
             d.database == current_database()
                 && d.visible_to(txid)
                 && d.schema.as_str() == schema
@@ -35614,27 +35983,49 @@ impl Storage {
         }) else {
             return Ok(None);
         };
-        let d = &mut self.domains[i];
+        let d = &mut catalog.domains[i];
         d.ddl_state = d.ddl_state.drop_by(txid);
         Ok(Some(i))
     }
 
     pub fn commit_domain_create(&mut self, slot: usize) {
-        self.domains[slot].ddl_state = self.domains[slot].ddl_state.commit_create();
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog.domains[slot].ddl_state = catalog.domains[slot].ddl_state.commit_create();
     }
 
     pub fn commit_domain_drop(&mut self, slot: usize) {
-        let (schema, name) = (self.domains[slot].schema, self.domains[slot].name);
+        let (schema, name) = {
+            let catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            (catalog.domains[slot].schema, catalog.domains[slot].name)
+        };
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
-        self.domains[slot].ddl_state = self.domains[slot].ddl_state.commit_drop();
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog.domains[slot].ddl_state = catalog.domains[slot].ddl_state.commit_drop();
     }
 
     pub fn rollback_domain_create(&mut self, slot: usize) {
-        self.domains[slot].ddl_state = self.domains[slot].ddl_state.rollback_create();
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog.domains[slot].ddl_state = catalog.domains[slot].ddl_state.rollback_create();
     }
 
     pub fn rollback_domain_drop(&mut self, slot: usize, txid: u32) {
-        let d = &mut self.domains[slot];
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let d = &mut catalog.domains[slot];
         d.ddl_state = d.ddl_state.rollback_drop(txid);
     }
 
@@ -35644,21 +36035,31 @@ impl Storage {
     /// `txid`, searching the current path when unqualified.
     fn find_enum_slot(&self, qualifier: Option<&str>, name: &str, txid: u32) -> Option<usize> {
         if let Some(schema) = qualifier {
-            return self.enums.iter().position(|e| {
-                e.database == current_database()
+            return EnumIter {
+                catalog: &self.type_catalog,
+                next_slot: 0,
+            }
+            .find_map(|(slot, e)| {
+                (e.database == current_database()
                     && e.visible_to(txid)
                     && e.definition_for(txid).schema.as_str() == schema
-                    && e.definition_for(txid).name.as_str() == name
+                    && e.definition_for(txid).name.as_str() == name)
+                    .then_some(slot)
             });
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
                 let schema = self.schemas[*slot as usize].name;
-                if let Some(i) = self.enums.iter().position(|e| {
-                    e.database == current_database()
+                if let Some(i) = (EnumIter {
+                    catalog: &self.type_catalog,
+                    next_slot: 0,
+                })
+                .find_map(|(slot, e)| {
+                    (e.database == current_database()
                         && e.visible_to(txid)
                         && e.definition_for(txid).schema.as_str() == schema.as_str()
-                        && e.definition_for(txid).name.as_str() == name
+                        && e.definition_for(txid).name.as_str() == name)
+                        .then_some(slot)
                 }) {
                     return Some(i);
                 }
@@ -35680,73 +36081,90 @@ impl Storage {
     /// The definition of an enum named `name` (any schema) visible to `txid` —
     /// for resolving a column whose stored type identity is only the enum name.
     pub fn enum_by_name(&self, name: &str, txid: u32) -> Option<EnumDefinition<'_>> {
-        self.enums
-            .iter()
-            .position(|enumeration| {
-                enumeration.database == current_database()
-                    && enumeration.visible_to(txid)
-                    && enumeration.definition_for(txid).name.as_str() == name
-            })
+        self.enum_slot_by_name(name, txid)
             .map(|slot| self.enum_for(slot, txid))
     }
 
     /// The slot of an enum named `name` (any schema) visible to `txid`.
     pub fn enum_slot_by_name(&self, name: &str, txid: u32) -> Option<usize> {
-        self.enums.iter().position(|e| {
-            e.database == current_database()
+        EnumIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .find_map(|(slot, e)| {
+            (e.database == current_database()
                 && e.visible_to(txid)
-                && e.definition_for(txid).name.as_str() == name
+                && e.definition_for(txid).name.as_str() == name)
+                .then_some(slot)
         })
     }
 
     /// The enum named `(schema, name)` visible to `txid`, by slot.
     pub fn enum_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        self.enums.iter().position(|e| {
-            e.database == current_database()
+        EnumIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .find_map(|(slot, e)| {
+            (e.database == current_database()
                 && e.visible_to(txid)
                 && e.definition_for(txid).schema.as_str() == schema
-                && e.definition_for(txid).name.as_str() == name
+                && e.definition_for(txid).name.as_str() == name)
+                .then_some(slot)
         })
     }
 
-    fn enum_member_image(&self, image: usize, count: u32) -> &[EnumMember] {
-        let count = usize::try_from(count).expect("enum member count fits usize");
-        let start = image * self.enum_members_per_image;
-        &self.enum_members[start..start + count]
-    }
-
-    fn enum_members_for(&self, slot: usize, txid: u32) -> &[EnumMember] {
-        if let Some(pending) = self.enums[slot]
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-        {
-            return self.enum_member_image(
-                self.enum_member_pending_base + pending.member_slot as usize,
-                pending.member_count,
-            );
-        }
-        self.enum_member_image(slot, self.enums[slot].member_count)
-    }
-
     pub(crate) fn enum_for(&self, slot: usize, txid: u32) -> EnumDefinition<'_> {
-        let definition = self.enums[slot].definition_for(txid);
+        let (definition, member_image, member_count) = {
+            let catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            let enumeration = catalog.enums[slot];
+            let definition = enumeration.definition_for(txid);
+            let (image, count) = enumeration
+                .pending_definition
+                .filter(|pending| pending.txid == txid)
+                .map_or((slot, enumeration.member_count), |pending| {
+                    (
+                        self.enum_member_pending_base + pending.member_slot as usize,
+                        pending.member_count,
+                    )
+                });
+            (
+                definition,
+                image * self.enum_members_per_image,
+                count as usize,
+            )
+        };
         EnumDefinition {
+            catalog: &self.type_catalog,
+            member_image,
+            member_count,
             database: definition.database,
             created_at: definition.created_at,
             schema: definition.schema,
             name: definition.name,
             ownership: definition.ownership,
-            members: self.enum_members_for(slot, txid),
             ddl_state: definition.ddl_state,
         }
     }
 
     pub(crate) fn enum_count(&self) -> usize {
-        self.enums.len()
+        self.type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .enums
+            .len()
     }
 
     pub(crate) fn enum_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.enums[slot].database == current_database() && self.enums[slot].visible_to(txid)
+        let enumeration = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .enums[slot];
+        enumeration.database == current_database() && enumeration.visible_to(txid)
     }
 
     /// Whether `label` was added to a pre-existing enum by this transaction.
@@ -35754,7 +36172,11 @@ impl Storage {
     /// use until commit; labels of a type created in the same transaction and
     /// renamed committed labels are immediately safe.
     pub(crate) fn enum_label_is_uncommitted(&self, slot: usize, label: &str, txid: u32) -> bool {
-        let enumeration = &self.enums[slot];
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let enumeration = &catalog.enums[slot];
         if enumeration.ddl_state == (CatalogDdlState::PendingCreate { txid }) {
             return false;
         }
@@ -35764,19 +36186,22 @@ impl Storage {
         else {
             return false;
         };
-        self.enum_member_image(
-            self.enum_member_pending_base + pending.member_slot as usize,
-            pending.member_count,
-        )
-        .iter()
-        .position(|member| member.label.as_str() == label)
-        .is_some_and(|index| index >= pending.safe_member_count as usize)
+        let start = (self.enum_member_pending_base + pending.member_slot as usize)
+            * self.enum_members_per_image;
+        catalog.enum_members[start..start + pending.member_count as usize]
+            .iter()
+            .position(|member| member.label.as_str() == label)
+            .is_some_and(|index| index >= pending.safe_member_count as usize)
     }
 
     /// Committed enums carrying their slot indices, for the checkpoint,
     /// `pg_type` and `pg_enum`.
-    pub fn live_enums(&self) -> impl Iterator<Item = (usize, &EnumDef)> {
-        self.enums.iter().enumerate().filter(|(_, e)| {
+    pub fn live_enums(&self) -> impl Iterator<Item = (usize, EnumDef)> + '_ {
+        EnumIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, e)| {
             e.database == current_database() && e.ddl_state == CatalogDdlState::Present
         })
     }
@@ -35804,15 +36229,16 @@ impl Storage {
     }
 
     fn write_enum_member_image(
-        &mut self,
+        catalog: &mut TypeCatalog,
+        enum_members_per_image: usize,
         image: usize,
         members: &[EnumMember],
     ) -> Result<u32, SqlError> {
-        if members.len() > self.enum_members_per_image {
+        if members.len() > enum_members_per_image {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "an enum type may have at most {} labels",
-                self.enum_members_per_image
+                enum_members_per_image
             ));
         }
         let count = u32::try_from(members.len()).map_err(|_| {
@@ -35821,8 +36247,8 @@ impl Storage {
                 "enum label count exceeds durable representation"
             )
         })?;
-        let start = image * self.enum_members_per_image;
-        self.enum_members[start..start + members.len()].copy_from_slice(members);
+        let start = image * enum_members_per_image;
+        catalog.enum_members[start..start + members.len()].copy_from_slice(members);
         Ok(count)
     }
 
@@ -35831,9 +36257,9 @@ impl Storage {
     }
 
     pub(crate) fn enum_replay_members(
-        &mut self,
+        &self,
         count: usize,
-    ) -> Result<&mut [EnumMember], SqlError> {
+    ) -> Result<EnumReplayMembers<'_>, SqlError> {
         if count > self.enum_members_per_image {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -35842,7 +36268,14 @@ impl Storage {
             ));
         }
         let start = self.enum_member_replay_image * self.enum_members_per_image;
-        Ok(&mut self.enum_members[start..start + count])
+        Ok(EnumReplayMembers {
+            catalog: self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned"),
+            start,
+            count,
+        })
     }
 
     pub(crate) fn finish_enum_replay(
@@ -35865,9 +36298,14 @@ impl Storage {
         };
         let source = self.enum_member_replay_image * self.enum_members_per_image;
         let target = slot * self.enum_members_per_image;
-        self.enum_members
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog
+            .enum_members
             .copy_within(source..source + count, target);
-        self.enums[slot].member_count = u32::try_from(count).map_err(|_| {
+        catalog.enums[slot].member_count = u32::try_from(count).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "enum label count exceeds durable representation"
@@ -35887,7 +36325,13 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
-        if let Some(blocker) = self.enums.iter().find_map(|e| {
+        let created_at = self.catalog_sequence.next();
+        let ownership = self.initial_ownership(txid);
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if let Some(blocker) = catalog.enums.iter().find_map(|e| {
             let same_name = e.database == current_database()
                 && (e.schema == schema && e.name == name
                     || e.pending_definition
@@ -35903,7 +36347,7 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if self.enums.iter().any(|e| {
+        if catalog.enums.iter().any(|e| {
             e.database == current_database()
                 && e.visible_to(txid)
                 && e.definition_for(txid).schema == schema
@@ -35915,7 +36359,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if let Some(blocker) = self.domains.iter().find_map(|d| {
+        if let Some(blocker) = catalog.domains.iter().find_map(|d| {
             (d.database == current_database()
                 && (d.schema == schema && d.name == name
                     || d.pending_definition
@@ -35928,7 +36372,7 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if self.domains.iter().any(|d| {
+        if catalog.domains.iter().any(|d| {
             d.database == current_database()
                 && d.visible_to(txid)
                 && d.definition_for(txid).schema == schema
@@ -35940,7 +36384,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if self.composites.iter().any(|composite| {
+        if catalog.composites.iter().any(|composite| {
             composite.database == current_database()
                 && composite.visible_to(txid)
                 && composite.definition_for(txid).schema == schema
@@ -35952,7 +36396,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let Some(new) = self
+        let Some(new) = catalog
             .enums
             .iter()
             .position(|e| e.ddl_state == CatalogDdlState::Absent)
@@ -35960,17 +36404,20 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many enum types (limit {})",
-                self.enums.len()
+                catalog.enums.len()
             ));
         };
-        let created_at = self.catalog_sequence.next();
-        let ownership = self.initial_ownership(txid);
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Enum,
             slot: new as u16,
         });
-        let member_count = self.write_enum_member_image(new, spec.members)?;
-        self.enums[new] = EnumDef {
+        let member_count = Self::write_enum_member_image(
+            &mut catalog,
+            self.enum_members_per_image,
+            new,
+            spec.members,
+        )?;
+        catalog.enums[new] = EnumDef {
             database: current_database(),
             created_at,
             schema,
@@ -35995,7 +36442,11 @@ impl Storage {
         members: &[EnumMember],
         txid: u32,
     ) -> Result<Option<PendingEnumDefinition>, SqlError> {
-        if let Some(blocker) = self
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if let Some(blocker) = catalog
             .enums
             .iter()
             .enumerate()
@@ -36018,7 +36469,7 @@ impl Storage {
         {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if let Some(blocker) = self.domains.iter().find_map(|domain| {
+        if let Some(blocker) = catalog.domains.iter().find_map(|domain| {
             (domain.database == current_database()
                 && (domain.schema == schema && domain.name == name
                     || domain
@@ -36032,18 +36483,18 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if self.enums.iter().enumerate().any(|(other_slot, other)| {
+        if catalog.enums.iter().enumerate().any(|(other_slot, other)| {
             other_slot != slot
                 && other.database == current_database()
                 && other.visible_to(txid)
                 && other.definition_for(txid).schema == schema
                 && other.definition_for(txid).name == name
-        }) || self.domains.iter().any(|domain| {
+        }) || catalog.domains.iter().any(|domain| {
             domain.database == current_database()
                 && domain.visible_to(txid)
                 && domain.definition_for(txid).schema == schema
                 && domain.definition_for(txid).name == name
-        }) || self.composites.iter().any(|composite| {
+        }) || catalog.composites.iter().any(|composite| {
             composite.database == current_database()
                 && composite.visible_to(txid)
                 && composite.definition_for(txid).schema == schema
@@ -36055,19 +36506,19 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if let Some(pending) = self.enums[slot].pending_definition
+        if let Some(pending) = catalog.enums[slot].pending_definition
             && pending.txid != txid
         {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "type \"{}\" is being altered by another transaction",
-                self.enums[slot].name.as_str()
+                catalog.enums[slot].name.as_str()
             ));
         }
-        let prior = self.enums[slot].pending_definition;
+        let prior = catalog.enums[slot].pending_definition;
         let previous = prior.map(|pending| pending.member_slot);
         if previous.is_some_and(|previous| {
-            self.pending_enum_members[previous as usize].depth
+            catalog.pending_enum_members[previous as usize].depth
                 >= self.max_catalog_versions_per_object
         }) {
             return Err(sql_err!(
@@ -36076,7 +36527,7 @@ impl Storage {
                 self.max_catalog_versions_per_object
             ));
         }
-        let Some(member_slot) = self
+        let Some(member_slot) = catalog
             .pending_enum_members
             .iter()
             .position(|entry| !entry.used)
@@ -36087,19 +36538,23 @@ impl Storage {
             ));
         };
         let depth = previous.map_or(1, |previous| {
-            self.pending_enum_members[previous as usize].depth + 1
+            catalog.pending_enum_members[previous as usize].depth + 1
         });
-        let member_count =
-            self.write_enum_member_image(self.enum_member_pending_base + member_slot, members)?;
-        self.pending_enum_members[member_slot] = PendingEnumMemberSlot {
+        let member_count = Self::write_enum_member_image(
+            &mut catalog,
+            self.enum_members_per_image,
+            self.enum_member_pending_base + member_slot,
+            members,
+        )?;
+        catalog.pending_enum_members[member_slot] = PendingEnumMemberSlot {
             used: true,
             previous,
             depth,
         };
-        let safe_member_count = prior.map_or(self.enums[slot].member_count, |pending| {
+        let safe_member_count = prior.map_or(catalog.enums[slot].member_count, |pending| {
             pending.safe_member_count
         });
-        self.enums[slot].pending_definition = Some(PendingEnumDefinition {
+        catalog.enums[slot].pending_definition = Some(PendingEnumDefinition {
             txid,
             schema,
             name,
@@ -36116,59 +36571,70 @@ impl Storage {
         label: SqlName,
         txid: u32,
     ) -> Result<(), SqlError> {
-        if self.enums[slot].ddl_state == (CatalogDdlState::PendingCreate { txid }) {
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if catalog.enums[slot].ddl_state == (CatalogDdlState::PendingCreate { txid }) {
             return Ok(());
         }
-        let pending = self.enums[slot]
+        let pending = catalog.enums[slot]
             .pending_definition
             .filter(|pending| pending.txid == txid)
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "enum alteration is not staged"))?;
-        self.enum_member_image(
-            self.enum_member_pending_base + pending.member_slot as usize,
-            pending.member_count,
-        )
-        .iter()
-        .position(|member| member.label == label)
-        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "new enum label is not staged"))?;
+        let start = (self.enum_member_pending_base + pending.member_slot as usize)
+            * self.enum_members_per_image;
+        catalog.enum_members[start..start + pending.member_count as usize]
+            .iter()
+            .position(|member| member.label == label)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "new enum label is not staged"))?;
         Ok(())
     }
 
-    fn release_pending_enum_members(&mut self, slot: u32) -> Option<u32> {
-        let pending = self.pending_enum_members[slot as usize];
-        self.pending_enum_members[slot as usize] = PendingEnumMemberSlot::EMPTY;
+    fn release_pending_enum_members(catalog: &mut TypeCatalog, slot: u32) -> Option<u32> {
+        let pending = catalog.pending_enum_members[slot as usize];
+        catalog.pending_enum_members[slot as usize] = PendingEnumMemberSlot::EMPTY;
         pending.previous
     }
 
-    fn clear_pending_enum_member_chain(&mut self, mut tail: Option<u32>) {
+    fn clear_pending_enum_member_chain(catalog: &mut TypeCatalog, mut tail: Option<u32>) {
         while let Some(slot) = tail {
-            tail = self.release_pending_enum_members(slot);
+            tail = Self::release_pending_enum_members(catalog, slot);
         }
     }
 
     pub(crate) fn commit_enum_alter(&mut self, slot: usize, txid: u32) {
-        if let Some(pending) = self.enums[slot]
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-        {
-            let definition = self.enums[slot].definition_for(txid);
-            let previous = self.enums[slot];
-            if definition.schema != previous.schema || definition.name != previous.name {
-                self.move_enum_references(
-                    slot,
-                    previous.schema,
-                    previous.name,
-                    definition.schema,
-                    definition.name,
-                );
-            }
+        let rename = {
+            let mut catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            let Some(pending) = catalog.enums[slot]
+                .pending_definition
+                .filter(|pending| pending.txid == txid)
+            else {
+                return;
+            };
+            let definition = catalog.enums[slot].definition_for(txid);
+            let previous = catalog.enums[slot];
             let source = (self.enum_member_pending_base + pending.member_slot as usize)
                 * self.enum_members_per_image;
             let target = slot * self.enum_members_per_image;
             let count = pending.member_count as usize;
-            self.enum_members
+            catalog
+                .enum_members
                 .copy_within(source..source + count, target);
-            self.enums[slot] = definition;
-            self.clear_pending_enum_member_chain(Some(pending.member_slot));
+            catalog.enums[slot] = definition;
+            Self::clear_pending_enum_member_chain(&mut catalog, Some(pending.member_slot));
+            (definition.schema != previous.schema || definition.name != previous.name).then_some((
+                previous.schema,
+                previous.name,
+                definition.schema,
+                definition.name,
+            ))
+        };
+        if let Some((old_schema, old_name, schema, name)) = rename {
+            self.move_enum_references(slot, old_schema, old_name, schema, name);
         }
     }
 
@@ -36178,18 +36644,22 @@ impl Storage {
         schema: SqlName,
         name: SqlName,
     ) -> Result<(), SqlError> {
-        if self.enums.iter().enumerate().any(|(other_slot, other)| {
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if catalog.enums.iter().enumerate().any(|(other_slot, other)| {
             other_slot != slot
                 && other.database == current_database()
                 && other.visible_to(0)
                 && other.schema == schema
                 && other.name == name
-        }) || self.domains.iter().any(|domain| {
+        }) || catalog.domains.iter().any(|domain| {
             domain.database == current_database()
                 && domain.visible_to(0)
                 && domain.schema == schema
                 && domain.name == name
-        }) || self.composites.iter().any(|composite| {
+        }) || catalog.composites.iter().any(|composite| {
             composite.database == current_database()
                 && composite.visible_to(0)
                 && composite.schema == schema
@@ -36201,11 +36671,12 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let previous = self.enums[slot];
+        let previous = catalog.enums[slot];
         if schema != previous.schema || name != previous.name {
+            catalog.enums[slot].schema = schema;
+            catalog.enums[slot].name = name;
+            drop(catalog);
             self.move_enum_references(slot, previous.schema, previous.name, schema, name);
-            self.enums[slot].schema = schema;
-            self.enums[slot].name = name;
         }
         Ok(())
     }
@@ -36215,10 +36686,14 @@ impl Storage {
         slot: usize,
         prior: Option<PendingEnumDefinition>,
     ) {
-        if let Some(current) = self.enums[slot].pending_definition {
-            self.release_pending_enum_members(current.member_slot);
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if let Some(current) = catalog.enums[slot].pending_definition {
+            Self::release_pending_enum_members(&mut catalog, current.member_slot);
         }
-        self.enums[slot].pending_definition = prior;
+        catalog.enums[slot].pending_definition = prior;
     }
 
     /// Moves an enum and every persisted reference to its type identity. Runtime
@@ -36256,7 +36731,11 @@ impl Storage {
                 table.mark_dirty();
             }
         }
-        for composite in self
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        for composite in catalog
             .composites
             .iter_mut()
             .filter(|composite| composite.ddl_state != CatalogDdlState::Absent)
@@ -36280,7 +36759,7 @@ impl Storage {
                 }
             }
         }
-        for domain in self
+        for domain in catalog
             .domains
             .iter_mut()
             .filter(|domain| domain.ddl_state != CatalogDdlState::Absent)
@@ -36298,6 +36777,7 @@ impl Storage {
                 });
             }
         }
+        drop(catalog);
         for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
                 && comment.class == CommentClass::Type
@@ -36326,7 +36806,11 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if let Some(blocker) = self.enums.iter().find_map(|e| {
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if let Some(blocker) = catalog.enums.iter().find_map(|e| {
             let same_name = e.schema.as_str() == schema
                 && (e.name.as_str() == name
                     || e.pending_definition
@@ -36342,39 +36826,61 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
-        let Some(i) = self.enums.iter().position(|e| {
+        let Some(i) = catalog.enums.iter().position(|e| {
             e.visible_to(txid)
                 && e.schema.as_str() == schema
                 && e.definition_for(txid).name.as_str() == name
         }) else {
             return Ok(None);
         };
-        let e = &mut self.enums[i];
+        let e = &mut catalog.enums[i];
         e.ddl_state = e.ddl_state.drop_by(txid);
         Ok(Some(i))
     }
 
     pub fn commit_enum_create(&mut self, slot: usize) {
-        self.enums[slot].ddl_state = self.enums[slot].ddl_state.commit_create();
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog.enums[slot].ddl_state = catalog.enums[slot].ddl_state.commit_create();
     }
 
     pub fn commit_enum_drop(&mut self, slot: usize) {
-        let (schema, name) = (self.enums[slot].schema, self.enums[slot].name);
+        let (schema, name) = {
+            let catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            (catalog.enums[slot].schema, catalog.enums[slot].name)
+        };
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
-        let pending = self.enums[slot]
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let pending = catalog.enums[slot]
             .pending_definition
             .take()
             .map(|pending| pending.member_slot);
-        self.clear_pending_enum_member_chain(pending);
-        self.enums[slot].ddl_state = self.enums[slot].ddl_state.commit_drop();
+        Self::clear_pending_enum_member_chain(&mut catalog, pending);
+        catalog.enums[slot].ddl_state = catalog.enums[slot].ddl_state.commit_drop();
     }
 
     pub fn rollback_enum_create(&mut self, slot: usize) {
-        self.enums[slot].ddl_state = self.enums[slot].ddl_state.rollback_create();
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog.enums[slot].ddl_state = catalog.enums[slot].ddl_state.rollback_create();
     }
 
     pub fn rollback_enum_drop(&mut self, slot: usize, txid: u32) {
-        let e = &mut self.enums[slot];
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let e = &mut catalog.enums[slot];
         e.ddl_state = e.ddl_state.rollback_drop(txid);
     }
 
@@ -36404,11 +36910,16 @@ impl Storage {
     }
 
     pub fn composite_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        self.composites.iter().position(|definition| {
-            definition.database == current_database()
+        CompositeIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .find_map(|(slot, definition)| {
+            (definition.database == current_database()
                 && definition.visible_to(txid)
                 && definition.definition_for(txid).schema.as_str() == schema
-                && definition.definition_for(txid).name.as_str() == name
+                && definition.definition_for(txid).name.as_str() == name)
+                .then_some(slot)
         })
     }
 
@@ -36457,44 +36968,53 @@ impl Storage {
         }
     }
 
-    pub fn composite(&self, slot: usize) -> &CompositeDef {
-        &self.composites[slot]
+    pub fn composite(&self, slot: usize) -> CompositeDef {
+        self.type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .composites[slot]
     }
 
     pub(crate) fn composite_for(&self, slot: usize, txid: u32) -> CompositeDef {
-        self.composites[slot].definition_for(txid)
+        self.composite(slot).definition_for(txid)
     }
 
-    pub fn live_composites(&self) -> impl Iterator<Item = (usize, &CompositeDef)> {
-        self.composites
-            .iter()
-            .enumerate()
-            .filter(|(_, definition)| {
-                definition.database == current_database()
-                    && definition.ddl_state == CatalogDdlState::Present
-            })
+    pub fn live_composites(&self) -> impl Iterator<Item = (usize, CompositeDef)> + '_ {
+        CompositeIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, definition)| {
+            definition.database == current_database()
+                && definition.ddl_state == CatalogDdlState::Present
+        })
     }
 
     pub(crate) fn composite_count(&self) -> usize {
-        self.composites.len()
+        self.type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .composites
+            .len()
     }
 
     pub(crate) fn composites_with_slots_visible_to(
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, CompositeDef)> + '_ {
-        self.composites
-            .iter()
-            .enumerate()
-            .filter(move |(_, definition)| {
-                definition.database == current_database() && definition.visible_to(txid)
-            })
-            .map(move |(slot, definition)| (slot, definition.definition_for(txid)))
+        CompositeIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, definition)| {
+            definition.database == current_database() && definition.visible_to(txid)
+        })
+        .map(move |(slot, definition)| (slot, definition.definition_for(txid)))
     }
 
     pub(crate) fn composite_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.composites[slot].database == current_database()
-            && self.composites[slot].visible_to(txid)
+        let composite = self.composite(slot);
+        composite.database == current_database() && composite.visible_to(txid)
     }
 
     pub(crate) fn stage_composite_alter(
@@ -36503,7 +37023,11 @@ impl Storage {
         definition: CompositeDef,
         txid: u32,
     ) -> Result<Option<PendingCompositeDefinition>, SqlError> {
-        if let Some(blocker) = self.enums.iter().find_map(|enumeration| {
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if let Some(blocker) = catalog.enums.iter().find_map(|enumeration| {
             (enumeration.database == current_database()
                 && (enumeration.schema == definition.schema && enumeration.name == definition.name
                     || enumeration.pending_definition.is_some_and(|pending| {
@@ -36520,7 +37044,7 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
-        if let Some(blocker) = self.domains.iter().find_map(|domain| {
+        if let Some(blocker) = catalog.domains.iter().find_map(|domain| {
             (domain.database == current_database()
                 && (domain.schema == definition.schema && domain.name == definition.name
                     || domain
@@ -36534,40 +37058,42 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
-        if let Some(blocker) = self
-            .composites
-            .iter()
-            .enumerate()
-            .find_map(|(other_slot, other)| {
-                (other_slot != slot
-                    && other.database == current_database()
-                    && (other.schema == definition.schema && other.name == definition.name
-                        || other.pending_definition.is_some_and(|pending| {
-                            pending.schema == definition.schema && pending.name == definition.name
-                        })))
-                .then(|| {
-                    other
-                        .pending_definition
-                        .map(|pending| pending.txid)
-                        .or_else(|| other.ddl_state.pending_txid())
+        if let Some(blocker) =
+            catalog
+                .composites
+                .iter()
+                .enumerate()
+                .find_map(|(other_slot, other)| {
+                    (other_slot != slot
+                        && other.database == current_database()
+                        && (other.schema == definition.schema && other.name == definition.name
+                            || other.pending_definition.is_some_and(|pending| {
+                                pending.schema == definition.schema
+                                    && pending.name == definition.name
+                            })))
+                    .then(|| {
+                        other
+                            .pending_definition
+                            .map(|pending| pending.txid)
+                            .or_else(|| other.ddl_state.pending_txid())
+                    })
+                    .flatten()
+                    .filter(|&owner| owner != txid)
                 })
-                .flatten()
-                .filter(|&owner| owner != txid)
-            })
         {
             return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
-        if self.enums.iter().any(|enumeration| {
+        if catalog.enums.iter().any(|enumeration| {
             enumeration.database == current_database()
                 && enumeration.visible_to(txid)
                 && enumeration.definition_for(txid).schema == definition.schema
                 && enumeration.definition_for(txid).name == definition.name
-        }) || self.domains.iter().any(|domain| {
+        }) || catalog.domains.iter().any(|domain| {
             domain.database == current_database()
                 && domain.visible_to(txid)
                 && domain.definition_for(txid).schema == definition.schema
                 && domain.definition_for(txid).name == definition.name
-        }) || self
+        }) || catalog
             .composites
             .iter()
             .enumerate()
@@ -36585,8 +37111,8 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        let name = self.composites[slot].name;
-        let composite = &mut self.composites[slot];
+        let name = catalog.composites[slot].name;
+        let composite = &mut catalog.composites[slot];
         if let Some(pending) = composite.pending_definition
             && pending.txid != txid
         {
@@ -36605,7 +37131,11 @@ impl Storage {
 
     pub(crate) fn commit_composite_alter(&mut self, slot: usize, txid: u32) {
         let renamed = {
-            let composite = &mut self.composites[slot];
+            let mut catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            let composite = &mut catalog.composites[slot];
             if let Some(pending) = composite.pending_definition
                 && pending.txid == txid
             {
@@ -36671,7 +37201,11 @@ impl Storage {
                 table.mark_dirty();
             }
         }
-        for composite in self
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        for composite in catalog
             .composites
             .iter_mut()
             .filter(|composite| composite.ddl_state != CatalogDdlState::Absent)
@@ -36715,7 +37249,7 @@ impl Storage {
                 }
             }
         }
-        for domain in self
+        for domain in catalog
             .domains
             .iter_mut()
             .filter(|domain| domain.ddl_state != CatalogDdlState::Absent)
@@ -36733,6 +37267,7 @@ impl Storage {
                 });
             }
         }
+        drop(catalog);
         for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
                 && comment.class == CommentClass::Type
@@ -36866,7 +37401,11 @@ impl Storage {
         slot: usize,
         prior: Option<PendingCompositeDefinition>,
     ) {
-        self.composites[slot].pending_definition = prior;
+        self.type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .composites[slot]
+            .pending_definition = prior;
     }
 
     pub fn create_composite(
@@ -36877,60 +37416,6 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
-        if let Some(blocker) = self.domains.iter().find_map(|domain| {
-            (domain.database == current_database()
-                && (domain.schema == schema && domain.name == name
-                    || domain
-                        .pending_definition
-                        .and_then(|pending| pending.identity)
-                        .is_some_and(|identity| {
-                            identity.schema == schema && identity.name == name
-                        })))
-            .then(|| {
-                domain
-                    .pending_definition
-                    .map(|pending| pending.txid)
-                    .or_else(|| domain.ddl_state.pending_txid())
-            })
-            .flatten()
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if let Some(blocker) = self.enums.iter().find_map(|enumeration| {
-            (enumeration.database == current_database()
-                && (enumeration.schema == schema && enumeration.name == name
-                    || enumeration
-                        .pending_definition
-                        .is_some_and(|pending| pending.schema == schema && pending.name == name)))
-            .then(|| {
-                enumeration
-                    .pending_definition
-                    .map(|pending| pending.txid)
-                    .or_else(|| enumeration.ddl_state.pending_txid())
-            })
-            .flatten()
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if let Some(blocker) = self.composites.iter().find_map(|composite| {
-            (composite.database == current_database()
-                && (composite.schema == schema && composite.name == name
-                    || composite
-                        .pending_definition
-                        .is_some_and(|pending| pending.schema == schema && pending.name == name)))
-            .then(|| {
-                composite
-                    .pending_definition
-                    .map(|pending| pending.txid)
-                    .or_else(|| composite.ddl_state.pending_txid())
-            })
-            .flatten()
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
         for field in spec.fields.iter_mut().take(spec.n_fields) {
             let Some(identity) = field.user_type else {
                 continue;
@@ -36960,15 +37445,80 @@ impl Storage {
                 field.ctype = ctype;
             }
         }
-        let exists = self
-            .domain_slot(schema.as_str(), name.as_str(), txid)
-            .is_some()
-            || self
-                .enum_slot(schema.as_str(), name.as_str(), txid)
-                .is_some()
-            || self
-                .composite_slot(schema.as_str(), name.as_str(), txid)
-                .is_some();
+        let created_at = self.catalog_sequence.next();
+        let ownership = self.initial_ownership(txid);
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let blocker = catalog
+            .domains
+            .iter()
+            .filter_map(|domain| {
+                (domain.database == current_database()
+                    && (domain.schema == schema && domain.name == name
+                        || domain
+                            .pending_definition
+                            .and_then(|pending| pending.identity)
+                            .is_some_and(|identity| {
+                                identity.schema == schema && identity.name == name
+                            })))
+                .then(|| {
+                    domain
+                        .pending_definition
+                        .map(|pending| pending.txid)
+                        .or_else(|| domain.ddl_state.pending_txid())
+                })
+                .flatten()
+            })
+            .chain(catalog.enums.iter().filter_map(|enumeration| {
+                (enumeration.database == current_database()
+                    && (enumeration.schema == schema && enumeration.name == name
+                        || enumeration.pending_definition.is_some_and(|pending| {
+                            pending.schema == schema && pending.name == name
+                        })))
+                .then(|| {
+                    enumeration
+                        .pending_definition
+                        .map(|pending| pending.txid)
+                        .or_else(|| enumeration.ddl_state.pending_txid())
+                })
+                .flatten()
+            }))
+            .chain(catalog.composites.iter().filter_map(|composite| {
+                (composite.database == current_database()
+                    && (composite.schema == schema && composite.name == name
+                        || composite.pending_definition.is_some_and(|pending| {
+                            pending.schema == schema && pending.name == name
+                        })))
+                .then(|| {
+                    composite
+                        .pending_definition
+                        .map(|pending| pending.txid)
+                        .or_else(|| composite.ddl_state.pending_txid())
+                })
+                .flatten()
+            }))
+            .find(|&owner| owner != txid);
+        if let Some(blocker) = blocker {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let exists = catalog.domains.iter().any(|domain| {
+            domain.database == current_database()
+                && domain.visible_to(txid)
+                && domain.definition_for(txid).schema == schema
+                && domain.definition_for(txid).name == name
+        }) || catalog.enums.iter().any(|enumeration| {
+            enumeration.database == current_database()
+                && enumeration.visible_to(txid)
+                && enumeration.definition_for(txid).schema == schema
+                && enumeration.definition_for(txid).name == name
+        }) || catalog.composites.iter().any(|composite| {
+            composite.database == current_database()
+                && composite.visible_to(txid)
+                && composite.definition_for(txid).schema == schema
+                && composite.definition_for(txid).name == name
+        });
         if exists {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -36976,7 +37526,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let Some(slot) = self
+        let Some(slot) = catalog
             .composites
             .iter()
             .position(|definition| definition.ddl_state == CatalogDdlState::Absent)
@@ -36984,10 +37534,29 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many composite types (limit {})",
-                self.composites.len()
+                catalog.composites.len()
             ));
         };
-        self.create_composite_at(slot, schema, name, spec, txid)
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Composite,
+            slot: slot as u16,
+        });
+        catalog.composites[slot] = CompositeDef {
+            database: current_database(),
+            created_at,
+            schema,
+            name,
+            ownership,
+            fields: spec.fields,
+            n_fields: spec.n_fields,
+            pending_definition: None,
+            ddl_state: if txid == 0 {
+                CatalogDdlState::Present
+            } else {
+                CatalogDdlState::PendingCreate { txid }
+            },
+        };
+        Ok(slot)
     }
 
     /// Replays a durable composite catalog identity. A WAL record names the
@@ -37001,14 +37570,6 @@ impl Storage {
         mut spec: CompositeSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if slot >= self.composites.len()
-            || self.composites[slot].ddl_state != CatalogDdlState::Absent
-        {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "journal composite catalog identity is unavailable"
-            ));
-        }
         for field in spec.fields.iter_mut().take(spec.n_fields) {
             let Some(identity) = field.user_type else {
                 continue;
@@ -37038,16 +37599,29 @@ impl Storage {
             }
         }
         let created_at = self.catalog_sequence.next();
+        let ownership = self.initial_ownership(txid);
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if slot >= catalog.composites.len()
+            || catalog.composites[slot].ddl_state != CatalogDdlState::Absent
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "journal composite catalog identity is unavailable"
+            ));
+        }
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Composite,
             slot: slot as u16,
         });
-        self.composites[slot] = CompositeDef {
+        catalog.composites[slot] = CompositeDef {
             database: current_database(),
             created_at,
             schema,
             name,
-            ownership: self.initial_ownership(txid),
+            ownership,
             fields: spec.fields,
             n_fields: spec.n_fields,
             pending_definition: None,
@@ -37061,7 +37635,11 @@ impl Storage {
     }
 
     pub fn commit_composite_create(&mut self, slot: usize) {
-        self.composites[slot].ddl_state = self.composites[slot].ddl_state.commit_create();
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog.composites[slot].ddl_state = catalog.composites[slot].ddl_state.commit_create();
     }
 
     pub fn drop_composite(
@@ -37070,7 +37648,11 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if let Some(blocker) = self.composites.iter().find_map(|definition| {
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        if let Some(blocker) = catalog.composites.iter().find_map(|definition| {
             (definition.database == current_database()
                 && definition.schema.as_str() == schema
                 && (definition.name.as_str() == name
@@ -37088,7 +37670,7 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
-        let Some(slot) = self.composites.iter().position(|definition| {
+        let Some(slot) = catalog.composites.iter().position(|definition| {
             definition.database == current_database()
                 && definition.visible_to(txid)
                 && definition.schema.as_str() == schema
@@ -37096,26 +37678,38 @@ impl Storage {
         }) else {
             return Ok(None);
         };
-        self.composites[slot].ddl_state = self.composites[slot].ddl_state.drop_by(txid);
+        catalog.composites[slot].ddl_state = catalog.composites[slot].ddl_state.drop_by(txid);
         Ok(Some(slot))
     }
 
     pub fn commit_composite_drop(&mut self, slot: usize) {
-        let definition = self.composites[slot];
+        let definition = self.composite(slot);
         self.drop_object_comments(
             CommentClass::Type,
             definition.schema.as_str(),
             definition.name.as_str(),
         );
-        self.composites[slot].ddl_state = self.composites[slot].ddl_state.commit_drop();
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog.composites[slot].ddl_state = catalog.composites[slot].ddl_state.commit_drop();
     }
 
     pub fn rollback_composite_create(&mut self, slot: usize) {
-        self.composites[slot].ddl_state = self.composites[slot].ddl_state.rollback_create();
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog.composites[slot].ddl_state = catalog.composites[slot].ddl_state.rollback_create();
     }
 
     pub fn rollback_composite_drop(&mut self, slot: usize, txid: u32) {
-        self.composites[slot].ddl_state = self.composites[slot].ddl_state.rollback_drop(txid);
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog.composites[slot].ddl_state = catalog.composites[slot].ddl_state.rollback_drop(txid);
     }
 
     /// Registers a view as an uncommitted CREATE owned by `txid` (other
@@ -47908,7 +48502,11 @@ mod tests {
         assert_eq!(storage.schemas.len(), 17);
         assert_eq!(storage.sequences.len(), 18);
         assert_eq!(storage.sequence_values().capacity(), 18);
-        assert_eq!(storage.domains.len(), 26);
+        let type_catalog = storage
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        assert_eq!(type_catalog.domains.len(), 26);
         assert_eq!(
             storage
                 .domain_graph_scratch
@@ -47917,17 +48515,18 @@ mod tests {
                 .len(),
             26
         );
-        assert_eq!(storage.enums.len(), 28);
+        assert_eq!(type_catalog.enums.len(), 28);
         assert_eq!(storage.enum_members_per_image, 96);
         assert_eq!(
-            storage.pending_enum_members.len(),
+            type_catalog.pending_enum_members.len(),
             pending_enum_definition_capacity(&config)
         );
         assert_eq!(
-            storage.enum_members.len(),
+            type_catalog.enum_members.len(),
             enum_member_image_capacity(&config) * 96
         );
-        assert_eq!(storage.composites.len(), 29);
+        assert_eq!(type_catalog.composites.len(), 29);
+        drop(type_catalog);
         let role_catalog = storage
             .role_catalog
             .lock()
@@ -48606,6 +49205,110 @@ mod tests {
             storage
                 .comment_text(CommentClass::AccessMethod, "", "", oid, 0,)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn type_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<TypeCatalog>>();
+        assert_send_sync::<DomainIter<'_>>();
+        assert_send_sync::<EnumIter<'_>>();
+        assert_send_sync::<EnumMemberIter<'_>>();
+        assert_send_sync::<CompositeIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_domains = WORKERS;
+        config.max_enums = WORKERS;
+        config.max_enum_labels_per_type = WORKERS;
+        config.max_composites = WORKERS;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let domain_name = stack_format!(63, "domain_{worker}");
+                    let enum_name = stack_format!(63, "enum_{worker}");
+                    let composite_name = stack_format!(63, "composite_{worker}");
+                    let label = stack_format!(63, "label_{worker}");
+                    let mut catalog = storage
+                        .type_catalog
+                        .lock()
+                        .expect("type catalog lock poisoned");
+
+                    let mut domain = DomainDef::EMPTY;
+                    domain.created_at = worker as u64 + 1;
+                    domain.name = SqlName::parse(domain_name.as_str()).unwrap();
+                    domain.ddl_state = CatalogDdlState::Present;
+                    catalog.domains[worker] = domain;
+
+                    let mut enumeration = EnumDef::EMPTY;
+                    enumeration.created_at = worker as u64 + 101;
+                    enumeration.name = SqlName::parse(enum_name.as_str()).unwrap();
+                    enumeration.member_count = 1;
+                    enumeration.ddl_state = CatalogDdlState::Present;
+                    catalog.enums[worker] = enumeration;
+                    catalog.enum_members[worker * WORKERS] = EnumMember {
+                        label: SqlName::parse(label.as_str()).unwrap(),
+                        sort: worker as f64 + 1.0,
+                    };
+
+                    let mut composite = CompositeDef::EMPTY;
+                    composite.created_at = worker as u64 + 201;
+                    composite.name = SqlName::parse(composite_name.as_str()).unwrap();
+                    composite.ddl_state = CatalogDdlState::Present;
+                    catalog.composites[worker] = composite;
+                });
+            }
+        });
+
+        let catalog = storage
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        assert_eq!(catalog.domains.capacity(), WORKERS);
+        assert_eq!(catalog.enums.capacity(), WORKERS);
+        assert_eq!(catalog.composites.capacity(), WORKERS);
+        assert_eq!(
+            catalog.enum_members.capacity(),
+            enum_member_image_capacity(&config) * WORKERS
+        );
+        assert_eq!(
+            catalog.pending_enum_members.capacity(),
+            pending_enum_definition_capacity(&config)
+        );
+        drop(catalog);
+
+        assert_eq!(storage.live_domains().count(), WORKERS);
+        assert_eq!(storage.live_enums().count(), WORKERS);
+        assert_eq!(storage.live_composites().count(), WORKERS);
+        for (slot, domain) in storage.live_domains() {
+            assert_eq!(storage.domain(slot).name, domain.name);
+            assert_eq!(storage.enum_for(slot, 0).members().len(), 1);
+            assert!(storage.composite(slot).visible_to(0));
+        }
+
+        assert!(
+            storage
+                .create_domain(
+                    SqlName::parse("public").unwrap(),
+                    SqlName::parse("domain_full").unwrap(),
+                    DomainSpec {
+                        base_domain: None,
+                        base_user_type: None,
+                        base: ColType::Int4,
+                        base_type_mod: -1,
+                        not_null: false,
+                        default_expr: None,
+                        checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
+                        n_checks: 0,
+                    },
+                    9,
+                )
+                .is_err()
         );
     }
 

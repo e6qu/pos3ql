@@ -39987,7 +39987,8 @@ pub fn create_domain(
         Err(e) => return sql_fail(e),
     };
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateDomain(storage.domain(slot))) {
+    let definition = storage.domain(slot);
+    if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateDomain(&definition)) {
         storage.rollback_domain_create(slot);
         return sql_fail(e);
     }
@@ -41297,7 +41298,7 @@ pub fn create_enum(
         &WalOp::CreateEnum {
             schema: definition.schema.as_str(),
             name: definition.name.as_str(),
-            members: definition.members(),
+            members: spec.members,
         },
     ) {
         storage.rollback_enum_create(slot);
@@ -43993,6 +43994,21 @@ fn enum_column_in_use(
     None
 }
 
+fn copy_enum_members<'a>(
+    definition: &crate::storage::EnumDefinition<'_>,
+    arena: &'a Arena,
+) -> Result<&'a mut [crate::storage::EnumMember], SqlError> {
+    let members = arena
+        .alloc_slice_with(definition.members().len(), |_| {
+            crate::storage::EnumMember::EMPTY
+        })
+        .map_err(|_| arena_full())?;
+    for (target, source) in members.iter_mut().zip(definition.members()) {
+        *target = source;
+    }
+    Ok(members)
+}
+
 pub fn alter_type(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -44071,12 +44087,8 @@ pub fn alter_type(
                     label
                 ));
             }
-            let altered = match arena.alloc_slice_with(current.members().len() + 1, |index| {
-                current
-                    .members()
-                    .get(index)
-                    .copied()
-                    .unwrap_or(crate::storage::EnumMember::EMPTY)
+            let altered = match arena.alloc_slice_with(current.members().len() + 1, |_| {
+                crate::storage::EnumMember::EMPTY
             }) {
                 Ok(members) => members,
                 Err(_) => {
@@ -44086,6 +44098,9 @@ pub fn alter_type(
                     ));
                 }
             };
+            for (target, source) in altered.iter_mut().zip(current.members()) {
+                *target = source;
+            }
             let (sort, renumbered) = match compute_add_value_sort(
                 &mut altered[..current.members().len()],
                 before.as_deref(),
@@ -44172,7 +44187,7 @@ pub fn alter_type(
                 Ok(name) => name,
                 Err(e) => return sql_fail(e),
             };
-            let members = match arena.alloc_slice_copy(current.members()) {
+            let members = match copy_enum_members(&current, arena) {
                 Ok(members) => members,
                 Err(_) => {
                     return sql_fail(sql_err!(
@@ -44248,7 +44263,7 @@ pub fn alter_type(
                     current.name.as_str()
                 ));
             }
-            let members = match arena.alloc_slice_copy(current.members()) {
+            let members = match copy_enum_members(&current, arena) {
                 Ok(members) => members,
                 Err(_) => {
                     return sql_fail(sql_err!(
@@ -44290,7 +44305,6 @@ pub fn alter_type(
             let current_name = current.name;
             let Some(member_index) = current
                 .members()
-                .iter()
                 .position(|member| member.label.as_str() == *from)
             else {
                 return sql_fail(sql_err!(
@@ -44310,7 +44324,7 @@ pub fn alter_type(
                 Ok(label) => label,
                 Err(e) => return sql_fail(e),
             };
-            let altered = match arena.alloc_slice_copy(current.members()) {
+            let altered = match copy_enum_members(&current, arena) {
                 Ok(members) => members,
                 Err(_) => {
                     return sql_fail(sql_err!(
@@ -57401,6 +57415,7 @@ pub(crate) fn instead_of_view_dml<'a>(
             alias,
             storage,
             txn.txid,
+            arena,
             &mut description,
         ) {
             Ok(count) => count,
@@ -58296,6 +58311,7 @@ where
             None,
             Some(storage),
             txn.txid,
+            arena,
             &mut columns,
         ) {
             Ok(n) => responder.row_description(&columns[..n])?,
@@ -59645,6 +59661,7 @@ pub(crate) fn update<'a>(
             statement.alias,
             Some(storage),
             txn.txid,
+            arena,
             &mut columns,
         ) {
             Ok(n) => responder.row_description(&columns[..n])?,
@@ -60563,6 +60580,7 @@ pub(crate) fn delete<'a>(
             statement.alias,
             Some(storage),
             txn.txid,
+            arena,
             &mut columns,
         ) {
             Ok(n) => responder.row_description(&columns[..n])?,

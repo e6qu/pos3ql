@@ -749,6 +749,15 @@ type, schema, role, or operator resolution. Four-worker publication,
 nested-reader progress, exact retained capacities, access-method exhaustion,
 and `Send + Sync` have direct coverage. The same audit fixed access-method drop
 retaining comments keyed by a reusable catalog identity.
+The type catalog audit found domains, enums and their committed and pending
+member images, and named composites in five unsynchronized fixed vectors.
+Overlapping type DDL, replay, database cloning, schema and type moves,
+ownership, checkpoint, and catalog work could lose updates or combine fields
+from different transitions. One startup-bounded mutex now owns the complete
+type namespace. Iterators copy one fixed definition or member and release the
+lock before nested catalog resolution. Four-worker publication across every
+type family, nested-reader progress, exact retained capacities, domain
+exhaustion, and `Send + Sync` have direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

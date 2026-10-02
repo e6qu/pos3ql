@@ -157,6 +157,9 @@ active production roadmap is [PLAN.md](../PLAN.md).
   complete entries before nested role or object resolution. Role definitions,
   memberships, and per-role settings share one startup-bounded mutex; readers
   copy complete entries before nested authorization or catalog resolution.
+  Access method definitions, operators, operator families, and operator classes
+  share one startup-bounded mutex; readers copy complete entries before nested
+  routine, type, schema, role, or operator resolution.
   Engine mutation remains single-owner and serialized while the other catalog
   definition containers, cache, and row sharing are prepared. Authorization
   graph traversal uses one exactly charged bitmap per query workspace,

@@ -116,15 +116,21 @@ pub(crate) fn access_method_oid_in(storage: &Storage, txid: u32, name: &str) -> 
     })
 }
 
-pub(crate) fn access_method_name_in(storage: &Storage, txid: u32, oid: i32) -> Option<&str> {
-    access_method_name(oid).or_else(|| {
-        crate::storage::AccessMethodOid::parse(oid).and_then(|oid| {
-            storage
-                .access_methods_visible_to(txid)
-                .find(|(_, method)| method.oid() == oid)
-                .map(|(_, method)| method.definition.name.as_str())
+pub(crate) fn access_method_name_in(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Option<crate::storage::SqlName> {
+    access_method_name(oid)
+        .and_then(|name| crate::storage::SqlName::parse(name).ok())
+        .or_else(|| {
+            crate::storage::AccessMethodOid::parse(oid).and_then(|oid| {
+                storage
+                    .access_methods_visible_to(txid)
+                    .find(|(_, method)| method.oid() == oid)
+                    .map(|(_, method)| method.definition.name)
+            })
         })
-    })
 }
 
 pub(crate) fn procedural_language_oid(name: &str) -> Option<i32> {
@@ -13817,7 +13823,9 @@ fn pg_description<'a>(
                 let Ok(oid) = i32::try_from(subid) else {
                     continue;
                 };
-                if access_method_name_in(storage, txid, oid) != Some(name) {
+                if !access_method_name_in(storage, txid, oid)
+                    .is_some_and(|candidate| candidate.as_str() == name)
+                {
                     continue;
                 }
                 (oid, PG_AM_OID)
@@ -14437,7 +14445,8 @@ pub fn comment_text_for<'a>(
                     && subid == 0
                     && signed_oid.is_some_and(|access_method_oid| {
                         csub == access_method_oid as u32
-                            && access_method_name_in(storage, txid, access_method_oid) == Some(name)
+                            && access_method_name_in(storage, txid, access_method_oid)
+                                .is_some_and(|candidate| candidate.as_str() == name)
                     })
             }
             "pg_language" => {

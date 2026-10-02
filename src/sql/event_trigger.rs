@@ -1149,7 +1149,8 @@ fn comment_reference(
         )),
         CommentClass::AccessMethod => {
             let oid = i32::try_from(subid).map_err(|_| graph_full())?;
-            (catalog::access_method_name_in(storage, txid, oid) == Some(name.as_str()))
+            catalog::access_method_name_in(storage, txid, oid)
+                .is_some_and(|candidate| candidate.as_str() == name.as_str())
                 .then_some(EventObjectRef::Primary(ObjectRef::AccessMethod(oid)))
                 .ok_or_else(graph_full)?
         }
@@ -1965,16 +1966,19 @@ fn primary_object(
             )
         }
         ObjectRef::AccessMethod(oid) => {
-            let name = catalog::access_method_name(oid)
-                .or_else(|| storage.access_method_name_by_oid(oid))
-                .ok_or_else(graph_full)?;
+            let name = match catalog::access_method_name(oid) {
+                Some(name) => crate::storage::SqlName::parse(name).map_err(|_| graph_full())?,
+                None => storage
+                    .access_method_name_by_oid(oid)
+                    .ok_or_else(graph_full)?,
+            };
             base_object(
                 catalog::PG_AM_OID,
                 oid,
                 "access method",
                 None,
-                Some(name),
-                StackStr::from_str(identifier(name).as_str()),
+                Some(name.as_str()),
+                StackStr::from_str(identifier(name.as_str()).as_str()),
                 false,
             )
         }

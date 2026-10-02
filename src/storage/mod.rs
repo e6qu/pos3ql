@@ -6927,6 +6927,81 @@ impl OperatorClassDef {
     }
 }
 
+struct OperatorCatalog {
+    access_methods: FixedVec<AccessMethodDef>,
+    operators: FixedVec<OperatorDef>,
+    families: FixedVec<OperatorFamilyDef>,
+    classes: FixedVec<OperatorClassDef>,
+}
+
+struct AccessMethodIter<'a> {
+    catalog: &'a std::sync::Mutex<OperatorCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for AccessMethodIter<'_> {
+    type Item = (usize, AccessMethodDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("operator catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.access_methods.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
+struct OperatorIter<'a> {
+    catalog: &'a std::sync::Mutex<OperatorCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for OperatorIter<'_> {
+    type Item = (usize, OperatorDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("operator catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.operators.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
+struct OperatorFamilyIter<'a> {
+    catalog: &'a std::sync::Mutex<OperatorCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for OperatorFamilyIter<'_> {
+    type Item = (usize, OperatorFamilyDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("operator catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.families.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
+struct OperatorClassIter<'a> {
+    catalog: &'a std::sync::Mutex<OperatorCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for OperatorClassIter<'_> {
+    type Item = (usize, OperatorClassDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("operator catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.classes.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RoutineSpec {
     pub identity: RoutineIdentity,
@@ -12442,10 +12517,7 @@ pub struct Storage {
     rules: FixedVec<RuleDef>,
     routines: FixedVec<RoutineDef>,
     casts: FixedVec<CastDef>,
-    access_methods: FixedVec<AccessMethodDef>,
-    operators: FixedVec<OperatorDef>,
-    operator_families: FixedVec<OperatorFamilyDef>,
-    operator_classes: FixedVec<OperatorClassDef>,
+    operator_catalog: std::sync::Mutex<OperatorCatalog>,
     collations: FixedVec<CollationDef>,
     conversions: FixedVec<ConversionDef>,
     text_search_objects: FixedVec<TextSearchDef>,
@@ -17068,10 +17140,12 @@ impl Storage {
             rules,
             routines,
             casts,
-            access_methods,
-            operators,
-            operator_families,
-            operator_classes,
+            operator_catalog: std::sync::Mutex::new(OperatorCatalog {
+                access_methods,
+                operators,
+                families: operator_families,
+                classes: operator_classes,
+            }),
             collations,
             conversions,
             text_search_objects,
@@ -18652,13 +18726,17 @@ impl Storage {
                 );
             }
 
-            for source_slot in 0..self.access_methods.len() {
-                let mut definition = self.access_methods[source_slot];
+            let mut operator_catalog = self
+                .operator_catalog
+                .lock()
+                .expect("operator catalog lock poisoned");
+            for source_slot in 0..operator_catalog.access_methods.len() {
+                let mut definition = operator_catalog.access_methods[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let target_slot = self
+                let target_slot = operator_catalog
                     .access_methods
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -18670,7 +18748,7 @@ impl Storage {
                     })?;
                 definition.database = target;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.access_methods[target_slot] = definition;
+                operator_catalog.access_methods[target_slot] = definition;
             }
 
             for source_slot in 0..self.event_triggers.len() {
@@ -18724,13 +18802,13 @@ impl Storage {
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                 self.casts[target_slot] = definition;
             }
-            for source_slot in 0..self.operators.len() {
-                let mut definition = self.operators[source_slot];
+            for source_slot in 0..operator_catalog.operators.len() {
+                let mut definition = operator_catalog.operators[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let target_slot = self
+                let target_slot = operator_catalog
                     .operators
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -18740,16 +18818,16 @@ impl Storage {
                 definition.database = target;
                 definition.pending = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.operators[target_slot] = definition;
+                operator_catalog.operators[target_slot] = definition;
             }
-            for source_slot in 0..self.operator_families.len() {
-                let mut definition = self.operator_families[source_slot];
+            for source_slot in 0..operator_catalog.families.len() {
+                let mut definition = operator_catalog.families[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let target_slot = self
-                    .operator_families
+                let target_slot = operator_catalog
+                    .families
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                     .ok_or_else(|| {
@@ -18761,16 +18839,16 @@ impl Storage {
                 definition.database = target;
                 definition.pending = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.operator_families[target_slot] = definition;
+                operator_catalog.families[target_slot] = definition;
             }
-            for source_slot in 0..self.operator_classes.len() {
-                let mut definition = self.operator_classes[source_slot];
+            for source_slot in 0..operator_catalog.classes.len() {
+                let mut definition = operator_catalog.classes[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let target_slot = self
-                    .operator_classes
+                let target_slot = operator_catalog
+                    .classes
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                     .ok_or_else(|| {
@@ -18782,8 +18860,9 @@ impl Storage {
                 definition.database = target;
                 definition.pending = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.operator_classes[target_slot] = definition;
+                operator_catalog.classes[target_slot] = definition;
             }
+            drop(operator_catalog);
 
             for source_slot in 0..self.indexes.len() {
                 let mut definition = self.indexes[source_slot];
@@ -19503,14 +19582,10 @@ impl Storage {
         clear_catalog!(rules);
         clear_catalog!(routines);
         clear_catalog!(casts);
-        clear_catalog!(access_methods);
-        clear_catalog!(operators);
         clear_catalog!(collations);
         clear_catalog!(text_search_objects);
         clear_catalog!(conversions);
         clear_catalog!(event_triggers);
-        clear_catalog!(operator_families);
-        clear_catalog!(operator_classes);
         clear_catalog!(triggers);
         clear_catalog!(policies);
         clear_catalog!(extended_statistics);
@@ -19523,6 +19598,36 @@ impl Storage {
         clear_catalog!(composites);
         clear_catalog!(indexes);
         clear_catalog!(extensions);
+        {
+            let mut catalog = self
+                .operator_catalog
+                .lock()
+                .expect("operator catalog lock poisoned");
+            for definition in catalog.access_methods.iter_mut() {
+                if definition.database == database {
+                    definition.database = DatabaseOid::POSTGRES;
+                    definition.ddl_state = CatalogDdlState::Absent;
+                }
+            }
+            for definition in catalog.operators.iter_mut() {
+                if definition.database == database {
+                    definition.database = DatabaseOid::POSTGRES;
+                    definition.ddl_state = CatalogDdlState::Absent;
+                }
+            }
+            for definition in catalog.families.iter_mut() {
+                if definition.database == database {
+                    definition.database = DatabaseOid::POSTGRES;
+                    definition.ddl_state = CatalogDdlState::Absent;
+                }
+            }
+            for definition in catalog.classes.iter_mut() {
+                if definition.database == database {
+                    definition.database = DatabaseOid::POSTGRES;
+                    definition.ddl_state = CatalogDdlState::Absent;
+                }
+            }
+        }
         for slot in self.replication_slots.iter_mut() {
             if slot.database == database {
                 slot.database = DatabaseOid::POSTGRES;
@@ -19634,14 +19739,10 @@ impl Storage {
         commit_catalog!(rules);
         commit_catalog!(routines);
         commit_catalog!(casts);
-        commit_catalog!(access_methods);
-        commit_catalog!(operators);
         commit_catalog!(collations);
         commit_catalog!(text_search_objects);
         commit_catalog!(conversions);
         commit_catalog!(event_triggers);
-        commit_catalog!(operator_families);
-        commit_catalog!(operator_classes);
         commit_catalog!(triggers);
         commit_catalog!(policies);
         commit_catalog!(extended_statistics);
@@ -19654,6 +19755,40 @@ impl Storage {
         commit_catalog!(composites);
         commit_catalog!(indexes);
         commit_catalog!(extensions);
+        {
+            let mut catalog = self
+                .operator_catalog
+                .lock()
+                .expect("operator catalog lock poisoned");
+            for definition in catalog.access_methods.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+            for definition in catalog.operators.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+            for definition in catalog.families.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+            for definition in catalog.classes.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         for dependency in self.extension_dependencies.iter_mut() {
             if dependency
                 .pending
@@ -20744,38 +20879,42 @@ impl Storage {
         })
     }
 
-    pub(crate) fn checkpoint_operators(&self) -> impl Iterator<Item = (usize, &OperatorDef)> {
-        self.operators
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    pub(crate) fn checkpoint_operators(&self) -> impl Iterator<Item = (usize, OperatorDef)> + '_ {
+        OperatorIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_operator_families(
         &self,
-    ) -> impl Iterator<Item = (usize, &OperatorFamilyDef)> {
-        self.operator_families
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    ) -> impl Iterator<Item = (usize, OperatorFamilyDef)> + '_ {
+        OperatorFamilyIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_operator_classes(
         &self,
-    ) -> impl Iterator<Item = (usize, &OperatorClassDef)> {
-        self.operator_classes
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    ) -> impl Iterator<Item = (usize, OperatorClassDef)> + '_ {
+        OperatorClassIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_access_methods(
         &self,
-    ) -> impl Iterator<Item = (usize, &AccessMethodDef)> {
-        self.access_methods
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    ) -> impl Iterator<Item = (usize, AccessMethodDef)> + '_ {
+        AccessMethodIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_triggers(&self) -> impl Iterator<Item = (usize, &TriggerDef)> {
@@ -24607,7 +24746,11 @@ impl Storage {
                 pending.definition.rename(Some(name), None);
             }
         }
-        for definition in self.operators.iter_mut().filter(|definition| {
+        let mut operator_catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        for definition in operator_catalog.operators.iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -24616,7 +24759,7 @@ impl Storage {
                 rename_schema_name(&mut pending.definition.schema, prior, name);
             }
         }
-        for definition in self.operator_families.iter_mut().filter(|definition| {
+        for definition in operator_catalog.families.iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -24625,7 +24768,7 @@ impl Storage {
                 rename_schema_name(&mut pending.definition.schema, prior, name);
             }
         }
-        for definition in self.operator_classes.iter_mut().filter(|definition| {
+        for definition in operator_catalog.classes.iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -24634,6 +24777,7 @@ impl Storage {
                 rename_schema_name(&mut pending.definition.schema, prior, name);
             }
         }
+        drop(operator_catalog);
         for definition in self.extended_statistics.iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
@@ -42038,7 +42182,11 @@ impl Storage {
         if name == "heap" {
             return Some(TableAccessMethod::Heap);
         }
-        self.access_methods.iter().find_map(|method| {
+        AccessMethodIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .find_map(|(_, method)| {
             (method.database == current_database()
                 && method.visible_to(txid)
                 && method.definition.name.as_str() == name)
@@ -42053,7 +42201,11 @@ impl Storage {
     ) -> Option<SqlName> {
         match method {
             TableAccessMethod::Heap => SqlName::parse("heap").ok(),
-            TableAccessMethod::Catalog(oid) => self.access_methods.iter().find_map(|candidate| {
+            TableAccessMethod::Catalog(oid) => AccessMethodIter {
+                catalog: &self.operator_catalog,
+                next_slot: 0,
+            }
+            .find_map(|(_, candidate)| {
                 (candidate.database == current_database()
                     && candidate.visible_to(txid)
                     && candidate.oid() == oid)
@@ -42063,30 +42215,44 @@ impl Storage {
     }
 
     pub(crate) fn access_method_slot(&self, name: &str, txid: u32) -> Option<usize> {
-        self.access_methods.iter().position(|method| {
-            method.database == current_database()
+        AccessMethodIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .find_map(|(slot, method)| {
+            (method.database == current_database()
                 && method.visible_to(txid)
-                && method.definition.name.as_str() == name
+                && method.definition.name.as_str() == name)
+                .then_some(slot)
         })
     }
 
     pub(crate) fn access_method_oid_at(&self, slot: usize) -> Option<i32> {
-        self.access_methods.get(slot).and_then(|method| {
-            if method.database == current_database() && method.created_at != 0 {
-                Some(method.oid().get())
-            } else {
-                None
-            }
-        })
+        self.operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned")
+            .access_methods
+            .get(slot)
+            .and_then(|method| {
+                if method.database == current_database() && method.created_at != 0 {
+                    Some(method.oid().get())
+                } else {
+                    None
+                }
+            })
     }
 
-    pub(crate) fn access_method_name_by_oid(&self, oid: i32) -> Option<&str> {
-        self.access_methods.iter().find_map(|method| {
+    pub(crate) fn access_method_name_by_oid(&self, oid: i32) -> Option<SqlName> {
+        AccessMethodIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .find_map(|(_, method)| {
             if method.database == current_database()
                 && method.created_at != 0
                 && method.oid().get() == oid
             {
-                Some(method.definition.name.as_str())
+                Some(method.definition.name)
             } else {
                 None
             }
@@ -42096,13 +42262,12 @@ impl Storage {
     pub(crate) fn access_methods_visible_to(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &AccessMethodDef)> {
-        self.access_methods
-            .iter()
-            .enumerate()
-            .filter(move |(_, method)| {
-                method.database == current_database() && method.visible_to(txid)
-            })
+    ) -> impl Iterator<Item = (usize, AccessMethodDef)> + '_ {
+        AccessMethodIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, method)| method.database == current_database() && method.visible_to(txid))
     }
 
     pub(crate) fn access_method_table_dependency(
@@ -42124,7 +42289,7 @@ impl Storage {
     }
 
     pub(crate) fn create_access_method(
-        &mut self,
+        &self,
         created_at: u64,
         definition: AccessMethodDefinition,
         txid: u32,
@@ -42132,17 +42297,35 @@ impl Storage {
         if matches!(
             definition.name.as_str(),
             "heap" | "btree" | "hash" | "gist" | "gin" | "brin" | "spgist"
-        ) || self
-            .access_method_slot(definition.name.as_str(), txid)
-            .is_some()
-        {
+        ) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "access method \"{}\" already exists",
                 definition.name.as_str()
             ));
         }
-        let slot = self
+        let created_at = if created_at == 0 {
+            self.catalog_sequence.next()
+        } else {
+            self.catalog_sequence.observe(created_at);
+            created_at
+        };
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        if catalog.access_methods.iter().any(|method| {
+            method.database == current_database()
+                && method.visible_to(txid)
+                && method.definition.name == definition.name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "access method \"{}\" already exists",
+                definition.name.as_str()
+            ));
+        }
+        let slot = catalog
             .access_methods
             .iter()
             .position(|method| method.ddl_state == CatalogDdlState::Absent)
@@ -42152,13 +42335,7 @@ impl Storage {
                     "access method catalog capacity exhausted"
                 )
             })?;
-        let created_at = if created_at == 0 {
-            self.catalog_sequence.next()
-        } else {
-            self.catalog_sequence.observe(created_at);
-            created_at
-        };
-        self.access_methods[slot] = AccessMethodDef {
+        catalog.access_methods[slot] = AccessMethodDef {
             database: current_database(),
             created_at,
             definition,
@@ -42167,25 +42344,53 @@ impl Storage {
         Ok(slot)
     }
 
-    pub(crate) fn drop_access_method(&mut self, slot: usize, txid: u32) {
-        self.access_methods[slot].ddl_state = self.access_methods[slot].ddl_state.drop_by(txid);
+    pub(crate) fn drop_access_method(&self, slot: usize, txid: u32) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.access_methods[slot].ddl_state =
+            catalog.access_methods[slot].ddl_state.drop_by(txid);
     }
 
-    pub(crate) fn commit_access_method_create(&mut self, slot: usize) {
-        self.access_methods[slot].ddl_state = self.access_methods[slot].ddl_state.commit_create();
+    pub(crate) fn commit_access_method_create(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.access_methods[slot].ddl_state =
+            catalog.access_methods[slot].ddl_state.commit_create();
     }
 
-    pub(crate) fn rollback_access_method_create(&mut self, slot: usize) {
-        self.access_methods[slot].ddl_state = self.access_methods[slot].ddl_state.rollback_create();
+    pub(crate) fn rollback_access_method_create(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.access_methods[slot].ddl_state =
+            catalog.access_methods[slot].ddl_state.rollback_create();
     }
 
-    pub(crate) fn commit_access_method_drop(&mut self, slot: usize) {
-        self.access_methods[slot].ddl_state = self.access_methods[slot].ddl_state.commit_drop();
+    pub(crate) fn commit_access_method_drop(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        self.drop_comments_by_subid(
+            CommentClass::AccessMethod,
+            catalog.access_methods[slot].oid().get() as u32,
+        );
+        catalog.access_methods[slot].ddl_state =
+            catalog.access_methods[slot].ddl_state.commit_drop();
     }
 
-    pub(crate) fn rollback_access_method_drop(&mut self, slot: usize, txid: u32) {
-        self.access_methods[slot].ddl_state =
-            self.access_methods[slot].ddl_state.rollback_drop(txid);
+    pub(crate) fn rollback_access_method_drop(&self, slot: usize, txid: u32) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.access_methods[slot].ddl_state =
+            catalog.access_methods[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn tablespace_by_id(&self, id: u16, txid: u32) -> Option<TablespaceDef> {
@@ -44171,17 +44376,22 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, OperatorDefinition)> + '_ {
-        self.operators
-            .iter()
-            .enumerate()
-            .filter(move |(_, operator)| {
-                operator.database == current_database() && operator.visible_to(txid)
-            })
-            .map(move |(slot, operator)| (slot, operator.definition_for(txid)))
+        OperatorIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, operator)| {
+            operator.database == current_database() && operator.visible_to(txid)
+        })
+        .map(move |(slot, operator)| (slot, operator.definition_for(txid)))
     }
 
     pub(crate) fn operator_count(&self) -> usize {
-        self.operators.len()
+        self.operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned")
+            .operators
+            .len()
     }
 
     pub(crate) fn collations_visible_to(
@@ -45844,20 +46054,28 @@ impl Storage {
         }
     }
 
-    pub(crate) fn operator(&self, slot: usize) -> &OperatorDef {
-        &self.operators[slot]
+    pub(crate) fn operator(&self, slot: usize) -> OperatorDef {
+        self.operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned")
+            .operators[slot]
     }
 
     pub(crate) fn operator_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
-        self.operators.iter().position(|operator| {
-            operator.database == current_database()
+        OperatorIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .find_map(|(slot, operator)| {
+            (operator.database == current_database()
                 && operator.visible_to(txid)
-                && operator.oid() == oid
+                && operator.oid() == oid)
+                .then_some(slot)
         })
     }
 
     pub(crate) fn operator_for(&self, slot: usize, txid: u32) -> OperatorDefinition {
-        self.operators[slot].definition_for(txid)
+        self.operator(slot).definition_for(txid)
     }
 
     pub(crate) fn operator_slot_exact(
@@ -46148,27 +46366,30 @@ impl Storage {
     }
 
     pub(crate) fn create_operator(
-        &mut self,
+        &self,
         definition: OperatorDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
         self.require_schema_create(definition.schema.as_str(), txid)?;
         self.validate_operator_definition(definition, txid, None)?;
-        if self
-            .operator_slot_exact(
-                definition.schema.as_str(),
-                definition.name.as_str(),
-                definition.signature,
-                txid,
-            )
-            .is_some()
-        {
+        let created_at = self.catalog_sequence.next();
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        if catalog.operators.iter().any(|operator| {
+            operator.database == current_database()
+                && operator.visible_to(txid)
+                && operator.definition_for(txid).schema == definition.schema
+                && operator.definition_for(txid).name == definition.name
+                && operator.definition_for(txid).signature == definition.signature
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
                 "operator already exists with the same argument types"
             ));
         }
-        let Some(slot) = self
+        let Some(slot) = catalog
             .operators
             .iter()
             .position(|operator| operator.ddl_state == CatalogDdlState::Absent)
@@ -46176,11 +46397,10 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many operators (limit {})",
-                self.operators.len()
+                catalog.operators.len()
             ));
         };
-        let created_at = self.catalog_sequence.next();
-        self.operators[slot] = OperatorDef {
+        catalog.operators[slot] = OperatorDef {
             database: current_database(),
             created_at,
             definition,
@@ -46191,7 +46411,7 @@ impl Storage {
     }
 
     pub(crate) fn replay_set_operator(
-        &mut self,
+        &self,
         created_at: u64,
         mut definition: OperatorDefinition,
     ) -> Result<usize, SqlError> {
@@ -46212,17 +46432,25 @@ impl Storage {
             0,
             Some(catalog_object_oid(OPERATOR_OID_BASE, created_at)),
         )?;
-        let existing = self.operators.iter().position(|candidate| {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        let existing = catalog.operators.iter().position(|candidate| {
             candidate.ddl_state == CatalogDdlState::Present && candidate.created_at == created_at
         });
-        if self
-            .operator_slot_exact(
-                definition.schema.as_str(),
-                definition.name.as_str(),
-                definition.signature,
-                0,
-            )
-            .is_some_and(|slot| Some(slot) != existing)
+        if catalog
+            .operators
+            .iter()
+            .enumerate()
+            .any(|(slot, candidate)| {
+                candidate.database == current_database()
+                    && candidate.visible_to(0)
+                    && candidate.definition.schema == definition.schema
+                    && candidate.definition.name == definition.name
+                    && candidate.definition.signature == definition.signature
+                    && Some(slot) != existing
+            })
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
@@ -46231,7 +46459,7 @@ impl Storage {
         }
         let slot = match existing {
             Some(slot) => slot,
-            None => self
+            None => catalog
                 .operators
                 .iter()
                 .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -46239,12 +46467,12 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many operators (limit {})",
-                        self.operators.len()
+                        catalog.operators.len()
                     )
                 })?,
         };
         self.catalog_sequence.observe(created_at);
-        self.operators[slot] = OperatorDef {
+        catalog.operators[slot] = OperatorDef {
             database: current_database(),
             created_at,
             definition,
@@ -46255,13 +46483,18 @@ impl Storage {
     }
 
     pub(crate) fn stage_operator_definition(
-        &mut self,
+        &self,
         slot: usize,
         definition: OperatorDefinition,
         txid: u32,
     ) -> Result<Option<PendingOperatorDefinition>, SqlError> {
-        self.validate_operator_definition(definition, txid, Some(self.operators[slot].oid()))?;
-        let prior = self.operators[slot].pending;
+        let oid = self.operator(slot).oid();
+        self.validate_operator_definition(definition, txid, Some(oid))?;
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        let prior = catalog.operators[slot].pending;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(self.catalog_ddl_wait_error(
                 txid,
@@ -46269,34 +46502,51 @@ impl Storage {
                 definition.name.as_str(),
             ));
         }
-        self.operators[slot].pending = Some(PendingOperatorDefinition { txid, definition });
+        catalog.operators[slot].pending = Some(PendingOperatorDefinition { txid, definition });
         Ok(prior)
     }
 
-    pub(crate) fn drop_operator(&mut self, slot: usize, txid: u32) {
-        self.operators[slot].ddl_state = self.operators[slot].ddl_state.drop_by(txid);
+    pub(crate) fn drop_operator(&self, slot: usize, txid: u32) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.operators[slot].ddl_state = catalog.operators[slot].ddl_state.drop_by(txid);
     }
 
-    pub(crate) fn commit_operator_create(&mut self, slot: usize) {
-        self.operators[slot].ddl_state = self.operators[slot].ddl_state.commit_create();
+    pub(crate) fn commit_operator_create(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.operators[slot].ddl_state = catalog.operators[slot].ddl_state.commit_create();
     }
 
-    pub(crate) fn rollback_operator_create(&mut self, slot: usize) {
-        self.operators[slot].ddl_state = self.operators[slot].ddl_state.rollback_create();
+    pub(crate) fn rollback_operator_create(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.operators[slot].ddl_state = catalog.operators[slot].ddl_state.rollback_create();
     }
 
     pub(crate) fn commit_operator_alter(&mut self, slot: usize, txid: u32) {
-        let changed = self.operators[slot]
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        let changed = catalog.operators[slot]
             .pending
             .filter(|pending| pending.txid == txid)
             .map(|pending| (pending.definition.schema, pending.definition.name));
-        if let Some(pending) = self.operators[slot]
+        if let Some(pending) = catalog.operators[slot]
             .pending
             .filter(|pending| pending.txid == txid)
         {
-            self.operators[slot].definition = pending.definition;
-            self.operators[slot].pending = None;
+            catalog.operators[slot].definition = pending.definition;
+            catalog.operators[slot].pending = None;
         }
+        drop(catalog);
         if let Some((schema, name)) = changed {
             self.rename_stored_query_dependency(
                 DependencyClass::Operator,
@@ -46309,48 +46559,69 @@ impl Storage {
     }
 
     pub(crate) fn rollback_operator_alter(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingOperatorDefinition>,
     ) {
-        self.operators[slot].pending = prior;
+        self.operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned")
+            .operators[slot]
+            .pending = prior;
     }
 
-    pub(crate) fn commit_operator_drop(&mut self, slot: usize) {
-        self.drop_comments_by_subid(CommentClass::Operator, self.operators[slot].oid() as u32);
-        self.operators[slot].ddl_state = self.operators[slot].ddl_state.commit_drop();
-        self.operators[slot].pending = None;
+    pub(crate) fn commit_operator_drop(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        self.drop_comments_by_subid(CommentClass::Operator, catalog.operators[slot].oid() as u32);
+        catalog.operators[slot].ddl_state = catalog.operators[slot].ddl_state.commit_drop();
+        catalog.operators[slot].pending = None;
     }
 
-    pub(crate) fn rollback_operator_drop(&mut self, slot: usize, txid: u32) {
-        self.operators[slot].ddl_state = self.operators[slot].ddl_state.rollback_drop(txid);
+    pub(crate) fn rollback_operator_drop(&self, slot: usize, txid: u32) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.operators[slot].ddl_state = catalog.operators[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn operator_families_visible_to(
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, OperatorFamilyDefinition)> + '_ {
-        self.operator_families
-            .iter()
-            .enumerate()
-            .filter(move |(_, family)| {
-                family.database == current_database() && family.visible_to(txid)
-            })
-            .map(move |(slot, family)| (slot, family.definition_for(txid)))
+        OperatorFamilyIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, family)| family.database == current_database() && family.visible_to(txid))
+        .map(move |(slot, family)| (slot, family.definition_for(txid)))
     }
 
-    pub(crate) fn operator_family(&self, slot: usize) -> &OperatorFamilyDef {
-        &self.operator_families[slot]
+    pub(crate) fn operator_family(&self, slot: usize) -> OperatorFamilyDef {
+        self.operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned")
+            .families[slot]
     }
 
     pub(crate) fn operator_family_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
-        self.operator_families.iter().position(|family| {
-            family.database == current_database() && family.visible_to(txid) && family.oid() == oid
+        OperatorFamilyIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .find_map(|(slot, family)| {
+            (family.database == current_database()
+                && family.visible_to(txid)
+                && family.oid() == oid)
+                .then_some(slot)
         })
     }
 
     pub(crate) fn operator_family_for(&self, slot: usize, txid: u32) -> OperatorFamilyDefinition {
-        self.operator_families[slot].definition_for(txid)
+        self.operator_family(slot).definition_for(txid)
     }
 
     pub(crate) fn operator_family_slot_exact(
@@ -46497,35 +46768,41 @@ impl Storage {
     }
 
     pub(crate) fn create_operator_family(
-        &mut self,
+        &self,
         definition: OperatorFamilyDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
         self.require_schema_create(definition.schema.as_str(), txid)?;
         self.validate_operator_family_definition(definition, txid)?;
-        if self
-            .operator_family_slot_exact(definition.schema.as_str(), definition.name.as_str(), txid)
-            .is_some()
-        {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        if catalog.families.iter().any(|family| {
+            family.database == current_database()
+                && family.visible_to(txid)
+                && family.definition_for(txid).schema == definition.schema
+                && family.definition_for(txid).name == definition.name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "operator family \"{}\" already exists for access method \"btree\"",
                 definition.name.as_str()
             ));
         }
-        let Some(slot) = self
-            .operator_families
+        let Some(slot) = catalog
+            .families
             .iter()
             .position(|family| family.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many operator families (limit {})",
-                self.operator_families.len()
+                catalog.families.len()
             ));
         };
         let created_at = self.catalog_sequence.next();
-        self.operator_families[slot] = OperatorFamilyDef {
+        catalog.families[slot] = OperatorFamilyDef {
             database: current_database(),
             created_at,
             definition,
@@ -46536,7 +46813,7 @@ impl Storage {
     }
 
     pub(crate) fn replay_set_operator_family(
-        &mut self,
+        &self,
         created_at: u64,
         mut definition: OperatorFamilyDefinition,
     ) -> Result<usize, SqlError> {
@@ -46549,12 +46826,24 @@ impl Storage {
             member.right = self.bind_routine_result(member.right, 0)?;
         }
         self.validate_operator_family_definition(definition, 0)?;
-        let existing = self.operator_families.iter().position(|candidate| {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        let existing = catalog.families.iter().position(|candidate| {
             candidate.ddl_state == CatalogDdlState::Present && candidate.created_at == created_at
         });
-        if self
-            .operator_family_slot_exact(definition.schema.as_str(), definition.name.as_str(), 0)
-            .is_some_and(|slot| Some(slot) != existing)
+        if catalog
+            .families
+            .iter()
+            .enumerate()
+            .any(|(slot, candidate)| {
+                candidate.database == current_database()
+                    && candidate.visible_to(0)
+                    && candidate.definition.schema == definition.schema
+                    && candidate.definition.name == definition.name
+                    && Some(slot) != existing
+            })
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -46563,20 +46852,20 @@ impl Storage {
         }
         let slot = match existing {
             Some(slot) => slot,
-            None => self
-                .operator_families
+            None => catalog
+                .families
                 .iter()
                 .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many operator families (limit {})",
-                        self.operator_families.len()
+                        catalog.families.len()
                     )
                 })?,
         };
         self.catalog_sequence.observe(created_at);
-        self.operator_families[slot] = OperatorFamilyDef {
+        catalog.families[slot] = OperatorFamilyDef {
             database: current_database(),
             created_at,
             definition,
@@ -46587,13 +46876,17 @@ impl Storage {
     }
 
     pub(crate) fn stage_operator_family_definition(
-        &mut self,
+        &self,
         slot: usize,
         definition: OperatorFamilyDefinition,
         txid: u32,
     ) -> Result<Option<PendingOperatorFamilyDefinition>, SqlError> {
         self.validate_operator_family_definition(definition, txid)?;
-        let prior = self.operator_families[slot].pending;
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        let prior = catalog.families[slot].pending;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(self.catalog_ddl_wait_error(
                 txid,
@@ -46601,74 +46894,98 @@ impl Storage {
                 definition.name.as_str(),
             ));
         }
-        self.operator_families[slot].pending =
-            Some(PendingOperatorFamilyDefinition { txid, definition });
+        catalog.families[slot].pending = Some(PendingOperatorFamilyDefinition { txid, definition });
         Ok(prior)
     }
 
-    pub(crate) fn drop_operator_family(&mut self, slot: usize, txid: u32) {
-        self.operator_families[slot].ddl_state =
-            self.operator_families[slot].ddl_state.drop_by(txid);
+    pub(crate) fn drop_operator_family(&self, slot: usize, txid: u32) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.families[slot].ddl_state = catalog.families[slot].ddl_state.drop_by(txid);
     }
 
-    pub(crate) fn commit_operator_family_create(&mut self, slot: usize) {
-        self.operator_families[slot].ddl_state =
-            self.operator_families[slot].ddl_state.commit_create();
+    pub(crate) fn commit_operator_family_create(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.families[slot].ddl_state = catalog.families[slot].ddl_state.commit_create();
     }
 
-    pub(crate) fn rollback_operator_family_create(&mut self, slot: usize) {
-        self.operator_families[slot].ddl_state =
-            self.operator_families[slot].ddl_state.rollback_create();
+    pub(crate) fn rollback_operator_family_create(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.families[slot].ddl_state = catalog.families[slot].ddl_state.rollback_create();
     }
 
-    pub(crate) fn commit_operator_family_alter(&mut self, slot: usize, txid: u32) {
-        if let Some(pending) = self.operator_families[slot]
+    pub(crate) fn commit_operator_family_alter(&self, slot: usize, txid: u32) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        if let Some(pending) = catalog.families[slot]
             .pending
             .filter(|pending| pending.txid == txid)
         {
-            self.operator_families[slot].definition = pending.definition;
-            self.operator_families[slot].pending = None;
+            catalog.families[slot].definition = pending.definition;
+            catalog.families[slot].pending = None;
         }
     }
 
     pub(crate) fn rollback_operator_family_alter(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingOperatorFamilyDefinition>,
     ) {
-        self.operator_families[slot].pending = prior;
+        self.operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned")
+            .families[slot]
+            .pending = prior;
     }
 
-    pub(crate) fn commit_operator_family_drop(&mut self, slot: usize) {
+    pub(crate) fn commit_operator_family_drop(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
         self.drop_comments_by_subid(
             CommentClass::OperatorFamily,
-            self.operator_families[slot].oid() as u32,
+            catalog.families[slot].oid() as u32,
         );
-        self.operator_families[slot].ddl_state =
-            self.operator_families[slot].ddl_state.commit_drop();
-        self.operator_families[slot].pending = None;
+        catalog.families[slot].ddl_state = catalog.families[slot].ddl_state.commit_drop();
+        catalog.families[slot].pending = None;
     }
 
-    pub(crate) fn rollback_operator_family_drop(&mut self, slot: usize, txid: u32) {
-        self.operator_families[slot].ddl_state =
-            self.operator_families[slot].ddl_state.rollback_drop(txid);
+    pub(crate) fn rollback_operator_family_drop(&self, slot: usize, txid: u32) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.families[slot].ddl_state = catalog.families[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn operator_classes_visible_to(
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, OperatorClassDefinition)> + '_ {
-        self.operator_classes
-            .iter()
-            .enumerate()
-            .filter(move |(_, class)| {
-                class.database == current_database() && class.visible_to(txid)
-            })
-            .map(move |(slot, class)| (slot, class.definition_for(txid)))
+        OperatorClassIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, class)| class.database == current_database() && class.visible_to(txid))
+        .map(move |(slot, class)| (slot, class.definition_for(txid)))
     }
 
-    pub(crate) fn operator_class(&self, slot: usize) -> &OperatorClassDef {
-        &self.operator_classes[slot]
+    pub(crate) fn operator_class(&self, slot: usize) -> OperatorClassDef {
+        self.operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned")
+            .classes[slot]
     }
 
     pub(crate) fn operator_class_slot_by_oid(
@@ -46676,15 +46993,20 @@ impl Storage {
         oid: OperatorClassOid,
         txid: u32,
     ) -> Option<usize> {
-        self.operator_classes.iter().position(|class| {
-            class.database == current_database()
+        OperatorClassIter {
+            catalog: &self.operator_catalog,
+            next_slot: 0,
+        }
+        .find_map(|(slot, class)| {
+            (class.database == current_database()
                 && class.visible_to(txid)
-                && class.oid() == oid.get()
+                && class.oid() == oid.get())
+            .then_some(slot)
         })
     }
 
     pub(crate) fn operator_class_for(&self, slot: usize, txid: u32) -> OperatorClassDefinition {
-        self.operator_classes[slot].definition_for(txid)
+        self.operator_class(slot).definition_for(txid)
     }
 
     pub(crate) fn operator_class_slot_exact(
@@ -46931,27 +47253,14 @@ impl Storage {
     }
 
     pub(crate) fn create_operator_class(
-        &mut self,
+        &self,
         definition: OperatorClassDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
         self.require_schema_create(definition.schema.as_str(), txid)?;
         self.validate_operator_class_definition(definition, txid)?;
-        if self
-            .operator_class_slot_exact(definition.schema.as_str(), definition.name.as_str(), txid)
-            .is_some()
-        {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "operator class \"{}\" already exists for access method \"btree\"",
-                definition.name.as_str()
-            ));
-        }
         if definition.default
-            && (crate::sql::types::BtreeOperatorClass::for_type(definition.input.ctype).is_some()
-                || self
-                    .default_operator_class_for_type(definition.input, txid)?
-                    .is_some())
+            && crate::sql::types::BtreeOperatorClass::for_type(definition.input.ctype).is_some()
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -46959,19 +47268,49 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        let Some(slot) = self
-            .operator_classes
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        if catalog.classes.iter().any(|class| {
+            class.database == current_database()
+                && class.visible_to(txid)
+                && class.definition_for(txid).schema == definition.schema
+                && class.definition_for(txid).name == definition.name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "operator class \"{}\" already exists for access method \"btree\"",
+                definition.name.as_str()
+            ));
+        }
+        if definition.default
+            && catalog.classes.iter().any(|class| {
+                class.database == current_database()
+                    && class.visible_to(txid)
+                    && class.definition_for(txid).default
+                    && class.definition_for(txid).input == definition.input
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "could not make operator class \"{}\" be default for type because another default operator class already exists",
+                definition.name.as_str()
+            ));
+        }
+        let Some(slot) = catalog
+            .classes
             .iter()
             .position(|class| class.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many operator classes (limit {})",
-                self.operator_classes.len()
+                catalog.classes.len()
             ));
         };
         let created_at = self.catalog_sequence.next();
-        self.operator_classes[slot] = OperatorClassDef {
+        catalog.classes[slot] = OperatorClassDef {
             database: current_database(),
             created_at,
             definition,
@@ -46982,7 +47321,7 @@ impl Storage {
     }
 
     pub(crate) fn replay_set_operator_class(
-        &mut self,
+        &self,
         created_at: u64,
         mut definition: OperatorClassDefinition,
     ) -> Result<usize, SqlError> {
@@ -46997,13 +47336,20 @@ impl Storage {
             member.right = self.bind_routine_result(member.right, 0)?;
         }
         self.validate_operator_class_definition(definition, 0)?;
-        let existing = self.operator_classes.iter().position(|candidate| {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        let existing = catalog.classes.iter().position(|candidate| {
             candidate.ddl_state == CatalogDdlState::Present && candidate.created_at == created_at
         });
-        if self
-            .operator_class_slot_exact(definition.schema.as_str(), definition.name.as_str(), 0)
-            .is_some_and(|slot| Some(slot) != existing)
-        {
+        if catalog.classes.iter().enumerate().any(|(slot, candidate)| {
+            candidate.database == current_database()
+                && candidate.visible_to(0)
+                && candidate.definition.schema == definition.schema
+                && candidate.definition.name == definition.name
+                && Some(slot) != existing
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "operator class already exists for access method \"btree\""
@@ -47011,20 +47357,20 @@ impl Storage {
         }
         let slot = match existing {
             Some(slot) => slot,
-            None => self
-                .operator_classes
+            None => catalog
+                .classes
                 .iter()
                 .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many operator classes (limit {})",
-                        self.operator_classes.len()
+                        catalog.classes.len()
                     )
                 })?,
         };
         self.catalog_sequence.observe(created_at);
-        self.operator_classes[slot] = OperatorClassDef {
+        catalog.classes[slot] = OperatorClassDef {
             database: current_database(),
             created_at,
             definition,
@@ -47035,13 +47381,17 @@ impl Storage {
     }
 
     pub(crate) fn stage_operator_class_definition(
-        &mut self,
+        &self,
         slot: usize,
         definition: OperatorClassDefinition,
         txid: u32,
     ) -> Result<Option<PendingOperatorClassDefinition>, SqlError> {
         self.validate_operator_class_definition(definition, txid)?;
-        let prior = self.operator_classes[slot].pending;
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        let prior = catalog.classes[slot].pending;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(self.catalog_ddl_wait_error(
                 txid,
@@ -47049,55 +47399,79 @@ impl Storage {
                 definition.name.as_str(),
             ));
         }
-        self.operator_classes[slot].pending =
-            Some(PendingOperatorClassDefinition { txid, definition });
+        catalog.classes[slot].pending = Some(PendingOperatorClassDefinition { txid, definition });
         Ok(prior)
     }
 
-    pub(crate) fn drop_operator_class(&mut self, slot: usize, txid: u32) {
-        self.operator_classes[slot].ddl_state = self.operator_classes[slot].ddl_state.drop_by(txid);
+    pub(crate) fn drop_operator_class(&self, slot: usize, txid: u32) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.classes[slot].ddl_state = catalog.classes[slot].ddl_state.drop_by(txid);
     }
 
-    pub(crate) fn commit_operator_class_create(&mut self, slot: usize) {
-        self.operator_classes[slot].ddl_state =
-            self.operator_classes[slot].ddl_state.commit_create();
+    pub(crate) fn commit_operator_class_create(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.classes[slot].ddl_state = catalog.classes[slot].ddl_state.commit_create();
     }
 
-    pub(crate) fn rollback_operator_class_create(&mut self, slot: usize) {
-        self.operator_classes[slot].ddl_state =
-            self.operator_classes[slot].ddl_state.rollback_create();
+    pub(crate) fn rollback_operator_class_create(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.classes[slot].ddl_state = catalog.classes[slot].ddl_state.rollback_create();
     }
 
-    pub(crate) fn commit_operator_class_alter(&mut self, slot: usize, txid: u32) {
-        if let Some(pending) = self.operator_classes[slot]
+    pub(crate) fn commit_operator_class_alter(&self, slot: usize, txid: u32) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        if let Some(pending) = catalog.classes[slot]
             .pending
             .filter(|pending| pending.txid == txid)
         {
-            self.operator_classes[slot].definition = pending.definition;
-            self.operator_classes[slot].pending = None;
+            catalog.classes[slot].definition = pending.definition;
+            catalog.classes[slot].pending = None;
         }
     }
 
     pub(crate) fn rollback_operator_class_alter(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingOperatorClassDefinition>,
     ) {
-        self.operator_classes[slot].pending = prior;
+        self.operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned")
+            .classes[slot]
+            .pending = prior;
     }
 
-    pub(crate) fn commit_operator_class_drop(&mut self, slot: usize) {
+    pub(crate) fn commit_operator_class_drop(&self, slot: usize) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
         self.drop_comments_by_subid(
             CommentClass::OperatorClass,
-            self.operator_classes[slot].oid() as u32,
+            catalog.classes[slot].oid() as u32,
         );
-        self.operator_classes[slot].ddl_state = self.operator_classes[slot].ddl_state.commit_drop();
-        self.operator_classes[slot].pending = None;
+        catalog.classes[slot].ddl_state = catalog.classes[slot].ddl_state.commit_drop();
+        catalog.classes[slot].pending = None;
     }
 
-    pub(crate) fn rollback_operator_class_drop(&mut self, slot: usize, txid: u32) {
-        self.operator_classes[slot].ddl_state =
-            self.operator_classes[slot].ddl_state.rollback_drop(txid);
+    pub(crate) fn rollback_operator_class_drop(&self, slot: usize, txid: u32) {
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        catalog.classes[slot].ddl_state = catalog.classes[slot].ddl_state.rollback_drop(txid);
     }
 
     /// Lowers reads to a command snapshot (a data-modifying `WITH` statement) or
@@ -47653,9 +48027,15 @@ mod tests {
             policy_role_image_capacity(&config) - 1
         );
         assert_eq!(storage.casts.len(), 6);
-        assert_eq!(storage.operators.len(), 7);
-        assert_eq!(storage.operator_families.len(), 8);
-        assert_eq!(storage.operator_classes.len(), 9);
+        let operator_catalog = storage
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        assert_eq!(operator_catalog.access_methods.len(), MAX_ACCESS_METHODS);
+        assert_eq!(operator_catalog.operators.len(), 7);
+        assert_eq!(operator_catalog.families.len(), 8);
+        assert_eq!(operator_catalog.classes.len(), 9);
+        drop(operator_catalog);
         assert_eq!(storage.triggers.len(), 10);
         assert_eq!(storage.partition_trigger_states.len(), 20);
         assert_eq!(storage.publications.len(), 11);
@@ -48093,6 +48473,139 @@ mod tests {
                 .filter(|(_, setting)| setting.live)
                 .count(),
             WORKERS - 1
+        );
+    }
+
+    #[test]
+    fn operator_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<OperatorCatalog>>();
+        assert_send_sync::<AccessMethodIter<'_>>();
+        assert_send_sync::<OperatorIter<'_>>();
+        assert_send_sync::<OperatorFamilyIter<'_>>();
+        assert_send_sync::<OperatorClassIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let names = ["am_a", "am_b", "am_c", "am_d"];
+        let mut config = test_config();
+        config.max_operators = WORKERS;
+        config.max_operator_families = WORKERS;
+        config.max_operator_classes = WORKERS;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let slot = storage
+                        .create_access_method(
+                            0,
+                            AccessMethodDefinition {
+                                name: SqlName::parse(names[worker]).unwrap(),
+                                handler: TableAccessMethodHandler::Heap,
+                            },
+                            worker as u32 + 1,
+                        )
+                        .unwrap();
+                    storage.commit_access_method_create(slot);
+
+                    let mut catalog = storage
+                        .operator_catalog
+                        .lock()
+                        .expect("operator catalog lock poisoned");
+                    let mut operator = OperatorDef::EMPTY;
+                    operator.database = DatabaseOid::POSTGRES;
+                    operator.created_at = 100 + worker as u64;
+                    operator.definition.name = SqlName::parse(names[worker]).unwrap();
+                    operator.ddl_state = CatalogDdlState::Present;
+                    catalog.operators[worker] = operator;
+
+                    let mut family = OperatorFamilyDef::EMPTY;
+                    family.database = DatabaseOid::POSTGRES;
+                    family.created_at = 200 + worker as u64;
+                    family.definition.name = SqlName::parse(names[worker]).unwrap();
+                    family.ddl_state = CatalogDdlState::Present;
+                    catalog.families[worker] = family;
+
+                    let mut class = OperatorClassDef::EMPTY;
+                    class.database = DatabaseOid::POSTGRES;
+                    class.created_at = 300 + worker as u64;
+                    class.definition.name = SqlName::parse(names[worker]).unwrap();
+                    class.ddl_state = CatalogDdlState::Present;
+                    catalog.classes[worker] = class;
+                });
+            }
+        });
+
+        let catalog = storage
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        assert_eq!(catalog.access_methods.capacity(), MAX_ACCESS_METHODS);
+        assert_eq!(catalog.operators.capacity(), WORKERS);
+        assert_eq!(catalog.families.capacity(), WORKERS);
+        assert_eq!(catalog.classes.capacity(), WORKERS);
+        drop(catalog);
+
+        assert_eq!(storage.access_methods_visible_to(0).count(), WORKERS);
+        assert_eq!(storage.operators_visible_to(0).count(), WORKERS);
+        assert_eq!(storage.operator_families_visible_to(0).count(), WORKERS);
+        assert_eq!(storage.operator_classes_visible_to(0).count(), WORKERS);
+        for (slot, definition) in storage.operators_visible_to(0) {
+            assert_eq!(storage.operator(slot).definition.name, definition.name);
+        }
+        for slot in WORKERS..MAX_ACCESS_METHODS {
+            let name = stack_format!(63, "am_{slot}");
+            let created = storage
+                .create_access_method(
+                    0,
+                    AccessMethodDefinition {
+                        name: SqlName::parse(name.as_str()).unwrap(),
+                        handler: TableAccessMethodHandler::Heap,
+                    },
+                    9,
+                )
+                .unwrap();
+            storage.commit_access_method_create(created);
+        }
+        assert!(
+            storage
+                .create_access_method(
+                    0,
+                    AccessMethodDefinition {
+                        name: SqlName::parse("am_full").unwrap(),
+                        handler: TableAccessMethodHandler::Heap,
+                    },
+                    9,
+                )
+                .is_err()
+        );
+
+        let slot = storage.access_method_slot(names[0], 0).unwrap();
+        let oid = storage.access_method_oid_at(slot).unwrap() as u32;
+        let (comment, _) = storage
+            .set_comment(
+                CommentClass::AccessMethod,
+                SqlName::EMPTY,
+                SqlName::EMPTY,
+                oid,
+                Some(StackStr::from_str("comment")),
+                10,
+            )
+            .unwrap();
+        storage.commit_comment(comment, 10);
+        assert!(
+            storage
+                .comment_text(CommentClass::AccessMethod, "", "", oid, 0,)
+                .is_some()
+        );
+        storage.drop_access_method(slot, 10);
+        storage.commit_access_method_drop(slot);
+        assert!(
+            storage
+                .comment_text(CommentClass::AccessMethod, "", "", oid, 0,)
+                .is_none()
         );
     }
 

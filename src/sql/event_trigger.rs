@@ -1690,7 +1690,7 @@ fn primary_object(
             .map_err(|_| graph_full())?;
             let mut object = base_object(
                 catalog::PG_TRIGGER_OID,
-                crate::storage::trigger_oid(trigger),
+                crate::storage::trigger_oid(&trigger),
                 "trigger",
                 Some(schema.as_str()),
                 Some(name.as_str()),

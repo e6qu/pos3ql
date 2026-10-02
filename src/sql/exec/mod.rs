@@ -49770,7 +49770,7 @@ pub fn drop_access_method(
         let method = storage
             .access_methods_visible_to(txn.txid)
             .find(|(candidate, _)| *candidate == slot)
-            .map(|(_, method)| *method)
+            .map(|(_, method)| method)
             .expect("resolved access method is visible");
         while let Some((schema, table)) =
             storage.access_method_table_dependency(method.oid(), txn.txid)

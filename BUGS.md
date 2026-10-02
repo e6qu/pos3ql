@@ -739,6 +739,16 @@ publication, nested-reader progress, exact retained capacities, loud
 exhaustion, and `Send + Sync` have direct coverage. The same audit fixed
 recovery role removal retaining memberships and settings that referenced the
 reusable role slot.
+The operator catalog audit found access method definitions, operators,
+operator families, and operator classes in four unsynchronized fixed vectors.
+Overlapping DDL, replay, database cloning, schema rename, checkpoint, overload
+resolution, and dependency validation could lose updates or combine fields
+from different transitions. One startup-bounded mutex now owns all four
+families. Iterators copy one entry and release the lock before nested routine,
+type, schema, role, or operator resolution. Four-worker publication,
+nested-reader progress, exact retained capacities, access-method exhaustion,
+and `Send + Sync` have direct coverage. The same audit fixed access-method drop
+retaining comments keyed by a reusable catalog identity.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

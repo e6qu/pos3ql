@@ -451,9 +451,18 @@ families. Iterators copy one fixed entry and release the mutex before nested
 role, ACL, or catalog resolution. Four-worker publication, nested-reader
 progress, exact retained capacities, loud exhaustion, and `Send + Sync` have
 direct coverage. Recovery role removal also clears memberships and settings
-that reference the removed slot. The remaining catalog definition containers
-and row mutation paths still require synchronization before fixed workers can
-overlap execution.
+that reference the removed slot.
+
+Access method definitions, operators, operator families, and operator classes
+now share one startup-bounded mutex. DDL publication, rollback, replay,
+database cloning, schema rename, checkpoint and catalog reads, overload
+resolution, and dependency validation observe complete images across all four
+families. Iterators copy one fixed entry and release the mutex before nested
+routine, type, schema, role, or operator resolution. Four-worker publication
+across the complete catalog, nested-reader progress, exact retained capacities,
+access-method exhaustion, and `Send + Sync` have direct coverage. The remaining
+catalog definition containers and row mutation paths still require
+synchronization before fixed workers can overlap execution.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

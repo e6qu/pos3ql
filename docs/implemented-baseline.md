@@ -189,6 +189,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   use the common transaction wait boundary or the existing serialization
   error. Creation publishes initial ownership with existence, and removal
   clears the complete reusable slot and pending data chain.
+  Publication definitions, pending names and definition images, ownership, and
+  existence state share one startup-bounded mutex; readers copy complete
+  definitions before nested table, schema, role, comment, or replication
+  lookup. Conflicting DDL and ownership changes use the common transaction wait
+  boundary, and removal clears the complete reusable slot.
   Engine mutation remains single-owner and serialized while the other catalog
   definition containers, cache, and row sharing are prepared. Authorization
   graph traversal uses one exactly charged bitmap per query workspace,

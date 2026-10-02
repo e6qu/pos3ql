@@ -5941,6 +5941,30 @@ impl ReplicationSlotAdvance {
 }
 
 impl PublicationDef {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        created_at: 0,
+        name: SqlName::EMPTY,
+        pending_name: None,
+        all_tables: false,
+        tables: [u16::MAX; MAX_PUBLICATION_TABLES],
+        table_column_masks: [ColumnSet::EMPTY; MAX_PUBLICATION_TABLES],
+        table_include_descendants: [false; MAX_PUBLICATION_TABLES],
+        table_filters: PublicationFilters::EMPTY,
+        table_count: 0,
+        schemas: [u8::MAX; MAX_PUBLICATION_SCHEMAS],
+        schema_count: 0,
+        publish_insert: true,
+        publish_update: true,
+        publish_delete: true,
+        publish_truncate: true,
+        publish_via_partition_root: false,
+        publish_generated_columns: PublishGeneratedColumns::None,
+        pending_definition: None,
+        ownership: Ownership::BOOTSTRAP,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
     }
@@ -5991,6 +6015,25 @@ impl PublicationDef {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or_else(|| self.definition(), |pending| pending.definition)
+    }
+
+    fn identity_matches(&self, name: SqlName) -> bool {
+        self.name == name
+            || self
+                .pending_name
+                .is_some_and(|pending| pending.name == name)
+    }
+
+    fn pending_owner_other_than(&self, txid: u32) -> Option<u32> {
+        [
+            self.ddl_state.pending_txid(),
+            self.pending_name.map(|pending| pending.txid),
+            self.pending_definition.map(|pending| pending.txid),
+            self.ownership.pending.map(|pending| pending.txid),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|owner| *owner != txid)
     }
 }
 
@@ -7096,6 +7139,26 @@ struct ExtendedStatisticsCatalog {
 struct ExtendedStatisticsIter<'a> {
     catalog: &'a std::sync::Mutex<ExtendedStatisticsCatalog>,
     next_slot: usize,
+}
+
+struct PublicationIter<'a> {
+    catalog: &'a std::sync::Mutex<FixedVec<PublicationDef>>,
+    next_slot: usize,
+}
+
+impl Iterator for PublicationIter<'_> {
+    type Item = (usize, PublicationDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("publication catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
 }
 
 impl Iterator for ExtendedStatisticsIter<'_> {
@@ -12845,7 +12908,7 @@ pub struct Storage {
     policy_role_pending_base: usize,
     policy_role_replay_image: usize,
     extended_statistics_catalog: std::sync::Mutex<ExtendedStatisticsCatalog>,
-    publications: FixedVec<PublicationDef>,
+    publications: std::sync::Mutex<FixedVec<PublicationDef>>,
     replication_slots: FixedVec<ReplicationSlotDef>,
     subscriptions: FixedVec<SubscriptionDef>,
     foreign: foreign::ForeignCatalog,
@@ -16892,29 +16955,7 @@ impl Storage {
         let mut publications = FixedVec::new(budget, "publications", config.max_publications)?;
         for _ in 0..config.max_publications {
             publications
-                .push(PublicationDef {
-                    database: DatabaseOid::POSTGRES,
-                    created_at: 0,
-                    name: SqlName::parse("").expect("empty name fits"),
-                    pending_name: None,
-                    all_tables: false,
-                    tables: [u16::MAX; MAX_PUBLICATION_TABLES],
-                    table_column_masks: [ColumnSet::EMPTY; MAX_PUBLICATION_TABLES],
-                    table_include_descendants: [false; MAX_PUBLICATION_TABLES],
-                    table_filters: PublicationFilters::EMPTY,
-                    table_count: 0,
-                    schemas: [u8::MAX; MAX_PUBLICATION_SCHEMAS],
-                    schema_count: 0,
-                    publish_insert: true,
-                    publish_update: true,
-                    publish_delete: true,
-                    publish_truncate: true,
-                    publish_via_partition_root: false,
-                    publish_generated_columns: PublishGeneratedColumns::None,
-                    pending_definition: None,
-                    ownership: Ownership::BOOTSTRAP,
-                    ddl_state: CatalogDdlState::Absent,
-                })
+                .push(PublicationDef::EMPTY)
                 .expect("sized to max_publications");
         }
         let mut replication_slots =
@@ -17483,7 +17524,7 @@ impl Storage {
                 definitions: extended_statistics,
                 pending_data: pending_extended_statistics_data,
             }),
-            publications,
+            publications: std::sync::Mutex::new(publications),
             replication_slots,
             subscriptions,
             foreign,
@@ -19448,8 +19489,8 @@ impl Storage {
                 statistics_catalog.definitions[target_slot] = definition;
             }
 
-            for source_slot in 0..self.publications.len() {
-                let mut definition = self.publications[source_slot];
+            for source_slot in 0..self.publication_count() {
+                let mut definition = self.publication_for_event_trigger(source_slot);
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
@@ -19497,8 +19538,11 @@ impl Storage {
                         )
                     })?;
                 }
-                let target_slot = self
+                let mut publications = self
                     .publications
+                    .lock()
+                    .expect("publication catalog lock poisoned");
+                let target_slot = publications
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                     .ok_or_else(|| {
@@ -19512,7 +19556,7 @@ impl Storage {
                 definition.pending_definition = None;
                 definition.ownership = definition.ownership.committed();
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.publications[target_slot] = definition;
+                publications[target_slot] = definition;
             }
 
             for source_slot in 0..self.extensions.len() {
@@ -19951,7 +19995,17 @@ impl Storage {
         clear_catalog!(views);
         clear_catalog!(rules);
         clear_catalog!(policies);
-        clear_catalog!(publications);
+        {
+            let mut publications = self
+                .publications
+                .lock()
+                .expect("publication catalog lock poisoned");
+            for definition in publications.iter_mut() {
+                if definition.database == database {
+                    *definition = PublicationDef::EMPTY;
+                }
+            }
+        }
         clear_catalog!(subscriptions);
         clear_catalog!(matviews);
         clear_catalog!(sequences);
@@ -20203,7 +20257,19 @@ impl Storage {
         commit_catalog!(views);
         commit_catalog!(rules);
         commit_catalog!(policies);
-        commit_catalog!(publications);
+        {
+            let mut publications = self
+                .publications
+                .lock()
+                .expect("publication catalog lock poisoned");
+            for definition in publications.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         commit_catalog!(subscriptions);
         commit_catalog!(matviews);
         commit_catalog!(sequences);
@@ -21409,11 +21475,14 @@ impl Storage {
         })
     }
 
-    pub(crate) fn checkpoint_publications(&self) -> impl Iterator<Item = (usize, &PublicationDef)> {
-        self.publications
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    pub(crate) fn checkpoint_publications(
+        &self,
+    ) -> impl Iterator<Item = (usize, PublicationDef)> + '_ {
+        PublicationIter {
+            catalog: &self.publications,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_replication_slots(
@@ -32974,45 +33043,57 @@ impl Storage {
     }
 
     pub(crate) fn publication_count(&self) -> usize {
-        self.publications.len()
+        self.publications
+            .lock()
+            .expect("publication catalog lock poisoned")
+            .len()
     }
 
     /// Committed publications for catalog visibility and replication setup.
-    pub fn live_publications(&self) -> impl Iterator<Item = &PublicationDef> {
-        self.publications.iter().filter(|publication| {
+    pub fn live_publications(&self) -> impl Iterator<Item = PublicationDef> + '_ {
+        PublicationIter {
+            catalog: &self.publications,
+            next_slot: 0,
+        }
+        .map(|(_, publication)| publication)
+        .filter(|publication| {
             publication.database == current_database()
                 && publication.ddl_state == CatalogDdlState::Present
         })
     }
 
-    pub fn publications_with_slots(&self) -> impl Iterator<Item = (usize, &PublicationDef)> {
-        self.publications
-            .iter()
-            .enumerate()
-            .filter(|(_, publication)| {
-                publication.database == current_database()
-                    && publication.ddl_state == CatalogDdlState::Present
-            })
+    pub fn publications_with_slots(&self) -> impl Iterator<Item = (usize, PublicationDef)> + '_ {
+        PublicationIter {
+            catalog: &self.publications,
+            next_slot: 0,
+        }
+        .filter(|(_, publication)| {
+            publication.database == current_database()
+                && publication.ddl_state == CatalogDdlState::Present
+        })
     }
 
-    pub(crate) fn publication_for_event_trigger(&self, slot: usize) -> &PublicationDef {
-        &self.publications[slot]
+    pub(crate) fn publication_for_event_trigger(&self, slot: usize) -> PublicationDef {
+        self.publications
+            .lock()
+            .expect("publication catalog lock poisoned")[slot]
     }
 
     pub(crate) fn publications_with_slots_visible_to(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &PublicationDef)> {
-        self.publications
-            .iter()
-            .enumerate()
-            .filter(move |(_, publication)| {
-                publication.database == current_database() && publication.visible_to(txid)
-            })
+    ) -> impl Iterator<Item = (usize, PublicationDef)> + '_ {
+        PublicationIter {
+            catalog: &self.publications,
+            next_slot: 0,
+        }
+        .filter(move |(_, publication)| {
+            publication.database == current_database() && publication.visible_to(txid)
+        })
     }
 
     /// Committed publication lookup for replication protocol setup.
-    pub(crate) fn publication(&self, name: &str) -> Option<&PublicationDef> {
+    pub(crate) fn publication(&self, name: &str) -> Option<PublicationDef> {
         self.live_publications()
             .find(|publication| publication.name.as_str() == name)
     }
@@ -33023,6 +33104,8 @@ impl Storage {
         txid: u32,
     ) -> Option<(usize, PublicationDefinition)> {
         self.publications
+            .lock()
+            .expect("publication catalog lock poisoned")
             .iter()
             .enumerate()
             .find_map(|(slot, publication)| {
@@ -33034,11 +33117,18 @@ impl Storage {
     }
 
     pub(crate) fn publication_owner(&self, slot: usize, txid: u32) -> u16 {
-        self.publications[slot].ownership.owner_to(txid)
+        self.publications
+            .lock()
+            .expect("publication catalog lock poisoned")[slot]
+            .ownership
+            .owner_to(txid)
     }
 
     pub(crate) fn restore_publication_owner(&mut self, slot: usize, owner: u16) {
-        self.publications[slot].ownership = Ownership {
+        self.publications
+            .lock()
+            .expect("publication catalog lock poisoned")[slot]
+            .ownership = Ownership {
             owner,
             pending: None,
         };
@@ -33050,8 +33140,17 @@ impl Storage {
         owner: usize,
         txid: u32,
     ) -> Result<Option<PendingOwnership>, SqlError> {
-        self.ensure_publication_changeable(slot, txid)?;
-        let ownership = &mut self.publications[slot].ownership;
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        let publication = &mut publications[slot];
+        if let Some(blocker) = publication.pending_owner_other_than(txid) {
+            let name = publication.name;
+            drop(publications);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let ownership = &mut publication.ownership;
         let prior = ownership.pending;
         ownership.pending = Some(PendingOwnership {
             txid,
@@ -33065,7 +33164,11 @@ impl Storage {
         slot: usize,
         prior: Option<PendingOwnership>,
     ) {
-        self.publications[slot].ownership.pending = prior;
+        self.publications
+            .lock()
+            .expect("publication catalog lock poisoned")[slot]
+            .ownership
+            .pending = prior;
     }
 
     pub(crate) fn rename_publication(
@@ -33074,9 +33177,16 @@ impl Storage {
         name: SqlName,
         txid: u32,
     ) -> Result<Option<PendingPublicationName>, SqlError> {
-        self.ensure_publication_changeable(slot, txid)?;
-        if self
+        let mut publications = self
             .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        if let Some(blocker) = publications[slot].pending_owner_other_than(txid) {
+            let current_name = publications[slot].name;
+            drop(publications);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, current_name.as_str()));
+        }
+        if publications
             .iter()
             .enumerate()
             .any(|(other_slot, publication)| {
@@ -33093,20 +33203,21 @@ impl Storage {
             ));
         }
         if let Some(blocker) =
-            self.publications
+            publications
                 .iter()
                 .enumerate()
                 .find_map(|(other_slot, publication)| {
-                    (other_slot != slot && publication.database == current_database())
-                        .then_some(publication.pending_name)
-                        .flatten()
-                        .filter(|pending| pending.name == name && pending.txid != txid)
-                        .map(|pending| pending.txid)
+                    (other_slot != slot
+                        && publication.database == current_database()
+                        && publication.identity_matches(name))
+                    .then(|| publication.pending_owner_other_than(txid))
+                    .flatten()
                 })
         {
+            drop(publications);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        let publication = &mut self.publications[slot];
+        let publication = &mut publications[slot];
         if let Some(pending) = publication.pending_name
             && pending.txid != txid
         {
@@ -33122,7 +33233,11 @@ impl Storage {
     }
 
     pub(crate) fn commit_publication_rename(&mut self, slot: usize, txid: u32) {
-        let publication = &mut self.publications[slot];
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        let publication = &mut publications[slot];
         if let Some(pending) = publication.pending_name
             && pending.txid == txid
         {
@@ -33136,7 +33251,10 @@ impl Storage {
         slot: usize,
         prior: Option<PendingPublicationName>,
     ) {
-        self.publications[slot].pending_name = prior;
+        self.publications
+            .lock()
+            .expect("publication catalog lock poisoned")[slot]
+            .pending_name = prior;
     }
 
     pub(crate) fn publication_selecting_schema(
@@ -33144,13 +33262,17 @@ impl Storage {
         schema: u8,
         txid: u32,
     ) -> Option<(SqlName, PublicationDefinition)> {
-        self.publications.iter().find_map(|publication| {
-            let definition = publication.definition_for(txid);
-            (publication.database == current_database()
-                && publication.visible_to(txid)
-                && definition.schemas[..definition.schema_count].contains(&schema))
-            .then_some((publication.name_for(txid), definition))
-        })
+        self.publications
+            .lock()
+            .expect("publication catalog lock poisoned")
+            .iter()
+            .find_map(|publication| {
+                let definition = publication.definition_for(txid);
+                (publication.database == current_database()
+                    && publication.visible_to(txid)
+                    && definition.schemas[..definition.schema_count].contains(&schema))
+                .then_some((publication.name_for(txid), definition))
+            })
     }
 
     pub(crate) fn require_publication_owner(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
@@ -33163,7 +33285,16 @@ impl Storage {
                 "current role is not present in the role catalog"
             )
         })?;
-        let owner = self.publications[slot].ownership.owner_to(txid) as usize;
+        let (owner, name) = {
+            let publications = self
+                .publications
+                .lock()
+                .expect("publication catalog lock poisoned");
+            (
+                publications[slot].ownership.owner_to(txid) as usize,
+                publications[slot].name,
+            )
+        };
         if self.role(role).attributes_to(txid).superuser
             || owner == role
             || self.role_can_set(role, owner, txid)
@@ -33173,7 +33304,7 @@ impl Storage {
         Err(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "must be owner of publication {}",
-            self.publications[slot].name.as_str()
+            name.as_str()
         ))
     }
 
@@ -34339,44 +34470,6 @@ impl Storage {
                 MAX_PUBLICATION_SCHEMAS
             ));
         }
-        if let Some(blocker) = self.publications.iter().find_map(|publication| {
-            (publication.database == current_database() && publication.name_for(txid) == spec.name)
-                .then_some(publication.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, spec.name.as_str()));
-        }
-        if self.publications.iter().any(|publication| {
-            publication.database == current_database()
-                && publication.visible_to(txid)
-                && publication.name_for(txid) == spec.name
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "publication \"{}\" already exists",
-                spec.name.as_str()
-            ));
-        }
-        if let Some(blocker) = self.publications.iter().find_map(|publication| {
-            (publication.database == current_database())
-                .then_some(publication.pending_name)
-                .flatten()
-                .filter(|pending| pending.name == spec.name && pending.txid != txid)
-                .map(|pending| pending.txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, spec.name.as_str()));
-        }
-        let Some(slot) = self
-            .publications
-            .iter()
-            .position(|publication| publication.ddl_state == CatalogDdlState::Absent)
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many publications (limit {})",
-                self.publications.len()
-            ));
-        };
         let mut members = [u16::MAX; MAX_PUBLICATION_TABLES];
         members[..spec.tables.len()].copy_from_slice(spec.tables);
         let mut table_column_masks = [ColumnSet::EMPTY; MAX_PUBLICATION_TABLES];
@@ -34388,10 +34481,43 @@ impl Storage {
         let table_filters = PublicationFilters::from_sql(spec.table_filter_sql)?;
         let mut schemas = [u8::MAX; MAX_PUBLICATION_SCHEMAS];
         schemas[..spec.schemas.len()].copy_from_slice(spec.schemas);
-        let created_at = self.catalog_sequence.next();
-        self.publications[slot] = PublicationDef {
+        let ownership = self.initial_ownership(txid);
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        if let Some(blocker) = publications.iter().find_map(|publication| {
+            (publication.database == current_database() && publication.identity_matches(spec.name))
+                .then(|| publication.pending_owner_other_than(txid))
+                .flatten()
+        }) {
+            drop(publications);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, spec.name.as_str()));
+        }
+        if publications.iter().any(|publication| {
+            publication.database == current_database()
+                && publication.visible_to(txid)
+                && publication.name_for(txid) == spec.name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "publication \"{}\" already exists",
+                spec.name.as_str()
+            ));
+        }
+        let Some(slot) = publications
+            .iter()
+            .position(|publication| publication.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many publications (limit {})",
+                publications.len()
+            ));
+        };
+        publications[slot] = PublicationDef {
             database: current_database(),
-            created_at,
+            created_at: self.catalog_sequence.next(),
             name: spec.name,
             pending_name: None,
             all_tables: spec.all_tables,
@@ -34409,31 +34535,47 @@ impl Storage {
             publish_via_partition_root: spec.publish_via_partition_root,
             publish_generated_columns: spec.publish_generated_columns,
             pending_definition: None,
-            ownership: self.initial_ownership(txid),
+            ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         Ok(slot)
     }
 
     pub fn drop_publication(&mut self, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
-        let Some(slot) = self.publications.iter().position(|publication| {
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        let Some(slot) = publications.iter().position(|publication| {
             publication.database == current_database()
                 && publication.visible_to(txid)
                 && publication.name_for(txid).as_str() == name
         }) else {
             return Ok(None);
         };
-        self.ensure_publication_changeable(slot, txid)?;
-        let publication = &mut self.publications[slot];
+        let publication = &mut publications[slot];
+        if let Some(blocker) = publication.pending_owner_other_than(txid) {
+            let publication_name = publication.name;
+            drop(publications);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, publication_name.as_str()));
+        }
         publication.ddl_state = publication.ddl_state.drop_by(txid);
         Ok(Some(slot))
     }
 
     pub fn commit_publication_create(&mut self, slot: usize) {
-        self.publications[slot].ddl_state = self.publications[slot].ddl_state.commit_create();
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        publications[slot].ddl_state = publications[slot].ddl_state.commit_create();
     }
     pub(crate) fn commit_publication_owner(&mut self, slot: usize, txid: u32) {
-        let ownership = &mut self.publications[slot].ownership;
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        let ownership = &mut publications[slot].ownership;
         if let Some(pending) = ownership.pending
             && pending.txid == txid
         {
@@ -34442,7 +34584,14 @@ impl Storage {
         }
     }
     pub fn commit_publication_drop(&mut self, slot: usize) {
-        self.publications[slot].ddl_state = self.publications[slot].ddl_state.commit_drop();
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        if publications[slot].ddl_state.commit_drop() == CatalogDdlState::Absent {
+            publications[slot] = PublicationDef::EMPTY;
+        }
+        drop(publications);
         self.drop_comments_by_subid(CommentClass::Publication, slot as u32);
     }
 
@@ -34459,7 +34608,11 @@ impl Storage {
                 MAX_PUBLICATION_TABLES
             ));
         }
-        let Some(slot) = self.publications.iter().position(|publication| {
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        let Some(slot) = publications.iter().position(|publication| {
             publication.database == current_database()
                 && publication.visible_to(txid)
                 && publication.name_for(txid).as_str() == name
@@ -34470,8 +34623,12 @@ impl Storage {
                 name
             ));
         };
-        self.ensure_publication_changeable(slot, txid)?;
-        let publication = &mut self.publications[slot];
+        let publication = &mut publications[slot];
+        if let Some(blocker) = publication.pending_owner_other_than(txid) {
+            let publication_name = publication.name;
+            drop(publications);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, publication_name.as_str()));
+        }
         if matches!(publication.ddl_state, CatalogDdlState::PendingCreate { txid: owner } if owner == txid)
         {
             let prior = publication.definition();
@@ -34483,23 +34640,12 @@ impl Storage {
         Ok((slot, PublicationAlteration::Committed(prior)))
     }
 
-    fn ensure_publication_changeable(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
-        let publication = &self.publications[slot];
-        let blocker = publication
-            .ddl_state
-            .pending_txid()
-            .or_else(|| publication.pending_definition.map(|pending| pending.txid))
-            .or_else(|| publication.pending_name.map(|pending| pending.txid))
-            .or_else(|| publication.ownership.pending.map(|pending| pending.txid))
-            .filter(|owner| *owner != txid);
-        if let Some(blocker) = blocker {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, publication.name.as_str()));
-        }
-        Ok(())
-    }
-
     pub(crate) fn commit_publication_alter(&mut self, slot: usize, txid: u32) {
-        let publication = &mut self.publications[slot];
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        let publication = &mut publications[slot];
         if let Some(pending) = publication
             .pending_definition
             .filter(|pending| pending.txid == txid)
@@ -34510,17 +34656,31 @@ impl Storage {
     }
 
     pub(crate) fn rollback_publication_alter(&mut self, slot: usize, prior: PublicationAlteration) {
-        let publication = &mut self.publications[slot];
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        let publication = &mut publications[slot];
         match prior {
             PublicationAlteration::Committed(prior) => publication.pending_definition = prior,
             PublicationAlteration::Created(prior) => publication.set_definition(prior),
         }
     }
     pub fn rollback_publication_create(&mut self, slot: usize) {
-        self.publications[slot].ddl_state = self.publications[slot].ddl_state.rollback_create();
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        if publications[slot].ddl_state.rollback_create() == CatalogDdlState::Absent {
+            publications[slot] = PublicationDef::EMPTY;
+        }
     }
     pub fn rollback_publication_drop(&mut self, slot: usize, txid: u32) {
-        let publication = &mut self.publications[slot];
+        let mut publications = self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned");
+        let publication = &mut publications[slot];
         publication.ddl_state = publication.ddl_state.rollback_drop(txid);
     }
 
@@ -50053,7 +50213,7 @@ mod tests {
         assert_eq!(trigger_catalog.definitions.len(), 10);
         assert_eq!(trigger_catalog.partition_states.len(), 20);
         drop(trigger_catalog);
-        assert_eq!(storage.publications.len(), 11);
+        assert_eq!(storage.publication_count(), 11);
         let text_catalog = storage
             .text_catalog
             .lock()
@@ -51256,6 +51416,118 @@ mod tests {
         assert_eq!(storage.extended_statistics(1).created_at, 0);
         assert_eq!(
             storage.extended_statistics(1).ddl_state,
+            CatalogDdlState::Absent
+        );
+    }
+
+    #[test]
+    fn publication_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<FixedVec<PublicationDef>>>();
+        assert_send_sync::<PublicationIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_connections = WORKERS as u32;
+        config.max_publications = WORKERS;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let name = stack_format!(63, "publication_{worker}");
+                    storage
+                        .publications
+                        .lock()
+                        .expect("publication catalog lock poisoned")[worker] = PublicationDef {
+                        created_at: worker as u64 + 1,
+                        name: SqlName::parse(name.as_str()).unwrap(),
+                        all_tables: true,
+                        ddl_state: CatalogDdlState::Present,
+                        ..PublicationDef::EMPTY
+                    };
+                });
+            }
+        });
+
+        assert_eq!(
+            storage
+                .publications
+                .lock()
+                .expect("publication catalog lock poisoned")
+                .capacity(),
+            WORKERS
+        );
+        assert_eq!(storage.publications_with_slots().count(), WORKERS);
+        for (slot, definition) in storage.publications_with_slots() {
+            assert_eq!(
+                storage.publication_for_event_trigger(slot).created_at,
+                definition.created_at
+            );
+        }
+
+        let empty_masks: [ColumnSet; 0] = [];
+        let empty_descendants: [bool; 0] = [];
+        let empty_filters: [StackStr<PUBLICATION_FILTER_SQL_MAX>; 0] = [];
+        let full = PublicationSpec {
+            name: SqlName::parse("publication_full").unwrap(),
+            all_tables: true,
+            tables: &[],
+            table_column_masks: &empty_masks,
+            table_include_descendants: &empty_descendants,
+            table_filter_sql: &empty_filters,
+            schemas: &[],
+            publish_insert: true,
+            publish_update: true,
+            publish_delete: true,
+            publish_truncate: true,
+            publish_via_partition_root: false,
+            publish_generated_columns: PublishGeneratedColumns::None,
+        };
+        assert!(storage.create_publication(full, 0).is_err());
+
+        let pending_name = SqlName::parse("publication_pending").unwrap();
+        let prior = storage.rename_publication(0, pending_name, 9).unwrap();
+        assert!(storage.rename_publication(1, pending_name, 10).is_err());
+        assert!(
+            storage
+                .create_publication(
+                    PublicationSpec {
+                        name: pending_name,
+                        ..full
+                    },
+                    10,
+                )
+                .is_err()
+        );
+        assert!(storage.drop_publication("publication_0", 10).is_err());
+        storage.rollback_publication_rename(0, prior);
+
+        {
+            let mut publications = storage
+                .publications
+                .lock()
+                .expect("publication catalog lock poisoned");
+            publications[0].ddl_state = CatalogDdlState::PendingCreate { txid: 9 };
+            publications[0].pending_name = Some(PendingPublicationName {
+                txid: 9,
+                name: pending_name,
+            });
+        }
+        storage.rollback_publication_create(0);
+        assert_eq!(storage.publication_for_event_trigger(0).created_at, 0);
+        assert_eq!(
+            storage.publication_for_event_trigger(0).ddl_state,
+            CatalogDdlState::Absent
+        );
+
+        storage.drop_publication("publication_1", 9).unwrap();
+        storage.commit_publication_drop(1);
+        assert_eq!(storage.publication_for_event_trigger(1).created_at, 0);
+        assert_eq!(
+            storage.publication_for_event_trigger(1).ddl_state,
             CatalogDdlState::Absent
         );
     }

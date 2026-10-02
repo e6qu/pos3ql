@@ -251,14 +251,19 @@ jobs:
         include:
           # Keep instrumented corpus and auxiliary phases in independent
           # workers so cold setup plus measurement stays below 15 minutes.
-          - { name: corpus-a, corpus_shard: "0-of-3", auxiliary: none }
-          - { name: corpus-b, corpus_shard: "1-of-3", auxiliary: none }
-          - { name: corpus-c, corpus_shard: "2-of-3", auxiliary: none }
+          - { name: corpus-a, corpus_shard: "0-of-6", auxiliary: none }
+          - { name: corpus-b, corpus_shard: "1-of-6", auxiliary: none }
+          - { name: corpus-c, corpus_shard: "2-of-6", auxiliary: none }
+          - { name: corpus-d, corpus_shard: "3-of-6", auxiliary: none }
+          - { name: corpus-e, corpus_shard: "4-of-6", auxiliary: none }
+          - { name: corpus-f, corpus_shard: "5-of-6", auxiliary: none }
           - { name: auxiliary-exact, corpus_shard: "none", auxiliary: exact }
           - { name: auxiliary-copy, corpus_shard: "none", auxiliary: copy }
           - { name: auxiliary-types, corpus_shard: "none", auxiliary: types }
           - { name: auxiliary-pg-regress-a, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "0" }
           - { name: auxiliary-pg-regress-b, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "1" }
+          - { name: auxiliary-pg-regress-c, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "2" }
+          - { name: auxiliary-pg-regress-d, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "3" }
           - { name: auxiliary-slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "4" }
           - { name: auxiliary-slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "4" }
           - { name: auxiliary-slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "4" }
@@ -314,7 +319,7 @@ jobs:
           POS3QL_DIFF_CORPUS_SHARD: ${{ matrix.corpus_shard }}
           POS3QL_DIFF_AUXILIARY: ${{ matrix.auxiliary }}
           POS3QL_POSTGRES_REGRESS_SHARD: ${{ matrix.pg_regress_shard || '0' }}
-          POS3QL_POSTGRES_REGRESS_SHARDS: "2"
+          POS3QL_POSTGRES_REGRESS_SHARDS: "4"
           POS3QL_SLT_QUERY_SHARD: ${{ matrix.slt_query_shard || '0' }}
           POS3QL_SLT_QUERY_SHARDS: ${{ matrix.slt_query_shards || '1' }}
           COVERAGE_SHARDS: "run:diff"

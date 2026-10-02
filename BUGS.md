@@ -789,9 +789,10 @@ has its own worker after its 70,000-row cursor began too late in a general
 corpus slice to finish within the same bound. Sqllogictest read-only queries now
 run in eight slices after a four-slice worker spent 11 minutes 41 seconds in
 replay and reached the ceiling before reporting its result.
-Instrumented sqllogictest queries now run in four slices after a two-slice
+Instrumented sqllogictest queries now run in eight slices after a two-slice
 worker passed the complete differential suite but reached the ceiling during
-runner cleanup. The uninstrumented auxiliary differential now runs PostgreSQL
+runner cleanup, and a four-slice worker later made normal progress until the
+same ceiling. The uninstrumented auxiliary differential now runs PostgreSQL
 regression, exact errors, COPY, type fidelity, LISTEN/NOTIFY, and binary
 composites independently after their combined worker completed the regression
 and protocol phases but reached the ceiling during binary composites.
@@ -827,6 +828,18 @@ common transaction wait boundary. Four-worker publication, nested-reader
 progress, exact retained capacity, event-trigger exhaustion, and `Send + Sync`
 have direct coverage. Failed creation and committed removal now clear the
 complete reusable slot.
+The relation-trigger catalog audit found ordinary and constraint definitions,
+pending replacement images, and per-partition enablement in unsynchronized
+fixed vectors. Overlapping DDL, replay, database lifecycle, view-slot moves,
+relation cascades, checkpoint, catalog, and dispatch work could lose updates,
+combine fields from different definitions, or retain enablement for a removed
+trigger. One startup-bounded mutex now owns both vectors. Readers copy one
+fixed definition or enablement row and release the lock before nested relation,
+routine, comment, dependency, or execution lookup. Conflicting creates,
+renames, replacements, and drops use the common transaction wait boundary.
+Four-worker publication, nested-reader progress, exact retained capacities,
+trigger exhaustion, complete slot reuse, and `Send + Sync` have direct
+coverage.
 The instrumented SQL differential corpus outgrew its three-worker partition,
 then a slower runner exhausted the limit again with four workers after a
 3-minute 20-second build and more than 11 minutes of normal corpus progress.

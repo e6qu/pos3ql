@@ -180,7 +180,8 @@ CI preserves the complete library, curated PostgreSQL differential, and
 15-minute worker ceiling; the library suite runs in four slices, sqllogictest
 queries run in eight, the seeded sequence runs in ten, the growing forced-spill
 corpus runs in six, and instrumented auxiliary phases have independent workers.
-Instrumented sqllogictest queries run in four slices. The 70,000-row cursor and
+Instrumented sqllogictest queries run in eight slices after a four-slice worker
+made normal progress but reached the 15-minute ceiling. The 70,000-row cursor and
 1,100-call execution-width differential has its own corpus worker, and the
 remaining auxiliary differential phases have independent workers. The vendored
 PostgreSQL regression inputs run in four filename-grouped slices in both
@@ -534,6 +535,20 @@ exhaustion, and `Send + Sync` have direct coverage. Failed creation and
 committed removal clear the complete reusable slot. The remaining catalog
 definition containers and row mutation paths still require synchronization
 before fixed workers can overlap execution.
+
+Ordinary and constraint trigger definitions now share one startup-bounded
+mutex with their per-partition enablement images. DDL publication and rollback,
+replay, database cloning and removal, view-slot moves, relation cascades,
+checkpoint and catalog reads, and trigger dispatch observe complete definition
+images. Dropping a trigger retires its inherited enablement rows in the same
+transition. Iterators copy one fixed definition or enablement row and release
+the mutex before nested relation, routine, comment, dependency, or execution
+lookup. Conflicting creates, renames, replacements, and drops use the common
+transaction wait boundary. Four-worker publication, nested-reader progress,
+exact retained capacities, trigger exhaustion, complete slot reuse, and
+`Send + Sync` have direct coverage. The remaining catalog definition containers and
+row mutation paths still require synchronization before fixed workers can
+overlap execution.
 
 Instrumented SQL differential coverage now divides the corpus into six
 deterministic slices after three and then four slices exhausted the fixed

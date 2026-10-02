@@ -19824,7 +19824,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 }
             };
             if let Some(slot) = storage.trigger_slot_on(target, name, 0) {
-                storage.drop_trigger(slot, 0);
+                storage.drop_trigger(slot, 0)?;
                 storage.commit_trigger_drop(slot);
             }
         }

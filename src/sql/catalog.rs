@@ -20232,7 +20232,7 @@ fn extension_dependency_catalog_identity(
         AccessClass::Statistics => (3381, extended_statistics_oid(slot)),
         AccessClass::Tablespace => return None,
         AccessClass::Extension => (3079, extension_oid(slot)),
-        AccessClass::Trigger => (2620, crate::storage::trigger_oid(storage.trigger(slot))),
+        AccessClass::Trigger => (2620, crate::storage::trigger_oid(&storage.trigger(slot))),
         AccessClass::EventTrigger => (3466, storage.event_trigger(slot).oid()),
         AccessClass::Database => (1262, 5),
         AccessClass::LargeObject => (

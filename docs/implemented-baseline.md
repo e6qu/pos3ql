@@ -177,6 +177,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   startup-bounded mutex; readers copy complete entries before nested routine,
   role, comment, dependency, or dispatch lookup, and conflicting DDL uses the
   common transaction wait boundary.
+  Ordinary and constraint trigger definitions share one startup-bounded mutex
+  with per-partition enablement images; readers copy complete entries before
+  nested relation, routine, comment, dependency, or dispatch lookup. Trigger
+  removal retires inherited enablement in the same catalog transition, and
+  conflicting DDL uses the common transaction wait boundary.
   Engine mutation remains single-owner and serialized while the other catalog
   definition containers, cache, and row sharing are prepared. Authorization
   graph traversal uses one exactly charged bitmap per query workspace,

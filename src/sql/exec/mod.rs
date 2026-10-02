@@ -5411,7 +5411,9 @@ fn drop_table_kind(
                         |(slot, trigger)| (trigger.target == trigger_target).then_some(slot),
                     );
                     let Some(slot) = trigger else { break };
-                    storage.drop_trigger(slot, txn.txid);
+                    if let Err(error) = storage.drop_trigger(slot, txn.txid) {
+                        return sql_fail(error);
+                    }
                     if let Err(error) =
                         txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))
                     {
@@ -12800,7 +12802,9 @@ pub fn drop_schema(
                         |(slot, trigger)| (trigger.target == trigger_target).then_some(slot),
                     );
                     let Some(slot) = trigger else { break };
-                    storage.drop_trigger(slot, txn.txid);
+                    if let Err(error) = storage.drop_trigger(slot, txn.txid) {
+                        return sql_fail(error);
+                    }
                     if let Err(error) =
                         txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))
                     {
@@ -25624,7 +25628,7 @@ fn execute_deferred_trigger_event<'a>(
     if let Some(bytes) = new_bytes {
         rowenc::decode(bytes, &schema[..definition.n_columns], &mut new_values)?;
     }
-    let trigger = *storage.trigger(usize::from(trigger_slot));
+    let trigger = storage.trigger(usize::from(trigger_slot));
     let old = old_bytes.map(|_| &old_values[..definition.n_columns]);
     let mut new = new_bytes.map(|_| &mut new_values[..definition.n_columns]);
     // Completion precedes execution so recursive SQL cannot refire this event;
@@ -27481,7 +27485,9 @@ pub fn drop_trigger(
             trigger.table.name
         ));
     };
-    storage.drop_trigger(slot, txn.txid);
+    if let Err(error) = storage.drop_trigger(slot, txn.txid) {
+        return sql_fail(error);
+    }
     let staged = if storage.access_object_is_temporary(
         crate::storage::Storage::trigger_access_object(slot),
         txn.txid,
@@ -35094,7 +35100,9 @@ pub fn drop_routine(
             if let Err(error) = stage_trigger_drop(storage, wal, txn, trigger) {
                 return sql_fail(error);
             }
-            storage.drop_trigger(trigger_slot, txn.txid);
+            if let Err(error) = storage.drop_trigger(trigger_slot, txn.txid) {
+                return sql_fail(error);
+            }
             if let Err(error) =
                 txn.record_ddl(super::txn::DdlUndo::TriggerDropped(trigger_slot as u32))
             {
@@ -40346,7 +40354,7 @@ fn drop_type_dependent_routines(
             break;
         };
         stage_trigger_drop(storage, wal, txn, trigger)?;
-        storage.drop_trigger(slot, txn.txid);
+        storage.drop_trigger(slot, txn.txid)?;
         txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
     }
 
@@ -43781,7 +43789,7 @@ fn drop_selected_stored_queries(
             break;
         };
         stage_trigger_drop(storage, wal, txn, trigger)?;
-        storage.drop_trigger(slot, txn.txid);
+        storage.drop_trigger(slot, txn.txid)?;
         txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
     }
     for slot in (0..storage.routine_count()).rev() {
@@ -43942,7 +43950,7 @@ fn drop_view_trigger_dependencies(
                 },
             )?;
         }
-        storage.drop_trigger(slot, txn.txid);
+        storage.drop_trigger(slot, txn.txid)?;
         txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
     }
 }

@@ -74,10 +74,14 @@ for reference_entry in \
     '- { name: auxiliary-pg-regress-b, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "1" }' \
     '- { name: auxiliary-pg-regress-c, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "2" }' \
     '- { name: auxiliary-pg-regress-d, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "3" }' \
-    '- { name: auxiliary-slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "4" }' \
-    '- { name: auxiliary-slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "4" }' \
-    '- { name: auxiliary-slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "4" }' \
-    '- { name: auxiliary-slt-d, corpus_shard: "none", auxiliary: slt, slt_query_shard: "3", slt_query_shards: "4" }'; do
+    '- { name: auxiliary-slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "8" }' \
+    '- { name: auxiliary-slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "8" }' \
+    '- { name: auxiliary-slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "8" }' \
+    '- { name: auxiliary-slt-d, corpus_shard: "none", auxiliary: slt, slt_query_shard: "3", slt_query_shards: "8" }' \
+    '- { name: auxiliary-slt-e, corpus_shard: "none", auxiliary: slt, slt_query_shard: "4", slt_query_shards: "8" }' \
+    '- { name: auxiliary-slt-f, corpus_shard: "none", auxiliary: slt, slt_query_shard: "5", slt_query_shards: "8" }' \
+    '- { name: auxiliary-slt-g, corpus_shard: "none", auxiliary: slt, slt_query_shard: "6", slt_query_shards: "8" }' \
+    '- { name: auxiliary-slt-h, corpus_shard: "none", auxiliary: slt, slt_query_shard: "7", slt_query_shards: "8" }'; do
     if ! grep -Fq -- "$reference_entry" "$reference_matrix"; then
         printf 'CI timeout guard: missing reference differential shard definition %s\n' "$reference_entry" >&2
         failed=1

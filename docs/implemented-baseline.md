@@ -170,6 +170,9 @@ active production roadmap is [PLAN.md](../PLAN.md).
   startup-bounded mutex; readers copy complete entries before nested type,
   role, ACL, comment, dependency, or execution lookup. Replacement replay
   normalizes its complete WAL image to committed catalog state.
+  Cast definitions share one startup-bounded mutex; readers copy complete
+  entries before nested type, routine, comment, dependency, or execution
+  lookup, and conflicting DDL uses the common transaction wait boundary.
   Engine mutation remains single-owner and serialized while the other catalog
   definition containers, cache, and row sharing are prepared. Authorization
   graph traversal uses one exactly charged bitmap per query workspace,

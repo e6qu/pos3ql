@@ -795,6 +795,25 @@ runner cleanup. The uninstrumented auxiliary differential now runs PostgreSQL
 regression, exact errors, COPY, type fidelity, LISTEN/NOTIFY, and binary
 composites independently after their combined worker completed the regression
 and protocol phases but reached the ceiling during binary composites.
+The instrumented PostgreSQL regression worker later reached the ceiling while
+executing the complete 1,172-statement schedule on a slower runner. Coverage
+and ordinary differential CI now divide the schedule into two deterministic
+filename-grouped slices; every range from one upstream source remains together
+so its dependency order and the complete pinned corpus are preserved.
+The cast catalog audit found definition identity, type endpoints, support
+method, coercion context, and transaction-private existence in one
+unsynchronized fixed vector. Overlapping DDL, replay, database lifecycle,
+checkpoint, dependency, catalog, and execution work could lose updates or
+combine fields from different definitions. One startup-bounded mutex now owns
+the catalog. Readers copy one fixed definition and release the lock before
+nested type, routine, comment, dependency, or execution lookup. Conflicting
+creates and drops use the common transaction wait boundary instead of racing a
+state transition. Four-worker publication, nested-reader progress, exact
+retained capacity, cast exhaustion, and `Send + Sync` have direct coverage.
+Failed creation and committed removal now clear the complete reusable slot.
+The first instrumented grouping-width run exposed per-slot locking in hot cast
+lookups: the exact 4,096-set boundary exceeded its 120-second response limit.
+Identity and OID scans now acquire the catalog mutex once per lookup.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -28102,7 +28102,7 @@ pub(crate) fn create_cast(
             "cast will be ignored because the target data type is a domain",
         )?;
     }
-    let definition = *storage.cast(slot);
+    let definition = storage.cast(slot);
     let lsn = storage.lsn() + 1;
     if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::SetCast(definition)) {
         storage.rollback_cast_create(slot);
@@ -28123,8 +28123,16 @@ fn stage_cast_drop(
     txn: &mut TxnState,
     slot: usize,
 ) -> Result<(), SqlError> {
-    let definition = *storage.cast(slot);
-    storage.drop_cast(definition.source, definition.target, txn.txid);
+    let definition = storage.cast(slot);
+    let dropped_slot = storage
+        .drop_cast(definition.source, definition.target, txn.txid)?
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "cast does not exist"))?;
+    if dropped_slot != slot {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "cast catalog identity changed during drop"
+        ));
+    }
     let lsn = storage.lsn() + 1;
     if let Err(error) = wal.stage(
         txn.txid,

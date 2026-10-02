@@ -182,7 +182,9 @@ queries run in eight, the seeded sequence runs in ten, the growing forced-spill
 corpus runs in six, and instrumented auxiliary phases have independent workers.
 Instrumented sqllogictest queries run in four slices. The 70,000-row cursor and
 1,100-call execution-width differential has its own corpus worker, and the
-remaining auxiliary differential phases have independent workers.
+remaining auxiliary differential phases have independent workers. The vendored
+PostgreSQL regression inputs run in two filename-grouped slices in both
+instrumented and ordinary differential CI.
 
 Join range tables and accumulated `USING` merge state now use exact
 statement-arena slices rather than a 64-relation executor envelope. Compact
@@ -504,6 +506,21 @@ before reuse. Replacement replay normalizes its complete WAL image to committed
 catalog state before publication. The remaining catalog definition containers
 and row mutation paths still require synchronization before fixed workers can
 overlap execution.
+
+Cast definitions and their transaction-private existence now share one
+startup-bounded mutex. Create and drop publication, rollback, replay, database
+cloning and removal, checkpoint and catalog reads, type and routine dependency
+checks, and execution lookup observe complete definition images. Iterators copy
+one fixed definition and release the mutex before nested type, routine,
+comment, dependency, or execution lookup. Conflicting DDL reports the owning
+transaction through the common wait boundary. Four-worker publication,
+nested-reader progress, exact retained capacity, cast exhaustion, and `Send +
+Sync` have direct coverage. Failed creation and committed removal clear the
+complete reusable slot. Direct identity and OID lookups scan under one lock so
+wide expression analysis does not reacquire the mutex for every empty slot.
+The remaining catalog definition containers and row
+mutation paths still require synchronization before fixed workers can overlap
+execution.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

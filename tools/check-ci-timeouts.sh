@@ -67,7 +67,8 @@ for reference_entry in \
     '- { name: auxiliary-exact, corpus_shard: "none", auxiliary: exact }' \
     '- { name: auxiliary-copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: auxiliary-types, corpus_shard: "none", auxiliary: types }' \
-    '- { name: auxiliary-pg-regress, corpus_shard: "none", auxiliary: pg_regress }' \
+    '- { name: auxiliary-pg-regress-a, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "0" }' \
+    '- { name: auxiliary-pg-regress-b, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "1" }' \
     '- { name: auxiliary-slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "4" }' \
     '- { name: auxiliary-slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "4" }' \
     '- { name: auxiliary-slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "4" }' \
@@ -96,13 +97,20 @@ for differential_shard in \
     fuzz-1 fuzz-2 fuzz-3 fuzz-4 fuzz-5 \
     fuzz-6 fuzz-7 fuzz-8 fuzz-9 fuzz-10 core \
     corpus-1 corpus-2 corpus-3 corpus-4 corpus-execution-widths \
-    auxiliary-pg-regress auxiliary-exact auxiliary-copy auxiliary-types \
+    auxiliary-pg-regress-a auxiliary-pg-regress-b \
+    auxiliary-exact auxiliary-copy auxiliary-types \
     auxiliary-listen auxiliary-composites; do
     if ! grep -Fq -- "- shard: $differential_shard" "$differential_workflow"; then
         printf 'CI timeout guard: missing differential shard %s\n' "$differential_shard" >&2
         failed=1
     fi
 done
+if (( $(grep -Fc 'pg_regress_shard: "0"' "$differential_workflow") != 1 )) \
+    || (( $(grep -Fc 'pg_regress_shard: "1"' "$differential_workflow") != 1 )) \
+    || ! grep -Fq -- 'POSTGRES_REGRESS_SHARDS: "2"' "$differential_workflow"; then
+    printf '%s\n' 'CI timeout guard: PostgreSQL regression inputs must retain two file slices' >&2
+    failed=1
+fi
 for auxiliary_phase in pg_regress exact copy types listen composites; do
     if ! grep -Fq -- "auxiliary_phase: $auxiliary_phase" "$differential_workflow"; then
         printf 'CI timeout guard: missing auxiliary phase %s\n' "$auxiliary_phase" >&2

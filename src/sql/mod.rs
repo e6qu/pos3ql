@@ -19461,10 +19461,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::DropCast { source, target } => {
             let source = storage.bind_routine_result(source, 0)?;
             let target = storage.bind_routine_result(target, 0)?;
-            let slot = storage.cast_slot(source, target, 0).ok_or_else(|| {
+            let slot = storage.drop_cast(source, target, 0)?.ok_or_else(|| {
                 sql_err!(sqlstate::UNDEFINED_OBJECT, "journal cast does not exist")
             })?;
-            storage.drop_cast(source, target, 0);
             storage.commit_cast_drop(slot);
         }
         WalOp::SetOperator {

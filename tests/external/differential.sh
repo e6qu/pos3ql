@@ -96,10 +96,19 @@ all | none | exact | copy | types | slt | pg_regress) ;;
 esac
 SLT_QUERY_SHARD=${POS3QL_SLT_QUERY_SHARD:-0}
 SLT_QUERY_SHARDS=${POS3QL_SLT_QUERY_SHARDS:-1}
+POSTGRES_REGRESS_SHARD=${POS3QL_POSTGRES_REGRESS_SHARD:-0}
+POSTGRES_REGRESS_SHARDS=${POS3QL_POSTGRES_REGRESS_SHARDS:-1}
 if ! [[ "$SLT_QUERY_SHARD" =~ ^[0-9]+$ && "$SLT_QUERY_SHARDS" =~ ^[1-9][0-9]*$ ]] \
     || (( SLT_QUERY_SHARD >= SLT_QUERY_SHARDS )); then
   printf 'FAIL: POS3QL_SLT_QUERY_SHARD must be in [0, POS3QL_SLT_QUERY_SHARDS) (got %q/%q)\n' \
     "$SLT_QUERY_SHARD" "$SLT_QUERY_SHARDS"
+  exit 1
+fi
+if ! [[ "$POSTGRES_REGRESS_SHARD" =~ ^[0-9]+$ \
+    && "$POSTGRES_REGRESS_SHARDS" =~ ^[1-9][0-9]*$ ]] \
+    || (( POSTGRES_REGRESS_SHARD >= POSTGRES_REGRESS_SHARDS )); then
+  printf 'FAIL: POS3QL_POSTGRES_REGRESS_SHARD must be in [0, POS3QL_POSTGRES_REGRESS_SHARDS) (got %q/%q)\n' \
+    "$POSTGRES_REGRESS_SHARD" "$POSTGRES_REGRESS_SHARDS"
   exit 1
 fi
 want_auxiliary() { [[ "$DIFF_AUXILIARY" == all || "$DIFF_AUXILIARY" == "$1" ]]; }
@@ -350,6 +359,8 @@ if "$ROOT_VENV/bin/python" "$EXT/postgres_regress_diff.py" \
     --pg "$PG_PORT" --p3 "$P3_PORT" \
     --setup "$EXT/postgres_regress_setup.sql" \
     --manifest "$EXT/postgres_regress_schedule.tsv" \
+    --shard-index "$POSTGRES_REGRESS_SHARD" \
+    --shard-count "$POSTGRES_REGRESS_SHARDS" \
     --max-print "${POSTGRES_REGRESS_MAX_PRINT:-30}" \
     > "$WORK/postgres-regress.out" 2>&1; then
   ok "vendored PostgreSQL regression inputs ($(tail -1 "$WORK/postgres-regress.out"))"

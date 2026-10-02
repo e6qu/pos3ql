@@ -7050,6 +7050,23 @@ struct RoutineIter<'a> {
     next_slot: usize,
 }
 
+struct CastIter<'a> {
+    catalog: &'a std::sync::Mutex<FixedVec<CastDef>>,
+    next_slot: usize,
+}
+
+impl Iterator for CastIter<'_> {
+    type Item = (usize, CastDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("cast catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
 impl Iterator for RoutineIter<'_> {
     type Item = (usize, RoutineDef);
 
@@ -12706,7 +12723,7 @@ pub struct Storage {
     views: FixedVec<ViewDef>,
     rules: FixedVec<RuleDef>,
     routines: std::sync::Mutex<FixedVec<RoutineDef>>,
-    casts: FixedVec<CastDef>,
+    casts: std::sync::Mutex<FixedVec<CastDef>>,
     operator_catalog: std::sync::Mutex<OperatorCatalog>,
     text_catalog: std::sync::Mutex<TextCatalog>,
     event_triggers: FixedVec<EventTriggerDef>,
@@ -17327,7 +17344,7 @@ impl Storage {
             views,
             rules,
             routines: std::sync::Mutex::new(routines),
-            casts,
+            casts: std::sync::Mutex::new(casts),
             operator_catalog: std::sync::Mutex::new(OperatorCatalog {
                 access_methods,
                 operators,
@@ -18948,6 +18965,27 @@ impl Storage {
                 );
             }
 
+            {
+                let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+                for source_slot in 0..casts.len() {
+                    let mut definition = casts[source_slot];
+                    if definition.database != source
+                        || definition.ddl_state != CatalogDdlState::Present
+                    {
+                        continue;
+                    }
+                    let target_slot = casts
+                        .iter()
+                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "cast catalog is full")
+                        })?;
+                    definition.database = target;
+                    definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                    casts[target_slot] = definition;
+                }
+            }
+
             let mut operator_catalog = self
                 .operator_catalog
                 .lock()
@@ -19007,23 +19045,6 @@ impl Storage {
                 self.event_triggers[target_slot] = event_trigger;
             }
 
-            for source_slot in 0..self.casts.len() {
-                let mut definition = self.casts[source_slot];
-                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
-                {
-                    continue;
-                }
-                let target_slot = self
-                    .casts
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "cast catalog is full")
-                    })?;
-                definition.database = target;
-                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.casts[target_slot] = definition;
-            }
             for source_slot in 0..operator_catalog.operators.len() {
                 let mut definition = operator_catalog.operators[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
@@ -19802,7 +19823,6 @@ impl Storage {
         }
         clear_catalog!(views);
         clear_catalog!(rules);
-        clear_catalog!(casts);
         clear_catalog!(event_triggers);
         clear_catalog!(triggers);
         clear_catalog!(policies);
@@ -19813,6 +19833,14 @@ impl Storage {
         clear_catalog!(sequences);
         clear_catalog!(indexes);
         clear_catalog!(extensions);
+        {
+            let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+            for definition in casts.iter_mut() {
+                if definition.database == database {
+                    *definition = CastDef::EMPTY;
+                }
+            }
+        }
         {
             let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
             for definition in routines.iter_mut() {
@@ -20011,7 +20039,6 @@ impl Storage {
         }
         commit_catalog!(views);
         commit_catalog!(rules);
-        commit_catalog!(casts);
         commit_catalog!(event_triggers);
         commit_catalog!(triggers);
         commit_catalog!(policies);
@@ -20022,6 +20049,16 @@ impl Storage {
         commit_catalog!(sequences);
         commit_catalog!(indexes);
         commit_catalog!(extensions);
+        {
+            let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+            for definition in casts.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         {
             let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
             for definition in routines.iter_mut() {
@@ -21182,11 +21219,12 @@ impl Storage {
         })
     }
 
-    pub(crate) fn checkpoint_casts(&self) -> impl Iterator<Item = (usize, &CastDef)> {
-        self.casts
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    pub(crate) fn checkpoint_casts(&self) -> impl Iterator<Item = (usize, CastDef)> + '_ {
+        CastIter {
+            catalog: &self.casts,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_collations(&self) -> impl Iterator<Item = (usize, CollationDef)> + '_ {
@@ -44829,17 +44867,21 @@ impl Storage {
         }
     }
 
-    pub(crate) fn cast(&self, slot: usize) -> &CastDef {
-        &self.casts[slot]
+    pub(crate) fn cast(&self, slot: usize) -> CastDef {
+        self.casts.lock().expect("cast catalog lock poisoned")[slot]
     }
 
-    pub(crate) fn casts_visible_to(&self, txid: u32) -> impl Iterator<Item = (usize, &CastDef)> {
-        self.casts
-            .iter()
-            .enumerate()
-            .filter(move |(_, definition)| {
-                definition.database == current_database() && definition.visible_to(txid)
-            })
+    pub(crate) fn casts_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, CastDef)> + '_ {
+        CastIter {
+            catalog: &self.casts,
+            next_slot: 0,
+        }
+        .filter(move |(_, definition)| {
+            definition.database == current_database() && definition.visible_to(txid)
+        })
     }
 
     pub(crate) fn cast_slot(
@@ -44848,11 +44890,13 @@ impl Storage {
         target: RoutineResult,
         txid: u32,
     ) -> Option<usize> {
-        self.casts.iter().position(|definition| {
-            definition.database == current_database()
+        let casts = self.casts.lock().expect("cast catalog lock poisoned");
+        casts.iter().enumerate().find_map(|(slot, definition)| {
+            (definition.database == current_database()
                 && definition.visible_to(txid)
                 && definition.source == source
-                && definition.target == target
+                && definition.target == target)
+                .then_some(slot)
         })
     }
 
@@ -44862,7 +44906,13 @@ impl Storage {
         target_oid: i32,
         txid: u32,
     ) -> Option<(usize, CastDef)> {
-        self.casts_visible_to(txid).find_map(|(slot, definition)| {
+        // Expression analysis calls this on hot paths. Scan under one lock;
+        // locking once per empty catalog slot makes wide expressions costly.
+        let casts = self.casts.lock().expect("cast catalog lock poisoned");
+        casts.iter().enumerate().find_map(|(slot, definition)| {
+            if definition.database != current_database() || !definition.visible_to(txid) {
+                return None;
+            }
             let source =
                 self.routine_type_oid(definition.source.ctype, definition.source.user_type, txid)?;
             let target =
@@ -45109,9 +45159,6 @@ impl Storage {
             },
             txid,
         )?;
-        if self.cast_slot(source, target, txid).is_some() {
-            return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
-        }
         let source_oid = self
             .routine_type_oid(source.ctype, source.user_type, txid)
             .expect("validated cast source type");
@@ -45121,19 +45168,37 @@ impl Storage {
         if Self::builtin_cast_exists(source_oid, target_oid) {
             return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
         }
-        let Some(slot) = self
-            .casts
+        let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+        if let Some(blocker) = casts.iter().find_map(|definition| {
+            (definition.database == current_database()
+                && definition.source == source
+                && definition.target == target)
+                .then_some(definition.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
+        }) {
+            drop(casts);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, "cast"));
+        }
+        if casts.iter().any(|definition| {
+            definition.database == current_database()
+                && definition.visible_to(txid)
+                && definition.source == source
+                && definition.target == target
+        }) {
+            return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
+        }
+        let Some(slot) = casts
             .iter()
             .position(|definition| definition.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many casts (limit {})",
-                self.casts.len()
+                casts.len()
             ));
         };
         let created_at = self.catalog_sequence.next();
-        self.casts[slot] = CastDef {
+        casts[slot] = CastDef {
             database: current_database(),
             created_at,
             source,
@@ -45152,26 +45217,28 @@ impl Storage {
         definition.source = self.bind_routine_result(definition.source, 0)?;
         definition.target = self.bind_routine_result(definition.target, 0)?;
         self.validate_cast_definition(definition, 0)?;
-        if self
-            .cast_slot(definition.source, definition.target, 0)
-            .is_some()
-        {
+        let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+        if casts.iter().any(|candidate| {
+            candidate.database == current_database()
+                && candidate.visible_to(0)
+                && candidate.source == definition.source
+                && candidate.target == definition.target
+        }) {
             return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
         }
-        let Some(slot) = self
-            .casts
+        let Some(slot) = casts
             .iter()
             .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many casts (limit {})",
-                self.casts.len()
+                casts.len()
             ));
         };
         self.catalog_sequence.observe(definition.created_at);
         definition.ddl_state = CatalogDdlState::Present;
-        self.casts[slot] = definition;
+        casts[slot] = definition;
         Ok(slot)
     }
 
@@ -45180,27 +45247,55 @@ impl Storage {
         source: RoutineResult,
         target: RoutineResult,
         txid: u32,
-    ) -> Option<usize> {
-        let slot = self.cast_slot(source, target, txid)?;
-        self.casts[slot].ddl_state = self.casts[slot].ddl_state.drop_by(txid);
-        Some(slot)
+    ) -> Result<Option<usize>, SqlError> {
+        let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+        if let Some(blocker) = casts.iter().find_map(|definition| {
+            (definition.database == current_database()
+                && definition.source == source
+                && definition.target == target)
+                .then_some(definition.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
+        }) {
+            drop(casts);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, "cast"));
+        }
+        let Some(slot) = casts.iter().position(|definition| {
+            definition.database == current_database()
+                && definition.visible_to(txid)
+                && definition.source == source
+                && definition.target == target
+        }) else {
+            return Ok(None);
+        };
+        casts[slot].ddl_state = casts[slot].ddl_state.drop_by(txid);
+        Ok(Some(slot))
     }
 
     pub(crate) fn commit_cast_create(&mut self, slot: usize) {
-        self.casts[slot].ddl_state = self.casts[slot].ddl_state.commit_create();
+        let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+        casts[slot].ddl_state = casts[slot].ddl_state.commit_create();
     }
 
     pub(crate) fn rollback_cast_create(&mut self, slot: usize) {
-        self.casts[slot].ddl_state = self.casts[slot].ddl_state.rollback_create();
+        let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+        casts[slot].ddl_state = casts[slot].ddl_state.rollback_create();
+        casts[slot] = CastDef::EMPTY;
     }
 
     pub(crate) fn commit_cast_drop(&mut self, slot: usize) {
-        self.drop_comments_by_subid(CommentClass::Cast, self.casts[slot].oid() as u32);
-        self.casts[slot].ddl_state = self.casts[slot].ddl_state.commit_drop();
+        let oid = {
+            let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+            let oid = casts[slot].oid() as u32;
+            casts[slot].ddl_state = casts[slot].ddl_state.commit_drop();
+            casts[slot] = CastDef::EMPTY;
+            oid
+        };
+        self.drop_comments_by_subid(CommentClass::Cast, oid);
     }
 
     pub(crate) fn rollback_cast_drop(&mut self, slot: usize, txid: u32) {
-        self.casts[slot].ddl_state = self.casts[slot].ddl_state.rollback_drop(txid);
+        let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+        casts[slot].ddl_state = casts[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn operators_visible_to(
@@ -49096,7 +49191,14 @@ mod tests {
             storage.policy_role_replay_image,
             policy_role_image_capacity(&config) - 1
         );
-        assert_eq!(storage.casts.len(), 6);
+        assert_eq!(
+            storage
+                .casts
+                .lock()
+                .expect("cast catalog lock poisoned")
+                .len(),
+            6
+        );
         let operator_catalog = storage
             .operator_catalog
             .lock()
@@ -49870,6 +49972,76 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn cast_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<FixedVec<CastDef>>>();
+        assert_send_sync::<CastIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_casts = WORKERS;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    storage.casts.lock().expect("cast catalog lock poisoned")[worker] = CastDef {
+                        database: DatabaseOid::POSTGRES,
+                        created_at: worker as u64 + 1,
+                        source: RoutineResult::builtin(ColType::Int2),
+                        target: RoutineResult::builtin(ColType::Date),
+                        method: CastMethod::InOut,
+                        context: CastContext::Explicit,
+                        ddl_state: CatalogDdlState::Present,
+                    };
+                });
+            }
+        });
+
+        assert_eq!(
+            storage
+                .casts
+                .lock()
+                .expect("cast catalog lock poisoned")
+                .capacity(),
+            WORKERS
+        );
+        assert_eq!(storage.casts_visible_to(0).count(), WORKERS);
+        for (slot, definition) in storage.casts_visible_to(0) {
+            assert_eq!(storage.cast(slot).created_at, definition.created_at);
+        }
+
+        assert!(
+            storage
+                .create_cast(
+                    RoutineResult::builtin(ColType::Bool),
+                    RoutineResult::builtin(ColType::Date),
+                    CastMethod::InOut,
+                    CastContext::Explicit,
+                    9,
+                )
+                .is_err()
+        );
+
+        let mut pending = storage.cast(0);
+        pending.ddl_state = CatalogDdlState::PendingCreate { txid: 9 };
+        storage.casts.lock().expect("cast catalog lock poisoned")[0] = pending;
+        storage.rollback_cast_create(0);
+        assert_eq!(storage.cast(0).created_at, 0);
+        assert_eq!(storage.cast(0).ddl_state, CatalogDdlState::Absent);
+        storage.casts.lock().expect("cast catalog lock poisoned")[0] = CastDef {
+            created_at: 99,
+            ddl_state: CatalogDdlState::PendingDrop { txid: 9 },
+            ..CastDef::EMPTY
+        };
+        storage.commit_cast_drop(0);
+        assert_eq!(storage.cast(0).created_at, 0);
+        assert_eq!(storage.cast(0).ddl_state, CatalogDdlState::Absent);
     }
 
     #[test]

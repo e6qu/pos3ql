@@ -257,7 +257,8 @@ jobs:
           - { name: auxiliary-exact, corpus_shard: "none", auxiliary: exact }
           - { name: auxiliary-copy, corpus_shard: "none", auxiliary: copy }
           - { name: auxiliary-types, corpus_shard: "none", auxiliary: types }
-          - { name: auxiliary-pg-regress, corpus_shard: "none", auxiliary: pg_regress }
+          - { name: auxiliary-pg-regress-a, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "0" }
+          - { name: auxiliary-pg-regress-b, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "1" }
           - { name: auxiliary-slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "4" }
           - { name: auxiliary-slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "4" }
           - { name: auxiliary-slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "4" }
@@ -312,6 +313,8 @@ jobs:
           POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
           POS3QL_DIFF_CORPUS_SHARD: ${{ matrix.corpus_shard }}
           POS3QL_DIFF_AUXILIARY: ${{ matrix.auxiliary }}
+          POS3QL_POSTGRES_REGRESS_SHARD: ${{ matrix.pg_regress_shard || '0' }}
+          POS3QL_POSTGRES_REGRESS_SHARDS: "2"
           POS3QL_SLT_QUERY_SHARD: ${{ matrix.slt_query_shard || '0' }}
           POS3QL_SLT_QUERY_SHARDS: ${{ matrix.slt_query_shards || '1' }}
           COVERAGE_SHARDS: "run:diff"

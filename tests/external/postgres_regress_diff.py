@@ -237,6 +237,19 @@ def manifest_entries(path):
     return entries
 
 
+def manifest_shard(entries, index, count):
+    """Keep every range from one upstream file in the same stable shard."""
+    ordinals = {}
+    selected = []
+    for entry in entries:
+        filename = entry[0]
+        if filename not in ordinals:
+            ordinals[filename] = len(ordinals)
+        if ordinals[filename] % count == index:
+            selected.append(entry)
+    return selected
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pg", type=int, required=True)
@@ -244,6 +257,8 @@ def main():
     parser.add_argument("--setup", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--max-print", type=int, default=30)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
     args = parser.parse_args()
     if psycopg is None:
         print("psycopg is required", file=sys.stderr)
@@ -255,9 +270,12 @@ def main():
                               dbname="postgres", autocommit=True)
     pg = pg_conn.cursor()
     p3 = p3_conn.cursor()
-    sources = [(args.setup, 1, 0, False)] + [
-        (*entry, True) for entry in manifest_entries(args.manifest)
-    ]
+    if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
+        parser.error("shard index must be in [0, shard count)")
+    entries = manifest_shard(
+        manifest_entries(args.manifest), args.shard_index, args.shard_count
+    )
+    sources = [(args.setup, 1, 0, False)] + [(*entry, True) for entry in entries]
     setup_total = 0
     upstream_total = 0
     mismatches = 0

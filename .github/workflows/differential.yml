@@ -305,7 +305,7 @@ jobs:
             fuzz_count: "0"
             corpus_shard: "1"
             corpus_only: "179_remaining_execution_widths"
-          - shard: auxiliary-pg-regress
+          - shard: auxiliary-pg-regress-a
             run_fast: "1"
             run_core: "0"
             run_corpus: "0"
@@ -317,6 +317,20 @@ jobs:
             fuzz_count: "0"
             corpus_shard: "0"
             auxiliary_phase: pg_regress
+            pg_regress_shard: "0"
+          - shard: auxiliary-pg-regress-b
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "1"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+            auxiliary_phase: pg_regress
+            pg_regress_shard: "1"
           - shard: auxiliary-exact
             run_fast: "1"
             run_core: "0"
@@ -467,6 +481,8 @@ jobs:
           RUN_CORPUS: ${{ matrix.run_corpus }}
           RUN_AUX: ${{ matrix.run_aux }}
           AUXILIARY_PHASE: ${{ matrix.auxiliary_phase }}
+          POSTGRES_REGRESS_SHARD: ${{ matrix.pg_regress_shard || '0' }}
+          POSTGRES_REGRESS_SHARDS: "2"
           RUN_SLT: ${{ matrix.run_slt }}
           RUN_FUZZ: ${{ matrix.run_fuzz }}
           FAST_CORPUS_SHARDS: "4"

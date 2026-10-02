@@ -16,6 +16,7 @@
 #   RUN_CORE / RUN_CORPUS / RUN_AUX / RUN_SLT / RUN_FUZZ
 #                              select deterministic phase groups
 #   AUXILIARY_PHASE            selected auxiliary phase (default all)
+#   POSTGRES_REGRESS_SHARD(S)  selected upstream regression file slice
 #   FAST_CORPUS_SHARD(S)       selected curated-corpus file slice
 #   FUZZ_START                 first ordinal in the seeded fuzz sequence
 #
@@ -57,6 +58,8 @@ RUN_CORE=${RUN_CORE:-$RUN_FAST}
 RUN_CORPUS=${RUN_CORPUS:-$RUN_FAST}
 RUN_AUX=${RUN_AUX:-$RUN_FAST}
 AUXILIARY_PHASE=${AUXILIARY_PHASE:-all}
+POSTGRES_REGRESS_SHARD=${POSTGRES_REGRESS_SHARD:-0}
+POSTGRES_REGRESS_SHARDS=${POSTGRES_REGRESS_SHARDS:-1}
 FAST_CORPUS_SHARD=${FAST_CORPUS_SHARD:-0}
 FAST_CORPUS_SHARDS=${FAST_CORPUS_SHARDS:-1}
 FAST_CORPUS_ONLY=${FAST_CORPUS_ONLY:-}
@@ -80,6 +83,12 @@ case "$AUXILIARY_PHASE" in
     exit 1
     ;;
 esac
+if ! [[ "$POSTGRES_REGRESS_SHARD" =~ ^[0-9]+$ \
+    && "$POSTGRES_REGRESS_SHARDS" =~ ^[1-9][0-9]*$ ]] \
+    || (( POSTGRES_REGRESS_SHARD >= POSTGRES_REGRESS_SHARDS )); then
+  echo "POSTGRES_REGRESS_SHARD must be in [0, POSTGRES_REGRESS_SHARDS)" >&2
+  exit 1
+fi
 EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 
@@ -1479,6 +1488,8 @@ reset_corpus_pair
 if "$PY" "$EXT/postgres_regress_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" \
     --setup "$EXT/postgres_regress_setup.sql" \
     --manifest "$EXT/postgres_regress_schedule.tsv" \
+    --shard-index "$POSTGRES_REGRESS_SHARD" \
+    --shard-count "$POSTGRES_REGRESS_SHARDS" \
     --max-print "${POSTGRES_REGRESS_MAX_PRINT:-30}" \
     > "$WORK/postgres-regress.out" 2>&1; then
   ok "vendored PostgreSQL regression inputs ($(tail -1 "$WORK/postgres-regress.out"))"

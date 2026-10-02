@@ -177,9 +177,12 @@ decodes maximum-width relation and tuple frames as validated borrowed wire
 views, keeping the decoded message size independent of the 1,600-column limit.
 CI preserves the complete library, curated PostgreSQL differential, and
 10,000-statement seeded fuzz suites in deterministic shards below the
-15-minute worker ceiling; the seeded sequence runs in five slices, the growing
-forced-spill corpus runs in six, and instrumented auxiliary phases have
-independent workers.
+15-minute worker ceiling; the library suite runs in four slices, sqllogictest
+queries run in eight, the seeded sequence runs in ten, the growing forced-spill
+corpus runs in six, and instrumented auxiliary phases have independent workers.
+Instrumented sqllogictest queries run in four slices. The 70,000-row cursor and
+1,100-call execution-width differential has its own corpus worker, and the
+remaining auxiliary differential phases have independent workers.
 
 Join range tables and accumulated `USING` merge state now use exact
 statement-arena slices rather than a 64-relation executor envelope. Compact
@@ -487,6 +490,20 @@ progress, exact retained capacities, collation exhaustion, and `Send + Sync`
 have direct coverage. The remaining catalog definition containers and row
 mutation paths still require synchronization before fixed workers can overlap
 execution.
+
+Routine definitions and their transaction-private identity and replacement
+images now share one startup-bounded mutex. DDL publication and rollback,
+replay, database cloning and removal, schema and type rewrites, ownership,
+checkpoint and catalog reads, overload resolution, and dependency rebinding
+observe complete definition images. Iterators copy one fixed definition and
+release the mutex before nested type, role, ACL, comment, dependency, or
+execution lookup. Four-worker publication, nested-reader progress, exact
+retained capacity, routine exhaustion, and `Send + Sync` have direct coverage.
+Failed creation and committed or rolled-back removal clear the complete slot
+before reuse. Replacement replay normalizes its complete WAL image to committed
+catalog state before publication. The remaining catalog definition containers
+and row mutation paths still require synchronization before fixed workers can
+overlap execution.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

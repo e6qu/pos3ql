@@ -7,7 +7,7 @@ name: Differential
 # against PostgreSQL as the oracle.
 #
 # Sharded so every job fits the 15-minute cap while total coverage is
-# preserved: four shards replay the vendored sqllogictest queries, five replay
+# preserved: eight shards replay the vendored sqllogictest queries, ten replay
 # disjoint slices of one seeded fuzzer sequence, and deterministic protocol,
 # curated-corpus, and auxiliary gates run in their own bounded shards.
 
@@ -80,6 +80,50 @@ jobs:
             fuzz_start: "0"
             fuzz_count: "0"
             corpus_shard: "0"
+          - shard: slt-5
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "1"
+            query_shard: "4"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+          - shard: slt-6
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "1"
+            query_shard: "5"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+          - shard: slt-7
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "1"
+            query_shard: "6"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+          - shard: slt-8
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "1"
+            query_shard: "7"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
           - shard: fuzz-1
             run_fast: "0"
             run_core: "0"
@@ -89,7 +133,7 @@ jobs:
             query_shard: "0"
             run_fuzz: "1"
             fuzz_start: "0"
-            fuzz_count: "2000"
+            fuzz_count: "1000"
             corpus_shard: "0"
           - shard: fuzz-2
             run_fast: "0"
@@ -99,8 +143,8 @@ jobs:
             run_slt: "0"
             query_shard: "0"
             run_fuzz: "1"
-            fuzz_start: "2000"
-            fuzz_count: "2000"
+            fuzz_start: "1000"
+            fuzz_count: "1000"
             corpus_shard: "0"
           - shard: fuzz-3
             run_fast: "0"
@@ -110,8 +154,8 @@ jobs:
             run_slt: "0"
             query_shard: "0"
             run_fuzz: "1"
-            fuzz_start: "4000"
-            fuzz_count: "2000"
+            fuzz_start: "2000"
+            fuzz_count: "1000"
             corpus_shard: "0"
           - shard: fuzz-4
             run_fast: "0"
@@ -121,8 +165,8 @@ jobs:
             run_slt: "0"
             query_shard: "0"
             run_fuzz: "1"
-            fuzz_start: "6000"
-            fuzz_count: "2000"
+            fuzz_start: "3000"
+            fuzz_count: "1000"
             corpus_shard: "0"
           - shard: fuzz-5
             run_fast: "0"
@@ -132,8 +176,63 @@ jobs:
             run_slt: "0"
             query_shard: "0"
             run_fuzz: "1"
+            fuzz_start: "4000"
+            fuzz_count: "1000"
+            corpus_shard: "0"
+          - shard: fuzz-6
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "1"
+            fuzz_start: "5000"
+            fuzz_count: "1000"
+            corpus_shard: "0"
+          - shard: fuzz-7
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "1"
+            fuzz_start: "6000"
+            fuzz_count: "1000"
+            corpus_shard: "0"
+          - shard: fuzz-8
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "1"
+            fuzz_start: "7000"
+            fuzz_count: "1000"
+            corpus_shard: "0"
+          - shard: fuzz-9
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "1"
             fuzz_start: "8000"
-            fuzz_count: "2000"
+            fuzz_count: "1000"
+            corpus_shard: "0"
+          - shard: fuzz-10
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "1"
+            fuzz_start: "9000"
+            fuzz_count: "1000"
             corpus_shard: "0"
           - shard: core
             run_fast: "1"
@@ -157,6 +256,7 @@ jobs:
             fuzz_start: "0"
             fuzz_count: "0"
             corpus_shard: "0"
+            corpus_exclude: "179_remaining_execution_widths"
           - shard: corpus-2
             run_fast: "1"
             run_core: "0"
@@ -168,6 +268,7 @@ jobs:
             fuzz_start: "0"
             fuzz_count: "0"
             corpus_shard: "1"
+            corpus_exclude: "179_remaining_execution_widths"
           - shard: corpus-3
             run_fast: "1"
             run_core: "0"
@@ -179,6 +280,7 @@ jobs:
             fuzz_start: "0"
             fuzz_count: "0"
             corpus_shard: "2"
+            corpus_exclude: "179_remaining_execution_widths"
           - shard: corpus-4
             run_fast: "1"
             run_core: "0"
@@ -190,7 +292,20 @@ jobs:
             fuzz_start: "0"
             fuzz_count: "0"
             corpus_shard: "3"
-          - shard: auxiliary
+            corpus_exclude: "179_remaining_execution_widths"
+          - shard: corpus-execution-widths
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "1"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "1"
+            corpus_only: "179_remaining_execution_widths"
+          - shard: auxiliary-pg-regress
             run_fast: "1"
             run_core: "0"
             run_corpus: "0"
@@ -201,6 +316,67 @@ jobs:
             fuzz_start: "0"
             fuzz_count: "0"
             corpus_shard: "0"
+            auxiliary_phase: pg_regress
+          - shard: auxiliary-exact
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "1"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+            auxiliary_phase: exact
+          - shard: auxiliary-copy
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "1"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+            auxiliary_phase: copy
+          - shard: auxiliary-types
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "1"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+            auxiliary_phase: types
+          - shard: auxiliary-listen
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "1"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+            auxiliary_phase: listen
+          - shard: auxiliary-composites
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "1"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+            auxiliary_phase: composites
 
     services:
       postgres:
@@ -275,12 +451,12 @@ jobs:
           PGUSER: postgres
           P3_PORT: "15599"
           # Replay the whole vendored sqllogictest corpus (~11k blocks): each of
-          # the four slt shards runs all files and all statements but a quarter of
-          # the query blocks, so even one pathologically slow file (select4's
-          # joins) is balanced under the cap. SLT_LIMIT is the per-file block cap
-          # (all).
+          # the eight slt shards runs all files and all statements but one
+          # eighth of the query blocks, so even one pathologically slow file
+          # (select4's joins) is balanced under the cap. SLT_LIMIT is the
+          # per-file block cap (all).
           SLT_LIMIT: "50000"
-          SLT_QUERY_SHARDS: "4"
+          SLT_QUERY_SHARDS: "8"
           SLT_QUERY_SHARD: ${{ matrix.query_shard }}
           # Unsupported SQL is a measured compatibility debt, not a green
           # escape hatch. Wide range tables now execute too, so no shard may
@@ -290,10 +466,13 @@ jobs:
           RUN_CORE: ${{ matrix.run_core }}
           RUN_CORPUS: ${{ matrix.run_corpus }}
           RUN_AUX: ${{ matrix.run_aux }}
+          AUXILIARY_PHASE: ${{ matrix.auxiliary_phase }}
           RUN_SLT: ${{ matrix.run_slt }}
           RUN_FUZZ: ${{ matrix.run_fuzz }}
           FAST_CORPUS_SHARDS: "4"
           FAST_CORPUS_SHARD: ${{ matrix.corpus_shard }}
+          FAST_CORPUS_ONLY: ${{ matrix.corpus_only }}
+          FAST_CORPUS_EXCLUDE: ${{ matrix.corpus_exclude }}
           # The fuzz shards cover disjoint slices of the same 10k-statement
           # seeded sequence. Ignored on the other shards (RUN_FUZZ=0).
           FUZZ_START: ${{ matrix.fuzz_start }}

@@ -786,7 +786,13 @@ fn describe_record_star<'q>(
                 ));
             };
             for column in columns {
-                let mut description = ColDesc::of_type(column.name.as_str(), column.ctype);
+                let name = arena.alloc_str(column.name.as_str()).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "record description exceeds the statement arena"
+                    )
+                })?;
+                let mut description = ColDesc::of_type(name, column.ctype);
                 if column.ctype.is_collatable() {
                     description = description.with_collation(crate::sql::ast::Collation::Default);
                 }

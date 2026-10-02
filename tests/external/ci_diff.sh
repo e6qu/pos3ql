@@ -15,6 +15,7 @@
 #   FUZZ_UNSUPPORTED_BUDGET    allowed unsupported generated statements (default 0)
 #   RUN_CORE / RUN_CORPUS / RUN_AUX / RUN_SLT / RUN_FUZZ
 #                              select deterministic phase groups
+#   AUXILIARY_PHASE            selected auxiliary phase (default all)
 #   FAST_CORPUS_SHARD(S)       selected curated-corpus file slice
 #   FUZZ_START                 first ordinal in the seeded fuzz sequence
 #
@@ -55,14 +56,30 @@ RUN_FUZZ=${RUN_FUZZ:-1}
 RUN_CORE=${RUN_CORE:-$RUN_FAST}
 RUN_CORPUS=${RUN_CORPUS:-$RUN_FAST}
 RUN_AUX=${RUN_AUX:-$RUN_FAST}
+AUXILIARY_PHASE=${AUXILIARY_PHASE:-all}
 FAST_CORPUS_SHARD=${FAST_CORPUS_SHARD:-0}
 FAST_CORPUS_SHARDS=${FAST_CORPUS_SHARDS:-1}
+FAST_CORPUS_ONLY=${FAST_CORPUS_ONLY:-}
+FAST_CORPUS_EXCLUDE=${FAST_CORPUS_EXCLUDE:-}
 FUZZ_START=${FUZZ_START:-0}
 if ! [[ "$FAST_CORPUS_SHARD" =~ ^[0-9]+$ && "$FAST_CORPUS_SHARDS" =~ ^[1-9][0-9]*$ ]] \
     || (( FAST_CORPUS_SHARD >= FAST_CORPUS_SHARDS )); then
   echo "FAST_CORPUS_SHARD must be in [0, FAST_CORPUS_SHARDS)" >&2
   exit 1
 fi
+if ! [[ "$FAST_CORPUS_ONLY" =~ ^[A-Za-z0-9_]*$ \
+    && "$FAST_CORPUS_EXCLUDE" =~ ^[A-Za-z0-9_]*$ ]] \
+    || [[ -n "$FAST_CORPUS_ONLY" && -n "$FAST_CORPUS_EXCLUDE" ]]; then
+  echo "FAST_CORPUS_ONLY and FAST_CORPUS_EXCLUDE must be safe names and cannot both be set" >&2
+  exit 1
+fi
+case "$AUXILIARY_PHASE" in
+  all|pg_regress|exact|copy|types|listen|composites) ;;
+  *)
+    echo "AUXILIARY_PHASE must be all, pg_regress, exact, copy, types, listen, or composites" >&2
+    exit 1
+    ;;
+esac
 EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 
@@ -1432,11 +1449,16 @@ echo "=== differential SQL corpus (real PostgreSQL vs pos3ql) ==="
 reset_corpus_pair
 corpus_ordinal=0
 for f in "$EXT"/differential/*.sql; do
+  n=$(basename "$f" .sql)
+  if [[ -n "$FAST_CORPUS_ONLY" && "$n" != "$FAST_CORPUS_ONLY" ]] \
+      || [[ -n "$FAST_CORPUS_EXCLUDE" && "$n" == "$FAST_CORPUS_EXCLUDE" ]]; then
+    corpus_ordinal=$((corpus_ordinal + 1))
+    continue
+  fi
   if (( corpus_ordinal % FAST_CORPUS_SHARDS != FAST_CORPUS_SHARD )); then
     corpus_ordinal=$((corpus_ordinal + 1))
     continue
   fi
-  n=$(basename "$f" .sql)
   run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f"
   run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f"
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "corpus: $n"
@@ -1451,6 +1473,7 @@ if [[ "$RUN_AUX" == 1 ]]; then
 # These are unmodified inputs from PostgreSQL's own regression suite. Run the
 # selected dependency-closed schedule against both engines; PostgreSQL remains
 # the output and SQLSTATE oracle.
+if [[ "$AUXILIARY_PHASE" == all || "$AUXILIARY_PHASE" == pg_regress ]]; then
 echo "=== vendored PostgreSQL regression inputs ==="
 reset_corpus_pair
 if "$PY" "$EXT/postgres_regress_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" \
@@ -1464,10 +1487,12 @@ else
   cat "$WORK/postgres-regress.out"
 fi
 reset_corpus_pair
+fi
 
 # --- exact-error corpora (message wording must match) -----------------------
 # Each phase owns its fixed 64-table test budget.  Reusing the curated corpus
 # server made otherwise independent checks fail only after its catalog filled.
+if [[ "$AUXILIARY_PHASE" == all || "$AUXILIARY_PHASE" == exact ]]; then
 restart_p3_fresh || exit 1
 echo "=== exact-error corpora (message wording must match) ==="
 normalize_exact() {
@@ -1488,8 +1513,10 @@ for f in "$EXT"/differential_exact/*.sql; do
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "exact errors: $n"
   else bad "exact errors: $n"; head -40 "$WORK/$n.diff"; fi
 done
+fi
 
 # --- COPY binary round-trip (binary data cannot be fed through a psql corpus) -
+if [[ "$AUXILIARY_PHASE" == all || "$AUXILIARY_PHASE" == copy ]]; then
 restart_p3_fresh || exit 1
 echo "=== COPY binary round-trip (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/copy_binary_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/copybin.out" 2>&1; then
@@ -1497,8 +1524,10 @@ if "$PY" "$EXT/copy_binary_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/copy
 else
   bad "COPY binary round-trip"; cat "$WORK/copybin.out"
 fi
+fi
 
 # --- generated type fidelity matrix ----------------------------------------
+if [[ "$AUXILIARY_PHASE" == all || "$AUXILIARY_PHASE" == types ]]; then
 restart_p3_fresh || exit 1
 echo "=== accepted-type fidelity matrix (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/result_column_capacity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/result-column-capacity.out" 2>&1; then
@@ -1521,8 +1550,10 @@ if "$PY" "$EXT/type_fidelity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/ty
 else
   bad "accepted-type fidelity matrix"; cat "$WORK/type_fidelity.out"
 fi
+fi
 
 # --- LISTEN / NOTIFY (cross-connection; needs two live connections per engine) -
+if [[ "$AUXILIARY_PHASE" == all || "$AUXILIARY_PHASE" == listen ]]; then
 restart_p3_fresh || exit 1
 echo "=== LISTEN / NOTIFY (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/listen_notify_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/listen.out" 2>&1; then
@@ -1530,14 +1561,17 @@ if "$PY" "$EXT/listen_notify_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/li
 else
   bad "LISTEN / NOTIFY"; cat "$WORK/listen.out"
 fi
+fi
 
 # --- extended-protocol binary composites (parameters and results) -------------
+if [[ "$AUXILIARY_PHASE" == all || "$AUXILIARY_PHASE" == composites ]]; then
 restart_p3_fresh || exit 1
 echo "=== binary composites (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/binary_param_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/binparam.out" 2>&1; then
   ok "binary composites ($(tail -1 "$WORK/binparam.out"))"
 else
   bad "binary composites"; cat "$WORK/binparam.out"
+fi
 fi
 fi
 

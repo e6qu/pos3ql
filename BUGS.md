@@ -768,6 +768,33 @@ dependency, or execution lookup. Four-worker publication, nested-reader
 progress, exact retained capacities, collation exhaustion, and `Send + Sync`
 have direct coverage. Database removal also clears transaction-private pending
 definitions before their slots are reused.
+The routine catalog audit found complete routine definitions, pending identity
+and replacement images, and ownership in an unsynchronized fixed vector.
+Overlapping DDL, replay, database lifecycle, schema or type rewrites, overload
+resolution, dependency rebinding, checkpoint, and catalog work could lose
+updates or combine fields from different definitions. One startup-bounded
+mutex now owns the catalog. Readers copy one fixed definition and release the
+lock before nested type, role, ACL, comment, dependency, or execution lookup.
+Four-worker publication, nested-reader progress, exact retained capacity,
+routine exhaustion, and `Send + Sync` have direct coverage. Failed creation
+and committed or rolled-back removal now clear the complete reusable slot.
+Replacement replay normalizes the complete WAL image to committed catalog
+state before publishing it, so its transaction-private create marker cannot
+hide an otherwise recovered routine. The complete library suite now runs in
+four deterministic slices after a 559-test slice exceeded the CI worker's
+15-minute ceiling. The 10,000-statement differential sequence now runs in ten
+1,000-statement slices after a 2,000-statement slice passed its assertions but
+reached the same ceiling during runner cleanup. The execution-width corpus now
+has its own worker after its 70,000-row cursor began too late in a general
+corpus slice to finish within the same bound. Sqllogictest read-only queries now
+run in eight slices after a four-slice worker spent 11 minutes 41 seconds in
+replay and reached the ceiling before reporting its result.
+Instrumented sqllogictest queries now run in four slices after a two-slice
+worker passed the complete differential suite but reached the ceiling during
+runner cleanup. The uninstrumented auxiliary differential now runs PostgreSQL
+regression, exact errors, COPY, type fidelity, LISTEN/NOTIFY, and binary
+composites independently after their combined worker completed the regression
+and protocol phases but reached the ceiling during binary composites.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

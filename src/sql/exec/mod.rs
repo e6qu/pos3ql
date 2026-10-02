@@ -9473,7 +9473,7 @@ pub fn drop_owned(
         {
             continue;
         }
-        let routine = *storage.routine(slot);
+        let routine = storage.routine(slot);
         let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
         let signature = match encode_routine_signature(routine.arguments(), &mut signature) {
             Ok(signature) => signature,
@@ -32486,12 +32486,13 @@ pub fn create_routine(
         },
     };
     if replaced.is_none() {
+        let stored = storage.routine(slot);
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage(
             txn.txid,
             lsn,
             &WalOp::CreateRoutine {
-                definition: storage.routine(slot),
+                definition: &stored,
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                     storage.routine_dependencies_for(slot, txn.txid),
                 ),
@@ -33277,12 +33278,13 @@ pub fn create_aggregate(
         },
     };
     if replaced.is_none() {
+        let stored = storage.routine(slot);
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage(
             txn.txid,
             lsn,
             &WalOp::CreateRoutine {
-                definition: storage.routine(slot),
+                definition: &stored,
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                     storage.routine_dependencies_for(slot, txn.txid),
                 ),
@@ -34824,7 +34826,7 @@ pub fn drop_routine(
         if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
             return sql_fail(error);
         }
-        let routine = *storage.routine(slot);
+        let routine = storage.routine(slot);
         let StoredDependencyClosure {
             views: dependent_views,
             matviews: dependent_matviews,

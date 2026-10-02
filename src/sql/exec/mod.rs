@@ -3751,7 +3751,7 @@ fn copy_like_statistics(
         let source_slot = resolve_dml_table(storage, &like.source, txn.txid)?;
         let source_capacity = storage.extended_statistics_count();
         for source_statistics_slot in 0..source_capacity {
-            let source = *storage.extended_statistics(source_statistics_slot);
+            let source = storage.extended_statistics(source_statistics_slot);
             if !source.visible_to(txn.txid) || usize::from(source.table) != source_slot {
                 continue;
             }
@@ -5384,6 +5384,10 @@ fn drop_table_kind(
                     let definition = storage
                         .extended_statistics(statistics_slot)
                         .definition_for(txn.txid);
+                    if let Err(error) = storage.drop_extended_statistics(statistics_slot, txn.txid)
+                    {
+                        return sql_fail(error);
+                    }
                     if def.persistence != crate::storage::RelationPersistence::Temporary {
                         let lsn = storage.bump_lsn();
                         if let Err(error) = wal.stage(
@@ -5394,10 +5398,10 @@ fn drop_table_kind(
                                 name: definition.name.as_str(),
                             },
                         ) {
+                            storage.rollback_extended_statistics_drop(statistics_slot, txn.txid);
                             return sql_fail(error);
                         }
                     }
-                    storage.drop_extended_statistics(statistics_slot, txn.txid);
                     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(
                         statistics_slot as u32,
                     )) {
@@ -6176,6 +6180,12 @@ pub fn alter_owner(
             _ => undefined_qual(name),
         });
     };
+    if object.class == AccessClass::Statistics
+        && let Err(error) =
+            storage.require_extended_statistics_mutation(usize::from(object.slot), txn.txid)
+    {
+        return sql_fail(error);
+    }
     let role = resolve_role_name(role);
     let Some(new_owner) = storage.find_role_visible(role.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
@@ -12724,6 +12734,9 @@ pub fn drop_schema(
                 let definition = storage
                     .extended_statistics(*statistics)
                     .definition_for(txn.txid);
+                if let Err(error) = storage.drop_extended_statistics(*statistics, txn.txid) {
+                    return sql_fail(error);
+                }
                 let lsn = storage.bump_lsn();
                 if let Err(error) = wal.stage(
                     txn.txid,
@@ -12733,9 +12746,9 @@ pub fn drop_schema(
                         name: definition.name.as_str(),
                     },
                 ) {
+                    storage.rollback_extended_statistics_drop(*statistics, txn.txid);
                     return sql_fail(error);
                 }
-                storage.drop_extended_statistics(*statistics, txn.txid);
                 if let Err(error) =
                     txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(*statistics as u32))
                 {
@@ -42928,16 +42941,19 @@ fn apply_column_drop_dependencies(
             break;
         };
         let definition = storage.extended_statistics(slot).definition_for(txn.txid);
+        storage.drop_extended_statistics(slot, txn.txid)?;
         let lsn = storage.bump_lsn();
-        wal.stage(
+        if let Err(error) = wal.stage(
             txn.txid,
             lsn,
             &WalOp::DropExtendedStatistics {
                 schema: definition.schema.as_str(),
                 name: definition.name.as_str(),
             },
-        )?;
-        storage.drop_extended_statistics(slot, txn.txid);
+        ) {
+            storage.rollback_extended_statistics_drop(slot, txn.txid);
+            return Err(error);
+        }
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(slot as u32)) {
             storage.rollback_extended_statistics_drop(slot, txn.txid);
             return Err(error);
@@ -44860,7 +44876,7 @@ fn rewrite_table_statistics_column_references(
     }
     let statistics_capacity = storage.extended_statistics_count();
     for slot in 0..statistics_capacity {
-        let statistics = *storage.extended_statistics(slot);
+        let statistics = storage.extended_statistics(slot);
         if !statistics.visible_to(txn.txid) || usize::from(statistics.table) != table {
             continue;
         }
@@ -46732,7 +46748,9 @@ pub fn drop_statistics(
         let table = usize::from(storage.extended_statistics(slot).table);
         let temporary = storage.table_def(table, txn.txid).persistence
             == crate::storage::RelationPersistence::Temporary;
-        storage.drop_extended_statistics(slot, txn.txid);
+        if let Err(error) = storage.drop_extended_statistics(slot, txn.txid) {
+            return sql_fail(error);
+        }
         let definition = storage.extended_statistics(slot).definition_for(txn.txid);
         if !temporary {
             let lsn = storage.lsn() + 1;
@@ -46764,7 +46782,7 @@ fn stage_extended_statistics_definition(
     txn: &TxnState,
     slot: usize,
 ) -> Result<(), SqlError> {
-    let statistics = *storage.extended_statistics(slot);
+    let statistics = storage.extended_statistics(slot);
     let mutable = statistics.definition_for(txn.txid);
     let table = *storage.table_def(usize::from(statistics.table), txn.txid);
     if table.persistence == crate::storage::RelationPersistence::Temporary {
@@ -46890,7 +46908,7 @@ pub(crate) fn analyze_extended_statistics(
     let table_definition = *storage.table_def(table, txn.txid);
     let statistics_capacity = storage.extended_statistics_count();
     for slot in 0..statistics_capacity {
-        let definition = *storage.extended_statistics(slot);
+        let definition = storage.extended_statistics(slot);
         if !definition.visible_to(txn.txid) || usize::from(definition.table) != table {
             continue;
         }

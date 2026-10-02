@@ -840,6 +840,21 @@ renames, replacements, and drops use the common transaction wait boundary.
 Four-worker publication, nested-reader progress, exact retained capacities,
 trigger exhaustion, complete slot reuse, and `Send + Sync` have direct
 coverage.
+The extended-statistics catalog audit found definitions, pending identity and
+key images, ownership, committed analyzed data, and transaction-private data
+versions split across unsynchronized fixed vectors. Overlapping DDL, ANALYZE,
+replay, database lifecycle, schema rename, ownership, checkpoint, catalog, and
+planner work could lose updates, combine fields from different transitions, or
+reuse a definition slot while a pending data chain still referenced it. One
+startup-bounded mutex now owns definitions and pending data. Readers copy one
+fixed definition and release the lock before nested relation, role, comment,
+or planner lookup. Conflicting DDL, ownership, and analysis mutations report
+the owning transaction or the existing serialization failure. Four-worker
+publication, nested-reader progress, exact retained capacities, loud
+exhaustion, complete slot reuse, and `Send + Sync` have direct coverage. The
+same audit found statistics creation committing existence without promoting
+its initial ownership overlay; later DDL and ANALYZE now see committed
+ownership instead of a stale transaction blocker.
 The instrumented SQL differential corpus outgrew its three-worker partition,
 then a slower runner exhausted the limit again with four workers after a
 3-minute 20-second build and more than 11 minutes of normal corpus progress.

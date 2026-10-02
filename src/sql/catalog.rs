@@ -16184,8 +16184,8 @@ fn pg_statistic_ext<'a>(
                 mutable
                     .target
                     .map_or(Datum::Null, |target| Datum::Int2(target as i16)),
-                extended_statistics_kinds(statistics, txid, arena)?,
-                extended_statistics_expressions(statistics, txid, arena)?,
+                extended_statistics_kinds(&statistics, txid, arena)?,
+                extended_statistics_expressions(&statistics, txid, arena)?,
             ],
             arena,
         )?;
@@ -16454,7 +16454,7 @@ fn pg_statistic_ext_data<'a>(
         if !data.valid {
             continue;
         }
-        let key_numbers = extended_statistics_key_numbers(storage, statistics, txid);
+        let key_numbers = extended_statistics_key_numbers(storage, &statistics, txid);
         let key_numbers = &key_numbers[..usize::from(statistics.n_keys)];
         let ndistinct = extended_statistics_ndistinct(key_numbers, data);
         let dependencies = extended_statistics_dependencies(key_numbers, data);
@@ -16542,7 +16542,7 @@ fn pg_stats_ext<'a>(
                 }
             }
         }
-        let key_numbers = extended_statistics_key_numbers(storage, statistics, txid);
+        let key_numbers = extended_statistics_key_numbers(storage, &statistics, txid);
         let key_numbers = &key_numbers[..usize::from(statistics.n_keys)];
         let ndistinct = extended_statistics_ndistinct(key_numbers, data);
         let dependencies = extended_statistics_dependencies(key_numbers, data);
@@ -16642,7 +16642,7 @@ fn pg_stats_ext<'a>(
                     super::types::ArrElem::Text,
                     arena,
                 )?,
-                extended_statistics_kinds(statistics, txid, arena)?,
+                extended_statistics_kinds(&statistics, txid, arena)?,
                 Datum::Bool(data.inherited),
                 statistics
                     .kinds

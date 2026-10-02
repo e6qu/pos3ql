@@ -546,9 +546,22 @@ the mutex before nested relation, routine, comment, dependency, or execution
 lookup. Conflicting creates, renames, replacements, and drops use the common
 transaction wait boundary. Four-worker publication, nested-reader progress,
 exact retained capacities, trigger exhaustion, complete slot reuse, and
-`Send + Sync` have direct coverage. The remaining catalog definition containers and
-row mutation paths still require synchronization before fixed workers can
-overlap execution.
+`Send + Sync` have direct coverage.
+
+Extended statistics definitions, pending identity and key images, ownership,
+committed analyzed data, and the startup-bounded pending data pool now share
+one mutex. DDL, `ANALYZE`, replay, database cloning and removal, schema rename,
+ownership changes, checkpoint and catalog reads, and planner lookups observe
+complete images. Iterators copy one fixed definition and release the mutex
+before nested relation, role, comment, or planner lookup. Conflicting DDL,
+ownership, and analysis mutations use the common transaction wait boundary or
+the existing serialization error. Four-worker publication, nested-reader
+progress, exact retained capacities, loud exhaustion, complete slot reuse, and
+`Send + Sync` have direct coverage. Creation commit now promotes the initial
+ownership overlay with existence, so later transactions do not retain a stale
+catalog blocker. The remaining catalog definition
+containers and row mutation paths still require synchronization before fixed
+workers can overlap execution.
 
 Instrumented SQL differential coverage now divides the corpus into six
 deterministic slices after three and then four slices exhausted the fixed

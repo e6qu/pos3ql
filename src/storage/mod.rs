@@ -11283,6 +11283,81 @@ impl RoleSetting {
     }
 }
 
+struct RoleCatalog {
+    roles: FixedVec<RoleDef>,
+    memberships: FixedVec<RoleMembership>,
+    settings: FixedVec<RoleSetting>,
+}
+
+struct RoleIter<'a> {
+    catalog: &'a std::sync::Mutex<RoleCatalog>,
+    next_slot: usize,
+    live_only: bool,
+}
+
+impl Iterator for RoleIter<'_> {
+    type Item = (usize, RoleDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let catalog = self.catalog.lock().expect("role catalog lock poisoned");
+            if self.next_slot >= catalog.roles.len() {
+                return None;
+            }
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            let role = catalog.roles[slot];
+            if !self.live_only || role.live {
+                return Some((slot, role));
+            }
+        }
+    }
+}
+
+struct RoleMembershipIter<'a> {
+    catalog: &'a std::sync::Mutex<RoleCatalog>,
+    next_slot: usize,
+    live_only: bool,
+}
+
+impl Iterator for RoleMembershipIter<'_> {
+    type Item = (usize, RoleMembership);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let catalog = self.catalog.lock().expect("role catalog lock poisoned");
+            if self.next_slot >= catalog.memberships.len() {
+                return None;
+            }
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            let membership = catalog.memberships[slot];
+            if !self.live_only || membership.live {
+                return Some((slot, membership));
+            }
+        }
+    }
+}
+
+struct RoleSettingIter<'a> {
+    catalog: &'a std::sync::Mutex<RoleCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for RoleSettingIter<'_> {
+    type Item = (usize, RoleSetting);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("role catalog lock poisoned");
+        if self.next_slot >= catalog.settings.len() {
+            return None;
+        }
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        Some((slot, catalog.settings[slot]))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SystemSetting {
     pub name: SqlName,
@@ -12426,9 +12501,7 @@ pub struct Storage {
     extension_scripts: FixedVec<ExtensionScript>,
     extension_script_source: FixedBuf,
     extension_package_source: ExtensionPackageSource,
-    roles: FixedVec<RoleDef>,
-    role_memberships: FixedVec<RoleMembership>,
-    role_settings: FixedVec<RoleSetting>,
+    role_catalog: std::sync::Mutex<RoleCatalog>,
     /// One mutex-protected authorization bitmap per fixed query workspace.
     role_graph_scratch: FixedVec<std::sync::Mutex<FixedVec<bool>>>,
     system_settings: FixedVec<SystemSetting>,
@@ -17070,9 +17143,11 @@ impl Storage {
             extension_scripts,
             extension_script_source,
             extension_package_source: ExtensionPackageSource::Durable,
-            roles,
-            role_memberships,
-            role_settings,
+            role_catalog: std::sync::Mutex::new(RoleCatalog {
+                roles,
+                memberships: role_memberships,
+                settings: role_settings,
+            }),
             role_graph_scratch,
             system_settings,
             prepared_transactions,
@@ -17950,7 +18025,11 @@ impl Storage {
     }
 
     pub fn role_count(&self) -> usize {
-        self.roles.len()
+        self.role_catalog
+            .lock()
+            .expect("role catalog lock poisoned")
+            .roles
+            .len()
     }
 
     pub(crate) fn databases_visible_to(
@@ -18057,11 +18136,7 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        if self
-            .roles
-            .get(usize::from(owner))
-            .is_none_or(|role| !role.visible_to(txid))
-        {
+        if !self.role_slot_visible(usize::from(owner), txid) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "database owner does not exist"
@@ -19637,9 +19712,15 @@ impl Storage {
             class: AccessClass::Database,
             slot: slot as u16,
         });
-        for setting in self.role_settings.iter_mut() {
-            if setting.live && setting.scope.database() == Some(oid) {
-                *setting = RoleSetting::EMPTY;
+        {
+            let mut catalog = self
+                .role_catalog
+                .lock()
+                .expect("role catalog lock poisoned");
+            for setting in catalog.settings.iter_mut() {
+                if setting.live && setting.scope.database() == Some(oid) {
+                    *setting = RoleSetting::EMPTY;
+                }
             }
         }
         self.clear_database_catalog(oid);
@@ -19678,12 +19759,24 @@ impl Storage {
         }
     }
 
-    pub fn role(&self, slot: usize) -> &RoleDef {
-        &self.roles[slot]
+    pub fn role(&self, slot: usize) -> RoleDef {
+        self.role_catalog
+            .lock()
+            .expect("role catalog lock poisoned")
+            .roles[slot]
     }
 
     pub fn role_name(&self, slot: usize, txid: u32) -> SqlName {
-        self.roles[slot].name_to(txid)
+        self.role(slot).name_to(txid)
+    }
+
+    fn role_slot_visible(&self, slot: usize, txid: u32) -> bool {
+        self.role_catalog
+            .lock()
+            .expect("role catalog lock poisoned")
+            .roles
+            .get(slot)
+            .is_some_and(|role| role.visible_to(txid))
     }
 
     /// `CREATEDB` is a cluster role attribute and must never stand in for the
@@ -19712,18 +19805,28 @@ impl Storage {
         )
     }
 
-    pub fn live_roles(&self) -> impl Iterator<Item = (usize, &RoleDef)> {
-        self.roles.iter().enumerate().filter(|(_, role)| role.live)
+    pub fn live_roles(&self) -> impl Iterator<Item = (usize, RoleDef)> + '_ {
+        RoleIter {
+            catalog: &self.role_catalog,
+            next_slot: 0,
+            live_only: true,
+        }
     }
 
     pub fn find_role(&self, name: &str) -> Option<usize> {
-        self.roles
+        self.role_catalog
+            .lock()
+            .expect("role catalog lock poisoned")
+            .roles
             .iter()
             .position(|role| role.live && role.name.as_str() == name)
     }
 
     pub fn find_role_visible(&self, name: &str, txid: u32) -> Option<usize> {
-        self.roles
+        self.role_catalog
+            .lock()
+            .expect("role catalog lock poisoned")
+            .roles
             .iter()
             .position(|role| role.visible_to(txid) && role.name_to(txid).as_str() == name)
     }
@@ -19740,9 +19843,15 @@ impl Storage {
     }
 
     pub(crate) fn role_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
-        self.roles.iter().enumerate().find_map(|(slot, role)| {
-            (role.visible_to(txid) && Self::role_oid(slot) == oid).then_some(slot)
-        })
+        self.role_catalog
+            .lock()
+            .expect("role catalog lock poisoned")
+            .roles
+            .iter()
+            .enumerate()
+            .find_map(|(slot, role)| {
+                (role.visible_to(txid) && Self::role_oid(slot) == oid).then_some(slot)
+            })
     }
 
     fn ownership(&self, object: AccessObject) -> &Ownership {
@@ -22274,9 +22383,13 @@ impl Storage {
             return;
         }
         out[member] = true;
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
         loop {
             let mut changed = false;
-            for membership in self.role_memberships.iter() {
+            for membership in catalog.memberships.iter() {
                 if !membership.visible_to(txid)
                     || !out[membership.member as usize]
                     || (require_inherit && !membership.options_to(txid).inherit)
@@ -22673,25 +22786,34 @@ impl Storage {
     }
 
     pub fn create_role(
-        &mut self,
+        &self,
         name: SqlName,
         attributes: RoleAttributes,
         txid: u32,
     ) -> Result<(usize, Option<PendingRole>), SqlError> {
-        if self.find_role_visible(name.as_str(), txid).is_some() {
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        if catalog
+            .roles
+            .iter()
+            .any(|role| role.visible_to(txid) && role.name_to(txid) == name)
+        {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "role \"{}\" already exists",
                 name.as_str()
             ));
         }
-        if let Some(owner) = self.roles.iter().find_map(|role| {
+        if let Some(owner) = catalog.roles.iter().find_map(|role| {
             (role.name == name)
                 .then_some(role.pending)
                 .flatten()
                 .filter(|pending| pending.txid != txid)
                 .map(|pending| pending.txid)
         }) {
+            drop(catalog);
             self.wait_for_transaction(txid, owner)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
@@ -22699,7 +22821,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let Some(slot) = self
+        let Some(slot) = catalog
             .roles
             .iter()
             .position(|role| !role.live && role.pending.is_none())
@@ -22707,11 +22829,11 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many roles (limit {})",
-                self.roles.len()
+                catalog.roles.len()
             ));
         };
-        let prior = self.roles[slot].pending;
-        self.roles[slot] = RoleDef {
+        let prior = catalog.roles[slot].pending;
+        catalog.roles[slot] = RoleDef {
             name,
             attributes: RoleAttributes::ORDINARY,
             live: false,
@@ -22726,24 +22848,30 @@ impl Storage {
     }
 
     pub fn alter_role(
-        &mut self,
+        &self,
         slot: usize,
         attributes: RoleAttributes,
         txid: u32,
     ) -> Result<Option<PendingRole>, SqlError> {
-        if let Some(pending) = self.roles[slot].pending
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        if let Some(pending) = catalog.roles[slot].pending
             && pending.txid != txid
         {
+            let role_name = catalog.roles[slot].name;
+            drop(catalog);
             self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on role \"{}\"",
-                self.roles[slot].name.as_str()
+                role_name.as_str()
             ));
         }
-        let prior = self.roles[slot].pending;
-        let name = self.roles[slot].name_to(txid);
-        self.roles[slot].pending = Some(PendingRole {
+        let prior = catalog.roles[slot].pending;
+        let name = catalog.roles[slot].name_to(txid);
+        catalog.roles[slot].pending = Some(PendingRole {
             txid,
             exists: true,
             name,
@@ -22753,13 +22881,19 @@ impl Storage {
     }
 
     pub fn rename_role(
-        &mut self,
+        &self,
         slot: usize,
         name: SqlName,
         txid: u32,
     ) -> Result<Option<PendingRole>, SqlError> {
-        if self
-            .find_role_visible(name.as_str(), txid)
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        if catalog
+            .roles
+            .iter()
+            .position(|role| role.visible_to(txid) && role.name_to(txid) == name)
             .is_some_and(|existing| existing != slot)
         {
             return Err(sql_err!(
@@ -22768,22 +22902,24 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if let Some(pending) = self.roles[slot].pending
+        if let Some(pending) = catalog.roles[slot].pending
             && pending.txid != txid
         {
+            let role_name = catalog.roles[slot].name;
+            drop(catalog);
             self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on role \"{}\"",
-                self.roles[slot].name.as_str()
+                role_name.as_str()
             ));
         }
-        let prior = self.roles[slot].pending;
-        let mut attributes = self.roles[slot].attributes_to(txid);
+        let prior = catalog.roles[slot].pending;
+        let mut attributes = catalog.roles[slot].attributes_to(txid);
         if matches!(attributes.password, Some(RoleCredential::Md5(_))) {
             attributes.password = None;
         }
-        self.roles[slot].pending = Some(PendingRole {
+        catalog.roles[slot].pending = Some(PendingRole {
             txid,
             exists: true,
             name,
@@ -22792,25 +22928,27 @@ impl Storage {
         Ok(prior)
     }
 
-    pub fn drop_role_in(
-        &mut self,
-        slot: usize,
-        txid: u32,
-    ) -> Result<Option<PendingRole>, SqlError> {
-        if let Some(pending) = self.roles[slot].pending
+    pub fn drop_role_in(&self, slot: usize, txid: u32) -> Result<Option<PendingRole>, SqlError> {
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        if let Some(pending) = catalog.roles[slot].pending
             && pending.txid != txid
         {
+            let role_name = catalog.roles[slot].name;
+            drop(catalog);
             self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on role \"{}\"",
-                self.roles[slot].name.as_str()
+                role_name.as_str()
             ));
         }
-        let prior = self.roles[slot].pending;
-        let name = self.roles[slot].name_to(txid);
-        let attributes = self.roles[slot].attributes_to(txid);
-        self.roles[slot].pending = Some(PendingRole {
+        let prior = catalog.roles[slot].pending;
+        let name = catalog.roles[slot].name_to(txid);
+        let attributes = catalog.roles[slot].attributes_to(txid);
+        catalog.roles[slot].pending = Some(PendingRole {
             txid,
             exists: false,
             name,
@@ -22819,38 +22957,59 @@ impl Storage {
         Ok(prior)
     }
 
-    pub fn commit_role_change(&mut self, slot: usize) {
-        let Some(pending) = self.roles[slot].pending.take() else {
-            return;
+    pub fn commit_role_change(&self, slot: usize) {
+        let dropped = {
+            let mut catalog = self
+                .role_catalog
+                .lock()
+                .expect("role catalog lock poisoned");
+            let Some(pending) = catalog.roles[slot].pending.take() else {
+                return;
+            };
+            catalog.roles[slot].live = pending.exists;
+            catalog.roles[slot].name = pending.name;
+            catalog.roles[slot].attributes = pending.attributes;
+            if !pending.exists {
+                catalog.roles[slot].name = SqlName::EMPTY;
+            }
+            !pending.exists
         };
-        self.roles[slot].live = pending.exists;
-        self.roles[slot].name = pending.name;
-        self.roles[slot].attributes = pending.attributes;
-        if !pending.exists {
+        if dropped {
             self.drop_comments_by_subid(CommentClass::Role, Self::role_oid(slot) as u32);
-            self.roles[slot].name = SqlName::EMPTY;
         }
     }
 
-    pub fn rollback_role_change(&mut self, slot: usize, prior: Option<PendingRole>) {
-        self.roles[slot].pending = prior;
-        if !self.roles[slot].live && prior.is_none() {
-            self.roles[slot].name = SqlName::EMPTY;
-            self.roles[slot].attributes = RoleAttributes::ORDINARY;
+    pub fn rollback_role_change(&self, slot: usize, prior: Option<PendingRole>) {
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        catalog.roles[slot].pending = prior;
+        if !catalog.roles[slot].live && prior.is_none() {
+            catalog.roles[slot].name = SqlName::EMPTY;
+            catalog.roles[slot].attributes = RoleAttributes::ORDINARY;
         }
     }
 
     /// Committed role install used by WAL and manifest recovery.
     pub fn install_role(
-        &mut self,
+        &self,
         name: SqlName,
         attributes: RoleAttributes,
     ) -> Result<usize, SqlError> {
-        if let Some(slot) = self.find_role(name.as_str()) {
-            self.roles[slot].attributes = attributes;
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        if let Some(slot) = catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.name == name)
+        {
+            catalog.roles[slot].attributes = attributes;
             return Ok(slot);
         }
-        let Some(slot) = self
+        let Some(slot) = catalog
             .roles
             .iter()
             .position(|role| !role.live && role.pending.is_none())
@@ -22858,10 +23017,10 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many roles (limit {})",
-                self.roles.len()
+                catalog.roles.len()
             ));
         };
-        self.roles[slot] = RoleDef {
+        catalog.roles[slot] = RoleDef {
             name,
             attributes,
             live: true,
@@ -22870,8 +23029,16 @@ impl Storage {
         Ok(slot)
     }
 
-    pub fn remove_role(&mut self, name: &str) {
-        if let Some(slot) = self.find_role(name) {
+    pub fn remove_role(&self, name: &str) {
+        let mut roles = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        if let Some(slot) = roles
+            .roles
+            .iter()
+            .position(|role| role.live && role.name.as_str() == name)
+        {
             self.drop_comments_by_subid(CommentClass::Role, Self::role_oid(slot) as u32);
             let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
             for entry in catalog.objects.iter_mut() {
@@ -22911,28 +23078,58 @@ impl Storage {
                 }
             }
             drop(catalog);
-            self.roles[slot] = RoleDef {
+            roles.roles[slot] = RoleDef {
                 name: SqlName::EMPTY,
                 attributes: RoleAttributes::ORDINARY,
                 live: false,
                 pending: None,
             };
+            for membership in roles.memberships.iter_mut() {
+                if membership.role as usize == slot
+                    || membership.member as usize == slot
+                    || membership.grantor as usize == slot
+                {
+                    *membership = RoleMembership {
+                        role: 0,
+                        member: 0,
+                        grantor: 0,
+                        options: RoleMembershipOptions::DEFAULT,
+                        live: false,
+                        pending: None,
+                    };
+                }
+            }
+            for setting in roles.settings.iter_mut() {
+                if setting.scope.role() == Some(slot as u16) {
+                    *setting = RoleSetting::EMPTY;
+                }
+            }
         }
     }
 
     /// WAL replay keeps the catalog slot, and therefore its shared-object
     /// comment identity, when a role is renamed.
-    pub fn replay_rename_role(&mut self, name: &str, new_name: &str) -> Result<(), SqlError> {
-        let Some(slot) = self.find_role(name) else {
+    pub fn replay_rename_role(&self, name: &str, new_name: &str) -> Result<(), SqlError> {
+        let new_name = SqlName::parse(new_name)?;
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let Some(slot) = catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.name.as_str() == name)
+        else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "journal renames unknown role \"{}\"",
                 name
             ));
         };
-        let new_name = SqlName::parse(new_name)?;
-        if self
-            .find_role(new_name.as_str())
+        if catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.name == new_name)
             .is_some_and(|existing| existing != slot)
         {
             return Err(sql_err!(
@@ -22941,29 +23138,37 @@ impl Storage {
                 new_name.as_str()
             ));
         }
-        self.roles[slot].name = new_name;
+        catalog.roles[slot].name = new_name;
         if matches!(
-            self.roles[slot].attributes.password,
+            catalog.roles[slot].attributes.password,
             Some(RoleCredential::Md5(_))
         ) {
-            self.roles[slot].attributes.password = None;
+            catalog.roles[slot].attributes.password = None;
         }
         Ok(())
     }
 
     pub fn role_membership_count(&self) -> usize {
-        self.role_memberships.len()
+        self.role_catalog
+            .lock()
+            .expect("role catalog lock poisoned")
+            .memberships
+            .len()
     }
 
-    pub fn role_membership(&self, slot: usize) -> &RoleMembership {
-        &self.role_memberships[slot]
+    pub fn role_membership(&self, slot: usize) -> RoleMembership {
+        self.role_catalog
+            .lock()
+            .expect("role catalog lock poisoned")
+            .memberships[slot]
     }
 
-    pub fn live_role_memberships(&self) -> impl Iterator<Item = (usize, &RoleMembership)> {
-        self.role_memberships
-            .iter()
-            .enumerate()
-            .filter(|(_, membership)| membership.live)
+    pub fn live_role_memberships(&self) -> impl Iterator<Item = (usize, RoleMembership)> + '_ {
+        RoleMembershipIter {
+            catalog: &self.role_catalog,
+            next_slot: 0,
+            live_only: true,
+        }
     }
 
     pub fn find_role_membership_visible(
@@ -22972,15 +23177,20 @@ impl Storage {
         member: usize,
         txid: u32,
     ) -> Option<usize> {
-        self.role_memberships.iter().position(|membership| {
-            membership.visible_to(txid)
-                && membership.role as usize == role
-                && membership.member as usize == member
-        })
+        self.role_catalog
+            .lock()
+            .expect("role catalog lock poisoned")
+            .memberships
+            .iter()
+            .position(|membership| {
+                membership.visible_to(txid)
+                    && membership.role as usize == role
+                    && membership.member as usize == member
+            })
     }
 
     pub fn change_role_membership(
-        &mut self,
+        &self,
         role: usize,
         member: usize,
         grantor: usize,
@@ -22988,7 +23198,11 @@ impl Storage {
         exists: bool,
         txid: u32,
     ) -> Result<(usize, Option<PendingRoleMembership>), SqlError> {
-        let existing = self.role_memberships.iter().position(|membership| {
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let existing = catalog.memberships.iter().position(|membership| {
             (membership.live || membership.pending.is_some())
                 && membership.role as usize == role
                 && membership.member as usize == member
@@ -23001,33 +23215,34 @@ impl Storage {
                     "role membership does not exist"
                 ));
             }
-            None => self
-                .role_memberships
+            None => catalog
+                .memberships
                 .iter()
                 .position(|membership| !membership.live && membership.pending.is_none())
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many role memberships (limit {})",
-                        self.role_memberships.len()
+                        catalog.memberships.len()
                     )
                 })?,
         };
-        if let Some(pending) = self.role_memberships[slot].pending
+        if let Some(pending) = catalog.memberships[slot].pending
             && pending.txid != txid
         {
+            drop(catalog);
             self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent role membership DDL"
             ));
         }
-        let prior = self.role_memberships[slot].pending;
+        let prior = catalog.memberships[slot].pending;
         if existing.is_none() {
-            self.role_memberships[slot].role = role as u16;
-            self.role_memberships[slot].member = member as u16;
+            catalog.memberships[slot].role = role as u16;
+            catalog.memberships[slot].member = member as u16;
         }
-        self.role_memberships[slot].pending = Some(PendingRoleMembership {
+        catalog.memberships[slot].pending = Some(PendingRoleMembership {
             txid,
             exists,
             grantor: grantor as u16,
@@ -23036,78 +23251,106 @@ impl Storage {
         Ok((slot, prior))
     }
 
-    pub fn commit_role_membership_change(&mut self, slot: usize) {
-        let Some(pending) = self.role_memberships[slot].pending.take() else {
+    pub fn commit_role_membership_change(&self, slot: usize) {
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let Some(pending) = catalog.memberships[slot].pending.take() else {
             return;
         };
-        self.role_memberships[slot].live = pending.exists;
-        self.role_memberships[slot].grantor = pending.grantor;
-        self.role_memberships[slot].options = pending.options;
+        catalog.memberships[slot].live = pending.exists;
+        catalog.memberships[slot].grantor = pending.grantor;
+        catalog.memberships[slot].options = pending.options;
         if !pending.exists {
-            self.role_memberships[slot].role = 0;
-            self.role_memberships[slot].member = 0;
-            self.role_memberships[slot].grantor = 0;
+            catalog.memberships[slot].role = 0;
+            catalog.memberships[slot].member = 0;
+            catalog.memberships[slot].grantor = 0;
         }
     }
 
     pub fn rollback_role_membership_change(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingRoleMembership>,
     ) {
-        self.role_memberships[slot].pending = prior;
-        if !self.role_memberships[slot].live && prior.is_none() {
-            self.role_memberships[slot].role = 0;
-            self.role_memberships[slot].member = 0;
-            self.role_memberships[slot].grantor = 0;
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        catalog.memberships[slot].pending = prior;
+        if !catalog.memberships[slot].live && prior.is_none() {
+            catalog.memberships[slot].role = 0;
+            catalog.memberships[slot].member = 0;
+            catalog.memberships[slot].grantor = 0;
         }
     }
 
     pub fn install_role_membership(
-        &mut self,
+        &self,
         role_name: &str,
         member_name: &str,
         grantor_name: &str,
         options: RoleMembershipOptions,
     ) -> Result<usize, SqlError> {
-        let role = self.find_role(role_name).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "membership role \"{}\" does not exist",
-                role_name
-            )
-        })?;
-        let member = self.find_role(member_name).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "membership member \"{}\" does not exist",
-                member_name
-            )
-        })?;
-        let grantor = self.find_role(grantor_name).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "membership grantor \"{}\" does not exist",
-                grantor_name
-            )
-        })?;
-        if let Some(slot) = self.find_role_membership_visible(role, member, 0) {
-            self.role_memberships[slot].grantor = grantor as u16;
-            self.role_memberships[slot].options = options;
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let role = catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.name.as_str() == role_name)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "membership role \"{}\" does not exist",
+                    role_name
+                )
+            })?;
+        let member = catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.name.as_str() == member_name)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "membership member \"{}\" does not exist",
+                    member_name
+                )
+            })?;
+        let grantor = catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.name.as_str() == grantor_name)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "membership grantor \"{}\" does not exist",
+                    grantor_name
+                )
+            })?;
+        if let Some(slot) = catalog.memberships.iter().position(|membership| {
+            membership.visible_to(0)
+                && membership.role as usize == role
+                && membership.member as usize == member
+        }) {
+            catalog.memberships[slot].grantor = grantor as u16;
+            catalog.memberships[slot].options = options;
             return Ok(slot);
         }
-        let slot = self
-            .role_memberships
+        let slot = catalog
+            .memberships
             .iter()
             .position(|membership| !membership.live && membership.pending.is_none())
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many role memberships (limit {})",
-                    self.role_memberships.len()
+                    catalog.memberships.len()
                 )
             })?;
-        self.role_memberships[slot] = RoleMembership {
+        catalog.memberships[slot] = RoleMembership {
             role: role as u16,
             member: member as u16,
             grantor: grantor as u16,
@@ -23118,22 +23361,33 @@ impl Storage {
         Ok(slot)
     }
 
-    pub(crate) fn role_settings(&self) -> impl Iterator<Item = (usize, &RoleSetting)> {
-        self.role_settings.iter().enumerate()
+    pub(crate) fn role_settings(&self) -> impl Iterator<Item = (usize, RoleSetting)> + '_ {
+        RoleSettingIter {
+            catalog: &self.role_catalog,
+            next_slot: 0,
+        }
     }
 
     pub(crate) fn role_setting_count(&self) -> usize {
-        self.role_settings.len()
+        self.role_catalog
+            .lock()
+            .expect("role catalog lock poisoned")
+            .settings
+            .len()
     }
 
     pub(crate) fn change_role_setting(
-        &mut self,
+        &self,
         scope: RoleSettingScope,
         name: SqlName,
         value: Option<StackStr<ROLE_SETTING_VALUE_MAX>>,
         txid: u32,
     ) -> Result<(usize, Option<PendingRoleSetting>), SqlError> {
-        let existing = self.role_settings.iter().position(|setting| {
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let existing = catalog.settings.iter().position(|setting| {
             (setting.live || setting.pending.is_some())
                 && setting.scope == scope
                 && setting.name == name
@@ -23146,33 +23400,34 @@ impl Storage {
                     "role setting does not exist"
                 ));
             }
-            None => self
-                .role_settings
+            None => catalog
+                .settings
                 .iter()
                 .position(|setting| !setting.live && setting.pending.is_none())
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many role settings (limit {})",
-                        self.role_settings.len()
+                        catalog.settings.len()
                     )
                 })?,
         };
-        if let Some(pending) = self.role_settings[slot].pending
+        if let Some(pending) = catalog.settings[slot].pending
             && pending.txid != txid
         {
+            drop(catalog);
             self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent role setting DDL"
             ));
         }
-        let prior = self.role_settings[slot].pending;
+        let prior = catalog.settings[slot].pending;
         if existing.is_none() {
-            self.role_settings[slot].scope = scope;
-            self.role_settings[slot].name = name;
+            catalog.settings[slot].scope = scope;
+            catalog.settings[slot].name = name;
         }
-        self.role_settings[slot].pending = Some(PendingRoleSetting {
+        catalog.settings[slot].pending = Some(PendingRoleSetting {
             txid,
             exists: value.is_some(),
             value: value.unwrap_or_default(),
@@ -23180,57 +23435,69 @@ impl Storage {
         Ok((slot, prior))
     }
 
-    pub(crate) fn commit_role_setting(&mut self, slot: usize) {
-        let Some(pending) = self.role_settings[slot].pending.take() else {
+    pub(crate) fn commit_role_setting(&self, slot: usize) {
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let Some(pending) = catalog.settings[slot].pending.take() else {
             return;
         };
-        self.role_settings[slot].live = pending.exists;
-        self.role_settings[slot].value = pending.value;
+        catalog.settings[slot].live = pending.exists;
+        catalog.settings[slot].value = pending.value;
         if !pending.exists {
-            self.role_settings[slot] = RoleSetting::EMPTY;
+            catalog.settings[slot] = RoleSetting::EMPTY;
         }
     }
 
-    pub(crate) fn rollback_role_setting(&mut self, slot: usize, prior: Option<PendingRoleSetting>) {
-        self.role_settings[slot].pending = prior;
-        if !self.role_settings[slot].live && prior.is_none() {
-            self.role_settings[slot] = RoleSetting::EMPTY;
+    pub(crate) fn rollback_role_setting(&self, slot: usize, prior: Option<PendingRoleSetting>) {
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        catalog.settings[slot].pending = prior;
+        if !catalog.settings[slot].live && prior.is_none() {
+            catalog.settings[slot] = RoleSetting::EMPTY;
         }
     }
 
     pub(crate) fn install_role_setting(
-        &mut self,
+        &self,
         scope: RoleSettingScope,
         name: SqlName,
         value: Option<StackStr<ROLE_SETTING_VALUE_MAX>>,
     ) -> Result<(), SqlError> {
-        if let Some(slot) = self
-            .role_settings
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        if let Some(slot) = catalog
+            .settings
             .iter()
             .position(|setting| setting.live && setting.scope == scope && setting.name == name)
         {
             if let Some(value) = value {
-                self.role_settings[slot].value = value;
+                catalog.settings[slot].value = value;
             } else {
-                self.role_settings[slot] = RoleSetting::EMPTY;
+                catalog.settings[slot] = RoleSetting::EMPTY;
             }
             return Ok(());
         }
         let Some(value) = value else {
             return Ok(());
         };
-        let slot = self
-            .role_settings
+        let slot = catalog
+            .settings
             .iter()
             .position(|setting| !setting.live && setting.pending.is_none())
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many role settings (limit {})",
-                    self.role_settings.len()
+                    catalog.settings.len()
                 )
             })?;
-        self.role_settings[slot] = RoleSetting {
+        catalog.settings[slot] = RoleSetting {
             scope,
             name,
             value,
@@ -23358,13 +23625,28 @@ impl Storage {
         Ok(())
     }
 
-    pub fn remove_role_membership(&mut self, role_name: &str, member_name: &str) {
-        let (Some(role), Some(member)) = (self.find_role(role_name), self.find_role(member_name))
-        else {
+    pub fn remove_role_membership(&self, role_name: &str, member_name: &str) {
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let role = catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.name.as_str() == role_name);
+        let member = catalog
+            .roles
+            .iter()
+            .position(|role| role.live && role.name.as_str() == member_name);
+        let (Some(role), Some(member)) = (role, member) else {
             return;
         };
-        if let Some(slot) = self.find_role_membership_visible(role, member, 0) {
-            self.role_memberships[slot].live = false;
+        if let Some(slot) = catalog.memberships.iter().position(|membership| {
+            membership.visible_to(0)
+                && membership.role as usize == role
+                && membership.member as usize == member
+        }) {
+            catalog.memberships[slot].live = false;
         }
     }
 
@@ -23388,7 +23670,12 @@ impl Storage {
     }
 
     pub fn role_can_admin(&self, member: usize, target: usize, txid: u32) -> bool {
-        self.role_memberships.iter().any(|membership| {
+        RoleMembershipIter {
+            catalog: &self.role_catalog,
+            next_slot: 0,
+            live_only: false,
+        }
+        .any(|(_, membership)| {
             membership.visible_to(txid)
                 && membership.role as usize == target
                 && membership.options_to(txid).admin
@@ -23403,20 +23690,27 @@ impl Storage {
         excluded: usize,
         txid: u32,
     ) -> bool {
-        self.role_memberships
-            .iter()
-            .enumerate()
-            .any(|(slot, membership)| {
-                slot != excluded
-                    && membership.visible_to(txid)
-                    && membership.role as usize == target
-                    && membership.options_to(txid).admin
-                    && self.role_is_member_of(member, membership.member as usize, txid)
-            })
+        RoleMembershipIter {
+            catalog: &self.role_catalog,
+            next_slot: 0,
+            live_only: false,
+        }
+        .any(|(slot, membership)| {
+            slot != excluded
+                && membership.visible_to(txid)
+                && membership.role as usize == target
+                && membership.options_to(txid).admin
+                && self.role_is_member_of(member, membership.member as usize, txid)
+        })
     }
 
     pub fn role_has_grants_from(&self, role: usize, grantor: usize, txid: u32) -> bool {
-        self.role_memberships.iter().any(|membership| {
+        RoleMembershipIter {
+            catalog: &self.role_catalog,
+            next_slot: 0,
+            live_only: false,
+        }
+        .any(|(_, membership)| {
             membership.visible_to(txid)
                 && membership.role as usize == role
                 && membership.grantor_to(txid) as usize == grantor
@@ -42047,11 +42341,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if self
-            .roles
-            .get(usize::from(owner))
-            .is_none_or(|role| !role.visible_to(txid))
-        {
+        if !self.role_slot_visible(usize::from(owner), txid) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "tablespace owner does not exist"
@@ -44882,11 +45172,7 @@ impl Storage {
                 definition.event.name()
             ));
         }
-        if self
-            .roles
-            .get(usize::from(definition.ownership.owner_to(txid)))
-            .is_none_or(|role| !role.visible_to(txid))
-        {
+        if !self.role_slot_visible(usize::from(definition.ownership.owner_to(txid)), txid) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "event trigger owner does not exist"
@@ -47268,9 +47554,14 @@ mod tests {
             enum_member_image_capacity(&config) * 96
         );
         assert_eq!(storage.composites.len(), 29);
-        assert_eq!(storage.roles.len(), 19);
-        assert_eq!(storage.role_memberships.len(), 20);
-        assert_eq!(storage.role_settings.len(), 21);
+        let role_catalog = storage
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        assert_eq!(role_catalog.roles.len(), 19);
+        assert_eq!(role_catalog.memberships.len(), 20);
+        assert_eq!(role_catalog.settings.len(), 21);
+        drop(role_catalog);
         assert_eq!(storage.role_graph_scratch.len(), 2);
         assert!(storage.role_graph_scratch.iter().all(|scratch| {
             scratch
@@ -47676,6 +47967,133 @@ mod tests {
         let bounded = CatalogSequence::new(1);
         assert_eq!(bounded.next_bounded(2, "test").unwrap(), 2);
         assert!(bounded.next_bounded(2, "test").is_err());
+    }
+
+    #[test]
+    fn role_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<RoleCatalog>>();
+        assert_send_sync::<RoleIter<'_>>();
+        assert_send_sync::<RoleMembershipIter<'_>>();
+        assert_send_sync::<RoleSettingIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let names = ["role_a", "role_b", "role_c", "role_d"];
+        let mut config = test_config();
+        config.max_roles = 1 + WORKERS;
+        config.max_role_memberships = WORKERS;
+        config.max_role_settings = WORKERS;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let txid = worker as u32 + 1;
+                    let name = SqlName::parse(names[worker]).unwrap();
+                    let (role, _) = storage
+                        .create_role(name, RoleAttributes::ORDINARY, txid)
+                        .unwrap();
+                    storage.commit_role_change(role);
+
+                    let options = RoleMembershipOptions {
+                        admin: true,
+                        ..RoleMembershipOptions::DEFAULT
+                    };
+                    let (membership, _) = storage
+                        .change_role_membership(
+                            BOOTSTRAP_ROLE as usize,
+                            role,
+                            0,
+                            options,
+                            true,
+                            txid,
+                        )
+                        .unwrap();
+                    storage.commit_role_membership_change(membership);
+
+                    let (setting, _) = storage
+                        .change_role_setting(
+                            RoleSettingScope::RoleAllDatabases(role as u16),
+                            SqlName::parse("application_name").unwrap(),
+                            Some(StackStr::from_str(names[worker])),
+                            txid,
+                        )
+                        .unwrap();
+                    storage.commit_role_setting(setting);
+                });
+            }
+        });
+
+        let catalog = storage
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        assert_eq!(catalog.roles.capacity(), 1 + WORKERS);
+        assert_eq!(catalog.memberships.capacity(), WORKERS);
+        assert_eq!(catalog.settings.capacity(), WORKERS);
+        drop(catalog);
+
+        assert_eq!(storage.live_roles().count(), 1 + WORKERS);
+        assert_eq!(storage.live_role_memberships().count(), WORKERS);
+        assert_eq!(
+            storage
+                .role_settings()
+                .filter(|(_, setting)| setting.live)
+                .count(),
+            WORKERS
+        );
+        for (slot, role) in storage.live_roles() {
+            assert_eq!(storage.role_name(slot, 0), role.name);
+        }
+        for worker in 0..WORKERS {
+            let role = storage.find_role(names[worker]).unwrap();
+            assert!(storage.role_can_admin(role, BOOTSTRAP_ROLE as usize, 0));
+        }
+        assert!(
+            storage
+                .create_role(
+                    SqlName::parse("role_e").unwrap(),
+                    RoleAttributes::ORDINARY,
+                    9,
+                )
+                .is_err()
+        );
+        let first = storage.find_role(names[0]).unwrap();
+        assert!(
+            storage
+                .change_role_membership(
+                    first,
+                    BOOTSTRAP_ROLE as usize,
+                    0,
+                    RoleMembershipOptions::DEFAULT,
+                    true,
+                    9,
+                )
+                .is_err()
+        );
+        assert!(
+            storage
+                .change_role_setting(
+                    RoleSettingScope::AllRolesInDatabase(DatabaseOid::POSTGRES),
+                    SqlName::parse("application_name").unwrap(),
+                    Some(StackStr::from_str("full")),
+                    9,
+                )
+                .is_err()
+        );
+
+        storage.remove_role(names[0]);
+        assert!(storage.find_role(names[0]).is_none());
+        assert_eq!(storage.live_role_memberships().count(), WORKERS - 1);
+        assert_eq!(
+            storage
+                .role_settings()
+                .filter(|(_, setting)| setting.live)
+                .count(),
+            WORKERS - 1
+        );
     }
 
     #[test]

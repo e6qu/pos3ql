@@ -1027,7 +1027,7 @@ fn describe_leaf_inner<'a>(
     arena: &'a Arena,
 ) -> Result<usize, SqlError> {
     match &s.from {
-        None => super::describe_catalog_items(s.items, None, storage, txid, columns),
+        None => super::describe_catalog_items(s.items, None, storage, txid, arena, columns),
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
             describe_scope_items(s.items, &scope, None, storage, txid, arena, columns)

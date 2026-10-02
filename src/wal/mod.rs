@@ -755,7 +755,7 @@ pub(crate) fn apply_enum_payload(
         at += 1;
         count
     };
-    let members = storage.enum_replay_members(count)?;
+    let mut members = storage.enum_replay_members(count)?;
     for member in members.iter_mut() {
         let label = crate::storage::SqlName::parse(take_name(&mut at)?)?;
         let sort = f64::from_le_bytes(
@@ -775,6 +775,7 @@ pub(crate) fn apply_enum_payload(
             "invalid enum journal payload"
         ));
     }
+    drop(members);
     storage.finish_enum_replay(schema, name, count)?;
     Ok(())
 }

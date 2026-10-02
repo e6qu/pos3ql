@@ -26751,7 +26751,7 @@ fn pg_enum<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             continue;
         }
         let typid = crate::sql::types::oid::enum_oid(slot as u16);
-        for (i, m) in e.members().iter().enumerate() {
+        for (i, m) in e.members().enumerate() {
             out[n] = row(
                 &[
                     // A stable, unique synthetic OID per member.

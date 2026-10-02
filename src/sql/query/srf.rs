@@ -2028,6 +2028,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
                     None,
                     storage,
                     txid,
+                    arena,
                     &mut descriptors,
                 )?;
                 let mut slot = 0usize;

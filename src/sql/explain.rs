@@ -170,7 +170,14 @@ fn projected_shape<'a>(
             arena,
             &mut columns,
         )?,
-        None => query::describe_catalog_items(statement.items, None, storage, txid, &mut columns)?,
+        None => query::describe_catalog_items(
+            statement.items,
+            None,
+            storage,
+            txid,
+            arena,
+            &mut columns,
+        )?,
     };
     let mut width = 0u32;
     let mut output = StackStr::new();

@@ -464,6 +464,18 @@ access-method exhaustion, and `Send + Sync` have direct coverage. The remaining
 catalog definition containers and row mutation paths still require
 synchronization before fixed workers can overlap execution.
 
+Domain definitions, enum definitions and member images, pending enum versions,
+and named composites now share one startup-bounded mutex. Type namespace
+checks, DDL publication and rollback, replay, database cloning, schema and type
+moves, ownership, checkpoint reads, and catalog reads observe complete images
+across the shared namespace. Domain, enum, composite, and enum-member iterators
+copy one fixed entry and release the mutex before nested schema, routine,
+dependency, ACL, or type resolution. Four-worker publication across every type
+family, nested-reader progress, exact retained capacities, domain exhaustion,
+and `Send + Sync` have direct coverage. The remaining catalog definition
+containers and row mutation paths still require synchronization before fixed
+workers can overlap execution.
+
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint
 roster used while opening or resuming a remote transaction, with exact startup

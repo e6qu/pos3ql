@@ -166,6 +166,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   Collation definitions, conversion definitions, and text search objects share
   one startup-bounded mutex; readers copy complete entries before nested
   schema, comment, dependency, or collation execution lookup.
+  Routine definitions and pending identity and replacement images share one
+  startup-bounded mutex; readers copy complete entries before nested type,
+  role, ACL, comment, dependency, or execution lookup. Replacement replay
+  normalizes its complete WAL image to committed catalog state.
   Engine mutation remains single-owner and serialized while the other catalog
   definition containers, cache, and row sharing are prepared. Authorization
   graph traversal uses one exactly charged bitmap per query workspace,

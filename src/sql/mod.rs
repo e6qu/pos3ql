@@ -5482,7 +5482,7 @@ impl Engine {
                     class: object.class as u8,
                     object_oid: match object.class {
                         crate::storage::AccessClass::Routine => {
-                            crate::storage::routine_oid(self.storage.routine(object.slot as usize))
+                            crate::storage::routine_oid(&self.storage.routine(object.slot as usize))
                         }
                         crate::storage::AccessClass::LargeObject => {
                             self.storage.large_object(object.slot as usize).oid.get() as i32
@@ -5548,7 +5548,7 @@ impl Engine {
                     class: object.class as u8,
                     object_oid: match object.class {
                         crate::storage::AccessClass::Routine => {
-                            crate::storage::routine_oid(self.storage.routine(object.slot as usize))
+                            crate::storage::routine_oid(&self.storage.routine(object.slot as usize))
                         }
                         crate::storage::AccessClass::LargeObject => {
                             self.storage.large_object(object.slot as usize).oid.get() as i32

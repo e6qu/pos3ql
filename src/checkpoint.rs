@@ -9663,7 +9663,7 @@ impl Checkpointer {
                     routine.kind.wire_code(),
                     result_schema.as_str(),
                     result_name.as_str(),
-                    ManifestRoutineColumns(routine),
+                    ManifestRoutineColumns(&routine),
                     creation_path.as_str(),
                     ManifestDependencies(storage.routine_dependencies_for(slot, 0)),
                 ),
@@ -10841,7 +10841,7 @@ impl Checkpointer {
                     format_args!(
                         "own {} {} {} {} {}",
                         object.class as u8,
-                        crate::storage::routine_oid(storage.routine(object.slot as usize)),
+                        crate::storage::routine_oid(&storage.routine(object.slot as usize)),
                         schema_hex.as_str(),
                         name_hex.as_str(),
                         owner_hex.as_str()
@@ -10973,7 +10973,7 @@ impl Checkpointer {
                     format_args!(
                         "acl {} {} {} {} {} {} {} {}",
                         acl.object.class as u8,
-                        crate::storage::routine_oid(storage.routine(acl.object.slot as usize)),
+                        crate::storage::routine_oid(&storage.routine(acl.object.slot as usize)),
                         schema_hex.as_str(),
                         name_hex.as_str(),
                         grantee_hex.as_str(),

@@ -68,8 +68,10 @@ for reference_entry in \
     '- { name: auxiliary-copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: auxiliary-types, corpus_shard: "none", auxiliary: types }' \
     '- { name: auxiliary-pg-regress, corpus_shard: "none", auxiliary: pg_regress }' \
-    '- { name: auxiliary-slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "2" }' \
-    '- { name: auxiliary-slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "2" }'; do
+    '- { name: auxiliary-slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "4" }' \
+    '- { name: auxiliary-slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "4" }' \
+    '- { name: auxiliary-slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "4" }' \
+    '- { name: auxiliary-slt-d, corpus_shard: "none", auxiliary: slt, slt_query_shard: "3", slt_query_shards: "4" }'; do
     if ! grep -Fq -- "$reference_entry" "$reference_matrix"; then
         printf 'CI timeout guard: missing reference differential shard definition %s\n' "$reference_entry" >&2
         failed=1
@@ -79,29 +81,48 @@ done
 # PostgreSQL-width unit fixtures no longer fit behind build and lint in one
 # worker. Keep the complete library suite split across explicit partitions.
 ci_workflow=.github/workflows/ci.yml
-for test_partition in 0-of-3 1-of-3 2-of-3; do
+for test_partition in 0-of-4 1-of-4 2-of-4 3-of-4; do
     if ! grep -Fq -- "$test_partition" "$ci_workflow"; then
         printf 'CI timeout guard: missing library test partition %s\n' "$test_partition" >&2
         failed=1
     fi
 done
 
-# The differential matrix owns every disjoint deterministic phase and all five
+# The differential matrix owns every disjoint deterministic phase and all ten
 # slices of the original seeded fuzz sequence.
 differential_workflow=.github/workflows/differential.yml
 for differential_shard in \
-    slt-1 slt-2 slt-3 slt-4 fuzz-1 fuzz-2 fuzz-3 fuzz-4 fuzz-5 core \
-    corpus-1 corpus-2 corpus-3 corpus-4 auxiliary; do
+    slt-1 slt-2 slt-3 slt-4 slt-5 slt-6 slt-7 slt-8 \
+    fuzz-1 fuzz-2 fuzz-3 fuzz-4 fuzz-5 \
+    fuzz-6 fuzz-7 fuzz-8 fuzz-9 fuzz-10 core \
+    corpus-1 corpus-2 corpus-3 corpus-4 corpus-execution-widths \
+    auxiliary-pg-regress auxiliary-exact auxiliary-copy auxiliary-types \
+    auxiliary-listen auxiliary-composites; do
     if ! grep -Fq -- "- shard: $differential_shard" "$differential_workflow"; then
         printf 'CI timeout guard: missing differential shard %s\n' "$differential_shard" >&2
         failed=1
     fi
 done
-if (( $(grep -Fc 'fuzz_count: "2000"' "$differential_workflow") != 5 )); then
-    printf '%s\n' 'CI timeout guard: differential fuzz must retain five 2,000-statement slices' >&2
+for auxiliary_phase in pg_regress exact copy types listen composites; do
+    if ! grep -Fq -- "auxiliary_phase: $auxiliary_phase" "$differential_workflow"; then
+        printf 'CI timeout guard: missing auxiliary phase %s\n' "$auxiliary_phase" >&2
+        failed=1
+    fi
+done
+if ! grep -Fq -- 'SLT_QUERY_SHARDS: "8"' "$differential_workflow"; then
+    printf '%s\n' 'CI timeout guard: sqllogictest queries must retain eight slices' >&2
     failed=1
 fi
-for fuzz_start in 0 2000 4000 6000 8000; do
+if (( $(grep -Fc 'corpus_exclude: "179_remaining_execution_widths"' "$differential_workflow") != 4 )) \
+    || ! grep -Fq -- 'corpus_only: "179_remaining_execution_widths"' "$differential_workflow"; then
+    printf '%s\n' 'CI timeout guard: execution-width corpus must have one isolated worker' >&2
+    failed=1
+fi
+if (( $(grep -Fc 'fuzz_count: "1000"' "$differential_workflow") != 10 )); then
+    printf '%s\n' 'CI timeout guard: differential fuzz must retain ten 1,000-statement slices' >&2
+    failed=1
+fi
+for fuzz_start in 0 1000 2000 3000 4000 5000 6000 7000 8000 9000; do
     if ! grep -Fq -- "fuzz_start: \"$fuzz_start\"" "$differential_workflow"; then
         printf 'CI timeout guard: missing differential fuzz start %s\n' "$fuzz_start" >&2
         failed=1

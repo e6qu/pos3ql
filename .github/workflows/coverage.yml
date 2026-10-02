@@ -258,8 +258,10 @@ jobs:
           - { name: auxiliary-copy, corpus_shard: "none", auxiliary: copy }
           - { name: auxiliary-types, corpus_shard: "none", auxiliary: types }
           - { name: auxiliary-pg-regress, corpus_shard: "none", auxiliary: pg_regress }
-          - { name: auxiliary-slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "2" }
-          - { name: auxiliary-slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "2" }
+          - { name: auxiliary-slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "4" }
+          - { name: auxiliary-slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "4" }
+          - { name: auxiliary-slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "4" }
+          - { name: auxiliary-slt-d, corpus_shard: "none", auxiliary: slt, slt_query_shard: "3", slt_query_shards: "4" }
     services:
       postgres:
         image: postgres:18

@@ -7045,6 +7045,23 @@ struct TextSearchIter<'a> {
     next_slot: usize,
 }
 
+struct RoutineIter<'a> {
+    catalog: &'a std::sync::Mutex<FixedVec<RoutineDef>>,
+    next_slot: usize,
+}
+
+impl Iterator for RoutineIter<'_> {
+    type Item = (usize, RoutineDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("routine catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
 impl Iterator for TextSearchIter<'_> {
     type Item = (usize, TextSearchDef);
 
@@ -12688,7 +12705,7 @@ pub struct Storage {
     pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
     views: FixedVec<ViewDef>,
     rules: FixedVec<RuleDef>,
-    routines: FixedVec<RoutineDef>,
+    routines: std::sync::Mutex<FixedVec<RoutineDef>>,
     casts: FixedVec<CastDef>,
     operator_catalog: std::sync::Mutex<OperatorCatalog>,
     text_catalog: std::sync::Mutex<TextCatalog>,
@@ -15716,7 +15733,7 @@ impl Storage {
     }
 
     fn matview_dependency_image(&self, slot: usize) -> usize {
-        self.rules.len() + self.policies.len() + self.routines.len() + slot
+        self.rules.len() + self.policies.len() + self.routine_count() + slot
     }
 
     fn dependency_image(&self, image: usize, count: u8) -> StoredQueryDependencyView<'_> {
@@ -16082,10 +16099,9 @@ impl Storage {
                 )?;
             }
         }
-        for slot in 0..self.routines.len() {
-            if self.routines[slot].database == current_database()
-                && self.routines[slot].visible_to(txid)
-            {
+        for slot in 0..self.routine_count() {
+            let routine = self.routine(slot);
+            if routine.database == current_database() && routine.visible_to(txid) {
                 let owner = StoredQueryDependencyOwner::Routine(slot as u16);
                 self.rebind_stored_query_dependency_image(
                     self.committed_dependency_image(owner),
@@ -16145,8 +16161,9 @@ impl Storage {
                 );
             }
         }
-        for routine_slot in 0..self.routines.len() {
-            if self.routines[routine_slot].ddl_state != CatalogDdlState::Absent {
+        for routine_slot in 0..self.routine_count() {
+            let routine = self.routine(routine_slot);
+            if routine.ddl_state != CatalogDdlState::Absent {
                 rename_dependency(
                     self.committed_dependencies_mut(StoredQueryDependencyOwner::Routine(
                         routine_slot as u16,
@@ -16222,8 +16239,9 @@ impl Storage {
                 );
             }
         }
-        for routine_slot in 0..self.routines.len() {
-            if self.routines[routine_slot].ddl_state != CatalogDdlState::Absent {
+        for routine_slot in 0..self.routine_count() {
+            let routine = self.routine(routine_slot);
+            if routine.ddl_state != CatalogDdlState::Absent {
                 replace_dependency_slot(
                     self.committed_dependencies_mut(StoredQueryDependencyOwner::Routine(
                         routine_slot as u16,
@@ -17308,7 +17326,7 @@ impl Storage {
             pending_table_statistics,
             views,
             rules,
-            routines,
+            routines: std::sync::Mutex::new(routines),
             casts,
             operator_catalog: std::sync::Mutex::new(OperatorCatalog {
                 access_methods,
@@ -18892,25 +18910,38 @@ impl Storage {
                 );
             }
 
-            for source_slot in 0..self.routines.len() {
-                let mut definition = self.routines[source_slot];
+            {
+                let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+                for source_slot in 0..routines.len() {
+                    let mut definition = routines[source_slot];
+                    if definition.database != source
+                        || definition.ddl_state != CatalogDdlState::Present
+                    {
+                        continue;
+                    }
+                    let target_slot = routines
+                        .iter()
+                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "routine catalog is full")
+                        })?;
+                    definition.database = target;
+                    definition.ownership = definition.ownership.committed();
+                    definition.pending_identity = None;
+                    definition.pending_definition = None;
+                    definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                    routines[target_slot] = definition;
+                }
+            }
+            for source_slot in 0..self.routine_count() {
+                let definition = self.routine(source_slot);
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
                 let target_slot = self
-                    .routines
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "routine catalog is full")
-                    })?;
-                definition.database = target;
-                definition.ownership = definition.ownership.committed();
-                definition.pending_identity = None;
-                definition.pending_definition = None;
-                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.routines[target_slot] = definition;
+                    .routine_slot_by_oid(routine_oid(&definition), txid)
+                    .expect("cloned routine retains its object identifier");
                 self.copy_committed_dependencies(
                     StoredQueryDependencyOwner::Routine(source_slot as u16),
                     StoredQueryDependencyOwner::Routine(target_slot as u16),
@@ -18950,7 +18981,7 @@ impl Storage {
                     continue;
                 }
                 let source_routine_oid =
-                    routine_oid(&self.routines[usize::from(event_trigger.definition.function)]);
+                    routine_oid(&self.routine(usize::from(event_trigger.definition.function)));
                 event_trigger.definition.function = self
                     .routine_slot_by_oid(source_routine_oid, txid)
                     .ok_or_else(|| {
@@ -19206,7 +19237,7 @@ impl Storage {
                     }
                 };
                 let source_routine_oid =
-                    routine_oid(&self.routines[usize::from(definition.function)]);
+                    routine_oid(&self.routine(usize::from(definition.function)));
                 definition.function = self
                     .routine_slot_by_oid(source_routine_oid, txid)
                     .ok_or_else(|| {
@@ -19628,7 +19659,7 @@ impl Storage {
                 AccessClass::Domain => self.domain(usize::from(entry.object.slot)).database,
                 AccessClass::Enum => self.enum_for(usize::from(entry.object.slot), 0).database,
                 AccessClass::Index => self.indexes[usize::from(entry.object.slot)].database,
-                AccessClass::Routine => self.routines[usize::from(entry.object.slot)].database,
+                AccessClass::Routine => self.routine(usize::from(entry.object.slot)).database,
                 AccessClass::Composite => self.composite(usize::from(entry.object.slot)).database,
                 AccessClass::Statistics => {
                     self.extended_statistics[usize::from(entry.object.slot)].database
@@ -19771,7 +19802,6 @@ impl Storage {
         }
         clear_catalog!(views);
         clear_catalog!(rules);
-        clear_catalog!(routines);
         clear_catalog!(casts);
         clear_catalog!(event_triggers);
         clear_catalog!(triggers);
@@ -19783,6 +19813,14 @@ impl Storage {
         clear_catalog!(sequences);
         clear_catalog!(indexes);
         clear_catalog!(extensions);
+        {
+            let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+            for definition in routines.iter_mut() {
+                if definition.database == database {
+                    *definition = RoutineDef::EMPTY;
+                }
+            }
+        }
         {
             let mut catalog = self
                 .text_catalog
@@ -19878,9 +19916,10 @@ impl Storage {
                 self.stored_query_dependency_counts[image] = 0;
             }
         }
-        for slot in 0..self.routines.len() {
-            if self.routines[slot].database == DatabaseOid::POSTGRES
-                && self.routines[slot].ddl_state == CatalogDdlState::Absent
+        for slot in 0..self.routine_count() {
+            let routine = self.routine(slot);
+            if routine.database == DatabaseOid::POSTGRES
+                && routine.ddl_state == CatalogDdlState::Absent
             {
                 self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
             }
@@ -19972,7 +20011,6 @@ impl Storage {
         }
         commit_catalog!(views);
         commit_catalog!(rules);
-        commit_catalog!(routines);
         commit_catalog!(casts);
         commit_catalog!(event_triggers);
         commit_catalog!(triggers);
@@ -19984,6 +20022,16 @@ impl Storage {
         commit_catalog!(sequences);
         commit_catalog!(indexes);
         commit_catalog!(extensions);
+        {
+            let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+            for definition in routines.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         {
             let mut catalog = self
                 .text_catalog
@@ -20283,7 +20331,7 @@ impl Storage {
             AccessClass::Domain => self.domain(slot).ownership,
             AccessClass::Enum => self.enum_for(slot, 0).ownership,
             AccessClass::Index => self.indexes[slot].ownership,
-            AccessClass::Routine => self.routines[slot].ownership,
+            AccessClass::Routine => self.routine(slot).ownership,
             AccessClass::Composite => self.composite(slot).ownership,
             AccessClass::Tablespace => self.tablespaces[slot].ownership,
             AccessClass::Statistics => self.extended_statistics[slot].ownership,
@@ -20317,7 +20365,9 @@ impl Storage {
                 unreachable!("type ownership is synchronized separately")
             }
             AccessClass::Index => &mut self.indexes[slot].ownership,
-            AccessClass::Routine => &mut self.routines[slot].ownership,
+            AccessClass::Routine => {
+                unreachable!("routine ownership is synchronized separately")
+            }
             AccessClass::Tablespace => &mut self.tablespaces[slot].ownership,
             AccessClass::Statistics => &mut self.extended_statistics[slot].ownership,
             AccessClass::Extension => &mut self.extensions[slot].ownership,
@@ -20657,11 +20707,16 @@ impl Storage {
                     && index.schema.as_str() == schema
                     && index.name_for(txid).as_str() == name
             }),
-            AccessClass::Routine => self.routines.iter().position(|routine| {
-                routine.database == current_database()
+            AccessClass::Routine => RoutineIter {
+                catalog: &self.routines,
+                next_slot: 0,
+            }
+            .find_map(|(slot, routine)| {
+                (routine.database == current_database()
                     && routine.visible_to(txid)
                     && routine.schema_for(txid).as_str() == schema
-                    && routine.name_for(txid).as_str() == name
+                    && routine.name_for(txid).as_str() == name)
+                    .then_some(slot)
             }),
             AccessClass::Composite => self.composite_slot(schema, name, txid),
             AccessClass::Tablespace => self.tablespace_slot(name, txid),
@@ -20736,7 +20791,7 @@ impl Storage {
                 (definition.schema, definition.name_for(txid))
             }
             AccessClass::Routine => {
-                let definition = &self.routines[slot];
+                let definition = self.routine(slot);
                 (definition.schema_for(txid), definition.name_for(txid))
             }
             AccessClass::Composite => {
@@ -20804,7 +20859,7 @@ impl Storage {
             AccessClass::Domain => self.domain(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Enum => self.enum_for(slot, 0).ddl_state == CatalogDdlState::Present,
             AccessClass::Index => self.indexes[slot].ddl_state == CatalogDdlState::Present,
-            AccessClass::Routine => self.routines[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Routine => self.routine(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Composite => self.composite(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Tablespace => self.tablespaces[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Statistics => {
@@ -20845,7 +20900,7 @@ impl Storage {
             AccessClass::Domain => self.domain(slot).visible_to(txid),
             AccessClass::Enum => self.enum_for(slot, txid).visible_to(txid),
             AccessClass::Index => self.indexes[slot].visible_to(txid),
-            AccessClass::Routine => self.routines[slot].visible_to(txid),
+            AccessClass::Routine => self.routine(slot).visible_to(txid),
             AccessClass::Composite => self.composite(slot).visible_to(txid),
             AccessClass::Tablespace => self.tablespaces[slot].visible_to(txid),
             AccessClass::Statistics => self.extended_statistics[slot].visible_to(txid),
@@ -20878,7 +20933,7 @@ impl Storage {
             AccessClass::Domain => Some(self.domain(slot).database),
             AccessClass::Enum => Some(self.enum_for(slot, 0).database),
             AccessClass::Index => Some(self.indexes[slot].database),
-            AccessClass::Routine => Some(self.routines[slot].database),
+            AccessClass::Routine => Some(self.routine(slot).database),
             AccessClass::Composite => Some(self.composite(slot).database),
             AccessClass::Statistics => Some(self.extended_statistics[slot].database),
             AccessClass::Extension => Some(self.extensions[slot].database),
@@ -20974,9 +21029,14 @@ impl Storage {
                 })?
             }
             AccessClass::Routine => {
-                let created_at = self.routines[source_slot].created_at;
-                self.routines.iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
+                let created_at = self.routine(source_slot).created_at;
+                RoutineIter {
+                    catalog: &self.routines,
+                    next_slot: 0,
+                }
+                .find_map(|(slot, candidate)| {
+                    (candidate.database == target_database && candidate.created_at == created_at)
+                        .then_some(slot)
                 })?
             }
             AccessClass::Statistics => {
@@ -21345,7 +21405,7 @@ impl Storage {
             AccessClass::Domain => self.domain_count(),
             AccessClass::Enum => self.enum_count(),
             AccessClass::Index => self.indexes.len(),
-            AccessClass::Routine => self.routines.len(),
+            AccessClass::Routine => self.routine_count(),
             AccessClass::Composite => self.composite_count(),
             AccessClass::Tablespace => self.tablespaces.len(),
             AccessClass::Statistics => self.extended_statistics.len(),
@@ -21405,7 +21465,7 @@ impl Storage {
             (AccessClass::Domain, self.domain_count()),
             (AccessClass::Enum, self.enum_count()),
             (AccessClass::Index, self.indexes.len()),
-            (AccessClass::Routine, self.routines.len()),
+            (AccessClass::Routine, self.routine_count()),
             (AccessClass::Composite, self.composite_count()),
             (AccessClass::Tablespace, self.tablespaces.len()),
             (AccessClass::Statistics, self.extended_statistics.len()),
@@ -21513,6 +21573,21 @@ impl Storage {
             }
             return prior;
         }
+        if object.class == AccessClass::Routine {
+            let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+            let ownership = &mut routines[usize::from(object.slot)].ownership;
+            let prior = ownership.pending;
+            if txid == 0 {
+                ownership.owner = owner as u16;
+                ownership.pending = None;
+            } else {
+                ownership.pending = Some(PendingOwnership {
+                    txid,
+                    owner: owner as u16,
+                });
+            }
+            return prior;
+        }
         if matches!(
             object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
@@ -21570,6 +21645,17 @@ impl Storage {
             }
             return;
         }
+        if object.class == AccessClass::Routine {
+            let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+            let ownership = &mut routines[usize::from(object.slot)].ownership;
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            return;
+        }
         if matches!(
             object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
@@ -21613,6 +21699,13 @@ impl Storage {
                 .lock()
                 .expect("large object catalog lock poisoned")
                 .definitions[usize::from(object.slot)]
+            .ownership
+            .pending = prior;
+            return;
+        }
+        if object.class == AccessClass::Routine {
+            self.routines.lock().expect("routine catalog lock poisoned")
+                [usize::from(object.slot)]
             .ownership
             .pending = prior;
             return;
@@ -24857,7 +24950,11 @@ impl Storage {
                 rename_schema_qualified_sql(&mut source, prior, name)?;
             }
         }
-        for definition in self.routines.iter().filter(|definition| {
+        for (_, definition) in (RoutineIter {
+            catalog: &self.routines,
+            next_slot: 0,
+        })
+        .filter(|(_, definition)| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -25053,7 +25150,8 @@ impl Storage {
             }
         }
         drop(type_catalog);
-        for definition in self.routines.iter_mut().filter(|definition| {
+        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+        for definition in routines.iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -25106,6 +25204,7 @@ impl Storage {
                 rename_schema_qualified_sql(&mut pending.body, prior, name)?;
             }
         }
+        drop(routines);
         let mut text_catalog = self
             .text_catalog
             .lock()
@@ -25240,9 +25339,10 @@ impl Storage {
                 );
             }
         }
-        for slot in 0..self.routines.len() {
-            if self.routines[slot].database == current_database()
-                && self.routines[slot].ddl_state != CatalogDdlState::Absent
+        for slot in 0..self.routine_count() {
+            let routine = self.routine(slot);
+            if routine.database == current_database()
+                && routine.ddl_state != CatalogDdlState::Absent
             {
                 rename_dependency_schema(
                     self.committed_dependencies_mut(StoredQueryDependencyOwner::Routine(
@@ -35799,13 +35899,11 @@ impl Storage {
                 identity.name.as_str()
             ))
         }
-        for slot in 0..self.routines.len() {
-            if self.routines[slot].database != current_database()
-                || !self.routines[slot].visible_to(txid)
-            {
+        for slot in 0..self.routine_count() {
+            let mut routine = self.routine(slot);
+            if routine.database != current_database() || !routine.visible_to(txid) {
                 continue;
             }
-            let mut routine = self.routines[slot];
             for argument in &mut routine.arguments[..routine.argument_count] {
                 if let Some(identity) = argument.user_type {
                     argument.ctype = rebind(self, argument.ctype, identity, txid)?;
@@ -35846,7 +35944,7 @@ impl Storage {
                 | RoutineKind::EventTrigger
                 | RoutineKind::Procedure => {}
             }
-            self.routines[slot] = routine;
+            self.routines.lock().expect("routine catalog lock poisoned")[slot] = routine;
         }
         Ok(())
     }
@@ -37454,7 +37552,8 @@ impl Storage {
                 });
             }
         };
-        for routine in self.routines.iter_mut() {
+        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+        for routine in routines.iter_mut() {
             for argument in routine.arguments.iter_mut().take(routine.argument_count) {
                 move_argument(argument);
             }
@@ -38443,29 +38542,49 @@ impl Storage {
     }
 
     pub(crate) fn routine_count(&self) -> usize {
-        self.routines.len()
+        self.routines
+            .lock()
+            .expect("routine catalog lock poisoned")
+            .len()
+    }
+
+    fn routine_entries(&self) -> RoutineIter<'_> {
+        RoutineIter {
+            catalog: &self.routines,
+            next_slot: 0,
+        }
     }
 
     pub(crate) fn routine_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.routines[slot].database == current_database() && self.routines[slot].visible_to(txid)
+        let routine = self.routine(slot);
+        routine.database == current_database() && routine.visible_to(txid)
     }
 
-    pub(crate) fn routine(&self, slot: usize) -> &RoutineDef {
-        &self.routines[slot]
+    pub(crate) fn routine(&self, slot: usize) -> RoutineDef {
+        self.routine_at(slot).expect("routine slot is in range")
+    }
+
+    fn routine_at(&self, slot: usize) -> Option<RoutineDef> {
+        self.routines
+            .lock()
+            .expect("routine catalog lock poisoned")
+            .get(slot)
+            .copied()
     }
 
     /// Returns the routine definition visible to `txid`.  Replacement keeps
     /// the catalog slot and object identifier stable while its new definition
     /// is private until commit.
     pub(crate) fn routine_for(&self, slot: usize, txid: u32) -> RoutineDef {
-        self.routines[slot].definition_for(txid)
+        self.routine(slot).definition_for(txid)
     }
 
     pub(crate) fn routine_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
-        self.routines.iter().position(|routine| {
-            routine.database == current_database()
+        self.routine_entries().find_map(|(slot, routine)| {
+            (routine.database == current_database()
                 && routine.visible_to(txid)
-                && routine_oid(routine) == oid
+                && routine_oid(&routine) == oid)
+                .then_some(slot)
         })
     }
 
@@ -38545,50 +38664,46 @@ impl Storage {
         kind: RoutineCallKind,
     ) -> Option<usize> {
         let resolve = |schema: &str, routine_name: &str| {
-            let mut candidates = self
-                .routines
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, routine)| {
-                    let definition = routine.definition_for(txid);
-                    if routine.database != current_database()
-                        || !routine.visible_to(txid)
-                        || !kind.accepts(definition.kind)
-                        || definition.schema_for(txid).as_str() != schema
-                        || definition.name_for(txid).as_str() != routine_name
-                    {
-                        return None;
-                    }
-                    let variadic_index = definition.arguments().len().checked_sub(1)?;
-                    let variadic_parameter = definition.parameter_for_input(variadic_index)?;
-                    let RoutineParameterMode::Variadic { .. } = variadic_parameter.mode else {
-                        return None;
-                    };
-                    let ColType::Array(element) = variadic_parameter.ctype else {
-                        return None;
-                    };
-                    let fixed = &definition.arguments()[..variadic_index];
-                    if argument_type_oids.len() < fixed.len() + usize::from(!explicit_variadic)
-                        || explicit_variadic && argument_type_oids.len() != fixed.len() + 1
-                        || !fixed.iter().zip(argument_type_oids).all(|(argument, oid)| {
-                            self.routine_argument_oid(argument, txid)
-                                .is_some_and(|expected| {
-                                    self.routine_implicit_cast(*oid, expected, txid)
-                                })
-                        })
-                    {
-                        return None;
-                    }
-                    let expected = if explicit_variadic {
-                        self.routine_argument_oid(&definition.arguments()[variadic_index], txid)?
-                    } else {
-                        element.element_oid()
-                    };
-                    argument_type_oids[variadic_index..]
-                        .iter()
-                        .all(|oid| self.routine_implicit_cast(*oid, expected, txid))
-                        .then_some(slot)
-                });
+            let mut candidates = self.routine_entries().filter_map(|(slot, routine)| {
+                let definition = routine.definition_for(txid);
+                if routine.database != current_database()
+                    || !routine.visible_to(txid)
+                    || !kind.accepts(definition.kind)
+                    || definition.schema_for(txid).as_str() != schema
+                    || definition.name_for(txid).as_str() != routine_name
+                {
+                    return None;
+                }
+                let variadic_index = definition.arguments().len().checked_sub(1)?;
+                let variadic_parameter = definition.parameter_for_input(variadic_index)?;
+                let RoutineParameterMode::Variadic { .. } = variadic_parameter.mode else {
+                    return None;
+                };
+                let ColType::Array(element) = variadic_parameter.ctype else {
+                    return None;
+                };
+                let fixed = &definition.arguments()[..variadic_index];
+                if argument_type_oids.len() < fixed.len() + usize::from(!explicit_variadic)
+                    || explicit_variadic && argument_type_oids.len() != fixed.len() + 1
+                    || !fixed.iter().zip(argument_type_oids).all(|(argument, oid)| {
+                        self.routine_argument_oid(argument, txid)
+                            .is_some_and(|expected| {
+                                self.routine_implicit_cast(*oid, expected, txid)
+                            })
+                    })
+                {
+                    return None;
+                }
+                let expected = if explicit_variadic {
+                    self.routine_argument_oid(&definition.arguments()[variadic_index], txid)?
+                } else {
+                    element.element_oid()
+                };
+                argument_type_oids[variadic_index..]
+                    .iter()
+                    .all(|oid| self.routine_implicit_cast(*oid, expected, txid))
+                    .then_some(slot)
+            });
             let first = candidates.next();
             if first.is_some() && candidates.next().is_none() {
                 first
@@ -38803,7 +38918,7 @@ impl Storage {
         }
         let resolve = |schema: &str, routine_name: &str| {
             let mut found = None;
-            for (slot, stored) in self.routines.iter().enumerate() {
+            for (slot, stored) in self.routine_entries() {
                 let routine = stored.definition_for(txid);
                 if stored.database != current_database()
                     || !stored.visible_to(txid)
@@ -39029,7 +39144,7 @@ impl Storage {
         accepts: impl Fn(RoutineKind, RoutineAttributes) -> bool,
     ) -> bool {
         let matches = |schema: &str, routine_name: &str| {
-            self.routines.iter().any(|routine| {
+            self.routine_entries().any(|(_, routine)| {
                 routine.database == current_database()
                     && routine.visible_to(txid)
                     && accepts(routine.kind_for(txid), routine.attributes_for(txid))
@@ -39154,21 +39269,17 @@ impl Storage {
         txid: u32,
     ) -> Option<usize> {
         let resolve = |schema: &str, routine_name: &str| {
-            let mut candidates = self
-                .routines
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, routine)| {
-                    let definition = routine.definition_for(txid);
-                    (routine.database == current_database()
-                        && routine.visible_to(txid)
-                        && definition.schema_for(txid).as_str() == schema
-                        && definition.name_for(txid).as_str() == routine_name
-                        && definition
-                            .procedure_call_mapping(argument_names, argument_count)
-                            .is_some())
-                    .then_some(slot)
-                });
+            let mut candidates = self.routine_entries().filter_map(|(slot, routine)| {
+                let definition = routine.definition_for(txid);
+                (routine.database == current_database()
+                    && routine.visible_to(txid)
+                    && definition.schema_for(txid).as_str() == schema
+                    && definition.name_for(txid).as_str() == routine_name
+                    && definition
+                        .procedure_call_mapping(argument_names, argument_count)
+                        .is_some())
+                .then_some(slot)
+            });
             let first = candidates.next();
             if first.is_some() && candidates.next().is_none() {
                 first
@@ -39205,7 +39316,7 @@ impl Storage {
         }
         let resolve = |schema: &str, routine_name: &str| {
             let mut found = None;
-            for stored in self.routines.iter() {
+            for (_, stored) in self.routine_entries() {
                 let routine = stored.definition_for(txid);
                 if stored.database != current_database()
                     || !stored.visible_to(txid)
@@ -39384,9 +39495,9 @@ impl Storage {
         txid: u32,
         kind: RoutineCallKind,
     ) -> Option<usize> {
-        self.routines.iter().position(|routine| {
+        self.routine_entries().find_map(|(slot, routine)| {
             let definition = routine.definition_for(txid);
-            routine.database == current_database()
+            (routine.database == current_database()
                 && routine.visible_to(txid)
                 && kind.accepts(definition.kind)
                 && definition.schema_for(txid).as_str() == schema
@@ -39395,7 +39506,8 @@ impl Storage {
                 && definition.arguments()[..argument_types.len()]
                     .iter()
                     .zip(argument_types)
-                    .all(|(parameter, value)| parameter.ctype == *value)
+                    .all(|(parameter, value)| parameter.ctype == *value))
+            .then_some(slot)
         })
     }
 
@@ -39408,9 +39520,9 @@ impl Storage {
         kind: RoutineCallKind,
     ) -> Option<usize> {
         let exact =
-            self.routines.iter().position(|routine| {
+            self.routine_entries().find_map(|(slot, routine)| {
                 let definition = routine.definition_for(txid);
-                routine.database == current_database()
+                (routine.database == current_database()
                     && routine.visible_to(txid)
                     && kind.accepts(definition.kind)
                     && definition.schema_for(txid).as_str() == schema
@@ -39418,60 +39530,53 @@ impl Storage {
                     && definition.argument_count == argument_type_oids.len()
                     && definition.arguments().iter().zip(argument_type_oids).all(
                         |(argument, oid)| self.routine_argument_oid(argument, txid) == Some(*oid),
-                    )
+                    ))
+                .then_some(slot)
             });
         if exact.is_some() {
             return exact;
         }
-        let concrete = self
-            .routines
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, routine)| {
-                let definition = routine.definition_for(txid);
-                (routine.database == current_database()
-                    && routine.visible_to(txid)
-                    && kind.accepts(definition.kind)
-                    && definition.schema_for(txid).as_str() == schema
-                    && definition.name_for(txid).as_str() == name
-                    && definition.accepts_input_arity(argument_type_oids.len())
-                    && definition.arguments()[..argument_type_oids.len()]
-                        .iter()
-                        .zip(argument_type_oids)
-                        .all(|(argument, oid)| {
-                            self.routine_argument_oid(argument, txid)
-                                .is_some_and(|expected| {
-                                    self.routine_implicit_cast(*oid, expected, txid)
-                                })
-                        }))
-                .then_some(slot)
-            });
+        let concrete = self.routine_entries().filter_map(|(slot, routine)| {
+            let definition = routine.definition_for(txid);
+            (routine.database == current_database()
+                && routine.visible_to(txid)
+                && kind.accepts(definition.kind)
+                && definition.schema_for(txid).as_str() == schema
+                && definition.name_for(txid).as_str() == name
+                && definition.accepts_input_arity(argument_type_oids.len())
+                && definition.arguments()[..argument_type_oids.len()]
+                    .iter()
+                    .zip(argument_type_oids)
+                    .all(|(argument, oid)| {
+                        self.routine_argument_oid(argument, txid)
+                            .is_some_and(|expected| {
+                                self.routine_implicit_cast(*oid, expected, txid)
+                            })
+                    }))
+            .then_some(slot)
+        });
         let mut concrete = concrete;
         let first = concrete.next();
         if first.is_some() && concrete.next().is_none() {
             return first;
         }
-        let polymorphic = self
-            .routines
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, routine)| {
-                let definition = routine.definition_for(txid);
-                (routine.database == current_database()
-                    && routine.visible_to(txid)
-                    && kind.accepts(definition.kind)
-                    && definition.schema_for(txid).as_str() == schema
-                    && definition.name_for(txid).as_str() == name
-                    && definition.accepts_input_arity(argument_type_oids.len())
-                    && self
-                        .polymorphic_call_binding(
-                            &definition.arguments()[..argument_type_oids.len()],
-                            argument_type_oids,
-                            txid,
-                        )
-                        .is_some())
-                .then_some(slot)
-            });
+        let polymorphic = self.routine_entries().filter_map(|(slot, routine)| {
+            let definition = routine.definition_for(txid);
+            (routine.database == current_database()
+                && routine.visible_to(txid)
+                && kind.accepts(definition.kind)
+                && definition.schema_for(txid).as_str() == schema
+                && definition.name_for(txid).as_str() == name
+                && definition.accepts_input_arity(argument_type_oids.len())
+                && self
+                    .polymorphic_call_binding(
+                        &definition.arguments()[..argument_type_oids.len()],
+                        argument_type_oids,
+                        txid,
+                    )
+                    .is_some())
+            .then_some(slot)
+        });
         let mut polymorphic = polymorphic;
         let first = polymorphic.next();
         if first.is_some() && polymorphic.next().is_none() {
@@ -39528,13 +39633,9 @@ impl Storage {
             polymorphic == saw_polymorphic
         };
         for (implicit, polymorphic) in [(false, false), (true, false), (true, true)] {
-            let mut candidates = self
-                .routines
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, routine)| {
-                    matches(routine, implicit, polymorphic).then_some(slot)
-                });
+            let mut candidates = self.routine_entries().filter_map(|(slot, routine)| {
+                matches(&routine, implicit, polymorphic).then_some(slot)
+            });
             let first = candidates.next();
             if first.is_some() && candidates.next().is_none() {
                 return first;
@@ -39886,9 +39987,9 @@ impl Storage {
         argument_types: &[ColType],
         txid: u32,
     ) -> Option<usize> {
-        self.routines.iter().position(|routine| {
+        self.routine_entries().find_map(|(slot, routine)| {
             let definition = routine.definition_for(txid);
-            routine.database == current_database()
+            (routine.database == current_database()
                 && routine.visible_to(txid)
                 && definition.schema_for(txid).as_str() == schema
                 && definition.name_for(txid).as_str() == name
@@ -39897,7 +39998,8 @@ impl Storage {
                     .arguments()
                     .iter()
                     .zip(argument_types)
-                    .all(|(argument, ctype)| argument.ctype == *ctype)
+                    .all(|(argument, ctype)| argument.ctype == *ctype))
+            .then_some(slot)
         })
     }
 
@@ -39908,9 +40010,9 @@ impl Storage {
         arguments: &[RoutineArgumentDef],
         txid: u32,
     ) -> Option<usize> {
-        self.routines.iter().position(|routine| {
+        self.routine_entries().find_map(|(slot, routine)| {
             let definition = routine.definition_for(txid);
-            routine.database == current_database()
+            (routine.database == current_database()
                 && routine.visible_to(txid)
                 && definition.schema_for(txid).as_str() == schema
                 && definition.name_for(txid).as_str() == name
@@ -39921,7 +40023,8 @@ impl Storage {
                     .zip(arguments)
                     .all(|(left, right)| {
                         left.ctype == right.ctype && left.user_type == right.user_type
-                    })
+                    }))
+            .then_some(slot)
         })
     }
 
@@ -39934,7 +40037,7 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, ()> {
         let mut found = None;
-        for (slot, routine) in self.routines.iter().enumerate() {
+        for (slot, routine) in self.routine_entries() {
             if routine.database != current_database()
                 || !routine.visible_to(txid)
                 || routine.schema_for(txid).as_str() != schema
@@ -39956,13 +40059,15 @@ impl Storage {
         name: SqlName,
         txid: u32,
     ) -> Result<Option<PendingRoutineIdentity>, SqlError> {
-        let routine = self.routines[slot];
+        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+        let routine = routines[slot];
         if let Some(pending) = routine.pending_identity
             && pending.txid != txid
         {
+            drop(routines);
             return Err(self.catalog_ddl_wait_error(txid, pending.txid, routine.name.as_str()));
         }
-        if self.routines.iter().enumerate().any(|(other, candidate)| {
+        if routines.iter().enumerate().any(|(other, candidate)| {
             other != slot
                 && candidate.database == current_database()
                 && candidate.visible_to(txid)
@@ -39983,38 +40088,35 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if let Some(blocker) = self
-            .routines
-            .iter()
-            .enumerate()
-            .find_map(|(other, candidate)| {
-                (other != slot)
-                    .then_some(candidate.pending_identity)
-                    .flatten()
-                    .filter(|pending| {
-                        pending.txid != txid
-                            && pending.schema == schema
-                            && pending.name == name
-                            && candidate.argument_count == routine.argument_count
-                            && candidate.arguments().iter().zip(routine.arguments()).all(
-                                |(left, right)| {
-                                    left.ctype == right.ctype && left.user_type == right.user_type
-                                },
-                            )
-                    })
-                    .map(|pending| pending.txid)
-            })
-        {
+        if let Some(blocker) = routines.iter().enumerate().find_map(|(other, candidate)| {
+            (other != slot)
+                .then_some(candidate.pending_identity)
+                .flatten()
+                .filter(|pending| {
+                    pending.txid != txid
+                        && pending.schema == schema
+                        && pending.name == name
+                        && candidate.argument_count == routine.argument_count
+                        && candidate.arguments().iter().zip(routine.arguments()).all(
+                            |(left, right)| {
+                                left.ctype == right.ctype && left.user_type == right.user_type
+                            },
+                        )
+                })
+                .map(|pending| pending.txid)
+        }) {
+            drop(routines);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        let prior = self.routines[slot].pending_identity;
-        self.routines[slot].pending_identity = Some(PendingRoutineIdentity { txid, schema, name });
+        let prior = routines[slot].pending_identity;
+        routines[slot].pending_identity = Some(PendingRoutineIdentity { txid, schema, name });
         Ok(prior)
     }
 
     pub(crate) fn commit_routine_identity(&mut self, slot: usize, txid: u32) {
         let changed = {
-            let routine = &mut self.routines[slot];
+            let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+            let routine = &mut routines[slot];
             if let Some(pending) = routine.pending_identity
                 && pending.txid == txid
             {
@@ -40036,7 +40138,7 @@ impl Storage {
         slot: usize,
         prior: Option<PendingRoutineIdentity>,
     ) {
-        self.routines[slot].pending_identity = prior;
+        self.routines.lock().expect("routine catalog lock poisoned")[slot].pending_identity = prior;
     }
 
     pub(crate) const fn routine_access_object(slot: usize) -> AccessObject {
@@ -40051,7 +40153,8 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> StoredQueryDependencyView<'_> {
-        if let Some(pending) = self.routines[slot]
+        if let Some(pending) = self
+            .routine(slot)
             .pending_definition
             .filter(|pending| pending.txid == txid)
         {
@@ -40199,7 +40302,10 @@ impl Storage {
             | RoutineKind::Aggregate(_) => {}
         }
         self.require_schema_create(schema.as_str(), txid)?;
-        if let Some(blocker) = self.routines.iter().find_map(|routine| {
+        let allocated_ownership =
+            matches!(identity, RoutineIdentity::Allocate).then(|| self.initial_ownership(txid));
+        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+        if let Some(blocker) = routines.iter().find_map(|routine| {
             (routine.database == current_database()
                 && routine.schema_for(txid) == schema
                 && routine.name_for(txid) == name
@@ -40213,9 +40319,10 @@ impl Storage {
             .then_some(routine.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
         }) {
+            drop(routines);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if self.routines.iter().any(|routine| {
+        if routines.iter().any(|routine| {
             routine.database == current_database()
                 && routine.visible_to(txid)
                 && routine.schema_for(txid) == schema
@@ -40234,23 +40341,21 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let Some(slot) = self
-            .routines
+        let Some(slot) = routines
             .iter()
             .position(|routine| routine.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many routines (limit {})",
-                self.routines.len()
+                routines.len()
             ));
         };
-        self.clear_object_acl_entries(Self::routine_access_object(slot));
         let (created_at, ownership) = match identity {
-            RoutineIdentity::Allocate => {
-                let created_at = self.catalog_sequence.next();
-                (created_at, self.initial_ownership(txid))
-            }
+            RoutineIdentity::Allocate => (
+                self.catalog_sequence.next(),
+                allocated_ownership.expect("allocated routine ownership was prepared"),
+            ),
             RoutineIdentity::Preserve {
                 created_at,
                 ownership,
@@ -40259,7 +40364,7 @@ impl Storage {
                 (created_at, ownership)
             }
         };
-        self.routines[slot] = RoutineDef {
+        routines[slot] = RoutineDef {
             database: current_database(),
             created_at,
             schema,
@@ -40283,16 +40388,23 @@ impl Storage {
             ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
-        self.write_committed_dependencies(
+        drop(routines);
+        self.clear_object_acl_entries(Self::routine_access_object(slot));
+        if let Err(error) = self.write_committed_dependencies(
             StoredQueryDependencyOwner::Routine(slot as u16),
             dependencies.view(),
-        )?;
+        ) {
+            self.routines.lock().expect("routine catalog lock poisoned")[slot] = RoutineDef::EMPTY;
+            self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
+            return Err(error);
+        }
         Ok(slot)
     }
 
     pub(crate) fn commit_routine_create(&mut self, slot: usize, txid: u32) {
-        self.routines[slot].ddl_state = self.routines[slot].ddl_state.commit_create();
-        let ownership = &mut self.routines[slot].ownership;
+        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+        routines[slot].ddl_state = routines[slot].ddl_state.commit_create();
+        let ownership = &mut routines[slot].ownership;
         if let Some(pending) = ownership.pending
             && pending.txid == txid
         {
@@ -40302,7 +40414,7 @@ impl Storage {
     }
 
     pub(crate) fn rollback_routine_create(&mut self, slot: usize) {
-        self.routines[slot].ddl_state = self.routines[slot].ddl_state.rollback_create();
+        self.routines.lock().expect("routine catalog lock poisoned")[slot] = RoutineDef::EMPTY;
         self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
     }
 
@@ -40312,13 +40424,14 @@ impl Storage {
         mut definition: PendingRoutineDefinition,
         dependencies: StoredQueryDependencyView<'_>,
     ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
-        let name = self.routines[slot].name;
-        if let Some(pending) = self.routines[slot].pending_definition
+        let routine = self.routine(slot);
+        let name = routine.name;
+        if let Some(pending) = routine.pending_definition
             && pending.txid != definition.txid
         {
             return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
         }
-        let previous = self.routines[slot]
+        let previous = routine
             .pending_definition
             .filter(|pending| pending.txid == definition.txid)
             .map(|pending| pending.dependency_slot);
@@ -40328,7 +40441,8 @@ impl Storage {
             previous,
             dependencies,
         )?;
-        let routine = &mut self.routines[slot];
+        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+        let routine = &mut routines[slot];
         let prior = routine.pending_definition;
         routine.pending_definition = Some(definition);
         Ok(prior)
@@ -40339,13 +40453,14 @@ impl Storage {
         slot: usize,
         mut definition: PendingRoutineDefinition,
     ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
-        let name = self.routines[slot].name;
-        if let Some(pending) = self.routines[slot].pending_definition
+        let routine = self.routine(slot);
+        let name = routine.name;
+        if let Some(pending) = routine.pending_definition
             && pending.txid != definition.txid
         {
             return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
         }
-        let previous = self.routines[slot]
+        let previous = routine
             .pending_definition
             .filter(|pending| pending.txid == definition.txid)
             .map(|pending| pending.dependency_slot);
@@ -40353,21 +40468,23 @@ impl Storage {
             StoredQueryDependencyOwner::Routine(slot as u16),
             previous,
         )?;
-        let routine = &mut self.routines[slot];
+        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+        let routine = &mut routines[slot];
         let prior = routine.pending_definition;
         routine.pending_definition = Some(definition);
         Ok(prior)
     }
 
     pub(crate) fn commit_routine_replace(&mut self, slot: usize, txid: u32) {
-        if let Some(pending) = self.routines[slot].pending_definition
+        if let Some(pending) = self.routine(slot).pending_definition
             && pending.txid == txid
         {
             self.commit_pending_dependencies(
                 StoredQueryDependencyOwner::Routine(slot as u16),
                 pending.dependency_slot,
             );
-            let routine = &mut self.routines[slot];
+            let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+            let routine = &mut routines[slot];
             routine.arguments = pending.arguments;
             routine.argument_count = pending.argument_count;
             routine.parameters = pending.parameters;
@@ -40391,34 +40508,38 @@ impl Storage {
         slot: usize,
         prior: Option<PendingRoutineDefinition>,
     ) {
-        if let Some(current) = self.routines[slot].pending_definition {
+        if let Some(current) = self.routine(slot).pending_definition {
             self.release_pending_dependencies(current.dependency_slot);
         }
-        self.routines[slot].pending_definition = prior;
+        self.routines.lock().expect("routine catalog lock poisoned")[slot].pending_definition =
+            prior;
     }
 
     pub(crate) fn drop_routine(&mut self, slot: usize, txid: u32) {
-        self.routines[slot].ddl_state = self.routines[slot].ddl_state.drop_by(txid);
+        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+        routines[slot].ddl_state = routines[slot].ddl_state.drop_by(txid);
     }
 
     pub(crate) fn commit_routine_drop(&mut self, slot: usize) {
-        let routine_oid = routine_oid(&self.routines[slot]);
+        let routine = self.routine(slot);
+        let routine_oid = routine_oid(&routine);
         let oid = routine_oid as u32;
+        let pending = routine
+            .pending_definition
+            .map(|pending| pending.dependency_slot);
         self.reset_function_statistics(routine_oid);
-        self.routines[slot].ddl_state = self.routines[slot].ddl_state.commit_drop();
+        self.routines.lock().expect("routine catalog lock poisoned")[slot] = RoutineDef::EMPTY;
         let object = Self::routine_access_object(slot);
         self.clear_object_acl_entries(object);
         self.clear_extension_dependencies_for_object(object);
         self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
         self.drop_comments_by_subid(CommentClass::Routine, oid);
-        let pending = self.routines[slot]
-            .pending_definition
-            .map(|pending| pending.dependency_slot);
         self.clear_pending_dependency_chain(pending);
     }
 
     pub(crate) fn rollback_routine_drop(&mut self, slot: usize, txid: u32) {
-        self.routines[slot].ddl_state = self.routines[slot].ddl_state.rollback_drop(txid);
+        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
+        routines[slot].ddl_state = routines[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn policy(&self, slot: usize) -> &PolicyDef {
@@ -41478,27 +41599,15 @@ impl Storage {
             // the complete post-change definition for both creates and
             // replacements, so the matching durable identity selects an
             // in-place replay rather than a drop/reallocate cycle.
-            if self.routines[slot].created_at == definition.created_at {
-                self.routines[slot].arguments = definition.arguments;
-                self.routines[slot].argument_count = definition.argument_count;
-                self.routines[slot].parameters = definition.parameters;
-                self.routines[slot].parameter_count = definition.parameter_count;
-                self.routines[slot].kind = definition.kind;
-                self.routines[slot].result_columns = definition.result_columns;
-                self.routines[slot].result_column_count = definition.result_column_count;
-                self.routines[slot].language = definition.language;
-                self.routines[slot].attributes = definition.attributes;
-                self.routines[slot].configs = definition.configs;
-                self.routines[slot].config_count = definition.config_count;
-                self.routines[slot].body_kind = definition.body_kind;
-                self.routines[slot].body = definition.body;
-                self.routines[slot].creation_path = definition.creation_path;
+            if self.routine(slot).created_at == definition.created_at {
                 self.write_committed_dependencies(
                     StoredQueryDependencyOwner::Routine(slot as u16),
                     dependencies.view(),
                 )?;
-                self.routines[slot].ownership = definition.ownership;
-                self.routines[slot].pending_definition = None;
+                definition.pending_identity = None;
+                definition.pending_definition = None;
+                definition.ddl_state = CatalogDdlState::Present;
+                self.routines.lock().expect("routine catalog lock poisoned")[slot] = definition;
                 return Ok(());
             }
             self.drop_routine(slot, 0);
@@ -46316,8 +46425,7 @@ impl Storage {
         txid: u32,
     ) -> Result<(), SqlError> {
         let routine = self
-            .routines
-            .get(usize::from(definition.function))
+            .routine_at(usize::from(definition.function))
             .filter(|routine| routine.database == current_database() && routine.visible_to(txid))
             .map(|routine| routine.definition_for(txid))
             .ok_or_else(|| {
@@ -48965,7 +49073,7 @@ mod tests {
         drop(brin_maintenance);
         assert_eq!(storage.views.len(), 3);
         assert_eq!(storage.matviews.len(), 4);
-        assert_eq!(storage.routines.len(), 5);
+        assert_eq!(storage.routine_count(), 5);
         let committed_dependency_images = 7 + 8 + 5 + 4;
         assert_eq!(
             storage.pending_stored_query_dependencies.len(),
@@ -49673,6 +49781,90 @@ mod tests {
                         default_expr: None,
                         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                         n_checks: 0,
+                    },
+                    9,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn routine_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<FixedVec<RoutineDef>>>();
+        assert_send_sync::<RoutineIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_routines = WORKERS;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let name = stack_format!(63, "routine_{worker}");
+                    let mut routine = RoutineDef::EMPTY;
+                    routine.created_at = worker as u64 + 1;
+                    routine.schema = SqlName::parse("public").unwrap();
+                    routine.name = SqlName::parse(name.as_str()).unwrap();
+                    routine.ddl_state = CatalogDdlState::Present;
+                    storage
+                        .routines
+                        .lock()
+                        .expect("routine catalog lock poisoned")[worker] = routine;
+                });
+            }
+        });
+
+        assert_eq!(
+            storage
+                .routines
+                .lock()
+                .expect("routine catalog lock poisoned")
+                .capacity(),
+            WORKERS
+        );
+        assert_eq!(
+            storage
+                .routine_entries()
+                .filter(|(_, routine)| routine.visible_to(0))
+                .count(),
+            WORKERS
+        );
+        for (slot, routine) in storage.routine_entries() {
+            assert_eq!(storage.routine(slot).name, routine.name);
+            assert_eq!(
+                storage.routine_slot_by_oid(routine_oid(&routine), 0),
+                Some(slot)
+            );
+        }
+
+        assert!(
+            storage
+                .create_routine(
+                    RoutineSpec {
+                        identity: RoutineIdentity::Allocate,
+                        schema: SqlName::parse("public").unwrap(),
+                        name: SqlName::parse("routine_full").unwrap(),
+                        arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+                        argument_count: 0,
+                        parameters: [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+                        parameter_count: 0,
+                        kind: RoutineKind::Function {
+                            result: RoutineResult::TEXT,
+                        },
+                        result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS],
+                        result_column_count: 0,
+                        language: RoutineLanguage::Sql,
+                        attributes: RoutineAttributes::DEFAULT,
+                        configs: [RoutineConfig::EMPTY; MAX_ROUTINE_CONFIGS],
+                        config_count: 0,
+                        body_kind: RoutineBodyKind::String,
+                        body: StackStr::new(),
+                        creation_path: StackStr::new(),
+                        dependencies: StoredQueryDependencies::EMPTY,
                     },
                     9,
                 )

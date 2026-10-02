@@ -25082,7 +25082,7 @@ fn pg_trigger<'a>(
                 Datum::Int4(relation_oid),
                 Datum::Int4(0),
                 text(trigger.name_to(txid).as_str(), arena)?,
-                Datum::Int4(crate::storage::routine_oid(function)),
+                Datum::Int4(crate::storage::routine_oid(&function)),
                 Datum::Int2(trigger_type),
                 Datum::Bpchar(match trigger.enabled_to(txid) {
                     crate::storage::TriggerEnabled::Origin => "O",
@@ -25194,7 +25194,7 @@ fn pg_event_trigger<'a>(
                 Datum::Int4(Storage::role_oid(usize::from(
                     event_trigger.ownership.owner_to(txid),
                 ))),
-                Datum::Int4(crate::storage::routine_oid(routine)),
+                Datum::Int4(crate::storage::routine_oid(&routine)),
                 Datum::Bpchar(match event_trigger.enabled {
                     crate::storage::TriggerEnabled::Origin => "O",
                     crate::storage::TriggerEnabled::Replica => "R",

@@ -6999,6 +6999,64 @@ struct TypeCatalog {
     composites: FixedVec<CompositeDef>,
 }
 
+#[derive(Debug)]
+struct TextCatalog {
+    collations: FixedVec<CollationDef>,
+    conversions: FixedVec<ConversionDef>,
+    text_search_objects: FixedVec<TextSearchDef>,
+}
+
+struct CollationIter<'a> {
+    catalog: &'a std::sync::Mutex<TextCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for CollationIter<'_> {
+    type Item = (usize, CollationDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("text catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.collations.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
+struct ConversionIter<'a> {
+    catalog: &'a std::sync::Mutex<TextCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for ConversionIter<'_> {
+    type Item = (usize, ConversionDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("text catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.conversions.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
+struct TextSearchIter<'a> {
+    catalog: &'a std::sync::Mutex<TextCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for TextSearchIter<'_> {
+    type Item = (usize, TextSearchDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("text catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.text_search_objects.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
 struct DomainIter<'a> {
     catalog: &'a std::sync::Mutex<TypeCatalog>,
     next_slot: usize,
@@ -12633,9 +12691,7 @@ pub struct Storage {
     routines: FixedVec<RoutineDef>,
     casts: FixedVec<CastDef>,
     operator_catalog: std::sync::Mutex<OperatorCatalog>,
-    collations: FixedVec<CollationDef>,
-    conversions: FixedVec<ConversionDef>,
-    text_search_objects: FixedVec<TextSearchDef>,
+    text_catalog: std::sync::Mutex<TextCatalog>,
     event_triggers: FixedVec<EventTriggerDef>,
     stored_query_dependencies: FixedVec<StoredQueryDependency>,
     stored_query_dependency_counts: FixedVec<u8>,
@@ -15928,7 +15984,10 @@ impl Storage {
             },
             DependencyClass::Collation => self.collation_slot(schema, name, txid).or_else(|| {
                 let slot = usize::from(dependency.slot);
-                self.collations
+                self.text_catalog
+                    .lock()
+                    .expect("text catalog lock poisoned")
+                    .collations
                     .get(slot)
                     .is_some_and(|collation| {
                         collation.database == current_database() && collation.visible_to(txid)
@@ -15951,7 +16010,7 @@ impl Storage {
             )
         })?;
         let (schema, name) = if dependency.class == DependencyClass::Collation {
-            let definition = self.collations[slot].definition_for(txid);
+            let definition = self.collation(slot).definition_for(txid);
             (definition.schema, definition.name)
         } else {
             (dependency.schema, dependency.name)
@@ -17257,9 +17316,11 @@ impl Storage {
                 families: operator_families,
                 classes: operator_classes,
             }),
-            collations,
-            conversions,
-            text_search_objects,
+            text_catalog: std::sync::Mutex::new(TextCatalog {
+                collations,
+                conversions,
+                text_search_objects,
+            }),
             event_triggers,
             stored_query_dependencies,
             stored_query_dependency_counts,
@@ -18037,6 +18098,9 @@ impl Storage {
             | Collation::PgUnicodeFast => CollationBehavior::Bytewise,
             Collation::Default => CollationBehavior::Database,
             Collation::Catalog(slot) => self
+                .text_catalog
+                .lock()
+                .expect("text catalog lock poisoned")
                 .collations
                 .get(usize::from(slot))
                 .filter(|definition| {
@@ -18119,6 +18183,9 @@ impl Storage {
         let needs_locale = match collation {
             Collation::Default => true,
             Collation::Catalog(slot) => self
+                .text_catalog
+                .lock()
+                .expect("text catalog lock poisoned")
                 .collations
                 .get(usize::from(slot))
                 .filter(|definition| {
@@ -18449,17 +18516,21 @@ impl Storage {
                 self.schemas[target_slot].ownership = source_schema.ownership.committed();
             }
 
+            let mut text_catalog = self
+                .text_catalog
+                .lock()
+                .expect("text catalog lock poisoned");
             for (source_slot, target_mapping) in collation_slots
                 .iter_mut()
                 .enumerate()
-                .take(self.collations.len())
+                .take(text_catalog.collations.len())
             {
-                let mut definition = self.collations[source_slot];
+                let mut definition = text_catalog.collations[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let target_slot = self
+                let target_slot = text_catalog
                     .collations
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -18472,16 +18543,16 @@ impl Storage {
                 definition.database = target;
                 definition.pending = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.collations[target_slot] = definition;
+                text_catalog.collations[target_slot] = definition;
                 *target_mapping = target_slot as u8;
             }
-            for source_slot in 0..self.text_search_objects.len() {
-                let mut definition = self.text_search_objects[source_slot];
+            for source_slot in 0..text_catalog.text_search_objects.len() {
+                let mut definition = text_catalog.text_search_objects[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let target_slot = self
+                let target_slot = text_catalog
                     .text_search_objects
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -18494,15 +18565,15 @@ impl Storage {
                 definition.database = target;
                 definition.pending = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.text_search_objects[target_slot] = definition;
+                text_catalog.text_search_objects[target_slot] = definition;
             }
-            for source_slot in 0..self.conversions.len() {
-                let mut definition = self.conversions[source_slot];
+            for source_slot in 0..text_catalog.conversions.len() {
+                let mut definition = text_catalog.conversions[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let target_slot = self
+                let target_slot = text_catalog
                     .conversions
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -18515,8 +18586,9 @@ impl Storage {
                 definition.database = target;
                 definition.pending = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.conversions[target_slot] = definition;
+                text_catalog.conversions[target_slot] = definition;
             }
+            drop(text_catalog);
 
             let mut type_catalog = self
                 .type_catalog
@@ -19701,9 +19773,6 @@ impl Storage {
         clear_catalog!(rules);
         clear_catalog!(routines);
         clear_catalog!(casts);
-        clear_catalog!(collations);
-        clear_catalog!(text_search_objects);
-        clear_catalog!(conversions);
         clear_catalog!(event_triggers);
         clear_catalog!(triggers);
         clear_catalog!(policies);
@@ -19714,6 +19783,27 @@ impl Storage {
         clear_catalog!(sequences);
         clear_catalog!(indexes);
         clear_catalog!(extensions);
+        {
+            let mut catalog = self
+                .text_catalog
+                .lock()
+                .expect("text catalog lock poisoned");
+            for definition in catalog.collations.iter_mut() {
+                if definition.database == database {
+                    *definition = CollationDef::EMPTY;
+                }
+            }
+            for definition in catalog.conversions.iter_mut() {
+                if definition.database == database {
+                    *definition = ConversionDef::EMPTY;
+                }
+            }
+            for definition in catalog.text_search_objects.iter_mut() {
+                if definition.database == database {
+                    *definition = TextSearchDef::EMPTY;
+                }
+            }
+        }
         {
             let mut catalog = self
                 .type_catalog
@@ -19884,9 +19974,6 @@ impl Storage {
         commit_catalog!(rules);
         commit_catalog!(routines);
         commit_catalog!(casts);
-        commit_catalog!(collations);
-        commit_catalog!(text_search_objects);
-        commit_catalog!(conversions);
         commit_catalog!(event_triggers);
         commit_catalog!(triggers);
         commit_catalog!(policies);
@@ -19897,6 +19984,33 @@ impl Storage {
         commit_catalog!(sequences);
         commit_catalog!(indexes);
         commit_catalog!(extensions);
+        {
+            let mut catalog = self
+                .text_catalog
+                .lock()
+                .expect("text catalog lock poisoned");
+            for definition in catalog.collations.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+            for definition in catalog.conversions.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+            for definition in catalog.text_search_objects.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         {
             let mut catalog = self
                 .type_catalog
@@ -21015,27 +21129,32 @@ impl Storage {
             .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
-    pub(crate) fn checkpoint_collations(&self) -> impl Iterator<Item = (usize, &CollationDef)> {
-        self.collations
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    pub(crate) fn checkpoint_collations(&self) -> impl Iterator<Item = (usize, CollationDef)> + '_ {
+        CollationIter {
+            catalog: &self.text_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_text_search_objects(
         &self,
-    ) -> impl Iterator<Item = (usize, &TextSearchDef)> {
-        self.text_search_objects
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    ) -> impl Iterator<Item = (usize, TextSearchDef)> + '_ {
+        TextSearchIter {
+            catalog: &self.text_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
-    pub(crate) fn checkpoint_conversions(&self) -> impl Iterator<Item = (usize, &ConversionDef)> {
-        self.conversions
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    pub(crate) fn checkpoint_conversions(
+        &self,
+    ) -> impl Iterator<Item = (usize, ConversionDef)> + '_ {
+        ConversionIter {
+            catalog: &self.text_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_event_triggers(
@@ -24987,7 +25106,11 @@ impl Storage {
                 rename_schema_qualified_sql(&mut pending.body, prior, name)?;
             }
         }
-        for definition in self.collations.iter_mut().filter(|definition| {
+        let mut text_catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        for definition in text_catalog.collations.iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -24996,7 +25119,7 @@ impl Storage {
                 rename_schema_name(&mut pending.definition.schema, prior, name);
             }
         }
-        for definition in self.conversions.iter_mut().filter(|definition| {
+        for definition in text_catalog.conversions.iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -25005,10 +25128,14 @@ impl Storage {
                 rename_schema_name(&mut pending.definition.schema, prior, name);
             }
         }
-        for definition in self.text_search_objects.iter_mut().filter(|definition| {
-            definition.database == current_database()
-                && definition.ddl_state != CatalogDdlState::Absent
-        }) {
+        for definition in text_catalog
+            .text_search_objects
+            .iter_mut()
+            .filter(|definition| {
+                definition.database == current_database()
+                    && definition.ddl_state != CatalogDdlState::Absent
+            })
+        {
             if definition.definition.schema() == prior {
                 definition.definition.rename(Some(name), None);
             }
@@ -25018,6 +25145,7 @@ impl Storage {
                 pending.definition.rename(Some(name), None);
             }
         }
+        drop(text_catalog);
         let mut operator_catalog = self
             .operator_catalog
             .lock()
@@ -44992,55 +45120,71 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, CollationDefinition)> + '_ {
-        self.collations
-            .iter()
-            .enumerate()
-            .filter(move |(_, collation)| {
-                collation.database == current_database() && collation.visible_to(txid)
-            })
-            .map(move |(slot, collation)| (slot, collation.definition_for(txid)))
+        CollationIter {
+            catalog: &self.text_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, collation)| {
+            collation.database == current_database() && collation.visible_to(txid)
+        })
+        .map(move |(slot, collation)| (slot, collation.definition_for(txid)))
     }
 
     pub(crate) fn collation_capacity(&self) -> usize {
-        self.collations.len()
+        self.text_catalog
+            .lock()
+            .expect("text catalog lock poisoned")
+            .collations
+            .len()
     }
 
     pub(crate) fn conversions_visible_to(
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, ConversionDefinition)> + '_ {
-        self.conversions
-            .iter()
-            .enumerate()
-            .filter(move |(_, conversion)| {
-                conversion.database == current_database() && conversion.visible_to(txid)
-            })
-            .map(move |(slot, conversion)| (slot, conversion.definition_for(txid)))
+        ConversionIter {
+            catalog: &self.text_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, conversion)| {
+            conversion.database == current_database() && conversion.visible_to(txid)
+        })
+        .map(move |(slot, conversion)| (slot, conversion.definition_for(txid)))
     }
 
     pub(crate) fn conversion_capacity(&self) -> usize {
-        self.conversions.len()
+        self.text_catalog
+            .lock()
+            .expect("text catalog lock poisoned")
+            .conversions
+            .len()
     }
 
     pub(crate) fn text_search_objects_visible_to(
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, TextSearchDefinition)> + '_ {
-        self.text_search_objects
-            .iter()
-            .enumerate()
-            .filter(move |(_, object)| {
-                object.database == current_database() && object.visible_to(txid)
-            })
-            .map(move |(slot, object)| (slot, object.definition_for(txid)))
+        TextSearchIter {
+            catalog: &self.text_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, object)| object.database == current_database() && object.visible_to(txid))
+        .map(move |(slot, object)| (slot, object.definition_for(txid)))
     }
 
     pub(crate) fn text_search_object_capacity(&self) -> usize {
-        self.text_search_objects.len()
+        self.text_catalog
+            .lock()
+            .expect("text catalog lock poisoned")
+            .text_search_objects
+            .len()
     }
 
     pub(crate) fn text_search_object(&self, slot: usize) -> TextSearchDef {
-        self.text_search_objects[slot]
+        self.text_catalog
+            .lock()
+            .expect("text catalog lock poisoned")
+            .text_search_objects[slot]
     }
 
     pub(crate) fn text_search_slot(
@@ -45093,11 +45237,17 @@ impl Storage {
     }
 
     pub(crate) fn collation(&self, slot: usize) -> CollationDef {
-        self.collations[slot]
+        self.text_catalog
+            .lock()
+            .expect("text catalog lock poisoned")
+            .collations[slot]
     }
 
     pub(crate) fn conversion(&self, slot: usize) -> ConversionDef {
-        self.conversions[slot]
+        self.text_catalog
+            .lock()
+            .expect("text catalog lock poisoned")
+            .conversions[slot]
     }
 
     pub(crate) fn collation_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
@@ -45209,17 +45359,23 @@ impl Storage {
             ));
         }
         self.require_schema_create(definition.schema.as_str(), txid)?;
-        if self
-            .collation_slot(definition.schema.as_str(), definition.name.as_str(), txid)
-            .is_some()
-        {
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        if catalog.collations.iter().any(|candidate| {
+            candidate.database == current_database()
+                && candidate.visible_to(txid)
+                && candidate.definition_for(txid).schema == definition.schema
+                && candidate.definition_for(txid).name == definition.name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "collation \"{}\" already exists",
                 definition.name.as_str()
             ));
         }
-        let slot = self
+        let slot = catalog
             .collations
             .iter()
             .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -45227,11 +45383,11 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many collations (limit {})",
-                    self.collations.len()
+                    catalog.collations.len()
                 )
             })?;
         let created_at = self.catalog_sequence.next();
-        self.collations[slot] = CollationDef {
+        catalog.collations[slot] = CollationDef {
             database: current_database(),
             created_at,
             definition,
@@ -45247,10 +45403,16 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         self.require_schema_create(definition.schema.as_str(), txid)?;
-        if self
-            .conversion_slot(definition.schema.as_str(), definition.name.as_str(), txid)
-            .is_some()
-        {
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        if catalog.conversions.iter().any(|candidate| {
+            candidate.database == current_database()
+                && candidate.visible_to(txid)
+                && candidate.definition_for(txid).schema == definition.schema
+                && candidate.definition_for(txid).name == definition.name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "conversion \"{}\" already exists",
@@ -45258,8 +45420,11 @@ impl Storage {
             ));
         }
         if definition.default
-            && self.conversions_visible_to(txid).any(|(_, candidate)| {
-                candidate.schema == definition.schema
+            && catalog.conversions.iter().any(|entry| {
+                let candidate = entry.definition_for(txid);
+                entry.database == current_database()
+                    && entry.visible_to(txid)
+                    && candidate.schema == definition.schema
                     && candidate.source == definition.source
                     && candidate.destination == definition.destination
                     && candidate.default
@@ -45272,7 +45437,7 @@ impl Storage {
                 definition.destination.name()
             ));
         }
-        let slot = self
+        let slot = catalog
             .conversions
             .iter()
             .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -45280,11 +45445,11 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many conversions (limit {})",
-                    self.conversions.len()
+                    catalog.conversions.len()
                 )
             })?;
         let created_at = self.catalog_sequence.next();
-        self.conversions[slot] = ConversionDef {
+        catalog.conversions[slot] = ConversionDef {
             database: current_database(),
             created_at,
             definition,
@@ -45306,15 +45471,18 @@ impl Storage {
             ));
         }
         self.require_schema_create(definition.schema().as_str(), txid)?;
-        if self
-            .text_search_slot(
-                definition.kind(),
-                definition.schema().as_str(),
-                definition.name().as_str(),
-                txid,
-            )
-            .is_some()
-        {
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        if catalog.text_search_objects.iter().any(|entry| {
+            let candidate = entry.definition_for(txid);
+            entry.database == current_database()
+                && entry.visible_to(txid)
+                && candidate.kind() == definition.kind()
+                && candidate.schema() == definition.schema()
+                && candidate.name() == definition.name()
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "{} \"{}\" already exists",
@@ -45322,7 +45490,7 @@ impl Storage {
                 definition.name().as_str()
             ));
         }
-        let slot = self
+        let slot = catalog
             .text_search_objects
             .iter()
             .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -45330,7 +45498,7 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many text search objects (limit {})",
-                    self.text_search_objects.len()
+                    catalog.text_search_objects.len()
                 )
             })?;
         let base = match definition.kind() {
@@ -45341,7 +45509,7 @@ impl Storage {
         };
         definition.set_oid(base + slot as i32);
         let created_at = self.catalog_sequence.next();
-        self.text_search_objects[slot] = TextSearchDef {
+        catalog.text_search_objects[slot] = TextSearchDef {
             database: current_database(),
             created_at,
             definition,
@@ -45363,13 +45531,24 @@ impl Storage {
                 "text-search definition is not executable"
             ));
         }
-        let old = self.text_search_objects[slot].definition_for(txid);
-        if let Some(other) = self.text_search_slot(
-            definition.kind(),
-            definition.schema().as_str(),
-            definition.name().as_str(),
-            txid,
-        ) && other != slot
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let old = catalog.text_search_objects[slot].definition_for(txid);
+        if catalog
+            .text_search_objects
+            .iter()
+            .enumerate()
+            .any(|(other, entry)| {
+                let candidate = entry.definition_for(txid);
+                other != slot
+                    && entry.database == current_database()
+                    && entry.visible_to(txid)
+                    && candidate.kind() == definition.kind()
+                    && candidate.schema() == definition.schema()
+                    && candidate.name() == definition.name()
+            })
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -45377,7 +45556,7 @@ impl Storage {
                 definition.kind().noun()
             ));
         }
-        let prior = self.text_search_objects[slot].pending;
+        let prior = catalog.text_search_objects[slot].pending;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -45385,8 +45564,9 @@ impl Storage {
                 definition.kind().noun()
             ));
         }
-        self.text_search_objects[slot].pending =
+        catalog.text_search_objects[slot].pending =
             Some(PendingTextSearchDefinition { txid, definition });
+        drop(catalog);
         self.stage_object_comment_identity(
             text_search_comment_class(old.kind()),
             old.schema(),
@@ -45399,37 +45579,57 @@ impl Storage {
     }
 
     pub(crate) fn drop_text_search_object(&mut self, slot: usize, txid: u32) {
-        self.text_search_objects[slot].ddl_state =
-            self.text_search_objects[slot].ddl_state.drop_by(txid);
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.text_search_objects[slot].ddl_state =
+            catalog.text_search_objects[slot].ddl_state.drop_by(txid);
     }
 
     pub(crate) fn commit_text_search_create(&mut self, slot: usize) {
-        self.text_search_objects[slot].ddl_state =
-            self.text_search_objects[slot].ddl_state.commit_create();
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.text_search_objects[slot].ddl_state =
+            catalog.text_search_objects[slot].ddl_state.commit_create();
     }
 
     pub(crate) fn rollback_text_search_create(&mut self, slot: usize) {
-        self.text_search_objects[slot].ddl_state =
-            self.text_search_objects[slot].ddl_state.rollback_create();
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.text_search_objects[slot].ddl_state = catalog.text_search_objects[slot]
+            .ddl_state
+            .rollback_create();
     }
 
     pub(crate) fn commit_text_search_alter(&mut self, slot: usize, txid: u32) {
-        let old = self.text_search_objects[slot].definition;
-        let changed = self.text_search_objects[slot]
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let old = catalog.text_search_objects[slot].definition;
+        let changed = catalog.text_search_objects[slot]
             .pending
             .filter(|pending| pending.txid == txid)
             .map(|pending| pending.definition);
-        if let Some(pending) = self.text_search_objects[slot].pending
+        if let Some(pending) = catalog.text_search_objects[slot].pending
             && pending.txid == txid
         {
-            self.text_search_objects[slot].definition = pending.definition;
-            self.text_search_objects[slot].pending = None;
+            catalog.text_search_objects[slot].definition = pending.definition;
+            catalog.text_search_objects[slot].pending = None;
+            drop(catalog);
             self.commit_object_comment_identity(
                 text_search_comment_class(old.kind()),
                 old.schema(),
                 old.name(),
                 txid,
             );
+        } else {
+            drop(catalog);
         }
         if let Some(definition) = changed
             && definition.kind() == crate::sql::ast::TextSearchObjectKind::Configuration
@@ -45449,12 +45649,17 @@ impl Storage {
         slot: usize,
         prior: Option<PendingTextSearchDefinition>,
     ) {
-        let txid = self.text_search_objects[slot]
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let txid = catalog.text_search_objects[slot]
             .pending
             .map_or(0, |pending| pending.txid);
-        self.text_search_objects[slot].pending = prior;
-        let committed = self.text_search_objects[slot].definition;
+        catalog.text_search_objects[slot].pending = prior;
+        let committed = catalog.text_search_objects[slot].definition;
         let visible = prior.map_or(committed, |pending| pending.definition);
+        drop(catalog);
         self.stage_object_comment_identity(
             text_search_comment_class(committed.kind()),
             committed.schema(),
@@ -45466,20 +45671,29 @@ impl Storage {
     }
 
     pub(crate) fn commit_text_search_drop(&mut self, slot: usize) {
-        let definition = self.text_search_objects[slot].definition;
+        let definition = self.text_search_object(slot).definition;
         self.drop_object_comments(
             text_search_comment_class(definition.kind()),
             definition.schema().as_str(),
             definition.name().as_str(),
         );
-        self.text_search_objects[slot].pending = None;
-        self.text_search_objects[slot].ddl_state =
-            self.text_search_objects[slot].ddl_state.commit_drop();
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.text_search_objects[slot].pending = None;
+        catalog.text_search_objects[slot].ddl_state =
+            catalog.text_search_objects[slot].ddl_state.commit_drop();
     }
 
     pub(crate) fn rollback_text_search_drop(&mut self, slot: usize, txid: u32) {
-        self.text_search_objects[slot].ddl_state =
-            self.text_search_objects[slot].ddl_state.rollback_drop(txid);
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.text_search_objects[slot].ddl_state = catalog.text_search_objects[slot]
+            .ddl_state
+            .rollback_drop(txid);
     }
 
     pub(crate) fn replay_text_search_object(
@@ -45488,19 +45702,23 @@ impl Storage {
         created_at: u64,
         definition: TextSearchDefinition,
     ) -> Result<(), SqlError> {
-        if slot >= self.text_search_objects.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "journal text search object slot is out of range"
-            ));
-        }
         if definition.oid() <= 0 || !definition.executable_shape() {
             return Err(sql_err!(
                 sqlstate::INVALID_OBJECT_DEFINITION,
                 "journal text-search definition is invalid"
             ));
         }
-        if self
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        if slot >= catalog.text_search_objects.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "journal text search object slot is out of range"
+            ));
+        }
+        if catalog
             .text_search_objects
             .iter()
             .enumerate()
@@ -45520,8 +45738,18 @@ impl Storage {
                 definition.name().as_str()
             ));
         }
-        if self.text_search_objects[slot].ddl_state != CatalogDdlState::Absent {
-            let old = self.text_search_objects[slot].definition;
+        let old = (catalog.text_search_objects[slot].ddl_state != CatalogDdlState::Absent)
+            .then_some(catalog.text_search_objects[slot].definition);
+        self.catalog_sequence.observe(created_at);
+        catalog.text_search_objects[slot] = TextSearchDef {
+            database: current_database(),
+            created_at,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        drop(catalog);
+        if let Some(old) = old {
             self.replay_object_comment_identity(
                 text_search_comment_class(old.kind()),
                 old.schema(),
@@ -45539,14 +45767,6 @@ impl Storage {
                 );
             }
         }
-        self.catalog_sequence.observe(created_at);
-        self.text_search_objects[slot] = TextSearchDef {
-            database: current_database(),
-            created_at,
-            definition,
-            pending: None,
-            ddl_state: CatalogDdlState::Present,
-        };
         Ok(())
     }
 
@@ -45556,9 +45776,23 @@ impl Storage {
         schema: &str,
         name: &str,
     ) {
-        if let Some(slot) = self.text_search_slot(kind, schema, name, 0) {
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let removed = catalog.text_search_objects.iter().position(|entry| {
+            entry.database == current_database()
+                && entry.visible_to(0)
+                && entry.definition_for(0).kind() == kind
+                && entry.definition_for(0).schema().as_str() == schema
+                && entry.definition_for(0).name().as_str() == name
+        });
+        if let Some(slot) = removed {
+            catalog.text_search_objects[slot] = TextSearchDef::EMPTY;
+        }
+        drop(catalog);
+        if removed.is_some() {
             self.drop_object_comments(text_search_comment_class(kind), schema, name);
-            self.text_search_objects[slot] = TextSearchDef::EMPTY;
         }
     }
 
@@ -45568,24 +45802,33 @@ impl Storage {
         definition: CollationDefinition,
         txid: u32,
     ) -> Result<Option<PendingCollationDefinition>, SqlError> {
-        let old = self.collations[slot].definition_for(txid);
-        if let Some(other) =
-            self.collation_slot(definition.schema.as_str(), definition.name.as_str(), txid)
-            && other != slot
-        {
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let old = catalog.collations[slot].definition_for(txid);
+        if catalog.collations.iter().enumerate().any(|(other, entry)| {
+            let candidate = entry.definition_for(txid);
+            other != slot
+                && entry.database == current_database()
+                && entry.visible_to(txid)
+                && candidate.schema == definition.schema
+                && candidate.name == definition.name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "collation already exists"
             ));
         }
-        let prior = self.collations[slot].pending;
+        let prior = catalog.collations[slot].pending;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "collation is being altered by another transaction"
             ));
         }
-        self.collations[slot].pending = Some(PendingCollationDefinition { txid, definition });
+        catalog.collations[slot].pending = Some(PendingCollationDefinition { txid, definition });
+        drop(catalog);
         self.stage_object_comment_identity(
             CommentClass::Collation,
             old.schema,
@@ -45603,24 +45846,38 @@ impl Storage {
         definition: ConversionDefinition,
         txid: u32,
     ) -> Result<Option<PendingConversionDefinition>, SqlError> {
-        let old = self.conversions[slot].definition_for(txid);
-        if let Some(other) =
-            self.conversion_slot(definition.schema.as_str(), definition.name.as_str(), txid)
-            && other != slot
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let old = catalog.conversions[slot].definition_for(txid);
+        if catalog
+            .conversions
+            .iter()
+            .enumerate()
+            .any(|(other, entry)| {
+                let candidate = entry.definition_for(txid);
+                other != slot
+                    && entry.database == current_database()
+                    && entry.visible_to(txid)
+                    && candidate.schema == definition.schema
+                    && candidate.name == definition.name
+            })
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "conversion already exists"
             ));
         }
-        let prior = self.conversions[slot].pending;
+        let prior = catalog.conversions[slot].pending;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "conversion is being altered by another transaction"
             ));
         }
-        self.conversions[slot].pending = Some(PendingConversionDefinition { txid, definition });
+        catalog.conversions[slot].pending = Some(PendingConversionDefinition { txid, definition });
+        drop(catalog);
         self.stage_object_comment_identity(
             CommentClass::Conversion,
             old.schema,
@@ -45633,33 +45890,54 @@ impl Storage {
     }
 
     pub(crate) fn drop_collation(&mut self, slot: usize, txid: u32) {
-        self.collations[slot].ddl_state = self.collations[slot].ddl_state.drop_by(txid);
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.collations[slot].ddl_state = catalog.collations[slot].ddl_state.drop_by(txid);
     }
 
     pub(crate) fn drop_conversion(&mut self, slot: usize, txid: u32) {
-        self.conversions[slot].ddl_state = self.conversions[slot].ddl_state.drop_by(txid);
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.conversions[slot].ddl_state = catalog.conversions[slot].ddl_state.drop_by(txid);
     }
 
     pub(crate) fn commit_collation_create(&mut self, slot: usize) {
-        self.collations[slot].ddl_state = self.collations[slot].ddl_state.commit_create();
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.collations[slot].ddl_state = catalog.collations[slot].ddl_state.commit_create();
     }
 
     pub(crate) fn rollback_collation_create(&mut self, slot: usize) {
-        self.collations[slot].ddl_state = self.collations[slot].ddl_state.rollback_create();
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.collations[slot].ddl_state = catalog.collations[slot].ddl_state.rollback_create();
     }
 
     pub(crate) fn commit_collation_alter(&mut self, slot: usize, txid: u32) {
-        let old = self.collations[slot].definition;
-        let changed = self.collations[slot]
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let old = catalog.collations[slot].definition;
+        let changed = catalog.collations[slot]
             .pending
             .filter(|pending| pending.txid == txid)
             .map(|pending| (pending.definition.schema, pending.definition.name));
-        if let Some(pending) = self.collations[slot].pending
+        if let Some(pending) = catalog.collations[slot].pending
             && pending.txid == txid
         {
-            self.collations[slot].definition = pending.definition;
-            self.collations[slot].pending = None;
+            catalog.collations[slot].definition = pending.definition;
+            catalog.collations[slot].pending = None;
         }
+        drop(catalog);
         if let Some((schema, name)) = changed {
             self.rename_stored_query_dependency(
                 DependencyClass::Collation,
@@ -45682,12 +45960,17 @@ impl Storage {
         slot: usize,
         prior: Option<PendingCollationDefinition>,
     ) {
-        let txid = self.collations[slot]
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let txid = catalog.collations[slot]
             .pending
             .map_or(0, |pending| pending.txid);
-        self.collations[slot].pending = prior;
-        let committed = self.collations[slot].definition;
+        catalog.collations[slot].pending = prior;
+        let committed = catalog.collations[slot].definition;
         let visible = prior.map_or(committed, |pending| pending.definition);
+        drop(catalog);
         self.stage_object_comment_identity(
             CommentClass::Collation,
             committed.schema,
@@ -45699,35 +45982,61 @@ impl Storage {
     }
 
     pub(crate) fn commit_collation_drop(&mut self, slot: usize) {
-        let definition = self.collations[slot].definition;
+        let definition = self.collation(slot).definition;
         self.drop_object_comments(
             CommentClass::Collation,
             definition.schema.as_str(),
             definition.name.as_str(),
         );
-        self.collations[slot].pending = None;
-        self.collations[slot].ddl_state = self.collations[slot].ddl_state.commit_drop();
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.collations[slot].pending = None;
+        catalog.collations[slot].ddl_state = catalog.collations[slot].ddl_state.commit_drop();
     }
 
     pub(crate) fn rollback_collation_drop(&mut self, slot: usize, txid: u32) {
-        self.collations[slot].ddl_state = self.collations[slot].ddl_state.rollback_drop(txid);
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.collations[slot].ddl_state = catalog.collations[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn commit_conversion_create(&mut self, slot: usize) {
-        self.conversions[slot].ddl_state = self.conversions[slot].ddl_state.commit_create();
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.conversions[slot].ddl_state = catalog.conversions[slot].ddl_state.commit_create();
     }
 
     pub(crate) fn rollback_conversion_create(&mut self, slot: usize) {
-        self.conversions[slot].ddl_state = self.conversions[slot].ddl_state.rollback_create();
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.conversions[slot].ddl_state = catalog.conversions[slot].ddl_state.rollback_create();
     }
 
     pub(crate) fn commit_conversion_alter(&mut self, slot: usize, txid: u32) {
-        let old = self.conversions[slot].definition;
-        if let Some(pending) = self.conversions[slot].pending
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let old = catalog.conversions[slot].definition;
+        let changed = if let Some(pending) = catalog.conversions[slot].pending
             && pending.txid == txid
         {
-            self.conversions[slot].definition = pending.definition;
-            self.conversions[slot].pending = None;
+            catalog.conversions[slot].definition = pending.definition;
+            catalog.conversions[slot].pending = None;
+            true
+        } else {
+            false
+        };
+        drop(catalog);
+        if changed {
             self.commit_object_comment_identity(
                 CommentClass::Conversion,
                 old.schema,
@@ -45742,12 +46051,17 @@ impl Storage {
         slot: usize,
         prior: Option<PendingConversionDefinition>,
     ) {
-        let txid = self.conversions[slot]
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let txid = catalog.conversions[slot]
             .pending
             .map_or(0, |pending| pending.txid);
-        self.conversions[slot].pending = prior;
-        let committed = self.conversions[slot].definition;
+        catalog.conversions[slot].pending = prior;
+        let committed = catalog.conversions[slot].definition;
         let visible = prior.map_or(committed, |pending| pending.definition);
+        drop(catalog);
         self.stage_object_comment_identity(
             CommentClass::Conversion,
             committed.schema,
@@ -45759,18 +46073,27 @@ impl Storage {
     }
 
     pub(crate) fn commit_conversion_drop(&mut self, slot: usize) {
-        let definition = self.conversions[slot].definition;
+        let definition = self.conversion(slot).definition;
         self.drop_object_comments(
             CommentClass::Conversion,
             definition.schema.as_str(),
             definition.name.as_str(),
         );
-        self.conversions[slot].pending = None;
-        self.conversions[slot].ddl_state = self.conversions[slot].ddl_state.commit_drop();
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.conversions[slot].pending = None;
+        catalog.conversions[slot].ddl_state = catalog.conversions[slot].ddl_state.commit_drop();
     }
 
     pub(crate) fn rollback_conversion_drop(&mut self, slot: usize, txid: u32) {
-        self.conversions[slot].ddl_state = self.conversions[slot].ddl_state.rollback_drop(txid);
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        catalog.conversions[slot].ddl_state =
+            catalog.conversions[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn replay_collation(
@@ -45791,13 +46114,17 @@ impl Storage {
                 "journal collation behavior does not match its definition"
             ));
         }
-        if slot >= self.collations.len() {
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        if slot >= catalog.collations.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "journal collation slot is out of range"
             ));
         }
-        if self
+        if catalog
             .collations
             .iter()
             .enumerate()
@@ -45815,8 +46142,18 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        let old_identity = if self.collations[slot].ddl_state != CatalogDdlState::Absent {
-            let old = self.collations[slot].definition;
+        let old = (catalog.collations[slot].ddl_state != CatalogDdlState::Absent)
+            .then_some(catalog.collations[slot].definition);
+        self.catalog_sequence.observe(created_at);
+        catalog.collations[slot] = CollationDef {
+            database: current_database(),
+            created_at,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        drop(catalog);
+        let old_identity = if let Some(old) = old {
             self.replay_object_comment_identity(
                 CommentClass::Collation,
                 old.schema,
@@ -45839,21 +46176,27 @@ impl Storage {
             definition.schema,
             definition.name,
         );
-        self.catalog_sequence.observe(created_at);
-        self.collations[slot] = CollationDef {
-            database: current_database(),
-            created_at,
-            definition,
-            pending: None,
-            ddl_state: CatalogDdlState::Present,
-        };
         Ok(())
     }
 
     pub(crate) fn replay_drop_collation(&mut self, schema: &str, name: &str) {
-        if let Some(slot) = self.collation_slot(schema, name, 0) {
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let removed = catalog.collations.iter().position(|entry| {
+            let definition = entry.definition_for(0);
+            entry.database == current_database()
+                && entry.visible_to(0)
+                && definition.schema.as_str() == schema
+                && definition.name.as_str() == name
+        });
+        if let Some(slot) = removed {
+            catalog.collations[slot] = CollationDef::EMPTY;
+        }
+        drop(catalog);
+        if removed.is_some() {
             self.drop_object_comments(CommentClass::Collation, schema, name);
-            self.collations[slot] = CollationDef::EMPTY;
         }
     }
 
@@ -45863,13 +46206,17 @@ impl Storage {
         created_at: u64,
         definition: ConversionDefinition,
     ) -> Result<(), SqlError> {
-        if slot >= self.conversions.len() {
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        if slot >= catalog.conversions.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "journal conversion slot is out of range"
             ));
         }
-        if self
+        if catalog
             .conversions
             .iter()
             .enumerate()
@@ -45887,8 +46234,18 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        if self.conversions[slot].ddl_state != CatalogDdlState::Absent {
-            let old = self.conversions[slot].definition;
+        let old = (catalog.conversions[slot].ddl_state != CatalogDdlState::Absent)
+            .then_some(catalog.conversions[slot].definition);
+        self.catalog_sequence.observe(created_at);
+        catalog.conversions[slot] = ConversionDef {
+            database: current_database(),
+            created_at,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        drop(catalog);
+        if let Some(old) = old {
             self.replay_object_comment_identity(
                 CommentClass::Conversion,
                 old.schema,
@@ -45897,21 +46254,27 @@ impl Storage {
                 definition.name,
             );
         }
-        self.catalog_sequence.observe(created_at);
-        self.conversions[slot] = ConversionDef {
-            database: current_database(),
-            created_at,
-            definition,
-            pending: None,
-            ddl_state: CatalogDdlState::Present,
-        };
         Ok(())
     }
 
     pub(crate) fn replay_drop_conversion(&mut self, schema: &str, name: &str) {
-        if let Some(slot) = self.conversion_slot(schema, name, 0) {
+        let mut catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        let removed = catalog.conversions.iter().position(|entry| {
+            let definition = entry.definition_for(0);
+            entry.database == current_database()
+                && entry.visible_to(0)
+                && definition.schema.as_str() == schema
+                && definition.name.as_str() == name
+        });
+        if let Some(slot) = removed {
+            catalog.conversions[slot] = ConversionDef::EMPTY;
+        }
+        drop(catalog);
+        if removed.is_some() {
             self.drop_object_comments(CommentClass::Conversion, schema, name);
-            self.conversions[slot] = ConversionDef::EMPTY;
         }
     }
 
@@ -48638,9 +49001,14 @@ mod tests {
         assert_eq!(storage.triggers.len(), 10);
         assert_eq!(storage.partition_trigger_states.len(), 20);
         assert_eq!(storage.publications.len(), 11);
-        assert_eq!(storage.collations.len(), 12);
-        assert_eq!(storage.conversions.len(), 13);
-        assert_eq!(storage.text_search_objects.len(), 27);
+        let text_catalog = storage
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        assert_eq!(text_catalog.collations.len(), 12);
+        assert_eq!(text_catalog.conversions.len(), 13);
+        assert_eq!(text_catalog.text_search_objects.len(), 27);
+        drop(text_catalog);
         assert_eq!(storage.event_triggers.len(), 14);
         assert_eq!(
             storage.pending_extended_statistics_data.capacity(),
@@ -49305,6 +49673,104 @@ mod tests {
                         default_expr: None,
                         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                         n_checks: 0,
+                    },
+                    9,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn text_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<TextCatalog>>();
+        assert_send_sync::<CollationIter<'_>>();
+        assert_send_sync::<ConversionIter<'_>>();
+        assert_send_sync::<TextSearchIter<'_>>();
+
+        const WORKERS: usize = 4;
+        const BUILTINS: usize = 21;
+        let mut config = test_config();
+        config.max_collations = WORKERS;
+        config.max_conversions = WORKERS;
+        config.max_text_search_objects = BUILTINS + WORKERS;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let name = stack_format!(63, "text_{worker}");
+                    let name = SqlName::parse(name.as_str()).unwrap();
+                    let schema = SqlName::parse("public").unwrap();
+                    let mut catalog = storage
+                        .text_catalog
+                        .lock()
+                        .expect("text catalog lock poisoned");
+
+                    let mut collation = CollationDef::EMPTY;
+                    collation.created_at = worker as u64 + 1;
+                    collation.definition.schema = schema;
+                    collation.definition.name = name;
+                    collation.ddl_state = CatalogDdlState::Present;
+                    catalog.collations[worker] = collation;
+
+                    let mut conversion = ConversionDef::EMPTY;
+                    conversion.created_at = worker as u64 + 101;
+                    conversion.definition.schema = schema;
+                    conversion.definition.name = name;
+                    conversion.ddl_state = CatalogDdlState::Present;
+                    catalog.conversions[worker] = conversion;
+
+                    catalog.text_search_objects[BUILTINS + worker] = TextSearchDef {
+                        database: DatabaseOid::POSTGRES,
+                        created_at: worker as u64 + 201,
+                        definition: TextSearchDefinition::Parser {
+                            schema,
+                            name,
+                            oid: 400_000 + worker as i32,
+                            start: 3717,
+                            gettoken: 3718,
+                            end: 3719,
+                            headline: 3720,
+                            lextypes: 3721,
+                        },
+                        pending: None,
+                        ddl_state: CatalogDdlState::Present,
+                    };
+                });
+            }
+        });
+
+        let catalog = storage
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        assert_eq!(catalog.collations.capacity(), WORKERS);
+        assert_eq!(catalog.conversions.capacity(), WORKERS);
+        assert_eq!(catalog.text_search_objects.capacity(), BUILTINS + WORKERS);
+        drop(catalog);
+
+        assert_eq!(storage.collations_visible_to(0).count(), WORKERS);
+        assert_eq!(storage.conversions_visible_to(0).count(), WORKERS);
+        assert_eq!(
+            storage.text_search_objects_visible_to(0).count(),
+            7 + WORKERS
+        );
+        for (slot, definition) in storage.collations_visible_to(0) {
+            assert_eq!(storage.collation(slot).definition.name, definition.name);
+            assert_eq!(storage.conversion(slot).definition.name, definition.name);
+        }
+
+        assert!(
+            storage
+                .create_collation(
+                    CollationDefinition {
+                        schema: SqlName::parse("public").unwrap(),
+                        name: SqlName::parse("collation_full").unwrap(),
+                        behavior: CollationBehavior::Database,
+                        ..CollationDefinition::EMPTY
                     },
                     9,
                 )

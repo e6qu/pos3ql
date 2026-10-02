@@ -3717,6 +3717,26 @@ impl ExtendedStatisticsDef {
         };
         &keys[..usize::from(self.n_keys)]
     }
+
+    fn identity_matches(&self, schema: SqlName, name: SqlName) -> bool {
+        (self.mutable.schema == schema && self.mutable.name == name)
+            || self.pending_definition.is_some_and(|pending| {
+                pending.definition.schema == schema && pending.definition.name == name
+            })
+    }
+
+    fn pending_owner_other_than(&self, txid: u32) -> Option<u32> {
+        [
+            self.pending_definition.map(|pending| pending.txid),
+            self.pending_keys.map(|pending| pending.txid),
+            self.pending_data_txid,
+            self.ownership.pending.map(|pending| pending.txid),
+            self.ddl_state.pending_txid(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|owner| *owner != txid)
+    }
 }
 
 /// A table's binding of one indexed tuple to its value cache: the key columns
@@ -7065,6 +7085,32 @@ struct EventTriggerIter<'a> {
 struct TriggerCatalog {
     definitions: FixedVec<TriggerDef>,
     partition_states: FixedVec<PartitionTriggerState>,
+}
+
+/// Definitions and transaction-private ANALYZE images publish together.
+struct ExtendedStatisticsCatalog {
+    definitions: FixedVec<ExtendedStatisticsDef>,
+    pending_data: FixedVec<PendingExtendedStatisticsDataSlot>,
+}
+
+struct ExtendedStatisticsIter<'a> {
+    catalog: &'a std::sync::Mutex<ExtendedStatisticsCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for ExtendedStatisticsIter<'_> {
+    type Item = (usize, ExtendedStatisticsDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.definitions.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
 }
 
 struct TriggerIter<'a> {
@@ -12798,8 +12844,7 @@ pub struct Storage {
     policy_roles_per_image: usize,
     policy_role_pending_base: usize,
     policy_role_replay_image: usize,
-    extended_statistics: FixedVec<ExtendedStatisticsDef>,
-    pending_extended_statistics_data: FixedVec<PendingExtendedStatisticsDataSlot>,
+    extended_statistics_catalog: std::sync::Mutex<ExtendedStatisticsCatalog>,
     publications: FixedVec<PublicationDef>,
     replication_slots: FixedVec<ReplicationSlotDef>,
     subscriptions: FixedVec<SubscriptionDef>,
@@ -15178,6 +15223,20 @@ impl Storage {
     }
 
     pub(crate) fn access_object_is_temporary(&self, object: AccessObject, txid: u32) -> bool {
+        if object.class == AccessClass::Statistics {
+            let statistics = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned")
+                .definitions
+                .get(object.slot as usize)
+                .copied();
+            return statistics.is_some_and(|statistics| {
+                self.table_def(usize::from(statistics.table), txid)
+                    .persistence
+                    == RelationPersistence::Temporary
+            });
+        }
         match object.class {
             AccessClass::Table => {
                 self.table_def(object.slot as usize, txid).persistence
@@ -15206,14 +15265,6 @@ impl Storage {
                 .views
                 .get(object.slot as usize)
                 .is_some_and(|view| view.persistence == RelationPersistence::Temporary),
-            AccessClass::Statistics => self
-                .extended_statistics
-                .get(object.slot as usize)
-                .is_some_and(|statistics| {
-                    self.table_def(usize::from(statistics.table), txid)
-                        .persistence
-                        == RelationPersistence::Temporary
-                }),
             AccessClass::Trigger => {
                 let trigger = self.trigger(object.slot as usize);
                 match trigger.target {
@@ -17428,8 +17479,10 @@ impl Storage {
             policy_roles_per_image,
             policy_role_pending_base,
             policy_role_replay_image,
-            extended_statistics,
-            pending_extended_statistics_data,
+            extended_statistics_catalog: std::sync::Mutex::new(ExtendedStatisticsCatalog {
+                definitions: extended_statistics,
+                pending_data: pending_extended_statistics_data,
+            }),
             publications,
             replication_slots,
             subscriptions,
@@ -19348,8 +19401,9 @@ impl Storage {
                 trigger_catalog.definitions[target_slot] = definition;
             }
 
-            for source_slot in 0..self.extended_statistics.len() {
-                let mut definition = self.extended_statistics[source_slot];
+            let extended_statistics_capacity = self.extended_statistics_count();
+            for source_slot in 0..extended_statistics_capacity {
+                let mut definition = self.extended_statistics(source_slot);
                 if definition.database != source
                     || definition.ddl_state != CatalogDdlState::Present
                     || self.tables[usize::from(definition.table)].def.persistence
@@ -19370,8 +19424,12 @@ impl Storage {
                             "template statistics table was not cloned"
                         )
                     })? as u16;
-                let target_slot = self
-                    .extended_statistics
+                let mut statistics_catalog = self
+                    .extended_statistics_catalog
+                    .lock()
+                    .expect("extended-statistics catalog lock poisoned");
+                let target_slot = statistics_catalog
+                    .definitions
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                     .ok_or_else(|| {
@@ -19387,7 +19445,7 @@ impl Storage {
                 definition.pending_data_tail = None;
                 definition.pending_data_txid = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.extended_statistics[target_slot] = definition;
+                statistics_catalog.definitions[target_slot] = definition;
             }
 
             for source_slot in 0..self.publications.len() {
@@ -19751,7 +19809,8 @@ impl Storage {
                 AccessClass::Routine => self.routine(usize::from(entry.object.slot)).database,
                 AccessClass::Composite => self.composite(usize::from(entry.object.slot)).database,
                 AccessClass::Statistics => {
-                    self.extended_statistics[usize::from(entry.object.slot)].database
+                    self.extended_statistics(usize::from(entry.object.slot))
+                        .database
                 }
                 AccessClass::Extension => self.extensions[usize::from(entry.object.slot)].database,
                 AccessClass::Trigger => self.trigger(usize::from(entry.object.slot)).database,
@@ -19892,13 +19951,24 @@ impl Storage {
         clear_catalog!(views);
         clear_catalog!(rules);
         clear_catalog!(policies);
-        clear_catalog!(extended_statistics);
         clear_catalog!(publications);
         clear_catalog!(subscriptions);
         clear_catalog!(matviews);
         clear_catalog!(sequences);
         clear_catalog!(indexes);
         clear_catalog!(extensions);
+        {
+            let mut catalog = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            for slot in 0..catalog.definitions.len() {
+                if catalog.definitions[slot].database == database {
+                    Self::clear_pending_extended_statistics_data(&mut catalog, slot);
+                    catalog.definitions[slot] = ExtendedStatisticsDef::EMPTY;
+                }
+            }
+        }
         {
             let mut catalog = self
                 .trigger_catalog
@@ -20133,13 +20203,25 @@ impl Storage {
         commit_catalog!(views);
         commit_catalog!(rules);
         commit_catalog!(policies);
-        commit_catalog!(extended_statistics);
         commit_catalog!(publications);
         commit_catalog!(subscriptions);
         commit_catalog!(matviews);
         commit_catalog!(sequences);
         commit_catalog!(indexes);
         commit_catalog!(extensions);
+        {
+            let mut catalog = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            for definition in catalog.definitions.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         {
             let mut catalog = self
                 .trigger_catalog
@@ -20488,7 +20570,7 @@ impl Storage {
             AccessClass::Routine => self.routine(slot).ownership,
             AccessClass::Composite => self.composite(slot).ownership,
             AccessClass::Tablespace => self.tablespaces[slot].ownership,
-            AccessClass::Statistics => self.extended_statistics[slot].ownership,
+            AccessClass::Statistics => self.extended_statistics(slot).ownership,
             AccessClass::Extension => self.extensions[slot].ownership,
             AccessClass::Trigger => match self.trigger(slot).target {
                 TriggerTarget::Table(table) => self.tables[usize::from(table)].ownership,
@@ -20523,7 +20605,9 @@ impl Storage {
                 unreachable!("routine ownership is synchronized separately")
             }
             AccessClass::Tablespace => &mut self.tablespaces[slot].ownership,
-            AccessClass::Statistics => &mut self.extended_statistics[slot].ownership,
+            AccessClass::Statistics => {
+                unreachable!("extended-statistics ownership is synchronized separately")
+            }
             AccessClass::Extension => &mut self.extensions[slot].ownership,
             AccessClass::Trigger => {
                 unreachable!("triggers inherit relation ownership and cannot be reassigned")
@@ -20571,6 +20655,12 @@ impl Storage {
             return self
                 .event_trigger(usize::from(object.slot))
                 .definition_for(txid)
+                .ownership
+                .owner_to(txid) as usize;
+        }
+        if object.class == AccessClass::Statistics {
+            return self
+                .extended_statistics(usize::from(object.slot))
                 .ownership
                 .owner_to(txid) as usize;
         }
@@ -20963,7 +21053,7 @@ impl Storage {
             }
             AccessClass::Tablespace => (SqlName::EMPTY, self.tablespaces[slot].name_for(txid)),
             AccessClass::Statistics => {
-                let definition = self.extended_statistics[slot].definition_for(txid);
+                let definition = self.extended_statistics(slot).definition_for(txid);
                 (definition.schema, definition.name)
             }
             AccessClass::Extension => (SqlName::EMPTY, self.extensions[slot].name),
@@ -21026,7 +21116,7 @@ impl Storage {
             AccessClass::Composite => self.composite(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Tablespace => self.tablespaces[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Statistics => {
-                self.extended_statistics[slot].ddl_state == CatalogDdlState::Present
+                self.extended_statistics(slot).ddl_state == CatalogDdlState::Present
             }
             AccessClass::Extension => self.extensions[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Trigger => self.trigger(slot).ddl_state == CatalogDdlState::Present,
@@ -21066,7 +21156,7 @@ impl Storage {
             AccessClass::Routine => self.routine(slot).visible_to(txid),
             AccessClass::Composite => self.composite(slot).visible_to(txid),
             AccessClass::Tablespace => self.tablespaces[slot].visible_to(txid),
-            AccessClass::Statistics => self.extended_statistics[slot].visible_to(txid),
+            AccessClass::Statistics => self.extended_statistics(slot).visible_to(txid),
             AccessClass::Extension => self.extensions[slot].visible_to(txid),
             AccessClass::Trigger => self.trigger(slot).visible_to(txid),
             AccessClass::EventTrigger => self.event_trigger(slot).visible_to(txid),
@@ -21098,7 +21188,7 @@ impl Storage {
             AccessClass::Index => Some(self.indexes[slot].database),
             AccessClass::Routine => Some(self.routine(slot).database),
             AccessClass::Composite => Some(self.composite(slot).database),
-            AccessClass::Statistics => Some(self.extended_statistics[slot].database),
+            AccessClass::Statistics => Some(self.extended_statistics(slot).database),
             AccessClass::Extension => Some(self.extensions[slot].database),
             AccessClass::Trigger => Some(self.trigger(slot).database),
             AccessClass::EventTrigger => Some(self.event_trigger(slot).database),
@@ -21203,9 +21293,14 @@ impl Storage {
                 })?
             }
             AccessClass::Statistics => {
-                let created_at = self.extended_statistics[source_slot].created_at;
-                self.extended_statistics.iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
+                let created_at = self.extended_statistics(source_slot).created_at;
+                ExtendedStatisticsIter {
+                    catalog: &self.extended_statistics_catalog,
+                    next_slot: 0,
+                }
+                .find_map(|(slot, candidate)| {
+                    (candidate.database == target_database && candidate.created_at == created_at)
+                        .then_some(slot)
                 })?
             }
             AccessClass::Extension => {
@@ -21482,15 +21577,16 @@ impl Storage {
 
     pub(crate) fn checkpoint_extended_statistics(
         &self,
-    ) -> impl Iterator<Item = (usize, &ExtendedStatisticsDef)> {
-        self.extended_statistics
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| {
-                value.ddl_state == CatalogDdlState::Present
-                    && self.table_def(usize::from(value.table), 0).persistence
-                        != RelationPersistence::Temporary
-            })
+    ) -> impl Iterator<Item = (usize, ExtendedStatisticsDef)> + '_ {
+        ExtendedStatisticsIter {
+            catalog: &self.extended_statistics_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| {
+            value.ddl_state == CatalogDdlState::Present
+                && self.table_def(usize::from(value.table), 0).persistence
+                    != RelationPersistence::Temporary
+        })
     }
 
     pub(crate) fn checkpoint_policies(&self) -> impl Iterator<Item = (usize, &PolicyDef)> {
@@ -21587,7 +21683,7 @@ impl Storage {
             AccessClass::Routine => self.routine_count(),
             AccessClass::Composite => self.composite_count(),
             AccessClass::Tablespace => self.tablespaces.len(),
-            AccessClass::Statistics => self.extended_statistics.len(),
+            AccessClass::Statistics => self.extended_statistics_count(),
             AccessClass::Extension => self.extensions.len(),
             AccessClass::Trigger => self.trigger_capacity(),
             AccessClass::EventTrigger => self.event_trigger_capacity(),
@@ -21647,7 +21743,7 @@ impl Storage {
             (AccessClass::Routine, self.routine_count()),
             (AccessClass::Composite, self.composite_count()),
             (AccessClass::Tablespace, self.tablespaces.len()),
-            (AccessClass::Statistics, self.extended_statistics.len()),
+            (AccessClass::Statistics, self.extended_statistics_count()),
             (AccessClass::Extension, self.extensions.len()),
             (AccessClass::EventTrigger, self.event_trigger_capacity()),
             (
@@ -21797,6 +21893,24 @@ impl Storage {
             }
             return prior;
         }
+        if object.class == AccessClass::Statistics {
+            let mut catalog = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            let ownership = &mut catalog.definitions[usize::from(object.slot)].ownership;
+            let prior = ownership.pending;
+            if txid == 0 {
+                ownership.owner = owner as u16;
+                ownership.pending = None;
+            } else {
+                ownership.pending = Some(PendingOwnership {
+                    txid,
+                    owner: owner as u16,
+                });
+            }
+            return prior;
+        }
         if matches!(
             object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
@@ -21889,6 +22003,20 @@ impl Storage {
             }
             return;
         }
+        if object.class == AccessClass::Statistics {
+            let mut catalog = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            let ownership = &mut catalog.definitions[usize::from(object.slot)].ownership;
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            return;
+        }
         if matches!(
             object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
@@ -21953,6 +22081,15 @@ impl Storage {
             if let Some(definition) = &mut trigger.pending {
                 definition.definition.ownership.pending = prior;
             }
+            return;
+        }
+        if object.class == AccessClass::Statistics {
+            self.extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned")
+                .definitions[usize::from(object.slot)]
+            .ownership
+            .pending = prior;
             return;
         }
         if matches!(
@@ -25522,13 +25659,19 @@ impl Storage {
             }
         }
         drop(operator_catalog);
-        for definition in self.extended_statistics.iter_mut().filter(|definition| {
-            definition.database == current_database()
-                && definition.ddl_state != CatalogDdlState::Absent
-        }) {
-            rename_schema_name(&mut definition.mutable.schema, prior, name);
-            if let Some(pending) = &mut definition.pending_definition {
-                rename_schema_name(&mut pending.definition.schema, prior, name);
+        {
+            let mut catalog = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            for definition in catalog.definitions.iter_mut().filter(|definition| {
+                definition.database == current_database()
+                    && definition.ddl_state != CatalogDdlState::Absent
+            }) {
+                rename_schema_name(&mut definition.mutable.schema, prior, name);
+                if let Some(pending) = &mut definition.pending_definition {
+                    rename_schema_name(&mut pending.definition.schema, prior, name);
+                }
             }
         }
 
@@ -42088,30 +42231,38 @@ impl Storage {
     }
 
     pub(crate) fn extended_statistics_count(&self) -> usize {
-        self.extended_statistics.len()
+        self.extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned")
+            .definitions
+            .len()
     }
 
-    pub(crate) fn extended_statistics(&self, slot: usize) -> &ExtendedStatisticsDef {
-        &self.extended_statistics[slot]
+    pub(crate) fn extended_statistics(&self, slot: usize) -> ExtendedStatisticsDef {
+        self.extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned")
+            .definitions[slot]
     }
 
     pub(crate) fn extended_statistics_visible(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &ExtendedStatisticsDef)> {
-        self.extended_statistics
-            .iter()
-            .enumerate()
-            .filter(move |(_, statistics)| {
-                statistics.database == current_database() && statistics.visible_to(txid)
-            })
+    ) -> impl Iterator<Item = (usize, ExtendedStatisticsDef)> + '_ {
+        ExtendedStatisticsIter {
+            catalog: &self.extended_statistics_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, statistics)| {
+            statistics.database == current_database() && statistics.visible_to(txid)
+        })
     }
 
     pub(crate) fn extended_statistics_for_table(
         &self,
         table: usize,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &ExtendedStatisticsDef)> {
+    ) -> impl Iterator<Item = (usize, ExtendedStatisticsDef)> + '_ {
         self.extended_statistics_visible(txid)
             .filter(move |(_, statistics)| usize::from(statistics.table) == table)
     }
@@ -42122,13 +42273,18 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Option<usize> {
-        self.extended_statistics.iter().position(|statistics| {
-            let definition = statistics.definition_for(txid);
-            statistics.database == current_database()
-                && statistics.visible_to(txid)
-                && definition.schema.as_str() == schema
-                && definition.name.as_str() == name
-        })
+        self.extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned")
+            .definitions
+            .iter()
+            .position(|statistics| {
+                let definition = statistics.definition_for(txid);
+                statistics.database == current_database()
+                    && statistics.visible_to(txid)
+                    && definition.schema.as_str() == schema
+                    && definition.name.as_str() == name
+            })
     }
 
     pub(crate) fn extended_statistics_slot_on_path(
@@ -42148,6 +42304,26 @@ impl Storage {
             ),
             PathEntry::Catalog => None,
         })
+    }
+
+    pub(crate) fn require_extended_statistics_mutation(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        let statistics = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned")
+            .definitions[slot];
+        let Some(blocker) = statistics.pending_owner_other_than(txid) else {
+            return Ok(());
+        };
+        Err(self.catalog_ddl_wait_error(
+            txid,
+            blocker,
+            statistics.definition_for(txid).name.as_str(),
+        ))
     }
 
     pub(crate) fn create_extended_statistics(
@@ -42170,33 +42346,42 @@ impl Storage {
                 "invalid extended statistics key count"
             ));
         }
-        if let Some(blocker) = self.extended_statistics.iter().find_map(|statistics| {
-            let definition = statistics.definition_for(txid);
-            (definition.schema == spec.schema && definition.name == spec.name)
-                .then_some(statistics.ddl_state.pending_txid()?)
-                .filter(|owner| *owner != txid)
+        let ownership = self.initial_ownership(txid);
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        if let Some(blocker) = catalog.definitions.iter().find_map(|statistics| {
+            (statistics.database == current_database()
+                && statistics.identity_matches(spec.schema, spec.name))
+            .then(|| statistics.pending_owner_other_than(txid))
+            .flatten()
         }) {
+            drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, blocker, spec.name.as_str()));
         }
-        if self
-            .extended_statistics_slot(spec.schema.as_str(), spec.name.as_str(), txid)
-            .is_some()
-        {
+        if catalog.definitions.iter().any(|statistics| {
+            let definition = statistics.definition_for(txid);
+            statistics.database == current_database()
+                && statistics.visible_to(txid)
+                && definition.schema == spec.schema
+                && definition.name == spec.name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "statistics object \"{}\" already exists",
                 spec.name.as_str()
             ));
         }
-        let Some(slot) = self
-            .extended_statistics
+        let Some(slot) = catalog
+            .definitions
             .iter()
             .position(|statistics| statistics.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many statistics objects (limit {})",
-                self.extended_statistics.len()
+                catalog.definitions.len()
             ));
         };
         let created_at = if spec.created_at == 0 {
@@ -42205,7 +42390,7 @@ impl Storage {
             self.catalog_sequence.observe(spec.created_at);
             spec.created_at
         };
-        self.extended_statistics[slot] = ExtendedStatisticsDef {
+        catalog.definitions[slot] = ExtendedStatisticsDef {
             database: current_database(),
             created_at,
             table: spec.table,
@@ -42216,7 +42401,7 @@ impl Storage {
             },
             pending_definition: None,
             pending_keys: None,
-            ownership: self.initial_ownership(txid),
+            ownership,
             keys: spec.keys,
             n_keys: spec.n_keys,
             kinds: spec.kinds,
@@ -42235,11 +42420,43 @@ impl Storage {
         definition: ExtendedStatisticsMutableDefinition,
         txid: u32,
     ) -> Result<Option<PendingExtendedStatisticsDefinition>, SqlError> {
-        if let Some(other) = self.extended_statistics_slot(
-            definition.schema.as_str(),
-            definition.name.as_str(),
-            txid,
-        ) && other != slot
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        let statistics = catalog.definitions[slot];
+        let target_blocker = statistics.pending_owner_other_than(txid);
+        let name_blocker = catalog
+            .definitions
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot
+                    && candidate.database == current_database()
+                    && candidate.identity_matches(definition.schema, definition.name))
+                .then(|| candidate.pending_owner_other_than(txid))
+                .flatten()
+            });
+        if let Some(blocker) = target_blocker.or(name_blocker) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                blocker,
+                statistics.definition_for(txid).name.as_str(),
+            ));
+        }
+        if catalog
+            .definitions
+            .iter()
+            .enumerate()
+            .any(|(other, candidate)| {
+                let candidate_definition = candidate.definition_for(txid);
+                other != slot
+                    && candidate.database == current_database()
+                    && candidate.visible_to(txid)
+                    && candidate_definition.schema == definition.schema
+                    && candidate_definition.name == definition.name
+            })
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -42247,16 +42464,7 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        let statistics = &mut self.extended_statistics[slot];
-        if let Some(pending) = statistics.pending_definition
-            && pending.txid != txid
-        {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "statistics object \"{}\" is being altered by another transaction",
-                statistics.mutable.name.as_str()
-            ));
-        }
+        let statistics = &mut catalog.definitions[slot];
         let prior = statistics.pending_definition;
         statistics.pending_definition =
             Some(PendingExtendedStatisticsDefinition { txid, definition });
@@ -42269,35 +42477,49 @@ impl Storage {
         keys: [ExtendedStatisticsKey; MAX_EXTENDED_STATISTICS_KEYS],
         txid: u32,
     ) -> Result<Option<PendingExtendedStatisticsKeys>, SqlError> {
-        let statistics = &mut self.extended_statistics[slot];
-        if let Some(pending) = statistics.pending_keys
-            && pending.txid != txid
-        {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "statistics object \"{}\" is being altered by another transaction",
-                statistics.mutable.name.as_str()
-            ));
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        let blocker = catalog.definitions[slot].pending_owner_other_than(txid);
+        if let Some(blocker) = blocker {
+            let name = catalog.definitions[slot].definition_for(txid).name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
+        let statistics = &mut catalog.definitions[slot];
         let prior = statistics.pending_keys;
         statistics.pending_keys = Some(PendingExtendedStatisticsKeys { txid, keys });
         Ok(prior)
     }
 
     pub(crate) fn commit_extended_statistics_create(&mut self, slot: usize) {
-        self.extended_statistics[slot].ddl_state =
-            self.extended_statistics[slot].ddl_state.commit_create();
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_create();
     }
 
     pub(crate) fn rollback_extended_statistics_create(&mut self, slot: usize) {
-        self.clear_pending_extended_statistics_data(slot);
-        self.extended_statistics[slot].pending_keys = None;
-        self.extended_statistics[slot].ddl_state =
-            self.extended_statistics[slot].ddl_state.rollback_create();
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        Self::clear_pending_extended_statistics_data(&mut catalog, slot);
+        catalog.definitions[slot].pending_keys = None;
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.rollback_create();
+        if catalog.definitions[slot].ddl_state == CatalogDdlState::Absent {
+            catalog.definitions[slot] = ExtendedStatisticsDef::EMPTY;
+        }
     }
 
     pub(crate) fn commit_extended_statistics_alter(&mut self, slot: usize, txid: u32) {
-        let statistics = &mut self.extended_statistics[slot];
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        let statistics = &mut catalog.definitions[slot];
         if let Some(pending) = statistics.pending_definition
             && pending.txid == txid
         {
@@ -42317,7 +42539,11 @@ impl Storage {
         slot: usize,
         prior: Option<PendingExtendedStatisticsDefinition>,
     ) {
-        self.extended_statistics[slot].pending_definition = prior;
+        self.extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned")
+            .definitions[slot]
+            .pending_definition = prior;
     }
 
     pub(crate) fn rollback_extended_statistics_keys(
@@ -42325,38 +42551,65 @@ impl Storage {
         slot: usize,
         prior: Option<PendingExtendedStatisticsKeys>,
     ) {
-        self.extended_statistics[slot].pending_keys = prior;
+        self.extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned")
+            .definitions[slot]
+            .pending_keys = prior;
     }
 
-    pub(crate) fn drop_extended_statistics(&mut self, slot: usize, txid: u32) {
-        self.extended_statistics[slot].ddl_state =
-            self.extended_statistics[slot].ddl_state.drop_by(txid);
+    pub(crate) fn drop_extended_statistics(
+        &mut self,
+        slot: usize,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        let statistics = catalog.definitions[slot];
+        let blocker = statistics.pending_owner_other_than(txid);
+        if let Some(blocker) = blocker {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                blocker,
+                statistics.definition_for(txid).name.as_str(),
+            ));
+        }
+        catalog.definitions[slot].ddl_state = statistics.ddl_state.drop_by(txid);
+        Ok(())
     }
 
     pub(crate) fn commit_extended_statistics_drop(&mut self, slot: usize) {
         assert!(matches!(
-            self.extended_statistics[slot].ddl_state,
+            self.extended_statistics(slot).ddl_state,
             CatalogDdlState::PendingDrop { .. }
         ));
         self.retire_extended_statistics(slot);
     }
 
     fn retire_extended_statistics(&mut self, slot: usize) {
+        {
+            let mut catalog = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            Self::clear_pending_extended_statistics_data(&mut catalog, slot);
+            catalog.definitions[slot] = ExtendedStatisticsDef::EMPTY;
+        }
         self.drop_comments_by_subid(CommentClass::Statistics, slot as u32);
-        self.clear_pending_extended_statistics_data(slot);
-        self.extended_statistics[slot].data = ExtendedStatisticsData::EMPTY;
-        self.extended_statistics[slot].pending_definition = None;
-        self.extended_statistics[slot].pending_keys = None;
-        self.extended_statistics[slot].ddl_state = CatalogDdlState::Absent;
     }
 
     fn commit_extended_statistics_for_table(&mut self, table: usize) {
-        for slot in 0..self.extended_statistics.len() {
+        let capacity = self.extended_statistics_count();
+        for slot in 0..capacity {
             // A PendingDrop has its own DdlUndo entry and must be promoted by
             // that entry. This path owns only unstaged internal dependents,
             // such as statistics swept up by direct journal replay.
-            if self.extended_statistics[slot].ddl_state == CatalogDdlState::Present
-                && usize::from(self.extended_statistics[slot].table) == table
+            let statistics = self.extended_statistics(slot);
+            if statistics.ddl_state == CatalogDdlState::Present
+                && usize::from(statistics.table) == table
             {
                 self.retire_extended_statistics(slot);
             }
@@ -42364,8 +42617,12 @@ impl Storage {
     }
 
     pub(crate) fn rollback_extended_statistics_drop(&mut self, slot: usize, txid: u32) {
-        self.extended_statistics[slot].ddl_state =
-            self.extended_statistics[slot].ddl_state.rollback_drop(txid);
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        catalog.definitions[slot].ddl_state =
+            catalog.definitions[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn extended_statistics_data(
@@ -42373,11 +42630,15 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> ExtendedStatisticsData {
-        let statistics = &self.extended_statistics[slot];
+        let catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        let statistics = &catalog.definitions[slot];
         if statistics.pending_data_txid == Some(txid)
             && let Some(pending) = statistics.pending_data_tail
         {
-            return self.pending_extended_statistics_data[pending as usize].data;
+            return catalog.pending_data[pending as usize].data;
         }
         statistics.data
     }
@@ -42387,8 +42648,18 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> Option<ExtendedStatisticsData> {
-        (self.extended_statistics[slot].pending_data_txid == Some(txid))
-            .then(|| self.extended_statistics_data(slot, txid))
+        let catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        let statistics = &catalog.definitions[slot];
+        (statistics.pending_data_txid == Some(txid)).then(|| {
+            statistics
+                .pending_data_tail
+                .map_or(statistics.data, |pending| {
+                    catalog.pending_data[pending as usize].data
+                })
+        })
     }
 
     pub(crate) fn write_extended_statistics_data(
@@ -42397,10 +42668,12 @@ impl Storage {
         txid: u32,
         data: ExtendedStatisticsData,
     ) -> Result<(), SqlError> {
-        let statistics = &self.extended_statistics[slot];
-        if let Some(owner) = statistics.pending_data_txid
-            && owner != txid
-        {
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        let statistics = catalog.definitions[slot];
+        if statistics.pending_owner_other_than(txid).is_some() {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "could not serialize ANALYZE of statistics object \"{}\"",
@@ -42409,8 +42682,7 @@ impl Storage {
         }
         let previous = statistics.pending_data_tail;
         if previous.is_some_and(|pending| {
-            self.pending_extended_statistics_data[pending as usize].depth
-                >= self.max_catalog_versions_per_object
+            catalog.pending_data[pending as usize].depth >= self.max_catalog_versions_per_object
         }) {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -42420,26 +42692,22 @@ impl Storage {
             ));
         }
         let depth = previous.map_or(1, |pending| {
-            self.pending_extended_statistics_data[pending as usize].depth + 1
+            catalog.pending_data[pending as usize].depth + 1
         });
-        let pending = match self
-            .pending_extended_statistics_data
-            .iter()
-            .position(|entry| !entry.used)
-        {
+        let pending = match catalog.pending_data.iter().position(|entry| !entry.used) {
             Some(pending) => {
-                self.pending_extended_statistics_data[pending] =
-                    PendingExtendedStatisticsDataSlot {
-                        used: true,
-                        previous,
-                        depth,
-                        data,
-                    };
+                catalog.pending_data[pending] = PendingExtendedStatisticsDataSlot {
+                    used: true,
+                    previous,
+                    depth,
+                    data,
+                };
                 pending
             }
             None => {
-                let pending = self.pending_extended_statistics_data.len();
-                self.pending_extended_statistics_data
+                let pending = catalog.pending_data.len();
+                catalog
+                    .pending_data
                     .push(PendingExtendedStatisticsDataSlot {
                         used: true,
                         previous,
@@ -42455,46 +42723,61 @@ impl Storage {
                 pending
             }
         };
-        let statistics = &mut self.extended_statistics[slot];
+        let statistics = &mut catalog.definitions[slot];
         statistics.pending_data_tail = Some(pending as u32);
         statistics.pending_data_txid = Some(txid);
         Ok(())
     }
 
     pub(crate) fn rollback_extended_statistics_data(&mut self, slot: usize, txid: u32) {
-        let statistics = &mut self.extended_statistics[slot];
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        let statistics = catalog.definitions[slot];
         if statistics.pending_data_txid != Some(txid) {
             return;
         }
         let Some(pending) = statistics.pending_data_tail else {
             return;
         };
-        let previous = self.pending_extended_statistics_data[pending as usize].previous;
-        self.pending_extended_statistics_data[pending as usize].used = false;
+        let previous = catalog.pending_data[pending as usize].previous;
+        catalog.pending_data[pending as usize].used = false;
+        let statistics = &mut catalog.definitions[slot];
         statistics.pending_data_tail = previous;
         if previous.is_none() {
             statistics.pending_data_txid = None;
         }
     }
 
-    fn clear_pending_extended_statistics_data(&mut self, slot: usize) {
-        let statistics = &mut self.extended_statistics[slot];
-        let mut tail = statistics.pending_data_tail.take();
+    fn clear_pending_extended_statistics_data(
+        catalog: &mut ExtendedStatisticsCatalog,
+        slot: usize,
+    ) {
+        let mut tail = catalog.definitions[slot].pending_data_tail.take();
         while let Some(pending) = tail {
-            let entry = &mut self.pending_extended_statistics_data[pending as usize];
+            let entry = &mut catalog.pending_data[pending as usize];
             tail = entry.previous;
             entry.used = false;
         }
-        statistics.pending_data_txid = None;
+        catalog.definitions[slot].pending_data_txid = None;
     }
 
     pub(crate) fn commit_extended_statistics_data(&mut self, slot: usize, txid: u32) {
-        let data = self.extended_statistics_data(slot, txid);
-        if self.extended_statistics[slot].pending_data_txid != Some(txid) {
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        if catalog.definitions[slot].pending_data_txid != Some(txid) {
             return;
         }
-        self.extended_statistics[slot].data = data;
-        self.clear_pending_extended_statistics_data(slot);
+        let data = catalog.definitions[slot]
+            .pending_data_tail
+            .map_or(catalog.definitions[slot].data, |pending| {
+                catalog.pending_data[pending as usize].data
+            });
+        catalog.definitions[slot].data = data;
+        Self::clear_pending_extended_statistics_data(&mut catalog, slot);
     }
 
     pub(crate) fn install_extended_statistics_data(
@@ -42502,50 +42785,61 @@ impl Storage {
         slot: usize,
         data: ExtendedStatisticsData,
     ) {
-        self.clear_pending_extended_statistics_data(slot);
-        self.extended_statistics[slot].data = data;
+        let mut catalog = self
+            .extended_statistics_catalog
+            .lock()
+            .expect("extended-statistics catalog lock poisoned");
+        Self::clear_pending_extended_statistics_data(&mut catalog, slot);
+        catalog.definitions[slot].data = data;
     }
 
     pub(crate) fn replay_extended_statistics(
         &mut self,
         spec: ExtendedStatisticsSpec,
     ) -> Result<usize, SqlError> {
-        if let Some(slot) = self.extended_statistics.iter().position(|statistics| {
-            statistics.ddl_state != CatalogDdlState::Absent
-                && statistics.created_at == spec.created_at
-        }) {
-            if self
-                .extended_statistics
-                .iter()
-                .enumerate()
-                .any(|(other, statistics)| {
-                    other != slot
-                        && statistics.ddl_state != CatalogDdlState::Absent
-                        && statistics.mutable.schema == spec.schema
-                        && statistics.mutable.name == spec.name
-                })
-            {
-                return Err(sql_err!(
-                    sqlstate::DUPLICATE_OBJECT,
-                    "journal replays duplicate statistics object \"{}\"",
-                    spec.name.as_str()
-                ));
+        {
+            let mut catalog = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            if let Some(slot) = catalog.definitions.iter().position(|statistics| {
+                statistics.ddl_state != CatalogDdlState::Absent
+                    && statistics.created_at == spec.created_at
+            }) {
+                if catalog
+                    .definitions
+                    .iter()
+                    .enumerate()
+                    .any(|(other, statistics)| {
+                        other != slot
+                            && statistics.ddl_state != CatalogDdlState::Absent
+                            && statistics.mutable.schema == spec.schema
+                            && statistics.mutable.name == spec.name
+                    })
+                {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "journal replays duplicate statistics object \"{}\"",
+                        spec.name.as_str()
+                    ));
+                }
+                Self::clear_pending_extended_statistics_data(&mut catalog, slot);
+                let statistics = &mut catalog.definitions[slot];
+                statistics.table = spec.table;
+                statistics.mutable = ExtendedStatisticsMutableDefinition {
+                    schema: spec.schema,
+                    name: spec.name,
+                    target: spec.target,
+                };
+                statistics.pending_definition = None;
+                statistics.pending_keys = None;
+                statistics.keys = spec.keys;
+                statistics.n_keys = spec.n_keys;
+                statistics.kinds = spec.kinds;
+                statistics.expression_only = spec.expression_only;
+                statistics.ddl_state = CatalogDdlState::Present;
+                return Ok(slot);
             }
-            let statistics = &mut self.extended_statistics[slot];
-            statistics.table = spec.table;
-            statistics.mutable = ExtendedStatisticsMutableDefinition {
-                schema: spec.schema,
-                name: spec.name,
-                target: spec.target,
-            };
-            statistics.pending_definition = None;
-            statistics.pending_keys = None;
-            statistics.keys = spec.keys;
-            statistics.n_keys = spec.n_keys;
-            statistics.kinds = spec.kinds;
-            statistics.expression_only = spec.expression_only;
-            statistics.ddl_state = CatalogDdlState::Present;
-            return Ok(slot);
         }
         let slot = self.create_extended_statistics(spec, 0)?;
         self.commit_extended_statistics_create(slot);
@@ -42564,7 +42858,7 @@ impl Storage {
                 name
             ));
         };
-        self.drop_extended_statistics(slot, 0);
+        self.drop_extended_statistics(slot, 0)?;
         self.commit_extended_statistics_drop(slot);
         Ok(())
     }
@@ -49705,7 +49999,7 @@ mod tests {
         assert_eq!(catalog.defaults.capacity(), 24);
         assert_eq!(catalog.parameters.capacity(), 25);
         assert_eq!(storage.indexes.len(), 6);
-        assert_eq!(storage.extended_statistics.len(), 31);
+        assert_eq!(storage.extended_statistics_count(), 31);
         let brin_maintenance = storage.brin_maintenance();
         assert_eq!(brin_maintenance.states.len(), 6);
         assert_eq!(brin_maintenance.unsummarized_ranges.len(), 6 * 70);
@@ -49770,7 +50064,12 @@ mod tests {
         drop(text_catalog);
         assert_eq!(storage.event_trigger_capacity(), 14);
         assert_eq!(
-            storage.pending_extended_statistics_data.capacity(),
+            storage
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned")
+                .pending_data
+                .capacity(),
             pending_extended_statistics_capacity(&config)
         );
         assert_eq!(storage.tablespaces.len(), 15);
@@ -50800,6 +51099,165 @@ mod tests {
         assert_eq!(storage.trigger(0).created_at, 0);
         assert_eq!(storage.trigger(0).ddl_state, CatalogDdlState::Absent);
         assert_eq!(storage.partition_trigger_states().count(), WORKERS - 1);
+    }
+
+    #[test]
+    fn extended_statistics_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<ExtendedStatisticsCatalog>>();
+        assert_send_sync::<ExtendedStatisticsIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_connections = WORKERS as u32;
+        config.set_extended_statistics_capacity(WORKERS);
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "statistics_table",
+                &[("value", ColType::Int4, false)],
+            ))
+            .unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let name = stack_format!(63, "statistics_{worker}");
+                    let mut catalog = storage
+                        .extended_statistics_catalog
+                        .lock()
+                        .expect("extended-statistics catalog lock poisoned");
+                    let pending = catalog.pending_data.len();
+                    catalog
+                        .pending_data
+                        .push(PendingExtendedStatisticsDataSlot {
+                            used: true,
+                            previous: None,
+                            depth: 1,
+                            data: ExtendedStatisticsData {
+                                valid: true,
+                                rows: worker as u64 + 1,
+                                ..ExtendedStatisticsData::EMPTY
+                            },
+                        })
+                        .unwrap();
+                    catalog.definitions[worker] = ExtendedStatisticsDef {
+                        database: DatabaseOid::POSTGRES,
+                        created_at: worker as u64 + 1,
+                        table: table as u16,
+                        mutable: ExtendedStatisticsMutableDefinition {
+                            schema: SqlName::parse("public").unwrap(),
+                            name: SqlName::parse(name.as_str()).unwrap(),
+                            target: None,
+                        },
+                        ownership: Ownership::BOOTSTRAP,
+                        keys: [ExtendedStatisticsKey::Column(SqlName::parse("value").unwrap());
+                            MAX_EXTENDED_STATISTICS_KEYS],
+                        n_keys: 1,
+                        kinds: crate::sql::ast::StatisticsKinds::ALL,
+                        pending_data_tail: Some(pending as u32),
+                        pending_data_txid: Some(100 + worker as u32),
+                        ddl_state: CatalogDdlState::Present,
+                        ..ExtendedStatisticsDef::EMPTY
+                    };
+                });
+            }
+        });
+
+        {
+            let catalog = storage
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            assert_eq!(catalog.definitions.capacity(), WORKERS);
+            assert_eq!(
+                catalog.pending_data.capacity(),
+                pending_extended_statistics_capacity(&config)
+            );
+        }
+        assert_eq!(storage.extended_statistics_visible(0).count(), WORKERS);
+        for (slot, definition) in storage.extended_statistics_visible(0) {
+            assert_eq!(
+                storage.extended_statistics(slot).created_at,
+                definition.created_at
+            );
+            assert_eq!(
+                storage
+                    .extended_statistics_data(slot, 100 + slot as u32)
+                    .rows,
+                slot as u64 + 1
+            );
+        }
+
+        let full = ExtendedStatisticsSpec {
+            created_at: 0,
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("statistics_full").unwrap(),
+            table: table as u16,
+            target: None,
+            keys: [ExtendedStatisticsKey::Column(SqlName::parse("value").unwrap());
+                MAX_EXTENDED_STATISTICS_KEYS],
+            n_keys: 1,
+            kinds: crate::sql::ast::StatisticsKinds::ALL,
+            expression_only: false,
+        };
+        assert!(storage.create_extended_statistics(full, 0).is_err());
+
+        for slot in 0..WORKERS {
+            storage.rollback_extended_statistics_data(slot, 100 + slot as u32);
+        }
+        let renamed = ExtendedStatisticsMutableDefinition {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("statistics_pending").unwrap(),
+            target: None,
+        };
+        let prior = storage.alter_extended_statistics(0, renamed, 9).unwrap();
+        assert!(storage.alter_extended_statistics(1, renamed, 10).is_err());
+        assert!(
+            storage
+                .write_extended_statistics_data(0, 10, ExtendedStatisticsData::EMPTY)
+                .is_err()
+        );
+        storage.rollback_extended_statistics_alter(0, prior);
+
+        {
+            let mut catalog = storage
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            catalog.definitions[0].ddl_state = CatalogDdlState::PendingCreate { txid: 9 };
+            let keys = catalog.definitions[0].keys;
+            catalog.definitions[0].pending_keys =
+                Some(PendingExtendedStatisticsKeys { txid: 9, keys });
+        }
+        storage
+            .write_extended_statistics_data(0, 9, ExtendedStatisticsData::EMPTY)
+            .unwrap();
+        storage.rollback_extended_statistics_create(0);
+        assert_eq!(storage.extended_statistics(0).created_at, 0);
+        assert_eq!(
+            storage.extended_statistics(0).ddl_state,
+            CatalogDdlState::Absent
+        );
+        assert!(
+            storage
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned")
+                .pending_data
+                .iter()
+                .all(|pending| !pending.used)
+        );
+
+        storage.drop_extended_statistics(1, 9).unwrap();
+        storage.commit_extended_statistics_drop(1);
+        assert_eq!(storage.extended_statistics(1).created_at, 0);
+        assert_eq!(
+            storage.extended_statistics(1).ddl_state,
+            CatalogDdlState::Absent
+        );
     }
 
     #[test]

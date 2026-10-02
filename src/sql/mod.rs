@@ -6053,9 +6053,17 @@ impl Engine {
                 DdlUndo::PolicyAltered { slot, .. } => {
                     self.storage.commit_policy_alter(*slot as usize, txn.txid)
                 }
-                DdlUndo::StatisticsCreated(slot) => self
-                    .storage
-                    .commit_extended_statistics_create(*slot as usize),
+                DdlUndo::StatisticsCreated(slot) => {
+                    self.storage
+                        .commit_extended_statistics_create(*slot as usize);
+                    self.storage.commit_object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Statistics,
+                            slot: *slot as u16,
+                        },
+                        txn.txid,
+                    );
+                }
                 DdlUndo::StatisticsDropped(slot) => {
                     self.storage.commit_extended_statistics_drop(*slot as usize)
                 }

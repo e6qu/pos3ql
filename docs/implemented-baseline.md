@@ -182,6 +182,13 @@ active production roadmap is [PLAN.md](../PLAN.md).
   nested relation, routine, comment, dependency, or dispatch lookup. Trigger
   removal retires inherited enablement in the same catalog transition, and
   conflicting DDL uses the common transaction wait boundary.
+  Extended statistics definitions, pending identity and key images, ownership,
+  committed analyzed data, and pending data versions share one startup-bounded
+  mutex; readers copy complete definitions before nested relation, role,
+  comment, or planner lookup. Conflicting DDL, ownership, and analysis changes
+  use the common transaction wait boundary or the existing serialization
+  error. Creation publishes initial ownership with existence, and removal
+  clears the complete reusable slot and pending data chain.
   Engine mutation remains single-owner and serialized while the other catalog
   definition containers, cache, and row sharing are prepared. Authorization
   graph traversal uses one exactly charged bitmap per query workspace,

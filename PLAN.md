@@ -183,7 +183,7 @@ corpus runs in six, and instrumented auxiliary phases have independent workers.
 Instrumented sqllogictest queries run in four slices. The 70,000-row cursor and
 1,100-call execution-width differential has its own corpus worker, and the
 remaining auxiliary differential phases have independent workers. The vendored
-PostgreSQL regression inputs run in two filename-grouped slices in both
+PostgreSQL regression inputs run in four filename-grouped slices in both
 instrumented and ordinary differential CI.
 
 Join range tables and accumulated `USING` merge state now use exact
@@ -521,6 +521,27 @@ wide expression analysis does not reacquire the mutex for every empty slot.
 The remaining catalog definition containers and row
 mutation paths still require synchronization before fixed workers can overlap
 execution.
+
+Event trigger definitions and their transaction-private replacement images now
+share one startup-bounded mutex. DDL publication and rollback, replay, database
+cloning and removal, ownership changes, checkpoint and catalog reads, routine
+dependency checks, and trigger dispatch observe complete definition images.
+Iterators copy one fixed definition and release the mutex before nested routine,
+role, comment, dependency, or execution lookup. Conflicting create, alter, and
+drop operations use the common transaction wait boundary. Four-worker
+publication, nested-reader progress, exact retained capacity, event-trigger
+exhaustion, and `Send + Sync` have direct coverage. Failed creation and
+committed removal clear the complete reusable slot. The remaining catalog
+definition containers and row mutation paths still require synchronization
+before fixed workers can overlap execution.
+
+Instrumented SQL differential coverage now divides the corpus into six
+deterministic slices after three and then four slices exhausted the fixed
+15-minute worker budget while still making normal progress. The CI guard pins
+all six slices so corpus growth cannot silently restore the oversized shape.
+PostgreSQL regression differential coverage likewise uses four stable
+filename-grouped slices after the second of two uninstrumented slices reached
+the same ceiling on a slower runner.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

@@ -26482,7 +26482,9 @@ pub fn drop_event_trigger(
     ) {
         return sql_fail(error);
     }
-    storage.drop_event_trigger(slot, txn.txid);
+    if let Err(error) = storage.drop_event_trigger(slot, txn.txid) {
+        return sql_fail(error);
+    }
     let lsn = storage.lsn() + 1;
     if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropEventTrigger { name }) {
         storage.rollback_event_trigger_drop(slot, txn.txid);
@@ -35048,6 +35050,9 @@ pub fn drop_routine(
             let Some((trigger_slot, trigger)) = dependency else {
                 break;
             };
+            if let Err(error) = storage.drop_event_trigger(trigger_slot, txn.txid) {
+                return sql_fail(error);
+            }
             let lsn = storage.bump_lsn();
             if let Err(error) = wal.stage(
                 txn.txid,
@@ -35056,9 +35061,9 @@ pub fn drop_routine(
                     name: trigger.name.as_str(),
                 },
             ) {
+                storage.rollback_event_trigger_drop(trigger_slot, txn.txid);
                 return sql_fail(error);
             }
-            storage.drop_event_trigger(trigger_slot, txn.txid);
             if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EventTriggerDropped(
                 trigger_slot as u32,
             )) {

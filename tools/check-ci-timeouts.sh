@@ -61,14 +61,19 @@ done
 # slices and each independent auxiliary phase explicit.
 reference_matrix=.github/workflows/coverage.yml
 for reference_entry in \
-    '- { name: corpus-a, corpus_shard: "0-of-3", auxiliary: none }' \
-    '- { name: corpus-b, corpus_shard: "1-of-3", auxiliary: none }' \
-    '- { name: corpus-c, corpus_shard: "2-of-3", auxiliary: none }' \
+    '- { name: corpus-a, corpus_shard: "0-of-6", auxiliary: none }' \
+    '- { name: corpus-b, corpus_shard: "1-of-6", auxiliary: none }' \
+    '- { name: corpus-c, corpus_shard: "2-of-6", auxiliary: none }' \
+    '- { name: corpus-d, corpus_shard: "3-of-6", auxiliary: none }' \
+    '- { name: corpus-e, corpus_shard: "4-of-6", auxiliary: none }' \
+    '- { name: corpus-f, corpus_shard: "5-of-6", auxiliary: none }' \
     '- { name: auxiliary-exact, corpus_shard: "none", auxiliary: exact }' \
     '- { name: auxiliary-copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: auxiliary-types, corpus_shard: "none", auxiliary: types }' \
     '- { name: auxiliary-pg-regress-a, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "0" }' \
     '- { name: auxiliary-pg-regress-b, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "1" }' \
+    '- { name: auxiliary-pg-regress-c, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "2" }' \
+    '- { name: auxiliary-pg-regress-d, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "3" }' \
     '- { name: auxiliary-slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "4" }' \
     '- { name: auxiliary-slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "4" }' \
     '- { name: auxiliary-slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "4" }' \
@@ -78,6 +83,11 @@ for reference_entry in \
         failed=1
     fi
 done
+
+if ! grep -Fq -- 'POS3QL_POSTGRES_REGRESS_SHARDS: "4"' "$reference_matrix"; then
+    printf '%s\n' 'CI timeout guard: instrumented PostgreSQL regression inputs must retain four file slices' >&2
+    failed=1
+fi
 
 # PostgreSQL-width unit fixtures no longer fit behind build and lint in one
 # worker. Keep the complete library suite split across explicit partitions.
@@ -98,6 +108,7 @@ for differential_shard in \
     fuzz-6 fuzz-7 fuzz-8 fuzz-9 fuzz-10 core \
     corpus-1 corpus-2 corpus-3 corpus-4 corpus-execution-widths \
     auxiliary-pg-regress-a auxiliary-pg-regress-b \
+    auxiliary-pg-regress-c auxiliary-pg-regress-d \
     auxiliary-exact auxiliary-copy auxiliary-types \
     auxiliary-listen auxiliary-composites; do
     if ! grep -Fq -- "- shard: $differential_shard" "$differential_workflow"; then
@@ -107,8 +118,10 @@ for differential_shard in \
 done
 if (( $(grep -Fc 'pg_regress_shard: "0"' "$differential_workflow") != 1 )) \
     || (( $(grep -Fc 'pg_regress_shard: "1"' "$differential_workflow") != 1 )) \
-    || ! grep -Fq -- 'POSTGRES_REGRESS_SHARDS: "2"' "$differential_workflow"; then
-    printf '%s\n' 'CI timeout guard: PostgreSQL regression inputs must retain two file slices' >&2
+    || (( $(grep -Fc 'pg_regress_shard: "2"' "$differential_workflow") != 1 )) \
+    || (( $(grep -Fc 'pg_regress_shard: "3"' "$differential_workflow") != 1 )) \
+    || ! grep -Fq -- 'POSTGRES_REGRESS_SHARDS: "4"' "$differential_workflow"; then
+    printf '%s\n' 'CI timeout guard: PostgreSQL regression inputs must retain four file slices' >&2
     failed=1
 fi
 for auxiliary_phase in pg_regress exact copy types listen composites; do

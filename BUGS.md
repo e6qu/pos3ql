@@ -796,8 +796,9 @@ regression, exact errors, COPY, type fidelity, LISTEN/NOTIFY, and binary
 composites independently after their combined worker completed the regression
 and protocol phases but reached the ceiling during binary composites.
 The instrumented PostgreSQL regression worker later reached the ceiling while
-executing the complete 1,172-statement schedule on a slower runner. Coverage
-and ordinary differential CI now divide the schedule into two deterministic
+executing the complete 1,172-statement schedule on a slower runner. A later
+uninstrumented half reached the same ceiling without a mismatch. Coverage and
+ordinary differential CI now divide the schedule into four deterministic
 filename-grouped slices; every range from one upstream source remains together
 so its dependency order and the complete pinned corpus are preserved.
 The cast catalog audit found definition identity, type endpoints, support
@@ -814,6 +815,23 @@ Failed creation and committed removal now clear the complete reusable slot.
 The first instrumented grouping-width run exposed per-slot locking in hot cast
 lookups: the exact 4,096-set boundary exceeded its 120-second response limit.
 Identity and OID scans now acquire the catalog mutex once per lookup.
+The event-trigger catalog audit found definition identity, routine binding,
+event and tag filters, enablement, ownership, and transaction-private
+replacement images in one unsynchronized fixed vector. Overlapping DDL,
+replay, database lifecycle, ownership, checkpoint, dependency, catalog, and
+dispatch work could lose updates or combine fields from different definitions.
+One startup-bounded mutex now owns the catalog. Readers copy one fixed
+definition and release the lock before nested routine, role, comment,
+dependency, or execution lookup. Conflicting creates, alters, and drops use the
+common transaction wait boundary. Four-worker publication, nested-reader
+progress, exact retained capacity, event-trigger exhaustion, and `Send + Sync`
+have direct coverage. Failed creation and committed removal now clear the
+complete reusable slot.
+The instrumented SQL differential corpus outgrew its three-worker partition,
+then a slower runner exhausted the limit again with four workers after a
+3-minute 20-second build and more than 11 minutes of normal corpus progress.
+Coverage now uses six deterministic modulo slices, matching forced-spill
+coverage, and the CI timeout guard requires every slice explicitly.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

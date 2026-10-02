@@ -173,6 +173,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   Cast definitions share one startup-bounded mutex; readers copy complete
   entries before nested type, routine, comment, dependency, or execution
   lookup, and conflicting DDL uses the common transaction wait boundary.
+  Event trigger definitions and pending replacement images share one
+  startup-bounded mutex; readers copy complete entries before nested routine,
+  role, comment, dependency, or dispatch lookup, and conflicting DDL uses the
+  common transaction wait boundary.
   Engine mutation remains single-owner and serialized while the other catalog
   definition containers, cache, and row sharing are prepared. Authorization
   graph traversal uses one exactly charged bitmap per query workspace,

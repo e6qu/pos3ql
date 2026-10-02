@@ -7055,6 +7055,26 @@ struct CastIter<'a> {
     next_slot: usize,
 }
 
+struct EventTriggerIter<'a> {
+    catalog: &'a std::sync::Mutex<FixedVec<EventTriggerDef>>,
+    next_slot: usize,
+}
+
+impl Iterator for EventTriggerIter<'_> {
+    type Item = (usize, EventTriggerDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("event trigger catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
 impl Iterator for CastIter<'_> {
     type Item = (usize, CastDef);
 
@@ -12726,7 +12746,7 @@ pub struct Storage {
     casts: std::sync::Mutex<FixedVec<CastDef>>,
     operator_catalog: std::sync::Mutex<OperatorCatalog>,
     text_catalog: std::sync::Mutex<TextCatalog>,
-    event_triggers: FixedVec<EventTriggerDef>,
+    event_triggers: std::sync::Mutex<FixedVec<EventTriggerDef>>,
     stored_query_dependencies: FixedVec<StoredQueryDependency>,
     stored_query_dependency_counts: FixedVec<u8>,
     stored_query_dependencies_per_image: usize,
@@ -17356,7 +17376,7 @@ impl Storage {
                 conversions,
                 text_search_objects,
             }),
-            event_triggers,
+            event_triggers: std::sync::Mutex::new(event_triggers),
             stored_query_dependencies,
             stored_query_dependency_counts,
             stored_query_dependencies_per_image: config.max_stored_query_dependencies_per_object,
@@ -19011,8 +19031,12 @@ impl Storage {
                 operator_catalog.access_methods[target_slot] = definition;
             }
 
-            for source_slot in 0..self.event_triggers.len() {
-                let mut event_trigger = self.event_triggers[source_slot];
+            let mut event_triggers = self
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            for source_slot in 0..event_triggers.len() {
+                let mut event_trigger = event_triggers[source_slot];
                 if event_trigger.database != source
                     || event_trigger.ddl_state != CatalogDdlState::Present
                 {
@@ -19028,8 +19052,7 @@ impl Storage {
                             "template event trigger routine was not cloned"
                         )
                     })? as u16;
-                let target_slot = self
-                    .event_triggers
+                let target_slot = event_triggers
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                     .ok_or_else(|| {
@@ -19042,8 +19065,9 @@ impl Storage {
                 event_trigger.definition.ownership = event_trigger.definition.ownership.committed();
                 event_trigger.pending = None;
                 event_trigger.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.event_triggers[target_slot] = event_trigger;
+                event_triggers[target_slot] = event_trigger;
             }
+            drop(event_triggers);
 
             for source_slot in 0..operator_catalog.operators.len() {
                 let mut definition = operator_catalog.operators[source_slot];
@@ -19688,7 +19712,7 @@ impl Storage {
                 AccessClass::Extension => self.extensions[usize::from(entry.object.slot)].database,
                 AccessClass::Trigger => self.triggers[usize::from(entry.object.slot)].database,
                 AccessClass::EventTrigger => {
-                    self.event_triggers[usize::from(entry.object.slot)].database
+                    self.event_trigger(usize::from(entry.object.slot)).database
                 }
                 AccessClass::LargeObject => {
                     self.large_objects
@@ -19823,7 +19847,6 @@ impl Storage {
         }
         clear_catalog!(views);
         clear_catalog!(rules);
-        clear_catalog!(event_triggers);
         clear_catalog!(triggers);
         clear_catalog!(policies);
         clear_catalog!(extended_statistics);
@@ -19833,6 +19856,17 @@ impl Storage {
         clear_catalog!(sequences);
         clear_catalog!(indexes);
         clear_catalog!(extensions);
+        {
+            let mut event_triggers = self
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            for definition in event_triggers.iter_mut() {
+                if definition.database == database {
+                    *definition = EventTriggerDef::EMPTY;
+                }
+            }
+        }
         {
             let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
             for definition in casts.iter_mut() {
@@ -20039,7 +20073,6 @@ impl Storage {
         }
         commit_catalog!(views);
         commit_catalog!(rules);
-        commit_catalog!(event_triggers);
         commit_catalog!(triggers);
         commit_catalog!(policies);
         commit_catalog!(extended_statistics);
@@ -20049,6 +20082,19 @@ impl Storage {
         commit_catalog!(sequences);
         commit_catalog!(indexes);
         commit_catalog!(extensions);
+        {
+            let mut event_triggers = self
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            for definition in event_triggers.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         {
             let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
             for definition in casts.iter_mut() {
@@ -20377,7 +20423,7 @@ impl Storage {
                 TriggerTarget::Table(table) => self.tables[usize::from(table)].ownership,
                 TriggerTarget::View(view) => self.views[usize::from(view)].ownership,
             },
-            AccessClass::EventTrigger => self.event_triggers[slot].definition.ownership,
+            AccessClass::EventTrigger => self.event_trigger(slot).definition.ownership,
             AccessClass::Database => self.databases[slot].ownership,
             AccessClass::LargeObject => {
                 unreachable!("large object ownership is synchronized separately")
@@ -20411,7 +20457,9 @@ impl Storage {
             AccessClass::Trigger => {
                 unreachable!("triggers inherit relation ownership and cannot be reassigned")
             }
-            AccessClass::EventTrigger => &mut self.event_triggers[slot].definition.ownership,
+            AccessClass::EventTrigger => {
+                unreachable!("event trigger ownership is synchronized separately")
+            }
             AccessClass::Database => &mut self.databases[slot].ownership,
             AccessClass::LargeObject => {
                 unreachable!("large object ownership is synchronized separately")
@@ -20445,6 +20493,13 @@ impl Storage {
         if object.class == AccessClass::LargeObject {
             return self
                 .large_object(usize::from(object.slot))
+                .ownership
+                .owner_to(txid) as usize;
+        }
+        if object.class == AccessClass::EventTrigger {
+            return self
+                .event_trigger(usize::from(object.slot))
+                .definition_for(txid)
                 .ownership
                 .owner_to(txid) as usize;
         }
@@ -20851,7 +20906,7 @@ impl Storage {
             }
             AccessClass::EventTrigger => (
                 SqlName::EMPTY,
-                self.event_triggers[slot].definition_for(txid).name,
+                self.event_trigger(slot).definition_for(txid).name,
             ),
             AccessClass::Database => (
                 SqlName::EMPTY,
@@ -20905,7 +20960,7 @@ impl Storage {
             AccessClass::Extension => self.extensions[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Trigger => self.triggers[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::EventTrigger => {
-                self.event_triggers[slot].ddl_state == CatalogDdlState::Present
+                self.event_trigger(slot).ddl_state == CatalogDdlState::Present
             }
             AccessClass::Database => self.databases[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::LargeObject => {
@@ -20943,7 +20998,7 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics[slot].visible_to(txid),
             AccessClass::Extension => self.extensions[slot].visible_to(txid),
             AccessClass::Trigger => self.triggers[slot].visible_to(txid),
-            AccessClass::EventTrigger => self.event_triggers[slot].visible_to(txid),
+            AccessClass::EventTrigger => self.event_trigger(slot).visible_to(txid),
             AccessClass::Database => self.databases[slot].visible_to(txid),
             AccessClass::LargeObject => self.large_object(slot).visible_to(txid),
             AccessClass::ForeignDataWrapper => self.foreign.entry_wrapper(slot).visible_to(txid),
@@ -20975,7 +21030,7 @@ impl Storage {
             AccessClass::Statistics => Some(self.extended_statistics[slot].database),
             AccessClass::Extension => Some(self.extensions[slot].database),
             AccessClass::Trigger => Some(self.triggers[slot].database),
-            AccessClass::EventTrigger => Some(self.event_triggers[slot].database),
+            AccessClass::EventTrigger => Some(self.event_trigger(slot).database),
             AccessClass::LargeObject => Some(self.large_object(slot).database),
             AccessClass::ForeignDataWrapper => Some(self.foreign.entry_wrapper(slot).database),
             AccessClass::ForeignServer => Some(self.foreign.entry_server(slot).database),
@@ -21095,9 +21150,14 @@ impl Storage {
                 })?
             }
             AccessClass::EventTrigger => {
-                let created_at = self.event_triggers[source_slot].created_at;
-                self.event_triggers.iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
+                let created_at = self.event_trigger(source_slot).created_at;
+                EventTriggerIter {
+                    catalog: &self.event_triggers,
+                    next_slot: 0,
+                }
+                .find_map(|(slot, candidate)| {
+                    (candidate.database == target_database && candidate.created_at == created_at)
+                        .then_some(slot)
                 })?
             }
             AccessClass::LargeObject => {
@@ -21257,11 +21317,12 @@ impl Storage {
 
     pub(crate) fn checkpoint_event_triggers(
         &self,
-    ) -> impl Iterator<Item = (usize, &EventTriggerDef)> {
-        self.event_triggers
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    ) -> impl Iterator<Item = (usize, EventTriggerDef)> + '_ {
+        EventTriggerIter {
+            catalog: &self.event_triggers,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_rules(&self) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
@@ -21449,7 +21510,7 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics.len(),
             AccessClass::Extension => self.extensions.len(),
             AccessClass::Trigger => self.triggers.len(),
-            AccessClass::EventTrigger => self.event_triggers.len(),
+            AccessClass::EventTrigger => self.event_trigger_capacity(),
             AccessClass::Database => self.databases.len(),
             AccessClass::LargeObject => self
                 .large_objects
@@ -21508,7 +21569,7 @@ impl Storage {
             (AccessClass::Tablespace, self.tablespaces.len()),
             (AccessClass::Statistics, self.extended_statistics.len()),
             (AccessClass::Extension, self.extensions.len()),
-            (AccessClass::EventTrigger, self.event_triggers.len()),
+            (AccessClass::EventTrigger, self.event_trigger_capacity()),
             (
                 AccessClass::LargeObject,
                 self.access_class_slots(AccessClass::LargeObject),
@@ -21626,6 +21687,36 @@ impl Storage {
             }
             return prior;
         }
+        if object.class == AccessClass::EventTrigger {
+            let mut event_triggers = self
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            let trigger = &mut event_triggers[usize::from(object.slot)];
+            let ownership = &mut trigger.definition.ownership;
+            let prior = ownership.pending;
+            if txid == 0 {
+                ownership.owner = owner as u16;
+                ownership.pending = None;
+            } else {
+                ownership.pending = Some(PendingOwnership {
+                    txid,
+                    owner: owner as u16,
+                });
+            }
+            if let Some(pending) = &mut trigger.pending {
+                if txid == 0 {
+                    pending.definition.ownership.owner = owner as u16;
+                    pending.definition.ownership.pending = None;
+                } else {
+                    pending.definition.ownership.pending = Some(PendingOwnership {
+                        txid,
+                        owner: owner as u16,
+                    });
+                }
+            }
+            return prior;
+        }
         if matches!(
             object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
@@ -21694,6 +21785,30 @@ impl Storage {
             }
             return;
         }
+        if object.class == AccessClass::EventTrigger {
+            let mut event_triggers = self
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            let trigger = &mut event_triggers[usize::from(object.slot)];
+            let ownership = &mut trigger.definition.ownership;
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            if let Some(definition) = &mut trigger.pending {
+                let ownership = &mut definition.definition.ownership;
+                if let Some(pending) = ownership.pending
+                    && pending.txid == txid
+                {
+                    ownership.owner = pending.owner;
+                    ownership.pending = None;
+                }
+            }
+            return;
+        }
         if matches!(
             object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
@@ -21746,6 +21861,18 @@ impl Storage {
                 [usize::from(object.slot)]
             .ownership
             .pending = prior;
+            return;
+        }
+        if object.class == AccessClass::EventTrigger {
+            let mut event_triggers = self
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            let trigger = &mut event_triggers[usize::from(object.slot)];
+            trigger.definition.ownership.pending = prior;
+            if let Some(definition) = &mut trigger.pending {
+                definition.definition.ownership.pending = prior;
+            }
             return;
         }
         if matches!(
@@ -46486,31 +46613,44 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, EventTriggerDefinition)> + '_ {
-        self.event_triggers
-            .iter()
-            .enumerate()
-            .filter(move |(_, trigger)| {
-                trigger.database == current_database() && trigger.visible_to(txid)
-            })
-            .map(move |(slot, trigger)| (slot, trigger.definition_for(txid)))
+        EventTriggerIter {
+            catalog: &self.event_triggers,
+            next_slot: 0,
+        }
+        .filter(move |(_, trigger)| {
+            trigger.database == current_database() && trigger.visible_to(txid)
+        })
+        .map(move |(slot, trigger)| (slot, trigger.definition_for(txid)))
     }
 
     pub(crate) fn event_trigger_capacity(&self) -> usize {
-        self.event_triggers.len()
+        self.event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned")
+            .len()
     }
 
     pub(crate) fn event_trigger(&self, slot: usize) -> EventTriggerDef {
-        self.event_triggers[slot]
+        self.event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned")[slot]
     }
 
     pub(crate) fn event_trigger_slot(&self, name: &str, txid: u32) -> Option<usize> {
-        self.event_triggers_visible_to(txid)
-            .find_map(|(slot, definition)| {
-                definition
-                    .name
-                    .as_str()
-                    .eq_ignore_ascii_case(name)
-                    .then_some(slot)
+        self.event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned")
+            .iter()
+            .enumerate()
+            .find_map(|(slot, trigger)| {
+                (trigger.database == current_database()
+                    && trigger.visible_to(txid)
+                    && trigger
+                        .definition_for(txid)
+                        .name
+                        .as_str()
+                        .eq_ignore_ascii_case(name))
+                .then_some(slot)
             })
     }
 
@@ -47031,9 +47171,34 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         self.validate_event_trigger_definition(definition, txid)?;
-        if self
-            .event_trigger_slot(definition.name.as_str(), txid)
-            .is_some()
+        let mut event_triggers = self
+            .event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned");
+        let same_name = |candidate: &EventTriggerDef| {
+            candidate.database == current_database()
+                && (candidate.definition.name == definition.name
+                    || candidate
+                        .pending
+                        .is_some_and(|pending| pending.definition.name == definition.name))
+        };
+        if let Some(blocker) = event_triggers.iter().find_map(|candidate| {
+            same_name(candidate)
+                .then(|| {
+                    candidate
+                        .pending
+                        .map(|pending| pending.txid)
+                        .or_else(|| candidate.ddl_state.pending_txid())
+                })
+                .flatten()
+                .filter(|owner| *owner != txid)
+        }) {
+            drop(event_triggers);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
+        }
+        if event_triggers
+            .iter()
+            .any(|candidate| same_name(candidate) && candidate.visible_to(txid))
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -47041,19 +47206,18 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        let slot = self
-            .event_triggers
+        let slot = event_triggers
             .iter()
             .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many event triggers (limit {})",
-                    self.event_triggers.len()
+                    event_triggers.len()
                 )
             })?;
         let created_at = self.catalog_sequence.next();
-        self.event_triggers[slot] = EventTriggerDef {
+        event_triggers[slot] = EventTriggerDef {
             database: current_database(),
             created_at,
             definition,
@@ -47070,26 +47234,54 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<PendingEventTriggerDefinition>, SqlError> {
         self.validate_event_trigger_definition(definition, txid)?;
-        let old = self.event_triggers[slot].definition_for(txid);
-        if let Some(other) = self.event_trigger_slot(definition.name.as_str(), txid)
-            && other != slot
-        {
+        let mut event_triggers = self
+            .event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned");
+        let old = event_triggers[slot].definition_for(txid);
+        let target_blocker = event_triggers[slot]
+            .pending
+            .map(|pending| pending.txid)
+            .or_else(|| event_triggers[slot].ddl_state.pending_txid())
+            .filter(|owner| *owner != txid);
+        let name_blocker = event_triggers
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot
+                    && candidate.database == current_database()
+                    && (candidate.definition.name == definition.name
+                        || candidate
+                            .pending
+                            .is_some_and(|pending| pending.definition.name == definition.name)))
+                .then(|| {
+                    candidate
+                        .pending
+                        .map(|pending| pending.txid)
+                        .or_else(|| candidate.ddl_state.pending_txid())
+                })
+                .flatten()
+                .filter(|owner| *owner != txid)
+            });
+        if let Some(blocker) = target_blocker.or(name_blocker) {
+            drop(event_triggers);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
+        }
+        if event_triggers.iter().enumerate().any(|(other, candidate)| {
+            other != slot
+                && candidate.database == current_database()
+                && candidate.visible_to(txid)
+                && candidate.definition_for(txid).name == definition.name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "event trigger \"{}\" already exists",
                 definition.name.as_str()
             ));
         }
-        let prior = self.event_triggers[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                prior.expect("checked").txid,
-                definition.name.as_str(),
-            ));
-        }
-        self.event_triggers[slot].pending =
-            Some(PendingEventTriggerDefinition { txid, definition });
+        let prior = event_triggers[slot].pending;
+        event_triggers[slot].pending = Some(PendingEventTriggerDefinition { txid, definition });
+        drop(event_triggers);
         self.stage_object_comment_identity(
             CommentClass::EventTrigger,
             SqlName::EMPTY,
@@ -47101,25 +47293,67 @@ impl Storage {
         Ok(prior)
     }
 
-    pub(crate) fn drop_event_trigger(&mut self, slot: usize, txid: u32) {
-        self.event_triggers[slot].ddl_state = self.event_triggers[slot].ddl_state.drop_by(txid);
+    pub(crate) fn drop_event_trigger(&mut self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        let mut event_triggers = self
+            .event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned");
+        let definition = event_triggers[slot];
+        let blocker = definition
+            .pending
+            .map(|pending| pending.txid)
+            .or_else(|| definition.ddl_state.pending_txid())
+            .filter(|owner| *owner != txid);
+        if let Some(blocker) = blocker {
+            drop(event_triggers);
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                blocker,
+                definition.definition_for(txid).name.as_str(),
+            ));
+        }
+        event_triggers[slot].ddl_state = definition.ddl_state.drop_by(txid);
+        Ok(())
     }
 
     pub(crate) fn commit_event_trigger_create(&mut self, slot: usize) {
-        self.event_triggers[slot].ddl_state = self.event_triggers[slot].ddl_state.commit_create();
+        let mut event_triggers = self
+            .event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned");
+        event_triggers[slot].ddl_state = event_triggers[slot].ddl_state.commit_create();
     }
 
     pub(crate) fn rollback_event_trigger_create(&mut self, slot: usize) {
-        self.event_triggers[slot].ddl_state = self.event_triggers[slot].ddl_state.rollback_create();
+        let mut event_triggers = self
+            .event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned");
+        event_triggers[slot].ddl_state = event_triggers[slot].ddl_state.rollback_create();
+        if event_triggers[slot].ddl_state == CatalogDdlState::Absent {
+            event_triggers[slot] = EventTriggerDef::EMPTY;
+        }
     }
 
     pub(crate) fn commit_event_trigger_alter(&mut self, slot: usize, txid: u32) {
-        let old = self.event_triggers[slot].definition;
-        if let Some(pending) = self.event_triggers[slot].pending
-            && pending.txid == txid
-        {
-            self.event_triggers[slot].definition = pending.definition;
-            self.event_triggers[slot].pending = None;
+        let old = {
+            let mut event_triggers = self
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            let trigger = &mut event_triggers[slot];
+            if let Some(pending) = trigger.pending
+                && pending.txid == txid
+            {
+                let old = trigger.definition;
+                trigger.definition = pending.definition;
+                trigger.pending = None;
+                Some(old)
+            } else {
+                None
+            }
+        };
+        if let Some(old) = old {
             self.commit_object_comment_identity(
                 CommentClass::EventTrigger,
                 SqlName::EMPTY,
@@ -47134,12 +47368,18 @@ impl Storage {
         slot: usize,
         prior: Option<PendingEventTriggerDefinition>,
     ) {
-        let txid = self.event_triggers[slot]
-            .pending
-            .map_or(0, |pending| pending.txid);
-        self.event_triggers[slot].pending = prior;
-        let committed = self.event_triggers[slot].definition;
-        let visible = prior.map_or(committed, |pending| pending.definition);
+        let (txid, committed, visible) = {
+            let mut event_triggers = self
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            let trigger = &mut event_triggers[slot];
+            let txid = trigger.pending.map_or(0, |pending| pending.txid);
+            trigger.pending = prior;
+            let committed = trigger.definition;
+            let visible = prior.map_or(committed, |pending| pending.definition);
+            (txid, committed, visible)
+        };
         self.stage_object_comment_identity(
             CommentClass::EventTrigger,
             SqlName::EMPTY,
@@ -47151,10 +47391,19 @@ impl Storage {
     }
 
     pub(crate) fn commit_event_trigger_drop(&mut self, slot: usize) {
-        let name = self.event_triggers[slot].definition.name;
+        let name = {
+            let mut event_triggers = self
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            let trigger = event_triggers[slot];
+            let name = trigger.definition.name;
+            let state = trigger.ddl_state.commit_drop();
+            debug_assert_eq!(state, CatalogDdlState::Absent);
+            event_triggers[slot] = EventTriggerDef::EMPTY;
+            name
+        };
         self.drop_object_comments(CommentClass::EventTrigger, "", name.as_str());
-        self.event_triggers[slot].pending = None;
-        self.event_triggers[slot].ddl_state = self.event_triggers[slot].ddl_state.commit_drop();
         self.clear_extension_dependencies_for_object(AccessObject {
             class: AccessClass::EventTrigger,
             slot: slot as u16,
@@ -47162,8 +47411,11 @@ impl Storage {
     }
 
     pub(crate) fn rollback_event_trigger_drop(&mut self, slot: usize, txid: u32) {
-        self.event_triggers[slot].ddl_state =
-            self.event_triggers[slot].ddl_state.rollback_drop(txid);
+        let mut event_triggers = self
+            .event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned");
+        event_triggers[slot].ddl_state = event_triggers[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn replay_event_trigger(
@@ -47172,24 +47424,23 @@ impl Storage {
         created_at: u64,
         definition: EventTriggerDefinition,
     ) -> Result<(), SqlError> {
-        if slot >= self.event_triggers.len() {
+        self.validate_event_trigger_definition(definition, 0)?;
+        let mut event_triggers = self
+            .event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned");
+        if slot >= event_triggers.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "journal event trigger slot is out of range"
             ));
         }
-        self.validate_event_trigger_definition(definition, 0)?;
-        if self
-            .event_triggers
-            .iter()
-            .enumerate()
-            .any(|(other, candidate)| {
-                other != slot
-                    && candidate.database == current_database()
-                    && candidate.ddl_state != CatalogDdlState::Absent
-                    && candidate.definition.name == definition.name
-            })
-        {
+        if event_triggers.iter().enumerate().any(|(other, candidate)| {
+            other != slot
+                && candidate.database == current_database()
+                && candidate.ddl_state != CatalogDdlState::Absent
+                && candidate.definition.name == definition.name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "journal replays duplicate event trigger \"{}\"",
@@ -47197,7 +47448,7 @@ impl Storage {
             ));
         }
         self.catalog_sequence.observe(created_at);
-        self.event_triggers[slot] = EventTriggerDef {
+        event_triggers[slot] = EventTriggerDef {
             database: current_database(),
             created_at,
             definition,
@@ -47208,9 +47459,23 @@ impl Storage {
     }
 
     pub(crate) fn replay_drop_event_trigger(&mut self, name: &str) {
-        if let Some(slot) = self.event_trigger_slot(name, 0) {
+        let removed = {
+            let mut event_triggers = self
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            let removed = event_triggers.iter().position(|trigger| {
+                trigger.database == current_database()
+                    && trigger.visible_to(0)
+                    && trigger.definition.name.as_str().eq_ignore_ascii_case(name)
+            });
+            if let Some(slot) = removed {
+                event_triggers[slot] = EventTriggerDef::EMPTY;
+            }
+            removed.is_some()
+        };
+        if removed {
             self.drop_object_comments(CommentClass::EventTrigger, "", name);
-            self.event_triggers[slot] = EventTriggerDef::EMPTY;
         }
     }
 
@@ -49219,7 +49484,7 @@ mod tests {
         assert_eq!(text_catalog.conversions.len(), 13);
         assert_eq!(text_catalog.text_search_objects.len(), 27);
         drop(text_catalog);
-        assert_eq!(storage.event_triggers.len(), 14);
+        assert_eq!(storage.event_trigger_capacity(), 14);
         assert_eq!(
             storage.pending_extended_statistics_data.capacity(),
             pending_extended_statistics_capacity(&config)
@@ -50042,6 +50307,110 @@ mod tests {
         storage.commit_cast_drop(0);
         assert_eq!(storage.cast(0).created_at, 0);
         assert_eq!(storage.cast(0).ddl_state, CatalogDdlState::Absent);
+    }
+
+    #[test]
+    fn event_trigger_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<FixedVec<EventTriggerDef>>>();
+        assert_send_sync::<EventTriggerIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_event_triggers = WORKERS;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        {
+            let mut routines = storage
+                .routines
+                .lock()
+                .expect("routine catalog lock poisoned");
+            let routine = &mut routines[0];
+            routine.database = DatabaseOid::POSTGRES;
+            routine.kind = RoutineKind::EventTrigger;
+            routine.ddl_state = CatalogDdlState::Present;
+        }
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let name = stack_format!(63, "event_trigger_{worker}");
+                    storage
+                        .event_triggers
+                        .lock()
+                        .expect("event trigger catalog lock poisoned")[worker] = EventTriggerDef {
+                        database: DatabaseOid::POSTGRES,
+                        created_at: worker as u64 + 1,
+                        definition: EventTriggerDefinition {
+                            name: SqlName::parse(name.as_str()).unwrap(),
+                            event: crate::sql::ast::EventTriggerEvent::DdlCommandStart,
+                            function: 0,
+                            tags: EventTriggerTags::EMPTY,
+                            enabled: TriggerEnabled::Origin,
+                            ownership: Ownership::BOOTSTRAP,
+                        },
+                        pending: None,
+                        ddl_state: CatalogDdlState::Present,
+                    };
+                });
+            }
+        });
+
+        assert_eq!(storage.event_trigger_capacity(), WORKERS);
+        assert_eq!(storage.event_triggers_visible_to(0).count(), WORKERS);
+        for (slot, definition) in storage.event_triggers_visible_to(0) {
+            assert_eq!(storage.event_trigger(slot).definition.name, definition.name);
+        }
+
+        let full = EventTriggerDefinition {
+            name: SqlName::parse("event_trigger_full").unwrap(),
+            event: crate::sql::ast::EventTriggerEvent::DdlCommandStart,
+            function: 0,
+            tags: EventTriggerTags::EMPTY,
+            enabled: TriggerEnabled::Origin,
+            ownership: Ownership::BOOTSTRAP,
+        };
+        assert!(storage.create_event_trigger(full, 9).is_err());
+
+        {
+            let mut event_triggers = storage
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            event_triggers[0].ddl_state = CatalogDdlState::PendingCreate { txid: 9 };
+        }
+        storage.rollback_event_trigger_create(0);
+        assert_eq!(storage.event_trigger(0).created_at, 0);
+        assert_eq!(storage.event_trigger(0).ddl_state, CatalogDdlState::Absent);
+
+        let pending = EventTriggerDefinition {
+            name: SqlName::parse("event_trigger_pending").unwrap(),
+            ..full
+        };
+        storage
+            .event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned")[0] = EventTriggerDef {
+            database: DatabaseOid::POSTGRES,
+            created_at: 99,
+            definition: pending,
+            pending: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid: 9 },
+        };
+        assert!(storage.create_event_trigger(pending, 10).is_err());
+        storage.rollback_event_trigger_create(0);
+
+        {
+            let mut event_triggers = storage
+                .event_triggers
+                .lock()
+                .expect("event trigger catalog lock poisoned");
+            event_triggers[1].ddl_state = CatalogDdlState::PendingDrop { txid: 9 };
+        }
+        storage.commit_event_trigger_drop(1);
+        assert_eq!(storage.event_trigger(1).created_at, 0);
+        assert_eq!(storage.event_trigger(1).ddl_state, CatalogDdlState::Absent);
     }
 
     #[test]

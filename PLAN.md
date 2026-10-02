@@ -476,6 +476,18 @@ and `Send + Sync` have direct coverage. The remaining catalog definition
 containers and row mutation paths still require synchronization before fixed
 workers can overlap execution.
 
+Collation definitions, conversion definitions, and text search parsers,
+templates, dictionaries, and configurations now share one startup-bounded
+mutex. DDL publication and rollback, replay, database cloning, schema rename,
+checkpoint and catalog reads, dependency rebinding, and collation execution
+observe complete definition images. Iterators copy one fixed entry and release
+the mutex before nested schema, comment, dependency, or execution lookups.
+Four-worker publication across all three catalog families, nested-reader
+progress, exact retained capacities, collation exhaustion, and `Send + Sync`
+have direct coverage. The remaining catalog definition containers and row
+mutation paths still require synchronization before fixed workers can overlap
+execution.
+
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint
 roster used while opening or resuming a remote transaction, with exact startup

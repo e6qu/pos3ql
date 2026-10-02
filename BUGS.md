@@ -758,6 +758,16 @@ type namespace. Iterators copy one fixed definition or member and release the
 lock before nested catalog resolution. Four-worker publication across every
 type family, nested-reader progress, exact retained capacities, domain
 exhaustion, and `Send + Sync` have direct coverage.
+The schema-bound text catalog audit found collations, conversions, and text
+search objects in three unsynchronized fixed vectors. Overlapping DDL, replay,
+database cloning, schema rename, checkpoint, dependency, catalog, and
+collation-execution work could lose updates or combine fields from different
+transitions. One startup-bounded mutex now owns all three families. Iterators
+copy one fixed definition and release the lock before nested schema, comment,
+dependency, or execution lookup. Four-worker publication, nested-reader
+progress, exact retained capacities, collation exhaustion, and `Send + Sync`
+have direct coverage. Database removal also clears transaction-private pending
+definitions before their slots are reused.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

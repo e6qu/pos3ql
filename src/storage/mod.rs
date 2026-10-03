@@ -9789,7 +9789,7 @@ impl SequenceDef {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or_else(
-                || self.clone(),
+                || *self,
                 |pending| Self {
                     schema: pending.schema,
                     name: pending.name,
@@ -9805,7 +9805,7 @@ impl SequenceDef {
                     persistence: pending.persistence,
                     cache_generation: self.cache_generation.wrapping_add(1),
                     pending_definition: None,
-                    ..self.clone()
+                    ..*self
                 },
             )
     }
@@ -35891,11 +35891,11 @@ impl Storage {
         // ALTER SEQUENCE's definition is transactional, but an advance made
         // under an ordinary staged definition is not.  Only RESTART owns a
         // temporary value image that rollback may discard.
+        catalog.definitions[slot].pending_definition = prior;
         let values = &mut catalog.values[slot];
         if current.is_some_and(|pending| !pending.restarted) {
             values.committed = values.pending;
         }
-        catalog.definitions[slot].pending_definition = prior;
         if let Some(prior) = prior {
             values.pending = SequenceValue {
                 last_value: prior.last_value,
@@ -53139,7 +53139,30 @@ mod tests {
 
         let config = test_config();
         let mut budget = test_budget(&config);
-        let storage = Storage::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let sequence = storage
+            .create_sequence(
+                SequenceCreateSpec {
+                    schema: SqlName::parse("public").unwrap(),
+                    name: SqlName::parse("concurrent_sequence").unwrap(),
+                    spec: SeqSpec {
+                        data_type: SeqType::Bigint,
+                        increment: 1,
+                        min_value: 1,
+                        max_value: i64::MAX,
+                        start_value: 1,
+                        cache: 1,
+                        cycle: false,
+                    },
+                    owner: None,
+                    generator_for: None,
+                    persistence: RelationPersistence::Permanent,
+                },
+                0,
+            )
+            .unwrap();
+        storage.commit_sequence_create(sequence);
+        assert_eq!(sequence, 0);
         let catalog = &storage.sequence_catalog;
         std::thread::scope(|scope| {
             for _ in 0..4 {

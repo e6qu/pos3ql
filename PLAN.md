@@ -177,7 +177,7 @@ decodes maximum-width relation and tuple frames as validated borrowed wire
 views, keeping the decoded message size independent of the 1,600-column limit.
 CI preserves the complete library, curated PostgreSQL differential, and
 10,000-statement seeded fuzz suites in deterministic shards below the
-15-minute worker ceiling; the library suite runs in four slices, sqllogictest
+15-minute worker ceiling; the library suite runs in eight slices, sqllogictest
 queries run in eight, the seeded sequence runs in ten, the growing forced-spill
 corpus runs in six, and instrumented auxiliary phases have independent workers.
 Instrumented sqllogictest queries run in eight slices after a four-slice worker
@@ -605,6 +605,8 @@ catalog reads observe complete definition/value transitions. Iterators copy one
 fixed image and release the mutex before nested schema, role, comment, WAL, or
 catalog work. Four-worker reservation, exact retained capacities, atomic
 checkpoint images, complete slot reuse, and `Send + Sync` have direct coverage.
+Alter rollback restores the pending definition before updating its paired value
+image, keeping both changes within one borrow and one mutex hold.
 The remaining catalog definition containers and row mutation paths still
 require synchronization before fixed workers can overlap execution.
 
@@ -614,7 +616,10 @@ deterministic slices after three and then four slices exhausted the fixed
 all six slices so corpus growth cannot silently restore the oversized shape.
 PostgreSQL regression differential coverage likewise uses four stable
 filename-grouped slices after the second of two uninstrumented slices reached
-the same ceiling on a slower runner.
+the same ceiling on a slower runner. Forced-spill sqllogictest coverage uses
+four query slices after the second of two slices spent more than 11 minutes in
+normal differential progress following its instrumented build and reached the
+same ceiling.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

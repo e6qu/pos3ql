@@ -781,11 +781,12 @@ and committed or rolled-back removal now clear the complete reusable slot.
 Replacement replay normalizes the complete WAL image to committed catalog
 state before publishing it, so its transaction-private create marker cannot
 hide an otherwise recovered routine. The complete library suite now runs in
-four deterministic slices after a 559-test slice exceeded the CI worker's
-15-minute ceiling. The 10,000-statement differential sequence now runs in ten
-1,000-statement slices after a 2,000-statement slice passed its assertions but
-reached the same ceiling during runner cleanup. The execution-width corpus now
-has its own worker after its 70,000-row cursor began too late in a general
+eight deterministic slices after a 559-test slice first exceeded the CI
+worker's 15-minute ceiling and a later four-slice worker reached the same limit
+while making normal progress. The 10,000-statement differential sequence runs
+in ten 1,000-statement slices after a 2,000-statement slice passed its
+assertions but reached the same ceiling during runner cleanup. The execution-width
+corpus now has its own worker after its 70,000-row cursor began too late in a general
 corpus slice to finish within the same bound. Sqllogictest read-only queries now
 run in eight slices after a four-slice worker spent 11 minutes 41 seconds in
 replay and reached the ceiling before reporting its result.
@@ -905,11 +906,20 @@ before nested work. Committed drops and rolled-back creates also retained stale
 definition and value fields in reusable slots; every terminal path now clears
 the complete slot. Four-worker reservation, exact retained capacities, atomic
 checkpoint images, complete slot reuse, and `Send + Sync` have direct coverage.
+Alter rollback restores the pending definition before updating its paired value
+image, so the atomic transition also satisfies Rust's exclusive-borrow rules.
 The instrumented SQL differential corpus outgrew its three-worker partition,
 then a slower runner exhausted the limit again with four workers after a
 3-minute 20-second build and more than 11 minutes of normal corpus progress.
 Coverage now uses six deterministic modulo slices, matching forced-spill
 coverage, and the CI timeout guard requires every slice explicitly.
+The forced-spill sqllogictest auxiliary later exhausted the same limit after a
+3-minute 14-second instrumented build and more than 11 minutes of normal
+differential progress. It now runs in four deterministic query slices, and the
+timeout guard requires every slice explicitly.
+The sequence synchronization fixture now creates and commits its sequence
+through the catalog API before checking visibility-gated value publication;
+using an absent slot had made its final dirty-state assertion invalid.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -48,8 +48,10 @@ for spill_entry in \
     '- { name: exact, corpus_shard: "none", auxiliary: exact }' \
     '- { name: copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: types, corpus_shard: "none", auxiliary: types }' \
-    '- { name: slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "2" }' \
-    '- { name: slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "2" }'; do
+    '- { name: slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "4" }' \
+    '- { name: slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "4" }' \
+    '- { name: slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "4" }' \
+    '- { name: slt-d, corpus_shard: "none", auxiliary: slt, slt_query_shard: "3", slt_query_shards: "4" }'; do
     if ! grep -Fq -- "$spill_entry" "$spill_matrix"; then
         printf 'CI timeout guard: missing forced-spill shard definition %s\n' "$spill_entry" >&2
         failed=1
@@ -96,7 +98,7 @@ fi
 # PostgreSQL-width unit fixtures no longer fit behind build and lint in one
 # worker. Keep the complete library suite split across explicit partitions.
 ci_workflow=.github/workflows/ci.yml
-for test_partition in 0-of-4 1-of-4 2-of-4 3-of-4; do
+for test_partition in 0-of-8 1-of-8 2-of-8 3-of-8 4-of-8 5-of-8 6-of-8 7-of-8; do
     if ! grep -Fq -- "$test_partition" "$ci_workflow"; then
         printf 'CI timeout guard: missing library test partition %s\n' "$test_partition" >&2
         failed=1

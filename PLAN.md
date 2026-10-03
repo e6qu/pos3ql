@@ -598,6 +598,16 @@ slot reuse, and `Send + Sync` have direct coverage. The remaining catalog
 definition containers and row mutation paths still require synchronization
 before fixed workers can overlap execution.
 
+Sequence definitions, pending alterations, ownership, and committed and staged
+values now share one startup-bounded mutex. DDL, reservation, restart, replay,
+database cloning and removal, schema and table rebinding, checkpoint and
+catalog reads observe complete definition/value transitions. Iterators copy one
+fixed image and release the mutex before nested schema, role, comment, WAL, or
+catalog work. Four-worker reservation, exact retained capacities, atomic
+checkpoint images, complete slot reuse, and `Send + Sync` have direct coverage.
+The remaining catalog definition containers and row mutation paths still
+require synchronization before fixed workers can overlap execution.
+
 Instrumented SQL differential coverage now divides the corpus into six
 deterministic slices after three and then four slices exhausted the fixed
 15-minute worker budget while still making normal progress. The CI guard pins

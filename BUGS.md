@@ -895,6 +895,16 @@ bounded churn instead of indexing past their reserved row slices.
 Four-worker publication, nested-reader progress, exact retained capacities,
 loud exhaustion, atomic cross-vector updates, and `Send + Sync` have direct
 coverage.
+The sequence catalog audit found definitions, pending alterations, ownership,
+and committed and staged values split between an unsynchronized fixed vector
+and a separate value mutex. Overlapping DDL, reservation, restart, replay,
+database lifecycle, schema and table rebinding, checkpoint, and catalog work
+could combine definition and value images from different transitions. One
+startup-bounded mutex now owns both vectors, and readers copy complete images
+before nested work. Committed drops and rolled-back creates also retained stale
+definition and value fields in reusable slots; every terminal path now clears
+the complete slot. Four-worker reservation, exact retained capacities, atomic
+checkpoint images, complete slot reuse, and `Send + Sync` have direct coverage.
 The instrumented SQL differential corpus outgrew its three-worker partition,
 then a slower runner exhausted the limit again with four workers after a
 3-minute 20-second build and more than 11 minutes of normal corpus progress.

@@ -10368,15 +10368,6 @@ pub(crate) fn schema_name_by_oid(storage: &Storage, txid: u32, oid: i32) -> Opti
                     .then_some(table.schema.as_str())
             })
             .or_else(|| {
-                (0..storage.sequence_count()).find_map(|slot| {
-                    let sequence = storage.sequence(slot);
-                    (storage.sequence_slot_visible_to(slot, txid)
-                        && sequence.persistence == crate::storage::RelationPersistence::Temporary
-                        && namespace_oid(storage, sequence.schema.as_str()) == oid)
-                        .then_some(sequence.schema.as_str())
-                })
-            })
-            .or_else(|| {
                 storage
                     .visible_schemas(txid)
                     .find(|(slot, _)| namespace_oid_for_slot(*slot) == oid)
@@ -30321,16 +30312,16 @@ fn pg_sequences<'a>(
     )?;
     let mut n = 0;
     for slot in 0..storage.sequence_count() {
-        let seq = storage.sequence_for(slot, txid);
-        if !storage.sequence_slot_visible_to(slot, txid) {
+        let Some((seq, sequence_last_value, sequence_is_called, _, _, _)) =
+            storage.sequence_catalog_image_for(slot, txid)
+        else {
             continue;
-        }
+        };
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_sequences"));
         }
         // last_value is NULL until the sequence has been advanced at least once,
         // exactly as PostgreSQL reports it.
-        let (sequence_last_value, sequence_is_called) = storage.sequence_value_for(slot, txid);
         let last_value = if sequence_is_called {
             Datum::Int8(sequence_last_value)
         } else {

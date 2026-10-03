@@ -199,6 +199,13 @@ active production roadmap is [PLAN.md](../PLAN.md).
   startup-bounded mutex; readers copy complete slot images before nested WAL,
   catalog, or protocol work. Slot name operations include their database
   identity, and removal clears the complete reusable slot.
+  Subscription definitions, pending lifecycle and stream-definition images,
+  ownership, durable apply positions, failures, statistics, cleanup work, and
+  per-relation synchronization state share one startup-bounded mutex; readers
+  copy complete definitions and relation rows before nested catalog, WAL, or
+  protocol work. Definition replacement and acknowledgement update relation
+  generations and state in the same transition, and terminal paths clear the
+  complete reusable slots.
   Engine mutation remains single-owner and serialized while the other catalog
   definition containers, cache, and row sharing are prepared. Authorization
   graph traversal uses one exactly charged bitmap per query workspace,

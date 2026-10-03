@@ -585,6 +585,19 @@ retained capacity, loud exhaustion, complete slot reuse, and `Send + Sync` have
 direct coverage. The remaining catalog definition containers and row mutation
 paths still require synchronization before fixed workers can overlap execution.
 
+Subscription definitions, pending lifecycle and stream-definition images,
+ownership, durable apply positions, failures, statistics, cleanup work, and
+per-relation synchronization state now share one startup-bounded mutex. DDL,
+apply acknowledgement, relation refresh, replay, checkpoint, database removal,
+catalog reads, and worker control observe complete cross-vector transitions.
+Iterators copy one fixed definition or relation row and release the mutex before
+nested table, role, comment, WAL, protocol, or catalog work. Four-worker
+publication, nested-reader progress, exact retained capacities, loud
+exhaustion, atomic definition-generation and acknowledgement updates, complete
+slot reuse, and `Send + Sync` have direct coverage. The remaining catalog
+definition containers and row mutation paths still require synchronization
+before fixed workers can overlap execution.
+
 Instrumented SQL differential coverage now divides the corpus into six
 deterministic slices after three and then four slices exhausted the fixed
 15-minute worker budget while still making normal progress. The CI guard pins

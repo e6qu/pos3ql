@@ -3971,7 +3971,7 @@ impl Engine {
             self.storage
                 .subscriptions_with_slots_visible_to(txid)
                 .find_map(|(slot, subscription)| {
-                    (catalog::subscription_oid(subscription) == oid).then_some(slot)
+                    (catalog::subscription_oid(&subscription) == oid).then_some(slot)
                 })
         });
         if oid.is_none() || slot.is_some() {

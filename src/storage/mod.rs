@@ -340,9 +340,9 @@ impl TriggerArguments {
     }
 }
 
-/// A bounded, nonempty connection-info value. SQL and WAL must construct this
-/// before durable catalog state is changed, so truncation and NUL bytes cannot
-/// become a deferred runtime connection failure.
+/// A live subscription's bounded, nonempty connection-info value. SQL and WAL
+/// construct this before durable catalog state changes; the empty value is
+/// reserved for an absent catalog slot.
 #[derive(Clone, Copy)]
 pub(crate) struct SubscriptionConnInfo {
     text: StackStr<SUBSCRIPTION_CONNINFO_BYTES>,
@@ -350,6 +350,11 @@ pub(crate) struct SubscriptionConnInfo {
 }
 
 impl SubscriptionConnInfo {
+    const EMPTY: Self = Self {
+        text: StackStr::new(),
+        endpoint: None,
+    };
+
     pub(crate) fn parse(value: &str) -> Result<Self, SqlError> {
         if value.is_empty() || value.as_bytes().contains(&0) {
             return Err(sql_err!(
@@ -5343,6 +5348,7 @@ pub(crate) struct SubscriptionDef {
     pub behavior: SubscriptionBehavior,
     pub bootstrap: SubscriptionBootstrap,
     pending_bootstrap: Option<PendingSubscriptionBootstrap>,
+    pending_relation_refresh: Option<u32>,
     pub(crate) cleanup: SubscriptionCleanup,
     pub(crate) failure: Option<SubscriptionFailure>,
     /// Transient PostgreSQL-compatible worker counters. Durable apply
@@ -5464,6 +5470,15 @@ pub(crate) struct SubscriptionRelation {
 }
 
 impl SubscriptionRelation {
+    const EMPTY: Self = Self {
+        subscription_created_at: 0,
+        definition_generation: 0,
+        table_slot: u16::MAX,
+        state: SubscriptionRelationState::Initializing,
+        synchronization_lsn: 0,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
     pub(crate) fn table_slot(self) -> usize {
         usize::from(self.table_slot)
     }
@@ -5873,6 +5888,34 @@ impl SubscriptionBootstrap {
 }
 
 impl SubscriptionDef {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        created_at: 0,
+        definition_generation: 0,
+        name: SqlName::EMPTY,
+        pending_name: None,
+        connection: SubscriptionConnInfo::EMPTY,
+        publications: [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS],
+        publication_count: 0,
+        pending_definition: None,
+        enabled: false,
+        pending_enabled: None,
+        slot: SubscriptionSlot::Absent,
+        behavior: SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+        bootstrap: SubscriptionBootstrap::Deferred,
+        pending_bootstrap: None,
+        pending_relation_refresh: None,
+        cleanup: SubscriptionCleanup::None,
+        failure: None,
+        apply_error_count: 0,
+        sync_error_count: 0,
+        stats_reset: None,
+        confirmed_lsn: 0,
+        origin_lsn: 0,
+        ownership: Ownership::BOOTSTRAP,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
     }
@@ -7167,6 +7210,52 @@ struct PublicationIter<'a> {
 struct ReplicationSlotIter<'a> {
     catalog: &'a std::sync::Mutex<FixedVec<ReplicationSlotDef>>,
     next_slot: usize,
+}
+
+/// Subscription definitions and their per-relation synchronization state
+/// publish together because stream replacement and acknowledgement update both.
+struct SubscriptionCatalog {
+    definitions: FixedVec<SubscriptionDef>,
+    relations: FixedVec<SubscriptionRelation>,
+}
+
+struct SubscriptionIter<'a> {
+    catalog: &'a std::sync::Mutex<SubscriptionCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for SubscriptionIter<'_> {
+    type Item = (usize, SubscriptionDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.definitions.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
+struct SubscriptionRelationIter<'a> {
+    catalog: &'a std::sync::Mutex<SubscriptionCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for SubscriptionRelationIter<'_> {
+    type Item = SubscriptionRelation;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let relation = catalog.relations.get(self.next_slot).copied()?;
+        self.next_slot += 1;
+        Some(relation)
+    }
 }
 
 impl Iterator for ReplicationSlotIter<'_> {
@@ -12948,11 +13037,10 @@ pub struct Storage {
     extended_statistics_catalog: std::sync::Mutex<ExtendedStatisticsCatalog>,
     publications: std::sync::Mutex<FixedVec<PublicationDef>>,
     replication_slots: std::sync::Mutex<FixedVec<ReplicationSlotDef>>,
-    subscriptions: FixedVec<SubscriptionDef>,
+    subscription_catalog: std::sync::Mutex<SubscriptionCatalog>,
     foreign: foreign::ForeignCatalog,
     foreign_sessions: ForeignSessionPool,
     foreign_statement_contexts: FixedVec<std::sync::Mutex<ForeignStatementContext>>,
-    subscription_relations: FixedVec<SubscriptionRelation>,
     matviews: FixedVec<MatviewDef>,
     sequences: FixedVec<SequenceDef>,
     sequence_values: std::sync::Mutex<FixedVec<SequenceValues>>,
@@ -17006,35 +17094,7 @@ impl Storage {
         let mut subscriptions = FixedVec::new(budget, "subscriptions", config.max_subscriptions)?;
         for _ in 0..config.max_subscriptions {
             subscriptions
-                .push(SubscriptionDef {
-                    database: DatabaseOid::POSTGRES,
-                    created_at: 0,
-                    definition_generation: 0,
-                    name: SqlName::EMPTY,
-                    pending_name: None,
-                    connection: SubscriptionConnInfo::parse(
-                        "host=127.0.0.1 port=1 user=disabled dbname=disabled sslmode=disable",
-                    )
-                    .expect("static subscription placeholder is valid"),
-                    publications: [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS],
-                    publication_count: 0,
-                    pending_definition: None,
-                    enabled: false,
-                    pending_enabled: None,
-                    slot: SubscriptionSlot::Absent,
-                    behavior: SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-                    bootstrap: SubscriptionBootstrap::Deferred,
-                    pending_bootstrap: None,
-                    cleanup: SubscriptionCleanup::None,
-                    failure: None,
-                    apply_error_count: 0,
-                    sync_error_count: 0,
-                    stats_reset: None,
-                    confirmed_lsn: 0,
-                    origin_lsn: 0,
-                    ownership: Ownership::BOOTSTRAP,
-                    ddl_state: CatalogDdlState::Absent,
-                })
+                .push(SubscriptionDef::EMPTY)
                 .expect("sized to max_subscriptions");
         }
         let mut subscription_relations = FixedVec::new(
@@ -17044,14 +17104,7 @@ impl Storage {
         )?;
         for _ in 0..config.max_subscriptions * config.subscription_relation_capacity {
             subscription_relations
-                .push(SubscriptionRelation {
-                    subscription_created_at: 0,
-                    definition_generation: 0,
-                    table_slot: u16::MAX,
-                    state: SubscriptionRelationState::Initializing,
-                    synchronization_lsn: 0,
-                    ddl_state: CatalogDdlState::Absent,
-                })
+                .push(SubscriptionRelation::EMPTY)
                 .expect("sized to subscription relation capacity");
         }
         let mut matviews = FixedVec::new(budget, "matviews", config.max_materialized_views)?;
@@ -17551,14 +17604,16 @@ impl Storage {
             }),
             publications: std::sync::Mutex::new(publications),
             replication_slots: std::sync::Mutex::new(replication_slots),
-            subscriptions,
+            subscription_catalog: std::sync::Mutex::new(SubscriptionCatalog {
+                definitions: subscriptions,
+                relations: subscription_relations,
+            }),
             foreign,
             foreign_sessions: ForeignSessionPool {
                 assignment: std::sync::Mutex::new(()),
                 slots: FixedVec::new(budget, "foreign_sessions", config.max_foreign_sessions)?,
             },
             foreign_statement_contexts,
-            subscription_relations,
             matviews,
             sequences,
             sequence_values: std::sync::Mutex::new(sequence_values),
@@ -19965,15 +20020,26 @@ impl Storage {
                 *entry = CommentEntry::empty();
             }
         }
-        for relation in self.subscription_relations.iter_mut() {
-            let belongs = self.subscriptions.iter().any(|subscription| {
+        let mut subscription_catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        for relation_slot in 0..subscription_catalog.relations.len() {
+            let relation = subscription_catalog.relations[relation_slot];
+            let belongs = subscription_catalog.definitions.iter().any(|subscription| {
                 subscription.database == database
                     && subscription.created_at == relation.subscription_created_at
             });
             if belongs {
-                relation.ddl_state = CatalogDdlState::Absent;
+                subscription_catalog.relations[relation_slot] = SubscriptionRelation::EMPTY;
             }
         }
+        for subscription in subscription_catalog.definitions.iter_mut() {
+            if subscription.database == database {
+                *subscription = SubscriptionDef::EMPTY;
+            }
+        }
+        drop(subscription_catalog);
         for dependency in self.extension_dependencies.iter_mut() {
             if dependency.extension != u16::MAX
                 && self.extensions[usize::from(dependency.extension)].database == database
@@ -20031,7 +20097,6 @@ impl Storage {
                 }
             }
         }
-        clear_catalog!(subscriptions);
         clear_catalog!(matviews);
         clear_catalog!(sequences);
         clear_catalog!(indexes);
@@ -20298,7 +20363,19 @@ impl Storage {
                 }
             }
         }
-        commit_catalog!(subscriptions);
+        {
+            let mut subscriptions = self
+                .subscription_catalog
+                .lock()
+                .expect("subscription catalog lock poisoned");
+            for definition in subscriptions.definitions.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         commit_catalog!(matviews);
         commit_catalog!(sequences);
         commit_catalog!(indexes);
@@ -21525,8 +21602,12 @@ impl Storage {
 
     pub(crate) fn checkpoint_subscriptions(
         &self,
-    ) -> impl Iterator<Item = (usize, &SubscriptionDef)> {
-        self.subscriptions.iter().enumerate().filter(|(_, value)| {
+    ) -> impl Iterator<Item = (usize, SubscriptionDef)> + '_ {
+        SubscriptionIter {
+            catalog: &self.subscription_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| {
             value.ddl_state == CatalogDdlState::Present
                 || value.cleanup != SubscriptionCleanup::None
         })
@@ -33655,13 +33736,14 @@ impl Storage {
     pub(crate) fn subscriptions_with_slots_visible_to(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &SubscriptionDef)> {
-        self.subscriptions
-            .iter()
-            .enumerate()
-            .filter(move |(_, subscription)| {
-                subscription.database == current_database() && subscription.visible_to(txid)
-            })
+    ) -> impl Iterator<Item = (usize, SubscriptionDef)> + '_ {
+        SubscriptionIter {
+            catalog: &self.subscription_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, subscription)| {
+            subscription.database == current_database() && subscription.visible_to(txid)
+        })
     }
 
     pub(crate) fn reset_subscription_statistics(
@@ -33670,7 +33752,11 @@ impl Storage {
         txid: u32,
         reset_at: i64,
     ) {
-        for (index, subscription) in self.subscriptions.iter_mut().enumerate() {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        for (index, subscription) in catalog.definitions.iter_mut().enumerate() {
             if subscription.database == current_database()
                 && subscription.visible_to(txid)
                 && slot.is_none_or(|slot| slot == index)
@@ -33682,24 +33768,28 @@ impl Storage {
         }
     }
 
-    pub(crate) fn subscription_for_event_trigger(&self, slot: usize) -> &SubscriptionDef {
-        &self.subscriptions[slot]
+    pub(crate) fn subscription_for_event_trigger(&self, slot: usize) -> SubscriptionDef {
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions[slot]
     }
 
     pub(crate) fn subscriptions_with_slots_durable(
         &self,
-    ) -> impl Iterator<Item = (usize, &SubscriptionDef)> {
-        self.subscriptions
-            .iter()
-            .enumerate()
-            .filter(|(_, subscription)| {
-                subscription.database == current_database()
-                    && (subscription.ddl_state == CatalogDdlState::Present
-                        || subscription.cleanup != SubscriptionCleanup::None)
-            })
+    ) -> impl Iterator<Item = (usize, SubscriptionDef)> + '_ {
+        SubscriptionIter {
+            catalog: &self.subscription_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, subscription)| {
+            subscription.database == current_database()
+                && (subscription.ddl_state == CatalogDdlState::Present
+                    || subscription.cleanup != SubscriptionCleanup::None)
+        })
     }
 
-    pub(crate) fn subscription(&self, name: &str, txid: u32) -> Option<(usize, &SubscriptionDef)> {
+    pub(crate) fn subscription(&self, name: &str, txid: u32) -> Option<(usize, SubscriptionDef)> {
         self.subscriptions_with_slots_visible_to(txid)
             .find(|(_, subscription)| subscription.name_for(txid).as_str() == name)
     }
@@ -33753,31 +33843,50 @@ impl Storage {
                 "subscription slot ownership does not match its bootstrap state"
             ));
         }
-        if self.subscriptions.iter().any(|subscription| {
-            subscription.database == current_database()
-                && subscription.visible_to(txid)
-                && subscription.name_for(txid) == spec.name
-        }) {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        if let Some((existing_slot, subscription)) =
+            catalog
+                .definitions
+                .iter()
+                .enumerate()
+                .find(|(_, subscription)| {
+                    subscription.database == current_database()
+                        && subscription.ddl_state != CatalogDdlState::Absent
+                        && (subscription.name == spec.name
+                            || subscription
+                                .pending_name
+                                .is_some_and(|pending| pending.name == spec.name))
+                })
+        {
+            if let Some(blocker) = Self::subscription_change_blocker(&catalog, existing_slot, txid)
+            {
+                let name = subscription.name;
+                drop(catalog);
+                return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+            }
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "subscription \"{}\" already exists",
                 spec.name.as_str()
             ));
         }
-        let Some(slot) = self.subscriptions.iter().position(|subscription| {
+        let Some(slot) = catalog.definitions.iter().position(|subscription| {
             subscription.ddl_state == CatalogDdlState::Absent
                 && subscription.cleanup == SubscriptionCleanup::None
         }) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many subscriptions (limit {})",
-                self.subscriptions.len()
+                catalog.definitions.len()
             ));
         };
         let mut publications = [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS];
         publications[..spec.publications.len()].copy_from_slice(spec.publications);
         let created_at = self.catalog_sequence.next();
-        self.subscriptions[slot] = SubscriptionDef {
+        catalog.definitions[slot] = SubscriptionDef {
             database: current_database(),
             created_at,
             definition_generation: 1,
@@ -33793,6 +33902,7 @@ impl Storage {
             behavior: spec.behavior,
             bootstrap: spec.bootstrap,
             pending_bootstrap: None,
+            pending_relation_refresh: None,
             cleanup: SubscriptionCleanup::None,
             failure: None,
             apply_error_count: 0,
@@ -33814,14 +33924,23 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        let Some(slot) = self.subscriptions.iter().position(|subscription| {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let Some(slot) = catalog.definitions.iter().position(|subscription| {
             subscription.database == current_database()
                 && subscription.visible_to(txid)
                 && subscription.name_for(txid).as_str() == name
         }) else {
             return Ok(None);
         };
-        self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.drop_by(txid);
+        if let Some(blocker) = Self::subscription_change_blocker(&catalog, slot, txid) {
+            let name = catalog.definitions[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.drop_by(txid);
         Ok(Some(slot))
     }
 
@@ -33836,19 +33955,33 @@ impl Storage {
                 "current role is not present in the role catalog"
             )
         })?;
-        let owner = self.subscriptions[slot].ownership.owner_to(txid) as usize;
+        let (owner, name) = {
+            let catalog = self
+                .subscription_catalog
+                .lock()
+                .expect("subscription catalog lock poisoned");
+            let subscription = catalog.definitions[slot];
+            (
+                subscription.ownership.owner_to(txid) as usize,
+                subscription.name,
+            )
+        };
         if self.role(role).attributes_to(txid).superuser || role == owner {
             return Ok(());
         }
         Err(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "must be owner of subscription {}",
-            self.subscriptions[slot].name.as_str()
+            name.as_str()
         ))
     }
 
     pub(crate) fn commit_subscription_create(&mut self, slot: usize) {
-        self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.commit_create();
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_create();
     }
 
     pub(crate) fn restore_subscription_stream_identity(
@@ -33863,7 +33996,11 @@ impl Storage {
                 "subscription stream identity must be nonzero"
             ));
         }
-        let subscription = &mut self.subscriptions[slot];
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let subscription = &mut catalog.definitions[slot];
         subscription.created_at = created_at;
         subscription.definition_generation = definition_generation;
         self.catalog_sequence.observe(created_at);
@@ -33871,7 +34008,11 @@ impl Storage {
     }
 
     pub(crate) fn restore_subscription_owner(&mut self, slot: usize, owner: u16) {
-        self.subscriptions[slot].ownership = Ownership {
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions[slot]
+            .ownership = Ownership {
             owner,
             pending: None,
         };
@@ -33884,8 +34025,17 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<PendingOwnership>, SqlError> {
         self.require_subscription_owner(slot, txid)?;
-        let prior = self.subscriptions[slot].ownership.pending;
-        self.subscriptions[slot].ownership.pending = Some(PendingOwnership {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        if let Some(blocker) = Self::subscription_change_blocker(&catalog, slot, txid) {
+            let name = catalog.definitions[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let prior = catalog.definitions[slot].ownership.pending;
+        catalog.definitions[slot].ownership.pending = Some(PendingOwnership {
             txid,
             owner: owner as u16,
         });
@@ -33897,11 +34047,20 @@ impl Storage {
         slot: usize,
         prior: Option<PendingOwnership>,
     ) {
-        self.subscriptions[slot].ownership.pending = prior;
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions[slot]
+            .ownership
+            .pending = prior;
     }
 
     pub(crate) fn commit_subscription_owner(&mut self, slot: usize, txid: u32) {
-        let ownership = &mut self.subscriptions[slot].ownership;
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let ownership = &mut catalog.definitions[slot].ownership;
         if let Some(pending) = ownership.pending
             && pending.txid == txid
         {
@@ -33916,24 +34075,44 @@ impl Storage {
         name: SqlName,
         txid: u32,
     ) -> Result<Option<PendingSubscriptionName>, SqlError> {
-        if self
-            .subscriptions
-            .iter()
-            .enumerate()
-            .any(|(other, subscription)| {
-                other != slot
-                    && subscription.database == current_database()
-                    && subscription.visible_to(txid)
-                    && subscription.name_for(txid) == name
-            })
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        if let Some(blocker) = Self::subscription_change_blocker(&catalog, slot, txid) {
+            let current_name = catalog.definitions[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, current_name.as_str()));
+        }
+        if let Some(subscription) =
+            catalog
+                .definitions
+                .iter()
+                .enumerate()
+                .find_map(|(other, subscription)| {
+                    (other != slot
+                        && subscription.database == current_database()
+                        && subscription.ddl_state != CatalogDdlState::Absent
+                        && (subscription.name == name
+                            || subscription
+                                .pending_name
+                                .is_some_and(|pending| pending.name == name)))
+                    .then_some((other, subscription))
+                })
         {
+            let (other, subscription) = subscription;
+            if let Some(blocker) = Self::subscription_change_blocker(&catalog, other, txid) {
+                let current_name = subscription.name;
+                drop(catalog);
+                return Err(self.catalog_ddl_wait_error(txid, blocker, current_name.as_str()));
+            }
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "subscription \"{}\" already exists",
                 name.as_str()
             ));
         }
-        let subscription = &mut self.subscriptions[slot];
+        let subscription = &mut catalog.definitions[slot];
         if let Some(pending) = subscription.pending_name
             && pending.txid != txid
         {
@@ -33949,13 +34128,32 @@ impl Storage {
     }
 
     pub(crate) fn commit_subscription_rename(&mut self, slot: usize, txid: u32) {
-        let subscription = &mut self.subscriptions[slot];
-        if let Some(pending) = subscription.pending_name
-            && pending.txid == txid
-        {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let (created_at, definition_generation) = {
+            let subscription = &mut catalog.definitions[slot];
+            let Some(pending) = subscription
+                .pending_name
+                .filter(|pending| pending.txid == txid)
+            else {
+                return;
+            };
             subscription.name = pending.name;
             subscription.pending_name = None;
-            subscription.definition_generation += 1;
+            subscription.definition_generation = subscription
+                .definition_generation
+                .checked_add(1)
+                .expect("subscription definition generation exhausted");
+            (subscription.created_at, subscription.definition_generation)
+        };
+        for relation in catalog.relations.iter_mut() {
+            if relation.ddl_state != CatalogDdlState::Absent
+                && relation.subscription_created_at == created_at
+            {
+                relation.definition_generation = definition_generation;
+            }
         }
     }
 
@@ -33964,21 +34162,35 @@ impl Storage {
         slot: usize,
         prior: Option<PendingSubscriptionName>,
     ) {
-        self.subscriptions[slot].pending_name = prior;
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions[slot]
+            .pending_name = prior;
     }
 
     pub(crate) fn commit_subscription_drop(&mut self, slot: usize) {
-        let created_at = self.subscriptions[slot].created_at;
-        for relation in self.subscription_relations.iter_mut() {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let created_at = catalog.definitions[slot].created_at;
+        for relation in catalog.relations.iter_mut() {
             if relation.subscription_created_at == created_at {
-                relation.ddl_state = CatalogDdlState::Absent;
+                *relation = SubscriptionRelation::EMPTY;
             }
         }
-        self.subscriptions[slot].cleanup = match self.subscriptions[slot].slot {
+        let cleanup = match catalog.definitions[slot].slot {
             SubscriptionSlot::Managed(_) => SubscriptionCleanup::DropManagedSlot,
             SubscriptionSlot::Absent | SubscriptionSlot::External(_) => SubscriptionCleanup::None,
         };
-        self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.commit_drop();
+        if cleanup == SubscriptionCleanup::None {
+            catalog.definitions[slot] = SubscriptionDef::EMPTY;
+        } else {
+            catalog.definitions[slot].cleanup = cleanup;
+            catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_drop();
+        }
+        drop(catalog);
         self.drop_comments_by_subid(CommentClass::Subscription, created_at as u32);
     }
 
@@ -33986,7 +34198,11 @@ impl Storage {
         &self,
         slot: usize,
     ) -> Option<(u64, SqlName, SubscriptionConnInfo, SqlName)> {
-        let subscription = self.subscriptions.get(slot)?;
+        let catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let subscription = catalog.definitions.get(slot)?;
         let SubscriptionCleanup::DropManagedSlot = subscription.cleanup else {
             return None;
         };
@@ -34006,7 +34222,11 @@ impl Storage {
         slot: usize,
         created_at: u64,
     ) -> Result<(), SqlError> {
-        let subscription = self.subscriptions.get_mut(slot).ok_or_else(|| {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let subscription = catalog.definitions.get_mut(slot).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "subscription cleanup slot is invalid"
@@ -34021,16 +34241,29 @@ impl Storage {
                 "subscription cleanup identity changed"
             ));
         }
-        subscription.cleanup = SubscriptionCleanup::None;
+        *subscription = SubscriptionDef::EMPTY;
         Ok(())
     }
 
     pub(crate) fn rollback_subscription_create(&mut self, slot: usize) {
-        self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.rollback_create();
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        debug_assert_eq!(
+            catalog.definitions[slot].ddl_state.rollback_create(),
+            CatalogDdlState::Absent
+        );
+        catalog.definitions[slot] = SubscriptionDef::EMPTY;
     }
 
     pub(crate) fn rollback_subscription_drop(&mut self, slot: usize, txid: u32) {
-        self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.rollback_drop(txid);
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        catalog.definitions[slot].ddl_state =
+            catalog.definitions[slot].ddl_state.rollback_drop(txid);
     }
 
     /// Stages an enablement change only after proving no concurrent catalog
@@ -34042,8 +34275,16 @@ impl Storage {
         enabled: bool,
         txid: u32,
     ) -> Result<SubscriptionEnabledChange, SqlError> {
-        self.ensure_subscription_changeable(slot, txid)?;
-        let subscription = &mut self.subscriptions[slot];
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        if let Some(blocker) = Self::subscription_change_blocker(&catalog, slot, txid) {
+            let name = catalog.definitions[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let subscription = &mut catalog.definitions[slot];
         if subscription.enabled_to(txid) == enabled {
             return Ok(SubscriptionEnabledChange::Unchanged);
         }
@@ -34052,24 +34293,43 @@ impl Storage {
         Ok(SubscriptionEnabledChange::Changed { prior })
     }
 
-    fn ensure_subscription_changeable(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
-        let subscription = &self.subscriptions[slot];
-        let blocker = subscription
-            .ddl_state
-            .pending_txid()
-            .or_else(|| subscription.pending_enabled.map(|pending| pending.txid))
-            .or_else(|| subscription.pending_bootstrap.map(|pending| pending.txid))
-            .or_else(|| subscription.pending_definition.map(|pending| pending.txid))
-            .or_else(|| subscription.ownership.pending.map(|pending| pending.txid))
-            .filter(|owner| *owner != txid);
-        if let Some(blocker) = blocker {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, subscription.name.as_str()));
-        }
-        Ok(())
+    fn subscription_change_blocker(
+        catalog: &SubscriptionCatalog,
+        slot: usize,
+        txid: u32,
+    ) -> Option<u32> {
+        let subscription = &catalog.definitions[slot];
+        [
+            subscription.ddl_state.pending_txid(),
+            subscription.pending_name.map(|pending| pending.txid),
+            subscription.pending_enabled.map(|pending| pending.txid),
+            subscription.pending_bootstrap.map(|pending| pending.txid),
+            subscription.pending_relation_refresh,
+            subscription.pending_definition.map(|pending| pending.txid),
+            subscription.ownership.pending.map(|pending| pending.txid),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|owner| *owner != txid)
+        .or_else(|| {
+            catalog.relations.iter().find_map(|relation| {
+                if relation.subscription_created_at != subscription.created_at {
+                    return None;
+                }
+                relation
+                    .ddl_state
+                    .pending_txid()
+                    .filter(|owner| *owner != txid)
+            })
+        })
     }
 
     pub(crate) fn commit_subscription_enabled(&mut self, slot: usize, txid: u32) {
-        let subscription = &mut self.subscriptions[slot];
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let subscription = &mut catalog.definitions[slot];
         if let Some(pending) = subscription.pending_enabled
             && pending.txid == txid
         {
@@ -34086,7 +34346,11 @@ impl Storage {
         slot: usize,
         prior: Option<PendingSubscriptionEnabled>,
     ) {
-        self.subscriptions[slot].pending_enabled = prior;
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions[slot]
+            .pending_enabled = prior;
     }
 
     pub(crate) fn set_subscription_bootstrap(
@@ -34095,8 +34359,16 @@ impl Storage {
         bootstrap: SubscriptionBootstrap,
         txid: u32,
     ) -> Result<SubscriptionBootstrapChange, SqlError> {
-        self.ensure_subscription_changeable(slot, txid)?;
-        let subscription = &mut self.subscriptions[slot];
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        if let Some(blocker) = Self::subscription_change_blocker(&catalog, slot, txid) {
+            let name = catalog.definitions[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let subscription = &mut catalog.definitions[slot];
         if subscription.bootstrap_to(txid) == bootstrap {
             return Ok(SubscriptionBootstrapChange::Unchanged);
         }
@@ -34106,7 +34378,11 @@ impl Storage {
     }
 
     pub(crate) fn commit_subscription_bootstrap(&mut self, slot: usize, txid: u32) {
-        let subscription = &mut self.subscriptions[slot];
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let subscription = &mut catalog.definitions[slot];
         if let Some(pending) = subscription.pending_bootstrap
             && pending.txid == txid
         {
@@ -34121,7 +34397,11 @@ impl Storage {
         slot: usize,
         prior: Option<PendingSubscriptionBootstrap>,
     ) {
-        self.subscriptions[slot].pending_bootstrap = prior;
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions[slot]
+            .pending_bootstrap = prior;
     }
 
     pub(crate) fn set_subscription_definition(
@@ -34130,8 +34410,16 @@ impl Storage {
         definition: SubscriptionDefinition,
         txid: u32,
     ) -> Result<SubscriptionDefinitionChange, SqlError> {
-        self.ensure_subscription_changeable(slot, txid)?;
-        let subscription = &mut self.subscriptions[slot];
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        if let Some(blocker) = Self::subscription_change_blocker(&catalog, slot, txid) {
+            let name = catalog.definitions[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let subscription = &mut catalog.definitions[slot];
         let current = subscription.definition_to(txid);
         if current.connection.as_str() == definition.connection.as_str()
             && current.publications() == definition.publications()
@@ -34166,14 +34454,26 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> SubscriptionDefinition {
-        self.subscriptions[slot].definition_to(txid)
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions[slot]
+            .definition_to(txid)
     }
 
     pub(crate) fn commit_subscription_definition(&mut self, slot: usize, txid: u32) {
-        let subscription = &mut self.subscriptions[slot];
-        if let Some(pending) = subscription.pending_definition
-            && pending.txid == txid
-        {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let Some((created_at, definition_generation)) = ({
+            let subscription = &mut catalog.definitions[slot];
+            let Some(pending) = subscription
+                .pending_definition
+                .filter(|pending| pending.txid == txid)
+            else {
+                return;
+            };
             let replaces_stream = subscription.connection.as_str() != pending.connection.as_str()
                 || subscription.publication_count != pending.publication_count
                 || subscription.publications[..subscription.publication_count]
@@ -34195,13 +34495,15 @@ impl Storage {
             }
             subscription.pending_definition = None;
             subscription.failure = None;
-            for relation in self.subscription_relations.iter_mut() {
-                if relation.ddl_state == CatalogDdlState::Present
-                    && relation.subscription_created_at == subscription.created_at
-                    && replaces_stream
-                {
-                    relation.definition_generation = subscription.definition_generation;
-                }
+            replaces_stream.then_some((subscription.created_at, subscription.definition_generation))
+        }) else {
+            return;
+        };
+        for relation in catalog.relations.iter_mut() {
+            if relation.ddl_state != CatalogDdlState::Absent
+                && relation.subscription_created_at == created_at
+            {
+                relation.definition_generation = definition_generation;
             }
         }
     }
@@ -34211,7 +34513,11 @@ impl Storage {
         stream: SubscriptionStream,
         failure: SubscriptionFailure,
     ) -> Result<(), SqlError> {
-        let subscription = self.subscriptions.get_mut(stream.slot()).ok_or_else(|| {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let subscription = catalog.definitions.get_mut(stream.slot()).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "subscription worker slot is invalid"
@@ -34245,7 +34551,11 @@ impl Storage {
         slot: usize,
         prior: Option<PendingSubscriptionDefinition>,
     ) {
-        self.subscriptions[slot].pending_definition = prior;
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions[slot]
+            .pending_definition = prior;
     }
 
     /// Validates one monotonically advancing, committed publisher position.
@@ -34253,7 +34563,10 @@ impl Storage {
     /// explicitly idempotent; callers must not apply that remote transaction
     /// again.
     pub(crate) fn subscription_stream(&self, slot: usize, txid: u32) -> Option<SubscriptionStream> {
-        self.subscriptions
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions
             .get(slot)
             .filter(|subscription| {
                 subscription.database == current_database() && subscription.visible_to(txid)
@@ -34273,8 +34586,12 @@ impl Storage {
         confirmed_lsn: u64,
         txid: u32,
     ) -> Result<Option<SubscriptionAdvance>, SqlError> {
-        let subscription = self
-            .subscriptions
+        let catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let subscription = catalog
+            .definitions
             .get(stream.slot)
             .filter(|subscription| {
                 stream.database == current_database()
@@ -34304,22 +34621,29 @@ impl Storage {
         advance: SubscriptionAdvance,
         origin_lsn: u64,
     ) {
-        let subscription = self
-            .subscriptions
-            .get_mut(advance.stream.slot)
-            .filter(|subscription| {
-                subscription.ddl_state == CatalogDdlState::Present
-                    && subscription.database == current_database()
-                    && advance.stream.database == current_database()
-                    && subscription.created_at == advance.stream.created_at
-                    && subscription.definition_generation == advance.stream.definition_generation
-                    && subscription.name == advance.stream.name
-            })
-            .expect("validated subscription must remain live until its WAL commit");
-        subscription.confirmed_lsn = advance.confirmed_lsn;
-        subscription.origin_lsn = origin_lsn;
-        subscription.bootstrap = SubscriptionBootstrap::Ready;
-        for relation in self.subscription_relations.iter_mut() {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        {
+            let subscription = catalog
+                .definitions
+                .get_mut(advance.stream.slot)
+                .filter(|subscription| {
+                    subscription.ddl_state == CatalogDdlState::Present
+                        && subscription.database == current_database()
+                        && advance.stream.database == current_database()
+                        && subscription.created_at == advance.stream.created_at
+                        && subscription.definition_generation
+                            == advance.stream.definition_generation
+                        && subscription.name == advance.stream.name
+                })
+                .expect("validated subscription must remain live until its WAL commit");
+            subscription.confirmed_lsn = advance.confirmed_lsn;
+            subscription.origin_lsn = origin_lsn;
+            subscription.bootstrap = SubscriptionBootstrap::Ready;
+        }
+        for relation in catalog.relations.iter_mut() {
             if relation.ddl_state == CatalogDdlState::Present
                 && relation.subscription_created_at == advance.stream.created_at
                 && relation.definition_generation == advance.stream.definition_generation
@@ -34335,32 +34659,34 @@ impl Storage {
         stream: SubscriptionStream,
         txid: u32,
     ) -> Result<(), SqlError> {
-        self.subscriptions
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let valid = catalog
+            .definitions
             .get(stream.slot)
-            .filter(|subscription| {
+            .is_some_and(|subscription| {
                 stream.database == current_database()
                     && subscription.database == current_database()
                     && subscription.visible_to(txid)
                     && subscription.created_at == stream.created_at
                     && subscription.definition_generation == stream.definition_generation
                     && subscription.name == stream.name
-            })
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                    "subscription stream definition changed before relation refresh"
-                )
-            })?;
-        for relation in self.subscription_relations.iter_mut() {
-            if let Some(owner) = relation.ddl_state.pending_txid()
-                && owner != txid
-                && relation.subscription_created_at == stream.created_at
-            {
-                return Err(sql_err!(
-                    sqlstate::OBJECT_IN_USE,
-                    "subscription relation catalog is being changed concurrently"
-                ));
-            }
+            });
+        if !valid {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "subscription stream definition changed before relation refresh"
+            ));
+        }
+        if let Some(blocker) = Self::subscription_change_blocker(&catalog, stream.slot, txid) {
+            let name = catalog.definitions[stream.slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        catalog.definitions[stream.slot].pending_relation_refresh = Some(txid);
+        for relation in catalog.relations.iter_mut() {
             if relation.ddl_state == CatalogDdlState::Present
                 && relation.subscription_created_at == stream.created_at
             {
@@ -34391,7 +34717,38 @@ impl Storage {
                 "subscription relation table identity exceeds its fixed range"
             ));
         }
-        if self.subscription_relations.iter().any(|relation| {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        Self::stage_subscription_relation_in(&mut catalog, stream, table_slot, txid)
+    }
+
+    fn stage_subscription_relation_in(
+        catalog: &mut SubscriptionCatalog,
+        stream: SubscriptionStream,
+        table_slot: usize,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        catalog
+            .definitions
+            .get(stream.slot)
+            .filter(|subscription| {
+                stream.database == current_database()
+                    && subscription.database == current_database()
+                    && subscription.visible_to(txid)
+                    && subscription.created_at == stream.created_at
+                    && subscription.definition_generation == stream.definition_generation
+                    && subscription.name == stream.name
+                    && (txid == 0 || subscription.pending_relation_refresh == Some(txid))
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "subscription stream definition changed before relation refresh"
+                )
+            })?;
+        if catalog.relations.iter().any(|relation| {
             relation.ddl_state.visible_to(txid)
                 && relation.subscription_created_at == stream.created_at
                 && relation.definition_generation == stream.definition_generation
@@ -34399,8 +34756,8 @@ impl Storage {
         }) {
             return Ok(table_slot);
         }
-        let relation = self
-            .subscription_relations
+        let relation = catalog
+            .relations
             .iter_mut()
             .find(|relation| relation.ddl_state == CatalogDdlState::Absent)
             .ok_or_else(|| {
@@ -34428,9 +34785,33 @@ impl Storage {
         state: SubscriptionRelationState,
         synchronization_lsn: u64,
     ) -> Result<(), SqlError> {
-        let table_slot = self.stage_subscription_relation(stream, schema, table, 0)?;
-        let relation = self
-            .subscription_relations
+        let table_slot = self.find_visible(schema, table, 0).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "subscription relation \"{}.{}\" does not exist locally",
+                schema,
+                table
+            )
+        })?;
+        if table_slot > usize::from(u16::MAX) {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "subscription relation table identity exceeds its fixed range"
+            ));
+        }
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        catalog.definitions[stream.slot].pending_relation_refresh = Some(0);
+        if let Err(error) =
+            Self::stage_subscription_relation_in(&mut catalog, stream, table_slot, 0)
+        {
+            catalog.definitions[stream.slot].pending_relation_refresh = None;
+            return Err(error);
+        }
+        let relation = catalog
+            .relations
             .iter_mut()
             .find(|relation| {
                 relation.subscription_created_at == stream.created_at
@@ -34440,34 +34821,60 @@ impl Storage {
             .expect("staged subscription relation is present");
         relation.state = state;
         relation.synchronization_lsn = synchronization_lsn;
-        self.commit_subscription_relation_refresh(0);
+        for relation in catalog.relations.iter_mut() {
+            if matches!(
+                relation.ddl_state,
+                CatalogDdlState::PendingCreate { txid: 0 }
+            ) {
+                relation.ddl_state = CatalogDdlState::Present;
+            }
+        }
+        catalog.definitions[stream.slot].pending_relation_refresh = None;
         Ok(())
     }
 
     pub(crate) fn commit_subscription_relation_refresh(&mut self, txid: u32) {
-        for relation in self.subscription_relations.iter_mut() {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        for relation in catalog.relations.iter_mut() {
             match relation.ddl_state {
                 CatalogDdlState::PendingCreate { txid: owner } if owner == txid => {
                     relation.ddl_state = CatalogDdlState::Present;
                 }
                 CatalogDdlState::PendingDrop { txid: owner } if owner == txid => {
-                    relation.ddl_state = CatalogDdlState::Absent;
+                    *relation = SubscriptionRelation::EMPTY;
                 }
                 _ => {}
+            }
+        }
+        for subscription in catalog.definitions.iter_mut() {
+            if subscription.pending_relation_refresh == Some(txid) {
+                subscription.pending_relation_refresh = None;
             }
         }
     }
 
     pub(crate) fn rollback_subscription_relation_refresh(&mut self, txid: u32) {
-        for relation in self.subscription_relations.iter_mut() {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        for relation in catalog.relations.iter_mut() {
             match relation.ddl_state {
                 CatalogDdlState::PendingCreate { txid: owner } if owner == txid => {
-                    relation.ddl_state = CatalogDdlState::Absent;
+                    *relation = SubscriptionRelation::EMPTY;
                 }
                 CatalogDdlState::PendingDrop { txid: owner } if owner == txid => {
                     relation.ddl_state = CatalogDdlState::Present;
                 }
                 _ => {}
+            }
+        }
+        for subscription in catalog.definitions.iter_mut() {
+            if subscription.pending_relation_refresh == Some(txid) {
+                subscription.pending_relation_refresh = None;
             }
         }
     }
@@ -34476,11 +34883,17 @@ impl Storage {
         &self,
         subscription: &SubscriptionDef,
         txid: u32,
-    ) -> impl Iterator<Item = &SubscriptionRelation> {
-        self.subscription_relations.iter().filter(move |relation| {
+    ) -> impl Iterator<Item = SubscriptionRelation> + '_ {
+        let created_at = subscription.created_at;
+        let definition_generation = subscription.definition_generation;
+        SubscriptionRelationIter {
+            catalog: &self.subscription_catalog,
+            next_slot: 0,
+        }
+        .filter(move |relation| {
             relation.ddl_state.visible_to(txid)
-                && relation.subscription_created_at == subscription.created_at
-                && relation.definition_generation == subscription.definition_generation
+                && relation.subscription_created_at == created_at
+                && relation.definition_generation == definition_generation
         })
     }
 
@@ -34493,13 +34906,18 @@ impl Storage {
         let Some(table_slot) = self.find_visible(schema, table, 0) else {
             return false;
         };
-        self.subscription_relations.iter().any(|relation| {
-            relation.ddl_state == CatalogDdlState::Present
-                && relation.subscription_created_at == stream.created_at
-                && relation.definition_generation == stream.definition_generation
-                && relation.table_slot() == table_slot
-                && relation.state == SubscriptionRelationState::Ready
-        })
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .relations
+            .iter()
+            .any(|relation| {
+                relation.ddl_state == CatalogDdlState::Present
+                    && relation.subscription_created_at == stream.created_at
+                    && relation.definition_generation == stream.definition_generation
+                    && relation.table_slot() == table_slot
+                    && relation.state == SubscriptionRelationState::Ready
+            })
     }
 
     pub fn create_publication(
@@ -51701,6 +52119,175 @@ mod tests {
         assert_eq!((slots[0].total_txns, slots[0].total_bytes), (0, 0));
         assert_eq!(slots[1].sent_lsn, 21);
         assert_eq!((slots[1].total_txns, slots[1].total_bytes), (1, 200));
+    }
+
+    #[test]
+    fn subscription_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<SubscriptionCatalog>>();
+        assert_send_sync::<SubscriptionIter<'_>>();
+        assert_send_sync::<SubscriptionRelationIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_connections = WORKERS as u32;
+        config.max_subscriptions = WORKERS;
+        config.subscription_relation_capacity = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let connection = SubscriptionConnInfo::parse(
+            "host=127.0.0.1 port=1 user=test dbname=test sslmode=disable",
+        )
+        .unwrap();
+        let publication = SqlName::parse("published_changes").unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let name = stack_format!(63, "subscription_{worker}");
+                    let mut catalog = storage
+                        .subscription_catalog
+                        .lock()
+                        .expect("subscription catalog lock poisoned");
+                    catalog.definitions[worker] = SubscriptionDef {
+                        created_at: worker as u64 + 1,
+                        definition_generation: 1,
+                        name: SqlName::parse(name.as_str()).unwrap(),
+                        connection,
+                        publications: [publication; MAX_SUBSCRIPTION_PUBLICATIONS],
+                        publication_count: 1,
+                        ddl_state: CatalogDdlState::Present,
+                        ..SubscriptionDef::EMPTY
+                    };
+                    catalog.relations[worker] = SubscriptionRelation {
+                        subscription_created_at: worker as u64 + 1,
+                        definition_generation: 1,
+                        table_slot: worker as u16,
+                        state: SubscriptionRelationState::DataCopy,
+                        synchronization_lsn: 0,
+                        ddl_state: CatalogDdlState::Present,
+                    };
+                });
+            }
+        });
+
+        {
+            let catalog = storage
+                .subscription_catalog
+                .lock()
+                .expect("subscription catalog lock poisoned");
+            assert_eq!(catalog.definitions.capacity(), WORKERS);
+            assert_eq!(catalog.relations.capacity(), WORKERS);
+        }
+        assert_eq!(
+            storage.subscriptions_with_slots_visible_to(0).count(),
+            WORKERS
+        );
+        for (slot, definition) in storage.subscriptions_with_slots_visible_to(0) {
+            let nested = storage
+                .subscription(definition.name.as_str(), 0)
+                .expect("copied iterator releases the catalog lock");
+            assert_eq!(nested.0, slot);
+            assert_eq!(
+                storage
+                    .subscription_relations_visible_to(&definition, 0)
+                    .count(),
+                1
+            );
+        }
+
+        assert!(
+            storage
+                .create_subscription(
+                    SubscriptionSpec {
+                        name: SqlName::parse("subscription_full").unwrap(),
+                        connection,
+                        publications: &[publication],
+                        enabled: false,
+                        slot: SubscriptionSlot::Absent,
+                        behavior: SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+                        bootstrap: SubscriptionBootstrap::Deferred,
+                    },
+                    9,
+                )
+                .is_err()
+        );
+
+        let mut definition = storage.subscription_definition_to(0, 9);
+        definition.connection = SubscriptionConnInfo::parse(
+            "host=127.0.0.1 port=2 user=test dbname=test sslmode=disable",
+        )
+        .unwrap();
+        assert!(
+            storage
+                .set_subscription_definition(0, definition, 9)
+                .unwrap()
+                .changed
+        );
+        storage.commit_subscription_definition(0, 9);
+        let subscription = storage.subscription("subscription_0", 0).unwrap().1;
+        assert_eq!(subscription.definition_generation, 2);
+        let relation = storage
+            .subscription_relations_visible_to(&subscription, 0)
+            .next()
+            .unwrap();
+        assert_eq!(relation.definition_generation, 2);
+
+        let stream = storage.subscription_stream(0, 0).unwrap();
+        let advance = storage
+            .subscription_advance(stream, 42, 0)
+            .unwrap()
+            .unwrap();
+        storage.apply_subscription_advance(advance, 7);
+        let subscription = storage.subscription("subscription_0", 0).unwrap().1;
+        assert_eq!(
+            (subscription.confirmed_lsn, subscription.origin_lsn),
+            (42, 7)
+        );
+        let relation = storage
+            .subscription_relations_visible_to(&subscription, 0)
+            .next()
+            .unwrap();
+        assert_eq!(relation.state(), SubscriptionRelationState::Ready);
+        assert_eq!(relation.synchronization_lsn(), 42);
+
+        storage
+            .begin_subscription_relation_refresh(stream, 11)
+            .unwrap();
+        assert!(
+            storage
+                .rename_subscription(0, SqlName::parse("blocked_rename").unwrap(), 12)
+                .is_err()
+        );
+        storage.rollback_subscription_relation_refresh(11);
+
+        storage.drop_subscription("subscription_0", 9).unwrap();
+        storage.commit_subscription_drop(0);
+        let catalog = storage
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        assert_eq!(catalog.definitions[0].created_at, 0);
+        assert_eq!(catalog.definitions[0].name, SqlName::EMPTY);
+        assert_eq!(catalog.relations[0].subscription_created_at, 0);
+        assert_eq!(catalog.relations[0].ddl_state, CatalogDdlState::Absent);
+        drop(catalog);
+
+        let other_database = DatabaseOid::parse(USER_DATABASE_OID_BASE + 1).unwrap();
+        storage
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions[1]
+            .database = other_database;
+        storage.clear_database_catalog(other_database);
+        let catalog = storage
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        assert_eq!(catalog.definitions[1].created_at, 0);
+        assert_eq!(catalog.relations[1].subscription_created_at, 0);
     }
 
     #[test]

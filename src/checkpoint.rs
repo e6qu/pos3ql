@@ -9421,7 +9421,7 @@ impl Checkpointer {
                     publications.as_str(),
                 ),
             )?;
-            for relation in storage.subscription_relations_visible_to(subscription, 0) {
+            for relation in storage.subscription_relations_visible_to(&subscription, 0) {
                 let table = storage.table_def(relation.table_slot(), 0);
                 let mut schema = StackStr::<130>::new();
                 let mut table_name = StackStr::<130>::new();

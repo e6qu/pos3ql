@@ -3718,7 +3718,7 @@ impl Engine {
         source_name: crate::storage::ReplicationSlotName,
         destination_name: crate::storage::ReplicationSlotName,
     ) -> Result<u64, SqlError> {
-        let source = *self
+        let source = self
             .storage
             .replication_slot(source_name.as_str())
             .ok_or_else(|| {

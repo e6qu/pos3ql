@@ -5275,6 +5275,23 @@ pub(crate) struct ReplicationSlotDef {
     pub live: bool,
 }
 
+impl ReplicationSlotDef {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        name: SqlName::EMPTY,
+        restart_lsn: 0,
+        confirmed_flush_lsn: 0,
+        behavior: ReplicationSlotBehavior::DEFAULT,
+        active: false,
+        active_pid: None,
+        sent_lsn: 0,
+        total_txns: 0,
+        total_bytes: 0,
+        stats_reset: None,
+        live: false,
+    };
+}
+
 /// PostgreSQL logical-slot properties that affect what the publisher retains
 /// and where the slot can resume. They are one durable state, not command text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5930,6 +5947,7 @@ impl SubscriptionAdvance {
 /// WAL is written; only this module can then apply it to the recorded slot.
 pub(crate) struct ReplicationSlotAdvance {
     slot: usize,
+    database: DatabaseOid,
     name: SqlName,
     confirmed_flush_lsn: u64,
 }
@@ -7144,6 +7162,26 @@ struct ExtendedStatisticsIter<'a> {
 struct PublicationIter<'a> {
     catalog: &'a std::sync::Mutex<FixedVec<PublicationDef>>,
     next_slot: usize,
+}
+
+struct ReplicationSlotIter<'a> {
+    catalog: &'a std::sync::Mutex<FixedVec<ReplicationSlotDef>>,
+    next_slot: usize,
+}
+
+impl Iterator for ReplicationSlotIter<'_> {
+    type Item = (usize, ReplicationSlotDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("replication slot catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
 }
 
 impl Iterator for PublicationIter<'_> {
@@ -12909,7 +12947,7 @@ pub struct Storage {
     policy_role_replay_image: usize,
     extended_statistics_catalog: std::sync::Mutex<ExtendedStatisticsCatalog>,
     publications: std::sync::Mutex<FixedVec<PublicationDef>>,
-    replication_slots: FixedVec<ReplicationSlotDef>,
+    replication_slots: std::sync::Mutex<FixedVec<ReplicationSlotDef>>,
     subscriptions: FixedVec<SubscriptionDef>,
     foreign: foreign::ForeignCatalog,
     foreign_sessions: ForeignSessionPool,
@@ -16962,20 +17000,7 @@ impl Storage {
             FixedVec::new(budget, "replication_slots", config.max_replication_slots)?;
         for _ in 0..config.max_replication_slots {
             replication_slots
-                .push(ReplicationSlotDef {
-                    database: DatabaseOid::POSTGRES,
-                    name: SqlName::EMPTY,
-                    restart_lsn: 0,
-                    confirmed_flush_lsn: 0,
-                    behavior: ReplicationSlotBehavior::DEFAULT,
-                    active: false,
-                    active_pid: None,
-                    sent_lsn: 0,
-                    total_txns: 0,
-                    total_bytes: 0,
-                    stats_reset: None,
-                    live: false,
-                })
+                .push(ReplicationSlotDef::EMPTY)
                 .expect("sized to max_replication_slots");
         }
         let mut subscriptions = FixedVec::new(budget, "subscriptions", config.max_subscriptions)?;
@@ -17525,7 +17550,7 @@ impl Storage {
                 pending_data: pending_extended_statistics_data,
             }),
             publications: std::sync::Mutex::new(publications),
-            replication_slots,
+            replication_slots: std::sync::Mutex::new(replication_slots),
             subscriptions,
             foreign,
             foreign_sessions: ForeignSessionPool {
@@ -20146,11 +20171,14 @@ impl Storage {
                 }
             }
         }
-        for slot in self.replication_slots.iter_mut() {
+        for slot in self
+            .replication_slots
+            .lock()
+            .expect("replication slot catalog lock poisoned")
+            .iter_mut()
+        {
             if slot.database == database {
-                slot.database = DatabaseOid::POSTGRES;
-                slot.live = false;
-                slot.active = false;
+                *slot = ReplicationSlotDef::EMPTY;
             }
         }
         for slot in 0..self.matviews.len() {
@@ -21487,11 +21515,12 @@ impl Storage {
 
     pub(crate) fn checkpoint_replication_slots(
         &self,
-    ) -> impl Iterator<Item = (usize, &ReplicationSlotDef)> {
-        self.replication_slots
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.live)
+    ) -> impl Iterator<Item = (usize, ReplicationSlotDef)> + '_ {
+        ReplicationSlotIter {
+            catalog: &self.replication_slots,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.live)
     }
 
     pub(crate) fn checkpoint_subscriptions(
@@ -33308,39 +33337,42 @@ impl Storage {
         ))
     }
 
-    pub(crate) fn create_replication_slot(
-        &mut self,
+    fn insert_replication_slot(
+        &self,
         name: ReplicationSlotName,
         restart_lsn: u64,
+        confirmed_flush_lsn: u64,
         behavior: ReplicationSlotBehavior,
     ) -> Result<usize, SqlError> {
-        if self
+        let mut replication_slots = self
             .replication_slots
-            .iter()
-            .any(|slot| slot.live && slot.name.as_str() == name.as_str())
-        {
+            .lock()
+            .expect("replication slot catalog lock poisoned");
+        if replication_slots.iter().any(|slot| {
+            slot.database == current_database() && slot.live && slot.name.as_str() == name.as_str()
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "replication slot \"{}\" already exists",
                 name.as_str()
             ));
         }
-        let Some(index) = self.replication_slots.iter().position(|slot| !slot.live) else {
+        let Some(index) = replication_slots.iter().position(|slot| !slot.live) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many replication slots (limit {})",
-                self.replication_slots.len()
+                replication_slots.len()
             ));
         };
-        self.replication_slots[index] = ReplicationSlotDef {
+        replication_slots[index] = ReplicationSlotDef {
             database: current_database(),
             name: name.sql_name(),
             restart_lsn,
-            confirmed_flush_lsn: restart_lsn,
+            confirmed_flush_lsn,
             behavior,
             active: false,
             active_pid: None,
-            sent_lsn: restart_lsn,
+            sent_lsn: confirmed_flush_lsn,
             total_txns: 0,
             total_bytes: 0,
             stats_reset: None,
@@ -33349,10 +33381,24 @@ impl Storage {
         Ok(index)
     }
 
-    pub(crate) fn replication_slot(&self, name: &str) -> Option<&ReplicationSlotDef> {
-        self.replication_slots.iter().find(|slot| {
-            slot.database == current_database() && slot.live && slot.name.as_str() == name
-        })
+    pub(crate) fn create_replication_slot(
+        &mut self,
+        name: ReplicationSlotName,
+        restart_lsn: u64,
+        behavior: ReplicationSlotBehavior,
+    ) -> Result<usize, SqlError> {
+        self.insert_replication_slot(name, restart_lsn, restart_lsn, behavior)
+    }
+
+    pub(crate) fn replication_slot(&self, name: &str) -> Option<ReplicationSlotDef> {
+        self.replication_slots
+            .lock()
+            .expect("replication slot catalog lock poisoned")
+            .iter()
+            .copied()
+            .find(|slot| {
+                slot.database == current_database() && slot.live && slot.name.as_str() == name
+            })
     }
 
     pub(crate) fn alter_replication_slot(
@@ -33360,8 +33406,11 @@ impl Storage {
         name: ReplicationSlotName,
         behavior: ReplicationSlotBehavior,
     ) -> Result<(), SqlError> {
-        let slot = self
+        let mut replication_slots = self
             .replication_slots
+            .lock()
+            .expect("replication slot catalog lock poisoned");
+        let slot = replication_slots
             .iter_mut()
             .find(|slot| {
                 slot.database == current_database() && slot.live && slot.name == name.sql_name()
@@ -33386,15 +33435,19 @@ impl Storage {
 
     pub(crate) fn replication_slots_with_slots(
         &self,
-    ) -> impl Iterator<Item = (usize, &ReplicationSlotDef)> {
-        self.replication_slots
-            .iter()
-            .enumerate()
-            .filter(|(_, slot)| slot.database == current_database() && slot.live)
+    ) -> impl Iterator<Item = (usize, ReplicationSlotDef)> + '_ {
+        ReplicationSlotIter {
+            catalog: &self.replication_slots,
+            next_slot: 0,
+        }
+        .filter(|(_, slot)| slot.database == current_database() && slot.live)
     }
 
     pub(crate) fn replication_slot_capacity(&self) -> usize {
-        self.replication_slots.len()
+        self.replication_slots
+            .lock()
+            .expect("replication slot catalog lock poisoned")
+            .len()
     }
 
     /// The oldest durable point any logical consumer may still request.
@@ -33418,13 +33471,16 @@ impl Storage {
                 "replication slot confirmed LSN precedes restart LSN"
             ));
         }
-        let slot = self.create_replication_slot(name, restart_lsn, behavior)?;
-        self.replication_slots[slot].confirmed_flush_lsn = confirmed_flush_lsn;
-        Ok(())
+        self.insert_replication_slot(name, restart_lsn, confirmed_flush_lsn, behavior)
+            .map(|_| ())
     }
 
     pub(crate) fn drop_replication_slot(&mut self, name: &str) -> Result<(), SqlError> {
-        let Some(slot) = self.replication_slots.iter_mut().find(|slot| {
+        let mut replication_slots = self
+            .replication_slots
+            .lock()
+            .expect("replication slot catalog lock poisoned");
+        let Some(slot) = replication_slots.iter_mut().find(|slot| {
             slot.database == current_database() && slot.live && slot.name.as_str() == name
         }) else {
             return Err(sql_err!(
@@ -33440,20 +33496,7 @@ impl Storage {
                 name
             ));
         }
-        *slot = ReplicationSlotDef {
-            database: current_database(),
-            name: SqlName::EMPTY,
-            restart_lsn: 0,
-            confirmed_flush_lsn: 0,
-            behavior: ReplicationSlotBehavior::DEFAULT,
-            active: false,
-            active_pid: None,
-            sent_lsn: 0,
-            total_txns: 0,
-            total_bytes: 0,
-            stats_reset: None,
-            live: false,
-        };
+        *slot = ReplicationSlotDef::EMPTY;
         Ok(())
     }
 
@@ -33462,11 +33505,16 @@ impl Storage {
         name: &str,
         confirmed_flush_lsn: u64,
     ) -> Result<ReplicationSlotAdvance, SqlError> {
-        let (index, slot) = self
+        let replication_slots = self
             .replication_slots
+            .lock()
+            .expect("replication slot catalog lock poisoned");
+        let (index, slot) = replication_slots
             .iter()
             .enumerate()
-            .find(|(_, slot)| slot.live && slot.name.as_str() == name)
+            .find(|(_, slot)| {
+                slot.database == current_database() && slot.live && slot.name.as_str() == name
+            })
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -33482,16 +33530,22 @@ impl Storage {
         }
         Ok(ReplicationSlotAdvance {
             slot: index,
+            database: slot.database,
             name: slot.name,
             confirmed_flush_lsn,
         })
     }
 
     pub(crate) fn apply_replication_slot_advance(&mut self, advance: ReplicationSlotAdvance) {
-        let slot = self
+        let mut replication_slots = self
             .replication_slots
+            .lock()
+            .expect("replication slot catalog lock poisoned");
+        let slot = replication_slots
             .get_mut(advance.slot)
-            .filter(|slot| slot.live && slot.name == advance.name)
+            .filter(|slot| {
+                slot.database == advance.database && slot.live && slot.name == advance.name
+            })
             .expect("validated replication slot must remain live until its WAL commit");
         slot.confirmed_flush_lsn = advance.confirmed_flush_lsn;
         slot.restart_lsn = advance.confirmed_flush_lsn;
@@ -33502,10 +33556,15 @@ impl Storage {
         name: &str,
         backend_pid: i32,
     ) -> Result<u64, SqlError> {
-        let slot = self
+        let mut replication_slots = self
             .replication_slots
+            .lock()
+            .expect("replication slot catalog lock poisoned");
+        let slot = replication_slots
             .iter_mut()
-            .find(|slot| slot.live && slot.name.as_str() == name)
+            .find(|slot| {
+                slot.database == current_database() && slot.live && slot.name.as_str() == name
+            })
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -33532,11 +33591,13 @@ impl Storage {
         sent_lsn: u64,
         bytes: usize,
     ) {
-        let Some(slot) = self
+        let mut replication_slots = self
             .replication_slots
-            .iter_mut()
-            .find(|slot| slot.live && slot.name.as_str() == name)
-        else {
+            .lock()
+            .expect("replication slot catalog lock poisoned");
+        let Some(slot) = replication_slots.iter_mut().find(|slot| {
+            slot.database == current_database() && slot.live && slot.name.as_str() == name
+        }) else {
             return;
         };
         slot.sent_lsn = slot.sent_lsn.max(sent_lsn);
@@ -33551,8 +33612,14 @@ impl Storage {
         name: Option<&str>,
         reset_at: i64,
     ) -> Result<(), SqlError> {
+        let mut replication_slots = self
+            .replication_slots
+            .lock()
+            .expect("replication slot catalog lock poisoned");
         if let Some(name) = name
-            && self.replication_slot(name).is_none()
+            && !replication_slots.iter().any(|slot| {
+                slot.database == current_database() && slot.live && slot.name.as_str() == name
+            })
         {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -33560,7 +33627,7 @@ impl Storage {
                 name
             ));
         }
-        for slot in self.replication_slots.iter_mut().filter(|slot| {
+        for slot in replication_slots.iter_mut().filter(|slot| {
             slot.database == current_database()
                 && slot.live
                 && name.is_none_or(|name| slot.name.as_str() == name)
@@ -33573,11 +33640,13 @@ impl Storage {
     }
 
     pub(crate) fn deactivate_replication_slot(&mut self, name: &str) {
-        if let Some(slot) = self
+        let mut replication_slots = self
             .replication_slots
-            .iter_mut()
-            .find(|slot| slot.live && slot.name.as_str() == name)
-        {
+            .lock()
+            .expect("replication slot catalog lock poisoned");
+        if let Some(slot) = replication_slots.iter_mut().find(|slot| {
+            slot.database == current_database() && slot.live && slot.name.as_str() == name
+        }) {
             slot.active = false;
             slot.active_pid = None;
         }
@@ -51530,6 +51599,108 @@ mod tests {
             storage.publication_for_event_trigger(1).ddl_state,
             CatalogDdlState::Absent
         );
+    }
+
+    #[test]
+    fn replication_slot_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<FixedVec<ReplicationSlotDef>>>();
+        assert_send_sync::<ReplicationSlotIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_connections = WORKERS as u32;
+        config.max_replication_slots = WORKERS;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let name = stack_format!(63, "replication_slot_{worker}");
+                    storage
+                        .replication_slots
+                        .lock()
+                        .expect("replication slot catalog lock poisoned")[worker] =
+                        ReplicationSlotDef {
+                            name: SqlName::parse(name.as_str()).unwrap(),
+                            restart_lsn: worker as u64 + 1,
+                            confirmed_flush_lsn: worker as u64 + 1,
+                            sent_lsn: worker as u64 + 1,
+                            live: true,
+                            ..ReplicationSlotDef::EMPTY
+                        };
+                });
+            }
+        });
+
+        assert_eq!(storage.replication_slot_capacity(), WORKERS);
+        assert_eq!(storage.replication_slots_with_slots().count(), WORKERS);
+        for (_, slot) in storage.replication_slots_with_slots() {
+            assert_eq!(
+                storage
+                    .replication_slot(slot.name.as_str())
+                    .unwrap()
+                    .restart_lsn,
+                slot.restart_lsn
+            );
+        }
+        assert!(
+            storage
+                .create_replication_slot(
+                    ReplicationSlotName::parse("replication_slot_full").unwrap(),
+                    10,
+                    ReplicationSlotBehavior::DEFAULT,
+                )
+                .is_err()
+        );
+
+        storage
+            .activate_replication_slot("replication_slot_0", 41)
+            .unwrap();
+        storage.record_replication_slot_transaction("replication_slot_0", 20, 100);
+        assert!(storage.drop_replication_slot("replication_slot_0").is_err());
+        storage.deactivate_replication_slot("replication_slot_0");
+        storage.drop_replication_slot("replication_slot_0").unwrap();
+        let cleared = storage
+            .replication_slots
+            .lock()
+            .expect("replication slot catalog lock poisoned")[0];
+        assert!(!cleared.live);
+        assert_eq!(cleared.name, SqlName::EMPTY);
+        assert_eq!((cleared.total_txns, cleared.total_bytes), (0, 0));
+
+        let other_database = DatabaseOid::parse(USER_DATABASE_OID_BASE + 1).unwrap();
+        {
+            let mut slots = storage
+                .replication_slots
+                .lock()
+                .expect("replication slot catalog lock poisoned");
+            let name = slots[1].name;
+            slots[0] = ReplicationSlotDef {
+                database: other_database,
+                name,
+                restart_lsn: 99,
+                confirmed_flush_lsn: 99,
+                sent_lsn: 99,
+                live: true,
+                ..ReplicationSlotDef::EMPTY
+            };
+        }
+        storage
+            .activate_replication_slot("replication_slot_1", 42)
+            .unwrap();
+        storage.record_replication_slot_transaction("replication_slot_1", 21, 200);
+        storage.deactivate_replication_slot("replication_slot_1");
+        let slots = storage
+            .replication_slots
+            .lock()
+            .expect("replication slot catalog lock poisoned");
+        assert_eq!(slots[0].sent_lsn, 99);
+        assert_eq!((slots[0].total_txns, slots[0].total_bytes), (0, 0));
+        assert_eq!(slots[1].sent_lsn, 21);
+        assert_eq!((slots[1].total_txns, slots[1].total_bytes), (1, 200));
     }
 
     #[test]

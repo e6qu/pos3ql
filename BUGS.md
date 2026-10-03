@@ -866,6 +866,17 @@ creates, renames, alters, ownership changes, and drops use the common
 transaction wait boundary. Four-worker publication, nested-reader progress,
 exact retained capacity, loud exhaustion, complete slot reuse, and `Send +
 Sync` have direct coverage.
+The logical replication slot audit found durable resume state, behavior,
+transient activation, sent position, and statistics in one unsynchronized
+fixed vector. Overlapping protocol, WAL acknowledgement, checkpoint, replay,
+catalog, and statistics work could lose updates or combine fields from
+different slot images. One startup-bounded mutex now owns the catalog, and
+readers copy one complete slot before nested work. The audit also found that
+activation, acknowledgement preparation, accounting, and deactivation matched
+only the slot name despite names being database scoped; every path now includes
+the database identity. Four-worker publication, nested-reader progress, exact
+retained capacity, loud exhaustion, complete slot reuse, and `Send + Sync` have
+direct coverage.
 The instrumented SQL differential corpus outgrew its three-worker partition,
 then a slower runner exhausted the limit again with four workers after a
 3-minute 20-second build and more than 11 minutes of normal corpus progress.

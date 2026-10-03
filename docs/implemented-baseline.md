@@ -194,6 +194,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   definitions before nested table, schema, role, comment, or replication
   lookup. Conflicting DDL and ownership changes use the common transaction wait
   boundary, and removal clears the complete reusable slot.
+  Logical replication slot identity, durable resume positions and behavior,
+  transient activation, sent position, and statistics share one
+  startup-bounded mutex; readers copy complete slot images before nested WAL,
+  catalog, or protocol work. Slot name operations include their database
+  identity, and removal clears the complete reusable slot.
   Engine mutation remains single-owner and serialized while the other catalog
   definition containers, cache, and row sharing are prepared. Authorization
   graph traversal uses one exactly charged bitmap per query workspace,

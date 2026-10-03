@@ -877,6 +877,24 @@ only the slot name despite names being database scoped; every path now includes
 the database identity. Four-worker publication, nested-reader progress, exact
 retained capacity, loud exhaustion, complete slot reuse, and `Send + Sync` have
 direct coverage.
+The subscription catalog audit found definitions, pending lifecycle and stream
+images, ownership, durable apply positions, failures, statistics, cleanup
+work, and per-relation synchronization state split across two unsynchronized
+fixed vectors. Overlapping DDL, apply acknowledgement, relation refresh,
+replay, checkpoint, database removal, catalog reads, and worker control could
+lose updates or combine definition and relation generations from different
+transitions. One startup-bounded mutex now owns both vectors. Readers copy one
+complete definition or relation row before nested work. The same audit found
+rollback and ordinary removal retaining stale connection and identity fields,
+and database removal clearing relation rows without clearing their owning
+subscriptions; every terminal path now clears the complete reusable slots.
+Rename commit also advanced the stream generation without advancing its
+relation rows, making those rows disappear from refresh and catalog reads; the
+shared transition now advances both. Count-then-render catalog scans now report
+bounded churn instead of indexing past their reserved row slices.
+Four-worker publication, nested-reader progress, exact retained capacities,
+loud exhaustion, atomic cross-vector updates, and `Send + Sync` have direct
+coverage.
 The instrumented SQL differential corpus outgrew its three-worker partition,
 then a slower runner exhausted the limit again with four workers after a
 3-minute 20-second build and more than 11 minutes of normal corpus progress.

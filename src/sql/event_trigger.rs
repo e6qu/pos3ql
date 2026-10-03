@@ -1892,7 +1892,7 @@ fn primary_object(
             let name = subscription.name_for(txid);
             base_object(
                 catalog::PG_SUBSCRIPTION_OID,
-                catalog::subscription_oid(subscription),
+                catalog::subscription_oid(&subscription),
                 "subscription",
                 None,
                 Some(name.as_str()),
@@ -2709,7 +2709,7 @@ fn existing_catalog_object(
             storage
                 .subscriptions_with_slots_visible_to(txid)
                 .find_map(|(slot, subscription)| {
-                    (catalog::subscription_oid(subscription) == object_id).then_some(slot)
+                    (catalog::subscription_oid(&subscription) == object_id).then_some(slot)
                 })
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),

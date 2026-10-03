@@ -13986,7 +13986,7 @@ fn pg_description<'a>(
                 else {
                     continue;
                 };
-                (subscription_oid(subscription), PG_SUBSCRIPTION_OID)
+                (subscription_oid(&subscription), PG_SUBSCRIPTION_OID)
             }
             crate::storage::CommentClass::Rule => {
                 let rule = storage
@@ -14651,7 +14651,7 @@ pub fn comment_text_for<'a>(
                     && signed_oid.is_some_and(|oid| {
                         storage.subscriptions_with_slots_visible_to(txid).any(
                             |(_, subscription)| {
-                                subscription_oid(subscription) == oid
+                                subscription_oid(&subscription) == oid
                                     && csub == subscription.created_at as u32
                             },
                         )
@@ -17995,7 +17995,13 @@ fn pg_replication_origin<'a>(
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
     for (slot, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
-        let name = stack_format!(64, "pg_{}", subscription_oid(subscription));
+        if count == rows.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pg_replication_origin changed while it was being read"
+            ));
+        }
+        let name = stack_format!(64, "pg_{}", subscription_oid(&subscription));
         rows[count] = row(
             &[Datum::Oid(slot as u32 + 1), text(name.as_str(), arena)?],
             arena,
@@ -18019,7 +18025,13 @@ fn pg_replication_origin_status<'a>(
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
     for (slot, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
-        let name = stack_format!(64, "pg_{}", subscription_oid(subscription));
+        if count == rows.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pg_replication_origin_status changed while it was being read"
+            ));
+        }
+        let name = stack_format!(64, "pg_{}", subscription_oid(&subscription));
         rows[count] = row(
             &[
                 Datum::Oid(slot as u32 + 1),
@@ -18161,7 +18173,7 @@ fn pg_subscription<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(PG_SUBSCRIPTION_OID),
-                Datum::Int4(subscription_oid(subscription)),
+                Datum::Int4(subscription_oid(&subscription)),
                 Datum::Int4(storage.current_database_oid().get()),
                 skip_lsn,
                 text(subscription.name.as_str(), arena)?,
@@ -18216,7 +18228,7 @@ fn pg_subscription_rel<'a>(
         .subscriptions_with_slots_visible_to(txid)
         .map(|(_, subscription)| {
             storage
-                .subscription_relations_visible_to(subscription, txid)
+                .subscription_relations_visible_to(&subscription, txid)
                 .count()
         })
         .sum();
@@ -18225,12 +18237,18 @@ fn pg_subscription_rel<'a>(
         .map_err(|_| arena_full())?;
     let mut index = 0;
     for (_, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
-        for relation in storage.subscription_relations_visible_to(subscription, txid) {
+        for relation in storage.subscription_relations_visible_to(&subscription, txid) {
+            if index == rows.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "pg_subscription_rel changed while it was being read"
+                ));
+            }
             let lsn = relation.synchronization_lsn();
             let rendered_lsn = stack_format!(32, "0/{lsn:X}");
             rows[index] = row(
                 &[
-                    Datum::Int4(subscription_oid(subscription)),
+                    Datum::Int4(subscription_oid(&subscription)),
                     Datum::Int4(table_oid(storage, relation.table_slot())),
                     text(relation.state().pg_code(), arena)?,
                     if lsn == 0 {
@@ -18244,7 +18262,7 @@ fn pg_subscription_rel<'a>(
             index += 1;
         }
     }
-    finish(definition, rows, arena)
+    finish(definition, &rows[..index], arena)
 }
 
 fn pg_stat_subscription<'a>(
@@ -18279,7 +18297,7 @@ fn pg_stat_subscription<'a>(
         };
         rows[count] = row(
             &[
-                Datum::Oid(subscription_oid(subscription) as u32),
+                Datum::Oid(subscription_oid(&subscription) as u32),
                 text(subscription.name_for(txid).as_str(), arena)?,
                 text("apply", arena)?,
                 Datum::Null,
@@ -18319,7 +18337,7 @@ fn pg_stat_subscription_stats<'a>(
         }
         rows[count] = row(
             &[
-                Datum::Oid(subscription_oid(subscription) as u32),
+                Datum::Oid(subscription_oid(&subscription) as u32),
                 text(subscription.name_for(txid).as_str(), arena)?,
                 Datum::Int8(subscription.apply_error_count),
                 Datum::Int8(subscription.sync_error_count),

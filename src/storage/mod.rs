@@ -7303,6 +7303,47 @@ impl Iterator for ExtendedStatisticsIter<'_> {
     }
 }
 
+struct SequenceIter<'a> {
+    catalog: &'a std::sync::Mutex<SequenceCatalog>,
+    next_slot: usize,
+}
+
+struct SequenceCheckpointIter<'a> {
+    catalog: &'a std::sync::Mutex<SequenceCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for SequenceCheckpointIter<'_> {
+    type Item = (usize, SequenceDef, i64, bool, i64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("sequence catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.definitions.get(slot).copied()?;
+        let value = catalog.values[slot].committed;
+        self.next_slot += 1;
+        Some((
+            slot,
+            definition,
+            value.last_value,
+            value.is_called,
+            value.log_count,
+        ))
+    }
+}
+
+impl Iterator for SequenceIter<'_> {
+    type Item = (usize, SequenceDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("sequence catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.definitions.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
 struct TriggerIter<'a> {
     catalog: &'a std::sync::Mutex<TriggerCatalog>,
     next_slot: usize,
@@ -9524,8 +9565,8 @@ impl SeqType {
 /// A named sequence generator. Its *existence* (`live`/`pending`) is
 /// transactional catalog state, mirroring [`ViewDef`]. Ordinary value advances
 /// survive `ROLLBACK`, while a staged definition owns a private value image
-/// until commit. Mutable values live in [`Storage::sequence_values`].
-#[derive(Clone)]
+/// until commit. Definitions and mutable values share one catalog boundary.
+#[derive(Clone, Copy)]
 pub struct SequenceDef {
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
@@ -9552,6 +9593,29 @@ pub struct SequenceDef {
     pub generator_for: Option<SequenceOwner>,
     pub(crate) pending_definition: Option<PendingSequenceDefinition>,
     ddl_state: CatalogDdlState,
+}
+
+impl SequenceDef {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        created_at: 0,
+        cache_generation: 0,
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        ownership: Ownership::BOOTSTRAP,
+        data_type: SeqType::Bigint,
+        increment: 1,
+        min_value: 1,
+        max_value: i64::MAX,
+        start_value: 1,
+        cache: 1,
+        cycle: false,
+        persistence: RelationPersistence::Permanent,
+        owner: None,
+        generator_for: None,
+        pending_definition: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -9595,6 +9659,11 @@ impl SequenceValues {
             pending: SequenceValue::initial(value),
         }
     }
+}
+
+struct SequenceCatalog {
+    definitions: FixedVec<SequenceDef>,
+    values: FixedVec<SequenceValues>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13042,8 +13111,7 @@ pub struct Storage {
     foreign_sessions: ForeignSessionPool,
     foreign_statement_contexts: FixedVec<std::sync::Mutex<ForeignStatementContext>>,
     matviews: FixedVec<MatviewDef>,
-    sequences: FixedVec<SequenceDef>,
-    sequence_values: std::sync::Mutex<FixedVec<SequenceValues>>,
+    sequence_catalog: std::sync::Mutex<SequenceCatalog>,
     type_catalog: std::sync::Mutex<TypeCatalog>,
     enum_members_per_image: usize,
     enum_member_pending_base: usize,
@@ -15293,13 +15361,17 @@ impl Storage {
             self.commit_indexes_for(schema.as_str(), name.as_str(), 0);
             self.commit_drop(slot);
         }
-        for slot in 0..self.sequences.len() {
-            if self.sequences[slot].database == current_database()
-                && self.sequences[slot].ddl_state == CatalogDdlState::Present
-                && self.sequences[slot].persistence == RelationPersistence::Temporary
-                && self.sequences[slot].schema == schema
+        for slot in 0..self.sequence_count() {
+            let sequence = self.sequence(slot);
+            if sequence.database == current_database()
+                && sequence.ddl_state == CatalogDdlState::Present
+                && sequence.persistence == RelationPersistence::Temporary
+                && sequence.schema == schema
             {
-                self.sequences[slot].ddl_state = self.sequences[slot].ddl_state.drop_by(0);
+                let mut catalog = self.sequence_catalog();
+                catalog.definitions[slot].ddl_state =
+                    catalog.definitions[slot].ddl_state.drop_by(0);
+                drop(catalog);
                 self.commit_sequence_drop(slot);
             }
         }
@@ -15330,14 +15402,17 @@ impl Storage {
                     let table = self.tables[slot].def.name;
                     self.drop_indexes_for(schema.as_str(), table.as_str(), 0);
                     self.commit_indexes_for(schema.as_str(), table.as_str(), 0);
-                    for sequence in 0..self.sequences.len() {
-                        if self.sequences[sequence].ddl_state == CatalogDdlState::Present
-                            && self.sequences[sequence].owner.is_some_and(|owner| {
+                    for sequence in 0..self.sequence_count() {
+                        let definition = self.sequence(sequence);
+                        if definition.ddl_state == CatalogDdlState::Present
+                            && definition.owner.is_some_and(|owner| {
                                 owner.table_schema == schema && owner.table == table
                             })
                         {
-                            self.sequences[sequence].ddl_state =
-                                self.sequences[sequence].ddl_state.drop_by(0);
+                            let mut catalog = self.sequence_catalog();
+                            catalog.definitions[sequence].ddl_state =
+                                catalog.definitions[sequence].ddl_state.drop_by(0);
+                            drop(catalog);
                             self.commit_sequence_drop(sequence);
                         }
                     }
@@ -15365,12 +15440,13 @@ impl Storage {
             self.refresh_enforcers(slot)?;
             self.mark_value_bindings_dirty(slot);
         }
-        let mut sequence_values = self.sequence_values();
-        for (slot, sequence) in self.sequences.iter().enumerate() {
+        let mut catalog = self.sequence_catalog();
+        for slot in 0..catalog.definitions.len() {
+            let sequence = catalog.definitions[slot];
             if sequence.ddl_state == CatalogDdlState::Present
                 && sequence.persistence == RelationPersistence::Unlogged
             {
-                sequence_values[slot].committed = SequenceValue::initial(sequence.start_value);
+                catalog.values[slot].committed = SequenceValue::initial(sequence.start_value);
             }
         }
         Ok(())
@@ -15380,7 +15456,7 @@ impl Storage {
         self.tables
             .iter()
             .any(|table| table.live && table.def.persistence == RelationPersistence::Unlogged)
-            || self.sequences.iter().any(|sequence| {
+            || self.sequence_catalog().definitions.iter().any(|sequence| {
                 sequence.ddl_state == CatalogDdlState::Present
                     && sequence.persistence == RelationPersistence::Unlogged
             })
@@ -17126,26 +17202,7 @@ impl Storage {
         let mut sequence_values = FixedVec::new(budget, "sequence_values", config.max_sequences)?;
         for _ in 0..config.max_sequences {
             sequences
-                .push(SequenceDef {
-                    database: DatabaseOid::POSTGRES,
-                    created_at: 0,
-                    cache_generation: 0,
-                    schema: SqlName::EMPTY,
-                    name: SqlName::EMPTY,
-                    ownership: Ownership::BOOTSTRAP,
-                    data_type: SeqType::Bigint,
-                    increment: 1,
-                    min_value: 1,
-                    max_value: i64::MAX,
-                    start_value: 1,
-                    cache: 1,
-                    cycle: false,
-                    persistence: RelationPersistence::Permanent,
-                    owner: None,
-                    generator_for: None,
-                    pending_definition: None,
-                    ddl_state: CatalogDdlState::Absent,
-                })
+                .push(SequenceDef::EMPTY)
                 .expect("sized to max_sequences");
             sequence_values
                 .push(SequenceValues::initial(1))
@@ -17615,8 +17672,10 @@ impl Storage {
             },
             foreign_statement_contexts,
             matviews,
-            sequences,
-            sequence_values: std::sync::Mutex::new(sequence_values),
+            sequence_catalog: std::sync::Mutex::new(SequenceCatalog {
+                definitions: sequences,
+                values: sequence_values,
+            }),
             type_catalog: std::sync::Mutex::new(TypeCatalog {
                 domains,
                 enums,
@@ -19025,21 +19084,21 @@ impl Storage {
                 }
             }
 
-            let sequence_values = self
-                .sequence_values
+            let sequence_catalog = self
+                .sequence_catalog
                 .get_mut()
-                .expect("sequence value lock poisoned");
-            for source_slot in 0..self.sequences.len() {
-                let source_definition = &self.sequences[source_slot];
+                .expect("sequence catalog lock poisoned");
+            for source_slot in 0..sequence_catalog.definitions.len() {
+                let source_definition = sequence_catalog.definitions[source_slot];
                 if source_definition.database != source
                     || source_definition.ddl_state != CatalogDdlState::Present
                     || source_definition.persistence == RelationPersistence::Temporary
                 {
                     continue;
                 }
-                let mut definition = source_definition.clone();
-                let target_slot = self
-                    .sequences
+                let mut definition = source_definition;
+                let target_slot = sequence_catalog
+                    .definitions
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                     .ok_or_else(|| {
@@ -19049,9 +19108,9 @@ impl Storage {
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.sequences[target_slot] = definition;
-                sequence_values[target_slot] = sequence_values[source_slot];
-                sequence_values[target_slot].pending.dirty = false;
+                sequence_catalog.definitions[target_slot] = definition;
+                sequence_catalog.values[target_slot] = sequence_catalog.values[source_slot];
+                sequence_catalog.values[target_slot].pending.dirty = false;
             }
 
             for source_slot in 0..self.views.len() {
@@ -19925,7 +19984,7 @@ impl Storage {
                 AccessClass::MaterializedView => {
                     self.matviews[usize::from(entry.object.slot)].database
                 }
-                AccessClass::Sequence => self.sequences[usize::from(entry.object.slot)].database,
+                AccessClass::Sequence => self.sequence(usize::from(entry.object.slot)).database,
                 AccessClass::Schema => self.schemas[usize::from(entry.object.slot)].database,
                 AccessClass::Domain => self.domain(usize::from(entry.object.slot)).database,
                 AccessClass::Enum => self.enum_for(usize::from(entry.object.slot), 0).database,
@@ -20098,7 +20157,15 @@ impl Storage {
             }
         }
         clear_catalog!(matviews);
-        clear_catalog!(sequences);
+        {
+            let mut catalog = self.sequence_catalog();
+            for slot in 0..catalog.definitions.len() {
+                if catalog.definitions[slot].database == database {
+                    catalog.definitions[slot] = SequenceDef::EMPTY;
+                    catalog.values[slot] = SequenceValues::initial(1);
+                }
+            }
+        }
         clear_catalog!(indexes);
         clear_catalog!(extensions);
         {
@@ -20377,7 +20444,16 @@ impl Storage {
             }
         }
         commit_catalog!(matviews);
-        commit_catalog!(sequences);
+        {
+            let mut catalog = self.sequence_catalog();
+            for definition in catalog.definitions.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         commit_catalog!(indexes);
         commit_catalog!(extensions);
         {
@@ -20733,7 +20809,7 @@ impl Storage {
             AccessClass::Table => self.tables[slot].ownership,
             AccessClass::View => self.views[slot].ownership,
             AccessClass::MaterializedView => self.matviews[slot].ownership,
-            AccessClass::Sequence => self.sequences[slot].ownership,
+            AccessClass::Sequence => self.sequence(slot).ownership,
             AccessClass::Schema => self.schemas[slot].ownership,
             AccessClass::Domain => self.domain(slot).ownership,
             AccessClass::Enum => self.enum_for(slot, 0).ownership,
@@ -20766,7 +20842,9 @@ impl Storage {
             AccessClass::Table => &mut self.tables[slot].ownership,
             AccessClass::View => &mut self.views[slot].ownership,
             AccessClass::MaterializedView => &mut self.matviews[slot].ownership,
-            AccessClass::Sequence => &mut self.sequences[slot].ownership,
+            AccessClass::Sequence => {
+                unreachable!("sequence ownership is synchronized separately")
+            }
             AccessClass::Schema => &mut self.schemas[slot].ownership,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => {
                 unreachable!("type ownership is synchronized separately")
@@ -21278,7 +21356,7 @@ impl Storage {
             AccessClass::MaterializedView => {
                 self.matviews[slot].ddl_state == CatalogDdlState::Present
             }
-            AccessClass::Sequence => self.sequences[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Sequence => self.sequence(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Schema => self.schemas[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Domain => self.domain(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Enum => self.enum_for(slot, 0).ddl_state == CatalogDdlState::Present,
@@ -21319,7 +21397,7 @@ impl Storage {
             AccessClass::Table => self.tables[slot].visible_to(txid),
             AccessClass::View => self.views[slot].visible_to(txid),
             AccessClass::MaterializedView => self.matviews[slot].visible_to(txid),
-            AccessClass::Sequence => self.sequences[slot].visible_to(txid),
+            AccessClass::Sequence => self.sequence(slot).visible_to(txid),
             AccessClass::Schema => self.schemas[slot].visible_to(txid),
             AccessClass::Domain => self.domain(slot).visible_to(txid),
             AccessClass::Enum => self.enum_for(slot, txid).visible_to(txid),
@@ -21352,7 +21430,7 @@ impl Storage {
             AccessClass::Table => Some(self.tables[slot].database),
             AccessClass::View => Some(self.views[slot].database),
             AccessClass::MaterializedView => Some(self.matviews[slot].database),
-            AccessClass::Sequence => Some(self.sequences[slot].database),
+            AccessClass::Sequence => Some(self.sequence(slot).database),
             AccessClass::Schema => Some(self.schemas[slot].database),
             AccessClass::Domain => Some(self.domain(slot).database),
             AccessClass::Enum => Some(self.enum_for(slot, 0).database),
@@ -21408,8 +21486,9 @@ impl Storage {
                 })?
             }
             AccessClass::Sequence => {
-                let created_at = self.sequences[source_slot].created_at;
-                self.sequences.iter().position(|candidate| {
+                let catalog = self.sequence_catalog();
+                let created_at = catalog.definitions[source_slot].created_at;
+                catalog.definitions.iter().position(|candidate| {
                     candidate.database == target_database && candidate.created_at == created_at
                 })?
             }
@@ -21622,8 +21701,12 @@ impl Storage {
 
     pub(crate) fn checkpoint_sequences_with_slots(
         &self,
-    ) -> impl Iterator<Item = (usize, &SequenceDef)> {
-        self.sequences.iter().enumerate().filter(|(_, value)| {
+    ) -> impl Iterator<Item = (usize, SequenceDef, i64, bool, i64)> + '_ {
+        SequenceCheckpointIter {
+            catalog: &self.sequence_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value, _, _, _)| {
             value.ddl_state == CatalogDdlState::Present
                 && value.persistence != RelationPersistence::Temporary
         })
@@ -21854,7 +21937,7 @@ impl Storage {
             AccessClass::Table => self.tables.len(),
             AccessClass::View => self.views.len(),
             AccessClass::MaterializedView => self.matviews.len(),
-            AccessClass::Sequence => self.sequences.len(),
+            AccessClass::Sequence => self.sequence_count(),
             AccessClass::Schema => self.schemas.len(),
             AccessClass::Domain => self.domain_count(),
             AccessClass::Enum => self.enum_count(),
@@ -21914,7 +21997,7 @@ impl Storage {
             (AccessClass::Table, self.tables.len()),
             (AccessClass::View, self.views.len()),
             (AccessClass::MaterializedView, self.matviews.len()),
-            (AccessClass::Sequence, self.sequences.len()),
+            (AccessClass::Sequence, self.sequence_count()),
             (AccessClass::Schema, self.schemas.len()),
             (AccessClass::Domain, self.domain_count()),
             (AccessClass::Enum, self.enum_count()),
@@ -22090,6 +22173,21 @@ impl Storage {
             }
             return prior;
         }
+        if object.class == AccessClass::Sequence {
+            let mut catalog = self.sequence_catalog();
+            let ownership = &mut catalog.definitions[usize::from(object.slot)].ownership;
+            let prior = ownership.pending;
+            if txid == 0 {
+                ownership.owner = owner as u16;
+                ownership.pending = None;
+            } else {
+                ownership.pending = Some(PendingOwnership {
+                    txid,
+                    owner: owner as u16,
+                });
+            }
+            return prior;
+        }
         if matches!(
             object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
@@ -22196,6 +22294,17 @@ impl Storage {
             }
             return;
         }
+        if object.class == AccessClass::Sequence {
+            let mut catalog = self.sequence_catalog();
+            let ownership = &mut catalog.definitions[usize::from(object.slot)].ownership;
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            return;
+        }
         if matches!(
             object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
@@ -22241,6 +22350,12 @@ impl Storage {
                 .definitions[usize::from(object.slot)]
             .ownership
             .pending = prior;
+            return;
+        }
+        if object.class == AccessClass::Sequence {
+            self.sequence_catalog().definitions[usize::from(object.slot)]
+                .ownership
+                .pending = prior;
             return;
         }
         if object.class == AccessClass::Routine {
@@ -25630,24 +25745,27 @@ impl Storage {
                 rename_schema_name(&mut pending.schema, prior, name);
             }
         }
-        for definition in self.sequences.iter_mut().filter(|definition| {
-            definition.database == current_database()
-                && definition.ddl_state != CatalogDdlState::Absent
-        }) {
-            rename_schema_name(&mut definition.schema, prior, name);
-            if let Some(owner) = &mut definition.owner {
-                rename_schema_name(&mut owner.table_schema, prior, name);
-            }
-            if let Some(generator) = &mut definition.generator_for {
-                rename_schema_name(&mut generator.table_schema, prior, name);
-            }
-            if let Some(pending) = &mut definition.pending_definition {
-                rename_schema_name(&mut pending.schema, prior, name);
-                if let Some(owner) = &mut pending.owner {
+        {
+            let mut catalog = self.sequence_catalog();
+            for definition in catalog.definitions.iter_mut().filter(|definition| {
+                definition.database == current_database()
+                    && definition.ddl_state != CatalogDdlState::Absent
+            }) {
+                rename_schema_name(&mut definition.schema, prior, name);
+                if let Some(owner) = &mut definition.owner {
                     rename_schema_name(&mut owner.table_schema, prior, name);
                 }
-                if let Some(generator) = &mut pending.generator_for {
+                if let Some(generator) = &mut definition.generator_for {
                     rename_schema_name(&mut generator.table_schema, prior, name);
+                }
+                if let Some(pending) = &mut definition.pending_definition {
+                    rename_schema_name(&mut pending.schema, prior, name);
+                    if let Some(owner) = &mut pending.owner {
+                        rename_schema_name(&mut owner.table_schema, prior, name);
+                    }
+                    if let Some(generator) = &mut pending.generator_for {
+                        rename_schema_name(&mut generator.table_schema, prior, name);
+                    }
                 }
             }
         }
@@ -35388,50 +35506,68 @@ impl Storage {
 
     // --- Sequences -------------------------------------------------------
 
-    pub fn live_sequences(&self) -> impl Iterator<Item = &SequenceDef> {
-        self.sequences.iter().filter(|sequence| {
+    pub fn live_sequences(&self) -> impl Iterator<Item = SequenceDef> + '_ {
+        SequenceIter {
+            catalog: &self.sequence_catalog,
+            next_slot: 0,
+        }
+        .map(|(_, definition)| definition)
+        .filter(|sequence| {
             sequence.database == current_database()
                 && sequence.ddl_state == CatalogDdlState::Present
         })
     }
 
-    pub fn sequences_with_slots(&self) -> impl Iterator<Item = (usize, &SequenceDef)> {
-        self.sequences.iter().enumerate().filter(|(_, sequence)| {
+    pub fn sequences_with_slots(&self) -> impl Iterator<Item = (usize, SequenceDef)> + '_ {
+        SequenceIter {
+            catalog: &self.sequence_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, sequence)| {
             sequence.database == current_database()
                 && sequence.ddl_state == CatalogDdlState::Present
         })
     }
 
-    pub(crate) fn sequence(&self, slot: usize) -> &SequenceDef {
-        &self.sequences[slot]
-    }
-
-    fn sequence_values(&self) -> std::sync::MutexGuard<'_, FixedVec<SequenceValues>> {
-        self.sequence_values
+    pub(crate) fn sequence(&self, slot: usize) -> SequenceDef {
+        self.sequence_catalog
             .lock()
-            .expect("sequence value lock poisoned")
+            .expect("sequence catalog lock poisoned")
+            .definitions[slot]
+    }
+
+    fn sequence_catalog(&self) -> std::sync::MutexGuard<'_, SequenceCatalog> {
+        self.sequence_catalog
+            .lock()
+            .expect("sequence catalog lock poisoned")
     }
 
     pub(crate) fn sequence_count(&self) -> usize {
-        self.sequences.len()
+        self.sequence_catalog().definitions.len()
     }
 
     pub(crate) fn sequence_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.sequences[slot].database == current_database() && self.sequences[slot].visible_to(txid)
+        let catalog = self.sequence_catalog();
+        catalog.definitions[slot].database == current_database()
+            && catalog.definitions[slot].visible_to(txid)
     }
 
-    pub fn find_sequence(&self, schema: &str, name: &str, txid: u32) -> Option<&SequenceDef> {
-        self.sequences.iter().find(|s| {
-            let definition = s.definition_for(txid);
-            s.database == current_database()
-                && s.visible_to(txid)
-                && definition.schema.as_str() == schema
-                && definition.name.as_str() == name
-        })
+    pub fn find_sequence(&self, schema: &str, name: &str, txid: u32) -> Option<SequenceDef> {
+        self.sequence_catalog()
+            .definitions
+            .iter()
+            .copied()
+            .find(|s| {
+                let definition = s.definition_for(txid);
+                s.database == current_database()
+                    && s.visible_to(txid)
+                    && definition.schema.as_str() == schema
+                    && definition.name.as_str() == name
+            })
     }
 
     pub fn sequence_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        let slot = self.sequences.iter().position(|s| {
+        let slot = self.sequence_catalog().definitions.iter().position(|s| {
             let definition = s.definition_for(txid);
             s.database == current_database()
                 && s.visible_to(txid)
@@ -35453,17 +35589,21 @@ impl Storage {
         column: &str,
         txid: u32,
     ) -> Option<usize> {
-        let direct = self.sequences.iter().position(|sequence| {
-            sequence.database == current_database()
-                && sequence.visible_to(txid)
-                && matches!(
-                    sequence.definition_for(txid).generator_for,
-                    Some(owner)
-                        if owner.table_schema.as_str() == table_schema
-                            && owner.table.as_str() == table
-                            && owner.column.as_str() == column
-                )
-        });
+        let direct = self
+            .sequence_catalog()
+            .definitions
+            .iter()
+            .position(|sequence| {
+                sequence.database == current_database()
+                    && sequence.visible_to(txid)
+                    && matches!(
+                        sequence.definition_for(txid).generator_for,
+                        Some(owner)
+                            if owner.table_schema.as_str() == table_schema
+                                && owner.table.as_str() == table
+                                && owner.column.as_str() == column
+                    )
+            });
         if direct.is_some() {
             return direct;
         }
@@ -35491,17 +35631,20 @@ impl Storage {
                     .is_some_and(|mapped| mapped.as_str() == column)
                     .then_some(committed.columns()[index].name)
             })?;
-        self.sequences.iter().position(|sequence| {
-            sequence.database == current_database()
-                && sequence.visible_to(txid)
-                && matches!(
-                    sequence.definition_for(txid).generator_for,
-                    Some(owner)
-                        if owner.table_schema == committed.schema
-                            && owner.table == committed.name
-                            && owner.column == committed_column
-                )
-        })
+        self.sequence_catalog()
+            .definitions
+            .iter()
+            .position(|sequence| {
+                sequence.database == current_database()
+                    && sequence.visible_to(txid)
+                    && matches!(
+                        sequence.definition_for(txid).generator_for,
+                        Some(owner)
+                            if owner.table_schema == committed.schema
+                                && owner.table == committed.name
+                                && owner.column == committed_column
+                    )
+            })
     }
 
     /// Resolves a (possibly unqualified) sequence name to its slot: a qualifier
@@ -35563,33 +35706,35 @@ impl Storage {
             persistence,
         } = create;
         self.require_schema_create(schema.as_str(), txid)?;
-        if let Some(blocker) = self.sequences.iter().find_map(|s| {
+        let ownership = self.initial_ownership(txid);
+        let created_at = self.catalog_sequence.next();
+        let mut catalog = self.sequence_catalog();
+        if let Some(blocker) = catalog.definitions.iter().find_map(|s| {
             (s.database == current_database()
                 && s.schema.as_str() == schema.as_str()
                 && s.name.as_str() == name.as_str())
             .then_some(s.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
         }) {
+            drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        let Some(new) = self
-            .sequences
+        let Some(new) = catalog
+            .definitions
             .iter()
             .position(|sequence| sequence.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many sequences (limit {})",
-                self.sequences.len()
+                catalog.definitions.len()
             ));
         };
-        let ownership = self.initial_ownership(txid);
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Sequence,
             slot: new as u16,
         });
-        let created_at = self.catalog_sequence.next();
-        self.sequences[new] = SequenceDef {
+        catalog.definitions[new] = SequenceDef {
             database: current_database(),
             created_at,
             cache_generation: 0,
@@ -35609,10 +35754,8 @@ impl Storage {
             pending_definition: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
-        self.sequence_values
-            .get_mut()
-            .expect("sequence value lock poisoned")[new] =
-            SequenceValues::initial(spec.start_value);
+        catalog.values[new] = SequenceValues::initial(spec.start_value);
+        drop(catalog);
         if persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
         }
@@ -35620,7 +35763,7 @@ impl Storage {
     }
 
     pub(crate) fn sequence_for(&self, slot: usize, txid: u32) -> SequenceDef {
-        self.sequences[slot].definition_for(txid)
+        self.sequence_catalog().definitions[slot].definition_for(txid)
     }
 
     pub(crate) fn stage_sequence_alter(
@@ -35629,19 +35772,19 @@ impl Storage {
         alteration: SequenceAlteration,
         txid: u32,
     ) -> Result<Option<PendingSequenceDefinition>, SqlError> {
-        let current_identity = self.sequences[slot].definition_for(txid);
-        let pending = self.sequences[slot].pending_definition;
+        let mut catalog = self.sequence_catalog();
+        let current_identity = catalog.definitions[slot].definition_for(txid);
+        let pending = catalog.definitions[slot].pending_definition;
         if let Some(pending) = pending
             && pending.txid != txid
         {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "sequence \"{}\" is being altered by another transaction",
-                self.sequences[slot].name.as_str()
+                catalog.definitions[slot].name.as_str()
             ));
         }
-        let mut values = self.sequence_values();
-        let sequence_values = &mut values[slot];
+        let sequence_values = &mut catalog.values[slot];
         let prior = pending.map(|pending| PendingSequenceDefinition {
             last_value: sequence_values.pending.last_value,
             is_called: sequence_values.pending.is_called,
@@ -35668,8 +35811,7 @@ impl Storage {
             generation: sequence_values.pending.generation.wrapping_add(1),
             staged_generation: 0,
         };
-        drop(values);
-        self.sequences[slot].pending_definition = Some(PendingSequenceDefinition {
+        catalog.definitions[slot].pending_definition = Some(PendingSequenceDefinition {
             txid,
             schema: alteration.schema,
             name: alteration.name,
@@ -35682,6 +35824,7 @@ impl Storage {
             log_count: 0,
             restarted,
         });
+        drop(catalog);
         if current_identity.schema != alteration.schema || current_identity.name != alteration.name
         {
             self.stage_object_comment_identity(
@@ -35697,27 +35840,28 @@ impl Storage {
     }
 
     pub(crate) fn commit_sequence_alter(&mut self, slot: usize, txid: u32) {
-        if self.sequences[slot]
+        let mut catalog = self.sequence_catalog();
+        if catalog.definitions[slot]
             .pending_definition
             .filter(|pending| pending.txid == txid)
             .is_some()
         {
-            let old_schema = self.sequences[slot].schema;
-            let old_name = self.sequences[slot].name;
-            let definition = self.sequences[slot].definition_for(txid);
-            self.sequences[slot] = definition;
-            let values = &mut self
-                .sequence_values
-                .get_mut()
-                .expect("sequence value lock poisoned")[slot];
+            let old_schema = catalog.definitions[slot].schema;
+            let old_name = catalog.definitions[slot].name;
+            let definition = catalog.definitions[slot].definition_for(txid);
+            catalog.definitions[slot] = definition;
+            let values = &mut catalog.values[slot];
             values.committed = values.pending;
             values.committed.dirty = false;
             values.committed.staged_generation = 0;
             values.pending.dirty = false;
             values.pending.staged_generation = 0;
-            if old_schema != self.sequences[slot].schema || old_name != self.sequences[slot].name {
-                let new_schema = self.sequences[slot].schema;
-                let new_name = self.sequences[slot].name;
+            if old_schema != catalog.definitions[slot].schema
+                || old_name != catalog.definitions[slot].name
+            {
+                let new_schema = catalog.definitions[slot].schema;
+                let new_name = catalog.definitions[slot].name;
+                drop(catalog);
                 self.commit_object_comment_identity(
                     CommentClass::Relation,
                     old_schema,
@@ -35740,20 +35884,18 @@ impl Storage {
         slot: usize,
         prior: Option<PendingSequenceDefinition>,
     ) {
-        let current = self.sequences[slot].pending_definition;
+        let mut catalog = self.sequence_catalog();
+        let current = catalog.definitions[slot].pending_definition;
         let txid = current.map(|pending| pending.txid);
         let old_identity = current.map(|pending| (pending.schema, pending.name));
         // ALTER SEQUENCE's definition is transactional, but an advance made
         // under an ordinary staged definition is not.  Only RESTART owns a
         // temporary value image that rollback may discard.
-        let values = &mut self
-            .sequence_values
-            .get_mut()
-            .expect("sequence value lock poisoned")[slot];
+        let values = &mut catalog.values[slot];
         if current.is_some_and(|pending| !pending.restarted) {
             values.committed = values.pending;
         }
-        self.sequences[slot].pending_definition = prior;
+        catalog.definitions[slot].pending_definition = prior;
         if let Some(prior) = prior {
             values.pending = SequenceValue {
                 last_value: prior.last_value,
@@ -35767,8 +35909,9 @@ impl Storage {
             values.pending.dirty = false;
         }
         if let (Some(txid), Some((old_schema, old_name))) = (txid, old_identity) {
-            let visible = self.sequences[slot].definition_for(txid);
+            let visible = catalog.definitions[slot].definition_for(txid);
             if old_schema != visible.schema || old_name != visible.name {
+                drop(catalog);
                 self.stage_object_comment_identity(
                     CommentClass::Relation,
                     old_schema,
@@ -35787,16 +35930,16 @@ impl Storage {
         txid: u32,
         requested: i64,
     ) -> Result<(i64, i64, bool), SqlError> {
-        let sequence = &self.sequences[slot];
+        let mut catalog = self.sequence_catalog();
+        let sequence = catalog.definitions[slot];
         let pending = sequence
             .pending_definition
             .is_some_and(|pending| pending.txid == txid);
         let definition = pending.then(|| sequence.definition_for(txid));
-        let mut values = self.sequence_values();
         if let Some(definition) = definition {
-            return definition.reserve_values_with(&mut values[slot].pending, requested);
+            return definition.reserve_values_with(&mut catalog.values[slot].pending, requested);
         }
-        sequence.reserve_values_with(&mut values[slot].committed, requested)
+        sequence.reserve_values_with(&mut catalog.values[slot].committed, requested)
     }
 
     pub(crate) fn set_sequence_value(
@@ -35806,16 +35949,16 @@ impl Storage {
         value: i64,
         is_called: bool,
     ) -> Result<i64, SqlError> {
-        let sequence = &self.sequences[slot];
+        let mut catalog = self.sequence_catalog();
+        let sequence = catalog.definitions[slot];
         let pending = sequence
             .pending_definition
             .is_some_and(|pending| pending.txid == txid);
         let definition = pending.then(|| sequence.definition_for(txid));
-        let mut values = self.sequence_values();
         if let Some(definition) = definition {
-            return definition.set_value_with(value, is_called, &mut values[slot].pending);
+            return definition.set_value_with(value, is_called, &mut catalog.values[slot].pending);
         }
-        sequence.set_value_with(value, is_called, &mut values[slot].committed)
+        sequence.set_value_with(value, is_called, &mut catalog.values[slot].committed)
     }
 
     pub(crate) fn check_sequence_value(
@@ -35832,15 +35975,15 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> (i64, bool, i64, bool, u64) {
-        let sequence = &self.sequences[slot];
+        let catalog = self.sequence_catalog();
+        let sequence = catalog.definitions[slot];
         let pending = sequence
             .pending_definition
             .is_some_and(|pending| pending.txid == txid);
-        let values = self.sequence_values();
         let value = if pending {
-            values[slot].pending
+            catalog.values[slot].pending
         } else {
-            values[slot].committed
+            catalog.values[slot].committed
         };
         (
             value.last_value,
@@ -35849,6 +35992,35 @@ impl Storage {
             value.dirty,
             value.generation,
         )
+    }
+
+    pub(crate) fn sequence_catalog_image_for(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> Option<(SequenceDef, i64, bool, i64, bool, u64)> {
+        let catalog = self.sequence_catalog();
+        let sequence = catalog.definitions[slot];
+        if sequence.database != current_database() || !sequence.visible_to(txid) {
+            return None;
+        }
+        let pending = sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == txid);
+        let definition = sequence.definition_for(txid);
+        let value = if pending {
+            catalog.values[slot].pending
+        } else {
+            catalog.values[slot].committed
+        };
+        Some((
+            definition,
+            value.last_value,
+            value.is_called,
+            value.log_count,
+            value.dirty,
+            value.generation,
+        ))
     }
 
     pub(crate) fn sequence_value_for(&self, slot: usize, txid: u32) -> (i64, bool) {
@@ -35861,14 +36033,14 @@ impl Storage {
     }
 
     pub(crate) fn mark_sequence_value_staged(&self, slot: usize, txid: u32, generation: u64) {
-        let pending = self.sequences[slot]
+        let mut catalog = self.sequence_catalog();
+        let pending = catalog.definitions[slot]
             .pending_definition
             .is_some_and(|pending| pending.txid == txid);
-        let mut values = self.sequence_values();
         let value = if pending {
-            &mut values[slot].pending
+            &mut catalog.values[slot].pending
         } else {
-            &mut values[slot].committed
+            &mut catalog.values[slot].committed
         };
         if value.generation == generation {
             value.staged_generation = generation;
@@ -35876,16 +36048,19 @@ impl Storage {
     }
 
     pub(crate) fn clear_sequence_value_dirty(&self, slot: usize, txid: u32) {
-        let sequence = &self.sequences[slot];
+        let mut catalog = self.sequence_catalog();
+        let sequence = catalog.definitions[slot];
+        if sequence.database != current_database() || !sequence.visible_to(txid) {
+            return;
+        }
         let pending = sequence
             .pending_definition
             .is_some_and(|pending| pending.txid == txid);
         let temporary = sequence.definition_for(txid).persistence == RelationPersistence::Temporary;
-        let mut values = self.sequence_values();
         let value = if pending {
-            &mut values[slot].pending
+            &mut catalog.values[slot].pending
         } else {
-            &mut values[slot].committed
+            &mut catalog.values[slot].committed
         };
         if temporary || value.generation == value.staged_generation {
             value.dirty = false;
@@ -35899,13 +36074,13 @@ impl Storage {
         txid: u32,
         value: i64,
     ) -> SequenceValueState {
-        let sequence = &self.sequences[slot];
+        let mut catalog = self.sequence_catalog();
+        let sequence = catalog.definitions[slot];
         let pending = sequence
             .pending_definition
             .is_some_and(|pending| pending.txid == txid);
-        let mut values = self.sequence_values();
         if pending {
-            let state = &mut values[slot].pending;
+            let state = &mut catalog.values[slot].pending;
             let prior = SequenceValueState::Pending {
                 last_value: state.last_value,
                 is_called: state.is_called,
@@ -35924,7 +36099,7 @@ impl Storage {
             };
             return prior;
         }
-        let state = &mut values[slot].committed;
+        let state = &mut catalog.values[slot].committed;
         let prior = SequenceValueState::Committed {
             last_value: state.last_value,
             is_called: state.is_called,
@@ -35945,7 +36120,7 @@ impl Storage {
     }
 
     pub(crate) fn restore_sequence_value(&self, slot: usize, prior: SequenceValueState) {
-        let mut values = self.sequence_values();
+        let mut catalog = self.sequence_catalog();
         match prior {
             SequenceValueState::Committed {
                 last_value,
@@ -35955,7 +36130,7 @@ impl Storage {
                 generation,
                 staged_generation,
             } => {
-                values[slot].committed = SequenceValue {
+                catalog.values[slot].committed = SequenceValue {
                     last_value,
                     is_called,
                     log_count,
@@ -35972,7 +36147,7 @@ impl Storage {
                 generation,
                 staged_generation,
             } => {
-                values[slot].pending = SequenceValue {
+                catalog.values[slot].pending = SequenceValue {
                     last_value,
                     is_called,
                     log_count,
@@ -35990,7 +36165,8 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if let Some(blocker) = self.sequences.iter().find_map(|s| {
+        let mut catalog = self.sequence_catalog();
+        if let Some(blocker) = catalog.definitions.iter().find_map(|s| {
             let definition = s.definition_for(txid);
             (s.database == current_database()
                 && definition.schema.as_str() == schema
@@ -35998,9 +36174,10 @@ impl Storage {
                 .then_some(s.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
+            drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
-        let Some(i) = self.sequences.iter().position(|s| {
+        let Some(i) = catalog.definitions.iter().position(|s| {
             let definition = s.definition_for(txid);
             s.database == current_database()
                 && s.visible_to(txid)
@@ -36009,27 +36186,39 @@ impl Storage {
         }) else {
             return Ok(None);
         };
-        let sequence = &mut self.sequences[i];
+        let sequence = &mut catalog.definitions[i];
         sequence.ddl_state = sequence.ddl_state.drop_by(txid);
         Ok(Some(i))
     }
 
     pub fn commit_sequence_create(&mut self, slot: usize) {
-        self.sequences[slot].ddl_state = self.sequences[slot].ddl_state.commit_create();
+        let mut catalog = self.sequence_catalog();
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_create();
     }
 
     pub fn commit_sequence_drop(&mut self, slot: usize) {
-        let (schema, name) = (self.sequences[slot].schema, self.sequences[slot].name);
+        let mut catalog = self.sequence_catalog();
+        let (schema, name) = (
+            catalog.definitions[slot].schema,
+            catalog.definitions[slot].name,
+        );
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_drop();
+        catalog.definitions[slot] = SequenceDef::EMPTY;
+        catalog.values[slot] = SequenceValues::initial(1);
+        drop(catalog);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-        self.sequences[slot].ddl_state = self.sequences[slot].ddl_state.commit_drop();
     }
 
     pub fn rollback_sequence_create(&mut self, slot: usize) {
-        self.sequences[slot].ddl_state = self.sequences[slot].ddl_state.rollback_create();
+        let mut catalog = self.sequence_catalog();
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.rollback_create();
+        catalog.definitions[slot] = SequenceDef::EMPTY;
+        catalog.values[slot] = SequenceValues::initial(1);
     }
 
     pub fn rollback_sequence_drop(&mut self, slot: usize, txid: u32) {
-        let sequence = &mut self.sequences[slot];
+        let mut catalog = self.sequence_catalog();
+        let sequence = &mut catalog.definitions[slot];
         sequence.ddl_state = sequence.ddl_state.rollback_drop(txid);
     }
 
@@ -36040,11 +36229,11 @@ impl Storage {
         is_called: bool,
         log_count: i64,
     ) {
-        let values = self
-            .sequence_values
+        let catalog = self
+            .sequence_catalog
             .get_mut()
-            .expect("sequence value lock poisoned");
-        values[slot].committed = SequenceValue {
+            .expect("sequence catalog lock poisoned");
+        catalog.values[slot].committed = SequenceValue {
             last_value,
             is_called,
             log_count,
@@ -36057,17 +36246,17 @@ impl Storage {
     /// Applies a replayed/absolute `SequenceAdvance`: set value state directly,
     /// without marking dirty (replay must not re-journal).
     pub fn apply_sequence_advance(&mut self, schema: &str, name: &str, last: i64, is_called: bool) {
-        if let Some(i) = self.sequences.iter().position(|s| {
+        let catalog = self
+            .sequence_catalog
+            .get_mut()
+            .expect("sequence catalog lock poisoned");
+        if let Some(i) = catalog.definitions.iter().position(|s| {
             s.database == current_database()
                 && s.ddl_state != CatalogDdlState::Absent
                 && s.schema.as_str() == schema
                 && s.name.as_str() == name
         }) {
-            let values = self
-                .sequence_values
-                .get_mut()
-                .expect("sequence value lock poisoned");
-            values[i].committed = SequenceValue {
+            catalog.values[i].committed = SequenceValue {
                 last_value: last,
                 is_called,
                 log_count: 0,
@@ -44942,7 +45131,8 @@ impl Storage {
                 x.schema = new_schema;
             }
         }
-        for sequence in self.sequences.iter_mut() {
+        let mut sequence_catalog = self.sequence_catalog();
+        for sequence in sequence_catalog.definitions.iter_mut() {
             if sequence.database != database_oid || sequence.ddl_state != CatalogDdlState::Present {
                 continue;
             }
@@ -44968,6 +45158,7 @@ impl Storage {
                 generator.table_schema = new_schema;
             }
         }
+        drop(sequence_catalog);
         for t in self.tables.iter_mut() {
             if t.database != database_oid || !t.live {
                 continue;
@@ -45067,7 +45258,8 @@ impl Storage {
                 }
             }
         }
-        for sequence in self.sequences.iter_mut() {
+        let mut sequence_catalog = self.sequence_catalog();
+        for sequence in sequence_catalog.definitions.iter_mut() {
             if sequence.database != database_oid {
                 continue;
             }
@@ -45081,6 +45273,7 @@ impl Storage {
                 true,
             );
         }
+        drop(sequence_catalog);
         for index_def in self.indexes.iter_mut() {
             if index_def.database != database_oid
                 || index_def.ddl_state != CatalogDdlState::Present
@@ -50551,8 +50744,10 @@ mod tests {
         assert_eq!(storage.databases.len(), 6);
         assert_eq!(storage.cumulative_statistics().databases.len(), 6);
         assert_eq!(storage.schemas.len(), 17);
-        assert_eq!(storage.sequences.len(), 18);
-        assert_eq!(storage.sequence_values().capacity(), 18);
+        let sequence_catalog = storage.sequence_catalog();
+        assert_eq!(sequence_catalog.definitions.len(), 18);
+        assert_eq!(sequence_catalog.values.capacity(), 18);
+        drop(sequence_catalog);
         let type_catalog = storage
             .type_catalog
             .lock()
@@ -52935,36 +53130,40 @@ mod tests {
     }
 
     #[test]
-    fn sequence_values_are_synchronized_and_startup_bounded() {
+    fn sequence_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SequenceDef>();
         assert_send_sync::<SequenceValues>();
+        assert_send_sync::<std::sync::Mutex<SequenceCatalog>>();
+        assert_send_sync::<SequenceIter<'_>>();
 
         let config = test_config();
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
-        let sequence = &storage.sequences[0];
-        let values = &storage.sequence_values;
+        let catalog = &storage.sequence_catalog;
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(move || {
                     for _ in 0..1_000 {
-                        let mut values = values.lock().expect("sequence value lock poisoned");
+                        let mut catalog = catalog.lock().expect("sequence catalog lock poisoned");
+                        let sequence = catalog.definitions[0];
                         sequence
-                            .reserve_values_with(&mut values[0].committed, 1)
+                            .reserve_values_with(&mut catalog.values[0].committed, 1)
                             .unwrap();
                     }
                 });
             }
         });
-        let values = storage.sequence_values();
-        assert_eq!(values.capacity(), config.max_sequences);
-        assert_eq!(values.len(), config.max_sequences);
-        assert_eq!(values[0].committed.last_value, 4_000);
-        assert!(values[0].committed.is_called);
-        assert!(values[0].committed.dirty);
-        assert_eq!(values[0].committed.generation, 4_000);
-        drop(values);
+        let catalog = storage.sequence_catalog();
+        assert_eq!(catalog.definitions.capacity(), config.max_sequences);
+        assert_eq!(catalog.definitions.len(), config.max_sequences);
+        assert_eq!(catalog.values.capacity(), config.max_sequences);
+        assert_eq!(catalog.values.len(), config.max_sequences);
+        assert_eq!(catalog.values[0].committed.last_value, 4_000);
+        assert!(catalog.values[0].committed.is_called);
+        assert!(catalog.values[0].committed.dirty);
+        assert_eq!(catalog.values[0].committed.generation, 4_000);
+        drop(catalog);
         storage.mark_sequence_value_staged(0, 0, 4_000);
         storage.reserve_sequence_values(0, 0, 1).unwrap();
         storage.clear_sequence_value_dirty(0, 0);

@@ -9483,7 +9483,8 @@ impl Checkpointer {
         // Sequences: hex schema/name, then the numeric parameters and the live
         // value state. A sequence stores no rows, so
         // this line is its whole durable form.
-        for (slot, seq) in storage.checkpoint_sequences_with_slots() {
+        for (_, seq, last_value, is_called, log_count) in storage.checkpoint_sequences_with_slots()
+        {
             write_database_context(&mut self.manifest_buf, &mut database_context, seq.database)?;
             use core::fmt::Write;
             let mut hschema = StackStr::<130>::new();
@@ -9530,8 +9531,6 @@ impl Checkpointer {
                 let _ = write!(generator_table, "0");
                 let _ = write!(generator_column, "0");
             }
-            let (last_value, is_called, log_count, _, _) =
-                storage.sequence_value_image_for(slot, 0);
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
@@ -10880,7 +10879,7 @@ impl Checkpointer {
                 slot: slot as u16,
             })?;
         }
-        for (slot, _) in storage.checkpoint_sequences_with_slots() {
+        for (slot, _, _, _, _) in storage.checkpoint_sequences_with_slots() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Sequence,
                 slot: slot as u16,

@@ -132,8 +132,9 @@ active production roadmap is [PLAN.md](../PLAN.md).
   the target in that same state. Repeatable-read retention and serializable
   read tracking share a startup-bounded snapshot mutex. BRIN maintenance
   metadata and unsummarized ranges share one fixed mutex, including coherent
-  WAL and checkpoint images. Committed and staged sequence value images share
-  another fixed mutex across reservation, restart, replay, and publication.
+  WAL and checkpoint images. Sequence definitions, pending alterations,
+  ownership, and committed and staged values share another fixed mutex across
+  DDL, reservation, restart, replay, checkpoint, and publication.
   Foreign transaction metadata uses one mutex per fixed query workspace, and
   temporary-object transaction ownership uses a fixed shared mutex across
   PREPARE checks and cleanup. Role reachability scratch uses one fixed mutex per

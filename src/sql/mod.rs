@@ -5836,10 +5836,7 @@ impl Engine {
             }
         }
         for i in 0..self.storage.sequence_count() {
-            let sequence = self.storage.sequence(i);
-            if sequence.visible_to(txn.txid) {
-                self.storage.clear_sequence_value_dirty(i, txn.txid);
-            }
+            self.storage.clear_sequence_value_dirty(i, txn.txid);
         }
         for slot in 0..self.storage.index_count() {
             if self

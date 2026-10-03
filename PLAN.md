@@ -573,6 +573,18 @@ capacity, loud exhaustion, complete slot reuse, and `Send + Sync` have direct
 coverage. The remaining catalog definition containers and row mutation paths
 still require synchronization before fixed workers can overlap execution.
 
+Logical replication slot identity, durable resume positions and behavior,
+transient activation, sent position, and statistics now share one
+startup-bounded mutex. Create, copy, alter, drop, restore, checkpoint, WAL
+acknowledgement, activation, and statistics reset observe complete slot images.
+Iterators copy one fixed slot and release the mutex before nested WAL, catalog,
+or protocol work. Every name lookup now includes its database identity, so one
+database cannot activate, advance, account, or deactivate another database's
+same-named slot. Four-worker publication, nested-reader progress, exact
+retained capacity, loud exhaustion, complete slot reuse, and `Send + Sync` have
+direct coverage. The remaining catalog definition containers and row mutation
+paths still require synchronization before fixed workers can overlap execution.
+
 Instrumented SQL differential coverage now divides the corpus into six
 deterministic slices after three and then four slices exhausted the fixed
 15-minute worker budget while still making normal progress. The CI guard pins

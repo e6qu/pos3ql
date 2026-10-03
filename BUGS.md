@@ -855,6 +855,17 @@ exhaustion, complete slot reuse, and `Send + Sync` have direct coverage. The
 same audit found statistics creation committing existence without promoting
 its initial ownership overlay; later DDL and ANALYZE now see committed
 ownership instead of a stale transaction blocker.
+The publication catalog audit found complete definitions, pending names and
+definition images, ownership, and existence state in one unsynchronized fixed
+vector. Overlapping DDL, replay, database lifecycle, schema cleanup,
+checkpoint, catalog, and logical-replication work could lose updates or
+combine fields from different transitions. One startup-bounded mutex now owns
+the catalog. Readers copy one fixed definition and release the lock before
+nested table, schema, role, comment, or replication lookup. Conflicting
+creates, renames, alters, ownership changes, and drops use the common
+transaction wait boundary. Four-worker publication, nested-reader progress,
+exact retained capacity, loud exhaustion, complete slot reuse, and `Send +
+Sync` have direct coverage.
 The instrumented SQL differential corpus outgrew its three-worker partition,
 then a slower runner exhausted the limit again with four workers after a
 3-minute 20-second build and more than 11 minutes of normal corpus progress.

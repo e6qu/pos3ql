@@ -559,9 +559,19 @@ the existing serialization error. Four-worker publication, nested-reader
 progress, exact retained capacities, loud exhaustion, complete slot reuse, and
 `Send + Sync` have direct coverage. Creation commit now promotes the initial
 ownership overlay with existence, so later transactions do not retain a stale
-catalog blocker. The remaining catalog definition
-containers and row mutation paths still require synchronization before fixed
-workers can overlap execution.
+catalog blocker.
+
+Publication definitions, pending names and definition images, ownership, and
+existence state now share one startup-bounded mutex. DDL publication and
+rollback, replay, database cloning and removal, schema cleanup, checkpoint and
+catalog reads, and logical replication observe complete definition images.
+Iterators copy one fixed definition and release the mutex before nested table,
+schema, role, comment, or replication lookup. Conflicting create, rename,
+alter, ownership, and drop operations use the common transaction wait
+boundary. Four-worker publication, nested-reader progress, exact retained
+capacity, loud exhaustion, complete slot reuse, and `Send + Sync` have direct
+coverage. The remaining catalog definition containers and row mutation paths
+still require synchronization before fixed workers can overlap execution.
 
 Instrumented SQL differential coverage now divides the corpus into six
 deterministic slices after three and then four slices exhausted the fixed

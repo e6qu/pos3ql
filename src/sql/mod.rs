@@ -2088,8 +2088,8 @@ fn publication_output_relation(
         if publishes
             && publication.publish_via_partition_root
             && (publication.all_tables
-                || publication_partition_schema_member(storage, publication, table_slot)
-                || publication_partition_member(storage, publication, table_slot).is_some())
+                || publication_partition_schema_member(storage, &publication, table_slot)
+                || publication_partition_member(storage, &publication, table_slot).is_some())
         {
             return Ok(partition_root(storage, table_slot));
         }
@@ -2186,7 +2186,7 @@ fn publication_column_mask(
         if !publishes {
             continue;
         }
-        if let Some(mask) = publication_projection_mask(storage, publication, table_slot) {
+        if let Some(mask) = publication_projection_mask(storage, &publication, table_slot) {
             if selected.is_some_and(|selected| selected != mask) {
                 return Err(mismatched_publication_columns(storage, table_slot));
             }
@@ -2227,11 +2227,11 @@ fn publication_row_matches(
             continue;
         }
         if publication.all_tables
-            || publication_partition_schema_member(storage, publication, table_slot)
+            || publication_partition_schema_member(storage, &publication, table_slot)
         {
             return Ok(true);
         }
-        let Some(index) = publication_partition_member(storage, publication, table_slot) else {
+        let Some(index) = publication_partition_member(storage, &publication, table_slot) else {
             continue;
         };
         // With PostgreSQL's default leaf identity, a partition ancestor's
@@ -4010,7 +4010,7 @@ impl Engine {
                     .publication(name.as_str())
                     .expect("publication set was validated");
                 let Some(mask) =
-                    publication_projection_mask(&self.storage, publication, table_slot)
+                    publication_projection_mask(&self.storage, &publication, table_slot)
                 else {
                     continue;
                 };

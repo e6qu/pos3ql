@@ -17034,9 +17034,9 @@ fn pg_publication_tables<'a>(
             if !table.visible_to(txid) {
                 continue;
             }
-            let explicit = super::publication_partition_member(storage, publication, table_slot);
+            let explicit = super::publication_partition_member(storage, &publication, table_slot);
             let schema =
-                super::publication_partition_schema_member(storage, publication, table_slot);
+                super::publication_partition_schema_member(storage, &publication, table_slot);
             if !published.all_tables && !schema && explicit.is_none() {
                 continue;
             }
@@ -17059,7 +17059,7 @@ fn pg_publication_tables<'a>(
             emitted_count += 1;
             let output_definition = storage.table_def(output, txid);
             let effective_explicit =
-                super::publication_partition_member(storage, publication, output);
+                super::publication_partition_member(storage, &publication, output);
             let implicit_mask = || {
                 let mut mask = ColumnSet::EMPTY;
                 for (column, metadata) in output_definition.columns().iter().enumerate() {

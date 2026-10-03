@@ -594,10 +594,11 @@ at startup, reuse validates the typed owner, exhaustion returns SQLSTATE
 the owner's remote sessions. Exact memory-plan charging, endpoint isolation,
 slot reuse, operational capacity reporting, and live two-endpoint transaction
 behavior retain direct coverage.
-The coverage gate also exposed that the 4,096 grouping-set capacity probe could
-outlast its 60-second socket deadline under instrumentation. The wide-capacity
-probe now uses the existing 120-second deadline class and reports the active
-case on timeout, while the workflow's 15-minute outer bound remains unchanged.
+The coverage gate exposed that the 4,096 grouping-set capacity probe could
+outlast first its 60-second and later its 120-second socket deadline under
+instrumentation on slower runners. Grouping capacity now has an independent
+coverage worker with a 300-second query deadline, while ordinary runs retain
+120 seconds and the workflow's 15-minute outer bound remains unchanged.
 The cumulative-statistics audit found seven independently borrowed vectors and
 shared reset timestamps that would panic or lose updates under overlapping
 workers. They now share one startup-bounded state protected by a mutex.
@@ -920,6 +921,18 @@ timeout guard requires every slice explicitly.
 The sequence synchronization fixture now creates and commits its sequence
 through the catalog API before checking visibility-gated value publication;
 using an absent slot had made its final dirty-state assertion invalid.
+The tablespace catalog audit found definitions, pending names and options,
+ownership, and existence state in one unsynchronized fixed vector. Overlapping
+DDL, restore, replay, checkpoint, catalog, and relation placement work could
+lose updates, combine fields from different transitions, or claim an identity
+hidden by another transaction. One startup-bounded mutex now owns the catalog.
+Readers copy one fixed definition before nested work, and conflicting create,
+rename, alter, ownership, and drop operations use the common transaction wait
+boundary. Committed drops and rolled-back creates also retained stale identity,
+ownership, and ACL state in reusable slots; terminal paths now clear the
+complete slot. Four-worker publication, nested-reader progress, exact retained
+capacity, loud exhaustion, complete slot reuse, and `Send + Sync` have direct
+coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

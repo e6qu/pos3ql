@@ -10221,6 +10221,16 @@ struct TablespaceImage {
 }
 
 impl TablespaceDef {
+    const EMPTY: Self = Self {
+        created_at: 0,
+        name: SqlName::EMPTY,
+        location: StackStr::new(),
+        options: TablespaceOptions::DEFAULT,
+        ownership: Ownership::BOOTSTRAP,
+        pending: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
     pub(crate) fn name_for(&self, txid: u32) -> SqlName {
         self.pending
             .filter(|pending| pending.txid == txid)
@@ -10235,6 +10245,41 @@ impl TablespaceDef {
 
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
+    }
+
+    fn identity_matches(&self, name: SqlName) -> bool {
+        self.name == name || self.pending.is_some_and(|pending| pending.name == name)
+    }
+
+    fn pending_owner_other_than(&self, txid: u32) -> Option<u32> {
+        [
+            self.ddl_state.pending_txid(),
+            self.pending.map(|pending| pending.txid),
+            self.ownership.pending.map(|pending| pending.txid),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|owner| *owner != txid)
+    }
+}
+
+struct TablespaceIter<'a> {
+    catalog: &'a std::sync::Mutex<FixedVec<TablespaceDef>>,
+    next_slot: usize,
+}
+
+impl Iterator for TablespaceIter<'_> {
+    type Item = (usize, TablespaceDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
     }
 }
 
@@ -13126,7 +13171,7 @@ pub struct Storage {
     /// Transactions that resolved a temporary relation. PREPARE TRANSACTION
     /// must reject them before state can outlive the owning connection.
     temporary_transactions: std::sync::Mutex<TemporaryTransactionState>,
-    tablespaces: FixedVec<TablespaceDef>,
+    tablespaces: std::sync::Mutex<FixedVec<TablespaceDef>>,
     schemas: FixedVec<SchemaDef>,
     extensions: FixedVec<ExtensionDef>,
     extension_dependencies: FixedVec<ExtensionDependency>,
@@ -17709,7 +17754,7 @@ impl Storage {
                 reset_times: SharedStatisticsResetTimes::new(),
             }),
             temporary_transactions,
-            tablespaces,
+            tablespaces: std::sync::Mutex::new(tablespaces),
             schemas,
             extensions,
             extension_dependencies,
@@ -20816,7 +20861,7 @@ impl Storage {
             AccessClass::Index => self.indexes[slot].ownership,
             AccessClass::Routine => self.routine(slot).ownership,
             AccessClass::Composite => self.composite(slot).ownership,
-            AccessClass::Tablespace => self.tablespaces[slot].ownership,
+            AccessClass::Tablespace => self.tablespace(slot).ownership,
             AccessClass::Statistics => self.extended_statistics(slot).ownership,
             AccessClass::Extension => self.extensions[slot].ownership,
             AccessClass::Trigger => match self.trigger(slot).target {
@@ -20853,7 +20898,9 @@ impl Storage {
             AccessClass::Routine => {
                 unreachable!("routine ownership is synchronized separately")
             }
-            AccessClass::Tablespace => &mut self.tablespaces[slot].ownership,
+            AccessClass::Tablespace => {
+                unreachable!("tablespace ownership is synchronized separately")
+            }
             AccessClass::Statistics => {
                 unreachable!("extended-statistics ownership is synchronized separately")
             }
@@ -21300,7 +21347,7 @@ impl Storage {
                 let definition = self.composite_for(slot, txid);
                 (definition.schema, definition.name)
             }
-            AccessClass::Tablespace => (SqlName::EMPTY, self.tablespaces[slot].name_for(txid)),
+            AccessClass::Tablespace => (SqlName::EMPTY, self.tablespace(slot).name_for(txid)),
             AccessClass::Statistics => {
                 let definition = self.extended_statistics(slot).definition_for(txid);
                 (definition.schema, definition.name)
@@ -21363,7 +21410,7 @@ impl Storage {
             AccessClass::Index => self.indexes[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Routine => self.routine(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Composite => self.composite(slot).ddl_state == CatalogDdlState::Present,
-            AccessClass::Tablespace => self.tablespaces[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Tablespace => self.tablespace(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Statistics => {
                 self.extended_statistics(slot).ddl_state == CatalogDdlState::Present
             }
@@ -21404,7 +21451,7 @@ impl Storage {
             AccessClass::Index => self.indexes[slot].visible_to(txid),
             AccessClass::Routine => self.routine(slot).visible_to(txid),
             AccessClass::Composite => self.composite(slot).visible_to(txid),
-            AccessClass::Tablespace => self.tablespaces[slot].visible_to(txid),
+            AccessClass::Tablespace => self.tablespace(slot).visible_to(txid),
             AccessClass::Statistics => self.extended_statistics(slot).visible_to(txid),
             AccessClass::Extension => self.extensions[slot].visible_to(txid),
             AccessClass::Trigger => self.trigger(slot).visible_to(txid),
@@ -21944,7 +21991,7 @@ impl Storage {
             AccessClass::Index => self.indexes.len(),
             AccessClass::Routine => self.routine_count(),
             AccessClass::Composite => self.composite_count(),
-            AccessClass::Tablespace => self.tablespaces.len(),
+            AccessClass::Tablespace => self.tablespace_capacity(),
             AccessClass::Statistics => self.extended_statistics_count(),
             AccessClass::Extension => self.extensions.len(),
             AccessClass::Trigger => self.trigger_capacity(),
@@ -22004,7 +22051,7 @@ impl Storage {
             (AccessClass::Index, self.indexes.len()),
             (AccessClass::Routine, self.routine_count()),
             (AccessClass::Composite, self.composite_count()),
-            (AccessClass::Tablespace, self.tablespaces.len()),
+            (AccessClass::Tablespace, self.tablespace_capacity()),
             (AccessClass::Statistics, self.extended_statistics_count()),
             (AccessClass::Extension, self.extensions.len()),
             (AccessClass::EventTrigger, self.event_trigger_capacity()),
@@ -22084,6 +22131,35 @@ impl Storage {
         self.policies_with_slots_visible_to(txid)
             .any(|(slot, _)| self.policy_roles(slot, txid).contains(&(role as u16)))
             .then_some(RoleObjectDependency::Policy)
+    }
+
+    pub(crate) fn set_tablespace_owner(
+        &self,
+        slot: usize,
+        owner: usize,
+        txid: u32,
+    ) -> Result<Option<PendingOwnership>, SqlError> {
+        let mut tablespaces = self
+            .tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        if let Some(blocker) = tablespaces[slot].pending_owner_other_than(txid) {
+            let name = tablespaces[slot].name;
+            drop(tablespaces);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let ownership = &mut tablespaces[slot].ownership;
+        let prior = ownership.pending;
+        if txid == 0 {
+            ownership.owner = owner as u16;
+            ownership.pending = None;
+        } else {
+            ownership.pending = Some(PendingOwnership {
+                txid,
+                owner: owner as u16,
+            });
+        }
+        Ok(prior)
     }
 
     pub(crate) fn set_object_owner(
@@ -22187,6 +22263,9 @@ impl Storage {
                 });
             }
             return prior;
+        }
+        if object.class == AccessClass::Tablespace {
+            unreachable!("tablespace ownership is synchronized separately");
         }
         if matches!(
             object.class,
@@ -22305,6 +22384,20 @@ impl Storage {
             }
             return;
         }
+        if object.class == AccessClass::Tablespace {
+            let mut tablespaces = self
+                .tablespaces
+                .lock()
+                .expect("tablespace catalog lock poisoned");
+            let ownership = &mut tablespaces[usize::from(object.slot)].ownership;
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            return;
+        }
         if matches!(
             object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
@@ -22356,6 +22449,14 @@ impl Storage {
             self.sequence_catalog().definitions[usize::from(object.slot)]
                 .ownership
                 .pending = prior;
+            return;
+        }
+        if object.class == AccessClass::Tablespace {
+            self.tablespaces
+                .lock()
+                .expect("tablespace catalog lock poisoned")[usize::from(object.slot)]
+            .ownership
+            .pending = prior;
             return;
         }
         if object.class == AccessClass::Routine {
@@ -44572,9 +44673,13 @@ impl Storage {
     }
 
     pub(crate) fn tablespace_slot(&self, name: &str, txid: u32) -> Option<usize> {
-        self.tablespaces.iter().position(|tablespace| {
-            tablespace.visible_to(txid) && tablespace.name_for(txid).as_str() == name
-        })
+        self.tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned")
+            .iter()
+            .position(|tablespace| {
+                tablespace.visible_to(txid) && tablespace.name_for(txid).as_str() == name
+            })
     }
 
     /// Resolves a table access-method spelling to the durable implementation
@@ -44804,6 +44909,8 @@ impl Storage {
             return None;
         }
         self.tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned")
             .get(slot)
             .copied()
             .filter(|tablespace| tablespace.visible_to(txid))
@@ -44833,19 +44940,29 @@ impl Storage {
     pub(crate) fn tablespaces_visible_to(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &TablespaceDef)> {
-        self.tablespaces
-            .iter()
-            .enumerate()
-            .filter(move |(_, tablespace)| tablespace.visible_to(txid))
+    ) -> impl Iterator<Item = (usize, TablespaceDef)> + '_ {
+        TablespaceIter {
+            catalog: &self.tablespaces,
+            next_slot: 0,
+        }
+        .filter(move |(_, tablespace)| tablespace.visible_to(txid))
     }
 
     pub(crate) fn tablespace_capacity(&self) -> usize {
-        self.tablespaces.len()
+        self.tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned")
+            .len()
+    }
+
+    fn tablespace(&self, slot: usize) -> TablespaceDef {
+        self.tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned")[slot]
     }
 
     pub(crate) fn create_tablespace(
-        &mut self,
+        &self,
         created_at: u64,
         name: SqlName,
         location: StackStr<TABLESPACE_LOCATION_MAX>,
@@ -44854,8 +44971,30 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         self.validate_tablespace_identity(name, owner, txid)?;
-        let slot = self
+        let mut tablespaces = self
             .tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        if let Some(blocker) = tablespaces.iter().find_map(|tablespace| {
+            tablespace
+                .identity_matches(name)
+                .then(|| tablespace.pending_owner_other_than(txid))
+                .flatten()
+        }) {
+            drop(tablespaces);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if tablespaces
+            .iter()
+            .any(|tablespace| tablespace.visible_to(txid) && tablespace.name_for(txid) == name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "tablespace \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        let slot = tablespaces
             .iter()
             .position(|tablespace| tablespace.ddl_state == CatalogDdlState::Absent)
             .ok_or_else(|| {
@@ -44864,8 +45003,7 @@ impl Storage {
                     "tablespace catalog capacity exhausted"
                 )
             })?;
-        self.install_tablespace(
-            slot,
+        let definition = self.tablespace_definition(
             TablespaceImage {
                 created_at,
                 name,
@@ -44875,11 +45013,17 @@ impl Storage {
             },
             txid,
         );
+        tablespaces[slot] = definition;
+        drop(tablespaces);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Tablespace,
+            slot: slot as u16,
+        });
         Ok(slot)
     }
 
     pub(crate) fn restore_tablespace(
-        &mut self,
+        &self,
         slot: usize,
         created_at: u64,
         name: SqlName,
@@ -44899,11 +45043,44 @@ impl Storage {
                     "invalid built-in tablespace identity"
                 ));
             }
-            self.tablespaces[slot].options = options;
+            let mut tablespaces = self
+                .tablespaces
+                .lock()
+                .expect("tablespace catalog lock poisoned");
+            if let Some(blocker) = tablespaces[slot].pending_owner_other_than(0) {
+                drop(tablespaces);
+                return Err(self.catalog_ddl_wait_error(0, blocker, expected));
+            }
+            tablespaces[slot].options = options;
             return Ok(());
         }
         self.validate_tablespace_identity(name, owner, 0)?;
-        let Some(target) = self.tablespaces.get(slot) else {
+        let mut tablespaces = self
+            .tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        if let Some(blocker) = tablespaces
+            .iter()
+            .enumerate()
+            .find_map(|(other, tablespace)| {
+                (other != slot && tablespace.identity_matches(name))
+                    .then(|| tablespace.pending_owner_other_than(0))
+                    .flatten()
+            })
+        {
+            drop(tablespaces);
+            return Err(self.catalog_ddl_wait_error(0, blocker, name.as_str()));
+        }
+        if tablespaces.iter().enumerate().any(|(other, tablespace)| {
+            other != slot && tablespace.visible_to(0) && tablespace.name_for(0) == name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "tablespace \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        let Some(target) = tablespaces.get(slot) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "tablespace slot is out of range"
@@ -44916,8 +45093,7 @@ impl Storage {
                 slot
             ));
         }
-        self.install_tablespace(
-            slot,
+        let mut definition = self.tablespace_definition(
             TablespaceImage {
                 created_at,
                 name,
@@ -44927,7 +45103,9 @@ impl Storage {
             },
             0,
         );
-        self.commit_tablespace_create(slot);
+        definition.ddl_state = definition.ddl_state.commit_create();
+        definition.ownership = definition.ownership.committed();
+        tablespaces[slot] = definition;
         Ok(())
     }
 
@@ -44960,14 +45138,14 @@ impl Storage {
         Ok(())
     }
 
-    fn install_tablespace(&mut self, slot: usize, image: TablespaceImage, txid: u32) {
+    fn tablespace_definition(&self, image: TablespaceImage, txid: u32) -> TablespaceDef {
         let created_at = if image.created_at == 0 {
             self.catalog_sequence.next()
         } else {
             self.catalog_sequence.observe(image.created_at);
             image.created_at
         };
-        self.tablespaces[slot] = TablespaceDef {
+        TablespaceDef {
             created_at,
             name: image.name,
             location: image.location,
@@ -44981,26 +45159,30 @@ impl Storage {
             },
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
-        };
+        }
     }
 
     pub(crate) fn alter_tablespace_definition(
-        &mut self,
+        &self,
         slot: usize,
         name: SqlName,
         options: TablespaceOptions,
         txid: u32,
     ) -> Result<Option<PendingTablespaceDefinition>, SqlError> {
-        if self
+        let mut tablespaces = self
             .tablespaces
-            .iter()
-            .enumerate()
-            .any(|(other, tablespace)| {
-                other != slot && tablespace.visible_to(txid) && tablespace.name_for(txid) == name
-            })
-            || ((name.as_str().eq_ignore_ascii_case("pg_default")
-                || name.as_str().eq_ignore_ascii_case("pg_global"))
-                && self.tablespaces[slot].name_for(txid) != name)
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        if let Some(blocker) = tablespaces[slot].pending_owner_other_than(txid) {
+            let current_name = tablespaces[slot].name;
+            drop(tablespaces);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, current_name.as_str()));
+        }
+        if tablespaces.iter().enumerate().any(|(other, tablespace)| {
+            other != slot && tablespace.visible_to(txid) && tablespace.name_for(txid) == name
+        }) || ((name.as_str().eq_ignore_ascii_case("pg_default")
+            || name.as_str().eq_ignore_ascii_case("pg_global"))
+            && tablespaces[slot].name_for(txid) != name)
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -45008,15 +45190,20 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let prior = self.tablespaces[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                prior.unwrap().txid,
-                self.tablespaces[slot].name.as_str(),
-            ));
+        if let Some(blocker) = tablespaces
+            .iter()
+            .enumerate()
+            .find_map(|(other, tablespace)| {
+                (other != slot && tablespace.identity_matches(name))
+                    .then(|| tablespace.pending_owner_other_than(txid))
+                    .flatten()
+            })
+        {
+            drop(tablespaces);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        self.tablespaces[slot].pending = Some(PendingTablespaceDefinition {
+        let prior = tablespaces[slot].pending;
+        tablespaces[slot].pending = Some(PendingTablespaceDefinition {
             txid,
             name,
             options,
@@ -45024,12 +45211,22 @@ impl Storage {
         Ok(prior)
     }
 
-    pub(crate) fn drop_tablespace(&mut self, slot: usize, txid: u32) -> Result<(), SqlError> {
+    pub(crate) fn drop_tablespace(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        let tablespaces = self
+            .tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        let tablespace = tablespaces[slot];
+        if let Some(blocker) = tablespace.pending_owner_other_than(txid) {
+            drop(tablespaces);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, tablespace.name.as_str()));
+        }
+        drop(tablespaces);
         if slot < 2 {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "cannot drop built-in tablespace \"{}\"",
-                self.tablespaces[slot].name.as_str()
+                tablespace.name.as_str()
             ));
         }
         let id = u16::try_from(slot + 2).map_err(|_| {
@@ -45052,64 +45249,117 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::OBJECT_IN_USE,
                 "tablespace \"{}\" is not empty",
-                self.tablespaces[slot].name_for(txid).as_str()
+                tablespace.name_for(txid).as_str()
             ));
         }
-        self.tablespaces[slot].ddl_state = self.tablespaces[slot].ddl_state.drop_by(txid);
+        let mut tablespaces = self
+            .tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        if let Some(blocker) = tablespaces[slot].pending_owner_other_than(txid) {
+            let current_name = tablespaces[slot].name;
+            drop(tablespaces);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, current_name.as_str()));
+        }
+        tablespaces[slot].ddl_state = tablespaces[slot].ddl_state.drop_by(txid);
         Ok(())
     }
 
-    pub(crate) fn commit_tablespace_create(&mut self, slot: usize) {
-        self.tablespaces[slot].ddl_state = self.tablespaces[slot].ddl_state.commit_create();
-        self.tablespaces[slot].ownership = self.tablespaces[slot].ownership.committed();
+    pub(crate) fn commit_tablespace_create(&self, slot: usize) {
+        let mut tablespaces = self
+            .tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        tablespaces[slot].ddl_state = tablespaces[slot].ddl_state.commit_create();
+        tablespaces[slot].ownership = tablespaces[slot].ownership.committed();
     }
 
-    pub(crate) fn commit_tablespace_alter(&mut self, slot: usize, txid: u32) {
-        if let Some(pending) = self.tablespaces[slot].pending
+    pub(crate) fn commit_tablespace_alter(&self, slot: usize, txid: u32) {
+        let mut tablespaces = self
+            .tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        let rename = if let Some(pending) = tablespaces[slot].pending
             && pending.txid == txid
         {
-            let old_name = self.tablespaces[slot].name;
-            self.tablespaces[slot].name = pending.name;
-            self.tablespaces[slot].options = pending.options;
-            self.tablespaces[slot].pending = None;
+            let old_name = tablespaces[slot].name;
+            tablespaces[slot].name = pending.name;
+            tablespaces[slot].options = pending.options;
+            tablespaces[slot].pending = None;
+            Some((old_name, pending.name))
+        } else {
+            None
+        };
+        if tablespaces[slot]
+            .ownership
+            .pending
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            tablespaces[slot].ownership = tablespaces[slot].ownership.committed();
+        }
+        drop(tablespaces);
+        if let Some((old_name, new_name)) = rename {
             for comment in self.comment_catalog().entries.iter_mut() {
                 if comment.used
                     && comment.class == CommentClass::Tablespace
                     && comment.name == old_name
                 {
-                    comment.name = pending.name;
+                    comment.name = new_name;
                 }
             }
         }
-        if self.tablespaces[slot]
-            .ownership
-            .pending
-            .is_some_and(|pending| pending.txid == txid)
-        {
-            self.tablespaces[slot].ownership = self.tablespaces[slot].ownership.committed();
-        }
     }
 
-    pub(crate) fn commit_tablespace_drop(&mut self, slot: usize) {
-        let name = self.tablespaces[slot].name;
+    pub(crate) fn commit_tablespace_drop(&self, slot: usize) {
+        let tablespaces = self
+            .tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        let name = tablespaces[slot].name;
+        drop(tablespaces);
         self.drop_object_comments(CommentClass::Tablespace, "", name.as_str());
-        self.tablespaces[slot].ddl_state = self.tablespaces[slot].ddl_state.commit_drop();
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Tablespace,
+            slot: slot as u16,
+        });
+        let mut tablespaces = self
+            .tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        tablespaces[slot].ddl_state = tablespaces[slot].ddl_state.commit_drop();
+        tablespaces[slot] = TablespaceDef::EMPTY;
     }
 
-    pub(crate) fn rollback_tablespace_create(&mut self, slot: usize) {
-        self.tablespaces[slot].ddl_state = self.tablespaces[slot].ddl_state.rollback_create();
+    pub(crate) fn rollback_tablespace_create(&self, slot: usize) {
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Tablespace,
+            slot: slot as u16,
+        });
+        let mut tablespaces = self
+            .tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        tablespaces[slot].ddl_state = tablespaces[slot].ddl_state.rollback_create();
+        tablespaces[slot] = TablespaceDef::EMPTY;
     }
 
     pub(crate) fn rollback_tablespace_alter(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingTablespaceDefinition>,
     ) {
-        self.tablespaces[slot].pending = prior;
+        self.tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned")[slot]
+            .pending = prior;
     }
 
-    pub(crate) fn rollback_tablespace_drop(&mut self, slot: usize, txid: u32) {
-        self.tablespaces[slot].ddl_state = self.tablespaces[slot].ddl_state.rollback_drop(txid);
+    pub(crate) fn rollback_tablespace_drop(&self, slot: usize, txid: u32) {
+        let mut tablespaces = self
+            .tablespaces
+            .lock()
+            .expect("tablespace catalog lock poisoned");
+        tablespaces[slot].ddl_state = tablespaces[slot].ddl_state.rollback_drop(txid);
     }
 
     /// A definition-only schema move (ALTER TABLE ... SET SCHEMA): the table
@@ -50914,7 +51164,7 @@ mod tests {
                 .capacity(),
             pending_extended_statistics_capacity(&config)
         );
-        assert_eq!(storage.tablespaces.len(), 15);
+        assert_eq!(storage.tablespace_capacity(), 15);
         assert_eq!(storage.comment_capacity(), 16);
         assert_eq!(storage.foreign_sessions.slots.capacity(), 3);
         assert!(storage.foreign_sessions.slots.is_empty());
@@ -53195,6 +53445,166 @@ mod tests {
         storage.mark_sequence_value_staged(0, 0, 4_001);
         storage.clear_sequence_value_dirty(0, 0);
         assert!(!storage.sequence_value_image_for(0, 0).3);
+    }
+
+    #[test]
+    fn tablespace_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TablespaceDef>();
+        assert_send_sync::<std::sync::Mutex<FixedVec<TablespaceDef>>>();
+        assert_send_sync::<TablespaceIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let names = ["space_a", "space_b", "space_c", "space_d"];
+        let mut config = test_config();
+        config.max_tablespaces = 2 + WORKERS;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let txid = worker as u32 + 1;
+                    let slot = storage
+                        .create_tablespace(
+                            0,
+                            SqlName::parse(names[worker]).unwrap(),
+                            StackStr::from_str("/data"),
+                            TablespaceOptions::DEFAULT,
+                            BOOTSTRAP_ROLE,
+                            txid,
+                        )
+                        .unwrap();
+                    storage.commit_tablespace_create(slot);
+                });
+            }
+        });
+
+        assert_eq!(storage.tablespace_capacity(), 2 + WORKERS);
+        assert_eq!(storage.tablespaces_visible_to(0).count(), 2 + WORKERS);
+        for (slot, tablespace) in storage.tablespaces_visible_to(0) {
+            let nested = storage.tablespace(slot);
+            assert_eq!(nested.created_at, tablespace.created_at);
+            assert_eq!(nested.name, tablespace.name);
+        }
+        let created_at: [u64; WORKERS] = std::array::from_fn(|worker| {
+            let slot = storage.tablespace_slot(names[worker], 0).unwrap();
+            storage.tablespace(slot).created_at
+        });
+        for left in 0..WORKERS {
+            assert_ne!(created_at[left], 0);
+            for right in left + 1..WORKERS {
+                assert_ne!(created_at[left], created_at[right]);
+            }
+        }
+        assert_eq!(
+            storage
+                .create_tablespace(
+                    0,
+                    SqlName::parse("space_full").unwrap(),
+                    StackStr::from_str("/data"),
+                    TablespaceOptions::DEFAULT,
+                    BOOTSTRAP_ROLE,
+                    9,
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+
+        let reclaimed = storage.tablespace_slot(names[0], 0).unwrap();
+        storage.drop_tablespace(reclaimed, 10).unwrap();
+        storage.commit_tablespace_drop(reclaimed);
+        assert_eq!(storage.tablespace(reclaimed).created_at, 0);
+        assert_eq!(storage.tablespace(reclaimed).name, SqlName::EMPTY);
+        assert!(storage.tablespace(reclaimed).location.as_str().is_empty());
+        assert_eq!(
+            storage.tablespace(reclaimed).ddl_state,
+            CatalogDdlState::Absent
+        );
+
+        let reused = storage
+            .create_tablespace(
+                0,
+                SqlName::parse("space_reused").unwrap(),
+                StackStr::from_str("/reused"),
+                TablespaceOptions::DEFAULT,
+                BOOTSTRAP_ROLE,
+                11,
+            )
+            .unwrap();
+        assert_eq!(reused, reclaimed);
+        storage.rollback_tablespace_create(reused);
+        assert_eq!(storage.tablespace(reused).created_at, 0);
+        assert!(storage.tablespace(reused).ownership.pending.is_none());
+
+        let pending = storage
+            .create_tablespace(
+                0,
+                SqlName::parse("space_pending").unwrap(),
+                StackStr::from_str("/pending"),
+                TablespaceOptions::DEFAULT,
+                BOOTSTRAP_ROLE,
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .create_tablespace(
+                    0,
+                    SqlName::parse("space_pending").unwrap(),
+                    StackStr::from_str("/other"),
+                    TablespaceOptions::DEFAULT,
+                    BOOTSTRAP_ROLE,
+                    21,
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.release_row_locks(21);
+        storage.rollback_tablespace_create(pending);
+
+        let altered = storage.tablespace_slot(names[1], 0).unwrap();
+        let other = storage.tablespace_slot(names[2], 0).unwrap();
+        let renamed = SqlName::parse("space_renamed").unwrap();
+        let prior = storage
+            .alter_tablespace_definition(altered, renamed, TablespaceOptions::DEFAULT, 30)
+            .unwrap();
+        assert_eq!(
+            storage
+                .alter_tablespace_definition(other, renamed, TablespaceOptions::DEFAULT, 31)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.release_row_locks(31);
+        assert_eq!(
+            storage.drop_tablespace(altered, 32).unwrap_err().sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.release_row_locks(32);
+        storage.rollback_tablespace_alter(altered, prior);
+
+        let prior_owner = storage
+            .set_tablespace_owner(altered, usize::from(BOOTSTRAP_ROLE), 40)
+            .unwrap();
+        assert_eq!(
+            storage
+                .set_tablespace_owner(altered, usize::from(BOOTSTRAP_ROLE), 41)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.release_row_locks(41);
+        storage.restore_object_owner(
+            AccessObject {
+                class: AccessClass::Tablespace,
+                slot: altered as u16,
+            },
+            prior_owner,
+        );
     }
 
     #[test]

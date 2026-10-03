@@ -88,9 +88,9 @@ else
   DIFF_AUXILIARY=all
 fi
 case "$DIFF_AUXILIARY" in
-all | none | exact | copy | types | slt | pg_regress) ;;
+all | none | exact | copy | types | grouping | slt | pg_regress) ;;
 *)
-  printf 'FAIL: POS3QL_DIFF_AUXILIARY must be all, none, exact, copy, types, slt, or pg_regress (got %q)\n' "$DIFF_AUXILIARY"
+  printf 'FAIL: POS3QL_DIFF_AUXILIARY must be all, none, exact, copy, types, grouping, slt, or pg_regress (got %q)\n' "$DIFF_AUXILIARY"
   exit 1
   ;;
 esac
@@ -437,13 +437,6 @@ else
   bad "prepared-parameter capacity differential"
   cat "$WORK/parameter-capacity.out"
 fi
-if python3 "$EXT/grouping_capacity_diff.py" --pg "$PG_PORT" --p3 "$P3_PORT" \
-     > "$WORK/grouping-capacity.out" 2>&1; then
-  ok "grouping capacity differential ($(tail -1 "$WORK/grouping-capacity.out"))"
-else
-  bad "grouping capacity differential"
-  cat "$WORK/grouping-capacity.out"
-fi
 if python3 "$EXT/result_column_capacity_diff.py" --pg "$PG_PORT" --p3 "$P3_PORT" \
      > "$WORK/result-column-capacity.out" 2>&1; then
   ok "result-column capacity differential ($(tail -1 "$WORK/result-column-capacity.out"))"
@@ -475,6 +468,20 @@ if [[ -x "$ROOT_VENV/bin/python" ]]; then
   fi
 else
   printf '%s\n' 'SKIP: accepted-type fidelity matrix (need a psycopg venv at $POS3QL_VENV)'
+fi
+reset_pair
+fi
+
+if want_auxiliary grouping; then
+printf '%s\n' '' '=== grouping capacity ==='
+restart_pos3ql_clean
+if python3 "$EXT/grouping_capacity_diff.py" --pg "$PG_PORT" --p3 "$P3_PORT" \
+     --timeout-seconds "${POS3QL_GROUPING_QUERY_TIMEOUT_SECONDS:-120}" \
+     > "$WORK/grouping-capacity.out" 2>&1; then
+  ok "grouping capacity differential ($(tail -1 "$WORK/grouping-capacity.out"))"
+else
+  bad "grouping capacity differential"
+  cat "$WORK/grouping-capacity.out"
 fi
 reset_pair
 fi

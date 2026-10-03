@@ -21223,14 +21223,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 options,
                 0,
             )?;
-            storage.set_object_owner(
-                crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Tablespace,
-                    slot: slot as u16,
-                },
-                usize::from(owner),
-                0,
-            );
+            storage.set_tablespace_owner(slot, usize::from(owner), 0)?;
             storage.commit_tablespace_alter(slot, 0);
         }
         WalOp::DropTablespace { name } => {
@@ -21796,7 +21789,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     );
                 }
             }
-            storage.set_object_owner(object, owner, 0);
+            if object.class == crate::storage::AccessClass::Tablespace {
+                storage.set_tablespace_owner(usize::from(object.slot), owner, 0)?;
+            } else {
+                storage.set_object_owner(object, owner, 0);
+            }
         }
         WalOp::SetObjectAcl {
             class,

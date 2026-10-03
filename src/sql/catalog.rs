@@ -14123,7 +14123,7 @@ fn pg_shdescription<'a>(
         };
         rows[count] = row(
             &[
-                Datum::Int4(tablespace_oid(*tablespace)),
+                Datum::Int4(tablespace_oid(tablespace)),
                 Datum::Int4(PG_TABLESPACE_OID),
                 text(description, arena)?,
             ],
@@ -14393,7 +14393,7 @@ pub fn comment_text_for<'a>(
                     && subid == 0
                     && storage.tablespaces_visible_to(txid).any(|(_, tablespace)| {
                         tablespace.name_for(txid).as_str() == name
-                            && Some(tablespace_oid(*tablespace)) == signed_oid
+                            && Some(tablespace_oid(tablespace)) == signed_oid
                     })
             }
             "pg_database" => {
@@ -19338,7 +19338,7 @@ fn pg_tablespace<'a>(
                 Datum::Int4(match tablespace.name_for(txid).as_str() {
                     "pg_default" => 1663,
                     "pg_global" => 1664,
-                    _ => tablespace_oid(*tablespace),
+                    _ => tablespace_oid(tablespace),
                 }),
                 text(tablespace.name_for(txid).as_str(), arena)?,
                 Datum::Int4(Storage::role_oid(storage.object_owner(object, txid))),
@@ -19362,7 +19362,7 @@ pub(crate) fn tablespace_location_by_oid<'a>(
         return Ok(Some(""));
     }
     for (_, tablespace) in storage.tablespaces_visible_to(txid) {
-        if tablespace_oid(*tablespace) == oid {
+        if tablespace_oid(tablespace) == oid {
             return arena
                 .alloc_str(tablespace.location.as_str())
                 .map(Some)
@@ -19387,7 +19387,7 @@ pub(crate) fn tablespace_name_by_oid<'a>(
         return Ok(Some(name));
     }
     for (_, tablespace) in storage.tablespaces_visible_to(txid) {
-        if tablespace_oid(*tablespace) == oid {
+        if tablespace_oid(tablespace) == oid {
             return arena
                 .alloc_str(tablespace.name_for(txid).as_str())
                 .map(Some)
@@ -29911,7 +29911,7 @@ fn pg_database<'a>(
             id => storage
                 .tablespaces_visible_to(txid)
                 .find(|(slot, _)| *slot + 2 == usize::from(id))
-                .map_or(0, |(_, tablespace)| tablespace_oid(*tablespace)),
+                .map_or(0, |(_, tablespace)| tablespace_oid(tablespace)),
         };
         output[count] = row(
             &[

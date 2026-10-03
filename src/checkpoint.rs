@@ -3839,7 +3839,18 @@ impl Checkpointer {
                     let owner = storage
                         .find_role(&owner)
                         .ok_or(CheckpointSetupError::Corrupt("own role does not exist"))?;
-                    storage.set_object_owner(object, owner, 0);
+                    if object.class == crate::storage::AccessClass::Tablespace {
+                        storage
+                            .set_tablespace_owner(usize::from(object.slot), owner, 0)
+                            .map_err(|error| {
+                                CheckpointSetupError::ObjectStore(format!(
+                                    "manifest tablespace ownership rejected: {}",
+                                    error.message.as_str()
+                                ))
+                            })?;
+                    } else {
+                        storage.set_object_owner(object, owner, 0);
+                    }
                 }
                 Some("acl") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;

@@ -6,7 +6,7 @@ import socket
 import struct
 import sys
 
-QUERY_TIMEOUT_SECONDS = 120
+DEFAULT_QUERY_TIMEOUT_SECONDS = 120
 
 
 def recv_exact(stream, length):
@@ -56,13 +56,13 @@ def error_fields(payload):
 
 
 class Connection:
-    def __init__(self, host, port):
+    def __init__(self, host, port, timeout_seconds):
         self.host = host
         self.port = port
         self.stream = socket.create_connection(
-            (host, port), timeout=QUERY_TIMEOUT_SECONDS
+            (host, port), timeout=timeout_seconds
         )
-        self.stream.settimeout(QUERY_TIMEOUT_SECONDS)
+        self.stream.settimeout(timeout_seconds)
         startup = b"user\x00postgres\x00database\x00postgres\x00\x00"
         self.stream.sendall(struct.pack("!ii", len(startup) + 8, 3 << 16) + startup)
         while True:
@@ -161,8 +161,8 @@ def cases():
     ]
 
 
-def run(host, port, probes):
-    connection = Connection(host, port)
+def run(host, port, probes, timeout_seconds):
+    connection = Connection(host, port, timeout_seconds)
     try:
         results = []
         for name, sql, _ in probes:
@@ -183,12 +183,17 @@ def main():
     parser.add_argument("--pg", type=int, required=True)
     parser.add_argument("--p3", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--timeout-seconds", type=int, default=DEFAULT_QUERY_TIMEOUT_SECONDS
+    )
     args = parser.parse_args()
+    if args.timeout_seconds <= 0:
+        parser.error("--timeout-seconds must be positive")
 
     probes = cases()
     expected = [(name, result) for name, _, result in probes]
-    postgresql = run(args.host, args.pg, probes)
-    pos3ql = run(args.host, args.p3, probes)
+    postgresql = run(args.host, args.pg, probes, args.timeout_seconds)
+    pos3ql = run(args.host, args.p3, probes, args.timeout_seconds)
     if postgresql != expected or pos3ql != postgresql:
         print(f"expected:   {expected!r}")
         print(f"PostgreSQL: {postgresql!r}")

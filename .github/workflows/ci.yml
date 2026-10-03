@@ -137,7 +137,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0-of-4, 1-of-4, 2-of-4, 3-of-4]
+        partition: [0-of-8, 1-of-8, 2-of-8, 3-of-8, 4-of-8, 5-of-8, 6-of-8, 7-of-8]
     steps:
       - uses: actions/checkout@v5
 

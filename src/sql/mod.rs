@@ -5239,7 +5239,7 @@ impl Engine {
             }) {
                 continue;
             }
-            let extension = *self.storage.extension(slot);
+            let extension = self.storage.extension(slot);
             let lsn = self.storage.lsn() + 1;
             let result = if dropping || !extension.visible_to(txn.txid) {
                 self.wal.stage(
@@ -5290,7 +5290,7 @@ impl Engine {
             }) {
                 continue;
             }
-            let dependency = *self.storage.extension_dependency(slot as usize);
+            let dependency = self.storage.extension_dependency(slot as usize);
             let exists = dependency.visible_to(txn.txid);
             if dependency.live == exists {
                 continue;
@@ -5349,7 +5349,7 @@ impl Engine {
             }) {
                 continue;
             }
-            let config = *self.storage.extension_config(slot as usize);
+            let config = self.storage.extension_config(slot as usize);
             let extension = self.storage.extension(config.extension as usize).name;
             let (schema, name) = self
                 .storage
@@ -17171,7 +17171,7 @@ impl Engine {
             }
         }
         for slot in &existing[..existing_count] {
-            let dependency = *self.storage.extension_dependency(*slot);
+            let dependency = self.storage.extension_dependency(*slot);
             let required = self.storage.extension(dependency.extension as usize).name;
             if package.requires().contains(&required) {
                 continue;
@@ -17795,7 +17795,7 @@ impl Engine {
                 }
             }
             for slot in &requirement_slots[..requirement_count] {
-                let dependency = *self.storage.extension_dependency(*slot);
+                let dependency = self.storage.extension_dependency(*slot);
                 let (changed, prior) = match self.storage.change_extension_dependency(
                     dependency.extension as usize,
                     dependency.object,
@@ -21371,7 +21371,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         }
         WalOp::DropExtension { name } => {
             if let Some(slot) = storage.extension_slot(name, 0) {
-                storage.drop_extension_in(slot, 0);
+                storage.drop_extension_in(slot, 0)?;
                 storage.commit_extension_drop(slot);
             }
         }
@@ -21796,6 +21796,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.set_tablespace_owner(usize::from(object.slot), owner, 0)?;
             } else if object.class == crate::storage::AccessClass::Schema {
                 storage.set_schema_owner(usize::from(object.slot), owner, 0)?;
+            } else if object.class == crate::storage::AccessClass::Extension {
+                storage.set_extension_owner(usize::from(object.slot), owner, 0)?;
             } else {
                 storage.set_object_owner(object, owner, 0);
             }

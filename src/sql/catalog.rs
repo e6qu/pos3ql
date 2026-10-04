@@ -20141,7 +20141,7 @@ fn pg_extension<'a>(
             if config.extension as usize != slot {
                 continue;
             }
-            configs[config_count] = Some(*config);
+            configs[config_count] = Some(config);
             config_count += 1;
         }
         for index in 1..config_count {

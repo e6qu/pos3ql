@@ -946,5 +946,19 @@ with existence in the same critical section. Four-worker publication,
 nested-reader progress, exact retained capacity, loud exhaustion, complete
 slot reuse, and `Send + Sync` have direct coverage.
 
+The installed extension catalog audit found definitions, transaction-private
+alteration and ownership images, dependency edges, and configuration rows in
+three unsynchronized fixed vectors. Overlapping DDL, replay, database
+lifecycle, schema binding, checkpoint, catalog, and member cleanup could lose
+updates or combine rows from different transitions. One startup-bounded mutex
+now owns all three vectors, and readers copy one fixed row before nested work.
+The same audit found committed drops and rolled-back creates retaining stale
+definition, dependency, configuration, and ownership state in reusable
+slots; terminal paths now clear the complete cross-vector image. Conflicting
+create, alteration, ownership, dependency, configuration, and drop operations
+use the common transaction wait boundary. Four-worker publication,
+nested-reader progress, exact retained capacities, loud exhaustion, complete
+slot reuse, and `Send + Sync` have direct coverage.
+
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

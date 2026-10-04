@@ -3857,6 +3857,15 @@ impl Checkpointer {
                                     error.message.as_str()
                                 ))
                             })?;
+                    } else if object.class == crate::storage::AccessClass::Extension {
+                        storage
+                            .set_extension_owner(usize::from(object.slot), owner, 0)
+                            .map_err(|error| {
+                                CheckpointSetupError::ObjectStore(format!(
+                                    "manifest extension ownership rejected: {}",
+                                    error.message.as_str()
+                                ))
+                            })?;
                     } else {
                         storage.set_object_owner(object, owner, 0);
                     }

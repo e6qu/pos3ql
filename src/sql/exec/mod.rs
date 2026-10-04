@@ -8477,6 +8477,11 @@ pub fn reassign_owned(
                     Ok(prior) => prior,
                     Err(error) => return sql_fail(error),
                 }
+            } else if class == AccessClass::Extension {
+                match storage.set_extension_owner(slot, target, txn.txid) {
+                    Ok(prior) => prior,
+                    Err(error) => return sql_fail(error),
+                }
             } else {
                 storage.set_object_owner(object, target, txn.txid)
             };
@@ -33561,7 +33566,7 @@ pub(crate) fn drop_extension_catalog(
             name
         ));
     }
-    storage.drop_extension_in(extension, txn.txid);
+    storage.drop_extension_in(extension, txn.txid)?;
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionDropped(extension as u32)) {
         storage.rollback_extension_drop(extension, txn.txid);
         return Err(error);

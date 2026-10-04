@@ -311,6 +311,12 @@ active production roadmap is [PLAN.md](../PLAN.md).
   existence share one startup-bounded catalog sized by `max_tablespaces`.
   DDL conflicts use the transaction wait boundary, readers copy definitions
   before nested work, and terminal create and drop paths clear reusable slots.
+- Installed extension definitions, dependency edges, and configuration rows
+  share one startup-bounded mutex. Readers copy complete rows before nested
+  schema, relation, role, comment, WAL, or catalog work; conflicting catalog
+  transitions use the transaction wait boundary, and terminal create and drop
+  paths clear the complete reusable cross-vector image. Extension package and
+  script metadata remain immutable after startup loading.
 - Sequence catalogs are startup-sized through `max_sequences` across durable
   definitions, per-session `currval`/`lastval` and cache state, dependency
   planning, `DROP OWNED`, identity cleanup, catalogs, WAL, checkpoints, and

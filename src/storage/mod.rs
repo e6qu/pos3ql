@@ -10531,6 +10531,17 @@ impl ExtensionDef {
             |pending| (pending.namespace, pending.relocatable, pending.version),
         )
     }
+
+    fn pending_owner_other_than(&self, txid: u32) -> Option<u32> {
+        [
+            self.ddl_state.pending_txid(),
+            self.pending.map(|pending| pending.txid),
+            self.ownership.pending.map(|pending| pending.txid),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|owner| *owner != txid)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10706,6 +10717,72 @@ impl ExtensionConfig {
         self.pending
             .filter(|pending| pending.txid == txid && pending.exists)
             .map_or(self.condition, |pending| pending.condition)
+    }
+}
+
+struct ExtensionCatalog {
+    definitions: FixedVec<ExtensionDef>,
+    dependencies: FixedVec<ExtensionDependency>,
+    configs: FixedVec<ExtensionConfig>,
+}
+
+struct ExtensionIter<'a> {
+    catalog: &'a std::sync::Mutex<ExtensionCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for ExtensionIter<'_> {
+    type Item = (usize, ExtensionDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("extension catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.definitions.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
+struct ExtensionDependencyIter<'a> {
+    catalog: &'a std::sync::Mutex<ExtensionCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for ExtensionDependencyIter<'_> {
+    type Item = (usize, ExtensionDependency);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("extension catalog lock poisoned");
+        let slot = self.next_slot;
+        let dependency = catalog.dependencies.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, dependency))
+    }
+}
+
+struct ExtensionConfigIter<'a> {
+    catalog: &'a std::sync::Mutex<ExtensionCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for ExtensionConfigIter<'_> {
+    type Item = (usize, ExtensionConfig);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("extension catalog lock poisoned");
+        let slot = self.next_slot;
+        let config = catalog.configs.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, config))
     }
 }
 
@@ -13207,9 +13284,7 @@ pub struct Storage {
     temporary_transactions: std::sync::Mutex<TemporaryTransactionState>,
     tablespaces: std::sync::Mutex<FixedVec<TablespaceDef>>,
     schemas: std::sync::Mutex<FixedVec<SchemaDef>>,
-    extensions: FixedVec<ExtensionDef>,
-    extension_dependencies: FixedVec<ExtensionDependency>,
-    extension_configs: FixedVec<ExtensionConfig>,
+    extension_catalog: std::sync::Mutex<ExtensionCatalog>,
     extension_packages: FixedVec<ExtensionPackage>,
     extension_scripts: FixedVec<ExtensionScript>,
     extension_script_source: FixedBuf,
@@ -17790,9 +17865,11 @@ impl Storage {
             temporary_transactions,
             tablespaces: std::sync::Mutex::new(tablespaces),
             schemas: std::sync::Mutex::new(schemas),
-            extensions,
-            extension_dependencies,
-            extension_configs,
+            extension_catalog: std::sync::Mutex::new(ExtensionCatalog {
+                definitions: extensions,
+                dependencies: extension_dependencies,
+                configs: extension_configs,
+            }),
             extension_packages,
             extension_scripts,
             extension_script_source,
@@ -19792,8 +19869,10 @@ impl Storage {
                 publications[target_slot] = definition;
             }
 
-            for source_slot in 0..self.extensions.len() {
-                let mut definition = self.extensions[source_slot];
+            for (_, mut definition) in (ExtensionIter {
+                catalog: &self.extension_catalog,
+                next_slot: 0,
+            }) {
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
@@ -19814,8 +19893,9 @@ impl Storage {
                         )
                     })?
                     .slot;
-                let target_slot = self
-                    .extensions
+                let mut catalog = self.extension_catalog();
+                let target_slot = catalog
+                    .definitions
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                     .ok_or_else(|| {
@@ -19828,12 +19908,14 @@ impl Storage {
                 definition.ownership = definition.ownership.committed();
                 definition.pending = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.extensions[target_slot] = definition;
+                catalog.definitions[target_slot] = definition;
             }
-            for source_slot in 0..self.extension_dependencies.len() {
-                let dependency = self.extension_dependencies[source_slot];
+            for (_, dependency) in (ExtensionDependencyIter {
+                catalog: &self.extension_catalog,
+                next_slot: 0,
+            }) {
                 if !dependency.live
-                    || self.extensions[usize::from(dependency.extension)].database != source
+                    || self.extension(usize::from(dependency.extension)).database != source
                     || self.access_object_is_temporary(dependency.object, 0)
                 {
                     continue;
@@ -19856,8 +19938,9 @@ impl Storage {
                             "template extension member was not cloned"
                         )
                     })?;
-                let target_slot = self
-                    .extension_dependencies
+                let mut catalog = self.extension_catalog();
+                let target_slot = catalog
+                    .dependencies
                     .iter()
                     .position(|candidate| !candidate.live && candidate.pending.is_none())
                     .ok_or_else(|| {
@@ -19866,7 +19949,7 @@ impl Storage {
                             "extension dependency catalog is full"
                         )
                     })?;
-                self.extension_dependencies[target_slot] = ExtensionDependency {
+                catalog.dependencies[target_slot] = ExtensionDependency {
                     extension: extension.slot,
                     object,
                     pending: Some(PendingExtensionDependency { txid, exists: true }),
@@ -19874,10 +19957,12 @@ impl Storage {
                     ..dependency
                 };
             }
-            for source_slot in 0..self.extension_configs.len() {
-                let config = self.extension_configs[source_slot];
+            for (_, config) in (ExtensionConfigIter {
+                catalog: &self.extension_catalog,
+                next_slot: 0,
+            }) {
                 if !config.live
-                    || self.extensions[usize::from(config.extension)].database != source
+                    || self.extension(usize::from(config.extension)).database != source
                     || self.access_object_is_temporary(config.relation.access_object(), 0)
                 {
                     continue;
@@ -19901,8 +19986,9 @@ impl Storage {
                             "template extension configuration relation was not cloned"
                         )
                     })?;
-                let target_slot = self
-                    .extension_configs
+                let mut catalog = self.extension_catalog();
+                let target_slot = catalog
+                    .configs
                     .iter()
                     .position(|candidate| !candidate.live && candidate.pending.is_none())
                     .ok_or_else(|| {
@@ -19911,7 +19997,7 @@ impl Storage {
                             "extension configuration catalog is full"
                         )
                     })?;
-                self.extension_configs[target_slot] = ExtensionConfig {
+                catalog.configs[target_slot] = ExtensionConfig {
                     extension: extension.slot,
                     relation,
                     live: false,
@@ -20089,7 +20175,7 @@ impl Storage {
                     self.extended_statistics(usize::from(entry.object.slot))
                         .database
                 }
-                AccessClass::Extension => self.extensions[usize::from(entry.object.slot)].database,
+                AccessClass::Extension => self.extension(usize::from(entry.object.slot)).database,
                 AccessClass::Trigger => self.trigger(usize::from(entry.object.slot)).database,
                 AccessClass::EventTrigger => {
                     self.event_trigger(usize::from(entry.object.slot)).database
@@ -20193,18 +20279,14 @@ impl Storage {
             }
         }
         drop(subscription_catalog);
-        for dependency in self.extension_dependencies.iter_mut() {
-            if dependency.extension != u16::MAX
-                && self.extensions[usize::from(dependency.extension)].database == database
-            {
-                *dependency = ExtensionDependency::EMPTY;
-            }
-        }
-        for config in self.extension_configs.iter_mut() {
-            if config.extension != u16::MAX
-                && self.extensions[usize::from(config.extension)].database == database
-            {
-                *config = ExtensionConfig::EMPTY;
+        {
+            let mut catalog = self.extension_catalog();
+            for slot in 0..catalog.definitions.len() {
+                if catalog.definitions[slot].database == database {
+                    Self::clear_extension_dependencies_for_in(&mut catalog, slot, 0);
+                    Self::clear_extension_configs_for_in(&mut catalog, slot);
+                    catalog.definitions[slot] = ExtensionDef::EMPTY;
+                }
             }
         }
         for slot in 0..self.tables.len() {
@@ -20269,7 +20351,6 @@ impl Storage {
             }
         }
         clear_catalog!(indexes);
-        clear_catalog!(extensions);
         {
             let mut catalog = self
                 .extended_statistics_catalog
@@ -20562,7 +20643,39 @@ impl Storage {
             }
         }
         commit_catalog!(indexes);
-        commit_catalog!(extensions);
+        {
+            let mut catalog = self.extension_catalog();
+            for definition in catalog.definitions.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+            for slot in 0..catalog.dependencies.len() {
+                let dependency = catalog.dependencies[slot];
+                if dependency
+                    .pending
+                    .is_some_and(|pending| pending.txid == txid && pending.exists)
+                    && catalog.definitions[usize::from(dependency.extension)].database == database
+                {
+                    catalog.dependencies[slot].live = true;
+                    catalog.dependencies[slot].pending = None;
+                }
+            }
+            for slot in 0..catalog.configs.len() {
+                let config = catalog.configs[slot];
+                if config
+                    .pending
+                    .is_some_and(|pending| pending.txid == txid && pending.exists)
+                    && catalog.definitions[usize::from(config.extension)].database == database
+                {
+                    catalog.configs[slot].live = true;
+                    catalog.configs[slot].condition = config.pending.expect("checked").condition;
+                    catalog.configs[slot].pending = None;
+                }
+            }
+        }
         {
             let mut catalog = self
                 .extended_statistics_catalog
@@ -20708,27 +20821,6 @@ impl Storage {
                 {
                     definition.ddl_state = definition.ddl_state.commit_create();
                 }
-            }
-        }
-        for dependency in self.extension_dependencies.iter_mut() {
-            if dependency
-                .pending
-                .is_some_and(|pending| pending.txid == txid && pending.exists)
-                && self.extensions[usize::from(dependency.extension)].database == database
-            {
-                dependency.live = true;
-                dependency.pending = None;
-            }
-        }
-        for config in self.extension_configs.iter_mut() {
-            if config
-                .pending
-                .is_some_and(|pending| pending.txid == txid && pending.exists)
-                && self.extensions[usize::from(config.extension)].database == database
-            {
-                config.live = true;
-                config.condition = config.pending.expect("checked").condition;
-                config.pending = None;
             }
         }
         self.databases[slot].ddl_state = self.databases[slot].ddl_state.commit_create();
@@ -20925,7 +21017,7 @@ impl Storage {
             AccessClass::Composite => self.composite(slot).ownership,
             AccessClass::Tablespace => self.tablespace(slot).ownership,
             AccessClass::Statistics => self.extended_statistics(slot).ownership,
-            AccessClass::Extension => self.extensions[slot].ownership,
+            AccessClass::Extension => self.extension(slot).ownership,
             AccessClass::Trigger => match self.trigger(slot).target {
                 TriggerTarget::Table(table) => self.tables[usize::from(table)].ownership,
                 TriggerTarget::View(view) => self.views[usize::from(view)].ownership,
@@ -20968,7 +21060,9 @@ impl Storage {
             AccessClass::Statistics => {
                 unreachable!("extended-statistics ownership is synchronized separately")
             }
-            AccessClass::Extension => &mut self.extensions[slot].ownership,
+            AccessClass::Extension => {
+                unreachable!("extension ownership is synchronized separately")
+            }
             AccessClass::Trigger => {
                 unreachable!("triggers inherit relation ownership and cannot be reassigned")
             }
@@ -21416,7 +21510,7 @@ impl Storage {
                 let definition = self.extended_statistics(slot).definition_for(txid);
                 (definition.schema, definition.name)
             }
-            AccessClass::Extension => (SqlName::EMPTY, self.extensions[slot].name),
+            AccessClass::Extension => (SqlName::EMPTY, self.extension(slot).name),
             AccessClass::Trigger => {
                 let trigger = self.trigger(slot);
                 let schema = match trigger.target {
@@ -21478,7 +21572,7 @@ impl Storage {
             AccessClass::Statistics => {
                 self.extended_statistics(slot).ddl_state == CatalogDdlState::Present
             }
-            AccessClass::Extension => self.extensions[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Extension => self.extension(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Trigger => self.trigger(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::EventTrigger => {
                 self.event_trigger(slot).ddl_state == CatalogDdlState::Present
@@ -21517,7 +21611,7 @@ impl Storage {
             AccessClass::Composite => self.composite(slot).visible_to(txid),
             AccessClass::Tablespace => self.tablespace(slot).visible_to(txid),
             AccessClass::Statistics => self.extended_statistics(slot).visible_to(txid),
-            AccessClass::Extension => self.extensions[slot].visible_to(txid),
+            AccessClass::Extension => self.extension(slot).visible_to(txid),
             AccessClass::Trigger => self.trigger(slot).visible_to(txid),
             AccessClass::EventTrigger => self.event_trigger(slot).visible_to(txid),
             AccessClass::Database => self.databases[slot].visible_to(txid),
@@ -21549,7 +21643,7 @@ impl Storage {
             AccessClass::Routine => Some(self.routine(slot).database),
             AccessClass::Composite => Some(self.composite(slot).database),
             AccessClass::Statistics => Some(self.extended_statistics(slot).database),
-            AccessClass::Extension => Some(self.extensions[slot].database),
+            AccessClass::Extension => Some(self.extension(slot).database),
             AccessClass::Trigger => Some(self.trigger(slot).database),
             AccessClass::EventTrigger => Some(self.event_trigger(slot).database),
             AccessClass::LargeObject => Some(self.large_object(slot).database),
@@ -21666,9 +21760,14 @@ impl Storage {
                 })?
             }
             AccessClass::Extension => {
-                let created_at = self.extensions[source_slot].created_at;
-                self.extensions.iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
+                let created_at = self.extension(source_slot).created_at;
+                ExtensionIter {
+                    catalog: &self.extension_catalog,
+                    next_slot: 0,
+                }
+                .find_map(|(slot, candidate)| {
+                    (candidate.database == target_database && candidate.created_at == created_at)
+                        .then_some(slot)
                 })?
             }
             AccessClass::Trigger => {
@@ -21972,29 +22071,32 @@ impl Storage {
         })
     }
 
-    pub(crate) fn checkpoint_extensions(&self) -> impl Iterator<Item = (usize, &ExtensionDef)> {
-        self.extensions
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    pub(crate) fn checkpoint_extensions(&self) -> impl Iterator<Item = (usize, ExtensionDef)> + '_ {
+        ExtensionIter {
+            catalog: &self.extension_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_extension_dependencies(
         &self,
-    ) -> impl Iterator<Item = (usize, &ExtensionDependency)> {
-        self.extension_dependencies
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.live && !self.access_object_is_temporary(value.object, 0))
+    ) -> impl Iterator<Item = (usize, ExtensionDependency)> + '_ {
+        ExtensionDependencyIter {
+            catalog: &self.extension_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.live && !self.access_object_is_temporary(value.object, 0))
     }
 
     pub(crate) fn checkpoint_extension_configs(
         &self,
-    ) -> impl Iterator<Item = (usize, &ExtensionConfig)> {
-        self.extension_configs
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.live)
+    ) -> impl Iterator<Item = (usize, ExtensionConfig)> + '_ {
+        ExtensionConfigIter {
+            catalog: &self.extension_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.live)
     }
 
     pub(crate) fn checkpoint_indexes(&self) -> impl Iterator<Item = (usize, &IndexDef)> {
@@ -22059,7 +22161,7 @@ impl Storage {
             AccessClass::Composite => self.composite_count(),
             AccessClass::Tablespace => self.tablespace_capacity(),
             AccessClass::Statistics => self.extended_statistics_count(),
-            AccessClass::Extension => self.extensions.len(),
+            AccessClass::Extension => self.extension_count(),
             AccessClass::Trigger => self.trigger_capacity(),
             AccessClass::EventTrigger => self.event_trigger_capacity(),
             AccessClass::Database => self.databases.len(),
@@ -22119,7 +22221,7 @@ impl Storage {
             (AccessClass::Composite, self.composite_count()),
             (AccessClass::Tablespace, self.tablespace_capacity()),
             (AccessClass::Statistics, self.extended_statistics_count()),
-            (AccessClass::Extension, self.extensions.len()),
+            (AccessClass::Extension, self.extension_count()),
             (AccessClass::EventTrigger, self.event_trigger_capacity()),
             (
                 AccessClass::LargeObject,
@@ -22254,6 +22356,32 @@ impl Storage {
         Ok(prior)
     }
 
+    pub(crate) fn set_extension_owner(
+        &self,
+        slot: usize,
+        owner: usize,
+        txid: u32,
+    ) -> Result<Option<PendingOwnership>, SqlError> {
+        let mut catalog = self.extension_catalog();
+        if let Some(blocker) = catalog.definitions[slot].pending_owner_other_than(txid) {
+            let name = catalog.definitions[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let ownership = &mut catalog.definitions[slot].ownership;
+        let prior = ownership.pending;
+        if txid == 0 {
+            ownership.owner = owner as u16;
+            ownership.pending = None;
+        } else {
+            ownership.pending = Some(PendingOwnership {
+                txid,
+                owner: owner as u16,
+            });
+        }
+        Ok(prior)
+    }
+
     pub(crate) fn set_object_owner(
         &mut self,
         object: AccessObject,
@@ -22361,6 +22489,9 @@ impl Storage {
         }
         if object.class == AccessClass::Schema {
             unreachable!("schema ownership is synchronized separately");
+        }
+        if object.class == AccessClass::Extension {
+            unreachable!("extension ownership is synchronized separately");
         }
         if matches!(
             object.class,
@@ -22504,6 +22635,17 @@ impl Storage {
             }
             return;
         }
+        if object.class == AccessClass::Extension {
+            let mut catalog = self.extension_catalog();
+            let ownership = &mut catalog.definitions[usize::from(object.slot)].ownership;
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            return;
+        }
         if matches!(
             object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
@@ -22567,6 +22709,12 @@ impl Storage {
         }
         if object.class == AccessClass::Schema {
             self.schemas.lock().expect("schema catalog lock poisoned")[usize::from(object.slot)]
+                .ownership
+                .pending = prior;
+            return;
+        }
+        if object.class == AccessClass::Extension {
+            self.extension_catalog().definitions[usize::from(object.slot)]
                 .ownership
                 .pending = prior;
             return;
@@ -26298,32 +26446,46 @@ impl Storage {
         Ok(prior)
     }
 
-    pub(crate) fn extension(&self, slot: usize) -> &ExtensionDef {
-        &self.extensions[slot]
+    fn extension_catalog(&self) -> std::sync::MutexGuard<'_, ExtensionCatalog> {
+        self.extension_catalog
+            .lock()
+            .expect("extension catalog lock poisoned")
+    }
+
+    pub(crate) fn extension(&self, slot: usize) -> ExtensionDef {
+        self.extension_catalog().definitions[slot]
+    }
+
+    pub(crate) fn extension_count(&self) -> usize {
+        self.extension_catalog().definitions.len()
     }
 
     pub(crate) fn extensions_visible_to(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &ExtensionDef)> {
-        self.extensions
-            .iter()
-            .enumerate()
-            .filter(move |(_, extension)| {
-                extension.database == current_database() && extension.visible_to(txid)
-            })
-    }
-
-    pub(crate) fn extension_slot(&self, name: &str, txid: u32) -> Option<usize> {
-        self.extensions.iter().position(|extension| {
-            extension.database == current_database()
-                && extension.visible_to(txid)
-                && extension.name.as_str() == name
+    ) -> impl Iterator<Item = (usize, ExtensionDef)> + '_ {
+        ExtensionIter {
+            catalog: &self.extension_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, extension)| {
+            extension.database == current_database() && extension.visible_to(txid)
         })
     }
 
+    pub(crate) fn extension_slot(&self, name: &str, txid: u32) -> Option<usize> {
+        self.extension_catalog()
+            .definitions
+            .iter()
+            .position(|extension| {
+                extension.database == current_database()
+                    && extension.visible_to(txid)
+                    && extension.name.as_str() == name
+            })
+    }
+
     pub(crate) fn create_extension(
-        &mut self,
+        &self,
         name: SqlName,
         namespace: usize,
         relocatable: bool,
@@ -26337,44 +26499,47 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if self.extension_slot(name.as_str(), txid).is_some() {
+        let ownership = self.initial_ownership(txid);
+        let mut catalog = self.extension_catalog();
+        if catalog.definitions.iter().any(|extension| {
+            extension.database == current_database()
+                && extension.visible_to(txid)
+                && extension.name == name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "extension \"{}\" already exists",
                 name.as_str()
             ));
         }
-        if let Some(owner) = self.extensions.iter().find_map(|extension| {
+        if let Some(owner) = catalog.definitions.iter().find_map(|extension| {
             (extension.database == current_database() && extension.name == name)
-                .then_some(extension.ddl_state.pending_txid()?)
-                .filter(|owner| *owner != txid)
+                .then(|| extension.pending_owner_other_than(txid))
+                .flatten()
         }) {
+            drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
-        let slot = self
-            .extensions
+        let slot = catalog
+            .definitions
             .iter()
             .position(|extension| extension.ddl_state == CatalogDdlState::Absent)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many extensions (limit {})",
-                    self.extensions.len()
+                    catalog.definitions.len()
                 )
             })?;
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::Extension,
-            slot: slot as u16,
-        });
         let created_at = self.catalog_sequence.next();
-        self.extensions[slot] = ExtensionDef {
+        catalog.definitions[slot] = ExtensionDef {
             database: current_database(),
             created_at,
             name,
             namespace: namespace as u16,
             relocatable,
             version,
-            ownership: self.initial_ownership(txid),
+            ownership,
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
@@ -26382,7 +26547,7 @@ impl Storage {
     }
 
     pub(crate) fn install_extension(
-        &mut self,
+        &self,
         name: SqlName,
         namespace: usize,
         relocatable: bool,
@@ -26390,35 +26555,8 @@ impl Storage {
         owner: usize,
         created_at: u64,
     ) -> Result<usize, SqlError> {
-        if let Some(slot) = self.extension_slot(name.as_str(), 0) {
-            self.extensions[slot] = ExtensionDef {
-                database: current_database(),
-                created_at,
-                name,
-                namespace: namespace as u16,
-                relocatable,
-                version,
-                ownership: Ownership {
-                    owner: owner as u16,
-                    pending: None,
-                },
-                pending: None,
-                ddl_state: CatalogDdlState::Present,
-            };
-            return Ok(slot);
-        }
-        let slot = self
-            .extensions
-            .iter()
-            .position(|extension| extension.ddl_state == CatalogDdlState::Absent)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many extensions (limit {})",
-                    self.extensions.len()
-                )
-            })?;
-        self.extensions[slot] = ExtensionDef {
+        let mut catalog = self.extension_catalog();
+        let definition = ExtensionDef {
             database: current_database(),
             created_at,
             name,
@@ -26432,12 +26570,35 @@ impl Storage {
             pending: None,
             ddl_state: CatalogDdlState::Present,
         };
+        if let Some(slot) = catalog.definitions.iter().position(|extension| {
+            extension.database == current_database()
+                && extension.ddl_state == CatalogDdlState::Present
+                && extension.name == name
+        }) {
+            catalog.definitions[slot] = definition;
+            drop(catalog);
+            self.catalog_sequence.observe(created_at);
+            return Ok(slot);
+        }
+        let slot = catalog
+            .definitions
+            .iter()
+            .position(|extension| extension.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many extensions (limit {})",
+                    catalog.definitions.len()
+                )
+            })?;
+        catalog.definitions[slot] = definition;
+        drop(catalog);
         self.catalog_sequence.observe(created_at);
         Ok(slot)
     }
 
     pub(crate) fn alter_extension_definition(
-        &mut self,
+        &self,
         slot: usize,
         namespace: usize,
         relocatable: bool,
@@ -26450,17 +26611,14 @@ impl Storage {
                 "schema does not exist"
             ));
         }
-        if let Some(pending) = self.extensions[slot].pending
-            && pending.txid != txid
-        {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                pending.txid,
-                self.extensions[slot].name.as_str(),
-            ));
+        let mut catalog = self.extension_catalog();
+        if let Some(blocker) = catalog.definitions[slot].pending_owner_other_than(txid) {
+            let name = catalog.definitions[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        let prior = self.extensions[slot].pending;
-        self.extensions[slot].pending = Some(PendingExtensionDefinition {
+        let prior = catalog.definitions[slot].pending;
+        catalog.definitions[slot].pending = Some(PendingExtensionDefinition {
             txid,
             namespace: namespace as u16,
             relocatable,
@@ -26469,92 +26627,117 @@ impl Storage {
         Ok(prior)
     }
 
-    pub(crate) fn commit_extension_create(&mut self, slot: usize, txid: u32) {
-        self.extensions[slot].ddl_state = self.extensions[slot].ddl_state.commit_create();
-        self.commit_object_owner(
-            AccessObject {
-                class: AccessClass::Extension,
-                slot: slot as u16,
-            },
-            txid,
-        );
-    }
-
-    pub(crate) fn rollback_extension_create(&mut self, slot: usize) {
-        self.extensions[slot].ddl_state = self.extensions[slot].ddl_state.rollback_create();
-        self.extensions[slot].pending = None;
-        self.rollback_extension_dependencies_for(slot, 0);
-        self.clear_extension_configs_for(slot);
-    }
-
-    pub(crate) fn commit_extension_alter(&mut self, slot: usize, txid: u32) {
-        if let Some(pending) = self.extensions[slot].pending
+    pub(crate) fn commit_extension_create(&self, slot: usize, txid: u32) {
+        let mut catalog = self.extension_catalog();
+        let extension = &mut catalog.definitions[slot];
+        extension.ddl_state = extension.ddl_state.commit_create();
+        if let Some(pending) = extension.ownership.pending
             && pending.txid == txid
         {
-            self.extensions[slot].namespace = pending.namespace;
-            self.extensions[slot].relocatable = pending.relocatable;
-            self.extensions[slot].version = pending.version;
-            self.extensions[slot].pending = None;
+            extension.ownership.owner = pending.owner;
+            extension.ownership.pending = None;
+        }
+    }
+
+    pub(crate) fn rollback_extension_create(&self, slot: usize) {
+        let mut catalog = self.extension_catalog();
+        Self::clear_extension_dependencies_for_in(&mut catalog, slot, 0);
+        Self::clear_extension_configs_for_in(&mut catalog, slot);
+        catalog.definitions[slot] = ExtensionDef::EMPTY;
+        drop(catalog);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Extension,
+            slot: slot as u16,
+        });
+    }
+
+    pub(crate) fn commit_extension_alter(&self, slot: usize, txid: u32) {
+        let mut catalog = self.extension_catalog();
+        let extension = &mut catalog.definitions[slot];
+        if let Some(pending) = extension.pending
+            && pending.txid == txid
+        {
+            extension.namespace = pending.namespace;
+            extension.relocatable = pending.relocatable;
+            extension.version = pending.version;
+            extension.pending = None;
         }
     }
 
     pub(crate) fn rollback_extension_alter(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingExtensionDefinition>,
     ) {
-        self.extensions[slot].pending = prior;
+        self.extension_catalog().definitions[slot].pending = prior;
     }
 
-    pub(crate) fn drop_extension_in(&mut self, slot: usize, txid: u32) {
-        self.extensions[slot].ddl_state = self.extensions[slot].ddl_state.drop_by(txid);
+    pub(crate) fn drop_extension_in(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        let mut catalog = self.extension_catalog();
+        if let Some(blocker) = catalog.definitions[slot].pending_owner_other_than(txid) {
+            let name = catalog.definitions[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.drop_by(txid);
+        Ok(())
     }
 
-    pub(crate) fn commit_extension_drop(&mut self, slot: usize) {
-        let name = self.extensions[slot].name;
-        self.extensions[slot].ddl_state = self.extensions[slot].ddl_state.commit_drop();
-        self.extensions[slot].pending = None;
-        self.drop_object_comments(CommentClass::Extension, "", name.as_str());
+    pub(crate) fn commit_extension_drop(&self, slot: usize) {
+        let mut catalog = self.extension_catalog();
+        let name = catalog.definitions[slot].name;
         let object = AccessObject {
             class: AccessClass::Extension,
             slot: slot as u16,
         };
-        for dependency in self.extension_dependencies.iter_mut() {
+        for dependency in catalog.dependencies.iter_mut() {
             if dependency.extension as usize == slot || dependency.object == object {
                 *dependency = ExtensionDependency::EMPTY;
             }
         }
-        self.clear_extension_configs_for(slot);
+        Self::clear_extension_configs_for_in(&mut catalog, slot);
+        catalog.definitions[slot] = ExtensionDef::EMPTY;
+        drop(catalog);
+        self.drop_object_comments(CommentClass::Extension, "", name.as_str());
+        self.clear_object_acl_entries(object);
     }
 
-    pub(crate) fn rollback_extension_drop(&mut self, slot: usize, txid: u32) {
-        self.extensions[slot].ddl_state = self.extensions[slot].ddl_state.rollback_drop(txid);
+    pub(crate) fn rollback_extension_drop(&self, slot: usize, txid: u32) {
+        let mut catalog = self.extension_catalog();
+        catalog.definitions[slot].ddl_state =
+            catalog.definitions[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn extension_dependencies_visible_to(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &ExtensionDependency)> {
-        self.extension_dependencies
-            .iter()
-            .enumerate()
-            .filter(move |(_, dependency)| dependency.visible_to(txid))
+    ) -> impl Iterator<Item = (usize, ExtensionDependency)> + '_ {
+        ExtensionDependencyIter {
+            catalog: &self.extension_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, dependency)| dependency.visible_to(txid))
     }
 
-    pub(crate) fn extension_dependency(&self, slot: usize) -> &ExtensionDependency {
-        &self.extension_dependencies[slot]
+    pub(crate) fn extension_dependency(&self, slot: usize) -> ExtensionDependency {
+        self.extension_catalog().dependencies[slot]
     }
 
-    fn clear_extension_dependencies_for_object(&mut self, object: AccessObject) {
-        for dependency in self.extension_dependencies.iter_mut() {
+    fn clear_extension_dependencies_for_object(&self, object: AccessObject) {
+        for dependency in self.extension_catalog().dependencies.iter_mut() {
             if dependency.object == object {
                 *dependency = ExtensionDependency::EMPTY;
             }
         }
     }
 
-    pub(crate) fn extension_member_of(&self, object: AccessObject, txid: u32) -> Option<usize> {
-        self.extension_dependencies
+    fn extension_member_of_in(
+        catalog: &ExtensionCatalog,
+        object: AccessObject,
+        txid: u32,
+    ) -> Option<usize> {
+        catalog
+            .dependencies
             .iter()
             .find(|dependency| {
                 dependency.visible_to(txid)
@@ -26564,39 +26747,40 @@ impl Storage {
             .map(|dependency| dependency.extension as usize)
     }
 
+    pub(crate) fn extension_member_of(&self, object: AccessObject, txid: u32) -> Option<usize> {
+        Self::extension_member_of_in(&self.extension_catalog(), object, txid)
+    }
+
     pub(crate) fn require_not_extension_member(
         &self,
         object: AccessObject,
         txid: u32,
         kind: &str,
     ) -> Result<(), SqlError> {
-        let Some(extension) = self.extension_member_of(object, txid) else {
+        let catalog = self.extension_catalog();
+        let Some(extension) = Self::extension_member_of_in(&catalog, object, txid) else {
             return Ok(());
         };
+        let extension_name = catalog.definitions[extension].name;
+        drop(catalog);
         let (_, name) = self.access_object_name_to(object, txid);
         Err(sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             "cannot drop {} \"{}\" because extension \"{}\" requires it",
             kind,
             name.as_str(),
-            self.extensions[extension].name.as_str()
+            extension_name.as_str()
         ))
     }
 
     pub(crate) fn change_extension_dependency(
-        &mut self,
+        &self,
         extension: usize,
         object: AccessObject,
         kind: ExtensionDependencyKind,
         exists: bool,
         txid: u32,
     ) -> Result<(usize, Option<PendingExtensionDependency>), SqlError> {
-        if !self.extensions[extension].visible_to(txid) {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "extension does not exist"
-            ));
-        }
         if !self.access_object_visible_to(object, txid)
             || (object.class == AccessClass::Extension && kind != ExtensionDependencyKind::Required)
         {
@@ -26605,17 +26789,24 @@ impl Storage {
                 "extension dependency target does not exist"
             ));
         }
+        let mut catalog = self.extension_catalog();
+        if !catalog.definitions[extension].visible_to(txid) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "extension does not exist"
+            ));
+        }
         if exists
             && kind == ExtensionDependencyKind::Member
-            && let Some(other) = self.extension_member_of(object, txid)
+            && let Some(other) = Self::extension_member_of_in(&catalog, object, txid)
         {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "object is already a member of extension \"{}\"",
-                self.extensions[other].name.as_str()
+                catalog.definitions[other].name.as_str()
             ));
         }
-        let existing = self.extension_dependencies.iter().position(|dependency| {
+        let existing = catalog.dependencies.iter().position(|dependency| {
             dependency.extension as usize == extension
                 && dependency.object == object
                 && dependency.kind == kind
@@ -26628,42 +26819,41 @@ impl Storage {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "object is not a member of extension \"{}\"",
-                    self.extensions[extension].name.as_str()
+                    catalog.definitions[extension].name.as_str()
                 ));
             }
-            self.extension_dependencies
+            catalog
+                .dependencies
                 .iter()
                 .position(|dependency| !dependency.live && dependency.pending.is_none())
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many extension dependencies (limit {})",
-                        self.extension_dependencies.len()
+                        catalog.dependencies.len()
                     )
                 })?
         };
-        if let Some(pending) = self.extension_dependencies[slot].pending
+        if let Some(pending) = catalog.dependencies[slot].pending
             && pending.txid != txid
         {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                pending.txid,
-                self.extensions[extension].name.as_str(),
-            ));
+            let name = catalog.definitions[extension].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, pending.txid, name.as_str()));
         }
-        let prior = self.extension_dependencies[slot].pending;
+        let prior = catalog.dependencies[slot].pending;
         if existing.is_none() {
-            self.extension_dependencies[slot].extension = extension as u16;
-            self.extension_dependencies[slot].object = object;
-            self.extension_dependencies[slot].kind = kind;
+            catalog.dependencies[slot].extension = extension as u16;
+            catalog.dependencies[slot].object = object;
+            catalog.dependencies[slot].kind = kind;
         }
-        self.extension_dependencies[slot].pending =
-            Some(PendingExtensionDependency { txid, exists });
+        catalog.dependencies[slot].pending = Some(PendingExtensionDependency { txid, exists });
         Ok((slot, prior))
     }
 
-    pub(crate) fn commit_extension_dependency(&mut self, slot: usize, txid: u32) {
-        let dependency = &mut self.extension_dependencies[slot];
+    pub(crate) fn commit_extension_dependency(&self, slot: usize, txid: u32) {
+        let mut catalog = self.extension_catalog();
+        let dependency = &mut catalog.dependencies[slot];
         if let Some(pending) = dependency.pending
             && pending.txid == txid
         {
@@ -26676,18 +26866,23 @@ impl Storage {
     }
 
     pub(crate) fn rollback_extension_dependency(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingExtensionDependency>,
     ) {
-        self.extension_dependencies[slot].pending = prior;
-        if !self.extension_dependencies[slot].live && prior.is_none() {
-            self.extension_dependencies[slot] = ExtensionDependency::EMPTY;
+        let mut catalog = self.extension_catalog();
+        catalog.dependencies[slot].pending = prior;
+        if !catalog.dependencies[slot].live && prior.is_none() {
+            catalog.dependencies[slot] = ExtensionDependency::EMPTY;
         }
     }
 
-    fn rollback_extension_dependencies_for(&mut self, extension: usize, txid: u32) {
-        for dependency in self.extension_dependencies.iter_mut() {
+    fn clear_extension_dependencies_for_in(
+        catalog: &mut ExtensionCatalog,
+        extension: usize,
+        txid: u32,
+    ) {
+        for dependency in catalog.dependencies.iter_mut() {
             if dependency.extension as usize == extension
                 && (txid == 0
                     || dependency
@@ -26702,15 +26897,16 @@ impl Storage {
     pub(crate) fn extension_configs_visible_to(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &ExtensionConfig)> {
-        self.extension_configs
-            .iter()
-            .enumerate()
-            .filter(move |(_, config)| config.visible_to(txid))
+    ) -> impl Iterator<Item = (usize, ExtensionConfig)> + '_ {
+        ExtensionConfigIter {
+            catalog: &self.extension_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, config)| config.visible_to(txid))
     }
 
-    pub(crate) fn extension_config(&self, slot: usize) -> &ExtensionConfig {
-        &self.extension_configs[slot]
+    pub(crate) fn extension_config(&self, slot: usize) -> ExtensionConfig {
+        self.extension_catalog().configs[slot]
     }
 
     pub(crate) fn extension_config_slot(
@@ -26719,7 +26915,7 @@ impl Storage {
         relation: ExtensionConfigRelation,
         txid: u32,
     ) -> Option<usize> {
-        self.extension_configs.iter().position(|config| {
+        self.extension_catalog().configs.iter().position(|config| {
             config.extension as usize == extension
                 && config.relation == relation
                 && config.visible_to(txid)
@@ -26727,7 +26923,7 @@ impl Storage {
     }
 
     pub(crate) fn change_extension_config(
-        &mut self,
+        &self,
         extension: usize,
         relation: ExtensionConfigRelation,
         condition: ExtensionConfigCondition,
@@ -26740,7 +26936,7 @@ impl Storage {
     }
 
     pub(crate) fn replay_extension_config(
-        &mut self,
+        &self,
         extension: usize,
         relation: ExtensionConfigRelation,
         condition: ExtensionConfigCondition,
@@ -26758,7 +26954,7 @@ impl Storage {
     }
 
     fn change_extension_config_with_ordinal(
-        &mut self,
+        &self,
         extension: usize,
         relation: ExtensionConfigRelation,
         condition: ExtensionConfigCondition,
@@ -26766,12 +26962,6 @@ impl Storage {
         recovered_ordinal: Option<u16>,
         txid: u32,
     ) -> Result<(usize, Option<PendingExtensionConfig>), SqlError> {
-        if !self.extensions[extension].visible_to(txid) {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "extension does not exist"
-            ));
-        }
         let object = relation.access_object();
         if !self.access_object_visible_to(object, txid) {
             return Err(sql_err!(
@@ -26779,7 +26969,15 @@ impl Storage {
                 "extension configuration relation does not exist"
             ));
         }
-        if exists && self.extension_member_of(object, txid) != Some(extension) {
+        let mut catalog = self.extension_catalog();
+        if !catalog.definitions[extension].visible_to(txid) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "extension does not exist"
+            ));
+        }
+        if exists && Self::extension_member_of_in(&catalog, object, txid) != Some(extension) {
+            drop(catalog);
             let (_, name) = self.access_object_name_to(object, txid);
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -26787,7 +26985,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let existing = self.extension_configs.iter().position(|config| {
+        let existing = catalog.configs.iter().position(|config| {
             config.extension as usize == extension
                 && config.relation == relation
                 && (config.live || config.pending.is_some())
@@ -26801,31 +26999,29 @@ impl Storage {
                     "relation is not an extension configuration relation"
                 ));
             }
-            self.extension_configs
+            catalog
+                .configs
                 .iter()
                 .position(|config| !config.live && config.pending.is_none())
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many extension configuration relations (limit {})",
-                        self.extension_configs.len()
+                        catalog.configs.len()
                     )
                 })?
         };
-        if let Some(pending) = self.extension_configs[slot].pending
+        if let Some(pending) = catalog.configs[slot].pending
             && pending.txid != txid
         {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                pending.txid,
-                self.extensions[extension].name.as_str(),
-            ));
+            let name = catalog.definitions[extension].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, pending.txid, name.as_str()));
         }
-        let prior = self.extension_configs[slot].pending;
+        let prior = catalog.configs[slot].pending;
         if existing.is_none() {
-            self.extension_configs[slot].extension = extension as u16;
             let ordinal = if let Some(ordinal) = recovered_ordinal {
-                if self.extension_configs.iter().any(|config| {
+                if catalog.configs.iter().any(|config| {
                     config.extension as usize == extension
                         && (config.live || config.pending.is_some())
                         && config.ordinal == ordinal
@@ -26837,7 +27033,8 @@ impl Storage {
                 }
                 ordinal
             } else {
-                self.extension_configs
+                catalog
+                    .configs
                     .iter()
                     .filter(|config| {
                         config.extension as usize == extension
@@ -26847,17 +27044,18 @@ impl Storage {
                     .max()
                     .map_or(0, |ordinal| ordinal.saturating_add(1))
             };
-            self.extension_configs[slot].ordinal = ordinal;
-            self.extension_configs[slot].relation = relation;
+            catalog.configs[slot].extension = extension as u16;
+            catalog.configs[slot].ordinal = ordinal;
+            catalog.configs[slot].relation = relation;
         } else if let Some(ordinal) = recovered_ordinal
-            && self.extension_configs[slot].ordinal != ordinal
+            && catalog.configs[slot].ordinal != ordinal
         {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "extension configuration ordinal changed during recovery"
             ));
         }
-        self.extension_configs[slot].pending = Some(PendingExtensionConfig {
+        catalog.configs[slot].pending = Some(PendingExtensionConfig {
             txid,
             exists,
             condition,
@@ -26865,8 +27063,9 @@ impl Storage {
         Ok((slot, prior))
     }
 
-    pub(crate) fn commit_extension_config(&mut self, slot: usize, txid: u32) {
-        let config = &mut self.extension_configs[slot];
+    pub(crate) fn commit_extension_config(&self, slot: usize, txid: u32) {
+        let mut catalog = self.extension_catalog();
+        let config = &mut catalog.configs[slot];
         if let Some(pending) = config.pending
             && pending.txid == txid
         {
@@ -26880,18 +27079,19 @@ impl Storage {
     }
 
     pub(crate) fn rollback_extension_config(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingExtensionConfig>,
     ) {
-        self.extension_configs[slot].pending = prior;
-        if !self.extension_configs[slot].live && prior.is_none() {
-            self.extension_configs[slot] = ExtensionConfig::EMPTY;
+        let mut catalog = self.extension_catalog();
+        catalog.configs[slot].pending = prior;
+        if !catalog.configs[slot].live && prior.is_none() {
+            catalog.configs[slot] = ExtensionConfig::EMPTY;
         }
     }
 
-    fn clear_extension_configs_for(&mut self, extension: usize) {
-        for config in self.extension_configs.iter_mut() {
+    fn clear_extension_configs_for_in(catalog: &mut ExtensionCatalog, extension: usize) {
+        for config in catalog.configs.iter_mut() {
             if config.extension as usize == extension {
                 *config = ExtensionConfig::EMPTY;
             }
@@ -39696,7 +39896,7 @@ impl Storage {
             class: AccessClass::View,
             slot: to as u16,
         };
-        for dependency in self.extension_dependencies.iter_mut() {
+        for dependency in self.extension_catalog().dependencies.iter_mut() {
             if dependency.object == old_object {
                 dependency.object = new_object;
             }
@@ -53892,6 +54092,258 @@ mod tests {
                 slot: altered as u16,
             },
             prior_owner,
+        );
+    }
+
+    #[test]
+    fn extension_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ExtensionDef>();
+        assert_send_sync::<ExtensionDependency>();
+        assert_send_sync::<ExtensionConfig>();
+        assert_send_sync::<std::sync::Mutex<ExtensionCatalog>>();
+        assert_send_sync::<ExtensionIter<'_>>();
+        assert_send_sync::<ExtensionDependencyIter<'_>>();
+        assert_send_sync::<ExtensionConfigIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let extension_names = ["extension_a", "extension_b", "extension_c", "extension_d"];
+        let sequence_names = [
+            "extension_seq_a",
+            "extension_seq_b",
+            "extension_seq_c",
+            "extension_seq_d",
+        ];
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let namespace = storage.find_schema("public").unwrap();
+        let sequences: [usize; WORKERS] = std::array::from_fn(|worker| {
+            let slot = storage
+                .create_sequence(
+                    SequenceCreateSpec {
+                        schema: SqlName::parse("public").unwrap(),
+                        name: SqlName::parse(sequence_names[worker]).unwrap(),
+                        spec: SeqSpec {
+                            data_type: SeqType::Bigint,
+                            increment: 1,
+                            min_value: 1,
+                            max_value: i64::MAX,
+                            start_value: 1,
+                            cache: 1,
+                            cycle: false,
+                        },
+                        owner: None,
+                        generator_for: None,
+                        persistence: RelationPersistence::Permanent,
+                    },
+                    0,
+                )
+                .unwrap();
+            storage.commit_sequence_create(slot);
+            slot
+        });
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let txid = worker as u32 + 1;
+                    let extension = storage
+                        .create_extension(
+                            SqlName::parse(extension_names[worker]).unwrap(),
+                            namespace,
+                            true,
+                            ExtensionVersion::parse("1.0").unwrap(),
+                            txid,
+                        )
+                        .unwrap();
+                    storage.commit_extension_create(extension, txid);
+                    let relation = ExtensionConfigRelation::Sequence(sequences[worker] as u16);
+                    let (dependency, _) = storage
+                        .change_extension_dependency(
+                            extension,
+                            relation.access_object(),
+                            ExtensionDependencyKind::Member,
+                            true,
+                            txid,
+                        )
+                        .unwrap();
+                    storage.commit_extension_dependency(dependency, txid);
+                    let (config, _) = storage
+                        .change_extension_config(
+                            extension,
+                            relation,
+                            extension_config_condition("last_value > 0").unwrap(),
+                            true,
+                            txid,
+                        )
+                        .unwrap();
+                    storage.commit_extension_config(config, txid);
+                });
+            }
+        });
+
+        assert_eq!(storage.extension_count(), MAX_EXTENSIONS);
+        assert_eq!(storage.extensions_visible_to(0).count(), WORKERS);
+        assert_eq!(storage.checkpoint_extensions().count(), WORKERS);
+        assert_eq!(
+            storage.extension_dependencies_visible_to(0).count(),
+            WORKERS
+        );
+        assert_eq!(storage.extension_configs_visible_to(0).count(), WORKERS);
+        for (slot, extension) in storage.extensions_visible_to(0) {
+            assert_eq!(storage.extension(slot).created_at, extension.created_at);
+        }
+        for (slot, dependency) in storage.extension_dependencies_visible_to(0) {
+            assert_eq!(storage.extension_dependency(slot).object, dependency.object);
+        }
+        for (slot, config) in storage.extension_configs_visible_to(0) {
+            assert_eq!(storage.extension_config(slot).relation, config.relation);
+        }
+        let catalog = storage.extension_catalog();
+        assert_eq!(catalog.definitions.capacity(), MAX_EXTENSIONS);
+        assert_eq!(catalog.dependencies.capacity(), MAX_EXTENSION_DEPENDENCIES);
+        assert_eq!(catalog.configs.capacity(), MAX_EXTENSION_CONFIG_RELATIONS);
+        drop(catalog);
+
+        let reclaimed = storage.extension_slot(extension_names[0], 0).unwrap();
+        storage.drop_extension_in(reclaimed, 10).unwrap();
+        storage.commit_extension_drop(reclaimed);
+        assert_eq!(storage.extension(reclaimed).name, SqlName::EMPTY);
+        assert_eq!(storage.extension(reclaimed).database, DatabaseOid::POSTGRES);
+        assert_eq!(storage.extension(reclaimed).ownership, Ownership::BOOTSTRAP);
+        assert_eq!(
+            storage.extension(reclaimed).ddl_state,
+            CatalogDdlState::Absent
+        );
+        assert_eq!(
+            storage.extension_dependencies_visible_to(0).count(),
+            WORKERS - 1
+        );
+        assert_eq!(storage.extension_configs_visible_to(0).count(), WORKERS - 1);
+
+        let reused = storage
+            .create_extension(
+                SqlName::parse("extension_reused").unwrap(),
+                namespace,
+                false,
+                ExtensionVersion::parse("2.0").unwrap(),
+                11,
+            )
+            .unwrap();
+        assert_eq!(reused, reclaimed);
+        let relation = ExtensionConfigRelation::Sequence(sequences[0] as u16);
+        let (dependency, _) = storage
+            .change_extension_dependency(
+                reused,
+                relation.access_object(),
+                ExtensionDependencyKind::Member,
+                true,
+                11,
+            )
+            .unwrap();
+        storage.commit_extension_dependency(dependency, 11);
+        let (config_slot, _) = storage
+            .change_extension_config(reused, relation, ExtensionConfigCondition::new(), true, 11)
+            .unwrap();
+        storage.commit_extension_config(config_slot, 11);
+        storage.rollback_extension_create(reused);
+        assert_eq!(storage.extension(reused).created_at, 0);
+        assert!(storage.extension(reused).ownership.pending.is_none());
+        assert_eq!(
+            storage.extension_dependencies_visible_to(0).count(),
+            WORKERS - 1
+        );
+        assert_eq!(storage.extension_configs_visible_to(0).count(), WORKERS - 1);
+
+        let pending = storage
+            .create_extension(
+                SqlName::parse("extension_pending").unwrap(),
+                namespace,
+                false,
+                ExtensionVersion::parse("1.0").unwrap(),
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .create_extension(
+                    SqlName::parse("extension_pending").unwrap(),
+                    namespace,
+                    false,
+                    ExtensionVersion::parse("1.0").unwrap(),
+                    21,
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.release_row_locks(21);
+        storage.rollback_extension_create(pending);
+
+        let altered = storage.extension_slot(extension_names[1], 0).unwrap();
+        let prior = storage
+            .alter_extension_definition(
+                altered,
+                namespace,
+                true,
+                ExtensionVersion::parse("1.1").unwrap(),
+                30,
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .set_extension_owner(altered, usize::from(BOOTSTRAP_ROLE), 31)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.release_row_locks(31);
+        storage.rollback_extension_alter(altered, prior);
+        let prior_owner = storage
+            .set_extension_owner(altered, usize::from(BOOTSTRAP_ROLE), 32)
+            .unwrap();
+        assert_eq!(
+            storage.drop_extension_in(altered, 33).unwrap_err().sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.release_row_locks(33);
+        storage.restore_object_owner(
+            AccessObject {
+                class: AccessClass::Extension,
+                slot: altered as u16,
+            },
+            prior_owner,
+        );
+
+        let mut fill = 0usize;
+        while storage.checkpoint_extensions().count() < MAX_EXTENSIONS {
+            let name = crate::stack_format!(63, "extension_fill_{}", fill);
+            let slot = storage
+                .create_extension(
+                    SqlName::parse(name.as_str()).unwrap(),
+                    namespace,
+                    false,
+                    ExtensionVersion::parse("1.0").unwrap(),
+                    0,
+                )
+                .unwrap();
+            storage.commit_extension_create(slot, 0);
+            fill += 1;
+        }
+        assert_eq!(
+            storage
+                .create_extension(
+                    SqlName::parse("extension_full").unwrap(),
+                    namespace,
+                    false,
+                    ExtensionVersion::parse("1.0").unwrap(),
+                    0,
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
         );
     }
 

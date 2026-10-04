@@ -1609,7 +1609,7 @@ fn alter_foreign_owner(
             role.as_str()
         ));
     }
-    let prior = storage.stage_foreign_catalog_owner(class, slot, owner as u16, txn.txid);
+    let prior = storage.stage_foreign_catalog_owner(class, slot, owner as u16, txn.txid)?;
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignOwnerChanged {
         class,
         slot: slot as u32,
@@ -8479,6 +8479,24 @@ pub fn reassign_owned(
                 }
             } else if class == AccessClass::Extension {
                 match storage.set_extension_owner(slot, target, txn.txid) {
+                    Ok(prior) => prior,
+                    Err(error) => return sql_fail(error),
+                }
+            } else if matches!(
+                class,
+                AccessClass::ForeignDataWrapper | AccessClass::ForeignServer
+            ) {
+                let foreign_class = if class == AccessClass::ForeignDataWrapper {
+                    crate::storage::foreign::ForeignObjectClass::Wrapper
+                } else {
+                    crate::storage::foreign::ForeignObjectClass::Server
+                };
+                match storage.stage_foreign_catalog_owner(
+                    foreign_class,
+                    slot,
+                    target as u16,
+                    txn.txid,
+                ) {
                     Ok(prior) => prior,
                     Err(error) => return sql_fail(error),
                 }

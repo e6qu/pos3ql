@@ -13228,6 +13228,41 @@ impl CatalogSequence {
     }
 }
 
+struct ForeignCatalogIter<'a, D: Copy> {
+    catalog: &'a std::sync::Mutex<foreign::ForeignCatalog>,
+    next_slot: usize,
+    database: Option<DatabaseOid>,
+    txid: u32,
+    checkpoint: bool,
+    capacity: fn(&foreign::ForeignCatalog) -> usize,
+    entry: fn(&foreign::ForeignCatalog, usize) -> foreign::ForeignCatalogEntry<D>,
+}
+
+impl<D: Copy> Iterator for ForeignCatalogIter<'_, D> {
+    type Item = (usize, foreign::ForeignCatalogEntry<D>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let catalog = self.catalog.lock().expect("foreign catalog lock poisoned");
+            let slot = self.next_slot;
+            if slot >= (self.capacity)(&catalog) {
+                return None;
+            }
+            self.next_slot += 1;
+            let entry = (self.entry)(&catalog, slot);
+            let visible = if self.checkpoint {
+                entry.ddl_state == CatalogDdlState::Present
+            } else {
+                self.database == Some(entry.database) && entry.visible_to(self.txid)
+            };
+            drop(catalog);
+            if visible {
+                return Some((slot, entry));
+            }
+        }
+    }
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -13263,7 +13298,7 @@ pub struct Storage {
     publications: std::sync::Mutex<FixedVec<PublicationDef>>,
     replication_slots: std::sync::Mutex<FixedVec<ReplicationSlotDef>>,
     subscription_catalog: std::sync::Mutex<SubscriptionCatalog>,
-    foreign: foreign::ForeignCatalog,
+    foreign: std::sync::Mutex<foreign::ForeignCatalog>,
     foreign_sessions: ForeignSessionPool,
     foreign_statement_contexts: FixedVec<std::sync::Mutex<ForeignStatementContext>>,
     matviews: FixedVec<MatviewDef>,
@@ -15700,12 +15735,17 @@ impl Storage {
         }
     }
 
+    fn foreign_catalog(&self) -> std::sync::MutexGuard<'_, foreign::ForeignCatalog> {
+        self.foreign.lock().expect("foreign catalog lock poisoned")
+    }
+
     pub(crate) fn foreign_wrapper(
         &self,
         name: &str,
         txid: u32,
     ) -> Option<(usize, foreign::ForeignDataWrapperDefinition)> {
-        self.foreign.wrapper(current_database(), name, txid)
+        self.foreign_catalog()
+            .wrapper(current_database(), name, txid)
     }
 
     pub(crate) fn foreign_wrapper_by_slot(
@@ -15713,7 +15753,8 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> Option<foreign::ForeignDataWrapperDefinition> {
-        self.foreign.wrapper_by_slot(current_database(), slot, txid)
+        self.foreign_catalog()
+            .wrapper_by_slot(current_database(), slot, txid)
     }
 
     pub(crate) fn foreign_server(
@@ -15721,7 +15762,8 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Option<(usize, foreign::ForeignServerDefinition)> {
-        self.foreign.server(current_database(), name, txid)
+        self.foreign_catalog()
+            .server(current_database(), name, txid)
     }
 
     pub(crate) fn foreign_server_by_slot(
@@ -15729,7 +15771,8 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> Option<foreign::ForeignServerDefinition> {
-        self.foreign.server_by_slot(current_database(), slot, txid)
+        self.foreign_catalog()
+            .server_by_slot(current_database(), slot, txid)
     }
 
     pub(crate) fn foreign_user_mapping(
@@ -15738,7 +15781,8 @@ impl Storage {
         user: foreign::ForeignMappingUser,
         txid: u32,
     ) -> Option<(usize, foreign::UserMappingDefinition)> {
-        self.foreign.mapping(current_database(), server, user, txid)
+        self.foreign_catalog()
+            .mapping(current_database(), server, user, txid)
     }
 
     pub(crate) fn foreign_table(
@@ -15746,7 +15790,8 @@ impl Storage {
         table: u16,
         txid: u32,
     ) -> Option<(usize, foreign::ForeignTableDefinition)> {
-        self.foreign.table(current_database(), table, txid)
+        self.foreign_catalog()
+            .table(current_database(), table, txid)
     }
 
     pub(crate) fn foreign_wrappers(
@@ -15755,10 +15800,18 @@ impl Storage {
     ) -> impl Iterator<
         Item = (
             usize,
-            &foreign::ForeignCatalogEntry<foreign::ForeignDataWrapperDefinition>,
+            foreign::ForeignCatalogEntry<foreign::ForeignDataWrapperDefinition>,
         ),
     > {
-        self.foreign.wrappers(current_database(), txid)
+        ForeignCatalogIter {
+            catalog: &self.foreign,
+            next_slot: 0,
+            database: Some(current_database()),
+            txid,
+            checkpoint: false,
+            capacity: foreign::ForeignCatalog::wrapper_capacity,
+            entry: foreign::ForeignCatalog::entry_wrapper,
+        }
     }
 
     pub(crate) fn foreign_servers(
@@ -15767,10 +15820,18 @@ impl Storage {
     ) -> impl Iterator<
         Item = (
             usize,
-            &foreign::ForeignCatalogEntry<foreign::ForeignServerDefinition>,
+            foreign::ForeignCatalogEntry<foreign::ForeignServerDefinition>,
         ),
     > {
-        self.foreign.servers(current_database(), txid)
+        ForeignCatalogIter {
+            catalog: &self.foreign,
+            next_slot: 0,
+            database: Some(current_database()),
+            txid,
+            checkpoint: false,
+            capacity: foreign::ForeignCatalog::server_capacity,
+            entry: foreign::ForeignCatalog::entry_server,
+        }
     }
 
     pub(crate) fn foreign_user_mappings(
@@ -15779,10 +15840,18 @@ impl Storage {
     ) -> impl Iterator<
         Item = (
             usize,
-            &foreign::ForeignCatalogEntry<foreign::UserMappingDefinition>,
+            foreign::ForeignCatalogEntry<foreign::UserMappingDefinition>,
         ),
     > {
-        self.foreign.mappings(current_database(), txid)
+        ForeignCatalogIter {
+            catalog: &self.foreign,
+            next_slot: 0,
+            database: Some(current_database()),
+            txid,
+            checkpoint: false,
+            capacity: foreign::ForeignCatalog::mapping_capacity,
+            entry: foreign::ForeignCatalog::entry_mapping,
+        }
     }
 
     pub(crate) fn foreign_tables(
@@ -15791,10 +15860,18 @@ impl Storage {
     ) -> impl Iterator<
         Item = (
             usize,
-            &foreign::ForeignCatalogEntry<foreign::ForeignTableDefinition>,
+            foreign::ForeignCatalogEntry<foreign::ForeignTableDefinition>,
         ),
     > {
-        self.foreign.tables(current_database(), txid)
+        ForeignCatalogIter {
+            catalog: &self.foreign,
+            next_slot: 0,
+            database: Some(current_database()),
+            txid,
+            checkpoint: false,
+            capacity: foreign::ForeignCatalog::table_capacity,
+            entry: foreign::ForeignCatalog::entry_table,
+        }
     }
 
     pub(crate) fn checkpoint_foreign_wrappers(
@@ -15802,10 +15879,18 @@ impl Storage {
     ) -> impl Iterator<
         Item = (
             usize,
-            &foreign::ForeignCatalogEntry<foreign::ForeignDataWrapperDefinition>,
+            foreign::ForeignCatalogEntry<foreign::ForeignDataWrapperDefinition>,
         ),
     > {
-        self.foreign.checkpoint_wrappers()
+        ForeignCatalogIter {
+            catalog: &self.foreign,
+            next_slot: 0,
+            database: None,
+            txid: 0,
+            checkpoint: true,
+            capacity: foreign::ForeignCatalog::wrapper_capacity,
+            entry: foreign::ForeignCatalog::entry_wrapper,
+        }
     }
 
     pub(crate) fn checkpoint_foreign_servers(
@@ -15813,10 +15898,18 @@ impl Storage {
     ) -> impl Iterator<
         Item = (
             usize,
-            &foreign::ForeignCatalogEntry<foreign::ForeignServerDefinition>,
+            foreign::ForeignCatalogEntry<foreign::ForeignServerDefinition>,
         ),
     > {
-        self.foreign.checkpoint_servers()
+        ForeignCatalogIter {
+            catalog: &self.foreign,
+            next_slot: 0,
+            database: None,
+            txid: 0,
+            checkpoint: true,
+            capacity: foreign::ForeignCatalog::server_capacity,
+            entry: foreign::ForeignCatalog::entry_server,
+        }
     }
 
     pub(crate) fn checkpoint_foreign_user_mappings(
@@ -15824,10 +15917,18 @@ impl Storage {
     ) -> impl Iterator<
         Item = (
             usize,
-            &foreign::ForeignCatalogEntry<foreign::UserMappingDefinition>,
+            foreign::ForeignCatalogEntry<foreign::UserMappingDefinition>,
         ),
     > {
-        self.foreign.checkpoint_mappings()
+        ForeignCatalogIter {
+            catalog: &self.foreign,
+            next_slot: 0,
+            database: None,
+            txid: 0,
+            checkpoint: true,
+            capacity: foreign::ForeignCatalog::mapping_capacity,
+            entry: foreign::ForeignCatalog::entry_mapping,
+        }
     }
 
     pub(crate) fn checkpoint_foreign_tables(
@@ -15835,143 +15936,171 @@ impl Storage {
     ) -> impl Iterator<
         Item = (
             usize,
-            &foreign::ForeignCatalogEntry<foreign::ForeignTableDefinition>,
+            foreign::ForeignCatalogEntry<foreign::ForeignTableDefinition>,
         ),
     > {
-        self.foreign.checkpoint_tables()
+        ForeignCatalogIter {
+            catalog: &self.foreign,
+            next_slot: 0,
+            database: None,
+            txid: 0,
+            checkpoint: true,
+            capacity: foreign::ForeignCatalog::table_capacity,
+            entry: foreign::ForeignCatalog::entry_table,
+        }
     }
 
     pub(crate) fn checkpoint_foreign_wrapper(
         &self,
         slot: usize,
-    ) -> &foreign::ForeignCatalogEntry<foreign::ForeignDataWrapperDefinition> {
-        self.foreign.checkpoint_wrapper(slot)
+    ) -> foreign::ForeignCatalogEntry<foreign::ForeignDataWrapperDefinition> {
+        self.foreign_catalog().checkpoint_wrapper(slot)
     }
 
     pub(crate) fn checkpoint_foreign_server(
         &self,
         slot: usize,
-    ) -> &foreign::ForeignCatalogEntry<foreign::ForeignServerDefinition> {
-        self.foreign.checkpoint_server(slot)
+    ) -> foreign::ForeignCatalogEntry<foreign::ForeignServerDefinition> {
+        self.foreign_catalog().checkpoint_server(slot)
     }
 
     pub(crate) fn foreign_wrapper_entry(
         &self,
         slot: usize,
-    ) -> &foreign::ForeignCatalogEntry<foreign::ForeignDataWrapperDefinition> {
-        self.foreign.entry_wrapper(slot)
+    ) -> foreign::ForeignCatalogEntry<foreign::ForeignDataWrapperDefinition> {
+        self.foreign_catalog().entry_wrapper(slot)
     }
 
     pub(crate) fn foreign_server_entry(
         &self,
         slot: usize,
-    ) -> &foreign::ForeignCatalogEntry<foreign::ForeignServerDefinition> {
-        self.foreign.entry_server(slot)
+    ) -> foreign::ForeignCatalogEntry<foreign::ForeignServerDefinition> {
+        self.foreign_catalog().entry_server(slot)
     }
 
     pub(crate) fn foreign_mapping_entry(
         &self,
         slot: usize,
-    ) -> &foreign::ForeignCatalogEntry<foreign::UserMappingDefinition> {
-        self.foreign.entry_mapping(slot)
+    ) -> foreign::ForeignCatalogEntry<foreign::UserMappingDefinition> {
+        self.foreign_catalog().entry_mapping(slot)
     }
 
     pub(crate) fn foreign_table_entry(
         &self,
         slot: usize,
-    ) -> &foreign::ForeignCatalogEntry<foreign::ForeignTableDefinition> {
-        self.foreign.entry_table(slot)
+    ) -> foreign::ForeignCatalogEntry<foreign::ForeignTableDefinition> {
+        self.foreign_catalog().entry_table(slot)
     }
 
     pub(crate) fn restore_foreign_wrapper(
-        &mut self,
+        &self,
         slot: usize,
         created_at: u64,
         definition: foreign::ForeignDataWrapperDefinition,
         owner: u16,
     ) -> Result<(), SqlError> {
         self.catalog_sequence.observe(created_at);
-        self.foreign
-            .restore_wrapper(slot, current_database(), created_at, definition, owner)
+        self.foreign_catalog().restore_wrapper(
+            slot,
+            current_database(),
+            created_at,
+            definition,
+            owner,
+        )
     }
 
     pub(crate) fn restore_foreign_server(
-        &mut self,
+        &self,
         slot: usize,
         created_at: u64,
         definition: foreign::ForeignServerDefinition,
         owner: u16,
     ) -> Result<(), SqlError> {
         self.catalog_sequence.observe(created_at);
-        self.foreign
-            .restore_server(slot, current_database(), created_at, definition, owner)
+        self.foreign_catalog().restore_server(
+            slot,
+            current_database(),
+            created_at,
+            definition,
+            owner,
+        )
     }
 
     pub(crate) fn restore_foreign_user_mapping(
-        &mut self,
+        &self,
         slot: usize,
         created_at: u64,
         definition: foreign::UserMappingDefinition,
     ) -> Result<(), SqlError> {
         self.catalog_sequence.observe(created_at);
-        self.foreign
+        self.foreign_catalog()
             .restore_mapping(slot, current_database(), created_at, definition)
     }
 
     pub(crate) fn restore_foreign_table_binding(
-        &mut self,
+        &self,
         slot: usize,
         created_at: u64,
         definition: foreign::ForeignTableDefinition,
     ) -> Result<(), SqlError> {
         self.catalog_sequence.observe(created_at);
-        self.foreign
+        self.foreign_catalog()
             .restore_table(slot, current_database(), created_at, definition)
     }
 
     pub(crate) fn replay_set_foreign_wrapper(
-        &mut self,
+        &self,
         slot: usize,
         created_at: u64,
         owner: u16,
         definition: Option<foreign::ForeignDataWrapperDefinition>,
     ) -> Result<(), SqlError> {
         self.catalog_sequence.observe(created_at);
-        self.foreign
-            .replay_set_wrapper(slot, current_database(), created_at, owner, definition)
+        self.foreign_catalog().replay_set_wrapper(
+            slot,
+            current_database(),
+            created_at,
+            owner,
+            definition,
+        )
     }
 
     pub(crate) fn replay_set_foreign_server(
-        &mut self,
+        &self,
         slot: usize,
         created_at: u64,
         owner: u16,
         definition: Option<foreign::ForeignServerDefinition>,
     ) -> Result<(), SqlError> {
         self.catalog_sequence.observe(created_at);
-        self.foreign
-            .replay_set_server(slot, current_database(), created_at, owner, definition)
+        self.foreign_catalog().replay_set_server(
+            slot,
+            current_database(),
+            created_at,
+            owner,
+            definition,
+        )
     }
 
     pub(crate) fn replay_set_foreign_user_mapping(
-        &mut self,
+        &self,
         slot: usize,
         created_at: u64,
         definition: Option<foreign::UserMappingDefinition>,
     ) -> Result<(), SqlError> {
         self.catalog_sequence.observe(created_at);
-        self.foreign
+        self.foreign_catalog()
             .replay_set_mapping(slot, current_database(), created_at, definition)
     }
 
     pub(crate) fn replay_set_foreign_table(
-        &mut self,
+        &self,
         slot: usize,
         created_at: u64,
         definition: Option<foreign::ForeignTableDefinition>,
     ) -> Result<(), SqlError> {
         self.catalog_sequence.observe(created_at);
-        self.foreign
+        self.foreign_catalog()
             .replay_set_table(slot, current_database(), created_at, definition)
     }
 
@@ -15980,7 +16109,7 @@ impl Storage {
         wrapper: u16,
         txid: u32,
     ) -> Option<(usize, foreign::ForeignServerDefinition)> {
-        self.foreign
+        self.foreign_catalog()
             .first_server_for_wrapper(current_database(), wrapper, txid)
     }
 
@@ -15989,7 +16118,7 @@ impl Storage {
         server: u16,
         txid: u32,
     ) -> Option<(usize, foreign::UserMappingDefinition)> {
-        self.foreign
+        self.foreign_catalog()
             .first_mapping_for_server(current_database(), server, txid)
     }
 
@@ -15998,22 +16127,22 @@ impl Storage {
         server: u16,
         txid: u32,
     ) -> Option<(usize, foreign::ForeignTableDefinition)> {
-        self.foreign
+        self.foreign_catalog()
             .first_table_for_server(current_database(), server, txid)
     }
 
     pub(crate) fn has_foreign_table_for_wrapper(&self, wrapper: u16, txid: u32) -> bool {
-        self.foreign
+        self.foreign_catalog()
             .has_table_for_wrapper(current_database(), wrapper, txid)
     }
 
     pub(crate) fn create_foreign_wrapper(
-        &mut self,
+        &self,
         definition: foreign::ForeignDataWrapperDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
         let created_at = self.catalog_sequence.next();
-        let slot = self.foreign.create_wrapper(
+        let slot = self.foreign_catalog().create_wrapper(
             current_database(),
             created_at,
             definition,
@@ -16028,12 +16157,12 @@ impl Storage {
     }
 
     pub(crate) fn create_foreign_server(
-        &mut self,
+        &self,
         definition: foreign::ForeignServerDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
         let created_at = self.catalog_sequence.next();
-        let slot = self.foreign.create_server(
+        let slot = self.foreign_catalog().create_server(
             current_database(),
             created_at,
             definition,
@@ -16048,22 +16177,22 @@ impl Storage {
     }
 
     pub(crate) fn create_foreign_user_mapping(
-        &mut self,
+        &self,
         definition: foreign::UserMappingDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
         let created_at = self.catalog_sequence.next();
-        self.foreign
+        self.foreign_catalog()
             .create_mapping(current_database(), created_at, definition, txid)
     }
 
     pub(crate) fn create_foreign_table_binding(
-        &mut self,
+        &self,
         definition: foreign::ForeignTableDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
         let created_at = self.catalog_sequence.next();
-        self.foreign.create_table(
+        self.foreign_catalog().create_table(
             current_database(),
             created_at,
             definition,
@@ -16073,7 +16202,7 @@ impl Storage {
     }
 
     pub(crate) fn alter_foreign_wrapper(
-        &mut self,
+        &self,
         slot: usize,
         definition: foreign::ForeignDataWrapperDefinition,
         txid: u32,
@@ -16081,70 +16210,70 @@ impl Storage {
         Option<foreign::PendingForeignDefinition<foreign::ForeignDataWrapperDefinition>>,
         SqlError,
     > {
-        self.foreign.alter_wrapper(slot, definition, txid)
+        self.foreign_catalog().alter_wrapper(slot, definition, txid)
     }
 
     pub(crate) fn alter_foreign_server(
-        &mut self,
+        &self,
         slot: usize,
         definition: foreign::ForeignServerDefinition,
         txid: u32,
     ) -> Result<Option<foreign::PendingForeignDefinition<foreign::ForeignServerDefinition>>, SqlError>
     {
-        self.foreign.alter_server(slot, definition, txid)
+        self.foreign_catalog().alter_server(slot, definition, txid)
     }
 
     pub(crate) fn alter_foreign_user_mapping(
-        &mut self,
+        &self,
         slot: usize,
         definition: foreign::UserMappingDefinition,
         txid: u32,
     ) -> Result<Option<foreign::PendingForeignDefinition<foreign::UserMappingDefinition>>, SqlError>
     {
-        self.foreign.alter_mapping(slot, definition, txid)
+        self.foreign_catalog().alter_mapping(slot, definition, txid)
     }
 
     pub(crate) fn alter_foreign_table_binding(
-        &mut self,
+        &self,
         slot: usize,
         definition: foreign::ForeignTableDefinition,
         txid: u32,
     ) -> Result<Option<foreign::PendingForeignDefinition<foreign::ForeignTableDefinition>>, SqlError>
     {
-        self.foreign.alter_table(slot, definition, txid)
+        self.foreign_catalog().alter_table(slot, definition, txid)
     }
 
     pub(crate) fn foreign_catalog_commit_create(
-        &mut self,
+        &self,
         class: foreign::ForeignObjectClass,
         slot: usize,
     ) {
-        self.foreign.commit_create(class, slot);
+        self.foreign_catalog().commit_create(class, slot);
     }
 
     pub(crate) fn foreign_catalog_rollback_create(
-        &mut self,
+        &self,
         class: foreign::ForeignObjectClass,
         slot: usize,
     ) {
-        self.foreign.rollback_create(class, slot);
+        self.foreign_catalog().rollback_create(class, slot);
     }
 
     pub(crate) fn foreign_catalog_drop(
-        &mut self,
+        &self,
         class: foreign::ForeignObjectClass,
         slot: usize,
         txid: u32,
     ) {
-        self.foreign.drop(class, slot, txid);
+        self.foreign_catalog().stage_drop(class, slot, txid);
     }
 
     pub(crate) fn foreign_catalog_commit_drop(
-        &mut self,
+        &self,
         class: foreign::ForeignObjectClass,
         slot: usize,
     ) {
-        self.foreign.commit_drop(class, slot);
+        self.foreign_catalog().commit_drop(class, slot);
         let access = match class {
             foreign::ForeignObjectClass::Wrapper => Some(AccessClass::ForeignDataWrapper),
             foreign::ForeignObjectClass::Server => Some(AccessClass::ForeignServer),
@@ -16167,53 +16296,53 @@ impl Storage {
     }
 
     pub(crate) fn foreign_catalog_rollback_drop(
-        &mut self,
+        &self,
         class: foreign::ForeignObjectClass,
         slot: usize,
         txid: u32,
     ) {
-        self.foreign.rollback_drop(class, slot, txid);
+        self.foreign_catalog().rollback_drop(class, slot, txid);
     }
 
     pub(crate) fn foreign_catalog_commit_alter(
-        &mut self,
+        &self,
         class: foreign::ForeignObjectClass,
         slot: usize,
         txid: u32,
     ) {
-        self.foreign.commit_alter(class, slot, txid);
+        self.foreign_catalog().commit_alter(class, slot, txid);
     }
 
     pub(crate) fn rollback_foreign_wrapper_alter(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<foreign::PendingForeignDefinition<foreign::ForeignDataWrapperDefinition>>,
     ) {
-        self.foreign.rollback_wrapper_alter(slot, prior);
+        self.foreign_catalog().rollback_wrapper_alter(slot, prior);
     }
 
     pub(crate) fn rollback_foreign_server_alter(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<foreign::PendingForeignDefinition<foreign::ForeignServerDefinition>>,
     ) {
-        self.foreign.rollback_server_alter(slot, prior);
+        self.foreign_catalog().rollback_server_alter(slot, prior);
     }
 
     pub(crate) fn rollback_foreign_mapping_alter(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<foreign::PendingForeignDefinition<foreign::UserMappingDefinition>>,
     ) {
-        self.foreign.rollback_mapping_alter(slot, prior);
+        self.foreign_catalog().rollback_mapping_alter(slot, prior);
     }
 
     pub(crate) fn rollback_foreign_table_alter(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<foreign::PendingForeignDefinition<foreign::ForeignTableDefinition>>,
     ) {
-        self.foreign.rollback_table_alter(slot, prior);
+        self.foreign_catalog().rollback_table_alter(slot, prior);
     }
 
     pub(crate) fn foreign_catalog_owner_to(
@@ -16222,35 +16351,35 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> u16 {
-        self.foreign.owner_to(class, slot, txid)
+        self.foreign_catalog().owner_to(class, slot, txid)
     }
 
     pub(crate) fn stage_foreign_catalog_owner(
-        &mut self,
+        &self,
         class: foreign::ForeignObjectClass,
         slot: usize,
         owner: u16,
         txid: u32,
-    ) -> Option<PendingOwnership> {
-        self.foreign.stage_owner(class, slot, owner, txid)
+    ) -> Result<Option<PendingOwnership>, SqlError> {
+        self.foreign_catalog().stage_owner(class, slot, owner, txid)
     }
 
     pub(crate) fn commit_foreign_catalog_owner(
-        &mut self,
+        &self,
         class: foreign::ForeignObjectClass,
         slot: usize,
         txid: u32,
     ) {
-        self.foreign.commit_owner(class, slot, txid);
+        self.foreign_catalog().commit_owner(class, slot, txid);
     }
 
     pub(crate) fn rollback_foreign_catalog_owner(
-        &mut self,
+        &self,
         class: foreign::ForeignObjectClass,
         slot: usize,
         prior: Option<PendingOwnership>,
     ) {
-        self.foreign.rollback_owner(class, slot, prior);
+        self.foreign_catalog().rollback_owner(class, slot, prior);
     }
 
     pub(crate) fn empty_stored_query_dependencies(
@@ -17819,7 +17948,7 @@ impl Storage {
                 definitions: subscriptions,
                 relations: subscription_relations,
             }),
-            foreign,
+            foreign: std::sync::Mutex::new(foreign),
             foreign_sessions: ForeignSessionPool {
                 assignment: std::sync::Mutex::new(()),
                 slots: FixedVec::new(budget, "foreign_sessions", config.max_foreign_sessions)?,
@@ -20188,12 +20317,12 @@ impl Storage {
                     .database
                 }
                 AccessClass::ForeignDataWrapper => {
-                    self.foreign
+                    self.foreign_catalog()
                         .entry_wrapper(usize::from(entry.object.slot))
                         .database
                 }
                 AccessClass::ForeignServer => {
-                    self.foreign
+                    self.foreign_catalog()
                         .entry_server(usize::from(entry.object.slot))
                         .database
                 }
@@ -21027,8 +21156,8 @@ impl Storage {
             AccessClass::LargeObject => {
                 unreachable!("large object ownership is synchronized separately")
             }
-            AccessClass::ForeignDataWrapper => self.foreign.entry_wrapper(slot).ownership,
-            AccessClass::ForeignServer => self.foreign.entry_server(slot).ownership,
+            AccessClass::ForeignDataWrapper => self.foreign_catalog().entry_wrapper(slot).ownership,
+            AccessClass::ForeignServer => self.foreign_catalog().entry_server(slot).ownership,
             AccessClass::Language => {
                 unreachable!("built-in procedural languages have bootstrap ownership")
             }
@@ -21073,8 +21202,9 @@ impl Storage {
             AccessClass::LargeObject => {
                 unreachable!("large object ownership is synchronized separately")
             }
-            AccessClass::ForeignDataWrapper => &mut self.foreign.entry_wrapper_mut(slot).ownership,
-            AccessClass::ForeignServer => &mut self.foreign.entry_server_mut(slot).ownership,
+            AccessClass::ForeignDataWrapper | AccessClass::ForeignServer => {
+                unreachable!("foreign catalog ownership is synchronized separately")
+            }
             AccessClass::Language => {
                 unreachable!("built-in procedural languages have immutable ownership")
             }
@@ -21536,11 +21666,17 @@ impl Storage {
             }
             AccessClass::ForeignDataWrapper => (
                 SqlName::EMPTY,
-                self.foreign.entry_wrapper(slot).definition_for(txid).name,
+                self.foreign_catalog()
+                    .entry_wrapper(slot)
+                    .definition_for(txid)
+                    .name,
             ),
             AccessClass::ForeignServer => (
                 SqlName::EMPTY,
-                self.foreign.entry_server(slot).definition_for(txid).name,
+                self.foreign_catalog()
+                    .entry_server(slot)
+                    .definition_for(txid)
+                    .name,
             ),
             AccessClass::Language => {
                 let name = crate::sql::catalog::procedural_language_name(object.slot.into())
@@ -21582,10 +21718,10 @@ impl Storage {
                 self.large_object(slot).ddl_state == CatalogDdlState::Present
             }
             AccessClass::ForeignDataWrapper => {
-                self.foreign.entry_wrapper(slot).ddl_state == CatalogDdlState::Present
+                self.foreign_catalog().entry_wrapper(slot).ddl_state == CatalogDdlState::Present
             }
             AccessClass::ForeignServer => {
-                self.foreign.entry_server(slot).ddl_state == CatalogDdlState::Present
+                self.foreign_catalog().entry_server(slot).ddl_state == CatalogDdlState::Present
             }
             AccessClass::Language => {
                 crate::sql::catalog::procedural_language_name(object.slot.into()).is_some()
@@ -21616,8 +21752,12 @@ impl Storage {
             AccessClass::EventTrigger => self.event_trigger(slot).visible_to(txid),
             AccessClass::Database => self.databases[slot].visible_to(txid),
             AccessClass::LargeObject => self.large_object(slot).visible_to(txid),
-            AccessClass::ForeignDataWrapper => self.foreign.entry_wrapper(slot).visible_to(txid),
-            AccessClass::ForeignServer => self.foreign.entry_server(slot).visible_to(txid),
+            AccessClass::ForeignDataWrapper => {
+                self.foreign_catalog().entry_wrapper(slot).visible_to(txid)
+            }
+            AccessClass::ForeignServer => {
+                self.foreign_catalog().entry_server(slot).visible_to(txid)
+            }
             AccessClass::Language => {
                 crate::sql::catalog::procedural_language_name(object.slot.into()).is_some()
             }
@@ -21647,8 +21787,10 @@ impl Storage {
             AccessClass::Trigger => Some(self.trigger(slot).database),
             AccessClass::EventTrigger => Some(self.event_trigger(slot).database),
             AccessClass::LargeObject => Some(self.large_object(slot).database),
-            AccessClass::ForeignDataWrapper => Some(self.foreign.entry_wrapper(slot).database),
-            AccessClass::ForeignServer => Some(self.foreign.entry_server(slot).database),
+            AccessClass::ForeignDataWrapper => {
+                Some(self.foreign_catalog().entry_wrapper(slot).database)
+            }
+            AccessClass::ForeignServer => Some(self.foreign_catalog().entry_server(slot).database),
             AccessClass::Tablespace | AccessClass::Database | AccessClass::Language => None,
         }
     }
@@ -21805,8 +21947,8 @@ impl Storage {
                 })?
             }
             AccessClass::ForeignDataWrapper => {
-                let created_at = self.foreign.entry_wrapper(source_slot).created_at;
-                self.foreign
+                let created_at = self.foreign_catalog().entry_wrapper(source_slot).created_at;
+                self.foreign_catalog()
                     .checkpoint_wrappers()
                     .find_map(|(slot, candidate)| {
                         (candidate.database == target_database
@@ -21815,8 +21957,8 @@ impl Storage {
                     })?
             }
             AccessClass::ForeignServer => {
-                let created_at = self.foreign.entry_server(source_slot).created_at;
-                self.foreign
+                let created_at = self.foreign_catalog().entry_server(source_slot).created_at;
+                self.foreign_catalog()
                     .checkpoint_servers()
                     .find_map(|(slot, candidate)| {
                         (candidate.database == target_database
@@ -22171,8 +22313,8 @@ impl Storage {
                 .expect("large object catalog lock poisoned")
                 .definitions
                 .len(),
-            AccessClass::ForeignDataWrapper => self.foreign.wrapper_capacity(),
-            AccessClass::ForeignServer => self.foreign.server_capacity(),
+            AccessClass::ForeignDataWrapper => self.foreign_catalog().wrapper_capacity(),
+            AccessClass::ForeignServer => self.foreign_catalog().server_capacity(),
             AccessClass::Language => 0,
         }
     }
@@ -22208,6 +22350,10 @@ impl Storage {
         role: usize,
         txid: u32,
     ) -> Option<RoleObjectDependency> {
+        let (foreign_wrapper_capacity, foreign_server_capacity) = {
+            let catalog = self.foreign_catalog();
+            (catalog.wrapper_capacity(), catalog.server_capacity())
+        };
         let owned = [
             (AccessClass::Table, self.tables.len()),
             (AccessClass::View, self.views.len()),
@@ -22227,11 +22373,8 @@ impl Storage {
                 AccessClass::LargeObject,
                 self.access_class_slots(AccessClass::LargeObject),
             ),
-            (
-                AccessClass::ForeignDataWrapper,
-                self.foreign.wrapper_capacity(),
-            ),
-            (AccessClass::ForeignServer, self.foreign.server_capacity()),
+            (AccessClass::ForeignDataWrapper, foreign_wrapper_capacity),
+            (AccessClass::ForeignServer, foreign_server_capacity),
         ]
         .into_iter()
         .any(|(class, count)| {
@@ -22495,6 +22638,20 @@ impl Storage {
         }
         if matches!(
             object.class,
+            AccessClass::ForeignDataWrapper | AccessClass::ForeignServer
+        ) {
+            let class = if object.class == AccessClass::ForeignDataWrapper {
+                foreign::ForeignObjectClass::Wrapper
+            } else {
+                foreign::ForeignObjectClass::Server
+            };
+            return self
+                .foreign_catalog()
+                .stage_owner(class, usize::from(object.slot), owner as u16, txid)
+                .expect("foreign ownership conflict is handled at the DDL boundary");
+        }
+        if matches!(
+            object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
         ) {
             let mut catalog = self
@@ -22648,6 +22805,19 @@ impl Storage {
         }
         if matches!(
             object.class,
+            AccessClass::ForeignDataWrapper | AccessClass::ForeignServer
+        ) {
+            let class = if object.class == AccessClass::ForeignDataWrapper {
+                foreign::ForeignObjectClass::Wrapper
+            } else {
+                foreign::ForeignObjectClass::Server
+            };
+            self.foreign_catalog()
+                .commit_owner(class, usize::from(object.slot), txid);
+            return;
+        }
+        if matches!(
+            object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
         ) {
             let mut catalog = self
@@ -22717,6 +22887,19 @@ impl Storage {
             self.extension_catalog().definitions[usize::from(object.slot)]
                 .ownership
                 .pending = prior;
+            return;
+        }
+        if matches!(
+            object.class,
+            AccessClass::ForeignDataWrapper | AccessClass::ForeignServer
+        ) {
+            let class = if object.class == AccessClass::ForeignDataWrapper {
+                foreign::ForeignObjectClass::Wrapper
+            } else {
+                foreign::ForeignObjectClass::Server
+            };
+            self.foreign_catalog()
+                .rollback_owner(class, usize::from(object.slot), prior);
             return;
         }
         if object.class == AccessClass::Routine {
@@ -54339,6 +54522,282 @@ mod tests {
                     namespace,
                     false,
                     ExtensionVersion::parse("1.0").unwrap(),
+                    0,
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+    }
+
+    #[test]
+    fn foreign_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<foreign::ForeignCatalog>();
+        assert_send_sync::<std::sync::Mutex<foreign::ForeignCatalog>>();
+        assert_send_sync::<ForeignCatalogIter<'_, foreign::ForeignDataWrapperDefinition>>();
+
+        const WORKERS: usize = 4;
+        let wrapper_names = ["wrapper_a", "wrapper_b", "wrapper_c", "wrapper_d"];
+        let server_names = ["server_a", "server_b", "server_c", "server_d"];
+        let mut config = test_config();
+        config.max_foreign_data_wrappers = WORKERS;
+        config.max_foreign_servers = WORKERS;
+        config.max_user_mappings = WORKERS;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let txid = worker as u32 + 1;
+                    let wrapper = storage
+                        .create_foreign_wrapper(
+                            foreign::ForeignDataWrapperDefinition {
+                                name: SqlName::parse(wrapper_names[worker]).unwrap(),
+                                handler: foreign::ForeignDataHandler::None,
+                                validator: foreign::ForeignDataValidator::None,
+                                options: foreign::ForeignOptions::EMPTY,
+                            },
+                            txid,
+                        )
+                        .unwrap();
+                    storage.foreign_catalog_commit_create(
+                        foreign::ForeignObjectClass::Wrapper,
+                        wrapper,
+                    );
+                    let server = storage
+                        .create_foreign_server(
+                            foreign::ForeignServerDefinition {
+                                name: SqlName::parse(server_names[worker]).unwrap(),
+                                wrapper: wrapper as u16,
+                                server_type: None,
+                                version: None,
+                                options: foreign::ForeignOptions::EMPTY,
+                            },
+                            txid,
+                        )
+                        .unwrap();
+                    storage
+                        .foreign_catalog_commit_create(foreign::ForeignObjectClass::Server, server);
+                    let mapping = storage
+                        .create_foreign_user_mapping(
+                            foreign::UserMappingDefinition {
+                                server: server as u16,
+                                user: foreign::ForeignMappingUser::Public,
+                                options: foreign::ForeignOptions::EMPTY,
+                            },
+                            txid,
+                        )
+                        .unwrap();
+                    storage.foreign_catalog_commit_create(
+                        foreign::ForeignObjectClass::Mapping,
+                        mapping,
+                    );
+                    let table = storage
+                        .create_foreign_table_binding(
+                            foreign::ForeignTableDefinition {
+                                table: worker as u16,
+                                server: server as u16,
+                                options: foreign::ForeignOptions::EMPTY,
+                                column_options: foreign::ForeignColumnOptions::EMPTY,
+                            },
+                            txid,
+                        )
+                        .unwrap();
+                    storage
+                        .foreign_catalog_commit_create(foreign::ForeignObjectClass::Table, table);
+                });
+            }
+        });
+
+        assert_eq!(storage.foreign_wrappers(0).count(), WORKERS);
+        assert_eq!(storage.foreign_servers(0).count(), WORKERS);
+        assert_eq!(storage.foreign_user_mappings(0).count(), WORKERS);
+        assert_eq!(storage.foreign_tables(0).count(), WORKERS);
+        assert_eq!(storage.checkpoint_foreign_wrappers().count(), WORKERS);
+        assert_eq!(storage.checkpoint_foreign_servers().count(), WORKERS);
+        assert_eq!(
+            storage.role_object_dependency(usize::from(BOOTSTRAP_ROLE), 0),
+            Some(RoleObjectDependency::OwnedObject)
+        );
+        for (slot, entry) in storage.foreign_wrappers(0) {
+            assert_eq!(
+                storage.foreign_wrapper_entry(slot).created_at,
+                entry.created_at
+            );
+        }
+        let catalog = storage.foreign_catalog();
+        assert_eq!(catalog.wrapper_capacity(), config.max_foreign_data_wrappers);
+        assert_eq!(catalog.server_capacity(), config.max_foreign_servers);
+        assert_eq!(catalog.mapping_capacity(), config.max_user_mappings);
+        assert_eq!(catalog.table_capacity(), config.max_tables);
+        drop(catalog);
+
+        let wrapper = storage.foreign_wrapper(wrapper_names[0], 0).unwrap().0;
+        let server = storage.foreign_server(server_names[0], 0).unwrap().0;
+        let mapping = storage
+            .foreign_user_mapping(server as u16, foreign::ForeignMappingUser::Public, 0)
+            .unwrap()
+            .0;
+        let table = storage.foreign_table(0, 0).unwrap().0;
+        for (class, slot) in [
+            (foreign::ForeignObjectClass::Table, table),
+            (foreign::ForeignObjectClass::Mapping, mapping),
+            (foreign::ForeignObjectClass::Server, server),
+            (foreign::ForeignObjectClass::Wrapper, wrapper),
+        ] {
+            storage.foreign_catalog_drop(class, slot, 10);
+            storage.foreign_catalog_commit_drop(class, slot);
+        }
+        let empty = storage.foreign_wrapper_entry(wrapper);
+        assert_eq!(empty.database, DatabaseOid::POSTGRES);
+        assert_eq!(empty.created_at, 0);
+        assert_eq!(empty.definition.name, SqlName::EMPTY);
+        assert_eq!(empty.ownership, Ownership::BOOTSTRAP);
+        assert_eq!(empty.ddl_state, CatalogDdlState::Absent);
+        let empty = storage.foreign_server_entry(server);
+        assert_eq!(empty.created_at, 0);
+        assert_eq!(empty.definition.name, SqlName::EMPTY);
+        assert_eq!(empty.ownership, Ownership::BOOTSTRAP);
+        assert_eq!(empty.ddl_state, CatalogDdlState::Absent);
+        let empty = storage.foreign_mapping_entry(mapping);
+        assert_eq!(empty.created_at, 0);
+        assert_eq!(empty.definition.server, u16::MAX);
+        assert_eq!(empty.ddl_state, CatalogDdlState::Absent);
+        let empty = storage.foreign_table_entry(table);
+        assert_eq!(empty.created_at, 0);
+        assert_eq!(empty.definition.table, u16::MAX);
+        assert_eq!(empty.ddl_state, CatalogDdlState::Absent);
+
+        let dropped = storage.foreign_wrapper(wrapper_names[1], 0).unwrap().0;
+        storage.foreign_catalog_drop(foreign::ForeignObjectClass::Wrapper, dropped, 11);
+        let replacement = storage
+            .create_foreign_wrapper(
+                foreign::ForeignDataWrapperDefinition {
+                    name: SqlName::parse(wrapper_names[1]).unwrap(),
+                    handler: foreign::ForeignDataHandler::None,
+                    validator: foreign::ForeignDataValidator::None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                11,
+            )
+            .unwrap();
+        assert_eq!(replacement, wrapper);
+        storage.foreign_catalog_rollback_create(foreign::ForeignObjectClass::Wrapper, replacement);
+        storage.foreign_catalog_rollback_drop(foreign::ForeignObjectClass::Wrapper, dropped, 11);
+
+        let reused = storage
+            .create_foreign_wrapper(
+                foreign::ForeignDataWrapperDefinition {
+                    name: SqlName::parse("wrapper_reused").unwrap(),
+                    handler: foreign::ForeignDataHandler::None,
+                    validator: foreign::ForeignDataValidator::None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                11,
+            )
+            .unwrap();
+        assert_eq!(reused, wrapper);
+        storage.foreign_catalog_rollback_create(foreign::ForeignObjectClass::Wrapper, reused);
+        assert_eq!(storage.foreign_wrapper_entry(reused).created_at, 0);
+        assert!(
+            storage
+                .foreign_wrapper_entry(reused)
+                .ownership
+                .pending
+                .is_none()
+        );
+
+        let pending = storage
+            .create_foreign_wrapper(
+                foreign::ForeignDataWrapperDefinition {
+                    name: SqlName::parse("wrapper_pending").unwrap(),
+                    handler: foreign::ForeignDataHandler::None,
+                    validator: foreign::ForeignDataValidator::None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .create_foreign_wrapper(
+                    foreign::ForeignDataWrapperDefinition {
+                        name: SqlName::parse("wrapper_pending").unwrap(),
+                        handler: foreign::ForeignDataHandler::None,
+                        validator: foreign::ForeignDataValidator::None,
+                        options: foreign::ForeignOptions::EMPTY,
+                    },
+                    21,
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.foreign_catalog_rollback_create(foreign::ForeignObjectClass::Wrapper, pending);
+
+        let altered = storage.foreign_wrapper(wrapper_names[1], 0).unwrap().0;
+        let definition = storage.foreign_wrapper_entry(altered).definition;
+        let prior = storage
+            .alter_foreign_wrapper(altered, definition, 30)
+            .unwrap();
+        assert_eq!(
+            storage
+                .stage_foreign_catalog_owner(
+                    foreign::ForeignObjectClass::Wrapper,
+                    altered,
+                    BOOTSTRAP_ROLE,
+                    31,
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.rollback_foreign_wrapper_alter(altered, prior);
+        let prior_owner = storage
+            .stage_foreign_catalog_owner(
+                foreign::ForeignObjectClass::Wrapper,
+                altered,
+                BOOTSTRAP_ROLE,
+                32,
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .alter_foreign_wrapper(altered, definition, 33)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.rollback_foreign_catalog_owner(
+            foreign::ForeignObjectClass::Wrapper,
+            altered,
+            prior_owner,
+        );
+
+        let fill = storage
+            .create_foreign_wrapper(
+                foreign::ForeignDataWrapperDefinition {
+                    name: SqlName::parse("wrapper_fill").unwrap(),
+                    handler: foreign::ForeignDataHandler::None,
+                    validator: foreign::ForeignDataValidator::None,
+                    options: foreign::ForeignOptions::EMPTY,
+                },
+                0,
+            )
+            .unwrap();
+        storage.foreign_catalog_commit_create(foreign::ForeignObjectClass::Wrapper, fill);
+        assert_eq!(
+            storage
+                .create_foreign_wrapper(
+                    foreign::ForeignDataWrapperDefinition {
+                        name: SqlName::parse("wrapper_full").unwrap(),
+                        handler: foreign::ForeignDataHandler::None,
+                        validator: foreign::ForeignDataValidator::None,
+                        options: foreign::ForeignOptions::EMPTY,
+                    },
                     0,
                 )
                 .unwrap_err()

@@ -367,6 +367,17 @@ pub(crate) struct ForeignCatalogEntry<D: Copy> {
 }
 
 impl<D: Copy> ForeignCatalogEntry<D> {
+    fn empty(definition: D) -> Self {
+        Self {
+            database: DatabaseOid::POSTGRES,
+            created_at: 0,
+            definition,
+            pending: None,
+            ownership: Ownership::BOOTSTRAP,
+            ddl_state: CatalogDdlState::Absent,
+        }
+    }
+
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
     }
@@ -375,6 +386,17 @@ impl<D: Copy> ForeignCatalogEntry<D> {
         self.pending
             .filter(|pending| pending.txid == txid)
             .map_or(self.definition, |pending| pending.definition)
+    }
+
+    pub(crate) fn pending_owner_other_than(&self, txid: u32) -> Option<u32> {
+        [
+            self.ddl_state.pending_txid(),
+            self.pending.map(|pending| pending.txid),
+            self.ownership.pending.map(|pending| pending.txid),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|owner| *owner != txid)
     }
 }
 
@@ -386,12 +408,40 @@ pub(crate) struct ForeignCatalog {
 }
 
 impl ForeignCatalog {
+    fn entry_blocks_create<D: Copy>(
+        entry: &ForeignCatalogEntry<D>,
+        database: DatabaseOid,
+        txid: u32,
+        identity_matches: impl Fn(D) -> bool,
+    ) -> bool {
+        if entry.database != database || entry.ddl_state == CatalogDdlState::Absent {
+            return false;
+        }
+        if entry.pending_owner_other_than(txid).is_some()
+            && (identity_matches(entry.definition)
+                || entry
+                    .pending
+                    .is_some_and(|pending| identity_matches(pending.definition)))
+        {
+            return true;
+        }
+        entry.visible_to(txid) && identity_matches(entry.definition_for(txid))
+    }
+
     pub(crate) fn wrapper_capacity(&self) -> usize {
         self.wrappers.len()
     }
 
     pub(crate) fn server_capacity(&self) -> usize {
         self.servers.len()
+    }
+
+    pub(crate) fn mapping_capacity(&self) -> usize {
+        self.mappings.len()
+    }
+
+    pub(crate) fn table_capacity(&self) -> usize {
+        self.tables.len()
     }
 
     pub(crate) fn budget_bytes(config: &Config) -> usize {
@@ -447,14 +497,7 @@ impl ForeignCatalog {
         let mut entries = FixedVec::new(budget, label, capacity)?;
         for _ in 0..capacity {
             entries
-                .push(ForeignCatalogEntry {
-                    database: DatabaseOid::POSTGRES,
-                    created_at: 0,
-                    definition: empty,
-                    pending: None,
-                    ownership: Ownership::BOOTSTRAP,
-                    ddl_state: CatalogDdlState::Absent,
-                })
+                .push(ForeignCatalogEntry::empty(empty))
                 .expect("foreign catalog sized to configured capacity");
         }
         Ok(entries)
@@ -548,10 +591,18 @@ impl ForeignCatalog {
         ownership: Ownership,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if self
-            .wrapper(database, definition.name.as_str(), txid)
-            .is_some()
-        {
+        if let Some(entry) = self.wrappers.iter().find(|entry| {
+            Self::entry_blocks_create(entry, database, txid, |candidate| {
+                candidate.name == definition.name
+            })
+        }) {
+            if let Some(owner) = entry.pending_owner_other_than(txid) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_LOCK_WAIT,
+                    "waiting for transaction {} to finish changing foreign-data wrapper",
+                    owner
+                ));
+            }
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "foreign-data wrapper \"{}\" already exists",
@@ -577,10 +628,18 @@ impl ForeignCatalog {
         ownership: Ownership,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if self
-            .server(database, definition.name.as_str(), txid)
-            .is_some()
-        {
+        if let Some(entry) = self.servers.iter().find(|entry| {
+            Self::entry_blocks_create(entry, database, txid, |candidate| {
+                candidate.name == definition.name
+            })
+        }) {
+            if let Some(owner) = entry.pending_owner_other_than(txid) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_LOCK_WAIT,
+                    "waiting for transaction {} to finish changing foreign server",
+                    owner
+                ));
+            }
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "server \"{}\" already exists",
@@ -605,10 +664,18 @@ impl ForeignCatalog {
         definition: UserMappingDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if self
-            .mapping(database, definition.server, definition.user, txid)
-            .is_some()
-        {
+        if let Some(entry) = self.mappings.iter().find(|entry| {
+            Self::entry_blocks_create(entry, database, txid, |candidate| {
+                candidate.server == definition.server && candidate.user == definition.user
+            })
+        }) {
+            if let Some(owner) = entry.pending_owner_other_than(txid) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_LOCK_WAIT,
+                    "waiting for transaction {} to finish changing user mapping",
+                    owner
+                ));
+            }
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "user mapping already exists for server"
@@ -633,7 +700,18 @@ impl ForeignCatalog {
         ownership: Ownership,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if self.table(database, definition.table, txid).is_some() {
+        if let Some(entry) = self.tables.iter().find(|entry| {
+            Self::entry_blocks_create(entry, database, txid, |candidate| {
+                candidate.table == definition.table
+            })
+        }) {
+            if let Some(owner) = entry.pending_owner_other_than(txid) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_LOCK_WAIT,
+                    "waiting for transaction {} to finish changing foreign table binding",
+                    owner
+                ));
+            }
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "foreign table binding already exists"
@@ -795,6 +873,7 @@ impl ForeignCatalog {
         created_at: u64,
         definition: Option<D>,
         ownership: Ownership,
+        empty: D,
     ) -> Result<(), SqlError> {
         let Some(entry) = entries.get_mut(slot) else {
             return Err(sql_err!(
@@ -814,9 +893,7 @@ impl ForeignCatalog {
                 };
             }
             None => {
-                entry.pending = None;
-                entry.ownership.pending = None;
-                entry.ddl_state = CatalogDdlState::Absent;
+                *entry = ForeignCatalogEntry::empty(empty);
             }
         }
         Ok(())
@@ -840,6 +917,7 @@ impl ForeignCatalog {
                 owner,
                 pending: None,
             },
+            ForeignDataWrapperDefinition::EMPTY,
         )
     }
 
@@ -861,6 +939,7 @@ impl ForeignCatalog {
                 owner,
                 pending: None,
             },
+            ForeignServerDefinition::EMPTY,
         )
     }
 
@@ -878,6 +957,7 @@ impl ForeignCatalog {
             created_at,
             definition,
             Ownership::BOOTSTRAP,
+            UserMappingDefinition::EMPTY,
         )
     }
 
@@ -895,6 +975,7 @@ impl ForeignCatalog {
             created_at,
             definition,
             Ownership::BOOTSTRAP,
+            ForeignTableDefinition::EMPTY,
         )
     }
 
@@ -947,14 +1028,15 @@ impl ForeignCatalog {
         txid: u32,
         noun: &'static str,
     ) -> Result<Option<PendingForeignDefinition<D>>, SqlError> {
-        let prior = entries[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
+        if let Some(owner) = entries[slot].pending_owner_other_than(txid) {
             return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "{} is being altered by another transaction",
-                noun
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "waiting for transaction {} to finish changing {}",
+                owner,
+                noun,
             ));
         }
+        let prior = entries[slot].pending;
         entries[slot].pending = Some(PendingForeignDefinition { txid, definition });
         Ok(prior)
     }
@@ -968,20 +1050,44 @@ impl ForeignCatalog {
     }
 
     pub(crate) fn rollback_create(&mut self, class: ForeignObjectClass, slot: usize) {
-        let state = self.entry(class, slot).ddl_state();
-        *self.entry_mut(class, slot).ddl_state() = state.rollback_create();
+        match class {
+            ForeignObjectClass::Wrapper => {
+                self.wrappers[slot] =
+                    ForeignCatalogEntry::empty(ForeignDataWrapperDefinition::EMPTY)
+            }
+            ForeignObjectClass::Server => {
+                self.servers[slot] = ForeignCatalogEntry::empty(ForeignServerDefinition::EMPTY)
+            }
+            ForeignObjectClass::Mapping => {
+                self.mappings[slot] = ForeignCatalogEntry::empty(UserMappingDefinition::EMPTY)
+            }
+            ForeignObjectClass::Table => {
+                self.tables[slot] = ForeignCatalogEntry::empty(ForeignTableDefinition::EMPTY)
+            }
+        }
     }
 
-    pub(crate) fn drop(&mut self, class: ForeignObjectClass, slot: usize, txid: u32) {
+    pub(crate) fn stage_drop(&mut self, class: ForeignObjectClass, slot: usize, txid: u32) {
         let state = self.entry(class, slot).ddl_state();
         *self.entry_mut(class, slot).ddl_state() = state.drop_by(txid);
     }
 
     pub(crate) fn commit_drop(&mut self, class: ForeignObjectClass, slot: usize) {
-        let state = self.entry(class, slot).ddl_state();
-        let mut entry = self.entry_mut(class, slot);
-        *entry.ddl_state() = state.commit_drop();
-        entry.clear_pending();
+        match class {
+            ForeignObjectClass::Wrapper => {
+                self.wrappers[slot] =
+                    ForeignCatalogEntry::empty(ForeignDataWrapperDefinition::EMPTY)
+            }
+            ForeignObjectClass::Server => {
+                self.servers[slot] = ForeignCatalogEntry::empty(ForeignServerDefinition::EMPTY)
+            }
+            ForeignObjectClass::Mapping => {
+                self.mappings[slot] = ForeignCatalogEntry::empty(UserMappingDefinition::EMPTY)
+            }
+            ForeignObjectClass::Table => {
+                self.tables[slot] = ForeignCatalogEntry::empty(ForeignTableDefinition::EMPTY)
+            }
+        }
     }
 
     pub(crate) fn rollback_drop(&mut self, class: ForeignObjectClass, slot: usize, txid: u32) {
@@ -1052,7 +1158,14 @@ impl ForeignCatalog {
         slot: usize,
         owner: u16,
         txid: u32,
-    ) -> Option<PendingOwnership> {
+    ) -> Result<Option<PendingOwnership>, SqlError> {
+        if let Some(blocker) = self.entry(class, slot).pending_owner_other_than(txid) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "waiting for transaction {} to finish changing foreign catalog object",
+                blocker,
+            ));
+        }
         let ownership = match self.entry_mut(class, slot) {
             ForeignEntryMut::Wrapper(entry) => &mut entry.ownership,
             ForeignEntryMut::Server(entry) => &mut entry.ownership,
@@ -1061,7 +1174,7 @@ impl ForeignCatalog {
         };
         let prior = ownership.pending;
         ownership.pending = Some(PendingOwnership { txid, owner });
-        prior
+        Ok(prior)
     }
 
     pub(crate) fn commit_owner(&mut self, class: ForeignObjectClass, slot: usize, txid: u32) {
@@ -1089,17 +1202,6 @@ impl ForeignCatalog {
             ForeignEntryMut::Mapping(entry) => entry.ownership.pending = prior,
             ForeignEntryMut::Table(entry) => entry.ownership.pending = prior,
         }
-    }
-
-    pub(crate) fn wrappers(
-        &self,
-        database: DatabaseOid,
-        txid: u32,
-    ) -> impl Iterator<Item = (usize, &ForeignCatalogEntry<ForeignDataWrapperDefinition>)> {
-        self.wrappers
-            .iter()
-            .enumerate()
-            .filter(move |(_, entry)| entry.database == database && entry.visible_to(txid))
     }
 
     pub(crate) fn servers(
@@ -1153,72 +1255,37 @@ impl ForeignCatalog {
             .filter(|(_, entry)| entry.ddl_state == CatalogDdlState::Present)
     }
 
-    pub(crate) fn checkpoint_mappings(
-        &self,
-    ) -> impl Iterator<Item = (usize, &ForeignCatalogEntry<UserMappingDefinition>)> {
-        self.mappings
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.ddl_state == CatalogDdlState::Present)
-    }
-
-    pub(crate) fn checkpoint_tables(
-        &self,
-    ) -> impl Iterator<Item = (usize, &ForeignCatalogEntry<ForeignTableDefinition>)> {
-        self.tables
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.ddl_state == CatalogDdlState::Present)
-    }
-
     pub(crate) fn checkpoint_wrapper(
         &self,
         slot: usize,
-    ) -> &ForeignCatalogEntry<ForeignDataWrapperDefinition> {
-        &self.wrappers[slot]
+    ) -> ForeignCatalogEntry<ForeignDataWrapperDefinition> {
+        self.wrappers[slot]
     }
 
     pub(crate) fn checkpoint_server(
         &self,
         slot: usize,
-    ) -> &ForeignCatalogEntry<ForeignServerDefinition> {
-        &self.servers[slot]
+    ) -> ForeignCatalogEntry<ForeignServerDefinition> {
+        self.servers[slot]
     }
 
     pub(crate) fn entry_wrapper(
         &self,
         slot: usize,
-    ) -> &ForeignCatalogEntry<ForeignDataWrapperDefinition> {
-        &self.wrappers[slot]
+    ) -> ForeignCatalogEntry<ForeignDataWrapperDefinition> {
+        self.wrappers[slot]
     }
 
-    pub(crate) fn entry_server(
-        &self,
-        slot: usize,
-    ) -> &ForeignCatalogEntry<ForeignServerDefinition> {
-        &self.servers[slot]
+    pub(crate) fn entry_server(&self, slot: usize) -> ForeignCatalogEntry<ForeignServerDefinition> {
+        self.servers[slot]
     }
 
-    pub(crate) fn entry_wrapper_mut(
-        &mut self,
-        slot: usize,
-    ) -> &mut ForeignCatalogEntry<ForeignDataWrapperDefinition> {
-        &mut self.wrappers[slot]
+    pub(crate) fn entry_mapping(&self, slot: usize) -> ForeignCatalogEntry<UserMappingDefinition> {
+        self.mappings[slot]
     }
 
-    pub(crate) fn entry_server_mut(
-        &mut self,
-        slot: usize,
-    ) -> &mut ForeignCatalogEntry<ForeignServerDefinition> {
-        &mut self.servers[slot]
-    }
-
-    pub(crate) fn entry_mapping(&self, slot: usize) -> &ForeignCatalogEntry<UserMappingDefinition> {
-        &self.mappings[slot]
-    }
-
-    pub(crate) fn entry_table(&self, slot: usize) -> &ForeignCatalogEntry<ForeignTableDefinition> {
-        &self.tables[slot]
+    pub(crate) fn entry_table(&self, slot: usize) -> ForeignCatalogEntry<ForeignTableDefinition> {
+        self.tables[slot]
     }
 
     pub(crate) fn first_server_for_wrapper(
@@ -1314,6 +1381,15 @@ impl ForeignEntryRef<'_> {
             Self::Table(entry) => entry.ddl_state,
         }
     }
+
+    fn pending_owner_other_than(&self, txid: u32) -> Option<u32> {
+        match self {
+            Self::Wrapper(entry) => entry.pending_owner_other_than(txid),
+            Self::Server(entry) => entry.pending_owner_other_than(txid),
+            Self::Mapping(entry) => entry.pending_owner_other_than(txid),
+            Self::Table(entry) => entry.pending_owner_other_than(txid),
+        }
+    }
 }
 
 enum ForeignEntryMut<'a> {
@@ -1340,15 +1416,5 @@ impl ForeignEntryMut<'_> {
             Self::Mapping(entry) => &mut entry.ownership,
             Self::Table(entry) => &mut entry.ownership,
         }
-    }
-
-    fn clear_pending(&mut self) {
-        match self {
-            Self::Wrapper(entry) => entry.pending = None,
-            Self::Server(entry) => entry.pending = None,
-            Self::Mapping(entry) => entry.pending = None,
-            Self::Table(entry) => entry.pending = None,
-        }
-        self.ownership().pending = None;
     }
 }

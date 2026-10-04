@@ -960,5 +960,19 @@ use the common transaction wait boundary. Four-worker publication,
 nested-reader progress, exact retained capacities, loud exhaustion, complete
 slot reuse, and `Send + Sync` have direct coverage.
 
+The foreign-object catalog audit found wrapper, server, user-mapping, and
+foreign-table binding entries in four unsynchronized fixed vectors.
+Overlapping DDL, replay, database lifecycle, ownership, checkpoint, catalog,
+dependency, and foreign execution work could lose updates or combine fields
+from different transitions. One startup-bounded mutex now owns all four
+vectors, and readers copy one fixed entry before nested work. The audit also
+found committed drops, rolled-back creates, and replayed removals retaining
+stale definitions, ownership, and identity state in reusable slots; terminal
+paths now clear the complete entry. Conflicting creates and alterations return
+named transaction wait errors while same-transaction drop and recreation uses
+the caller-visible identity. Four-worker publication, nested-reader
+progress, exact retained capacities, loud exhaustion, complete slot reuse, and
+`Send + Sync` have direct coverage.
+
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

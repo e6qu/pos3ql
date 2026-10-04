@@ -317,6 +317,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   transitions use the transaction wait boundary, and terminal create and drop
   paths clear the complete reusable cross-vector image. Extension package and
   script metadata remain immutable after startup loading.
+- Foreign-data wrapper, server, user-mapping, and foreign-table binding entries
+  share one startup-bounded mutex. Readers copy complete entries before nested
+  role, relation, ACL, comment, WAL, checkpoint, or catalog work. Conflicting
+  creates and alterations return named transaction wait errors, and terminal
+  create, drop, and replay paths clear complete reusable entries.
 - Sequence catalogs are startup-sized through `max_sequences` across durable
   definitions, per-session `currval`/`lastval` and cache state, dependency
   planning, `DROP OWNED`, identity cleanup, catalogs, WAL, checkpoints, and

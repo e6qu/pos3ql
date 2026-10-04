@@ -201,12 +201,13 @@ pub(crate) fn plan_row_security<'a>(
             Some(source) => {
                 let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
                 let expression = crate::sql::parser::parse_expr(source, arena)?;
+                let dependencies = storage.snapshot_policy_dependencies(slot, txid, arena)?;
                 predicates[count] = PolicyPredicate {
                     expression: super::cte::expand_stored_expression(
                         expression,
                         storage,
                         txid,
-                        storage.policy_dependencies(slot, txid),
+                        dependencies.view(),
                         arena,
                     )?,
                     permissive: policy.permissive,

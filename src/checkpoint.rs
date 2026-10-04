@@ -9241,7 +9241,7 @@ impl Checkpointer {
                         .check_option
                         .map_or(0, crate::storage::ViewCheckOption::code),
                     ManifestViewColumns(view.columns),
-                    ManifestDependencies(storage.view_dependencies(view_slot))
+                    ManifestDependencies(storage.view_dependencies(view_slot).view())
                 ),
             )?;
         }
@@ -9505,7 +9505,7 @@ impl Checkpointer {
                     hpath.as_str(),
                     hname.as_str(),
                     u8::from(mv.populated),
-                    ManifestDependencies(storage.matview_dependencies(matview_slot))
+                    ManifestDependencies(storage.matview_dependencies(matview_slot).view())
                 ),
             )?;
         }
@@ -9693,7 +9693,7 @@ impl Checkpointer {
                     result_name.as_str(),
                     ManifestRoutineColumns(&routine),
                     creation_path.as_str(),
-                    ManifestDependencies(storage.routine_dependencies_for(slot, 0)),
+                    ManifestDependencies(storage.routine_dependencies_for(slot, 0).view()),
                 ),
             )?;
         }
@@ -9772,7 +9772,7 @@ impl Checkpointer {
                     spans.as_str(),
                     definition.returning_action.map_or(u16::MAX, u16::from),
                     ManifestName(definition.creation_path.as_str()),
-                    ManifestDependencies(storage.rule_dependencies(slot, 0)),
+                    ManifestDependencies(storage.rule_dependencies(slot, 0).view()),
                 ),
             )?;
         }
@@ -10315,7 +10315,7 @@ impl Checkpointer {
                     } else {
                         "-"
                     },
-                    ManifestDependencies(storage.policy_dependencies(slot, 0)),
+                    ManifestDependencies(storage.policy_dependencies(slot, 0).view()),
                 ),
             )?;
         }

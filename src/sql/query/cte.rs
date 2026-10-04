@@ -4662,7 +4662,7 @@ fn subst_tableref<'a>(
         let vsel = crate::sql::parser::parse_view_select(view_sql, arena)?;
         // The view body has its own scope: no outer CTEs, deeper view depth,
         // and the creator's path for its own references.
-        let dependencies = context.storage.view_dependencies(slot);
+        let dependencies = context.storage.snapshot_view_dependencies(slot, arena)?;
         let expanded = if let Some(execution) = context.execution {
             with_exec_context(
                 vsel.with,
@@ -4677,7 +4677,7 @@ fn subst_tableref<'a>(
                 execution.sequences,
                 context.depth + 1,
                 Some(view_path),
-                Some(dependencies),
+                Some(dependencies.view()),
                 authorization_role,
                 |name| select_references(vsel, name),
                 |inner| subst_select_body(vsel, inner, arena),
@@ -4688,7 +4688,7 @@ fn subst_tableref<'a>(
                 context.storage,
                 context.txid,
                 Some(view_path),
-                Some(dependencies),
+                Some(dependencies.view()),
                 context.depth + 1,
                 authorization_role,
                 arena,

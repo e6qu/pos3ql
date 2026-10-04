@@ -667,8 +667,16 @@ catalog, and dependency reads observe complete definition images. Iterators
 copy one fixed definition and release the mutex before nested table,
 dependency, role, comment, or checkpoint work. Four-worker publication and
 refresh, nested-reader progress, exact retained capacity, complete slot reuse,
-and `Send + Sync` have direct coverage. Stored-query dependency images remain
-in their shared fixed catalog and are a separate synchronization boundary.
+and `Send + Sync` have direct coverage.
+
+Stored-query dependency entries, committed counts, and pending transactional
+images now share one startup-bounded mutex. Rule, policy, routine, view, and
+materialized-view reads observe one complete image; recursive parsing and
+execution copy the selected image into the worker's statement arena before
+nested catalog work. Allocation, copy, commit, rollback, rename, rebinding,
+checkpoint, and reusable-slot cleanup use the same boundary. Four-worker
+publication and pending-image reservation, nested-reader progress, exact
+retained capacities, loud exhaustion, and `Send + Sync` have direct coverage.
 The remaining catalog definition containers and row mutation paths still
 require synchronization before fixed workers can overlap execution.
 

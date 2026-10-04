@@ -11090,12 +11090,17 @@ impl Engine {
                     original_transition.new,
                 )
             };
+            let dependencies = match storage.snapshot_rule_dependencies(rule_slot, txn.txid, arena)
+            {
+                Ok(dependencies) => dependencies,
+                Err(error) => return Ok(Err(error)),
+            };
             let condition = match query::expand_stored_rule_expression_exec(
                 parsed,
                 storage,
                 txn.txid,
                 path,
-                storage.rule_dependencies(rule_slot, txn.txid),
+                dependencies.view(),
                 arena,
                 params,
                 Some(&sequence::SeqEval::new(
@@ -11185,6 +11190,11 @@ impl Engine {
                     user.as_str(),
                     txn.txid,
                 );
+                let dependencies =
+                    match storage.snapshot_rule_dependencies(rule_slot, txn.txid, arena) {
+                        Ok(dependencies) => dependencies,
+                        Err(error) => return Ok(Err(error)),
+                    };
                 let condition = match definition.condition_sql() {
                     Some(sql) => {
                         let sql = match arena.alloc_str(sql) {
@@ -11200,7 +11210,7 @@ impl Engine {
                             storage,
                             txn.txid,
                             path,
-                            storage.rule_dependencies(rule_slot, txn.txid),
+                            dependencies.view(),
                             arena,
                             params,
                             Some(&sequence::SeqEval::new(
@@ -11236,7 +11246,7 @@ impl Engine {
                         storage,
                         txn.txid,
                         path,
-                        storage.rule_dependencies(rule_slot, txn.txid),
+                        dependencies.view(),
                         arena,
                         params,
                         Some(&sequence::SeqEval::new(

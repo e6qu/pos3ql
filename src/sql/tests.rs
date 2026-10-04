@@ -31766,6 +31766,7 @@ fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
                 && dependency.referenced_name.as_str() == "shifted"
                 && dependency.referenced_schema.as_str().is_empty()
         }));
+        drop(dependencies);
         let setup = run_with(
             &mut engine,
             &mut budget,
@@ -32435,12 +32436,14 @@ fn sql_standard_dml_bodies_bind_column_typed_overloads() {
             dependency.class == crate::storage::DependencyClass::Routine
                 && dependency.referenced_name.as_str() == "routine_dml_pick"
         })
+        .copied()
         .collect::<Vec<_>>();
     assert_eq!(routine_dependencies.len(), 1);
     let selected = engine
         .storage
         .routine_for(usize::from(routine_dependencies[0].slot), 0);
     assert_eq!(selected.arguments()[0].ctype, ColType::Int4);
+    drop(dependencies);
 
     let invoked = run_with(
         &mut engine,

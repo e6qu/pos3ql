@@ -1187,7 +1187,7 @@ fn comment_reference(
                 storage
                     .policies_with_slots_visible_to(txid)
                     .find_map(|(slot, policy)| {
-                        (crate::storage::policy_oid(policy) == oid).then_some(slot)
+                        (crate::storage::policy_oid(&policy) == oid).then_some(slot)
                     })
                     .ok_or_else(graph_full)?,
             ))
@@ -1848,7 +1848,7 @@ fn primary_object(
             .map_err(|_| graph_full())?;
             let mut object = base_object(
                 catalog::PG_POLICY_OID,
-                crate::storage::policy_oid(policy),
+                crate::storage::policy_oid(&policy),
                 "policy",
                 Some(table.schema.as_str()),
                 Some(policy.name.as_str()),
@@ -2695,7 +2695,7 @@ fn existing_catalog_object(
             storage
                 .policies_with_slots_visible_to(txid)
                 .find_map(|(slot, policy)| {
-                    (crate::storage::policy_oid(policy) == object_id).then_some(slot)
+                    (crate::storage::policy_oid(&policy) == object_id).then_some(slot)
                 })
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),

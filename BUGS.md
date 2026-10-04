@@ -994,5 +994,27 @@ borrowed image while resolving another stored query. Four-worker publication
 and pending reservation, nested-reader progress, exact retained capacities,
 loud exhaustion, and `Send + Sync` have direct coverage.
 
+The row-security policy audit found definitions and committed, transactional,
+and recovery role images in two unsynchronized fixed vectors. Concurrent DDL,
+replay, database lifecycle, table cleanup, checkpoint, catalog, authorization,
+and dependency work could lose updates or pair a definition with another role
+image. One startup-bounded mutex now owns both vectors, and readers copy one
+definition or retain one guarded role image through use. The same audit found
+database template cloning copied a policy definition and dependencies without
+copying its role image, silently changing a named-role policy to the target
+slot's default `PUBLIC` image. Cloning now publishes the complete definition
+and role-list image. Committed drops and rolled-back creates clear the complete
+reusable definition and committed role image. The first coverage run exposed
+checkpoint serialization retaining the guarded role image while dependency
+selection recursively acquired the policy mutex; this could park the
+checkpointer and every later policy reader. It now writes and releases roles
+before selecting dependencies. Four-worker publication, nested-reader
+progress, exact retained capacities, loud exhaustion, complete slot reuse, and
+`Send + Sync` have direct coverage. The added fixtures
+reshuffled the ordinal instrumented library partition and one of three workers
+reached the fixed 15-minute ceiling while making normal progress. Coverage now
+uses four deterministic library slices, and the CI timeout guard requires each
+slice explicitly.
+
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

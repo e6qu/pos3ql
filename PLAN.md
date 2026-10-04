@@ -677,6 +677,23 @@ nested catalog work. Allocation, copy, commit, rollback, rename, rebinding,
 checkpoint, and reusable-slot cleanup use the same boundary. Four-worker
 publication and pending-image reservation, nested-reader progress, exact
 retained capacities, loud exhaustion, and `Send + Sync` have direct coverage.
+
+Row-security policy definitions and their committed, transaction-private, and
+recovery role images now share one startup-bounded mutex. DDL, replay, database
+cloning and removal, table cleanup, checkpoint, catalog, authorization, and
+dependency reads observe complete definition and role-list images. Iterators
+copy one fixed definition and release the mutex before nested table,
+dependency, role, comment, or execution work. Template cloning now copies the
+source policy's role image instead of retaining the target slot's default
+`PUBLIC` image. Checkpoint serialization writes and releases the guarded role
+image before selecting its dependency image, so it cannot recursively acquire
+the policy mutex. Four-worker publication, nested-reader progress, exact
+retained capacities, loud exhaustion, complete slot reuse, and `Send + Sync`
+have direct coverage.
+Instrumented library coverage now uses four deterministic slices after the
+three-slice layout reached the fixed 15-minute worker ceiling while making
+normal test progress. The CI timeout guard pins every slice explicitly.
+
 The remaining catalog definition containers and row mutation paths still
 require synchronization before fixed workers can overlap execution.
 

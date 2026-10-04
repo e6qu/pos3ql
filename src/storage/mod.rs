@@ -7281,6 +7281,43 @@ struct TriggerCatalog {
     partition_states: FixedVec<PartitionTriggerState>,
 }
 
+/// Policy definitions and their committed, pending, and replay role images.
+struct PolicyCatalog {
+    definitions: FixedVec<PolicyDef>,
+    roles: FixedVec<u16>,
+}
+
+struct PolicyIter<'a> {
+    catalog: &'a std::sync::Mutex<PolicyCatalog>,
+    next_slot: usize,
+}
+
+impl Iterator for PolicyIter<'_> {
+    type Item = (usize, PolicyDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("policy catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = *catalog.definitions.get(slot)?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
+pub(crate) struct PolicyRoleImage<'a> {
+    catalog: std::sync::MutexGuard<'a, PolicyCatalog>,
+    start: usize,
+    count: usize,
+}
+
+impl std::ops::Deref for PolicyRoleImage<'_> {
+    type Target = [u16];
+
+    fn deref(&self) -> &Self::Target {
+        &self.catalog.roles[self.start..self.start + self.count]
+    }
+}
+
 /// Definitions and transaction-private ANALYZE images publish together.
 struct ExtendedStatisticsCatalog {
     definitions: FixedVec<ExtendedStatisticsDef>,
@@ -13410,8 +13447,8 @@ pub struct Storage {
     stored_query_dependencies_per_image: usize,
     stored_query_dependency_pending_base: usize,
     trigger_catalog: std::sync::Mutex<TriggerCatalog>,
-    policies: FixedVec<PolicyDef>,
-    policy_roles: FixedVec<u16>,
+    policy_catalog: std::sync::Mutex<PolicyCatalog>,
+    policy_catalog_capacity: usize,
     policy_roles_per_image: usize,
     policy_role_pending_base: usize,
     policy_role_replay_image: usize,
@@ -16521,13 +16558,13 @@ impl Storage {
             StoredQueryDependencyOwner::Rule(slot) => usize::from(slot),
             StoredQueryDependencyOwner::Policy(slot) => self.rules.len() + usize::from(slot),
             StoredQueryDependencyOwner::Routine(slot) => {
-                self.rules.len() + self.policies.len() + usize::from(slot)
+                self.rules.len() + self.policy_count() + usize::from(slot)
             }
         }
     }
 
     fn matview_dependency_image(&self, slot: usize) -> usize {
-        self.rules.len() + self.policies.len() + self.routine_count() + slot
+        self.rules.len() + self.policy_count() + self.routine_count() + slot
     }
 
     fn write_dependency_image(
@@ -16947,10 +16984,9 @@ impl Storage {
                 self.rebind_stored_query_dependency_image(image, txid)?;
             }
         }
-        for slot in 0..self.policies.len() {
-            if self.policies[slot].database == current_database()
-                && self.policies[slot].visible_to(txid)
-            {
+        for slot in 0..self.policy_count() {
+            let policy = self.policy(slot);
+            if policy.database == current_database() && policy.visible_to(txid) {
                 let owner = StoredQueryDependencyOwner::Policy(slot as u16);
                 self.rebind_stored_query_dependency_image(
                     self.committed_dependency_image(owner),
@@ -18042,8 +18078,11 @@ impl Storage {
                 definitions: triggers,
                 partition_states: partition_trigger_states,
             }),
-            policies,
-            policy_roles,
+            policy_catalog: std::sync::Mutex::new(PolicyCatalog {
+                definitions: policies,
+                roles: policy_roles,
+            }),
+            policy_catalog_capacity: policy_capacity,
             policy_roles_per_image,
             policy_role_pending_base,
             policy_role_replay_image,
@@ -19878,8 +19917,8 @@ impl Storage {
                 self.indexes[target_slot].mutable.parent = Some(target_parent as u16);
             }
 
-            for source_slot in 0..self.policies.len() {
-                let mut definition = self.policies[source_slot];
+            for source_slot in 0..self.policy_count() {
+                let mut definition = self.policy(source_slot);
                 if definition.database != source
                     || definition.ddl_state != CatalogDdlState::Present
                     || self.tables[usize::from(definition.table)].def.persistence
@@ -19900,17 +19939,31 @@ impl Storage {
                             "template policy table was not cloned"
                         )
                     })? as u16;
-                let target_slot = self
-                    .policies
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "policy catalog is full")
-                    })?;
                 definition.database = target;
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.policies[target_slot] = definition;
+                let target_slot = {
+                    let mut catalog = self
+                        .policy_catalog
+                        .lock()
+                        .expect("policy catalog lock poisoned");
+                    let target_slot = catalog
+                        .definitions
+                        .iter()
+                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "policy catalog is full")
+                        })?;
+                    let count = usize::try_from(definition.role_count)
+                        .expect("policy role count fits usize");
+                    let source_start = source_slot * self.policy_roles_per_image;
+                    let target_start = target_slot * self.policy_roles_per_image;
+                    catalog
+                        .roles
+                        .copy_within(source_start..source_start + count, target_start);
+                    catalog.definitions[target_slot] = definition;
+                    target_slot
+                };
                 self.copy_committed_dependencies(
                     StoredQueryDependencyOwner::Policy(source_slot as u16),
                     StoredQueryDependencyOwner::Policy(target_slot as u16),
@@ -20566,7 +20619,17 @@ impl Storage {
         }
         clear_catalog!(views);
         clear_catalog!(rules);
-        clear_catalog!(policies);
+        {
+            let mut catalog = self
+                .policy_catalog
+                .lock()
+                .expect("policy catalog lock poisoned");
+            for slot in 0..catalog.definitions.len() {
+                if catalog.definitions[slot].database == database {
+                    Self::clear_policy_slot_in(&mut catalog, self.policy_roles_per_image, slot);
+                }
+            }
+        }
         {
             let mut publications = self
                 .publications
@@ -20765,9 +20828,12 @@ impl Storage {
                 self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
             }
         }
-        for slot in 0..self.policies.len() {
-            if self.policies[slot].database == DatabaseOid::POSTGRES
-                && self.policies[slot].ddl_state == CatalogDdlState::Absent
+        for (slot, policy) in (PolicyIter {
+            catalog: &self.policy_catalog,
+            next_slot: 0,
+        }) {
+            if policy.database == DatabaseOid::POSTGRES
+                && policy.ddl_state == CatalogDdlState::Absent
             {
                 self.clear_committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16));
             }
@@ -20850,7 +20916,19 @@ impl Storage {
         }
         commit_catalog!(views);
         commit_catalog!(rules);
-        commit_catalog!(policies);
+        {
+            let mut catalog = self
+                .policy_catalog
+                .lock()
+                .expect("policy catalog lock poisoned");
+            for definition in catalog.definitions.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         {
             let mut publications = self
                 .publications
@@ -22336,8 +22414,12 @@ impl Storage {
         })
     }
 
-    pub(crate) fn checkpoint_policies(&self) -> impl Iterator<Item = (usize, &PolicyDef)> {
-        self.policies.iter().enumerate().filter(|(_, value)| {
+    pub(crate) fn checkpoint_policies(&self) -> impl Iterator<Item = (usize, PolicyDef)> + '_ {
+        PolicyIter {
+            catalog: &self.policy_catalog,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| {
             value.ddl_state == CatalogDdlState::Present
                 && self.table_def(usize::from(value.table), 0).persistence
                     != RelationPersistence::Temporary
@@ -26754,9 +26836,11 @@ impl Storage {
                 });
             }
         }
-        for slot in 0..self.policies.len() {
-            if self.policies[slot].database == current_database()
-                && self.policies[slot].ddl_state != CatalogDdlState::Absent
+        for (slot, policy) in (PolicyIter {
+            catalog: &self.policy_catalog,
+            next_slot: 0,
+        }) {
+            if policy.database == current_database() && policy.ddl_state != CatalogDdlState::Absent
             {
                 let image = self
                     .committed_dependency_image(StoredQueryDependencyOwner::Policy(slot as u16));
@@ -42617,12 +42701,15 @@ impl Storage {
         routines[slot].ddl_state = routines[slot].ddl_state.rollback_drop(txid);
     }
 
-    pub(crate) fn policy(&self, slot: usize) -> &PolicyDef {
-        &self.policies[slot]
+    pub(crate) fn policy(&self, slot: usize) -> PolicyDef {
+        self.policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned")
+            .definitions[slot]
     }
 
     pub(crate) fn policy_count(&self) -> usize {
-        self.policies.len()
+        self.policy_catalog_capacity
     }
 
     pub(crate) fn policy_dependencies(
@@ -42630,7 +42717,8 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> StoredQueryDependencyImage<'_> {
-        if let Some(pending) = self.policies[slot]
+        if let Some(pending) = self
+            .policy(slot)
             .pending_definition
             .filter(|pending| pending.txid == txid)
         {
@@ -42645,7 +42733,8 @@ impl Storage {
         txid: u32,
         arena: &crate::mem::arena::Arena,
     ) -> Result<StoredQueryDependencies, SqlError> {
-        let image = if let Some(pending) = self.policies[slot]
+        let image = if let Some(pending) = self
+            .policy(slot)
             .pending_definition
             .filter(|pending| pending.txid == txid)
         {
@@ -42656,18 +42745,17 @@ impl Storage {
         self.snapshot_dependency_image(image, arena)
     }
 
-    fn policy_role_image(&self, image: usize, count: u32) -> &[u16] {
-        let count = usize::try_from(count).expect("policy role count fits usize");
-        let start = image * self.policy_roles_per_image;
-        &self.policy_roles[start..start + count]
-    }
-
-    fn write_policy_role_image(&mut self, image: usize, roles: &[u16]) -> Result<u32, SqlError> {
-        if roles.is_empty() || roles.len() > self.policy_roles_per_image {
+    fn write_policy_role_image(
+        catalog: &mut PolicyCatalog,
+        roles_per_image: usize,
+        image: usize,
+        roles: &[u16],
+    ) -> Result<u32, SqlError> {
+        if roles.is_empty() || roles.len() > roles_per_image {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "a policy can target between 1 and {} roles",
-                self.policy_roles_per_image
+                roles_per_image
             ));
         }
         let count = u32::try_from(roles.len()).map_err(|_| {
@@ -42676,22 +42764,39 @@ impl Storage {
                 "policy role count exceeds durable representation"
             )
         })?;
-        let start = image * self.policy_roles_per_image;
-        self.policy_roles[start..start + roles.len()].copy_from_slice(roles);
+        let start = image * roles_per_image;
+        catalog.roles[start..start + roles.len()].copy_from_slice(roles);
         Ok(count)
     }
 
-    pub(crate) fn policy_roles(&self, slot: usize, txid: u32) -> &[u16] {
-        if let Some(pending) = self.policies[slot]
+    fn clear_policy_slot_in(catalog: &mut PolicyCatalog, roles_per_image: usize, slot: usize) {
+        catalog.definitions[slot] = PolicyDef::EMPTY;
+        let start = slot * roles_per_image;
+        catalog.roles[start..start + roles_per_image].fill(PUBLIC_ROLE);
+    }
+
+    pub(crate) fn policy_roles(&self, slot: usize, txid: u32) -> PolicyRoleImage<'_> {
+        let catalog = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
+        let policy = catalog.definitions[slot];
+        let (image, count) = if let Some(pending) = policy
             .pending_definition
             .filter(|pending| pending.txid == txid)
         {
-            return self.policy_role_image(
+            (
                 self.policy_role_pending_base + pending.dependency_slot as usize,
                 pending.role_count,
-            );
+            )
+        } else {
+            (slot, policy.role_count)
+        };
+        PolicyRoleImage {
+            catalog,
+            start: image * self.policy_roles_per_image,
+            count: usize::try_from(count).expect("policy role count fits usize"),
         }
-        self.policy_role_image(slot, self.policies[slot].role_count)
     }
 
     pub(crate) fn policy_role_capacity(&self) -> usize {
@@ -42710,8 +42815,12 @@ impl Storage {
         &self,
         table: usize,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &PolicyDef)> {
-        self.policies.iter().enumerate().filter(move |(_, policy)| {
+    ) -> impl Iterator<Item = (usize, PolicyDef)> + '_ {
+        PolicyIter {
+            catalog: &self.policy_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, policy)| {
             policy.database == current_database()
                 && policy.visible_to(txid)
                 && usize::from(policy.table) == table
@@ -42721,10 +42830,12 @@ impl Storage {
     pub(crate) fn policies_with_slots_visible_to(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &PolicyDef)> {
-        self.policies.iter().enumerate().filter(move |(_, policy)| {
-            policy.database == current_database() && policy.visible_to(txid)
-        })
+    ) -> impl Iterator<Item = (usize, PolicyDef)> + '_ {
+        PolicyIter {
+            catalog: &self.policy_catalog,
+            next_slot: 0,
+        }
+        .filter(move |(_, policy)| policy.database == current_database() && policy.visible_to(txid))
     }
 
     /// Whether this role is subject to the table's row-security policies.
@@ -42767,39 +42878,55 @@ impl Storage {
                 "invalid row-security policy definition"
             ));
         }
-        if self
-            .policy_slot_on(spec.table, spec.name.as_str(), txid)
-            .is_some()
-        {
+        let table = u16::try_from(spec.table).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table slot exceeds policy catalog capacity"
+            )
+        })?;
+        let mut catalog = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
+        if catalog.definitions.iter().any(|policy| {
+            policy.database == current_database()
+                && policy.visible_to(txid)
+                && policy.table == table
+                && policy.name == spec.name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "policy \"{}\" for table already exists",
                 spec.name.as_str()
             ));
         }
-        let Some(slot) = self
-            .policies
+        let Some(slot) = catalog
+            .definitions
             .iter()
             .position(|policy| policy.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "row-security policy catalog is full (limit {})",
-                self.policies.len()
+                catalog.definitions.len()
             ));
         };
-        let role_count = self.write_policy_role_image(slot, spec.roles)?;
+        let role_count = Self::write_policy_role_image(
+            &mut catalog,
+            self.policy_roles_per_image,
+            slot,
+            spec.roles,
+        )?;
+        self.write_committed_dependencies(
+            StoredQueryDependencyOwner::Policy(slot as u16),
+            dependencies.view(),
+        )?;
         let created_at = self.catalog_sequence.next();
-        self.policies[slot] = PolicyDef {
+        catalog.definitions[slot] = PolicyDef {
             database: current_database(),
             created_at,
             name: spec.name,
-            table: u16::try_from(spec.table).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table slot exceeds policy catalog capacity"
-                )
-            })?,
+            table,
             command: spec.command,
             permissive: spec.permissive,
             definition: spec.definition,
@@ -42807,10 +42934,6 @@ impl Storage {
             pending_definition: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
-        self.write_committed_dependencies(
-            StoredQueryDependencyOwner::Policy(slot as u16),
-            dependencies.view(),
-        )?;
         Ok(slot)
     }
 
@@ -42822,10 +42945,10 @@ impl Storage {
         dependencies: &StoredQueryDependencies,
         txid: u32,
     ) -> Result<Option<PendingPolicyDefinition>, SqlError> {
-        if matches!(self.policies[slot].command, PolicyCommandKind::Insert)
-            && definition.using.is_some()
+        let policy = self.policy(slot);
+        if matches!(policy.command, PolicyCommandKind::Insert) && definition.using.is_some()
             || matches!(
-                self.policies[slot].command,
+                policy.command,
                 PolicyCommandKind::Select | PolicyCommandKind::Delete
             ) && definition.with_check.is_some()
         {
@@ -42834,16 +42957,12 @@ impl Storage {
                 "policy expression is not valid for its command"
             ));
         }
-        if let Some(pending) = self.policies[slot].pending_definition
+        if let Some(pending) = policy.pending_definition
             && pending.txid != txid
         {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                pending.txid,
-                self.policies[slot].name.as_str(),
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, pending.txid, policy.name.as_str()));
         }
-        let prior = self.policies[slot].pending_definition;
+        let prior = policy.pending_definition;
         let previous = prior
             .filter(|pending| pending.txid == txid)
             .map(|pending| pending.dependency_slot);
@@ -42860,11 +42979,17 @@ impl Storage {
             previous,
             dependencies.view(),
         )?;
-        let role_count = self.write_policy_role_image(
+        let mut catalog = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
+        let role_count = Self::write_policy_role_image(
+            &mut catalog,
+            self.policy_roles_per_image,
             self.policy_role_pending_base + dependency_slot as usize,
             roles,
         )?;
-        self.policies[slot].pending_definition = Some(PendingPolicyDefinition {
+        catalog.definitions[slot].pending_definition = Some(PendingPolicyDefinition {
             txid,
             definition,
             role_count,
@@ -42874,35 +42999,51 @@ impl Storage {
     }
 
     pub(crate) fn drop_policy(&mut self, slot: usize, txid: u32) {
-        self.policies[slot].ddl_state = self.policies[slot].ddl_state.drop_by(txid);
+        let mut catalog = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.drop_by(txid);
     }
 
     pub(crate) fn commit_policy_create(&mut self, slot: usize) {
-        self.policies[slot].ddl_state = self.policies[slot].ddl_state.commit_create();
+        let mut catalog = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
+        catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_create();
     }
 
     pub(crate) fn rollback_policy_create(&mut self, slot: usize) {
-        self.policies[slot].ddl_state = self.policies[slot].ddl_state.rollback_create();
+        let mut catalog = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
+        Self::clear_policy_slot_in(&mut catalog, self.policy_roles_per_image, slot);
+        drop(catalog);
         self.clear_committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16));
     }
 
     pub(crate) fn commit_policy_alter(&mut self, slot: usize, txid: u32) {
-        if let Some(pending) = self.policies[slot].pending_definition
+        let mut catalog = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
+        if let Some(pending) = catalog.definitions[slot].pending_definition
             && pending.txid == txid
         {
             let source = (self.policy_role_pending_base + pending.dependency_slot as usize)
                 * self.policy_roles_per_image;
             let target = slot * self.policy_roles_per_image;
             let count = usize::try_from(pending.role_count).expect("policy role count fits usize");
-            self.policy_roles
-                .copy_within(source..source + count, target);
             self.commit_pending_dependencies(
                 StoredQueryDependencyOwner::Policy(slot as u16),
                 pending.dependency_slot,
             );
-            self.policies[slot].definition = pending.definition;
-            self.policies[slot].role_count = pending.role_count;
-            self.policies[slot].pending_definition = None;
+            catalog.roles.copy_within(source..source + count, target);
+            catalog.definitions[slot].definition = pending.definition;
+            catalog.definitions[slot].role_count = pending.role_count;
+            catalog.definitions[slot].pending_definition = None;
         }
     }
 
@@ -42911,41 +43052,71 @@ impl Storage {
         slot: usize,
         prior: Option<PendingPolicyDefinition>,
     ) {
-        if let Some(current) = self.policies[slot].pending_definition {
+        let mut catalog = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
+        if let Some(current) = catalog.definitions[slot].pending_definition {
+            catalog.definitions[slot].pending_definition = prior;
+            drop(catalog);
             self.release_pending_dependencies(current.dependency_slot);
+        } else {
+            catalog.definitions[slot].pending_definition = prior;
         }
-        self.policies[slot].pending_definition = prior;
     }
 
     pub(crate) fn commit_policy_drop(&mut self, slot: usize) {
-        let oid = policy_oid(&self.policies[slot]) as u32;
-        self.policies[slot].ddl_state = self.policies[slot].ddl_state.commit_drop();
-        let pending = self.policies[slot]
-            .pending_definition
-            .map(|pending| pending.dependency_slot);
-        self.policies[slot].pending_definition = None;
+        let (oid, pending) = {
+            let mut catalog = self
+                .policy_catalog
+                .lock()
+                .expect("policy catalog lock poisoned");
+            let policy = catalog.definitions[slot];
+            Self::clear_policy_slot_in(&mut catalog, self.policy_roles_per_image, slot);
+            (
+                policy_oid(&policy) as u32,
+                policy
+                    .pending_definition
+                    .map(|pending| pending.dependency_slot),
+            )
+        };
         self.clear_pending_dependency_chain(pending);
         self.clear_committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16));
         self.drop_comments_by_subid(CommentClass::Policy, oid);
     }
 
     pub(crate) fn rollback_policy_drop(&mut self, slot: usize, txid: u32) {
-        self.policies[slot].ddl_state = self.policies[slot].ddl_state.rollback_drop(txid);
+        let mut catalog = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
+        catalog.definitions[slot].ddl_state =
+            catalog.definitions[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn commit_policies_for_table(&mut self, table: usize) {
-        for slot in 0..self.policies.len() {
-            let policy = self.policies[slot];
-            if policy.ddl_state != CatalogDdlState::Absent && usize::from(policy.table) == table {
-                self.policies[slot].ddl_state = CatalogDdlState::Absent;
-                let pending = self.policies[slot]
-                    .pending_definition
-                    .map(|pending| pending.dependency_slot);
-                self.policies[slot].pending_definition = None;
-                self.clear_pending_dependency_chain(pending);
-                self.clear_committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16));
-                self.drop_comments_by_subid(CommentClass::Policy, policy_oid(&policy) as u32);
-            }
+        for slot in 0..self.policy_count() {
+            let removed = {
+                let mut catalog = self
+                    .policy_catalog
+                    .lock()
+                    .expect("policy catalog lock poisoned");
+                let policy = catalog.definitions[slot];
+                (policy.ddl_state != CatalogDdlState::Absent && usize::from(policy.table) == table)
+                    .then(|| {
+                        Self::clear_policy_slot_in(&mut catalog, self.policy_roles_per_image, slot);
+                        policy
+                    })
+            };
+            let Some(policy) = removed else {
+                continue;
+            };
+            let pending = policy
+                .pending_definition
+                .map(|pending| pending.dependency_slot);
+            self.clear_pending_dependency_chain(pending);
+            self.clear_committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16));
+            self.drop_comments_by_subid(CommentClass::Policy, policy_oid(&policy) as u32);
         }
     }
 
@@ -42970,6 +43141,10 @@ impl Storage {
             )
         })?;
         let scratch_start = self.policy_role_replay_image * self.policy_roles_per_image;
+        let mut catalog = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
         for (index, role) in roles.enumerate() {
             let role = if role.eq_ignore_ascii_case("public") {
                 PUBLIC_ROLE
@@ -42988,7 +43163,7 @@ impl Storage {
                     )
                 })?
             };
-            self.policy_roles[scratch_start + index] = role;
+            catalog.roles[scratch_start + index] = role;
         }
         if spec.table >= self.tables.len()
             || (matches!(spec.command, PolicyCommandKind::Insert)
@@ -43003,31 +43178,38 @@ impl Storage {
                 "invalid recovered row-security policy definition"
             ));
         }
-        let slot = if let Some(slot) = self.policy_slot_on(spec.table, spec.name.as_str(), 0) {
+        let table = u16::try_from(spec.table).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table slot exceeds policy catalog capacity"
+            )
+        })?;
+        let existing = catalog.definitions.iter().position(|policy| {
+            policy.database == current_database()
+                && policy.visible_to(0)
+                && policy.table == table
+                && policy.name == spec.name
+        });
+        let slot = if let Some(slot) = existing {
             slot
         } else {
-            let Some(slot) = self
-                .policies
+            let Some(slot) = catalog
+                .definitions
                 .iter()
                 .position(|policy| policy.ddl_state == CatalogDdlState::Absent)
             else {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "row-security policy catalog is full (limit {})",
-                    self.policies.len()
+                    catalog.definitions.len()
                 ));
             };
             let created_at = self.catalog_sequence.next();
-            self.policies[slot] = PolicyDef {
+            catalog.definitions[slot] = PolicyDef {
                 database: current_database(),
                 created_at,
                 name: spec.name,
-                table: u16::try_from(spec.table).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "table slot exceeds policy catalog capacity"
-                    )
-                })?,
+                table,
                 command: spec.command,
                 permissive: spec.permissive,
                 definition: spec.definition,
@@ -43038,18 +43220,19 @@ impl Storage {
             slot
         };
         let target = slot * self.policy_roles_per_image;
-        self.policy_roles
+        catalog
+            .roles
             .copy_within(scratch_start..scratch_start + role_count, target);
-        let policy = &mut self.policies[slot];
+        self.write_committed_dependencies(
+            StoredQueryDependencyOwner::Policy(slot as u16),
+            dependencies.view(),
+        )?;
+        let policy = &mut catalog.definitions[slot];
         policy.command = spec.command;
         policy.permissive = spec.permissive;
         policy.definition = spec.definition;
         policy.role_count = durable_role_count;
         policy.pending_definition = None;
-        self.write_committed_dependencies(
-            StoredQueryDependencyOwner::Policy(slot as u16),
-            dependencies.view(),
-        )?;
         Ok(slot)
     }
 
@@ -43068,7 +43251,11 @@ impl Storage {
         dependencies: StoredQueryDependencies,
     ) -> Result<(), SqlError> {
         let slot = self.replay_set_policy(spec, roles, dependencies)?;
-        self.policies[slot].created_at = created_at;
+        self.policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned")
+            .definitions[slot]
+            .created_at = created_at;
         self.catalog_sequence.observe(created_at);
         Ok(())
     }
@@ -51893,10 +52080,15 @@ mod tests {
         );
         drop(dependency_catalog);
         assert_eq!(storage.policy_roles_per_image, 20);
+        let policy_catalog = storage
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
         assert_eq!(
-            storage.policy_roles.len(),
+            policy_catalog.roles.len(),
             policy_role_image_capacity(&config) * 20
         );
+        drop(policy_catalog);
         assert_eq!(
             storage.policy_role_replay_image,
             policy_role_image_capacity(&config) - 1
@@ -55172,6 +55364,120 @@ mod tests {
             (catalog.counts.len() + catalog.pending.len())
                 * config.max_stored_query_dependencies_per_object
         );
+    }
+
+    #[test]
+    fn policy_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PolicyCatalog>();
+        assert_send_sync::<std::sync::Mutex<PolicyCatalog>>();
+        assert_send_sync::<PolicyIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_policies = WORKERS;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let mut catalog = storage
+                        .policy_catalog
+                        .lock()
+                        .expect("policy catalog lock poisoned");
+                    let role_start = worker * storage.policy_roles_per_image;
+                    catalog.roles[role_start] = worker as u16;
+                    catalog.definitions[worker] = PolicyDef {
+                        database: current_database(),
+                        created_at: storage.catalog_sequence.next(),
+                        name: SqlName::parse(stack_format!(63, "policy_{worker}").as_str())
+                            .unwrap(),
+                        table: 0,
+                        command: PolicyCommandKind::Select,
+                        permissive: true,
+                        definition: PolicyDefinition {
+                            using: None,
+                            with_check: None,
+                        },
+                        role_count: 1,
+                        pending_definition: None,
+                        ddl_state: CatalogDdlState::Present,
+                    };
+                });
+            }
+        });
+
+        assert_eq!(storage.policy_count(), WORKERS);
+        assert_eq!(storage.policies_with_slots_visible_to(0).count(), WORKERS);
+        for (slot, policy) in storage.policies_with_slots_visible_to(0) {
+            assert_eq!(storage.policy(slot).created_at, policy.created_at);
+            let roles = storage.policy_roles(slot, 0);
+            assert_eq!(&*roles, &[slot as u16]);
+        }
+        {
+            let catalog = storage
+                .policy_catalog
+                .lock()
+                .expect("policy catalog lock poisoned");
+            assert_eq!(catalog.definitions.capacity(), WORKERS);
+            assert_eq!(
+                catalog.roles.capacity(),
+                policy_role_image_capacity(&config) * storage.policy_roles_per_image
+            );
+        }
+
+        let dependencies = StoredQueryDependencies::EMPTY;
+        assert_eq!(
+            storage
+                .create_policy(
+                    PolicySpec {
+                        name: SqlName::parse("policy_full").unwrap(),
+                        table: 0,
+                        command: PolicyCommandKind::Select,
+                        permissive: true,
+                        definition: PolicyDefinition {
+                            using: None,
+                            with_check: None,
+                        },
+                        roles: &[PUBLIC_ROLE],
+                    },
+                    &dependencies,
+                    9,
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+
+        storage.drop_policy(0, 9);
+        storage.commit_policy_drop(0);
+        assert_eq!(storage.policy(0).created_at, 0);
+        assert_eq!(storage.policy(0).name, SqlName::EMPTY);
+        assert_eq!(storage.policy(0).table, u16::MAX);
+        assert_eq!(storage.policy(0).ddl_state, CatalogDdlState::Absent);
+        assert_eq!(&*storage.policy_roles(0, 0), &[PUBLIC_ROLE]);
+
+        {
+            let mut catalog = storage
+                .policy_catalog
+                .lock()
+                .expect("policy catalog lock poisoned");
+            catalog.definitions[0] = PolicyDef {
+                created_at: 99,
+                name: SqlName::parse("pending_policy").unwrap(),
+                table: 0,
+                ddl_state: CatalogDdlState::PendingCreate { txid: 10 },
+                ..PolicyDef::EMPTY
+            };
+        }
+        storage.rollback_policy_create(0);
+        assert_eq!(storage.policy(0).created_at, 0);
+        assert_eq!(storage.policy(0).name, SqlName::EMPTY);
+        assert_eq!(storage.policy(0).table, u16::MAX);
+        assert_eq!(storage.policy(0).ddl_state, CatalogDdlState::Absent);
+        assert_eq!(&*storage.policy_roles(0, 0), &[PUBLIC_ROLE]);
     }
 
     #[test]

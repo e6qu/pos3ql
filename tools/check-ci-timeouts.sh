@@ -35,6 +35,16 @@ if grep -nE 'shards:.*[/\\]' .github/workflows/coverage.yml; then
     failed=1
 fi
 
+# Instrumented library tests include a cold release build and must retain
+# enough explicit workers to fit beneath the fixed 15-minute ceiling.
+coverage_matrix=.github/workflows/coverage.yml
+for coverage_partition in 0-of-4 1-of-4 2-of-4 3-of-4; do
+    if ! grep -Fq -- "lib:$coverage_partition" "$coverage_matrix"; then
+        printf 'CI timeout guard: missing coverage library partition %s\n' "$coverage_partition" >&2
+        failed=1
+    fi
+done
+
 # The forced-spill suite must distribute corpus work and its independent
 # auxiliary probes. Each worker has a fixed 15-minute ceiling.
 spill_matrix=.github/workflows/coverage.yml

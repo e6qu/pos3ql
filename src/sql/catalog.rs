@@ -10354,24 +10354,28 @@ pub(crate) fn is_other_temporary_namespace(storage: &Storage, txid: u32, oid: i3
         }))
 }
 
-pub(crate) fn schema_name_by_oid(storage: &Storage, txid: u32, oid: i32) -> Option<&str> {
+pub(crate) fn schema_name_by_oid(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Option<crate::storage::SqlName> {
     match oid {
-        PUBLIC_NS_OID => Some("public"),
-        PG_CATALOG_NS_OID => Some("pg_catalog"),
-        PG_TOAST_NS_OID => Some("pg_toast"),
+        PUBLIC_NS_OID => crate::storage::SqlName::parse("public").ok(),
+        PG_CATALOG_NS_OID => crate::storage::SqlName::parse("pg_catalog").ok(),
+        PG_TOAST_NS_OID => crate::storage::SqlName::parse("pg_toast").ok(),
         _ => (0..storage.table_count())
             .find_map(|slot| {
                 let table = storage.table_def(slot, txid);
                 (storage.table_slot_visible_to(slot, txid)
                     && table.persistence == crate::storage::RelationPersistence::Temporary
                     && namespace_oid(storage, table.schema.as_str()) == oid)
-                    .then_some(table.schema.as_str())
+                    .then_some(table.schema)
             })
             .or_else(|| {
                 storage
                     .visible_schemas(txid)
                     .find(|(slot, _)| namespace_oid_for_slot(*slot) == oid)
-                    .map(|(_, schema)| schema.name.as_str())
+                    .map(|(_, schema)| schema.name)
             }),
     }
 }

@@ -2939,7 +2939,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let Some(name) = super::catalog::schema_name_by_oid(self.storage, self.txid, oid) else {
             return Ok(None);
         };
-        Ok(Some(arena.alloc_str(name).map_err(|_| arena_full())?))
+        Ok(Some(
+            arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
+        ))
     }
 
     fn schema_oid(&self, name: &str) -> Option<i32> {

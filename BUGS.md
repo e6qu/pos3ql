@@ -933,6 +933,18 @@ ownership, and ACL state in reusable slots; terminal paths now clear the
 complete slot. Four-worker publication, nested-reader progress, exact retained
 capacity, loud exhaustion, complete slot reuse, and `Send + Sync` have direct
 coverage.
+The schema catalog audit found identity, database binding, ownership, and
+existence state in one unsynchronized fixed vector. Overlapping DDL, replay,
+database lifecycle, schema rename, checkpoint, extension binding, and catalog
+work could lose updates or combine fields from different transitions. One
+startup-bounded mutex now owns the catalog. Readers copy one fixed definition
+before nested work, and conflicting create, ownership, and drop operations use
+the common transaction wait boundary. Committed drops and rolled-back creates
+also retained stale identity, ownership, and ACL state in reusable slots;
+terminal paths now clear the complete slot. Create commit promotes ownership
+with existence in the same critical section. Four-worker publication,
+nested-reader progress, exact retained capacity, loud exhaustion, complete
+slot reuse, and `Send + Sync` have direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -5251,6 +5251,7 @@ impl Engine {
                 )
             } else {
                 let (namespace, relocatable, version) = extension.definition_to(txn.txid);
+                let schema = self.storage.schema_def(namespace as usize).name;
                 let object = crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Extension,
                     slot: slot as u16,
@@ -5262,7 +5263,7 @@ impl Engine {
                     lsn,
                     &WalOp::UpsertExtension {
                         name: extension.name.as_str(),
-                        schema: self.storage.schema_def(namespace as usize).name.as_str(),
+                        schema: schema.as_str(),
                         version: version.as_str(),
                         relocatable,
                         owner: owner.as_str(),
@@ -6324,13 +6325,6 @@ impl Engine {
                 DdlUndo::SequenceReset { .. } | DdlUndo::OwnedSequenceReset { .. } => {}
                 DdlUndo::SchemaCreated(slot) => {
                     self.storage.commit_schema_create(*slot as usize);
-                    self.storage.commit_object_owner(
-                        crate::storage::AccessObject {
-                            class: crate::storage::AccessClass::Schema,
-                            slot: *slot as u16,
-                        },
-                        txn.txid,
-                    );
                 }
                 DdlUndo::SchemaDropped(slot) => self.storage.commit_schema_drop(*slot as usize),
                 DdlUndo::SchemaRenamed { .. } => {}
@@ -16966,6 +16960,8 @@ impl Engine {
         let package_definition = script.effective;
         let mut required_names =
             [crate::storage::SqlName::EMPTY; crate::storage::MAX_EXTENSION_REQUIRES];
+        let mut required_schema_names =
+            [crate::storage::SqlName::EMPTY; crate::storage::MAX_EXTENSION_REQUIRES];
         let mut required_schemas = [""; crate::storage::MAX_EXTENSION_REQUIRES];
         for (index, required) in package_definition.requires().iter().enumerate() {
             let Some(required_slot) = self.storage.extension_slot(required.as_str(), txn.txid)
@@ -16982,11 +16978,18 @@ impl Engine {
                 .definition_to(txn.txid)
                 .0 as usize;
             required_names[index] = *required;
-            required_schemas[index] = self.storage.schema_def(namespace).name.as_str();
+            required_schema_names[index] = self.storage.schema_def(namespace).name;
         }
         let required_count = package_definition.requires().len();
+        for (schema, name) in required_schemas[..required_count]
+            .iter_mut()
+            .zip(&required_schema_names[..required_count])
+        {
+            *schema = name.as_str();
+        }
         let namespace = self.storage.extension(extension).definition_to(txn.txid).0 as usize;
-        let schema = self.storage.schema_def(namespace).name.as_str();
+        let schema_name = self.storage.schema_def(namespace).name;
+        let schema = schema_name.as_str();
         debug_assert_eq!(script.package as usize, package);
         let source = self.storage.extension_script_source(script);
         if let Err(error) =
@@ -21791,6 +21794,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             }
             if object.class == crate::storage::AccessClass::Tablespace {
                 storage.set_tablespace_owner(usize::from(object.slot), owner, 0)?;
+            } else if object.class == crate::storage::AccessClass::Schema {
+                storage.set_schema_owner(usize::from(object.slot), owner, 0)?;
             } else {
                 storage.set_object_owner(object, owner, 0);
             }

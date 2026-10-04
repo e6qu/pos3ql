@@ -5529,15 +5529,11 @@ pub fn create_schema(
     };
     match created {
         Ok(slot) => {
-            if let Some(owner) = authorized_owner {
-                storage.set_object_owner(
-                    crate::storage::AccessObject {
-                        class: crate::storage::AccessClass::Schema,
-                        slot: slot as u16,
-                    },
-                    owner,
-                    txn.txid,
-                );
+            if let Some(owner) = authorized_owner
+                && let Err(error) = storage.set_schema_owner(slot, owner, txn.txid)
+            {
+                storage.rollback_schema_create(slot);
+                return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateSchema(name)) {
@@ -6228,7 +6224,14 @@ pub fn alter_owner(
         }
     }
     let old_owner = storage.object_owner(object, txn.txid) as u16;
-    let prior = storage.set_object_owner(object, new_owner, txn.txid);
+    let prior = if object.class == AccessClass::Schema {
+        match storage.set_schema_owner(usize::from(object.slot), new_owner, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        storage.set_object_owner(object, new_owner, txn.txid)
+    };
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged { object, prior }) {
         storage.restore_object_owner(object, prior);
         return sql_fail(error);
@@ -8466,6 +8469,11 @@ pub fn reassign_owned(
             let old_owner = storage.object_owner(object, txn.txid) as u16;
             let prior = if class == AccessClass::Tablespace {
                 match storage.set_tablespace_owner(slot, target, txn.txid) {
+                    Ok(prior) => prior,
+                    Err(error) => return sql_fail(error),
+                }
+            } else if class == AccessClass::Schema {
+                match storage.set_schema_owner(slot, target, txn.txid) {
                     Ok(prior) => prior,
                     Err(error) => return sql_fail(error),
                 }
@@ -12852,18 +12860,23 @@ pub fn drop_schema(
         }
     }
     for &slot in &slots[..n_slots] {
-        if let Err(error) = remove_schema_from_publications(storage, wal, txn, slot as u8) {
+        let name = storage.schema_def(slot).name;
+        if let Err(error) = storage.drop_schema_in(slot, txn.txid) {
             return sql_fail(error);
         }
-        let name = storage.schema_def(slot).name;
+        if let Err(error) = remove_schema_from_publications(storage, wal, txn, slot as u8) {
+            storage.rollback_schema_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::DropSchema(name.as_str())) {
+            storage.rollback_schema_drop(slot, txn.txid);
             return sql_fail(e);
         }
         if let Err(e) = txn.record_ddl(super::txn::DdlUndo::SchemaDropped(slot as u32)) {
+            storage.rollback_schema_drop(slot, txn.txid);
             return sql_fail(e);
         }
-        storage.drop_schema_in(slot, txn.txid);
     }
     responder.command_complete("DROP SCHEMA")?;
     sql_ok()
@@ -27974,12 +27987,15 @@ fn resolve_cast_function_name(
         });
     }
     for entry in storage.path().entries() {
-        let schema = match entry {
-            crate::storage::PathEntry::Catalog => "pg_catalog",
+        let schema_name = match entry {
+            crate::storage::PathEntry::Catalog => None,
             crate::storage::PathEntry::Schema(slot) => {
-                storage.schema_def(usize::from(*slot)).name.as_str()
+                Some(storage.schema_def(usize::from(*slot)).name)
             }
         };
+        let schema = schema_name
+            .as_ref()
+            .map_or("pg_catalog", |name| name.as_str());
         if let Some(slot) = resolve(schema)? {
             return Ok(slot);
         }

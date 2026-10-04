@@ -6101,7 +6101,7 @@ impl PublicationDef {
 /// A materialized view's catalog entry: like a [`ViewDef`], but its rows live in
 /// a same-named backing table (an ordinary [`Table`]). This entry stores only
 /// the defining query (re-run by REFRESH) and whether it has been populated.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct MatviewDef {
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
@@ -6117,6 +6117,17 @@ pub struct MatviewDef {
 }
 
 impl MatviewDef {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        created_at: 0,
+        backing_table: u16::MAX,
+        sql: StackStr::new(),
+        creation_path: StackStr::new(),
+        ownership: Ownership::BOOTSTRAP,
+        populated: false,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
     }
@@ -13263,6 +13274,39 @@ impl<D: Copy> Iterator for ForeignCatalogIter<'_, D> {
     }
 }
 
+struct MatviewIter<'a> {
+    catalog: &'a std::sync::Mutex<FixedVec<MatviewDef>>,
+    next_slot: usize,
+    database: Option<DatabaseOid>,
+    txid: u32,
+    checkpoint: bool,
+}
+
+impl Iterator for MatviewIter<'_> {
+    type Item = (usize, MatviewDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let catalog = self
+                .catalog
+                .lock()
+                .expect("materialized-view catalog lock poisoned");
+            let slot = self.next_slot;
+            let definition = *catalog.get(slot)?;
+            self.next_slot += 1;
+            let visible = if self.checkpoint {
+                definition.ddl_state == CatalogDdlState::Present
+            } else {
+                self.database == Some(definition.database) && definition.visible_to(self.txid)
+            };
+            drop(catalog);
+            if visible {
+                return Some((slot, definition));
+            }
+        }
+    }
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -13301,7 +13345,7 @@ pub struct Storage {
     foreign: std::sync::Mutex<foreign::ForeignCatalog>,
     foreign_sessions: ForeignSessionPool,
     foreign_statement_contexts: FixedVec<std::sync::Mutex<ForeignStatementContext>>,
-    matviews: FixedVec<MatviewDef>,
+    matviews: std::sync::Mutex<FixedVec<MatviewDef>>,
     sequence_catalog: std::sync::Mutex<SequenceCatalog>,
     type_catalog: std::sync::Mutex<TypeCatalog>,
     enum_members_per_image: usize,
@@ -16753,10 +16797,9 @@ impl Storage {
                 )?;
             }
         }
-        for slot in 0..self.matviews.len() {
-            if self.matviews[slot].database == current_database()
-                && self.matviews[slot].visible_to(txid)
-            {
+        for slot in 0..self.matview_count() {
+            let definition = self.matview(slot);
+            if definition.database == current_database() && definition.visible_to(txid) {
                 let image = self.matview_dependency_image(slot);
                 self.rebind_stored_query_dependency_image(image, txid)?;
             }
@@ -16807,8 +16850,8 @@ impl Storage {
                 );
             }
         }
-        for matview_slot in 0..self.matviews.len() {
-            if self.matviews[matview_slot].ddl_state != CatalogDdlState::Absent {
+        for matview_slot in 0..self.matview_count() {
+            if self.matview(matview_slot).ddl_state != CatalogDdlState::Absent {
                 let image = self.matview_dependency_image(matview_slot);
                 rename_dependency(
                     self.dependency_image_mut(image, self.stored_query_dependency_counts[image]),
@@ -16885,8 +16928,8 @@ impl Storage {
                 );
             }
         }
-        for matview_slot in 0..self.matviews.len() {
-            if self.matviews[matview_slot].ddl_state != CatalogDdlState::Absent {
+        for matview_slot in 0..self.matview_count() {
+            if self.matview(matview_slot).ddl_state != CatalogDdlState::Absent {
                 let image = self.matview_dependency_image(matview_slot);
                 replace_dependency_slot(
                     self.dependency_image_mut(image, self.stored_query_dependency_counts[image]),
@@ -17469,16 +17512,7 @@ impl Storage {
         let mut matviews = FixedVec::new(budget, "matviews", config.max_materialized_views)?;
         for _ in 0..config.max_materialized_views {
             matviews
-                .push(MatviewDef {
-                    database: DatabaseOid::POSTGRES,
-                    created_at: 0,
-                    backing_table: u16::MAX,
-                    sql: StackStr::new(),
-                    creation_path: StackStr::new(),
-                    ownership: Ownership::BOOTSTRAP,
-                    populated: false,
-                    ddl_state: CatalogDdlState::Absent,
-                })
+                .push(MatviewDef::EMPTY)
                 .expect("sized to max_materialized_views");
         }
         let mut sequences = FixedVec::new(budget, "sequences", config.max_sequences)?;
@@ -17954,7 +17988,7 @@ impl Storage {
                 slots: FixedVec::new(budget, "foreign_sessions", config.max_foreign_sessions)?,
             },
             foreign_statement_contexts,
-            matviews,
+            matviews: std::sync::Mutex::new(matviews),
             sequence_catalog: std::sync::Mutex::new(SequenceCatalog {
                 definitions: sequences,
                 values: sequence_values,
@@ -19491,16 +19525,16 @@ impl Storage {
                     self.views[usize::from(view_slot)].return_rule = target_slot as u16;
                 }
             }
-            for source_slot in 0..self.matviews.len() {
-                let source_definition = &self.matviews[source_slot];
+            for source_slot in 0..self.matview_count() {
+                let source_definition = self.matview(source_slot);
                 if source_definition.database != source
                     || source_definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let mut definition = source_definition.clone();
+                let mut definition = source_definition;
                 let target_slot = self
-                    .matviews
+                    .matview_catalog()
                     .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                     .ok_or_else(|| {
@@ -19512,7 +19546,7 @@ impl Storage {
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.matviews[target_slot] = definition;
+                self.matview_catalog()[target_slot] = definition;
                 self.copy_dependency_image(
                     self.matview_dependency_image(source_slot),
                     self.matview_dependency_image(target_slot),
@@ -20291,7 +20325,7 @@ impl Storage {
                 AccessClass::Table => self.tables[usize::from(entry.object.slot)].database,
                 AccessClass::View => self.views[usize::from(entry.object.slot)].database,
                 AccessClass::MaterializedView => {
-                    self.matviews[usize::from(entry.object.slot)].database
+                    self.matview(usize::from(entry.object.slot)).database
                 }
                 AccessClass::Sequence => self.sequence(usize::from(entry.object.slot)).database,
                 AccessClass::Schema => self.schema_def(usize::from(entry.object.slot)).database,
@@ -20349,7 +20383,7 @@ impl Storage {
             let object_database = match relation.class {
                 AccessClass::Table => self.tables[usize::from(relation.slot)].database,
                 AccessClass::View => self.views[usize::from(relation.slot)].database,
-                AccessClass::MaterializedView => self.matviews[usize::from(relation.slot)].database,
+                AccessClass::MaterializedView => self.matview(usize::from(relation.slot)).database,
                 _ => continue,
             };
             if object_database == database {
@@ -20469,7 +20503,14 @@ impl Storage {
                 }
             }
         }
-        clear_catalog!(matviews);
+        {
+            let mut matviews = self.matview_catalog();
+            for definition in matviews.iter_mut() {
+                if definition.database == database {
+                    *definition = MatviewDef::EMPTY;
+                }
+            }
+        }
         {
             let mut catalog = self.sequence_catalog();
             for slot in 0..catalog.definitions.len() {
@@ -20625,9 +20666,10 @@ impl Storage {
                 *slot = ReplicationSlotDef::EMPTY;
             }
         }
-        for slot in 0..self.matviews.len() {
-            if self.matviews[slot].database == DatabaseOid::POSTGRES
-                && self.matviews[slot].ddl_state == CatalogDdlState::Absent
+        for slot in 0..self.matview_count() {
+            let definition = self.matview(slot);
+            if definition.database == DatabaseOid::POSTGRES
+                && definition.ddl_state == CatalogDdlState::Absent
             {
                 let image = self.matview_dependency_image(slot);
                 self.stored_query_dependency_counts[image] = 0;
@@ -20760,7 +20802,16 @@ impl Storage {
                 }
             }
         }
-        commit_catalog!(matviews);
+        {
+            let mut matviews = self.matview_catalog();
+            for definition in matviews.iter_mut() {
+                if definition.database == database
+                    && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    definition.ddl_state = definition.ddl_state.commit_create();
+                }
+            }
+        }
         {
             let mut catalog = self.sequence_catalog();
             for definition in catalog.definitions.iter_mut() {
@@ -21136,7 +21187,7 @@ impl Storage {
         match object.class {
             AccessClass::Table => self.tables[slot].ownership,
             AccessClass::View => self.views[slot].ownership,
-            AccessClass::MaterializedView => self.matviews[slot].ownership,
+            AccessClass::MaterializedView => self.matview(slot).ownership,
             AccessClass::Sequence => self.sequence(slot).ownership,
             AccessClass::Schema => self.schema_def(slot).ownership,
             AccessClass::Domain => self.domain(slot).ownership,
@@ -21169,7 +21220,9 @@ impl Storage {
         match object.class {
             AccessClass::Table => &mut self.tables[slot].ownership,
             AccessClass::View => &mut self.views[slot].ownership,
-            AccessClass::MaterializedView => &mut self.matviews[slot].ownership,
+            AccessClass::MaterializedView => {
+                unreachable!("materialized-view ownership is synchronized separately")
+            }
             AccessClass::Sequence => {
                 unreachable!("sequence ownership is synchronized separately")
             }
@@ -21606,7 +21659,7 @@ impl Storage {
                 (definition.schema_for(txid), definition.name_for(txid))
             }
             AccessClass::MaterializedView => {
-                let definition = &self.matviews[slot];
+                let definition = self.matview(slot);
                 let table = self.table_def(usize::from(definition.backing_table), txid);
                 (table.schema, table.name)
             }
@@ -21695,7 +21748,7 @@ impl Storage {
             AccessClass::Table => self.tables[slot].live,
             AccessClass::View => self.views[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::MaterializedView => {
-                self.matviews[slot].ddl_state == CatalogDdlState::Present
+                self.matview(slot).ddl_state == CatalogDdlState::Present
             }
             AccessClass::Sequence => self.sequence(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Schema => self.schema_def(slot).ddl_state == CatalogDdlState::Present,
@@ -21737,7 +21790,7 @@ impl Storage {
         match object.class {
             AccessClass::Table => self.tables[slot].visible_to(txid),
             AccessClass::View => self.views[slot].visible_to(txid),
-            AccessClass::MaterializedView => self.matviews[slot].visible_to(txid),
+            AccessClass::MaterializedView => self.matview(slot).visible_to(txid),
             AccessClass::Sequence => self.sequence(slot).visible_to(txid),
             AccessClass::Schema => self.schema_def(slot).visible_to(txid),
             AccessClass::Domain => self.domain(slot).visible_to(txid),
@@ -21774,7 +21827,7 @@ impl Storage {
         match object.class {
             AccessClass::Table => Some(self.tables[slot].database),
             AccessClass::View => Some(self.views[slot].database),
-            AccessClass::MaterializedView => Some(self.matviews[slot].database),
+            AccessClass::MaterializedView => Some(self.matview(slot).database),
             AccessClass::Sequence => Some(self.sequence(slot).database),
             AccessClass::Schema => Some(self.schema_def(slot).database),
             AccessClass::Domain => Some(self.domain(slot).database),
@@ -21828,8 +21881,8 @@ impl Storage {
                 })?
             }
             AccessClass::MaterializedView => {
-                let created_at = self.matviews[source_slot].created_at;
-                self.matviews.iter().position(|candidate| {
+                let created_at = self.matview(source_slot).created_at;
+                self.matview_catalog().iter().position(|candidate| {
                     candidate.database == target_database && candidate.created_at == created_at
                 })?
             }
@@ -22046,11 +22099,14 @@ impl Storage {
         })
     }
 
-    pub(crate) fn checkpoint_matviews(&self) -> impl Iterator<Item = (usize, &MatviewDef)> {
-        self.matviews
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    pub(crate) fn checkpoint_matviews(&self) -> impl Iterator<Item = (usize, MatviewDef)> + '_ {
+        MatviewIter {
+            catalog: &self.matviews,
+            next_slot: 0,
+            database: None,
+            txid: 0,
+            checkpoint: true,
+        }
     }
 
     pub(crate) fn checkpoint_sequences_with_slots(
@@ -22293,7 +22349,7 @@ impl Storage {
         match class {
             AccessClass::Table => self.tables.len(),
             AccessClass::View => self.views.len(),
-            AccessClass::MaterializedView => self.matviews.len(),
+            AccessClass::MaterializedView => self.matview_count(),
             AccessClass::Sequence => self.sequence_count(),
             AccessClass::Schema => self.schema_count(),
             AccessClass::Domain => self.domain_count(),
@@ -22357,7 +22413,7 @@ impl Storage {
         let owned = [
             (AccessClass::Table, self.tables.len()),
             (AccessClass::View, self.views.len()),
-            (AccessClass::MaterializedView, self.matviews.len()),
+            (AccessClass::MaterializedView, self.matview_count()),
             (AccessClass::Sequence, self.sequence_count()),
             (AccessClass::Schema, self.schema_count()),
             (AccessClass::Domain, self.domain_count()),
@@ -22627,6 +22683,21 @@ impl Storage {
             }
             return prior;
         }
+        if object.class == AccessClass::MaterializedView {
+            let mut matviews = self.matview_catalog();
+            let ownership = &mut matviews[usize::from(object.slot)].ownership;
+            let prior = ownership.pending;
+            if txid == 0 {
+                ownership.owner = owner as u16;
+                ownership.pending = None;
+            } else {
+                ownership.pending = Some(PendingOwnership {
+                    txid,
+                    owner: owner as u16,
+                });
+            }
+            return prior;
+        }
         if object.class == AccessClass::Tablespace {
             unreachable!("tablespace ownership is synchronized separately");
         }
@@ -22767,6 +22838,17 @@ impl Storage {
             }
             return;
         }
+        if object.class == AccessClass::MaterializedView {
+            let mut matviews = self.matview_catalog();
+            let ownership = &mut matviews[usize::from(object.slot)].ownership;
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            return;
+        }
         if object.class == AccessClass::Tablespace {
             let mut tablespaces = self
                 .tablespaces
@@ -22865,6 +22947,12 @@ impl Storage {
         }
         if object.class == AccessClass::Sequence {
             self.sequence_catalog().definitions[usize::from(object.slot)]
+                .ownership
+                .pending = prior;
+            return;
+        }
+        if object.class == AccessClass::MaterializedView {
+            self.matview_catalog()[usize::from(object.slot)]
                 .ownership
                 .pending = prior;
             return;
@@ -26216,14 +26304,17 @@ impl Storage {
                 rename_schema_qualified_sql(&mut body, prior, name)?;
             }
         }
-        for definition in self.matviews.iter().filter(|definition| {
-            definition.database == current_database()
-                && definition.ddl_state != CatalogDdlState::Absent
-        }) {
-            let mut path = definition.creation_path;
-            rename_schema_path(&mut path, prior, name)?;
-            let mut sql = definition.sql;
-            rename_schema_qualified_sql(&mut sql, prior, name)?;
+        {
+            let matviews = self.matview_catalog();
+            for definition in matviews.iter().filter(|definition| {
+                definition.database == current_database()
+                    && definition.ddl_state != CatalogDdlState::Absent
+            }) {
+                let mut path = definition.creation_path;
+                rename_schema_path(&mut path, prior, name)?;
+                let mut sql = definition.sql;
+                rename_schema_qualified_sql(&mut sql, prior, name)?;
+            }
         }
         for table_slot in 0..self.tables.len() {
             let table = &self.tables[table_slot];
@@ -26555,12 +26646,15 @@ impl Storage {
                 rename_schema_qualified_sql(&mut pending.definition.source, prior, name)?;
             }
         }
-        for definition in self.matviews.iter_mut() {
-            if definition.database == current_database()
-                && definition.ddl_state != CatalogDdlState::Absent
-            {
-                rename_schema_path(&mut definition.creation_path, prior, name)?;
-                rename_schema_qualified_sql(&mut definition.sql, prior, name)?;
+        {
+            let mut matviews = self.matview_catalog();
+            for definition in matviews.iter_mut() {
+                if definition.database == current_database()
+                    && definition.ddl_state != CatalogDdlState::Absent
+                {
+                    rename_schema_path(&mut definition.creation_path, prior, name)?;
+                    rename_schema_qualified_sql(&mut definition.sql, prior, name)?;
+                }
             }
         }
         for slot in 0..self.rules.len() {
@@ -26574,9 +26668,10 @@ impl Storage {
                 );
             }
         }
-        for slot in 0..self.matviews.len() {
-            if self.matviews[slot].database == current_database()
-                && self.matviews[slot].ddl_state != CatalogDdlState::Absent
+        for slot in 0..self.matview_count() {
+            let definition = self.matview(slot);
+            if definition.database == current_database()
+                && definition.ddl_state != CatalogDdlState::Absent
             {
                 let image = self.matview_dependency_image(slot);
                 let count = self.stored_query_dependency_counts[image];
@@ -35928,33 +36023,42 @@ impl Storage {
     // same-named backing Table, so these hold only the defining query). ---
 
     /// Committed materialized views, for checkpoint serialization.
-    pub fn live_matviews(&self) -> impl Iterator<Item = &MatviewDef> {
+    fn matview_catalog(&self) -> std::sync::MutexGuard<'_, FixedVec<MatviewDef>> {
         self.matviews
-            .iter()
-            .filter(|m| m.database == current_database() && m.ddl_state == CatalogDdlState::Present)
+            .lock()
+            .expect("materialized-view catalog lock poisoned")
     }
 
-    pub fn matviews_with_slots(&self) -> impl Iterator<Item = (usize, &MatviewDef)> {
-        self.matviews.iter().enumerate().filter(|(_, matview)| {
-            matview.database == current_database() && matview.ddl_state == CatalogDdlState::Present
-        })
+    pub fn live_matviews(&self) -> impl Iterator<Item = MatviewDef> + '_ {
+        self.matviews_with_slots().map(|(_, definition)| definition)
+    }
+
+    pub fn matviews_with_slots(&self) -> impl Iterator<Item = (usize, MatviewDef)> + '_ {
+        MatviewIter {
+            catalog: &self.matviews,
+            next_slot: 0,
+            database: Some(current_database()),
+            txid: 0,
+            checkpoint: true,
+        }
     }
 
     /// Materialized views visible to `txid`, including the transaction's own DDL.
     pub(crate) fn matviews_visible_to(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &MatviewDef)> {
-        self.matviews
-            .iter()
-            .enumerate()
-            .filter(move |(_, matview)| {
-                matview.database == current_database() && matview.visible_to(txid)
-            })
+    ) -> impl Iterator<Item = (usize, MatviewDef)> + '_ {
+        MatviewIter {
+            catalog: &self.matviews,
+            next_slot: 0,
+            database: Some(current_database()),
+            txid,
+            checkpoint: false,
+        }
     }
 
-    pub(crate) fn matview(&self, slot: usize) -> &MatviewDef {
-        &self.matviews[slot]
+    pub(crate) fn matview(&self, slot: usize) -> MatviewDef {
+        self.matview_catalog()[slot]
     }
 
     pub(crate) fn matview_dependencies(&self, slot: usize) -> StoredQueryDependencyView<'_> {
@@ -35963,49 +36067,44 @@ impl Storage {
     }
 
     pub(crate) fn matview_count(&self) -> usize {
-        self.matviews.len()
+        self.matview_catalog().len()
     }
 
-    pub fn find_matview(&self, schema: &str, name: &str, txid: u32) -> Option<&MatviewDef> {
-        self.matviews.iter().find(|m| {
-            m.database == current_database()
-                && m.visible_to(txid)
-                && self.table_slot_visible_to(usize::from(m.backing_table), txid)
-                && {
-                    let table = self.table_def(usize::from(m.backing_table), txid);
-                    table.schema.as_str() == schema && table.name.as_str() == name
-                }
+    pub fn find_matview(&self, schema: &str, name: &str, txid: u32) -> Option<MatviewDef> {
+        self.matviews_visible_to(txid).find_map(|(_, definition)| {
+            (self.table_slot_visible_to(usize::from(definition.backing_table), txid) && {
+                let table = self.table_def(usize::from(definition.backing_table), txid);
+                table.schema.as_str() == schema && table.name.as_str() == name
+            })
+            .then_some(definition)
         })
     }
 
     /// The slot of a materialized view visible to `txid`, for later mutation
     /// (REFRESH marks it populated).
     pub fn matview_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        self.matviews.iter().position(|m| {
-            m.database == current_database()
-                && m.visible_to(txid)
-                && self.table_slot_visible_to(usize::from(m.backing_table), txid)
-                && {
-                    let table = self.table_def(usize::from(m.backing_table), txid);
+        self.matviews_visible_to(txid)
+            .find_map(|(slot, definition)| {
+                (self.table_slot_visible_to(usize::from(definition.backing_table), txid) && {
+                    let table = self.table_def(usize::from(definition.backing_table), txid);
                     table.schema.as_str() == schema && table.name.as_str() == name
-                }
-        })
+                })
+                .then_some(slot)
+            })
     }
 
     pub(crate) fn matview_table(&self, slot: usize) -> usize {
-        usize::from(self.matviews[slot].backing_table)
+        usize::from(self.matview(slot).backing_table)
     }
 
     pub(crate) fn matview_slot_for_table(&self, table: usize, txid: u32) -> Option<usize> {
-        self.matviews.iter().position(|matview| {
-            matview.database == current_database()
-                && matview.visible_to(txid)
-                && usize::from(matview.backing_table) == table
+        self.matviews_visible_to(txid).find_map(|(slot, matview)| {
+            (usize::from(matview.backing_table) == table).then_some(slot)
         })
     }
 
-    pub fn set_matview_populated(&mut self, slot: usize, populated: bool) {
-        self.matviews[slot].populated = populated;
+    pub fn set_matview_populated(&self, slot: usize, populated: bool) {
+        self.matview_catalog()[slot].populated = populated;
     }
 
     /// Registers a materialized view as an uncommitted CREATE owned by `txid`.
@@ -36025,25 +36124,28 @@ impl Storage {
                 "materialized view backing relation does not exist"
             ));
         }
-        if let Some(blocker) = self.matviews.iter().find_map(|m| {
+        let blocker = self.matview_catalog().iter().find_map(|m| {
             (m.database == current_database()
                 && m.ddl_state != CatalogDdlState::Absent
                 && m.backing_table == backing_table as u16)
                 .then_some(m.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
-        }) {
+        });
+        if let Some(blocker) = blocker {
             return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
-        let Some(new) = self
-            .matviews
-            .iter()
-            .position(|m| m.ddl_state == CatalogDdlState::Absent)
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many materialized views (limit {})",
-                self.matviews.len()
-            ));
+        let new = {
+            let matviews = self.matview_catalog();
+            matviews
+                .iter()
+                .position(|m| m.ddl_state == CatalogDdlState::Absent)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many materialized views (limit {})",
+                        matviews.len()
+                    )
+                })?
         };
         let ownership = self.initial_ownership(txid);
         self.clear_object_acl_entries(AccessObject {
@@ -36053,7 +36155,7 @@ impl Storage {
         let image = self.matview_dependency_image(new);
         let dependency_count = self.write_dependency_image(image, query.dependencies.view())?;
         let created_at = self.catalog_sequence.next();
-        self.matviews[new] = MatviewDef {
+        self.matview_catalog()[new] = MatviewDef {
             database: current_database(),
             created_at,
             backing_table: backing_table as u16,
@@ -36073,17 +36175,18 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if let Some(blocker) = self.matviews.iter().find_map(|m| {
+        let blocker = self.matview_catalog().iter().find_map(|m| {
             (m.database == current_database() && m.ddl_state != CatalogDdlState::Absent && {
                 let table = self.table_def(usize::from(m.backing_table), txid);
                 table.schema.as_str() == schema && table.name.as_str() == name
             })
             .then_some(m.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
-        }) {
+        });
+        if let Some(blocker) = blocker {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
-        let Some(i) = self.matviews.iter().position(|m| {
+        let Some(i) = self.matview_catalog().iter().position(|m| {
             m.database == current_database() && m.visible_to(txid) && {
                 let table = self.table_def(usize::from(m.backing_table), txid);
                 table.schema.as_str() == schema && table.name.as_str() == name
@@ -36096,19 +36199,21 @@ impl Storage {
     }
 
     fn pending_drop_matview(&mut self, slot: usize, txid: u32) {
-        let m = &mut self.matviews[slot];
+        let mut matviews = self.matview_catalog();
+        let m = &mut matviews[slot];
         m.ddl_state = m.ddl_state.drop_by(txid);
     }
 
     pub fn commit_matview_create(&mut self, slot: usize) {
-        self.matviews[slot].ddl_state = self.matviews[slot].ddl_state.commit_create();
+        let mut matviews = self.matview_catalog();
+        matviews[slot].ddl_state = matviews[slot].ddl_state.commit_create();
     }
 
     pub fn commit_matview_drop(&mut self, slot: usize) {
-        let definition = self.tables[usize::from(self.matviews[slot].backing_table)].def;
+        let definition = self.tables[usize::from(self.matview(slot).backing_table)].def;
         let (schema, name) = (definition.schema, definition.name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-        self.matviews[slot].ddl_state = self.matviews[slot].ddl_state.commit_drop();
+        self.matview_catalog()[slot] = MatviewDef::EMPTY;
         let image = self.matview_dependency_image(slot);
         self.stored_query_dependency_counts[image] = 0;
         self.clear_extension_dependencies_for_object(AccessObject {
@@ -36118,13 +36223,14 @@ impl Storage {
     }
 
     pub fn rollback_matview_create(&mut self, slot: usize) {
-        self.matviews[slot].ddl_state = self.matviews[slot].ddl_state.rollback_create();
+        self.matview_catalog()[slot] = MatviewDef::EMPTY;
         let image = self.matview_dependency_image(slot);
         self.stored_query_dependency_counts[image] = 0;
     }
 
     pub fn rollback_matview_drop(&mut self, slot: usize, txid: u32) {
-        let m = &mut self.matviews[slot];
+        let mut matviews = self.matview_catalog();
+        let m = &mut matviews[slot];
         m.ddl_state = m.ddl_state.rollback_drop(txid);
     }
 
@@ -51620,7 +51726,7 @@ mod tests {
         assert_eq!(brin_maintenance.unsummarized_ranges.len(), 6 * 70);
         drop(brin_maintenance);
         assert_eq!(storage.views.len(), 3);
-        assert_eq!(storage.matviews.len(), 4);
+        assert_eq!(storage.matview_count(), 4);
         assert_eq!(storage.routine_count(), 5);
         let committed_dependency_images = 7 + 8 + 5 + 4;
         assert_eq!(
@@ -54804,6 +54910,77 @@ mod tests {
                 .sqlstate,
             sqlstate::PROGRAM_LIMIT_EXCEEDED
         );
+    }
+
+    #[test]
+    fn materialized_view_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MatviewDef>();
+        assert_send_sync::<std::sync::Mutex<FixedVec<MatviewDef>>>();
+        assert_send_sync::<MatviewIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_materialized_views = WORKERS;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    let mut catalog = storage.matview_catalog();
+                    catalog[worker] = MatviewDef {
+                        database: current_database(),
+                        created_at: storage.catalog_sequence.next(),
+                        backing_table: worker as u16,
+                        sql: StackStr::from_str("SELECT 1"),
+                        creation_path: StackStr::from_str("public"),
+                        ownership: Ownership::BOOTSTRAP,
+                        populated: false,
+                        ddl_state: CatalogDdlState::Present,
+                    };
+                });
+            }
+        });
+
+        assert_eq!(storage.matviews_visible_to(0).count(), WORKERS);
+        assert_eq!(storage.checkpoint_matviews().count(), WORKERS);
+        assert_eq!(storage.matview_count(), config.max_materialized_views);
+        for (slot, definition) in storage.matviews_visible_to(0) {
+            assert_eq!(storage.matview(slot).created_at, definition.created_at);
+        }
+
+        std::thread::scope(|scope| {
+            for slot in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || storage.set_matview_populated(slot, true));
+            }
+        });
+        assert!(
+            storage
+                .live_matviews()
+                .all(|definition| definition.populated)
+        );
+
+        {
+            let mut catalog = storage.matview_catalog();
+            catalog[0].ddl_state = CatalogDdlState::PendingCreate { txid: 10 };
+            catalog[0].ownership.pending = Some(PendingOwnership {
+                txid: 10,
+                owner: BOOTSTRAP_ROLE,
+            });
+        }
+        storage.rollback_matview_create(0);
+        let empty = storage.matview(0);
+        assert_eq!(empty.database, DatabaseOid::POSTGRES);
+        assert_eq!(empty.created_at, 0);
+        assert_eq!(empty.backing_table, u16::MAX);
+        assert!(empty.sql.as_str().is_empty());
+        assert!(empty.creation_path.as_str().is_empty());
+        assert_eq!(empty.ownership, Ownership::BOOTSTRAP);
+        assert!(!empty.populated);
+        assert_eq!(empty.ddl_state, CatalogDdlState::Absent);
     }
 
     #[test]

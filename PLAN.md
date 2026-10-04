@@ -661,6 +661,17 @@ progress, exact retained capacities, loud exhaustion, complete slot reuse, and
 containers and row mutation paths still require synchronization before fixed
 workers can overlap execution.
 
+Materialized-view definitions now share one startup-bounded mutex. DDL,
+database cloning and removal, schema rewrite, ownership, refresh, checkpoint,
+catalog, and dependency reads observe complete definition images. Iterators
+copy one fixed definition and release the mutex before nested table,
+dependency, role, comment, or checkpoint work. Four-worker publication and
+refresh, nested-reader progress, exact retained capacity, complete slot reuse,
+and `Send + Sync` have direct coverage. Stored-query dependency images remain
+in their shared fixed catalog and are a separate synchronization boundary.
+The remaining catalog definition containers and row mutation paths still
+require synchronization before fixed workers can overlap execution.
+
 Instrumented SQL differential coverage now divides the corpus into six
 deterministic slices after three and then four slices exhausted the fixed
 15-minute worker budget while still making normal progress. The CI guard pins

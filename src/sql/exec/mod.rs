@@ -38559,7 +38559,7 @@ pub fn refresh_materialized_view(
         ));
     };
     // Copy the stored query out before mutating storage.
-    let matview = storage.matview(slot).clone();
+    let matview = storage.matview(slot);
     let sql = match arena.alloc_str(matview.sql.as_str()) {
         Ok(s) => s,
         Err(_) => {

@@ -322,6 +322,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   role, relation, ACL, comment, WAL, checkpoint, or catalog work. Conflicting
   creates and alterations return named transaction wait errors, and terminal
   create, drop, and replay paths clear complete reusable entries.
+- Materialized-view definitions share one startup-bounded mutex. Readers copy
+  complete definitions before nested table, dependency, role, comment, or
+  checkpoint work, and terminal create and drop paths clear complete reusable
+  entries.
 - Sequence catalogs are startup-sized through `max_sequences` across durable
   definitions, per-session `currval`/`lastval` and cache state, dependency
   planning, `DROP OWNED`, identity cleanup, catalogs, WAL, checkpoints, and

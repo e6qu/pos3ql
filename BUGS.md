@@ -974,5 +974,16 @@ the caller-visible identity. Four-worker publication, nested-reader
 progress, exact retained capacities, loud exhaustion, complete slot reuse, and
 `Send + Sync` have direct coverage.
 
+The materialized-view catalog audit found definition, ownership, population,
+and existence state in an unsynchronized fixed vector. Concurrent refresh,
+DDL, database lifecycle, schema rewrite, ownership, checkpoint, catalog, and
+dependency work could lose updates or observe fields from different
+transitions. One startup-bounded mutex now owns complete definitions, and
+readers copy one entry before nested work. Committed drops and rolled-back
+creates clear the complete reusable slot. Four-worker publication and refresh,
+nested-reader progress, exact retained capacity, complete slot reuse, and
+`Send + Sync` have direct coverage. Stored-query dependency images remain in
+their shared fixed catalog for a separate synchronization pass.
+
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

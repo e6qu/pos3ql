@@ -303,7 +303,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   object-cold recovery cover the declared capacities. A single `DROP SCHEMA`
   accepts the parser's complete bounded target list, and bulk tablespace,
   REINDEX, and CLUSTER scratch is sized from actual configured table
-  cardinality rather than an unrelated schema/column product.
+  cardinality rather than an unrelated schema/column product. Schema identity,
+  database binding, ownership, and existence share one startup-bounded mutex.
+  DDL conflicts use the transaction wait boundary, readers copy definitions
+  before nested work, and terminal create and drop paths clear reusable slots.
 - Tablespace definitions, transaction-local names and options, ownership, and
   existence share one startup-bounded catalog sized by `max_tablespaces`.
   DDL conflicts use the transaction wait boundary, readers copy definitions

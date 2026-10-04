@@ -11058,9 +11058,43 @@ pub struct SchemaDef {
 }
 
 impl SchemaDef {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        name: SqlName::EMPTY,
+        ownership: Ownership::BOOTSTRAP,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
     /// Whether `txid` sees this schema exist.
     pub fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
+    }
+
+    fn pending_owner_other_than(&self, txid: u32) -> Option<u32> {
+        [
+            self.ddl_state.pending_txid(),
+            self.ownership.pending.map(|pending| pending.txid),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|owner| *owner != txid)
+    }
+}
+
+struct SchemaIter<'a> {
+    catalog: &'a std::sync::Mutex<FixedVec<SchemaDef>>,
+    next_slot: usize,
+}
+
+impl Iterator for SchemaIter<'_> {
+    type Item = (usize, SchemaDef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("schema catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = catalog.get(slot).copied()?;
+        self.next_slot += 1;
+        Some((slot, definition))
     }
 }
 
@@ -13172,7 +13206,7 @@ pub struct Storage {
     /// must reject them before state can outlive the owning connection.
     temporary_transactions: std::sync::Mutex<TemporaryTransactionState>,
     tablespaces: std::sync::Mutex<FixedVec<TablespaceDef>>,
-    schemas: FixedVec<SchemaDef>,
+    schemas: std::sync::Mutex<FixedVec<SchemaDef>>,
     extensions: FixedVec<ExtensionDef>,
     extension_dependencies: FixedVec<ExtensionDependency>,
     extension_configs: FixedVec<ExtensionConfig>,
@@ -17755,7 +17789,7 @@ impl Storage {
             }),
             temporary_transactions,
             tablespaces: std::sync::Mutex::new(tablespaces),
-            schemas,
+            schemas: std::sync::Mutex::new(schemas),
             extensions,
             extension_dependencies,
             extension_configs,
@@ -18590,27 +18624,40 @@ impl Storage {
     /// Committed-catalog schema lookup (ignores uncommitted DDL): journal
     /// replay and the durable image.
     pub fn find_schema(&self, name: &str) -> Option<usize> {
-        self.schemas.iter().position(|schema| {
-            schema.database == current_database()
-                && schema.ddl_state == CatalogDdlState::Present
-                && schema.name.as_str() == name
-        })
+        self.schemas
+            .lock()
+            .expect("schema catalog lock poisoned")
+            .iter()
+            .position(|schema| {
+                schema.database == current_database()
+                    && schema.ddl_state == CatalogDdlState::Present
+                    && schema.name.as_str() == name
+            })
     }
 
     /// Transaction-scoped schema lookup: `txid` sees its own uncommitted
     /// CREATE/DROP and every committed schema.
     pub fn find_schema_visible(&self, name: &str, txid: u32) -> Option<usize> {
-        self.schemas.iter().position(|n| {
-            n.database == current_database() && n.visible_to(txid) && n.name.as_str() == name
-        })
+        self.schemas
+            .lock()
+            .expect("schema catalog lock poisoned")
+            .iter()
+            .position(|schema| {
+                schema.database == current_database()
+                    && schema.visible_to(txid)
+                    && schema.name.as_str() == name
+            })
     }
 
-    pub fn schema_def(&self, slot: usize) -> &SchemaDef {
-        &self.schemas[slot]
+    pub fn schema_def(&self, slot: usize) -> SchemaDef {
+        self.schemas.lock().expect("schema catalog lock poisoned")[slot]
     }
 
     pub(crate) fn schema_count(&self) -> usize {
-        self.schemas.len()
+        self.schemas
+            .lock()
+            .expect("schema catalog lock poisoned")
+            .len()
     }
 
     pub(crate) fn schema_drop_object_count(&self, txid: u32) -> usize {
@@ -18875,17 +18922,19 @@ impl Storage {
             // Catalog collation identities are one byte. Configuration rejects
             // capacities above the representable range before allocation.
             let mut collation_slots = [u8::MAX; u8::MAX as usize];
-            for source_slot in 0..self.schemas.len() {
-                let source_schema = self.schemas[source_slot];
+            for source_slot in 0..self.schema_count() {
+                let source_schema = self.schema_def(source_slot);
                 if source_schema.database != source
                     || source_schema.ddl_state != CatalogDdlState::Present
                     || source_schema.name.as_str().starts_with("pg_temp_")
                 {
                     continue;
                 }
-                let target_slot =
-                    self.alloc_schema(source_schema.name, CatalogDdlState::PendingCreate { txid })?;
-                self.schemas[target_slot].ownership = source_schema.ownership.committed();
+                self.alloc_schema(
+                    source_schema.name,
+                    CatalogDdlState::PendingCreate { txid },
+                    Some(source_schema.ownership.committed()),
+                )?;
             }
 
             let mut text_catalog = self
@@ -20030,7 +20079,7 @@ impl Storage {
                     self.matviews[usize::from(entry.object.slot)].database
                 }
                 AccessClass::Sequence => self.sequence(usize::from(entry.object.slot)).database,
-                AccessClass::Schema => self.schemas[usize::from(entry.object.slot)].database,
+                AccessClass::Schema => self.schema_def(usize::from(entry.object.slot)).database,
                 AccessClass::Domain => self.domain(usize::from(entry.object.slot)).database,
                 AccessClass::Enum => self.enum_for(usize::from(entry.object.slot), 0).database,
                 AccessClass::Index => self.indexes[usize::from(entry.object.slot)].database,
@@ -20170,11 +20219,19 @@ impl Storage {
             self.tables[slot].pending_ddl = None;
             self.tables[slot].database = DatabaseOid::POSTGRES;
         }
-        for schema in self.schemas.iter_mut() {
+        for (slot, schema) in self
+            .schemas
+            .lock()
+            .expect("schema catalog lock poisoned")
+            .iter_mut()
+            .enumerate()
+        {
             if schema.database == database {
-                schema.ddl_state = CatalogDdlState::Absent;
-                schema.name = SqlName::EMPTY;
-                schema.database = DatabaseOid::POSTGRES;
+                self.clear_object_acl_entries(AccessObject {
+                    class: AccessClass::Schema,
+                    slot: slot as u16,
+                });
+                *schema = SchemaDef::EMPTY;
             }
         }
         macro_rules! clear_catalog {
@@ -20429,7 +20486,12 @@ impl Storage {
             .ddl_state
             .pending_txid()
             .expect("database create owns its catalog clone");
-        for schema in self.schemas.iter_mut() {
+        for schema in self
+            .schemas
+            .lock()
+            .expect("schema catalog lock poisoned")
+            .iter_mut()
+        {
             if schema.database == database
                 && schema.ddl_state == (CatalogDdlState::PendingCreate { txid })
             {
@@ -20855,7 +20917,7 @@ impl Storage {
             AccessClass::View => self.views[slot].ownership,
             AccessClass::MaterializedView => self.matviews[slot].ownership,
             AccessClass::Sequence => self.sequence(slot).ownership,
-            AccessClass::Schema => self.schemas[slot].ownership,
+            AccessClass::Schema => self.schema_def(slot).ownership,
             AccessClass::Domain => self.domain(slot).ownership,
             AccessClass::Enum => self.enum_for(slot, 0).ownership,
             AccessClass::Index => self.indexes[slot].ownership,
@@ -20890,7 +20952,9 @@ impl Storage {
             AccessClass::Sequence => {
                 unreachable!("sequence ownership is synchronized separately")
             }
-            AccessClass::Schema => &mut self.schemas[slot].ownership,
+            AccessClass::Schema => {
+                unreachable!("schema ownership is synchronized separately")
+            }
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => {
                 unreachable!("type ownership is synchronized separately")
             }
@@ -21326,7 +21390,7 @@ impl Storage {
                 let definition = self.sequence_for(slot, txid);
                 (definition.schema, definition.name)
             }
-            AccessClass::Schema => (SqlName::EMPTY, self.schemas[slot].name),
+            AccessClass::Schema => (SqlName::EMPTY, self.schema_def(slot).name),
             AccessClass::Domain => {
                 let definition = self.domain_for(slot, txid);
                 (definition.schema, definition.name)
@@ -21404,7 +21468,7 @@ impl Storage {
                 self.matviews[slot].ddl_state == CatalogDdlState::Present
             }
             AccessClass::Sequence => self.sequence(slot).ddl_state == CatalogDdlState::Present,
-            AccessClass::Schema => self.schemas[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Schema => self.schema_def(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Domain => self.domain(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Enum => self.enum_for(slot, 0).ddl_state == CatalogDdlState::Present,
             AccessClass::Index => self.indexes[slot].ddl_state == CatalogDdlState::Present,
@@ -21445,7 +21509,7 @@ impl Storage {
             AccessClass::View => self.views[slot].visible_to(txid),
             AccessClass::MaterializedView => self.matviews[slot].visible_to(txid),
             AccessClass::Sequence => self.sequence(slot).visible_to(txid),
-            AccessClass::Schema => self.schemas[slot].visible_to(txid),
+            AccessClass::Schema => self.schema_def(slot).visible_to(txid),
             AccessClass::Domain => self.domain(slot).visible_to(txid),
             AccessClass::Enum => self.enum_for(slot, txid).visible_to(txid),
             AccessClass::Index => self.indexes[slot].visible_to(txid),
@@ -21478,7 +21542,7 @@ impl Storage {
             AccessClass::View => Some(self.views[slot].database),
             AccessClass::MaterializedView => Some(self.matviews[slot].database),
             AccessClass::Sequence => Some(self.sequence(slot).database),
-            AccessClass::Schema => Some(self.schemas[slot].database),
+            AccessClass::Schema => Some(self.schema_def(slot).database),
             AccessClass::Domain => Some(self.domain(slot).database),
             AccessClass::Enum => Some(self.enum_for(slot, 0).database),
             AccessClass::Index => Some(self.indexes[slot].database),
@@ -21507,8 +21571,9 @@ impl Storage {
         let source_slot = usize::from(source.slot);
         let target_slot = match source.class {
             AccessClass::Schema => {
-                let name = self.schemas[source_slot].name;
-                self.schemas.iter().position(|candidate| {
+                let schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+                let name = schemas[source_slot].name;
+                schemas.iter().position(|candidate| {
                     candidate.database == target_database
                         && candidate.ddl_state != CatalogDdlState::Absent
                         && candidate.name == name
@@ -21668,11 +21733,12 @@ impl Storage {
         })
     }
 
-    pub(crate) fn checkpoint_schemas(&self) -> impl Iterator<Item = (usize, &SchemaDef)> {
-        self.schemas
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    pub(crate) fn checkpoint_schemas(&self) -> impl Iterator<Item = (usize, SchemaDef)> + '_ {
+        SchemaIter {
+            catalog: &self.schemas,
+            next_slot: 0,
+        }
+        .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn checkpoint_domains(&self) -> impl Iterator<Item = (usize, DomainDef)> + '_ {
@@ -21985,7 +22051,7 @@ impl Storage {
             AccessClass::View => self.views.len(),
             AccessClass::MaterializedView => self.matviews.len(),
             AccessClass::Sequence => self.sequence_count(),
-            AccessClass::Schema => self.schemas.len(),
+            AccessClass::Schema => self.schema_count(),
             AccessClass::Domain => self.domain_count(),
             AccessClass::Enum => self.enum_count(),
             AccessClass::Index => self.indexes.len(),
@@ -22045,7 +22111,7 @@ impl Storage {
             (AccessClass::View, self.views.len()),
             (AccessClass::MaterializedView, self.matviews.len()),
             (AccessClass::Sequence, self.sequence_count()),
-            (AccessClass::Schema, self.schemas.len()),
+            (AccessClass::Schema, self.schema_count()),
             (AccessClass::Domain, self.domain_count()),
             (AccessClass::Enum, self.enum_count()),
             (AccessClass::Index, self.indexes.len()),
@@ -22149,6 +22215,32 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let ownership = &mut tablespaces[slot].ownership;
+        let prior = ownership.pending;
+        if txid == 0 {
+            ownership.owner = owner as u16;
+            ownership.pending = None;
+        } else {
+            ownership.pending = Some(PendingOwnership {
+                txid,
+                owner: owner as u16,
+            });
+        }
+        Ok(prior)
+    }
+
+    pub(crate) fn set_schema_owner(
+        &self,
+        slot: usize,
+        owner: usize,
+        txid: u32,
+    ) -> Result<Option<PendingOwnership>, SqlError> {
+        let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+        if let Some(blocker) = schemas[slot].pending_owner_other_than(txid) {
+            let name = schemas[slot].name;
+            drop(schemas);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let ownership = &mut schemas[slot].ownership;
         let prior = ownership.pending;
         if txid == 0 {
             ownership.owner = owner as u16;
@@ -22266,6 +22358,9 @@ impl Storage {
         }
         if object.class == AccessClass::Tablespace {
             unreachable!("tablespace ownership is synchronized separately");
+        }
+        if object.class == AccessClass::Schema {
+            unreachable!("schema ownership is synchronized separately");
         }
         if matches!(
             object.class,
@@ -22398,6 +22493,17 @@ impl Storage {
             }
             return;
         }
+        if object.class == AccessClass::Schema {
+            let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+            let ownership = &mut schemas[usize::from(object.slot)].ownership;
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            return;
+        }
         if matches!(
             object.class,
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite
@@ -22457,6 +22563,12 @@ impl Storage {
                 .expect("tablespace catalog lock poisoned")[usize::from(object.slot)]
             .ownership
             .pending = prior;
+            return;
+        }
+        if object.class == AccessClass::Schema {
+            self.schemas.lock().expect("schema catalog lock poisoned")[usize::from(object.slot)]
+                .ownership
+                .pending = prior;
             return;
         }
         if object.class == AccessClass::Routine {
@@ -25110,17 +25222,23 @@ impl Storage {
 
     /// Committed schemas with their slot indices, for checkpoint and catalog
     /// output.
-    pub fn live_schemas(&self) -> impl Iterator<Item = (usize, &SchemaDef)> {
-        self.schemas.iter().enumerate().filter(|(_, schema)| {
+    pub fn live_schemas(&self) -> impl Iterator<Item = (usize, SchemaDef)> + '_ {
+        SchemaIter {
+            catalog: &self.schemas,
+            next_slot: 0,
+        }
+        .filter(|(_, schema)| {
             schema.database == current_database() && schema.ddl_state == CatalogDdlState::Present
         })
     }
 
     /// Schemas visible to `txid`, for catalog output inside a transaction.
-    pub fn visible_schemas(&self, txid: u32) -> impl Iterator<Item = (usize, &SchemaDef)> {
-        self.schemas.iter().enumerate().filter(move |(_, schema)| {
-            schema.database == current_database() && schema.visible_to(txid)
-        })
+    pub fn visible_schemas(&self, txid: u32) -> impl Iterator<Item = (usize, SchemaDef)> + '_ {
+        SchemaIter {
+            catalog: &self.schemas,
+            next_slot: 0,
+        }
+        .filter(move |(_, schema)| schema.database == current_database() && schema.visible_to(txid))
     }
 
     // --- Object comments (`COMMENT ON ...`) ---
@@ -25569,19 +25687,12 @@ impl Storage {
 
     /// Committed create (journal replay): the schema is immediately part of
     /// the durable image.
-    pub fn create_schema(&mut self, name: SqlName) -> Result<usize, SqlError> {
-        if self.find_schema(name.as_str()).is_some() {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_SCHEMA,
-                "schema \"{}\" already exists",
-                name.as_str()
-            ));
-        }
-        self.alloc_schema(name, CatalogDdlState::Present)
+    pub fn create_schema(&self, name: SqlName) -> Result<usize, SqlError> {
+        self.alloc_schema(name, CatalogDdlState::Present, None)
     }
 
     /// Transactional create: the schema exists only for `txid` until commit.
-    pub fn create_schema_in(&mut self, name: SqlName, txid: u32) -> Result<usize, SqlError> {
+    pub fn create_schema_in(&self, name: SqlName, txid: u32) -> Result<usize, SqlError> {
         let role = self.current_role_slot(txid).ok_or_else(|| {
             sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -25596,50 +25707,50 @@ impl Storage {
                 database.name.as_str()
             ));
         }
-        if self.find_schema_visible(name.as_str(), txid).is_some() {
+        self.alloc_schema(name, CatalogDdlState::PendingCreate { txid }, None)
+    }
+
+    fn alloc_schema(
+        &self,
+        name: SqlName,
+        ddl_state: CatalogDdlState,
+        ownership: Option<Ownership>,
+    ) -> Result<usize, SqlError> {
+        let txid = ddl_state.pending_txid().unwrap_or(0);
+        let ownership = ownership.unwrap_or_else(|| self.initial_ownership(txid));
+        let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+        if let Some(blocker) = schemas.iter().find_map(|schema| {
+            (schema.database == current_database() && schema.name == name)
+                .then(|| schema.pending_owner_other_than(txid))
+                .flatten()
+        }) {
+            drop(schemas);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        if schemas.iter().any(|schema| {
+            schema.database == current_database() && schema.visible_to(txid) && schema.name == name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_SCHEMA,
                 "schema \"{}\" already exists",
                 name.as_str()
             ));
         }
-        if let Some(owner) = self.schemas.iter().find_map(|schema| {
-            (schema.database == current_database() && schema.name.as_str() == name.as_str())
-                .then_some(schema.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
-        }) {
-            self.wait_for_transaction(txid, owner)?;
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
-                "statement is waiting for concurrent DDL on schema \"{}\"",
-                name.as_str(),
-            ));
-        }
-        self.alloc_schema(name, CatalogDdlState::PendingCreate { txid })
-    }
-
-    fn alloc_schema(
-        &mut self,
-        name: SqlName,
-        ddl_state: CatalogDdlState,
-    ) -> Result<usize, SqlError> {
-        let Some(slot) = self
-            .schemas
+        let Some(slot) = schemas
             .iter()
             .position(|schema| schema.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many schemas (limit {})",
-                self.schemas.len()
+                schemas.len()
             ));
         };
-        let ownership = self.initial_ownership(ddl_state.pending_txid().unwrap_or(0));
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Schema,
             slot: slot as u16,
         });
-        self.schemas[slot] = SchemaDef {
+        schemas[slot] = SchemaDef {
             database: current_database(),
             name,
             ownership,
@@ -25649,40 +25760,67 @@ impl Storage {
     }
 
     /// Committed drop (journal replay).
-    pub fn drop_schema(&mut self, slot: usize) {
-        let name = self.schemas[slot].name;
+    pub fn drop_schema(&self, slot: usize) {
+        let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+        let name = schemas[slot].name;
         self.drop_object_comments(CommentClass::Schema, "", name.as_str());
-        self.schemas[slot].ddl_state = CatalogDdlState::Absent;
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Schema,
+            slot: slot as u16,
+        });
+        schemas[slot] = SchemaDef::EMPTY;
     }
 
     /// Transactional drop: the schema stays visible to other transactions
     /// until `txid` commits. The owner's own pending-create evaporates.
-    pub fn drop_schema_in(&mut self, slot: usize, txid: u32) {
-        let schema = &mut self.schemas[slot];
+    pub fn drop_schema_in(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+        if let Some(blocker) = schemas[slot].pending_owner_other_than(txid) {
+            let name = schemas[slot].name;
+            drop(schemas);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+        }
+        let schema = &mut schemas[slot];
         schema.ddl_state = schema.ddl_state.drop_by(txid);
+        Ok(())
     }
 
     /// Promotes an uncommitted CREATE SCHEMA into the committed catalog.
-    pub fn commit_schema_create(&mut self, slot: usize) {
-        self.schemas[slot].ddl_state = self.schemas[slot].ddl_state.commit_create();
+    pub fn commit_schema_create(&self, slot: usize) {
+        let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+        schemas[slot].ddl_state = schemas[slot].ddl_state.commit_create();
+        schemas[slot].ownership = schemas[slot].ownership.committed();
     }
 
     /// Applies a committed DROP SCHEMA.
-    pub fn commit_schema_drop(&mut self, slot: usize) {
-        let name = self.schemas[slot].name;
+    pub fn commit_schema_drop(&self, slot: usize) {
+        let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+        let name = schemas[slot].name;
         self.drop_object_comments(CommentClass::Schema, "", name.as_str());
-        self.schemas[slot].ddl_state = self.schemas[slot].ddl_state.commit_drop();
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Schema,
+            slot: slot as u16,
+        });
+        schemas[slot] = SchemaDef::EMPTY;
     }
 
     /// Rolls back an uncommitted CREATE SCHEMA, freeing the slot.
-    pub fn rollback_schema_create(&mut self, slot: usize) {
-        self.schemas[slot].ddl_state = self.schemas[slot].ddl_state.rollback_create();
+    pub fn rollback_schema_create(&self, slot: usize) {
+        let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+        if schemas[slot].ddl_state.rollback_create() == CatalogDdlState::Absent {
+            self.clear_object_acl_entries(AccessObject {
+                class: AccessClass::Schema,
+                slot: slot as u16,
+            });
+            schemas[slot] = SchemaDef::EMPTY;
+        }
     }
 
     /// Rolls back an uncommitted DROP SCHEMA: it returns to the committed
     /// image unchanged.
-    pub fn rollback_schema_drop(&mut self, slot: usize, txid: u32) {
-        self.schemas[slot].ddl_state = self.schemas[slot].ddl_state.rollback_drop(txid);
+    pub fn rollback_schema_drop(&self, slot: usize, txid: u32) {
+        let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+        schemas[slot].ddl_state = schemas[slot].ddl_state.rollback_drop(txid);
     }
 
     /// Rename one namespace and every durable identity that names it. Catalog
@@ -25692,11 +25830,12 @@ impl Storage {
         slot: usize,
         name: SqlName,
     ) -> Result<SqlName, SqlError> {
-        let prior = self.schemas[slot].name;
+        let mut schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+        let prior = schemas[slot].name;
         if prior == name {
             return Ok(prior);
         }
-        if self.schemas.iter().enumerate().any(|(other, schema)| {
+        if schemas.iter().enumerate().any(|(other, schema)| {
             other != slot
                 && schema.database == current_database()
                 && schema.ddl_state != CatalogDdlState::Absent
@@ -25802,7 +25941,8 @@ impl Storage {
             }
         }
 
-        self.schemas[slot].name = name;
+        schemas[slot].name = name;
+        drop(schemas);
 
         for table_slot in 0..self.tables.len() {
             if self.tables[table_slot].database != current_database() {
@@ -26190,7 +26330,7 @@ impl Storage {
         version: ExtensionVersion,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if namespace >= self.schemas.len() || !self.schemas[namespace].visible_to(txid) {
+        if namespace >= self.schema_count() || !self.schema_def(namespace).visible_to(txid) {
             return Err(sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
                 "schema for extension \"{}\" does not exist",
@@ -26304,7 +26444,7 @@ impl Storage {
         version: ExtensionVersion,
         txid: u32,
     ) -> Result<Option<PendingExtensionDefinition>, SqlError> {
-        if namespace >= self.schemas.len() || !self.schemas[namespace].visible_to(txid) {
+        if namespace >= self.schema_count() || !self.schema_def(namespace).visible_to(txid) {
             return Err(sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
                 "schema does not exist"
@@ -26910,7 +27050,7 @@ impl Storage {
                     }
                 }
                 PathEntry::Schema(slot) => {
-                    let schema_name = self.schemas[*slot as usize].name;
+                    let schema_name = self.schema_def(*slot as usize).name;
                     if let Some(found) = self.relation_in(schema_name.as_str(), name, txid) {
                         return Some(found);
                     }
@@ -26922,7 +27062,7 @@ impl Storage {
 
     pub(crate) fn schema_is_on_path(&self, schema: SqlName) -> bool {
         self.path().entries().iter().any(|entry| {
-            matches!(entry, PathEntry::Schema(slot) if self.schemas[*slot as usize].name == schema)
+            matches!(entry, PathEntry::Schema(slot) if self.schema_def(*slot as usize).name == schema)
         })
     }
 
@@ -27009,7 +27149,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
-                let schema_name = self.schemas[*slot as usize].name;
+                let schema_name = self.schema_def(*slot as usize).name;
                 if let Some(k) = self.relation_kind_in(schema_name.as_str(), name, txid) {
                     return Some((schema_name, k));
                 }
@@ -27071,7 +27211,7 @@ impl Storage {
                 "no schema has been selected to create in"
             ));
         };
-        Ok(self.schemas[slot as usize].name)
+        Ok(self.schema_def(slot as usize).name)
     }
 
     /// Live SQL tables with their slot indices, excluding internal storage.
@@ -35776,7 +35916,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
-                let schema_name = self.schemas[*slot as usize].name;
+                let schema_name = self.schema_def(*slot as usize).name;
                 if let Some(found) = self.sequence_slot(schema_name.as_str(), name, txid) {
                     return Some(found);
                 }
@@ -36399,7 +36539,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
-                let schema = self.schemas[*slot as usize].name;
+                let schema = self.schema_def(*slot as usize).name;
                 if let Some(i) = (DomainIter {
                     catalog: &self.type_catalog,
                     next_slot: 0,
@@ -37600,7 +37740,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(slot) = entry {
-                let schema = self.schemas[*slot as usize].name;
+                let schema = self.schema_def(*slot as usize).name;
                 if let Some(i) = (EnumIter {
                     catalog: &self.type_catalog,
                     next_slot: 0,
@@ -38452,7 +38592,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            let schema = self.schemas[*schema_slot as usize].name;
+            let schema = self.schema_def(*schema_slot as usize).name;
             if let Some(slot) = self.composite_slot(schema.as_str(), name, txid) {
                 return Some(slot);
             }
@@ -38492,7 +38632,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            let schema = self.schemas[*schema_slot as usize].name;
+            let schema = self.schema_def(*schema_slot as usize).name;
             if let Some(target) = self.alter_type_target_in_schema(schema.as_str(), name, txid) {
                 return Some(target);
             }
@@ -40049,7 +40189,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
-            resolve(self.schemas[*slot as usize].name.as_str(), name)
+            resolve(self.schema_def(*slot as usize).name.as_str(), name)
         })
     }
 
@@ -40082,7 +40222,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
-            resolve(self.schemas[*slot as usize].name.as_str(), name)
+            resolve(self.schema_def(*slot as usize).name.as_str(), name)
         })
     }
 
@@ -40115,7 +40255,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
-            resolve(self.schemas[*slot as usize].name.as_str(), name)
+            resolve(self.schema_def(*slot as usize).name.as_str(), name)
         })
     }
 
@@ -40331,7 +40471,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            let schema = self.schemas[*schema_slot as usize].name;
+            let schema = self.schema_def(*schema_slot as usize).name;
             if let Some(expected) = resolve(schema.as_str(), name) {
                 return Some(expected);
             }
@@ -40491,7 +40631,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return false;
             };
-            matches(self.schemas[*slot as usize].name.as_str(), name)
+            matches(self.schema_def(*slot as usize).name.as_str(), name)
         })
     }
 
@@ -40588,7 +40728,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
-            resolve(self.schemas[*slot as usize].name.as_str(), name)
+            resolve(self.schema_def(*slot as usize).name.as_str(), name)
         })
     }
 
@@ -40625,7 +40765,7 @@ impl Storage {
             let PathEntry::Schema(slot) = entry else {
                 return None;
             };
-            resolve(self.schemas[*slot as usize].name.as_str(), name)
+            resolve(self.schema_def(*slot as usize).name.as_str(), name)
         })
     }
 
@@ -40754,7 +40894,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            let schema = self.schemas[*schema_slot as usize].name;
+            let schema = self.schema_def(*schema_slot as usize).name;
             if let Some(expected) = resolve(schema.as_str(), name) {
                 return Some(expected);
             }
@@ -40785,7 +40925,7 @@ impl Storage {
                 return None;
             };
             self.routine_slot_in(
-                self.schemas[*slot as usize].name.as_str(),
+                self.schema_def(*slot as usize).name.as_str(),
                 name,
                 argument_types,
                 txid,
@@ -40809,7 +40949,7 @@ impl Storage {
                 return None;
             };
             self.routine_slot_in_oids(
-                self.schemas[*slot as usize].name.as_str(),
+                self.schema_def(*slot as usize).name.as_str(),
                 name,
                 argument_type_oids,
                 txid,
@@ -43235,7 +43375,7 @@ impl Storage {
         }
         self.path().entries().iter().find_map(|entry| match entry {
             PathEntry::Schema(slot) => self.extended_statistics_slot(
-                self.schemas[*slot as usize].name.as_str(),
+                self.schema_def(*slot as usize).name.as_str(),
                 name,
                 txid,
             ),
@@ -43846,7 +43986,7 @@ impl Storage {
         }
         self.path().entries().iter().find_map(|entry| match entry {
             PathEntry::Schema(slot) => {
-                self.index_slot(self.schemas[*slot as usize].name.as_str(), name, txid)
+                self.index_slot(self.schema_def(*slot as usize).name.as_str(), name, txid)
             }
             PathEntry::Catalog => None,
         })
@@ -47209,7 +47349,7 @@ impl Storage {
             None => self.path().entries().iter().find_map(|entry| match entry {
                 PathEntry::Schema(slot) => self.text_search_slot(
                     kind,
-                    self.schemas[*slot as usize].name.as_str(),
+                    self.schema_def(*slot as usize).name.as_str(),
                     name,
                     txid,
                 ),
@@ -47262,7 +47402,7 @@ impl Storage {
             Some(schema) => self.collation_slot(schema, name, txid),
             None => self.path().entries().iter().find_map(|entry| match entry {
                 PathEntry::Schema(slot) => {
-                    self.collation_slot(self.schemas[*slot as usize].name.as_str(), name, txid)
+                    self.collation_slot(self.schema_def(*slot as usize).name.as_str(), name, txid)
                 }
                 PathEntry::Catalog => None,
             }),
@@ -47306,7 +47446,7 @@ impl Storage {
             Some(schema) => self.conversion_slot(schema, name, txid),
             None => self.path().entries().iter().find_map(|entry| match entry {
                 PathEntry::Schema(slot) => {
-                    self.conversion_slot(self.schemas[*slot as usize].name.as_str(), name, txid)
+                    self.conversion_slot(self.schema_def(*slot as usize).name.as_str(), name, txid)
                 }
                 PathEntry::Catalog => None,
             }),
@@ -47323,7 +47463,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 return None;
             };
-            let schema = self.schemas[*schema_slot as usize].name;
+            let schema = self.schema_def(*schema_slot as usize).name;
             self.conversions_visible_to(txid)
                 .find_map(|(_, definition)| {
                     (definition.schema == schema
@@ -49184,7 +49324,7 @@ impl Storage {
 
     fn operator_schema_matches_path(&self, schema: SqlName) -> bool {
         self.path().entries().iter().any(|entry| match entry {
-            PathEntry::Schema(slot) => self.schemas[*slot as usize].name == schema,
+            PathEntry::Schema(slot) => self.schema_def(*slot as usize).name == schema,
             PathEntry::Catalog => false,
         })
     }
@@ -49288,7 +49428,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            if let Some(expected) = resolve(self.schemas[*schema_slot as usize].name.as_str()) {
+            if let Some(expected) = resolve(self.schema_def(*schema_slot as usize).name.as_str()) {
                 return Some(expected);
             }
         }
@@ -49330,7 +49470,7 @@ impl Storage {
             let PathEntry::Schema(schema_slot) = entry else {
                 continue;
             };
-            if let Some(expected) = resolve(self.schemas[*schema_slot as usize].name.as_str()) {
+            if let Some(expected) = resolve(self.schema_def(*schema_slot as usize).name.as_str()) {
                 return Some(expected);
             }
         }
@@ -49736,7 +49876,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(schema_slot) = entry {
-                let schema = self.schemas[*schema_slot as usize].name;
+                let schema = self.schema_def(*schema_slot as usize).name;
                 if let Some(slot) = self.operator_family_slot_exact(schema.as_str(), name, txid) {
                     return Some(slot);
                 }
@@ -50121,7 +50261,7 @@ impl Storage {
         }
         for entry in self.path().entries() {
             if let PathEntry::Schema(schema_slot) = entry {
-                let schema = self.schemas[*schema_slot as usize].name;
+                let schema = self.schema_def(*schema_slot as usize).name;
                 if let Some(slot) = self.operator_class_slot_exact(schema.as_str(), name, txid) {
                     return Some(slot);
                 }
@@ -50993,7 +51133,7 @@ mod tests {
         );
         assert_eq!(storage.databases.len(), 6);
         assert_eq!(storage.cumulative_statistics().databases.len(), 6);
-        assert_eq!(storage.schemas.len(), 17);
+        assert_eq!(storage.schema_count(), 17);
         let sequence_catalog = storage.sequence_catalog();
         assert_eq!(sequence_catalog.definitions.len(), 18);
         assert_eq!(sequence_catalog.values.capacity(), 18);
@@ -53601,6 +53741,154 @@ mod tests {
         storage.restore_object_owner(
             AccessObject {
                 class: AccessClass::Tablespace,
+                slot: altered as u16,
+            },
+            prior_owner,
+        );
+    }
+
+    #[test]
+    fn schema_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SchemaDef>();
+        assert_send_sync::<std::sync::Mutex<FixedVec<SchemaDef>>>();
+        assert_send_sync::<SchemaIter<'_>>();
+
+        const WORKERS: usize = 4;
+        let names = ["schema_a", "schema_b", "schema_c", "schema_d"];
+        let mut config = test_config();
+        config.max_schemas = 3 + WORKERS;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                scope.spawn(move || {
+                    storage
+                        .create_schema(SqlName::parse(names[worker]).unwrap())
+                        .unwrap();
+                });
+            }
+        });
+
+        assert_eq!(storage.schema_count(), 3 + WORKERS);
+        assert_eq!(storage.checkpoint_schemas().count(), 3 + WORKERS);
+        assert_eq!(storage.live_schemas().count(), 1 + WORKERS);
+        for (slot, schema) in storage.live_schemas() {
+            let nested = storage.schema_def(slot);
+            assert_eq!(nested.database, schema.database);
+            assert_eq!(nested.name, schema.name);
+        }
+        assert_eq!(
+            storage
+                .create_schema(SqlName::parse("schema_full").unwrap())
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+
+        let reclaimed = storage.find_schema(names[0]).unwrap();
+        let object = AccessObject {
+            class: AccessClass::Schema,
+            slot: reclaimed as u16,
+        };
+        storage
+            .change_acl(
+                object,
+                PUBLIC_ROLE,
+                BOOTSTRAP_ROLE,
+                PrivilegeSet::USAGE,
+                PrivilegeSet::NONE,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            storage.acl_from(object, PUBLIC_ROLE, BOOTSTRAP_ROLE, 0).0,
+            PrivilegeSet::USAGE
+        );
+        storage.drop_schema(reclaimed);
+        let empty = storage.schema_def(reclaimed);
+        assert_eq!(empty.name, SqlName::EMPTY);
+        assert_eq!(empty.database, DatabaseOid::POSTGRES);
+        assert_eq!(empty.ownership, Ownership::BOOTSTRAP);
+        assert_eq!(empty.ddl_state, CatalogDdlState::Absent);
+        assert_eq!(
+            storage.acl_from(object, PUBLIC_ROLE, BOOTSTRAP_ROLE, 0).0,
+            PrivilegeSet::NONE
+        );
+
+        let reused = storage
+            .alloc_schema(
+                SqlName::parse("schema_reused").unwrap(),
+                CatalogDdlState::PendingCreate { txid: 11 },
+                Some(Ownership {
+                    owner: BOOTSTRAP_ROLE,
+                    pending: Some(PendingOwnership {
+                        txid: 11,
+                        owner: BOOTSTRAP_ROLE,
+                    }),
+                }),
+            )
+            .unwrap();
+        assert_eq!(reused, reclaimed);
+        storage.rollback_schema_create(reused);
+        let empty = storage.schema_def(reused);
+        assert_eq!(empty.name, SqlName::EMPTY);
+        assert!(empty.ownership.pending.is_none());
+
+        let committed = storage
+            .alloc_schema(
+                SqlName::parse("schema_committed").unwrap(),
+                CatalogDdlState::PendingCreate { txid: 12 },
+                Some(Ownership {
+                    owner: BOOTSTRAP_ROLE,
+                    pending: Some(PendingOwnership {
+                        txid: 12,
+                        owner: BOOTSTRAP_ROLE,
+                    }),
+                }),
+            )
+            .unwrap();
+        storage.commit_schema_create(committed);
+        let definition = storage.schema_def(committed);
+        assert_eq!(definition.ddl_state, CatalogDdlState::Present);
+        assert!(definition.ownership.pending.is_none());
+        storage.drop_schema(committed);
+
+        let pending = storage
+            .alloc_schema(
+                SqlName::parse("schema_pending").unwrap(),
+                CatalogDdlState::PendingCreate { txid: 20 },
+                Some(Ownership::BOOTSTRAP),
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .alloc_schema(
+                    SqlName::parse("schema_pending").unwrap(),
+                    CatalogDdlState::PendingCreate { txid: 21 },
+                    Some(Ownership::BOOTSTRAP),
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.release_row_locks(21);
+        storage.rollback_schema_create(pending);
+
+        let altered = storage.find_schema(names[1]).unwrap();
+        let prior_owner = storage
+            .set_schema_owner(altered, usize::from(BOOTSTRAP_ROLE), 30)
+            .unwrap();
+        assert_eq!(
+            storage.drop_schema_in(altered, 31).unwrap_err().sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        storage.release_row_locks(31);
+        storage.restore_object_owner(
+            AccessObject {
+                class: AccessClass::Schema,
                 slot: altered as u16,
             },
             prior_owner,

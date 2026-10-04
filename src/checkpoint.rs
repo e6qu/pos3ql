@@ -3848,6 +3848,15 @@ impl Checkpointer {
                                     error.message.as_str()
                                 ))
                             })?;
+                    } else if object.class == crate::storage::AccessClass::Schema {
+                        storage
+                            .set_schema_owner(usize::from(object.slot), owner, 0)
+                            .map_err(|error| {
+                                CheckpointSetupError::ObjectStore(format!(
+                                    "manifest schema ownership rejected: {}",
+                                    error.message.as_str()
+                                ))
+                            })?;
                     } else {
                         storage.set_object_owner(object, owner, 0);
                     }
@@ -10314,12 +10323,8 @@ impl Checkpointer {
             for byte in extension.name.as_str().as_bytes() {
                 let _ = write!(name, "{byte:02x}");
             }
-            for byte in storage
-                .schema_def(extension.namespace as usize)
-                .name
-                .as_str()
-                .as_bytes()
-            {
+            let schema_name = storage.schema_def(extension.namespace as usize).name;
+            for byte in schema_name.as_str().as_bytes() {
                 let _ = write!(schema, "{byte:02x}");
             }
             for byte in extension.version.as_str().as_bytes() {

@@ -8464,7 +8464,14 @@ pub fn reassign_owned(
                 continue;
             }
             let old_owner = storage.object_owner(object, txn.txid) as u16;
-            let prior = storage.set_object_owner(object, target, txn.txid);
+            let prior = if class == AccessClass::Tablespace {
+                match storage.set_tablespace_owner(slot, target, txn.txid) {
+                    Ok(prior) => prior,
+                    Err(error) => return sql_fail(error),
+                }
+            } else {
+                storage.set_object_owner(object, target, txn.txid)
+            };
             if let Err(error) =
                 txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged { object, prior })
             {
@@ -50053,7 +50060,7 @@ pub fn alter_tablespace(
     let tablespace = storage
         .tablespaces_visible_to(txn.txid)
         .find(|(candidate, _)| *candidate == slot)
-        .map(|(_, tablespace)| *tablespace)
+        .map(|(_, tablespace)| tablespace)
         .expect("resolved tablespace is visible");
     let mut new_name = tablespace.name_for(txn.txid);
     let mut options = tablespace.options_for(txn.txid);
@@ -50112,7 +50119,13 @@ pub fn alter_tablespace(
             Ok(prior) => prior,
             Err(error) => return sql_fail(error),
         };
-    let prior_owner = storage.set_object_owner(object, owner, txn.txid);
+    let prior_owner = match storage.set_tablespace_owner(slot, owner, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => {
+            storage.rollback_tablespace_alter(slot, prior_definition);
+            return sql_fail(error);
+        }
+    };
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage(
         txn.txid,

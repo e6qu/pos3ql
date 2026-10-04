@@ -48,6 +48,7 @@ for spill_entry in \
     '- { name: exact, corpus_shard: "none", auxiliary: exact }' \
     '- { name: copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: types, corpus_shard: "none", auxiliary: types }' \
+    '- { name: grouping, corpus_shard: "none", auxiliary: grouping }' \
     '- { name: slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "4" }' \
     '- { name: slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "4" }' \
     '- { name: slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "4" }' \
@@ -72,6 +73,7 @@ for reference_entry in \
     '- { name: auxiliary-exact, corpus_shard: "none", auxiliary: exact }' \
     '- { name: auxiliary-copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: auxiliary-types, corpus_shard: "none", auxiliary: types }' \
+    '- { name: auxiliary-grouping, corpus_shard: "none", auxiliary: grouping, grouping_timeout: "300" }' \
     '- { name: auxiliary-pg-regress-a, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "0" }' \
     '- { name: auxiliary-pg-regress-b, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "1" }' \
     '- { name: auxiliary-pg-regress-c, corpus_shard: "none", auxiliary: pg_regress, pg_regress_shard: "2" }' \

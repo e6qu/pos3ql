@@ -180,6 +180,9 @@ CI preserves the complete library, curated PostgreSQL differential, and
 15-minute worker ceiling; the library suite runs in eight slices, sqllogictest
 queries run in eight, the seeded sequence runs in ten, the growing forced-spill
 corpus runs in six, and instrumented auxiliary phases have independent workers.
+The 4,096-set grouping boundary has its own worker and a 300-second query
+deadline under the unchanged 15-minute job ceiling; ordinary probes retain the
+120-second deadline.
 Instrumented sqllogictest queries run in eight slices after a four-slice worker
 made normal progress but reached the 15-minute ceiling. The 70,000-row cursor and
 1,100-call execution-width differential has its own corpus worker, and the
@@ -609,6 +612,17 @@ Alter rollback restores the pending definition before updating its paired value
 image, keeping both changes within one borrow and one mutex hold.
 The remaining catalog definition containers and row mutation paths still
 require synchronization before fixed workers can overlap execution.
+
+Tablespace definitions, pending names and options, ownership, and existence
+state now share one startup-bounded mutex. DDL, restore, replay, checkpoint,
+catalog reads, and relation placement observe complete definition images.
+Iterators copy one fixed definition and release the mutex before nested role,
+relation, comment, WAL, or catalog work. Conflicting create, rename, alter,
+ownership, and drop operations use the common transaction wait boundary.
+Four-worker publication, nested-reader progress, exact retained capacity, loud
+exhaustion, complete slot reuse, and `Send + Sync` have direct coverage. The
+remaining catalog definition containers and row mutation paths still require
+synchronization before fixed workers can overlap execution.
 
 Instrumented SQL differential coverage now divides the corpus into six
 deterministic slices after three and then four slices exhausted the fixed

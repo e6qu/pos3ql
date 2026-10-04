@@ -304,6 +304,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   accepts the parser's complete bounded target list, and bulk tablespace,
   REINDEX, and CLUSTER scratch is sized from actual configured table
   cardinality rather than an unrelated schema/column product.
+- Tablespace definitions, transaction-local names and options, ownership, and
+  existence share one startup-bounded catalog sized by `max_tablespaces`.
+  DDL conflicts use the transaction wait boundary, readers copy definitions
+  before nested work, and terminal create and drop paths clear reusable slots.
 - Sequence catalogs are startup-sized through `max_sequences` across durable
   definitions, per-session `currval`/`lastval` and cache state, dependency
   planning, `DROP OWNED`, identity cleanup, catalogs, WAL, checkpoints, and

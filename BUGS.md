@@ -982,8 +982,17 @@ transitions. One startup-bounded mutex now owns complete definitions, and
 readers copy one entry before nested work. Committed drops and rolled-back
 creates clear the complete reusable slot. Four-worker publication and refresh,
 nested-reader progress, exact retained capacity, complete slot reuse, and
-`Send + Sync` have direct coverage. Stored-query dependency images remain in
-their shared fixed catalog for a separate synchronization pass.
+`Send + Sync` have direct coverage.
+
+The stored-query dependency audit found committed entries and counts plus
+pending transactional images in three unsynchronized fixed vectors. Concurrent
+rule, policy, routine, view, and materialized-view definition work could claim
+the same pending slot, lose an image update, or expose a count from a different
+transition. One startup-bounded mutex now owns all three vectors. Recursive
+catalog work uses statement-arena snapshots so it cannot retain the mutex or a
+borrowed image while resolving another stored query. Four-worker publication
+and pending reservation, nested-reader progress, exact retained capacities,
+loud exhaustion, and `Send + Sync` have direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

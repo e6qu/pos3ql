@@ -902,6 +902,7 @@ pub(crate) fn execute_bound_routine_query<'a>(
     }
     let user = super::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(routine.creation_path.as_str(), user.as_str(), txid);
+    let dependencies = storage.snapshot_routine_dependencies_for(routine_slot, txid, arena)?;
     execute_routine_query_under(
         query,
         storage,
@@ -909,7 +910,7 @@ pub(crate) fn execute_bound_routine_query<'a>(
         arena,
         params,
         recycling,
-        Some((path, storage.routine_dependencies_for(routine_slot, txid))),
+        Some((path, dependencies.view())),
         emit,
     )
 }
@@ -928,14 +929,14 @@ pub(crate) fn bind_stored_routine_statement<'a>(
     }
     let user = super::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(routine.creation_path.as_str(), user.as_str(), txid);
-    let dependencies = storage.routine_dependencies_for(routine_slot, txid);
+    let dependencies = storage.snapshot_routine_dependencies_for(routine_slot, txid, arena)?;
     let rebound = match statement {
         Stmt::Select(select) => Stmt::Select(*expand_stored_query_exec(
             select,
             storage,
             txid,
             path,
-            dependencies,
+            dependencies.view(),
             arena,
             params,
             None,
@@ -946,7 +947,7 @@ pub(crate) fn bind_stored_routine_statement<'a>(
                 query.body,
                 storage,
                 txid,
-                cte::StoredExecutionContext::new(path, dependencies, params, None),
+                cte::StoredExecutionContext::new(path, dependencies.view(), params, None),
                 arena,
             )?;
             Stmt::SetQuery(SetQuery {
@@ -965,7 +966,7 @@ pub(crate) fn bind_stored_routine_statement<'a>(
                 storage,
                 txid,
                 path,
-                dependencies,
+                dependencies.view(),
                 arena,
                 params,
                 None,
@@ -4687,14 +4688,8 @@ pub fn resolve_view_for_dml<'a>(
         )
     };
     let sel = super::parser::parse_view_select(sql, arena)?;
-    let sel = expand_stored_query(
-        sel,
-        storage,
-        txid,
-        view_path,
-        storage.view_dependencies(view_slot),
-        arena,
-    )?;
+    let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
+    let sel = expand_stored_query(sel, storage, txid, view_path, dependencies.view(), arena)?;
     if sel.set_body.is_some()
         || sel.distinct
         || !sel.group_by.is_empty()

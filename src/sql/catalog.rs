@@ -15875,12 +15875,13 @@ pub(crate) fn describe_view<'a>(
             (candidate.schema == view.schema && candidate.name == view.name).then_some(slot)
         })
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "view does not exist"))?;
+    let dependencies = storage.snapshot_view_dependencies(slot, arena)?;
     let count = super::query::describe_stored_query(
         storage.view_sql_for(view),
         storage,
         txid,
         path,
-        storage.view_dependencies(slot),
+        dependencies.view(),
         arena,
         out,
     )?;
@@ -15919,12 +15920,13 @@ fn describe_stored_view<'a>(
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(storage.view_creation_path(slot), user.as_str(), txid);
+    let dependencies = storage.snapshot_view_dependencies(slot, arena)?;
     let count = super::query::describe_stored_query(
         storage.view_sql(slot),
         storage,
         txid,
         path,
-        storage.view_dependencies(slot),
+        dependencies.view(),
         arena,
         out,
     )?;
@@ -20267,9 +20269,8 @@ fn pg_depend<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_depend", false);
-    let dependency_capacity = |dependencies: crate::storage::StoredQueryDependencyView<'_>| {
+    let dependency_capacity = |dependencies: &[crate::storage::StoredQueryDependency]| {
         dependencies
-            .entries()
             .iter()
             .map(|dependency| {
                 if dependency.referenced_columns.is_empty() {
@@ -20313,11 +20314,11 @@ fn pg_depend<'a>(
         .sum::<usize>();
     let view_dependencies = storage
         .views_visible_to(txid)
-        .map(|(slot, _)| 1 + dependency_capacity(storage.view_dependencies(slot)))
+        .map(|(slot, _)| 1 + dependency_capacity(storage.view_dependencies(slot).entries()))
         .sum::<usize>();
     let rule_dependencies = storage
         .rules_visible_to(txid)
-        .map(|(slot, _)| 1 + dependency_capacity(storage.rule_dependencies(slot, txid)))
+        .map(|(slot, _)| 1 + dependency_capacity(storage.rule_dependencies(slot, txid).entries()))
         .sum::<usize>();
     let matview_dependencies = storage
         .matviews_visible_to(txid)
@@ -31235,7 +31236,8 @@ fn info_view_column_usage<'a>(
     let def = schema::require("view_column_usage", true);
     let mut count = 0usize;
     for (view_slot, view) in storage.views_visible_to(txid) {
-        for dependency in storage.view_dependencies(view_slot).entries() {
+        let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
+        for dependency in dependencies.entries() {
             if dependency.class == crate::storage::DependencyClass::Table {
                 let table_slot = dependency.slot as usize;
                 if !storage.table_slot_visible_to(table_slot, txid) {
@@ -31291,7 +31293,8 @@ fn info_view_column_usage<'a>(
         .map_err(|_| arena_full())?;
     let mut index = 0usize;
     for (view_slot, view) in storage.views_visible_to(txid) {
-        for dependency in storage.view_dependencies(view_slot).entries() {
+        let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
+        for dependency in dependencies.entries() {
             match dependency.class {
                 crate::storage::DependencyClass::Table => {
                     let table = storage.table_def(dependency.slot as usize, txid);

@@ -11697,7 +11697,7 @@ pub fn drop_schema(
                     || policy_depends_on_selected_stored_query(
                         storage,
                         txn.txid,
-                        dependencies,
+                        dependencies.view(),
                         dependent_views,
                         dependent_matviews,
                         dependent_routines,
@@ -11755,7 +11755,7 @@ pub fn drop_schema(
                 || policy_depends_on_selected_stored_query(
                     storage,
                     txn.txid,
-                    dependencies,
+                    dependencies.view(),
                     dependent_views,
                     dependent_matviews,
                     dependent_routines,
@@ -32511,16 +32511,20 @@ pub fn create_routine(
             };
             let definition = storage.routine_for(slot, txn.txid);
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::CreateRoutine {
-                    definition: &definition,
-                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                        storage.routine_dependencies_for(slot, txn.txid),
-                    ),
-                },
-            ) {
+            let wal_result = {
+                let dependencies = storage.routine_dependencies_for(slot, txn.txid);
+                wal.stage(
+                    txn.txid,
+                    lsn,
+                    &WalOp::CreateRoutine {
+                        definition: &definition,
+                        dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                            dependencies.view(),
+                        ),
+                    },
+                )
+            };
+            if let Err(error) = wal_result {
                 storage.rollback_routine_replace(slot, prior);
                 return sql_fail(error);
             }
@@ -32563,16 +32567,20 @@ pub fn create_routine(
     if replaced.is_none() {
         let stored = storage.routine(slot);
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::CreateRoutine {
-                definition: &stored,
-                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                    storage.routine_dependencies_for(slot, txn.txid),
-                ),
-            },
-        ) {
+        let wal_result = {
+            let dependencies = storage.routine_dependencies_for(slot, txn.txid);
+            wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateRoutine {
+                    definition: &stored,
+                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                        dependencies.view(),
+                    ),
+                },
+            )
+        };
+        if let Err(error) = wal_result {
             storage.rollback_routine_create(slot);
             return sql_fail(error);
         }
@@ -33302,16 +33310,20 @@ pub fn create_aggregate(
             };
             let durable = storage.routine_for(slot, txn.txid);
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::CreateRoutine {
-                    definition: &durable,
-                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                        storage.routine_dependencies_for(slot, txn.txid),
-                    ),
-                },
-            ) {
+            let wal_result = {
+                let dependencies = storage.routine_dependencies_for(slot, txn.txid);
+                wal.stage(
+                    txn.txid,
+                    lsn,
+                    &WalOp::CreateRoutine {
+                        definition: &durable,
+                        dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                            dependencies.view(),
+                        ),
+                    },
+                )
+            };
+            if let Err(error) = wal_result {
                 storage.rollback_routine_replace(slot, prior);
                 return sql_fail(error);
             }
@@ -33355,16 +33367,20 @@ pub fn create_aggregate(
     if replaced.is_none() {
         let stored = storage.routine(slot);
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::CreateRoutine {
-                definition: &stored,
-                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                    storage.routine_dependencies_for(slot, txn.txid),
-                ),
-            },
-        ) {
+        let wal_result = {
+            let dependencies = storage.routine_dependencies_for(slot, txn.txid);
+            wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateRoutine {
+                    definition: &stored,
+                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                        dependencies.view(),
+                    ),
+                },
+            )
+        };
+        if let Err(error) = wal_result {
             storage.rollback_routine_create(slot);
             return sql_fail(error);
         }
@@ -34499,16 +34515,20 @@ pub fn alter_routine(
         };
         let durable = storage.routine_for(slot, txn.txid);
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::CreateRoutine {
-                definition: &durable,
-                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                    storage.routine_dependencies_for(slot, txn.txid),
-                ),
-            },
-        ) {
+        let wal_result = {
+            let dependencies = storage.routine_dependencies_for(slot, txn.txid);
+            wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateRoutine {
+                    definition: &durable,
+                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                        dependencies.view(),
+                    ),
+                },
+            )
+        };
+        if let Err(error) = wal_result {
             storage.rollback_routine_replace(slot, prior);
             return sql_fail(error);
         }
@@ -35493,7 +35513,7 @@ pub fn create_view(
                             super::ast::ViewCheckOption::Cascaded => 2,
                         }),
                         dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                            storage.view_dependencies(new_slot),
+                            storage.view_dependencies(new_slot).view(),
                         ),
                     },
                 )
@@ -36175,7 +36195,7 @@ fn rewrite_view_column_dependents(
                         .check_option_for(txn.txid)
                         .map_or(0, |option| option.code()),
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                        storage.view_dependencies(new_slot),
+                        storage.view_dependencies(new_slot).view(),
                     ),
                 },
             )
@@ -36998,7 +37018,7 @@ fn stage_rule(
             returning_action: definition.returning_action,
             path: definition.creation_path.as_str(),
             dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                storage.rule_dependencies(slot, txn.txid),
+                storage.rule_dependencies(slot, txn.txid).view(),
             ),
         },
     )?;
@@ -37106,12 +37126,16 @@ pub fn comment(
                     Err(_) => return sql_fail(super::query::arena_full_pub()),
                 };
                 let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+                let dependencies = match storage.snapshot_view_dependencies(slot, arena) {
+                    Ok(dependencies) => dependencies,
+                    Err(error) => return sql_fail(error),
+                };
                 let described = super::query::describe_stored_query(
                     view_sql,
                     storage,
                     txid,
                     view_path,
-                    storage.view_dependencies(slot),
+                    dependencies.view(),
                     arena,
                     &mut columns,
                 );
@@ -38407,20 +38431,24 @@ pub fn create_table_as(
         ) {
             Ok(slot) => {
                 let lsn = storage.bump_lsn();
-                if let Err(e) = wal.stage(
-                    txn.txid,
-                    lsn,
-                    &WalOp::CreateMatview {
-                        schema: def.schema.as_str(),
-                        name: name.name,
-                        sql,
-                        path: raw_path,
-                        dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                            storage.matview_dependencies(slot),
-                        ),
-                        populated: with_data,
-                    },
-                ) {
+                let wal_result = {
+                    let dependencies = storage.matview_dependencies(slot);
+                    wal.stage(
+                        txn.txid,
+                        lsn,
+                        &WalOp::CreateMatview {
+                            schema: def.schema.as_str(),
+                            name: name.name,
+                            sql,
+                            path: raw_path,
+                            dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                                dependencies.view(),
+                            ),
+                            populated: with_data,
+                        },
+                    )
+                };
+                if let Err(e) = wal_result {
                     storage.rollback_matview_create(slot);
                     return sql_fail(e);
                 }
@@ -38580,12 +38608,16 @@ pub fn refresh_materialized_view(
         crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
         &replay_state,
     );
+    let dependencies = match storage.snapshot_matview_dependencies(slot, arena) {
+        Ok(dependencies) => dependencies,
+        Err(error) => return sql_fail(error),
+    };
     let select = match super::query::expand_stored_query_exec(
         select,
         storage,
         txn.txid,
         path,
-        storage.matview_dependencies(slot),
+        dependencies.view(),
         arena,
         params,
         Some(&live_sequence),
@@ -42533,7 +42565,7 @@ fn policy_depends_on_type_selection(
     }) || policy_depends_on_selected_stored_query(
         storage,
         txid,
-        dependencies,
+        dependencies.view(),
         views,
         matviews,
         routines,
@@ -42762,37 +42794,33 @@ fn policy_depends_on_owned_selection(
     {
         return false;
     }
-    storage
-        .policy_dependencies(slot, txid)
-        .entries()
-        .iter()
-        .any(|dependency| {
-            let slot = usize::from(dependency.slot);
-            match dependency.class {
-                crate::storage::DependencyClass::Table => tables.get(slot),
-                crate::storage::DependencyClass::View => views.get(slot),
-                crate::storage::DependencyClass::Sequence => sequences.get(slot),
-                crate::storage::DependencyClass::Domain => domains.get(slot),
-                crate::storage::DependencyClass::Enum => enums.get(slot),
-                crate::storage::DependencyClass::Composite => composites.get(slot),
-                crate::storage::DependencyClass::Routine => routines.get(slot),
-                crate::storage::DependencyClass::Operator => operators.get(slot),
-                crate::storage::DependencyClass::Collation => None,
-                crate::storage::DependencyClass::TextSearchConfiguration => {
-                    text_search_objects.get(slot)
-                }
+    let dependencies = storage.policy_dependencies(slot, txid);
+    dependencies.entries().iter().any(|dependency| {
+        let slot = usize::from(dependency.slot);
+        match dependency.class {
+            crate::storage::DependencyClass::Table => tables.get(slot),
+            crate::storage::DependencyClass::View => views.get(slot),
+            crate::storage::DependencyClass::Sequence => sequences.get(slot),
+            crate::storage::DependencyClass::Domain => domains.get(slot),
+            crate::storage::DependencyClass::Enum => enums.get(slot),
+            crate::storage::DependencyClass::Composite => composites.get(slot),
+            crate::storage::DependencyClass::Routine => routines.get(slot),
+            crate::storage::DependencyClass::Operator => operators.get(slot),
+            crate::storage::DependencyClass::Collation => None,
+            crate::storage::DependencyClass::TextSearchConfiguration => {
+                text_search_objects.get(slot)
             }
-            .copied()
-            .unwrap_or(false)
-        })
-        || policy_depends_on_selected_stored_query(
-            storage,
-            txid,
-            storage.policy_dependencies(slot, txid),
-            dependent_views,
-            dependent_matviews,
-            dependent_routines,
-        )
+        }
+        .copied()
+        .unwrap_or(false)
+    }) || policy_depends_on_selected_stored_query(
+        storage,
+        txid,
+        dependencies.view(),
+        dependent_views,
+        dependent_matviews,
+        dependent_routines,
+    )
 }
 
 #[expect(
@@ -42829,7 +42857,7 @@ fn policy_depends_on_dependency_drop(
     }) || policy_depends_on_selected_stored_query(
         storage,
         txid,
-        dependencies,
+        dependencies.view(),
         views,
         matviews,
         routines,
@@ -45521,10 +45549,11 @@ fn rewrite_composite_dependent_views(
         let user = super::eval::funcs::system::session_user_owned();
         let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
         let mut sites = [false; crate::storage::VIEW_SQL_MAX];
+        let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
         let site_count = super::query::stored_query_composite_field_rename_sites(
             view_sql.as_str(),
             path,
-            storage.view_dependencies(view_slot),
+            dependencies.view(),
             &super::query::StoredQueryCompositeFieldRename {
                 storage,
                 txid: txn.txid,
@@ -45591,7 +45620,7 @@ fn rewrite_composite_dependent_views(
                         .check_option_for(txn.txid)
                         .map_or(0, |option| option.code()),
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                        storage.view_dependencies(new_slot),
+                        storage.view_dependencies(new_slot).view(),
                     ),
                 },
             )
@@ -57308,12 +57337,13 @@ pub(crate) fn view_trigger_definition(
     let mut columns = [ColDesc::new("", 0, 0); MAX_COLUMNS];
     let user = crate::sql::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(storage.view_creation_path(view_slot), user.as_str(), txid);
+    let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
     let n_columns = super::query::describe_stored_query(
         storage.view_sql(view_slot),
         storage,
         txid,
         path,
-        storage.view_dependencies(view_slot),
+        dependencies.view(),
         arena,
         &mut columns,
     )?;
@@ -57968,14 +57998,9 @@ fn materialize_view_rows<'a>(
         .alloc_str(storage.view_sql(view_slot))
         .map_err(|_| super::query::arena_full_pub())?;
     let select = super::parser::parse_query(source, arena)?;
-    let select = super::query::expand_stored_query(
-        select,
-        storage,
-        txid,
-        path,
-        storage.view_dependencies(view_slot),
-        arena,
-    )?;
+    let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
+    let select =
+        super::query::expand_stored_query(select, storage, txid, path, dependencies.view(), arena)?;
     let rows = arena
         .alloc_slice_with(capacity, |_| &[][..])
         .map_err(|_| super::query::arena_full_pub())?;

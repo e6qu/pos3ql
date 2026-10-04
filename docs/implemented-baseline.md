@@ -546,7 +546,10 @@ view return rules share one contiguous dependency pool governed by
 `max_stored_query_dependencies_per_object` (durable maximum 255), rather than
 embedding a 64-entry image in each catalog object and pending version. WAL,
 checkpoints, template cloning, dependency cascades, catalog reporting, and
-execution all consume the same borrowed image contract. Compact backward
+execution consume complete images through one startup-bounded mutex owning the
+entries, committed counts, and pending transactional images. Recursive parsing
+and execution copy an image into the worker's statement arena before nested
+catalog work. Compact backward
 chains make latest-version reads, savepoint rollback, commit cleanup, and slot
 reuse constant-space operations. Regressions stage more than eight versions of one
 object, roll later versions back, commit, publish a checkpoint, discard both

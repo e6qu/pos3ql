@@ -1997,13 +1997,22 @@ fn record_relation_column_references<'a>(
             ResolvedRelation::View(slot) => {
                 source.class = DependencyClass::View;
                 source.slot = slot;
-                let columns = storage.view(slot).columns_for(txid);
+                let view_image = storage.view(slot);
+                let columns = view_image.columns_for(txid);
                 source.n_columns = columns.len();
                 for (column, name) in columns.names().iter().enumerate() {
                     source.columns[column] = table
                         .col_alias
                         .and_then(|aliases| aliases.get(column).copied())
-                        .unwrap_or(name.as_str());
+                        .map_or_else(
+                            || {
+                                arena
+                                    .alloc_str(name.as_str())
+                                    .map(|name| &*name)
+                                    .map_err(|_| arena_full())
+                            },
+                            Ok,
+                        )?;
                 }
             }
             _ => continue,

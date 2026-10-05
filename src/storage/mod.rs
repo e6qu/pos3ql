@@ -16719,7 +16719,8 @@ impl Storage {
         slot: usize,
         arena: &crate::mem::arena::Arena,
     ) -> Result<StoredQueryDependencies, SqlError> {
-        let owner = StoredQueryDependencyOwner::Rule(self.view(slot).return_rule);
+        let catalog = self.view_rule_catalog();
+        let owner = StoredQueryDependencyOwner::Rule(catalog.views[slot].return_rule);
         self.snapshot_dependency_image(self.committed_dependency_image(owner), arena)
     }
 
@@ -19614,83 +19615,114 @@ impl Storage {
                 sequence_catalog.values[target_slot].pending.dirty = false;
             }
 
-            for source_slot in 0..self.view_count() {
-                let source_definition = &self.view(source_slot);
-                if source_definition.database != source
-                    || source_definition.ddl_state != CatalogDdlState::Present
-                    || source_definition.persistence == RelationPersistence::Temporary
-                {
-                    continue;
+            {
+                let mut catalog = self.view_rule_catalog();
+                for source_slot in 0..catalog.views.len() {
+                    let source_definition = catalog.views[source_slot];
+                    if source_definition.database != source
+                        || source_definition.ddl_state != CatalogDdlState::Present
+                        || source_definition.persistence == RelationPersistence::Temporary
+                    {
+                        continue;
+                    }
+                    let mut definition = source_definition;
+                    let target_slot = catalog
+                        .views
+                        .iter()
+                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "view catalog is full")
+                        })?;
+                    definition.database = target;
+                    definition.ownership = definition.ownership.committed();
+                    definition.pending_schema = None;
+                    definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                    catalog.views[target_slot] = definition;
                 }
-                let mut definition = source_definition.clone();
-                let target_slot = self
-                    .view_entries()
-                    .map(|(_, entry)| entry)
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "view catalog is full")
-                    })?;
-                definition.database = target;
-                definition.ownership = definition.ownership.committed();
-                definition.pending_schema = None;
-                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.view_rule_catalog().views[target_slot] = definition;
-            }
-            for source_slot in 0..self.rule_count() {
-                let mut rule = self.rule(source_slot);
-                if rule.database != source
-                    || rule.ddl_state != CatalogDdlState::Present
-                    || self.access_object_is_temporary(rule.definition.target.access_object(), 0)
-                {
-                    continue;
-                }
-                let target_object = self
-                    .cloned_access_object(rule.definition.target.access_object(), source, target)
+                for source_slot in 0..catalog.rules.len() {
+                    let mut rule = catalog.rules[source_slot];
+                    if rule.database != source
+                        || rule.ddl_state != CatalogDdlState::Present
+                        || match rule.definition.target {
+                            RuleTarget::Table(table) => {
+                                self.table_def(usize::from(table), 0).persistence
+                                    == RelationPersistence::Temporary
+                            }
+                            RuleTarget::View(view) => {
+                                catalog.views[usize::from(view)].persistence
+                                    == RelationPersistence::Temporary
+                            }
+                        }
+                    {
+                        continue;
+                    }
+                    let target_object = match rule.definition.target {
+                        RuleTarget::Table(_) => self.cloned_access_object(
+                            rule.definition.target.access_object(),
+                            source,
+                            target,
+                        ),
+                        RuleTarget::View(view) => {
+                            let created_at = catalog.views[usize::from(view)].created_at;
+                            catalog
+                                .views
+                                .iter()
+                                .position(|candidate| {
+                                    candidate.database == target
+                                        && candidate.ddl_state != CatalogDdlState::Absent
+                                        && candidate.created_at == created_at
+                                })
+                                .map(|slot| AccessObject {
+                                    class: AccessClass::View,
+                                    slot: slot as u16,
+                                })
+                        }
+                    }
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::INTERNAL_ERROR,
                             "template rewrite-rule relation was not cloned"
                         )
                     })?;
-                rule.definition.target = match target_object.class {
-                    AccessClass::Table => RuleTarget::Table(target_object.slot),
-                    AccessClass::View => RuleTarget::View(target_object.slot),
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "template rewrite rule rebound to a non-relation"
-                        ));
-                    }
-                };
-                let target_slot = self
-                    .rule_entries()
-                    .map(|(_, entry)| entry)
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "rewrite-rule catalog is full"
-                        )
-                    })?;
-                rule.database = target;
-                rule.pending = None;
-                rule.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.view_rule_catalog().rules[target_slot] = rule;
-                self.copy_committed_dependencies(
-                    StoredQueryDependencyOwner::Rule(source_slot as u16),
-                    StoredQueryDependencyOwner::Rule(target_slot as u16),
-                );
-                if rule.definition.event == RewriteEvent::Select
-                    && rule.definition.name.as_str() == "_RETURN"
-                {
-                    let RuleTarget::View(view_slot) = rule.definition.target else {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "template return rule is not attached to a view"
-                        ));
+                    rule.definition.target = match target_object.class {
+                        AccessClass::Table => RuleTarget::Table(target_object.slot),
+                        AccessClass::View => RuleTarget::View(target_object.slot),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template rewrite rule rebound to a non-relation"
+                            ));
+                        }
                     };
-                    self.view_rule_catalog().views[usize::from(view_slot)].return_rule =
-                        target_slot as u16;
+                    let target_slot = catalog
+                        .rules
+                        .iter()
+                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "rewrite-rule catalog is full"
+                            )
+                        })?;
+                    rule.database = target;
+                    rule.pending = None;
+                    rule.ddl_state = CatalogDdlState::PendingCreate { txid };
+                    catalog.rules[target_slot] = rule;
+                    self.copy_committed_dependencies(
+                        StoredQueryDependencyOwner::Rule(source_slot as u16),
+                        StoredQueryDependencyOwner::Rule(target_slot as u16),
+                    );
+                    if rule.definition.event == RewriteEvent::Select
+                        && rule.definition.name.as_str() == "_RETURN"
+                    {
+                        let RuleTarget::View(view_slot) = rule.definition.target else {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template return rule is not attached to a view"
+                            ));
+                        };
+                        catalog.views[usize::from(view_slot)].return_rule = target_slot as u16;
+                    }
                 }
             }
             for source_slot in 0..self.matview_count() {
@@ -26681,18 +26713,27 @@ impl Storage {
             }
         }
 
-        for definition in self
-            .view_rule_catalog()
-            .views
-            .iter_mut()
-            .filter(|definition| {
+        {
+            let mut catalog = self.view_rule_catalog();
+            for definition in catalog.views.iter_mut().filter(|definition| {
                 definition.database == current_database()
                     && definition.ddl_state != CatalogDdlState::Absent
-            })
-        {
-            rename_schema_name(&mut definition.schema, prior, name);
-            if let Some(pending) = &mut definition.pending_schema {
-                rename_schema_name(&mut pending.schema, prior, name);
+            }) {
+                rename_schema_name(&mut definition.schema, prior, name);
+                if let Some(pending) = &mut definition.pending_schema {
+                    rename_schema_name(&mut pending.schema, prior, name);
+                }
+            }
+            for definition in catalog.rules.iter_mut().filter(|definition| {
+                definition.database == current_database()
+                    && definition.ddl_state != CatalogDdlState::Absent
+            }) {
+                rename_schema_path(&mut definition.definition.creation_path, prior, name)?;
+                rename_schema_qualified_sql(&mut definition.definition.source, prior, name)?;
+                if let Some(pending) = &mut definition.pending {
+                    rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
+                    rename_schema_qualified_sql(&mut pending.definition.source, prior, name)?;
+                }
             }
         }
         {
@@ -26922,22 +26963,6 @@ impl Storage {
             }
         }
 
-        for definition in self
-            .view_rule_catalog()
-            .rules
-            .iter_mut()
-            .filter(|definition| {
-                definition.database == current_database()
-                    && definition.ddl_state != CatalogDdlState::Absent
-            })
-        {
-            rename_schema_path(&mut definition.definition.creation_path, prior, name)?;
-            rename_schema_qualified_sql(&mut definition.definition.source, prior, name)?;
-            if let Some(pending) = &mut definition.pending {
-                rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
-                rename_schema_qualified_sql(&mut pending.definition.source, prior, name)?;
-            }
-        }
         {
             let mut matviews = self.matview_catalog();
             for definition in matviews.iter_mut() {
@@ -34298,6 +34323,30 @@ impl Storage {
         usize::from(self.view(slot).return_rule)
     }
 
+    pub(crate) fn snapshot_view_query(
+        &self,
+        slot: usize,
+        arena: &crate::mem::arena::Arena,
+    ) -> Result<StoredQueryDefinition, SqlError> {
+        let catalog = self.view_rule_catalog();
+        let rule_slot = catalog.views[slot].return_rule;
+        let definition = &catalog.rules[usize::from(rule_slot)].definition;
+        let dependencies = self.snapshot_dependency_image(
+            self.committed_dependency_image(StoredQueryDependencyOwner::Rule(rule_slot)),
+            arena,
+        )?;
+        Ok(StoredQueryDefinition {
+            sql: StackStr::from_str(
+                definition
+                    .action_sql()
+                    .next()
+                    .expect("every view has one _RETURN action"),
+            ),
+            creation_path: definition.creation_path,
+            dependencies,
+        })
+    }
+
     pub(crate) fn view_sql(&self, slot: usize) -> StackStr<VIEW_SQL_MAX> {
         self.view_sql_for(&self.view(slot))
     }
@@ -40531,7 +40580,7 @@ impl Storage {
     }
 
     /// Promotes an uncommitted CREATE VIEW into the committed catalog.
-    pub fn commit_view_create(&mut self, slot: usize) {
+    pub fn commit_view_create(&self, slot: usize) {
         let mut catalog = self.view_rule_catalog();
         catalog.views[slot].ddl_state = catalog.views[slot].ddl_state.commit_create();
         let rule = usize::from(catalog.views[slot].return_rule);
@@ -40853,7 +40902,7 @@ impl Storage {
     }
 
     /// Discards an uncommitted CREATE VIEW (rollback): the slot is freed.
-    pub fn rollback_view_create(&mut self, slot: usize) {
+    pub fn rollback_view_create(&self, slot: usize) {
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::View,
             slot: slot as u16,
@@ -49793,14 +49842,9 @@ impl Storage {
         if let RuleTarget::Table(table) = self.rule(slot).definition.target {
             self.tables[usize::from(table)].pending_has_rules_txid = prior_table_rule_txid;
         }
-        let _ = self.rule(slot).ddl_state.rollback_create();
-        let pending = self
-            .rule(slot)
-            .pending
-            .map(|pending| pending.dependency_slot);
-        self.view_rule_catalog().rules[slot] = RuleDef::EMPTY;
-        self.clear_pending_dependency_chain(pending);
-        self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
+        let mut catalog = self.view_rule_catalog();
+        let _ = catalog.rules[slot].ddl_state.rollback_create();
+        self.clear_rule_slot_in(&mut catalog, slot);
     }
 
     pub(crate) fn begin_rule_history(&mut self, target: RuleTarget, txid: u32) -> Option<u32> {
@@ -49817,19 +49861,18 @@ impl Storage {
     }
 
     pub(crate) fn commit_rule_alter(&mut self, slot: usize, txid: u32) {
-        if let Some(pending) = self.rule(slot).pending
+        let mut catalog = self.view_rule_catalog();
+        if let Some(pending) = catalog.rules[slot].pending
             && pending.txid == txid
         {
             self.commit_pending_dependencies(
                 StoredQueryDependencyOwner::Rule(slot as u16),
                 pending.dependency_slot,
             );
-            let old = self.rule(slot).definition;
-            {
-                let mut catalog = self.view_rule_catalog();
-                catalog.rules[slot].definition = pending.definition;
-                catalog.rules[slot].pending = None;
-            }
+            let old = catalog.rules[slot].definition;
+            catalog.rules[slot].definition = pending.definition;
+            catalog.rules[slot].pending = None;
+            drop(catalog);
             let subid = pending.definition.target.comment_subid();
             for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
                 comment.used
@@ -49911,8 +49954,9 @@ impl Storage {
     /// temporary table directly rather than first staging every dependent, so
     /// remove both present and transactionally dropped rules here.
     fn commit_rules_for_table(&mut self, table: usize) {
+        let mut catalog = self.view_rule_catalog();
         for slot in 0..self.rule_count() {
-            let rule = self.rule(slot);
+            let rule = catalog.rules[slot];
             if rule.database != current_database()
                 || rule.ddl_state == CatalogDdlState::Absent
                 || rule.definition.target != RuleTarget::Table(table as u16)
@@ -49930,13 +49974,7 @@ impl Storage {
                     *comment = CommentEntry::empty();
                 }
             }
-            let pending = self
-                .rule(slot)
-                .pending
-                .map(|pending| pending.dependency_slot);
-            self.view_rule_catalog().rules[slot] = RuleDef::EMPTY;
-            self.clear_pending_dependency_chain(pending);
-            self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
+            self.clear_rule_slot_in(&mut catalog, slot);
         }
     }
 
@@ -49959,18 +49997,14 @@ impl Storage {
             ));
         }
         self.validate_rule_target(definition.target, 0)?;
-        if self
-            .rule_entries()
-            .map(|(_, entry)| entry)
-            .enumerate()
-            .any(|(other, rule)| {
-                other != slot
-                    && rule.database == current_database()
-                    && rule.ddl_state != CatalogDdlState::Absent
-                    && rule.definition.target == definition.target
-                    && rule.definition.name == definition.name
-            })
-        {
+        let mut catalog = self.view_rule_catalog();
+        if catalog.rules.iter().enumerate().any(|(other, rule)| {
+            other != slot
+                && rule.database == current_database()
+                && rule.ddl_state != CatalogDdlState::Absent
+                && rule.definition.target == definition.target
+                && rule.definition.name == definition.name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "journal rewrite rule duplicates an existing identity"
@@ -49982,15 +50016,15 @@ impl Storage {
             dependencies.view(),
             self.stored_query_dependencies_per_image,
         )?;
-        if self.rule(slot).ddl_state != CatalogDdlState::Absent {
-            let occupied = self.rule(slot);
+        if catalog.rules[slot].ddl_state != CatalogDdlState::Absent {
+            let occupied = catalog.rules[slot];
             let occupied_definition = occupied.definition;
             if occupied_definition.target != definition.target
                 || occupied_definition.name != definition.name
             {
-                let free = self
-                    .rule_entries()
-                    .map(|(_, entry)| entry)
+                let free = catalog
+                    .rules
+                    .iter()
                     .position(|rule| rule.ddl_state == CatalogDdlState::Absent)
                     .ok_or_else(|| {
                         sql_err!(
@@ -49998,15 +50032,15 @@ impl Storage {
                             "rewrite-rule catalog is full during recovery"
                         )
                     })?;
-                self.view_rule_catalog().rules[free] = occupied;
+                catalog.rules[free] = occupied;
                 self.copy_committed_dependencies(
                     StoredQueryDependencyOwner::Rule(slot as u16),
                     StoredQueryDependencyOwner::Rule(free as u16),
                 );
                 if let RuleTarget::View(view) = occupied_definition.target
-                    && self.view(usize::from(view)).return_rule == slot as u16
+                    && catalog.views[usize::from(view)].return_rule == slot as u16
                 {
-                    self.view_rule_catalog().views[usize::from(view)].return_rule = free as u16;
+                    catalog.views[usize::from(view)].return_rule = free as u16;
                 }
             }
         }
@@ -50014,13 +50048,14 @@ impl Storage {
             StoredQueryDependencyOwner::Rule(slot as u16),
             dependencies.view(),
         )?;
-        self.view_rule_catalog().rules[slot] = RuleDef {
+        catalog.rules[slot] = RuleDef {
             database: current_database(),
             created_at,
             definition,
             pending: None,
             ddl_state: CatalogDdlState::Present,
         };
+        drop(catalog);
         if let RuleTarget::Table(table) = definition.target {
             self.tables[usize::from(table)].def.has_rules = true;
         }

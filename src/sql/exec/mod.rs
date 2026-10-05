@@ -10122,7 +10122,7 @@ fn column_privilege_target(
             let view = storage.view(relation.slot as usize);
             let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
             let count =
-                super::catalog::describe_view(storage, txid, view, arena, &mut descriptions)?;
+                super::catalog::describe_view(storage, txid, &view, arena, &mut descriptions)?;
             let column = descriptions[..count]
                 .iter()
                 .position(|description| description.name == name)
@@ -35366,7 +35366,7 @@ pub fn create_view(
         let prior_count = match super::catalog::describe_view(
             storage,
             txn.txid,
-            storage.view(slot),
+            &storage.view(slot),
             arena,
             &mut prior_description,
         ) {
@@ -35793,7 +35793,7 @@ pub fn alter_view(
             let count = match super::catalog::describe_view(
                 storage,
                 txn.txid,
-                storage.view(slot),
+                &storage.view(slot),
                 arena,
                 &mut descriptions,
             ) {
@@ -35924,7 +35924,8 @@ pub fn alter_view(
             return sql_ok();
         }
         AlterViewAction::RenameColumn { from, to } => {
-            let current = storage.view(slot).columns_for(txn.txid);
+            let view_image = storage.view(slot);
+            let current = view_image.columns_for(txn.txid);
             let Some(index) = current
                 .names()
                 .iter()
@@ -36130,10 +36131,9 @@ fn rewrite_view_column_dependents(
             continue;
         }
 
-        let view = storage.view(view_slot).clone();
-        let view_sql = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::from_str(
-            storage.view_sql(view_slot).as_str(),
-        );
+        let view = storage.view(view_slot);
+        let query = storage.snapshot_view_query(view_slot, arena)?;
+        let view_sql = query.sql;
         let rewritten = rewrite_relation_column_identifiers(view_sql.as_str(), rename, arena)?;
         if rewritten == view_sql {
             return Err(sql_err!(
@@ -36141,8 +36141,7 @@ fn rewrite_view_column_dependents(
                 "dependent view column binding has no matching stored identifier"
             ));
         }
-        let creation_path =
-            StackStr::<128>::from_str(storage.view_creation_path(view_slot).as_str());
+        let creation_path = query.creation_path;
         let user = super::eval::funcs::system::session_user_owned();
         let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
         let rebound = super::query::stored_query_dependencies(
@@ -36152,7 +36151,7 @@ fn rewrite_view_column_dependents(
             path,
             arena,
         )?;
-        if rebound.entries() != storage.view_dependencies(view_slot).entries() {
+        if rebound.entries() != query.dependencies.entries() {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "view column rename would change a dependent view binding"
@@ -36448,7 +36447,7 @@ fn stored_rule_definition(
             condition_columns.count = super::catalog::describe_view(
                 storage,
                 txn.txid,
-                storage.view(usize::from(slot)),
+                &storage.view(usize::from(slot)),
                 arena,
                 &mut descriptions,
             )?;
@@ -37123,21 +37122,19 @@ pub fn comment(
                         relation.name
                     ));
                 };
+                let query = match storage.snapshot_view_query(slot, arena) {
+                    Ok(query) => query,
+                    Err(error) => return sql_fail(error),
+                };
                 let user = super::eval::funcs::system::session_user_owned();
-                let view_path = storage.compute_path(
-                    storage.view_creation_path(slot).as_str(),
-                    user.as_str(),
-                    txid,
-                );
-                let view_sql = match arena.alloc_str(storage.view_sql(slot).as_str()) {
+                let view_path =
+                    storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
+                let view_sql = match arena.alloc_str(query.sql.as_str()) {
                     Ok(sql) => sql,
                     Err(_) => return sql_fail(super::query::arena_full_pub()),
                 };
                 let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-                let dependencies = match storage.snapshot_view_dependencies(slot, arena) {
-                    Ok(dependencies) => dependencies,
-                    Err(error) => return sql_fail(error),
-                };
+                let dependencies = query.dependencies;
                 let described = super::query::describe_stored_query(
                     view_sql,
                     storage,
@@ -45551,16 +45548,14 @@ fn rewrite_composite_dependent_views(
         if !storage.view(view_slot).visible_to(txn.txid) {
             continue;
         }
-        let view = storage.view(view_slot).clone();
-        let view_sql = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::from_str(
-            storage.view_sql(view_slot).as_str(),
-        );
-        let creation_path =
-            StackStr::<128>::from_str(storage.view_creation_path(view_slot).as_str());
+        let view = storage.view(view_slot);
+        let query = storage.snapshot_view_query(view_slot, arena)?;
+        let view_sql = query.sql;
+        let creation_path = query.creation_path;
         let user = super::eval::funcs::system::session_user_owned();
         let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
         let mut sites = [false; crate::storage::VIEW_SQL_MAX];
-        let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
+        let dependencies = query.dependencies;
         let site_count = super::query::stored_query_composite_field_rename_sites(
             view_sql.as_str(),
             path,
@@ -57347,14 +57342,14 @@ pub(crate) fn view_trigger_definition(
     let view = storage.view(view_slot);
     let mut columns = [ColDesc::new("", 0, 0); MAX_COLUMNS];
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(
-        storage.view_creation_path(view_slot).as_str(),
-        user.as_str(),
-        txid,
-    );
-    let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
+    let query = storage.snapshot_view_query(view_slot, arena)?;
+    let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
+    let dependencies = query.dependencies;
+    let source = arena
+        .alloc_str(query.sql.as_str())
+        .map_err(|_| super::query::arena_full_pub())?;
     let n_columns = super::query::describe_stored_query(
-        storage.view_sql(view_slot).as_str(),
+        source,
         storage,
         txid,
         path,
@@ -57362,7 +57357,8 @@ pub(crate) fn view_trigger_definition(
         arena,
         &mut columns,
     )?;
-    let n_columns = super::catalog::overlay_view_column_names(view, txid, &mut columns, n_columns)?;
+    let n_columns =
+        super::catalog::overlay_view_column_names(&view, txid, &mut columns, n_columns, arena)?;
     if n_columns > MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -58008,16 +58004,13 @@ fn materialize_view_rows<'a>(
     capacity: usize,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(
-        storage.view_creation_path(view_slot).as_str(),
-        user.as_str(),
-        txid,
-    );
+    let query = storage.snapshot_view_query(view_slot, arena)?;
+    let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
     let source = arena
-        .alloc_str(storage.view_sql(view_slot).as_str())
+        .alloc_str(query.sql.as_str())
         .map_err(|_| super::query::arena_full_pub())?;
     let select = super::parser::parse_query(source, arena)?;
-    let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
+    let dependencies = query.dependencies;
     let select =
         super::query::expand_stored_query(select, storage, txid, path, dependencies.view(), arena)?;
     let rows = arena
@@ -69463,7 +69456,8 @@ fn view_privilege_definition(
 ) -> Result<TableDef, SqlError> {
     let definition = storage.view(view);
     let mut descriptions = [super::types::ColDesc::new("", 0, 0); MAX_PROJ];
-    let count = super::catalog::describe_view(storage, txid, definition, arena, &mut descriptions)?;
+    let count =
+        super::catalog::describe_view(storage, txid, &definition, arena, &mut descriptions)?;
     let mut columns = [crate::storage::ColumnMeta::EMPTY; crate::storage::MAX_COLUMNS];
     if count > columns.len() {
         return Err(sql_err!(

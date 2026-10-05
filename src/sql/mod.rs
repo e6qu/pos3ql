@@ -10967,7 +10967,7 @@ impl Engine {
                 let count = match catalog::describe_view(
                     storage,
                     txn.txid,
-                    storage.view(usize::from(slot)),
+                    &storage.view(usize::from(slot)),
                     arena,
                     &mut descriptions,
                 ) {

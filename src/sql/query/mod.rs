@@ -1218,7 +1218,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
         let described = arena
             .alloc_slice_with(count, |_| super::types::ColDesc::new("", 0, 0))
             .map_err(|_| arena_full())?;
-        let count = super::catalog::describe_view(self.storage, self.txid, view, arena, described)?;
+        let count =
+            super::catalog::describe_view(self.storage, self.txid, &view, arena, described)?;
         for column in &described[..count] {
             let name = arena.alloc_str(column.name).map_err(|_| arena_full())?;
             columns
@@ -3061,7 +3062,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let count = super::catalog::describe_view(
                     self.storage,
                     self.txid,
-                    view,
+                    &view,
                     self.routine_workspace,
                     &mut descriptions,
                 )?;
@@ -3127,7 +3128,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let count = super::catalog::describe_view(
                     self.storage,
                     self.txid,
-                    view,
+                    &view,
                     self.routine_workspace,
                     &mut descriptions,
                 )?;
@@ -4672,15 +4673,12 @@ pub fn resolve_view_for_dml<'a>(
     let check_option = storage.view(view_slot).check_option_for(txid);
     // The body re-resolves under the view creator's search path.
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let view_path = storage.compute_path(
-        storage.view_creation_path(view_slot).as_str(),
-        user.as_str(),
-        txid,
-    );
+    let query = storage.snapshot_view_query(view_slot, arena)?;
+    let view_path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
     // Copy the definition into the arena so the parsed AST no longer borrows
     // storage (the caller then takes a mutable storage borrow to run the DML).
     let sql = arena
-        .alloc_str(storage.view_sql(view_slot).as_str())
+        .alloc_str(query.sql.as_str())
         .map_err(|_| arena_full())?;
     let name = name.name;
     let not_updatable = || {
@@ -4691,7 +4689,7 @@ pub fn resolve_view_for_dml<'a>(
         )
     };
     let sel = super::parser::parse_view_select(sql, arena)?;
-    let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
+    let dependencies = query.dependencies;
     let sel = expand_stored_query(sel, storage, txid, view_path, dependencies.view(), arena)?;
     if sel.set_body.is_some()
         || sel.distinct
@@ -4760,7 +4758,8 @@ pub fn resolve_view_for_dml<'a>(
             _ => return Err(not_updatable()),
         }
     }
-    let columns = storage.view(view_slot).columns_for(txid);
+    let view_image = storage.view(view_slot);
+    let columns = view_image.columns_for(txid);
     if columns.len() != n {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,

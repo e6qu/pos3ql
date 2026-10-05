@@ -5139,7 +5139,7 @@ impl ViewCheckOption {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct ViewDef {
     pub(crate) database: DatabaseOid,
     /// Monotonic creation stamp, shared with tables (see `Table::created_at`).
@@ -13415,6 +13415,47 @@ impl<D: Copy> Iterator for ForeignCatalogIter<'_, D> {
     }
 }
 
+struct ViewRuleCatalog {
+    views: FixedVec<ViewDef>,
+    rules: FixedVec<RuleDef>,
+}
+
+struct ViewRuleIter<'a, T> {
+    catalog: &'a std::sync::Mutex<ViewRuleCatalog>,
+    entries: fn(&ViewRuleCatalog) -> &FixedVec<T>,
+    next_slot: usize,
+    txid: u32,
+    accept: fn(&T, u32) -> bool,
+}
+
+impl<T> ViewRuleIter<'_, T> {
+    fn accepting(mut self, txid: u32, accept: fn(&T, u32) -> bool) -> Self {
+        self.txid = txid;
+        self.accept = accept;
+        self
+    }
+}
+
+impl<T: Copy> Iterator for ViewRuleIter<'_, T> {
+    type Item = (usize, T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self
+            .catalog
+            .lock()
+            .expect("view and rule catalog lock poisoned");
+        let entries = (self.entries)(&catalog);
+        while let Some(definition) = entries.get(self.next_slot) {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            if (self.accept)(definition, self.txid) {
+                return Some((slot, *definition));
+            }
+        }
+        None
+    }
+}
+
 struct MatviewIter<'a> {
     catalog: &'a std::sync::Mutex<FixedVec<MatviewDef>>,
     next_slot: usize,
@@ -13461,8 +13502,9 @@ pub struct Storage {
     max_catalog_versions_per_object: u32,
     pending_table_defs: FixedVec<PendingTableDefSlot>,
     pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
-    views: FixedVec<ViewDef>,
-    rules: FixedVec<RuleDef>,
+    view_rule_catalog: std::sync::Mutex<ViewRuleCatalog>,
+    view_catalog_capacity: usize,
+    rule_catalog_capacity: usize,
     routines: std::sync::Mutex<FixedVec<RoutineDef>>,
     casts: std::sync::Mutex<FixedVec<CastDef>>,
     operator_catalog: std::sync::Mutex<OperatorCatalog>,
@@ -15710,11 +15752,11 @@ impl Storage {
         let Ok(schema) = self.temporary_schema() else {
             return;
         };
-        for slot in 0..self.views.len() {
-            if self.views[slot].database == current_database()
-                && self.views[slot].ddl_state == CatalogDdlState::Present
-                && self.views[slot].persistence == RelationPersistence::Temporary
-                && self.views[slot].schema == schema
+        for slot in 0..self.view_count() {
+            if self.view(slot).database == current_database()
+                && self.view(slot).ddl_state == CatalogDdlState::Present
+                && self.view(slot).persistence == RelationPersistence::Temporary
+                && self.view(slot).schema == schema
             {
                 self.pending_drop_view(slot, 0);
                 self.commit_view_drop(slot);
@@ -15899,6 +15941,7 @@ impl Storage {
                     == RelationPersistence::Temporary
             }
             AccessClass::View => self
+                .view_rule_catalog()
                 .views
                 .get(object.slot as usize)
                 .is_some_and(|view| view.persistence == RelationPersistence::Temporary),
@@ -15910,7 +15953,7 @@ impl Storage {
                             == RelationPersistence::Temporary
                     }
                     TriggerTarget::View(view) => {
-                        self.views[usize::from(view)].persistence == RelationPersistence::Temporary
+                        self.view(usize::from(view)).persistence == RelationPersistence::Temporary
                     }
                 }
             }
@@ -16581,15 +16624,15 @@ impl Storage {
     fn committed_dependency_image(&self, owner: StoredQueryDependencyOwner) -> usize {
         match owner {
             StoredQueryDependencyOwner::Rule(slot) => usize::from(slot),
-            StoredQueryDependencyOwner::Policy(slot) => self.rules.len() + usize::from(slot),
+            StoredQueryDependencyOwner::Policy(slot) => self.rule_count() + usize::from(slot),
             StoredQueryDependencyOwner::Routine(slot) => {
-                self.rules.len() + self.policy_count() + usize::from(slot)
+                self.rule_count() + self.policy_count() + usize::from(slot)
             }
         }
     }
 
     fn matview_dependency_image(&self, slot: usize) -> usize {
-        self.rules.len() + self.policy_count() + self.routine_count() + slot
+        self.rule_count() + self.policy_count() + self.routine_count() + slot
     }
 
     fn write_dependency_image(
@@ -16679,7 +16722,15 @@ impl Storage {
             .expect("stored-query dependency catalog lock poisoned");
         let count = catalog.image_count(image);
         let source = catalog.image(image, count, self.stored_query_dependencies_per_image);
-        let mut snapshot = self.empty_stored_query_dependencies(arena)?;
+        let mut snapshot =
+            StoredQueryDependencies::with_arena_limit(usize::from(count).max(1), arena).map_err(
+                |_| {
+                    sql_err!(
+                        sqlstate::OUT_OF_MEMORY,
+                        "SQL statement arena is full while copying stored-query dependencies"
+                    )
+                },
+            )?;
         for dependency in source {
             snapshot.push(*dependency)?;
         }
@@ -16691,7 +16742,8 @@ impl Storage {
         slot: usize,
         arena: &crate::mem::arena::Arena,
     ) -> Result<StoredQueryDependencies, SqlError> {
-        let owner = StoredQueryDependencyOwner::Rule(self.views[slot].return_rule);
+        let catalog = self.view_rule_catalog();
+        let owner = StoredQueryDependencyOwner::Rule(catalog.views[slot].return_rule);
         self.snapshot_dependency_image(self.committed_dependency_image(owner), arena)
     }
 
@@ -16903,7 +16955,7 @@ impl Storage {
         let name = dependency.name.as_str();
         let slot = match dependency.class {
             DependencyClass::Table => self.find_visible(schema, name, txid),
-            DependencyClass::View => self.views.iter().position(|view| {
+            DependencyClass::View => self.view_rule_catalog().views.iter().position(|view| {
                 view.database == current_database()
                     && view.visible_to(txid)
                     && view.schema_for(txid).as_str() == schema
@@ -16971,19 +17023,33 @@ impl Storage {
         image: usize,
         txid: u32,
     ) -> Result<(), SqlError> {
+        // Resolve identities without retaining the dependency mutex: catalog
+        // publication writes dependencies while holding its definition guard.
+        let mut snapshot = [StoredQueryDependency::EMPTY; MAX_STORED_QUERY_DEPENDENCIES];
+        let count = {
+            let catalog = self
+                .stored_query_dependencies
+                .lock()
+                .expect("stored-query dependency catalog lock poisoned");
+            let count = catalog.counts[image];
+            snapshot[..usize::from(count)].copy_from_slice(catalog.image(
+                image,
+                count,
+                self.stored_query_dependencies_per_image,
+            ));
+            count
+        };
+        let dependencies = &mut snapshot[..usize::from(count)];
+        for dependency in dependencies.iter_mut() {
+            *dependency = self.rebound_stored_query_dependency(*dependency, txid)?;
+        }
         let mut catalog = self
             .stored_query_dependencies
             .lock()
             .expect("stored-query dependency catalog lock poisoned");
-        let count = catalog.counts[image];
-        let dependencies =
-            catalog.image_mut(image, count, self.stored_query_dependencies_per_image);
-        for dependency in dependencies.iter() {
-            self.rebound_stored_query_dependency(*dependency, txid)?;
-        }
-        for dependency in dependencies {
-            *dependency = self.rebound_stored_query_dependency(*dependency, txid)?;
-        }
+        catalog
+            .image_mut(image, count, self.stored_query_dependencies_per_image)
+            .copy_from_slice(dependencies);
         Ok(())
     }
 
@@ -16992,9 +17058,8 @@ impl Storage {
     }
 
     fn rebind_all_stored_query_dependencies_to(&mut self, txid: u32) -> Result<(), SqlError> {
-        for slot in 0..self.rules.len() {
-            if self.rules[slot].database == current_database() && self.rules[slot].visible_to(txid)
-            {
+        for slot in 0..self.rule_count() {
+            if self.rule(slot).database == current_database() && self.rule(slot).visible_to(txid) {
                 let owner = StoredQueryDependencyOwner::Rule(slot as u16);
                 self.rebind_stored_query_dependency_image(
                     self.committed_dependency_image(owner),
@@ -18059,8 +18124,9 @@ impl Storage {
             max_catalog_versions_per_object: config.max_catalog_versions_per_object as u32,
             pending_table_defs,
             pending_table_statistics,
-            views,
-            rules,
+            view_rule_catalog: std::sync::Mutex::new(ViewRuleCatalog { views, rules }),
+            view_catalog_capacity: config.max_views,
+            rule_catalog_capacity: config.max_rules,
             routines: std::sync::Mutex::new(routines),
             casts: std::sync::Mutex::new(casts),
             operator_catalog: std::sync::Mutex::new(OperatorCatalog {
@@ -19569,82 +19635,114 @@ impl Storage {
                 sequence_catalog.values[target_slot].pending.dirty = false;
             }
 
-            for source_slot in 0..self.views.len() {
-                let source_definition = &self.views[source_slot];
-                if source_definition.database != source
-                    || source_definition.ddl_state != CatalogDdlState::Present
-                    || source_definition.persistence == RelationPersistence::Temporary
-                {
-                    continue;
+            {
+                let mut catalog = self.view_rule_catalog();
+                for source_slot in 0..catalog.views.len() {
+                    let source_definition = catalog.views[source_slot];
+                    if source_definition.database != source
+                        || source_definition.ddl_state != CatalogDdlState::Present
+                        || source_definition.persistence == RelationPersistence::Temporary
+                    {
+                        continue;
+                    }
+                    let mut definition = source_definition;
+                    let target_slot = catalog
+                        .views
+                        .iter()
+                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "view catalog is full")
+                        })?;
+                    definition.database = target;
+                    definition.ownership = definition.ownership.committed();
+                    definition.pending_schema = None;
+                    definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                    catalog.views[target_slot] = definition;
                 }
-                let mut definition = source_definition.clone();
-                let target_slot = self
-                    .views
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "view catalog is full")
-                    })?;
-                definition.database = target;
-                definition.ownership = definition.ownership.committed();
-                definition.pending_schema = None;
-                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.views[target_slot] = definition;
-            }
-            for source_slot in 0..self.rules.len() {
-                let mut rule = self.rules[source_slot];
-                if rule.database != source
-                    || rule.ddl_state != CatalogDdlState::Present
-                    || self.access_object_is_temporary(rule.definition.target.access_object(), 0)
-                {
-                    continue;
-                }
-                let target_object = self
-                    .cloned_access_object(rule.definition.target.access_object(), source, target)
+                for source_slot in 0..catalog.rules.len() {
+                    let mut rule = catalog.rules[source_slot];
+                    if rule.database != source
+                        || rule.ddl_state != CatalogDdlState::Present
+                        || match rule.definition.target {
+                            RuleTarget::Table(table) => {
+                                self.table_def(usize::from(table), 0).persistence
+                                    == RelationPersistence::Temporary
+                            }
+                            RuleTarget::View(view) => {
+                                catalog.views[usize::from(view)].persistence
+                                    == RelationPersistence::Temporary
+                            }
+                        }
+                    {
+                        continue;
+                    }
+                    let target_object = match rule.definition.target {
+                        RuleTarget::Table(_) => self.cloned_access_object(
+                            rule.definition.target.access_object(),
+                            source,
+                            target,
+                        ),
+                        RuleTarget::View(view) => {
+                            let created_at = catalog.views[usize::from(view)].created_at;
+                            catalog
+                                .views
+                                .iter()
+                                .position(|candidate| {
+                                    candidate.database == target
+                                        && candidate.ddl_state != CatalogDdlState::Absent
+                                        && candidate.created_at == created_at
+                                })
+                                .map(|slot| AccessObject {
+                                    class: AccessClass::View,
+                                    slot: slot as u16,
+                                })
+                        }
+                    }
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::INTERNAL_ERROR,
                             "template rewrite-rule relation was not cloned"
                         )
                     })?;
-                rule.definition.target = match target_object.class {
-                    AccessClass::Table => RuleTarget::Table(target_object.slot),
-                    AccessClass::View => RuleTarget::View(target_object.slot),
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "template rewrite rule rebound to a non-relation"
-                        ));
-                    }
-                };
-                let target_slot = self
-                    .rules
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "rewrite-rule catalog is full"
-                        )
-                    })?;
-                rule.database = target;
-                rule.pending = None;
-                rule.ddl_state = CatalogDdlState::PendingCreate { txid };
-                self.rules[target_slot] = rule;
-                self.copy_committed_dependencies(
-                    StoredQueryDependencyOwner::Rule(source_slot as u16),
-                    StoredQueryDependencyOwner::Rule(target_slot as u16),
-                );
-                if rule.definition.event == RewriteEvent::Select
-                    && rule.definition.name.as_str() == "_RETURN"
-                {
-                    let RuleTarget::View(view_slot) = rule.definition.target else {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "template return rule is not attached to a view"
-                        ));
+                    rule.definition.target = match target_object.class {
+                        AccessClass::Table => RuleTarget::Table(target_object.slot),
+                        AccessClass::View => RuleTarget::View(target_object.slot),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template rewrite rule rebound to a non-relation"
+                            ));
+                        }
                     };
-                    self.views[usize::from(view_slot)].return_rule = target_slot as u16;
+                    let target_slot = catalog
+                        .rules
+                        .iter()
+                        .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "rewrite-rule catalog is full"
+                            )
+                        })?;
+                    rule.database = target;
+                    rule.pending = None;
+                    rule.ddl_state = CatalogDdlState::PendingCreate { txid };
+                    catalog.rules[target_slot] = rule;
+                    self.copy_committed_dependencies(
+                        StoredQueryDependencyOwner::Rule(source_slot as u16),
+                        StoredQueryDependencyOwner::Rule(target_slot as u16),
+                    );
+                    if rule.definition.event == RewriteEvent::Select
+                        && rule.definition.name.as_str() == "_RETURN"
+                    {
+                        let RuleTarget::View(view_slot) = rule.definition.target else {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template return rule is not attached to a view"
+                            ));
+                        };
+                        catalog.views[usize::from(view_slot)].return_rule = target_slot as u16;
+                    }
                 }
             }
             for source_slot in 0..self.matview_count() {
@@ -20005,9 +20103,10 @@ impl Storage {
                         )
                     }
                     TriggerTarget::View(source_view) => {
-                        let source_view = &self.views[usize::from(source_view)];
+                        let source_view = &self.view(usize::from(source_view));
                         TriggerTarget::View(
-                            self.views
+                            self.view_rule_catalog()
+                                .views
                                 .iter()
                                 .position(|view| {
                                     view.database == target
@@ -20459,7 +20558,7 @@ impl Storage {
             }
             let object_database = match entry.object.class {
                 AccessClass::Table => self.tables[usize::from(entry.object.slot)].database,
-                AccessClass::View => self.views[usize::from(entry.object.slot)].database,
+                AccessClass::View => self.view(usize::from(entry.object.slot)).database,
                 AccessClass::MaterializedView => {
                     self.matview(usize::from(entry.object.slot)).database
                 }
@@ -20518,7 +20617,7 @@ impl Storage {
             let relation = entry.target.relation;
             let object_database = match relation.class {
                 AccessClass::Table => self.tables[usize::from(relation.slot)].database,
-                AccessClass::View => self.views[usize::from(relation.slot)].database,
+                AccessClass::View => self.view(usize::from(relation.slot)).database,
                 AccessClass::MaterializedView => self.matview(usize::from(relation.slot)).database,
                 _ => continue,
             };
@@ -20625,19 +20724,17 @@ impl Storage {
                 }
             };
         }
-        for view in self.views.iter_mut() {
-            if view.database == database {
-                *view = ViewDef::EMPTY;
+        {
+            let mut catalog = self.view_rule_catalog();
+            for view in catalog.views.iter_mut() {
+                if view.database == database {
+                    *view = ViewDef::EMPTY;
+                }
             }
-        }
-        for slot in 0..self.rules.len() {
-            if self.rules[slot].database == database {
-                let pending = self.rules[slot]
-                    .pending
-                    .map(|pending| pending.dependency_slot);
-                self.rules[slot] = RuleDef::EMPTY;
-                self.clear_pending_dependency_chain(pending);
-                self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
+            for slot in 0..catalog.rules.len() {
+                if catalog.rules[slot].database == database {
+                    self.clear_rule_slot_in(&mut catalog, slot);
+                }
             }
         }
         {
@@ -20842,9 +20939,9 @@ impl Storage {
                 self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
             }
         }
-        for slot in 0..self.rules.len() {
-            if self.rules[slot].database == DatabaseOid::POSTGRES
-                && self.rules[slot].ddl_state == CatalogDdlState::Absent
+        for slot in 0..self.rule_count() {
+            if self.rule(slot).database == DatabaseOid::POSTGRES
+                && self.rule(slot).ddl_state == CatalogDdlState::Absent
             {
                 self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
             }
@@ -20935,8 +21032,23 @@ impl Storage {
                 }
             };
         }
-        commit_catalog!(views);
-        commit_catalog!(rules);
+        {
+            let mut catalog = self.view_rule_catalog();
+            for view in catalog.views.iter_mut() {
+                if view.database == database
+                    && view.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    view.ddl_state = view.ddl_state.commit_create();
+                }
+            }
+            for rule in catalog.rules.iter_mut() {
+                if rule.database == database
+                    && rule.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    rule.ddl_state = rule.ddl_state.commit_create();
+                }
+            }
+        }
         {
             let mut catalog = self
                 .policy_catalog
@@ -21360,7 +21472,7 @@ impl Storage {
         let slot = object.slot as usize;
         match object.class {
             AccessClass::Table => self.tables[slot].ownership,
-            AccessClass::View => self.views[slot].ownership,
+            AccessClass::View => self.view(slot).ownership,
             AccessClass::MaterializedView => self.matview(slot).ownership,
             AccessClass::Sequence => self.sequence(slot).ownership,
             AccessClass::Schema => self.schema_def(slot).ownership,
@@ -21374,7 +21486,7 @@ impl Storage {
             AccessClass::Extension => self.extension(slot).ownership,
             AccessClass::Trigger => match self.trigger(slot).target {
                 TriggerTarget::Table(table) => self.tables[usize::from(table)].ownership,
-                TriggerTarget::View(view) => self.views[usize::from(view)].ownership,
+                TriggerTarget::View(view) => self.view(usize::from(view)).ownership,
             },
             AccessClass::EventTrigger => self.event_trigger(slot).definition.ownership,
             AccessClass::Database => self.databases[slot].ownership,
@@ -21393,7 +21505,9 @@ impl Storage {
         let slot = object.slot as usize;
         match object.class {
             AccessClass::Table => &mut self.tables[slot].ownership,
-            AccessClass::View => &mut self.views[slot].ownership,
+            AccessClass::View => {
+                unreachable!("view ownership is synchronized separately")
+            }
             AccessClass::MaterializedView => {
                 unreachable!("materialized-view ownership is synchronized separately")
             }
@@ -21754,7 +21868,7 @@ impl Storage {
         }
         let slot = match class {
             AccessClass::Table => self.find_visible(schema, name, txid),
-            AccessClass::View => self.views.iter().position(|view| {
+            AccessClass::View => self.view_rule_catalog().views.iter().position(|view| {
                 view.database == current_database()
                     && view.visible_to(txid)
                     && view.schema_for(txid).as_str() == schema
@@ -21829,7 +21943,7 @@ impl Storage {
                 (definition.schema, definition.name)
             }
             AccessClass::View => {
-                let definition = &self.views[slot];
+                let definition = &self.view(slot);
                 (definition.schema_for(txid), definition.name_for(txid))
             }
             AccessClass::MaterializedView => {
@@ -21872,7 +21986,7 @@ impl Storage {
                 let trigger = self.trigger(slot);
                 let schema = match trigger.target {
                     TriggerTarget::Table(table) => self.table_def(usize::from(table), txid).schema,
-                    TriggerTarget::View(view) => self.views[usize::from(view)].schema,
+                    TriggerTarget::View(view) => self.view(usize::from(view)).schema,
                 };
                 (schema, trigger.name_to(txid))
             }
@@ -21920,7 +22034,7 @@ impl Storage {
         let slot = object.slot as usize;
         match object.class {
             AccessClass::Table => self.tables[slot].live,
-            AccessClass::View => self.views[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::View => self.view(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::MaterializedView => {
                 self.matview(slot).ddl_state == CatalogDdlState::Present
             }
@@ -21963,7 +22077,7 @@ impl Storage {
         let slot = object.slot as usize;
         match object.class {
             AccessClass::Table => self.tables[slot].visible_to(txid),
-            AccessClass::View => self.views[slot].visible_to(txid),
+            AccessClass::View => self.view(slot).visible_to(txid),
             AccessClass::MaterializedView => self.matview(slot).visible_to(txid),
             AccessClass::Sequence => self.sequence(slot).visible_to(txid),
             AccessClass::Schema => self.schema_def(slot).visible_to(txid),
@@ -22000,7 +22114,7 @@ impl Storage {
         let slot = usize::from(object.slot);
         match object.class {
             AccessClass::Table => Some(self.tables[slot].database),
-            AccessClass::View => Some(self.views[slot].database),
+            AccessClass::View => Some(self.view(slot).database),
             AccessClass::MaterializedView => Some(self.matview(slot).database),
             AccessClass::Sequence => Some(self.sequence(slot).database),
             AccessClass::Schema => Some(self.schema_def(slot).database),
@@ -22049,10 +22163,13 @@ impl Storage {
                 })?
             }
             AccessClass::View => {
-                let created_at = self.views[source_slot].created_at;
-                self.views.iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
-                })?
+                let created_at = self.view(source_slot).created_at;
+                self.view_rule_catalog()
+                    .views
+                    .iter()
+                    .position(|candidate| {
+                        candidate.database == target_database && candidate.created_at == created_at
+                    })?
             }
             AccessClass::MaterializedView => {
                 let created_at = self.matview(source_slot).created_at;
@@ -22233,8 +22350,8 @@ impl Storage {
         .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
-    pub(crate) fn checkpoint_views(&self) -> impl Iterator<Item = (usize, &ViewDef)> {
-        self.views.iter().enumerate().filter(|(_, value)| {
+    pub(crate) fn checkpoint_views(&self) -> impl Iterator<Item = (usize, ViewDef)> + '_ {
+        self.view_entries().accepting(0, |value, _| {
             value.ddl_state == CatalogDdlState::Present
                 && value.persistence != RelationPersistence::Temporary
         })
@@ -22343,22 +22460,25 @@ impl Storage {
     }
 
     pub(crate) fn checkpoint_rules(&self) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
-        self.rules.iter().copied().enumerate().filter(|(_, rule)| {
-            rule.ddl_state == CatalogDdlState::Present
-                && !rule.definition.is_view_return()
-                && !matches!(
-                    rule.definition.target,
-                    RuleTarget::Table(table)
-                        if self.table_def(usize::from(table), 0).persistence
-                            == RelationPersistence::Temporary
-                )
-                && !matches!(
-                    rule.definition.target,
-                    RuleTarget::View(view)
-                        if self.views[usize::from(view)].persistence
-                            == RelationPersistence::Temporary
-                )
-        })
+        self.rule_entries()
+            .map(|(_, entry)| entry)
+            .enumerate()
+            .filter(|(_, rule)| {
+                rule.ddl_state == CatalogDdlState::Present
+                    && !rule.definition.is_view_return()
+                    && !matches!(
+                        rule.definition.target,
+                        RuleTarget::Table(table)
+                            if self.table_def(usize::from(table), 0).persistence
+                                == RelationPersistence::Temporary
+                    )
+                    && !matches!(
+                        rule.definition.target,
+                        RuleTarget::View(view)
+                            if self.view(usize::from(view)).persistence
+                                == RelationPersistence::Temporary
+                    )
+            })
     }
 
     pub(crate) fn checkpoint_operators(&self) -> impl Iterator<Item = (usize, OperatorDef)> + '_ {
@@ -22415,7 +22535,7 @@ impl Storage {
                 && !matches!(
                     value.target,
                     TriggerTarget::View(view)
-                        if self.views[usize::from(view)].persistence
+                        if self.view(usize::from(view)).persistence
                             == RelationPersistence::Temporary
                 )
         })
@@ -22526,7 +22646,7 @@ impl Storage {
     pub(crate) fn access_class_slots(&self, class: AccessClass) -> usize {
         match class {
             AccessClass::Table => self.tables.len(),
-            AccessClass::View => self.views.len(),
+            AccessClass::View => self.view_count(),
             AccessClass::MaterializedView => self.matview_count(),
             AccessClass::Sequence => self.sequence_count(),
             AccessClass::Schema => self.schema_count(),
@@ -22590,7 +22710,7 @@ impl Storage {
         };
         let owned = [
             (AccessClass::Table, self.tables.len()),
-            (AccessClass::View, self.views.len()),
+            (AccessClass::View, self.view_count()),
             (AccessClass::MaterializedView, self.matview_count()),
             (AccessClass::Sequence, self.sequence_count()),
             (AccessClass::Schema, self.schema_count()),
@@ -22861,6 +22981,21 @@ impl Storage {
             }
             return prior;
         }
+        if object.class == AccessClass::View {
+            let mut catalog = self.view_rule_catalog();
+            let ownership = &mut catalog.views[usize::from(object.slot)].ownership;
+            let prior = ownership.pending;
+            if txid == 0 {
+                ownership.owner = owner as u16;
+                ownership.pending = None;
+            } else {
+                ownership.pending = Some(PendingOwnership {
+                    txid,
+                    owner: owner as u16,
+                });
+            }
+            return prior;
+        }
         if object.class == AccessClass::MaterializedView {
             let mut matviews = self.matview_catalog();
             let ownership = &mut matviews[usize::from(object.slot)].ownership;
@@ -23016,6 +23151,17 @@ impl Storage {
             }
             return;
         }
+        if object.class == AccessClass::View {
+            let mut catalog = self.view_rule_catalog();
+            let ownership = &mut catalog.views[usize::from(object.slot)].ownership;
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            return;
+        }
         if object.class == AccessClass::MaterializedView {
             let mut matviews = self.matview_catalog();
             let ownership = &mut matviews[usize::from(object.slot)].ownership;
@@ -23125,6 +23271,12 @@ impl Storage {
         }
         if object.class == AccessClass::Sequence {
             self.sequence_catalog().definitions[usize::from(object.slot)]
+                .ownership
+                .pending = prior;
+            return;
+        }
+        if object.class == AccessClass::View {
+            self.view_rule_catalog().views[usize::from(object.slot)]
                 .ownership
                 .pending = prior;
             return;
@@ -26449,7 +26601,7 @@ impl Storage {
         // unqualified names. Check every replacement before changing any
         // catalog identity, so a fixed-capacity path never leaves a partial
         // rename behind.
-        for rule in self.rules.iter().filter(|rule| {
+        for rule in self.rule_entries().map(|(_, entry)| entry).filter(|rule| {
             rule.database == current_database() && rule.ddl_state != CatalogDdlState::Absent
         }) {
             let mut path = rule.definition.creation_path;
@@ -26577,13 +26729,27 @@ impl Storage {
             }
         }
 
-        for definition in self.views.iter_mut().filter(|definition| {
-            definition.database == current_database()
-                && definition.ddl_state != CatalogDdlState::Absent
-        }) {
-            rename_schema_name(&mut definition.schema, prior, name);
-            if let Some(pending) = &mut definition.pending_schema {
-                rename_schema_name(&mut pending.schema, prior, name);
+        {
+            let mut catalog = self.view_rule_catalog();
+            for definition in catalog.views.iter_mut().filter(|definition| {
+                definition.database == current_database()
+                    && definition.ddl_state != CatalogDdlState::Absent
+            }) {
+                rename_schema_name(&mut definition.schema, prior, name);
+                if let Some(pending) = &mut definition.pending_schema {
+                    rename_schema_name(&mut pending.schema, prior, name);
+                }
+            }
+            for definition in catalog.rules.iter_mut().filter(|definition| {
+                definition.database == current_database()
+                    && definition.ddl_state != CatalogDdlState::Absent
+            }) {
+                rename_schema_path(&mut definition.definition.creation_path, prior, name)?;
+                rename_schema_qualified_sql(&mut definition.definition.source, prior, name)?;
+                if let Some(pending) = &mut definition.pending {
+                    rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
+                    rename_schema_qualified_sql(&mut pending.definition.source, prior, name)?;
+                }
             }
         }
         {
@@ -26813,17 +26979,6 @@ impl Storage {
             }
         }
 
-        for definition in self.rules.iter_mut().filter(|definition| {
-            definition.database == current_database()
-                && definition.ddl_state != CatalogDdlState::Absent
-        }) {
-            rename_schema_path(&mut definition.definition.creation_path, prior, name)?;
-            rename_schema_qualified_sql(&mut definition.definition.source, prior, name)?;
-            if let Some(pending) = &mut definition.pending {
-                rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
-                rename_schema_qualified_sql(&mut pending.definition.source, prior, name)?;
-            }
-        }
         {
             let mut matviews = self.matview_catalog();
             for definition in matviews.iter_mut() {
@@ -26835,9 +26990,9 @@ impl Storage {
                 }
             }
         }
-        for slot in 0..self.rules.len() {
-            if self.rules[slot].database == current_database()
-                && self.rules[slot].ddl_state != CatalogDdlState::Absent
+        for slot in 0..self.rule_count() {
+            if self.rule(slot).database == current_database()
+                && self.rule(slot).ddl_state != CatalogDdlState::Absent
             {
                 let image =
                     self.committed_dependency_image(StoredQueryDependencyOwner::Rule(slot as u16));
@@ -27744,14 +27899,14 @@ impl Storage {
             }
             return Some(ResolvedRelation::Table(t));
         }
-        let view = self.views.iter().position(|v| {
+        let view = self.view_rule_catalog().views.iter().position(|v| {
             v.database == current_database()
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema
                 && v.name_for(txid).as_str() == name
         });
         if let Some(slot) = view
-            && self.views[slot].persistence == RelationPersistence::Temporary
+            && self.view(slot).persistence == RelationPersistence::Temporary
         {
             self.mark_temporary_transaction(txid);
         }
@@ -34046,7 +34201,7 @@ impl Storage {
             txid,
             creating: false,
         });
-        for rule in self.rules.iter_mut().filter(|rule| {
+        for rule in self.view_rule_catalog().rules.iter_mut().filter(|rule| {
             rule.database == current_database()
                 && rule.visible_to(txid)
                 && rule.definition_for(txid).target == RuleTarget::Table(index as u16)
@@ -34099,7 +34254,7 @@ impl Storage {
     /// image unchanged.
     pub fn rollback_drop(&mut self, index: usize) {
         self.tables[index].pending_ddl = None;
-        for rule in self.rules.iter_mut().filter(|rule| {
+        for rule in self.view_rule_catalog().rules.iter_mut().filter(|rule| {
             rule.database == current_database()
                 && rule.definition.target == RuleTarget::Table(index as u16)
                 && matches!(rule.ddl_state, CatalogDdlState::PendingDrop { .. })
@@ -34110,76 +34265,132 @@ impl Storage {
 
     /// Whether any live view exists (lets the executor skip view expansion).
     pub fn has_any_view(&self) -> bool {
-        self.views.iter().any(|view| {
+        self.view_rule_catalog().views.iter().any(|view| {
             view.database == current_database() && view.ddl_state != CatalogDdlState::Absent
         })
     }
 
-    /// Committed views as (name, SELECT text), for checkpoint serialization.
-    pub fn live_views(&self) -> impl Iterator<Item = &ViewDef> {
-        self.views.iter().filter(|view| {
-            view.database == current_database() && view.ddl_state == CatalogDdlState::Present
-        })
+    /// Owned committed view images for nested catalog reads.
+    pub fn live_views(&self) -> impl Iterator<Item = ViewDef> + '_ {
+        self.views_with_slots().map(|(_, view)| view)
     }
 
     /// Committed views with their slot indices, for OID assignment.
-    pub fn views_with_slots(&self) -> impl Iterator<Item = (usize, &ViewDef)> {
-        self.views.iter().enumerate().filter(|(_, view)| {
+    pub fn views_with_slots(&self) -> impl Iterator<Item = (usize, ViewDef)> + '_ {
+        self.view_entries().accepting(0, |view, _| {
             view.database == current_database() && view.ddl_state == CatalogDdlState::Present
         })
     }
 
     /// Views visible to `txid`, including the transaction's own DDL.
-    pub(crate) fn views_visible_to(&self, txid: u32) -> impl Iterator<Item = (usize, &ViewDef)> {
-        self.views
-            .iter()
-            .enumerate()
-            .filter(move |(_, view)| view.database == current_database() && view.visible_to(txid))
+    pub(crate) fn views_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, ViewDef)> + '_ {
+        self.view_entries().accepting(txid, |view, txid| {
+            view.database == current_database() && view.visible_to(txid)
+        })
     }
 
-    pub(crate) fn view(&self, slot: usize) -> &ViewDef {
-        &self.views[slot]
+    fn view_rule_catalog(&self) -> std::sync::MutexGuard<'_, ViewRuleCatalog> {
+        self.view_rule_catalog
+            .lock()
+            .expect("view and rule catalog lock poisoned")
+    }
+
+    fn view_entries(&self) -> ViewRuleIter<'_, ViewDef> {
+        ViewRuleIter {
+            catalog: &self.view_rule_catalog,
+            entries: |catalog| &catalog.views,
+            next_slot: 0,
+            txid: 0,
+            accept: |_, _| true,
+        }
+    }
+
+    fn rule_entries(&self) -> ViewRuleIter<'_, RuleDef> {
+        ViewRuleIter {
+            catalog: &self.view_rule_catalog,
+            entries: |catalog| &catalog.rules,
+            next_slot: 0,
+            txid: 0,
+            accept: |_, _| true,
+        }
+    }
+
+    pub(crate) fn view(&self, slot: usize) -> ViewDef {
+        self.view_rule_catalog().views[slot]
     }
 
     pub(crate) fn view_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.views[slot].database == current_database() && self.views[slot].visible_to(txid)
+        let view = self.view(slot);
+        view.database == current_database() && view.visible_to(txid)
     }
 
     pub(crate) fn view_dependencies(&self, slot: usize) -> StoredQueryDependencyImage<'_> {
         self.committed_dependencies(StoredQueryDependencyOwner::Rule(
-            self.views[slot].return_rule,
+            self.view(slot).return_rule,
         ))
     }
 
     pub(crate) fn view_return_rule(&self, slot: usize) -> usize {
-        usize::from(self.views[slot].return_rule)
+        usize::from(self.view(slot).return_rule)
     }
 
-    pub(crate) fn view_sql(&self, slot: usize) -> &str {
-        self.view_sql_for(&self.views[slot])
+    pub(crate) fn snapshot_view_query(
+        &self,
+        slot: usize,
+        arena: &crate::mem::arena::Arena,
+    ) -> Result<StoredQueryDefinition, SqlError> {
+        let catalog = self.view_rule_catalog();
+        let rule_slot = catalog.views[slot].return_rule;
+        let definition = &catalog.rules[usize::from(rule_slot)].definition;
+        let dependencies = self.snapshot_dependency_image(
+            self.committed_dependency_image(StoredQueryDependencyOwner::Rule(rule_slot)),
+            arena,
+        )?;
+        Ok(StoredQueryDefinition {
+            sql: StackStr::from_str(
+                definition
+                    .action_sql()
+                    .next()
+                    .expect("every view has one _RETURN action"),
+            ),
+            creation_path: definition.creation_path,
+            dependencies,
+        })
     }
 
-    pub(crate) fn view_sql_for(&self, view: &ViewDef) -> &str {
-        let definition = &self.rules[usize::from(view.return_rule)].definition;
-        definition
-            .action_sql()
-            .next()
-            .expect("every view has one _RETURN action")
+    pub(crate) fn view_sql(&self, slot: usize) -> StackStr<VIEW_SQL_MAX> {
+        let catalog = self.view_rule_catalog();
+        let rule = &catalog.rules[usize::from(catalog.views[slot].return_rule)];
+        StackStr::from_str(
+            rule.definition
+                .action_sql()
+                .next()
+                .expect("every view has one _RETURN action"),
+        )
     }
 
-    pub(crate) fn view_creation_path(&self, slot: usize) -> &str {
-        self.view_creation_path_for(&self.views[slot])
+    pub(crate) fn view_sql_for(&self, view: &ViewDef) -> StackStr<VIEW_SQL_MAX> {
+        let definition = self.rule(usize::from(view.return_rule)).definition;
+        StackStr::from_str(
+            definition
+                .action_sql()
+                .next()
+                .expect("every view has one _RETURN action"),
+        )
     }
 
-    pub(crate) fn view_creation_path_for(&self, view: &ViewDef) -> &str {
-        self.rules[usize::from(view.return_rule)]
+    pub(crate) fn view_creation_path(&self, slot: usize) -> StackStr<128> {
+        let catalog = self.view_rule_catalog();
+        catalog.rules[usize::from(catalog.views[slot].return_rule)]
             .definition
             .creation_path
-            .as_str()
     }
 
     pub(crate) fn view_count(&self) -> usize {
-        self.views.len()
+        self.view_catalog_capacity
     }
 
     pub(crate) fn publication_count(&self) -> usize {
@@ -36203,13 +36414,17 @@ impl Storage {
 
     /// The stored SELECT text of a view visible to `txid`, if `name` names one
     /// (own uncommitted CREATE/DROP included; another transaction's excluded).
-    pub fn find_view(&self, schema: &str, name: &str, txid: u32) -> Option<&ViewDef> {
-        self.views.iter().find(|v| {
-            v.database == current_database()
-                && v.visible_to(txid)
-                && v.schema_for(txid).as_str() == schema
-                && v.name_for(txid).as_str() == name
-        })
+    pub fn find_view(&self, schema: &str, name: &str, txid: u32) -> Option<ViewDef> {
+        self.view_rule_catalog()
+            .views
+            .iter()
+            .find(|v| {
+                v.database == current_database()
+                    && v.visible_to(txid)
+                    && v.schema_for(txid).as_str() == schema
+                    && v.name_for(txid).as_str() == name
+            })
+            .copied()
     }
 
     // --- Materialized-view catalog (parallel to views; data lives in a
@@ -40102,7 +40317,7 @@ impl Storage {
     /// table, by a view visible to `txid` (without `or_replace`), or by
     /// another transaction's uncommitted view DDL.
     pub fn create_view(
-        &mut self,
+        &self,
         schema: SqlName,
         name: SqlName,
         definition: ViewDefinition,
@@ -40117,16 +40332,19 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if let Some(blocker) = self.views.iter().find_map(|v| {
+        let ownership = self.initial_ownership(txid);
+        let mut catalog = self.view_rule_catalog();
+        if let Some(blocker) = catalog.views.iter().find_map(|v| {
             (v.database == current_database()
                 && v.schema_for(txid).as_str() == schema.as_str()
                 && v.name.as_str() == name.as_str())
             .then_some(v.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
         }) {
+            drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        let existing = self.views.iter().position(|v| {
+        let existing = catalog.views.iter().position(|v| {
             v.database == current_database()
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema.as_str()
@@ -40139,7 +40357,7 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let Some(new) = self
+        let Some(new) = catalog
             .views
             .iter()
             .position(|v| v.ddl_state == CatalogDdlState::Absent)
@@ -40147,7 +40365,7 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many views (limit {})",
-                self.views.len()
+                self.view_count()
             ));
         };
         let rule_definition = RuleDefinition {
@@ -40172,17 +40390,20 @@ impl Storage {
         };
         // Reserve and populate the return rule before changing either view.
         // Capacity errors must leave an existing replacement target untouched.
-        let rule =
-            self.create_new_rule(rule_definition, definition.query.dependencies.view(), txid)?;
+        let rule = self.create_new_rule_in(
+            &mut catalog,
+            rule_definition,
+            definition.query.dependencies.view(),
+            txid,
+        )?;
         if let Some(old) = existing {
-            self.pending_replace_view(old, txid);
+            Self::pending_replace_view_in(&mut catalog, old, txid);
         }
-        let ownership = self.initial_ownership(txid);
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::View,
             slot: new as u16,
         });
-        self.views[new] = ViewDef {
+        catalog.views[new] = ViewDef {
             database: current_database(),
             created_at: self.catalog_sequence.next(),
             schema,
@@ -40198,6 +40419,7 @@ impl Storage {
             pending_columns: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
+        drop(catalog);
         if definition.persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
         }
@@ -40214,7 +40436,7 @@ impl Storage {
         name: SqlName,
         definition: ViewDefinition,
     ) -> Result<(), SqlError> {
-        if slot >= self.views.len() || self.views[slot].ddl_state != CatalogDdlState::Absent {
+        if slot >= self.view_count() || self.view(slot).ddl_state != CatalogDdlState::Absent {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "checkpoint view slot is unavailable"
@@ -40229,11 +40451,12 @@ impl Storage {
         let (created, replaced) = self.create_view(schema, name, definition, false, 0)?;
         debug_assert!(replaced.is_none());
         if created != slot {
-            self.views[slot] = self.views[created].clone();
-            self.views[created] = ViewDef::EMPTY;
-            let return_rule = usize::from(self.views[slot].return_rule);
-            self.rules[return_rule].definition.target = RuleTarget::View(slot as u16);
-            if let Some(pending) = &mut self.rules[return_rule].pending {
+            let mut catalog = self.view_rule_catalog();
+            catalog.views[slot] = catalog.views[created];
+            catalog.views[created] = ViewDef::EMPTY;
+            let return_rule = usize::from(catalog.views[slot].return_rule);
+            catalog.rules[return_rule].definition.target = RuleTarget::View(slot as u16);
+            if let Some(pending) = &mut catalog.rules[return_rule].pending {
                 pending.definition.target = RuleTarget::View(slot as u16);
             }
         }
@@ -40250,16 +40473,17 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if let Some(blocker) = self.views.iter().find_map(|v| {
+        let blocker = self.view_rule_catalog().views.iter().find_map(|v| {
             (v.database == current_database()
                 && v.schema_for(txid).as_str() == schema
                 && v.name.as_str() == name)
                 .then_some(v.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
-        }) {
+        });
+        if let Some(blocker) = blocker {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
-        let Some(i) = self.views.iter().position(|v| {
+        let Some(i) = self.view_rule_catalog().views.iter().position(|v| {
             v.database == current_database()
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema
@@ -40274,8 +40498,9 @@ impl Storage {
     /// Overlays a pending DROP on a slot: the owner's own pending-create
     /// simply evaporates (never committed, nothing to keep).
     fn pending_drop_view(&mut self, slot: usize, txid: u32) {
-        self.views[slot].ddl_state = self.views[slot].ddl_state.drop_by(txid);
-        for rule in self.rules.iter_mut().filter(|rule| {
+        let mut catalog = self.view_rule_catalog();
+        catalog.views[slot].ddl_state = catalog.views[slot].ddl_state.drop_by(txid);
+        for rule in catalog.rules.iter_mut().filter(|rule| {
             rule.database == current_database()
                 && rule.visible_to(txid)
                 && rule.definition_for(txid).target == RuleTarget::View(slot as u16)
@@ -40287,24 +40512,24 @@ impl Storage {
     /// A replacement retires only the old view and its SELECT rule. User
     /// rules, triggers, extension membership, and stored-query references
     /// belong to the logical view and are retargeted to the new catalog slot.
-    fn pending_replace_view(&mut self, slot: usize, txid: u32) {
-        self.views[slot].ddl_state = self.views[slot].ddl_state.drop_by(txid);
-        let return_rule = usize::from(self.views[slot].return_rule);
-        self.rules[return_rule].ddl_state = self.rules[return_rule].ddl_state.drop_by(txid);
+    fn pending_replace_view_in(catalog: &mut ViewRuleCatalog, slot: usize, txid: u32) {
+        catalog.views[slot].ddl_state = catalog.views[slot].ddl_state.drop_by(txid);
+        let return_rule = usize::from(catalog.views[slot].return_rule);
+        catalog.rules[return_rule].ddl_state = catalog.rules[return_rule].ddl_state.drop_by(txid);
     }
 
     /// Moves the internal identity of a replaced view between physical catalog
     /// slots. The same operation in the opposite direction is the rollback.
     pub(crate) fn retarget_view_dependents(&mut self, from: usize, to: usize) {
-        let schema = self.views[to].schema;
-        let name = self.views[to].name;
+        let schema = self.view(to).schema;
+        let name = self.view(to).name;
         self.replace_stored_query_dependency_slot(DependencyClass::View, from, to, schema, name);
 
         let old_rule_subid = RuleTarget::View(from as u16).comment_subid();
         let new_rule_subid = RuleTarget::View(to as u16).comment_subid();
-        let excluded_return_rule = usize::from(self.views[from].return_rule);
+        let excluded_return_rule = usize::from(self.view(from).return_rule);
         let mut moved_rule = false;
-        for (slot, rule) in self.rules.iter_mut().enumerate() {
+        for (slot, rule) in self.view_rule_catalog().rules.iter_mut().enumerate() {
             if slot == excluded_return_rule || rule.ddl_state == CatalogDdlState::Absent {
                 continue;
             }
@@ -40378,9 +40603,11 @@ impl Storage {
     }
 
     /// Promotes an uncommitted CREATE VIEW into the committed catalog.
-    pub fn commit_view_create(&mut self, slot: usize) {
-        self.views[slot].ddl_state = self.views[slot].ddl_state.commit_create();
-        self.commit_rule_create(usize::from(self.views[slot].return_rule));
+    pub fn commit_view_create(&self, slot: usize) {
+        let mut catalog = self.view_rule_catalog();
+        catalog.views[slot].ddl_state = catalog.views[slot].ddl_state.commit_create();
+        let rule = usize::from(catalog.views[slot].return_rule);
+        catalog.rules[rule].ddl_state = catalog.rules[rule].ddl_state.commit_create();
     }
 
     pub(crate) fn stage_view_schema(
@@ -40389,21 +40616,22 @@ impl Storage {
         schema: SqlName,
         txid: u32,
     ) -> Result<Option<PendingObjectSchema>, SqlError> {
-        let prior = self.views[slot].pending_schema;
+        let prior = self.view(slot).pending_schema;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(self.catalog_ddl_wait_error(
                 txid,
                 prior.expect("checked Some").txid,
-                self.views[slot].name.as_str(),
+                self.view(slot).name.as_str(),
             ));
         }
         let (old_schema, old_name) = {
-            let view = &self.views[slot];
+            let view = &self.view(slot);
             (view.schema_for(txid), view.name_for(txid))
         };
-        self.views[slot].pending_schema = Some(PendingObjectSchema { txid, schema });
-        let visible_schema = self.views[slot].schema_for(txid);
-        let name = self.views[slot].name_for(txid);
+        self.view_rule_catalog().views[slot].pending_schema =
+            Some(PendingObjectSchema { txid, schema });
+        let visible_schema = self.view(slot).schema_for(txid);
+        let name = self.view(slot).name_for(txid);
         self.stage_object_comment_identity(
             CommentClass::Relation,
             old_schema,
@@ -40424,30 +40652,34 @@ impl Storage {
     }
 
     pub(crate) fn commit_view_schema(&mut self, slot: usize, txid: u32) {
-        let Some(pending) = self.views[slot]
+        let Some(pending) = self
+            .view(slot)
             .pending_schema
             .filter(|pending| pending.txid == txid)
         else {
             return;
         };
-        let old_schema = self.views[slot].schema;
-        let name = self.views[slot].name;
-        self.views[slot].schema = pending.schema;
-        self.views[slot].pending_schema = None;
+        let old_schema = self.view(slot).schema;
+        let name = self.view(slot).name;
+        {
+            let mut catalog = self.view_rule_catalog();
+            catalog.views[slot].schema = pending.schema;
+            catalog.views[slot].pending_schema = None;
+        }
         self.commit_object_comment_identity(CommentClass::Relation, old_schema, name, txid);
         self.commit_object_comment_identity(CommentClass::Type, old_schema, name, txid);
     }
 
     pub(crate) fn rollback_view_schema(&mut self, slot: usize, prior: Option<PendingObjectSchema>) {
-        let txid = self.views[slot].pending_schema.map(|pending| pending.txid);
+        let txid = self.view(slot).pending_schema.map(|pending| pending.txid);
         let (old_schema, old_name) = txid.map_or((SqlName::EMPTY, SqlName::EMPTY), |txid| {
-            let view = &self.views[slot];
+            let view = &self.view(slot);
             (view.schema_for(txid), view.name_for(txid))
         });
-        self.views[slot].pending_schema = prior;
+        self.view_rule_catalog().views[slot].pending_schema = prior;
         if let Some(txid) = txid {
             let (visible_schema, name) = {
-                let view = &self.views[slot];
+                let view = &self.view(slot);
                 (view.schema_for(txid), view.name_for(txid))
             };
             self.stage_object_comment_identity(
@@ -40475,21 +40707,21 @@ impl Storage {
         name: SqlName,
         txid: u32,
     ) -> Result<Option<PendingViewName>, SqlError> {
-        let prior = self.views[slot].pending_name;
+        let prior = self.view(slot).pending_name;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(self.catalog_ddl_wait_error(
                 txid,
                 prior.expect("checked Some").txid,
-                self.views[slot].name.as_str(),
+                self.view(slot).name.as_str(),
             ));
         }
         let (old_schema, old_name) = {
-            let view = &self.views[slot];
+            let view = &self.view(slot);
             (view.schema_for(txid), view.name_for(txid))
         };
-        self.views[slot].pending_name = Some(PendingViewName { txid, name });
-        let new_schema = self.views[slot].schema_for(txid);
-        let new_name = self.views[slot].name_for(txid);
+        self.view_rule_catalog().views[slot].pending_name = Some(PendingViewName { txid, name });
+        let new_schema = self.view(slot).schema_for(txid);
+        let new_name = self.view(slot).name_for(txid);
         self.stage_object_comment_identity(
             CommentClass::Relation,
             old_schema,
@@ -40510,29 +40742,33 @@ impl Storage {
     }
 
     pub(crate) fn commit_view_rename(&mut self, slot: usize, txid: u32) {
-        let Some(pending) = self.views[slot]
+        let Some(pending) = self
+            .view(slot)
             .pending_name
             .filter(|pending| pending.txid == txid)
         else {
             return;
         };
-        let old_schema = self.views[slot].schema;
-        let old_name = self.views[slot].name;
-        self.views[slot].name = pending.name;
-        self.views[slot].pending_name = None;
+        let old_schema = self.view(slot).schema;
+        let old_name = self.view(slot).name;
+        {
+            let mut catalog = self.view_rule_catalog();
+            catalog.views[slot].name = pending.name;
+            catalog.views[slot].pending_name = None;
+        }
         self.commit_object_comment_identity(CommentClass::Relation, old_schema, old_name, txid);
         self.commit_object_comment_identity(CommentClass::Type, old_schema, old_name, txid);
     }
 
     pub(crate) fn rollback_view_rename(&mut self, slot: usize, prior: Option<PendingViewName>) {
-        let txid = self.views[slot].pending_name.map(|pending| pending.txid);
+        let txid = self.view(slot).pending_name.map(|pending| pending.txid);
         let (old_schema, old_name) = txid.map_or((SqlName::EMPTY, SqlName::EMPTY), |txid| {
-            let view = &self.views[slot];
+            let view = &self.view(slot);
             (view.schema_for(txid), view.name_for(txid))
         });
-        self.views[slot].pending_name = prior;
+        self.view_rule_catalog().views[slot].pending_name = prior;
         if let Some(txid) = txid {
-            let view = &self.views[slot];
+            let view = &self.view(slot);
             let new_schema = view.schema_for(txid);
             let new_name = view.name_for(txid);
             self.stage_object_comment_identity(
@@ -40560,31 +40796,36 @@ impl Storage {
         options: ViewOptions,
         txid: u32,
     ) -> Result<Option<PendingViewOptions>, SqlError> {
-        let prior = self.views[slot].pending_options;
+        let prior = self.view(slot).pending_options;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(self.catalog_ddl_wait_error(
                 txid,
                 prior.expect("checked Some").txid,
-                self.views[slot].name.as_str(),
+                self.view(slot).name.as_str(),
             ));
         }
-        self.views[slot].pending_options = Some(PendingViewOptions { txid, options });
+        self.view_rule_catalog().views[slot].pending_options =
+            Some(PendingViewOptions { txid, options });
         Ok(prior)
     }
 
     pub(crate) fn commit_view_options(&mut self, slot: usize, txid: u32) {
-        let Some(pending) = self.views[slot]
+        let Some(pending) = self
+            .view(slot)
             .pending_options
             .filter(|pending| pending.txid == txid)
         else {
             return;
         };
-        self.views[slot].options = pending.options;
-        self.views[slot].pending_options = None;
+        {
+            let mut catalog = self.view_rule_catalog();
+            catalog.views[slot].options = pending.options;
+            catalog.views[slot].pending_options = None;
+        }
     }
 
     pub(crate) fn rollback_view_options(&mut self, slot: usize, prior: Option<PendingViewOptions>) {
-        self.views[slot].pending_options = prior;
+        self.view_rule_catalog().views[slot].pending_options = prior;
     }
 
     pub(crate) fn stage_view_columns(
@@ -40593,60 +40834,70 @@ impl Storage {
         columns: ViewColumns,
         txid: u32,
     ) -> Result<Option<PendingViewColumns>, SqlError> {
-        let prior = self.views[slot].pending_columns;
+        let prior = self.view(slot).pending_columns;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(self.catalog_ddl_wait_error(
                 txid,
                 prior.expect("checked Some").txid,
-                self.views[slot].name.as_str(),
+                self.view(slot).name.as_str(),
             ));
         }
-        self.views[slot].pending_columns = Some(PendingViewColumns { txid, columns });
+        self.view_rule_catalog().views[slot].pending_columns =
+            Some(PendingViewColumns { txid, columns });
         Ok(prior)
     }
 
     pub(crate) fn commit_view_columns(&mut self, slot: usize, txid: u32) {
-        let Some(pending) = self.views[slot]
+        let Some(pending) = self
+            .view(slot)
             .pending_columns
             .filter(|pending| pending.txid == txid)
         else {
             return;
         };
-        self.views[slot].columns = pending.columns;
-        self.views[slot].pending_columns = None;
+        {
+            let mut catalog = self.view_rule_catalog();
+            catalog.views[slot].columns = pending.columns;
+            catalog.views[slot].pending_columns = None;
+        }
     }
 
     pub(crate) fn rollback_view_columns(&mut self, slot: usize, prior: Option<PendingViewColumns>) {
-        self.views[slot].pending_columns = prior;
+        self.view_rule_catalog().views[slot].pending_columns = prior;
     }
 
     /// Promotes an uncommitted DROP VIEW into the committed catalog.
     pub fn commit_view_drop(&mut self, slot: usize) {
-        let database = self.views[slot].database;
-        let (schema, name) = (self.views[slot].schema, self.views[slot].name);
+        let database = self.view(slot).database;
+        let (schema, name) = (self.view(slot).schema, self.view(slot).name);
         // CREATE OR REPLACE installs the replacement before retiring this
         // slot. Comments belong to the logical same-named object and survive;
         // an ordinary DROP has no replacement and removes them.
-        let replaced = self.views.iter().enumerate().any(|(other, view)| {
-            other != slot
-                && view.database == database
-                && view.ddl_state == CatalogDdlState::Present
-                && view.schema == schema
-                && view.name == name
-        });
+        let replaced = self
+            .view_rule_catalog()
+            .views
+            .iter()
+            .enumerate()
+            .any(|(other, view)| {
+                other != slot
+                    && view.database == database
+                    && view.ddl_state == CatalogDdlState::Present
+                    && view.schema == schema
+                    && view.name == name
+            });
         if !replaced {
             self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
             self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         }
-        for rule_slot in 0..self.rules.len() {
-            if self.rules[rule_slot].database == database
-                && self.rules[rule_slot].definition.target == RuleTarget::View(slot as u16)
+        for rule_slot in 0..self.rule_count() {
+            if self.rule(rule_slot).database == database
+                && self.rule(rule_slot).definition.target == RuleTarget::View(slot as u16)
                 && matches!(
-                    self.rules[rule_slot].ddl_state,
+                    self.rule(rule_slot).ddl_state,
                     CatalogDdlState::PendingDrop { .. }
                 )
             {
-                self.commit_rule_drop(rule_slot);
+                self.clear_rule_comments(self.rule(rule_slot).definition);
             }
         }
         self.commit_triggers_for_view(slot);
@@ -40658,33 +40909,49 @@ impl Storage {
             class: AccessClass::View,
             slot: slot as u16,
         });
-        let _ = self.views[slot].ddl_state.commit_drop();
-        self.views[slot] = ViewDef::EMPTY;
+        let mut catalog = self.view_rule_catalog();
+        let _ = catalog.views[slot].ddl_state.commit_drop();
+        for rule in 0..catalog.rules.len() {
+            if catalog.rules[rule].database == database
+                && catalog.rules[rule].definition.target == RuleTarget::View(slot as u16)
+                && matches!(
+                    catalog.rules[rule].ddl_state,
+                    CatalogDdlState::PendingDrop { .. }
+                )
+            {
+                self.clear_rule_slot_in(&mut catalog, rule);
+            }
+        }
+        catalog.views[slot] = ViewDef::EMPTY;
     }
 
     /// Discards an uncommitted CREATE VIEW (rollback): the slot is freed.
-    pub fn rollback_view_create(&mut self, slot: usize) {
-        self.rollback_rule_create(usize::from(self.views[slot].return_rule), None);
+    pub fn rollback_view_create(&self, slot: usize) {
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::View,
             slot: slot as u16,
         });
-        let _ = self.views[slot].ddl_state.rollback_create();
-        self.views[slot] = ViewDef::EMPTY;
+        let mut catalog = self.view_rule_catalog();
+        let _ = catalog.views[slot].ddl_state.rollback_create();
+        let rule = usize::from(catalog.views[slot].return_rule);
+        let _ = catalog.rules[rule].ddl_state.rollback_create();
+        self.clear_rule_slot_in(&mut catalog, rule);
+        catalog.views[slot] = ViewDef::EMPTY;
     }
 
     /// Discards an uncommitted DROP VIEW (rollback). A committed view becomes
     /// visible again; a same-transaction pending-create (create + drop, then
     /// the drop rolled back to a savepoint) reverts to pending-create.
     pub fn rollback_view_drop(&mut self, slot: usize, txid: u32) {
-        for rule in self.rules.iter_mut().filter(|rule| {
+        let mut catalog = self.view_rule_catalog();
+        for rule in catalog.rules.iter_mut().filter(|rule| {
             rule.database == current_database()
                 && rule.definition.target == RuleTarget::View(slot as u16)
                 && matches!(rule.ddl_state, CatalogDdlState::PendingDrop { txid: owner } if owner == txid)
         }) {
             rule.ddl_state = rule.ddl_state.rollback_drop(txid);
         }
-        let view = &mut self.views[slot];
+        let view = &mut catalog.views[slot];
         view.ddl_state = view.ddl_state.rollback_drop(txid);
     }
 
@@ -49309,7 +49576,7 @@ impl Storage {
     }
 
     pub(crate) fn rule(&self, slot: usize) -> RuleDef {
-        self.rules[slot]
+        self.view_rule_catalog().rules[slot]
     }
 
     pub(crate) fn rule_dependencies(
@@ -49317,7 +49584,8 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> StoredQueryDependencyImage<'_> {
-        if let Some(pending) = self.rules[slot]
+        if let Some(pending) = self
+            .rule(slot)
             .pending
             .filter(|pending| pending.txid == txid)
         {
@@ -49332,7 +49600,8 @@ impl Storage {
         txid: u32,
         arena: &crate::mem::arena::Arena,
     ) -> Result<StoredQueryDependencies, SqlError> {
-        let image = if let Some(pending) = self.rules[slot]
+        let image = if let Some(pending) = self
+            .rule(slot)
             .pending
             .filter(|pending| pending.txid == txid)
         {
@@ -49344,14 +49613,15 @@ impl Storage {
     }
 
     pub(crate) fn rule_slot_visible_to(&self, slot: usize, txid: u32) -> Option<RuleDef> {
-        self.rules
+        self.view_rule_catalog()
+            .rules
             .get(slot)
             .copied()
             .filter(|rule| rule.database == current_database() && rule.visible_to(txid))
     }
 
     pub(crate) fn rule_slot(&self, target: RuleTarget, name: &str, txid: u32) -> Option<usize> {
-        self.rules.iter().position(|rule| {
+        self.view_rule_catalog().rules.iter().position(|rule| {
             rule.database == current_database()
                 && rule.visible_to(txid)
                 && rule.definition_for(txid).target == target
@@ -49365,10 +49635,10 @@ impl Storage {
         event: RewriteEvent,
         txid: u32,
     ) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
-        self.rules
-            .iter()
-            .copied()
-            .enumerate()
+        self.rule_entries()
+            .accepting(txid, |rule, txid| {
+                rule.database == current_database() && rule.visible_to(txid)
+            })
             .filter(move |(_, rule)| {
                 rule.database == current_database()
                     && rule.visible_to(txid)
@@ -49402,24 +49672,31 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
-        self.rules
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(move |(_, rule)| rule.database == current_database() && rule.visible_to(txid))
+        self.rule_entries().accepting(txid, |rule, txid| {
+            rule.database == current_database() && rule.visible_to(txid)
+        })
     }
 
     pub(crate) fn rule_count(&self) -> usize {
-        self.rules.len()
+        self.rule_catalog_capacity
     }
 
     fn validate_rule_target(&self, target: RuleTarget, txid: u32) -> Result<(), SqlError> {
+        self.validate_rule_target_in(&self.view_rule_catalog(), target, txid)
+    }
+
+    fn validate_rule_target_in(
+        &self,
+        catalog: &ViewRuleCatalog,
+        target: RuleTarget,
+        txid: u32,
+    ) -> Result<(), SqlError> {
         let visible = match target {
             RuleTarget::Table(slot) => self
                 .tables
                 .get(usize::from(slot))
                 .is_some_and(|table| table.visible_to(txid)),
-            RuleTarget::View(slot) => self
+            RuleTarget::View(slot) => catalog
                 .views
                 .get(usize::from(slot))
                 .is_some_and(|view| view.visible_to(txid)),
@@ -49434,14 +49711,20 @@ impl Storage {
     }
 
     pub(crate) fn create_rule(
-        &mut self,
+        &self,
         definition: RuleDefinition,
         dependencies: StoredQueryDependencyView<'_>,
         or_replace: bool,
         txid: u32,
     ) -> Result<(usize, Option<PendingRuleDefinition>), SqlError> {
-        self.validate_rule_target(definition.target, txid)?;
-        if let Some(slot) = self.rule_slot(definition.target, definition.name.as_str(), txid) {
+        let mut catalog = self.view_rule_catalog();
+        self.validate_rule_target_in(&catalog, definition.target, txid)?;
+        if let Some(slot) = catalog.rules.iter().position(|rule| {
+            rule.database == current_database()
+                && rule.visible_to(txid)
+                && rule.definition_for(txid).target == definition.target
+                && rule.definition_for(txid).name == definition.name
+        }) {
             if !or_replace {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,
@@ -49449,8 +49732,9 @@ impl Storage {
                     definition.name.as_str()
                 ));
             }
-            let prior = self.rules[slot].pending;
+            let prior = catalog.rules[slot].pending;
             if prior.is_some_and(|pending| pending.txid != txid) {
+                drop(catalog);
                 return Err(self.catalog_ddl_wait_error(
                     txid,
                     prior.expect("checked").txid,
@@ -49466,26 +49750,27 @@ impl Storage {
                 previous,
                 dependencies,
             )?;
-            self.rules[slot].pending = Some(PendingRuleDefinition {
+            catalog.rules[slot].pending = Some(PendingRuleDefinition {
                 txid,
                 definition,
                 dependency_slot,
             });
             return Ok((slot, prior));
         }
-        self.create_new_rule(definition, dependencies, txid)
+        self.create_new_rule_in(&mut catalog, definition, dependencies, txid)
             .map(|slot| (slot, None))
     }
 
     /// The caller validates the target or publishes a new view owning it.
     /// No definition is published until its dependency image fits.
-    fn create_new_rule(
-        &mut self,
+    fn create_new_rule_in(
+        &self,
+        catalog: &mut ViewRuleCatalog,
         definition: RuleDefinition,
         dependencies: StoredQueryDependencyView<'_>,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        let slot = self
+        let slot = catalog
             .rules
             .iter()
             .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
@@ -49493,7 +49778,7 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many rewrite rules (limit {})",
-                    self.rules.len()
+                    self.rule_count()
                 )
             })?;
         self.write_committed_dependencies(
@@ -49501,7 +49786,7 @@ impl Storage {
             dependencies,
         )?;
         let created_at = self.catalog_sequence.next();
-        self.rules[slot] = RuleDef {
+        catalog.rules[slot] = RuleDef {
             database: current_database(),
             created_at,
             definition,
@@ -49527,7 +49812,7 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        let prior = self.rules[slot].pending;
+        let prior = self.rule(slot).pending;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(self.catalog_ddl_wait_error(
                 txid,
@@ -49535,7 +49820,7 @@ impl Storage {
                 definition.name.as_str(),
             ));
         }
-        let old = self.rules[slot].definition_for(txid);
+        let old = self.rule(slot).definition_for(txid);
         let previous = prior
             .filter(|pending| pending.txid == txid)
             .map(|pending| pending.dependency_slot);
@@ -49543,7 +49828,7 @@ impl Storage {
             StoredQueryDependencyOwner::Rule(slot as u16),
             previous,
         )?;
-        self.rules[slot].pending = Some(PendingRuleDefinition {
+        self.view_rule_catalog().rules[slot].pending = Some(PendingRuleDefinition {
             txid,
             definition,
             dependency_slot,
@@ -49571,12 +49856,17 @@ impl Storage {
     }
 
     pub(crate) fn drop_rule(&mut self, slot: usize, txid: u32) {
-        self.rules[slot].ddl_state = self.rules[slot].ddl_state.drop_by(txid);
+        let mut catalog = self.view_rule_catalog();
+        catalog.rules[slot].ddl_state = catalog.rules[slot].ddl_state.drop_by(txid);
     }
 
     pub(crate) fn commit_rule_create(&mut self, slot: usize) {
-        self.rules[slot].ddl_state = self.rules[slot].ddl_state.commit_create();
-        if let RuleTarget::Table(table) = self.rules[slot].definition.target {
+        let target = {
+            let mut catalog = self.view_rule_catalog();
+            catalog.rules[slot].ddl_state = catalog.rules[slot].ddl_state.commit_create();
+            catalog.rules[slot].definition.target
+        };
+        if let RuleTarget::Table(table) = target {
             let table = &mut self.tables[usize::from(table)];
             table.def.has_rules = true;
             table.pending_has_rules_txid = None;
@@ -49584,16 +49874,12 @@ impl Storage {
     }
 
     pub(crate) fn rollback_rule_create(&mut self, slot: usize, prior_table_rule_txid: Option<u32>) {
-        if let RuleTarget::Table(table) = self.rules[slot].definition.target {
+        if let RuleTarget::Table(table) = self.rule(slot).definition.target {
             self.tables[usize::from(table)].pending_has_rules_txid = prior_table_rule_txid;
         }
-        let _ = self.rules[slot].ddl_state.rollback_create();
-        let pending = self.rules[slot]
-            .pending
-            .map(|pending| pending.dependency_slot);
-        self.rules[slot] = RuleDef::EMPTY;
-        self.clear_pending_dependency_chain(pending);
-        self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
+        let mut catalog = self.view_rule_catalog();
+        let _ = catalog.rules[slot].ddl_state.rollback_create();
+        self.clear_rule_slot_in(&mut catalog, slot);
     }
 
     pub(crate) fn begin_rule_history(&mut self, target: RuleTarget, txid: u32) -> Option<u32> {
@@ -49610,16 +49896,18 @@ impl Storage {
     }
 
     pub(crate) fn commit_rule_alter(&mut self, slot: usize, txid: u32) {
-        if let Some(pending) = self.rules[slot].pending
+        let mut catalog = self.view_rule_catalog();
+        if let Some(pending) = catalog.rules[slot].pending
             && pending.txid == txid
         {
             self.commit_pending_dependencies(
                 StoredQueryDependencyOwner::Rule(slot as u16),
                 pending.dependency_slot,
             );
-            let old = self.rules[slot].definition;
-            self.rules[slot].definition = pending.definition;
-            self.rules[slot].pending = None;
+            let old = catalog.rules[slot].definition;
+            catalog.rules[slot].definition = pending.definition;
+            catalog.rules[slot].pending = None;
+            drop(catalog);
             let subid = pending.definition.target.comment_subid();
             for comment in self.comment_catalog().entries.iter_mut().filter(|comment| {
                 comment.used
@@ -49642,8 +49930,8 @@ impl Storage {
         slot: usize,
         prior: Option<PendingRuleDefinition>,
     ) {
-        let current = self.rules[slot].pending;
-        let committed = self.rules[slot].definition;
+        let current = self.rule(slot).pending;
+        let committed = self.rule(slot).definition;
         let restored = prior.map_or(committed, |pending| pending.definition);
         if let Some(current) = current {
             self.release_pending_dependencies(current.dependency_slot);
@@ -49664,11 +49952,10 @@ impl Storage {
                     });
             }
         }
-        self.rules[slot].pending = prior;
+        self.view_rule_catalog().rules[slot].pending = prior;
     }
 
-    pub(crate) fn commit_rule_drop(&mut self, slot: usize) {
-        let definition = self.rules[slot].definition;
+    fn clear_rule_comments(&self, definition: RuleDefinition) {
         let subid = definition.target.comment_subid();
         for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
@@ -49680,21 +49967,31 @@ impl Storage {
                 *comment = CommentEntry::empty();
             }
         }
-        let pending = self.rules[slot]
+    }
+
+    fn clear_rule_slot_in(&self, catalog: &mut ViewRuleCatalog, slot: usize) {
+        let pending = catalog.rules[slot]
             .pending
             .map(|pending| pending.dependency_slot);
-        let _ = self.rules[slot].ddl_state.commit_drop();
-        self.rules[slot] = RuleDef::EMPTY;
         self.clear_pending_dependency_chain(pending);
         self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
+        catalog.rules[slot] = RuleDef::EMPTY;
+    }
+
+    pub(crate) fn commit_rule_drop(&mut self, slot: usize) {
+        self.clear_rule_comments(self.rule(slot).definition);
+        let mut catalog = self.view_rule_catalog();
+        let _ = catalog.rules[slot].ddl_state.commit_drop();
+        self.clear_rule_slot_in(&mut catalog, slot);
     }
 
     /// Rules are internal relation dependents. Session teardown drops a
     /// temporary table directly rather than first staging every dependent, so
     /// remove both present and transactionally dropped rules here.
     fn commit_rules_for_table(&mut self, table: usize) {
-        for slot in 0..self.rules.len() {
-            let rule = self.rules[slot];
+        let mut catalog = self.view_rule_catalog();
+        for slot in 0..self.rule_count() {
+            let rule = catalog.rules[slot];
             if rule.database != current_database()
                 || rule.ddl_state == CatalogDdlState::Absent
                 || rule.definition.target != RuleTarget::Table(table as u16)
@@ -49712,17 +50009,13 @@ impl Storage {
                     *comment = CommentEntry::empty();
                 }
             }
-            let pending = self.rules[slot]
-                .pending
-                .map(|pending| pending.dependency_slot);
-            self.rules[slot] = RuleDef::EMPTY;
-            self.clear_pending_dependency_chain(pending);
-            self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
+            self.clear_rule_slot_in(&mut catalog, slot);
         }
     }
 
     pub(crate) fn rollback_rule_drop(&mut self, slot: usize, txid: u32) {
-        self.rules[slot].ddl_state = self.rules[slot].ddl_state.rollback_drop(txid);
+        let mut catalog = self.view_rule_catalog();
+        catalog.rules[slot].ddl_state = catalog.rules[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn replay_rule(
@@ -49732,14 +50025,15 @@ impl Storage {
         definition: RuleDefinition,
         dependencies: StoredQueryDependencies,
     ) -> Result<(), SqlError> {
-        if slot >= self.rules.len() {
+        if slot >= self.rule_count() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "journal rewrite-rule slot is out of range"
             ));
         }
-        self.validate_rule_target(definition.target, 0)?;
-        if self.rules.iter().enumerate().any(|(other, rule)| {
+        let mut catalog = self.view_rule_catalog();
+        self.validate_rule_target_in(&catalog, definition.target, 0)?;
+        if catalog.rules.iter().enumerate().any(|(other, rule)| {
             other != slot
                 && rule.database == current_database()
                 && rule.ddl_state != CatalogDdlState::Absent
@@ -49757,13 +50051,13 @@ impl Storage {
             dependencies.view(),
             self.stored_query_dependencies_per_image,
         )?;
-        if self.rules[slot].ddl_state != CatalogDdlState::Absent {
-            let occupied = self.rules[slot];
+        if catalog.rules[slot].ddl_state != CatalogDdlState::Absent {
+            let occupied = catalog.rules[slot];
             let occupied_definition = occupied.definition;
             if occupied_definition.target != definition.target
                 || occupied_definition.name != definition.name
             {
-                let free = self
+                let free = catalog
                     .rules
                     .iter()
                     .position(|rule| rule.ddl_state == CatalogDdlState::Absent)
@@ -49773,15 +50067,15 @@ impl Storage {
                             "rewrite-rule catalog is full during recovery"
                         )
                     })?;
-                self.rules[free] = occupied;
+                catalog.rules[free] = occupied;
                 self.copy_committed_dependencies(
                     StoredQueryDependencyOwner::Rule(slot as u16),
                     StoredQueryDependencyOwner::Rule(free as u16),
                 );
                 if let RuleTarget::View(view) = occupied_definition.target
-                    && self.views[usize::from(view)].return_rule == slot as u16
+                    && catalog.views[usize::from(view)].return_rule == slot as u16
                 {
-                    self.views[usize::from(view)].return_rule = free as u16;
+                    catalog.views[usize::from(view)].return_rule = free as u16;
                 }
             }
         }
@@ -49789,13 +50083,14 @@ impl Storage {
             StoredQueryDependencyOwner::Rule(slot as u16),
             dependencies.view(),
         )?;
-        self.rules[slot] = RuleDef {
+        catalog.rules[slot] = RuleDef {
             database: current_database(),
             created_at,
             definition,
             pending: None,
             ddl_state: CatalogDdlState::Present,
         };
+        drop(catalog);
         if let RuleTarget::Table(table) = definition.target {
             self.tables[usize::from(table)].def.has_rules = true;
         }
@@ -49816,8 +50111,8 @@ impl Storage {
                     *comment = CommentEntry::empty();
                 }
             }
-            self.rules[slot] = RuleDef::EMPTY;
-            self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
+            let mut catalog = self.view_rule_catalog();
+            self.clear_rule_slot_in(&mut catalog, slot);
         }
     }
 
@@ -51845,6 +52140,121 @@ mod tests {
         }
     }
 
+    #[test]
+    fn view_rule_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ViewRuleCatalog>();
+        assert_send_sync::<std::sync::Mutex<ViewRuleCatalog>>();
+        assert_send_sync::<ViewRuleIter<'_, ViewDef>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_views = WORKERS;
+        config.max_rules = WORKERS;
+        config.max_stored_query_dependencies_per_object = 1;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let arena = Arena::new(&mut budget, "view snapshot test", 1 << 16).unwrap();
+        let barrier = std::sync::Barrier::new(WORKERS + 1);
+        let finished = std::sync::atomic::AtomicUsize::new(0);
+        let names = ["worker_a", "worker_b", "worker_c", "worker_d"];
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                let barrier = &barrier;
+                let finished = &finished;
+                scope.spawn(move || {
+                    let schema = SqlName::parse("public").unwrap();
+                    let name = SqlName::parse(names[worker]).unwrap();
+                    barrier.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        for iteration in 0..16 {
+                            let (slot, prior) = storage
+                                .create_view(
+                                    schema,
+                                    name,
+                                    test_view_definition(StoredQueryDependencies::EMPTY),
+                                    false,
+                                    worker as u32 + 20,
+                                )
+                                .unwrap();
+                            assert!(prior.is_none());
+                            if iteration == 15 {
+                                storage.commit_view_create(slot);
+                            } else {
+                                storage.rollback_view_create(slot);
+                            }
+                        }
+                    });
+                    finished.fetch_add(1, std::sync::atomic::Ordering::Release);
+                });
+            }
+            barrier.wait();
+            crate::mem::guard::forbid_alloc(|| {
+                while finished.load(std::sync::atomic::Ordering::Acquire) != WORKERS {
+                    let catalog = storage.view_rule_catalog();
+                    for (slot, view) in catalog.views.iter().enumerate() {
+                        if view.ddl_state == CatalogDdlState::Absent {
+                            assert_eq!(view.return_rule, u16::MAX);
+                            continue;
+                        }
+                        let rule = &catalog.rules[usize::from(view.return_rule)];
+                        assert_eq!(rule.definition.target, RuleTarget::View(slot as u16));
+                        assert_eq!(rule.ddl_state, view.ddl_state);
+                    }
+                    for (slot, rule) in catalog.rules.iter().enumerate() {
+                        if rule.ddl_state != CatalogDdlState::Absent {
+                            let RuleTarget::View(view) = rule.definition.target else {
+                                panic!("unexpected table rule");
+                            };
+                            assert_eq!(catalog.views[usize::from(view)].return_rule, slot as u16);
+                        }
+                    }
+                    drop(catalog);
+                    for (slot, view) in storage.checkpoint_views() {
+                        let query = storage.snapshot_view_query(slot, &arena).unwrap();
+                        assert_eq!(query.sql.as_str(), "SELECT 1");
+                        assert_eq!(query.creation_path.as_str(), "public");
+                        assert_eq!(
+                            storage.rule(usize::from(view.return_rule)).ddl_state,
+                            CatalogDdlState::Present
+                        );
+                    }
+                    std::thread::yield_now();
+                }
+            });
+        });
+
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.view_count(), WORKERS);
+            assert_eq!(storage.rule_count(), WORKERS);
+            assert_eq!(storage.checkpoint_views().count(), WORKERS);
+            for (slot, view) in storage.views_visible_to(0) {
+                let rule = storage.rule(usize::from(view.return_rule));
+                assert_eq!(rule.definition.target, RuleTarget::View(slot as u16));
+                let query = storage.snapshot_view_query(slot, &arena).unwrap();
+                assert_eq!(query.sql.as_str(), "SELECT 1");
+                assert_eq!(query.creation_path.as_str(), "public");
+                assert!(query.dependencies.entries().is_empty());
+                assert_eq!(storage.view_sql(slot), query.sql);
+            }
+            assert_eq!(
+                storage
+                    .create_view(
+                        SqlName::parse("public").unwrap(),
+                        SqlName::parse("overflow").unwrap(),
+                        test_view_definition(StoredQueryDependencies::EMPTY),
+                        false,
+                        30,
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+        });
+    }
+
     fn oversized_test_dependencies() -> StoredQueryDependencies {
         let mut dependencies = StoredQueryDependencies::EMPTY;
         dependencies.push(StoredQueryDependency::EMPTY).unwrap();
@@ -51935,9 +52345,14 @@ mod tests {
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
-            assert!(storage.views.iter().all(|view| view.created_at == 0
-                && view.ddl_state == CatalogDdlState::Absent
-                && view.return_rule == u16::MAX));
+            assert!(
+                storage
+                    .view_entries()
+                    .map(|(_, view)| view)
+                    .all(|view| view.created_at == 0
+                        && view.ddl_state == CatalogDdlState::Absent
+                        && view.return_rule == u16::MAX)
+            );
             assert_eq!(storage.rule(0).ddl_state, CatalogDdlState::Absent);
             let (slot, _) = storage
                 .create_view(
@@ -51990,8 +52405,8 @@ mod tests {
             );
             assert_eq!(storage.view(slot).ddl_state, CatalogDdlState::Present);
             assert_eq!(storage.rule(0).ddl_state, CatalogDdlState::Present);
-            assert_eq!(storage.view_sql(slot), "SELECT 1");
-            assert_eq!(storage.views[2].created_at, 0);
+            assert_eq!(storage.view_sql(slot).as_str(), "SELECT 1");
+            assert_eq!(storage.view(2).created_at, 0);
             storage.drop_view("public", "test_view", 8).unwrap();
             storage.commit_view_drop(slot);
             assert_eq!(storage.view(slot).created_at, 0);
@@ -52094,7 +52509,7 @@ mod tests {
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
             assert_eq!(storage.view_return_rule(0), 0);
-            assert_eq!(storage.view_sql(0), "SELECT 1");
+            assert_eq!(storage.view_sql(0).as_str(), "SELECT 1");
             assert_eq!(storage.rule(1).ddl_state, CatalogDdlState::Absent);
             assert_eq!(
                 storage.rule_dependencies(0, 0).entries(),
@@ -52105,7 +52520,7 @@ mod tests {
                 .replay_rule(0, 42, definition, StoredQueryDependencies::EMPTY)
                 .unwrap();
             assert_eq!(storage.view_return_rule(0), 1);
-            assert_eq!(storage.view_sql(0), "SELECT 1");
+            assert_eq!(storage.view_sql(0).as_str(), "SELECT 1");
             assert_eq!(
                 storage.rule_dependencies(1, 0).entries(),
                 &[StoredQueryDependency::EMPTY]
@@ -52195,8 +52610,8 @@ mod tests {
         storage.alter_rule(rule, definition, 8).unwrap();
         storage.alter_rule(rule, definition, 8).unwrap();
         let other_database = DatabaseOid::parse(USER_DATABASE_OID_BASE + 1).unwrap();
-        storage.views[slot].database = other_database;
-        storage.rules[rule].database = other_database;
+        storage.view_rule_catalog().views[slot].database = other_database;
+        storage.view_rule_catalog().rules[rule].database = other_database;
         crate::mem::guard::forbid_alloc(|| {
             storage.clear_database_catalog(other_database);
             assert_eq!(storage.view(slot).created_at, 0);
@@ -52473,7 +52888,7 @@ mod tests {
         assert_eq!(brin_maintenance.states.len(), 6);
         assert_eq!(brin_maintenance.unsummarized_ranges.len(), 6 * 70);
         drop(brin_maintenance);
-        assert_eq!(storage.views.len(), 3);
+        assert_eq!(storage.view_count(), 3);
         assert_eq!(storage.matview_count(), 4);
         assert_eq!(storage.routine_count(), 5);
         let committed_dependency_images = 7 + 8 + 5 + 4;

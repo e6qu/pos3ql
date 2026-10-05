@@ -2458,7 +2458,7 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
         let described = arena
             .alloc_slice_with(width, |_| crate::sql::types::ColDesc::new("", 0, 0))
             .map_err(|_| arena_full())?;
-        let count = crate::sql::catalog::describe_view(storage, txid, view, arena, described)?;
+        let count = crate::sql::catalog::describe_view(storage, txid, &view, arena, described)?;
         for column in &described[..count] {
             let (ctype, user_type) =
                 crate::sql::exec::catalog_column_type(storage, txid, column.type_oid).ok_or_else(

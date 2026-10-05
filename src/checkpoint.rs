@@ -9208,7 +9208,7 @@ impl Checkpointer {
             write_database_context(&mut self.manifest_buf, &mut database_context, view.database)?;
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
-            for b in storage.view_sql(view_slot).as_bytes() {
+            for b in storage.view_sql(view_slot).as_str().as_bytes() {
                 let _ = write!(hex, "{b:02x}");
             }
             let mut hschema = StackStr::<130>::new();
@@ -9216,7 +9216,7 @@ impl Checkpointer {
                 let _ = write!(hschema, "{b:02x}");
             }
             let mut hpath = StackStr::<260>::new();
-            for b in storage.view_creation_path(view_slot).as_bytes() {
+            for b in storage.view_creation_path(view_slot).as_str().as_bytes() {
                 let _ = write!(hpath, "{b:02x}");
             }
             let mut hname = StackStr::<130>::new();

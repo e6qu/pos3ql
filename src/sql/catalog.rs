@@ -13606,7 +13606,7 @@ pub fn view_def_text<'a>(
     for (slot, _) in storage.views_visible_to(txid) {
         if view_oid(slot) == oid {
             return arena
-                .alloc_str_display(format_args!("{};", storage.view_sql(slot)))
+                .alloc_str_display(format_args!("{};", storage.view_sql(slot).as_str()))
                 .map(Some)
                 .map_err(|_| arena_full());
         }
@@ -15863,21 +15863,25 @@ fn text<'a>(s: &str, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
 pub(crate) fn describe_view<'a>(
     storage: &'a Storage,
     txid: u32,
-    view: &'a crate::storage::ViewDef,
+    view: &crate::storage::ViewDef,
     arena: &'a Arena,
     out: &mut [super::types::ColDesc<'a>],
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(storage.view_creation_path_for(view), user.as_str(), txid);
     let slot = storage
         .views_visible_to(txid)
         .find_map(|(slot, candidate)| {
             (candidate.schema == view.schema && candidate.name == view.name).then_some(slot)
         })
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "view does not exist"))?;
-    let dependencies = storage.snapshot_view_dependencies(slot, arena)?;
+    let query = storage.snapshot_view_query(slot, arena)?;
+    let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
+    let dependencies = query.dependencies;
+    let source = arena
+        .alloc_str(query.sql.as_str())
+        .map_err(|_| arena_full())?;
     let count = super::query::describe_stored_query(
-        storage.view_sql_for(view),
+        source,
         storage,
         txid,
         path,
@@ -15885,17 +15889,18 @@ pub(crate) fn describe_view<'a>(
         arena,
         out,
     )?;
-    overlay_view_column_names(view, txid, out, count)
+    overlay_view_column_names(view, txid, out, count, arena)
 }
 
 /// A view's body supplies types; its stored output relation supplies names.
 /// Keeping that overlay here makes SQL descriptions, catalogs, and wire
 /// metadata consume exactly the same identity.
 pub(crate) fn overlay_view_column_names<'a>(
-    view: &'a crate::storage::ViewDef,
+    view: &crate::storage::ViewDef,
     txid: u32,
     out: &mut [super::types::ColDesc<'a>],
     count: usize,
+    arena: &'a Arena,
 ) -> Result<usize, SqlError> {
     let columns = view.columns_for(txid);
     if columns.len() != count {
@@ -15906,7 +15911,7 @@ pub(crate) fn overlay_view_column_names<'a>(
         ));
     }
     for (column, name) in out[..count].iter_mut().zip(columns.names()) {
-        column.name = name.as_str();
+        column.name = arena.alloc_str(name.as_str()).map_err(|_| arena_full())?;
     }
     Ok(count)
 }
@@ -15919,10 +15924,14 @@ fn describe_stored_view<'a>(
     out: &mut [super::types::ColDesc<'a>],
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(storage.view_creation_path(slot), user.as_str(), txid);
-    let dependencies = storage.snapshot_view_dependencies(slot, arena)?;
+    let query = storage.snapshot_view_query(slot, arena)?;
+    let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
+    let dependencies = query.dependencies;
+    let source = arena
+        .alloc_str(query.sql.as_str())
+        .map_err(|_| arena_full())?;
     let count = super::query::describe_stored_query(
-        storage.view_sql(slot),
+        source,
         storage,
         txid,
         path,
@@ -15930,7 +15939,7 @@ fn describe_stored_view<'a>(
         arena,
         out,
     )?;
-    overlay_view_column_names(storage.view(slot), txid, out, count)
+    overlay_view_column_names(&storage.view(slot), txid, out, count, arena)
 }
 
 fn pg_stats<'a>(
@@ -20771,7 +20780,10 @@ fn pg_depend<'a>(
     for (view_slot, _) in storage.views_visible_to(txid) {
         let rewrite_oid = storage.rule(storage.view_return_rule(view_slot)).oid();
         push(2618, rewrite_oid, PG_CLASS_OID, view_oid(view_slot), 0, "i")?;
-        for dependency in storage.view_dependencies(view_slot).entries() {
+        for dependency in storage
+            .snapshot_view_dependencies(view_slot, arena)?
+            .entries()
+        {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
             };
@@ -20810,7 +20822,10 @@ fn pg_depend<'a>(
             crate::storage::RuleTarget::View(slot) => view_oid(usize::from(slot)),
         };
         push(2618, rule.oid(), PG_CLASS_OID, relation_oid, 0, "i")?;
-        for dependency in storage.rule_dependencies(slot, txid).entries() {
+        for dependency in storage
+            .snapshot_rule_dependencies(slot, txid, arena)?
+            .entries()
+        {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
             };
@@ -20841,7 +20856,10 @@ fn pg_depend<'a>(
     }
     for (materialized_slot, _) in storage.matviews_visible_to(txid) {
         let table_slot = storage.matview_table(materialized_slot);
-        for dependency in storage.matview_dependencies(materialized_slot).entries() {
+        for dependency in storage
+            .snapshot_matview_dependencies(materialized_slot, arena)?
+            .entries()
+        {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
             };
@@ -21792,7 +21810,7 @@ fn pg_attribute<'a>(
     }
     for (slot, view) in storage.views_visible_to(txid) {
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let count = describe_view(storage, txid, view, arena, &mut columns)?;
+        let count = describe_view(storage, txid, &view, arena, &mut columns)?;
         let defaults = view.columns_for(txid);
         for (attribute, column) in columns[..count].iter().enumerate() {
             if n == out.len() {
@@ -30199,7 +30217,7 @@ fn pg_views<'a>(
                     txid,
                     arena,
                 )?,
-                text(storage.view_sql(slot), arena)?,
+                text(storage.view_sql(slot).as_str(), arena)?,
             ],
             arena,
         )?;
@@ -31137,7 +31155,7 @@ fn info_views<'a>(
                 text("postgres", arena)?,
                 text(view.schema_for(txid).as_str(), arena)?,
                 text(view.name_for(txid).as_str(), arena)?,
-                text(storage.view_sql_for(view), arena)?,
+                text(storage.view_sql_for(&view).as_str(), arena)?,
                 text(
                     match view.check_option_for(txid) {
                         None => "NONE",
@@ -31166,7 +31184,10 @@ fn info_view_table_usage<'a>(
     let def = schema::require("view_table_usage", true);
     let mut count = 0usize;
     for (view_slot, _) in storage.views_visible_to(txid) {
-        for dependency in storage.view_dependencies(view_slot).entries() {
+        for dependency in storage
+            .snapshot_view_dependencies(view_slot, arena)?
+            .entries()
+        {
             if matches!(
                 dependency.class,
                 crate::storage::DependencyClass::Table | crate::storage::DependencyClass::View
@@ -31182,7 +31203,10 @@ fn info_view_table_usage<'a>(
         .map_err(|_| arena_full())?;
     let mut index = 0usize;
     for (view_slot, view) in storage.views_visible_to(txid) {
-        for dependency in storage.view_dependencies(view_slot).entries() {
+        for dependency in storage
+            .snapshot_view_dependencies(view_slot, arena)?
+            .entries()
+        {
             let (schema, name): (SqlName, SqlName) = match dependency.class {
                 crate::storage::DependencyClass::Table => {
                     let slot = dependency.slot as usize;
@@ -31419,7 +31443,7 @@ fn info_columns<'a>(
     // pg_attribute, Describe, and execution on one source of truth.
     for (_, view) in storage.views_visible_to(txid) {
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let count = describe_view(storage, txid, view, arena, &mut columns)?;
+        let count = describe_view(storage, txid, &view, arena, &mut columns)?;
         for (index, column) in columns[..count].iter().enumerate() {
             if n == out.len() {
                 return Err(sql_err!(
@@ -32623,7 +32647,7 @@ fn info_column_privileges<'a>(
     }
     for (view_slot, view) in storage.views_visible_to(txid) {
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let column_count = describe_view(storage, txid, view, arena, &mut columns)?;
+        let column_count = describe_view(storage, txid, &view, arena, &mut columns)?;
         output_count = output_count
             .checked_add(
                 column_count
@@ -32767,7 +32791,7 @@ fn info_column_privileges<'a>(
     }
     for (slot, view) in storage.views_visible_to(txid) {
         let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let description_count = describe_view(storage, txid, view, arena, &mut descriptions)?;
+        let description_count = describe_view(storage, txid, &view, arena, &mut descriptions)?;
         let mut columns = [ColumnMeta::EMPTY; super::exec::MAX_PROJ];
         for (index, description) in descriptions[..description_count].iter().enumerate() {
             let (ctype, user_type) = view_column_catalog_type(storage, txid, description.type_oid)?;
@@ -32838,7 +32862,7 @@ fn info_column_privileges<'a>(
                 let view = storage.view(relation.slot as usize);
                 let mut descriptions =
                     [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-                let described = describe_view(storage, txid, view, arena, &mut descriptions)?;
+                let described = describe_view(storage, txid, &view, arena, &mut descriptions)?;
                 if entry.target.column() as usize >= described {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -33247,7 +33271,7 @@ fn info_column_type_usage<'a>(
     }
     for (_, view) in storage.views_visible_to(txid) {
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let column_count = describe_view(storage, txid, view, arena, &mut columns)?;
+        let column_count = describe_view(storage, txid, &view, arena, &mut columns)?;
         for column in &columns[..column_count] {
             let (ctype, user_type) = view_column_catalog_type(storage, txid, column.type_oid)?;
             let metadata = ColumnMeta {

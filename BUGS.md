@@ -1030,7 +1030,19 @@ View creation and drop also used committed names while lookup used the owner's
 pending rename, allowing duplicate creation or missing a drop after a rename.
 Both now use the same transaction-visible name. Allocation-free fixtures cover
 these errors, preserved dependency images,
-checkpoint slot identity, and complete slot reuse. No external blocker remains.
+checkpoint slot identity, and complete slot reuse. The synchronization audit
+also found dependency rebinding retained its lock while resolving view
+identities, which would invert the new view-to-dependency lock order. Rebinding
+now resolves a fixed snapshot outside that guard and publishes only after
+successful resolution. Dependency reports also resolved referenced catalog
+objects while retaining dependency locks; they now use fixed statement
+snapshots before nested resolution. Snapshot capacity follows the retained
+entry count, so an empty image does not reserve the configured maximum.
+View and return-rule publication shares one mutex;
+query snapshots keep SQL, creation path, and dependencies together, and owned
+iterator images allow nested catalog reads. Concurrent publication and rollback
+check both directions of the view/rule graph without runtime allocation.
+No external blocker remains.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

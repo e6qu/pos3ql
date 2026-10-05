@@ -4359,17 +4359,19 @@ fn rewrite_stored_relation_name<'a>(
             let definition = context
                 .storage
                 .table_def(dependency.slot as usize, context.txid);
-            (definition.schema.as_str(), definition.name.as_str())
+            (definition.schema, definition.name)
         }
         crate::storage::DependencyClass::View => {
             let definition = context.storage.view(dependency.slot as usize);
-            (definition.schema.as_str(), definition.name.as_str())
+            (definition.schema, definition.name)
         }
         _ => unreachable!("stored relation rewrite only accepts relations"),
     };
     Ok(crate::sql::ast::QualName {
-        schema: Some(arena.alloc_str(schema).map_err(|_| arena_full())?),
-        name: arena.alloc_str(relation).map_err(|_| arena_full())?,
+        schema: Some(arena.alloc_str(schema.as_str()).map_err(|_| arena_full())?),
+        name: arena
+            .alloc_str(relation.as_str())
+            .map_err(|_| arena_full())?,
     })
 }
 
@@ -4650,19 +4652,19 @@ fn subst_tableref<'a>(
             }
             crate::storage::ViewSecurity::Invoker => context.authorization_role,
         };
+        let query = context.storage.snapshot_view_query(slot, arena)?;
         let view_sql = arena
-            .alloc_str(context.storage.view_sql(slot))
+            .alloc_str(query.sql.as_str())
             .map_err(|_| arena_full())?;
         let user = crate::sql::eval::funcs::system::session_user_owned();
-        let view_path = context.storage.compute_path(
-            context.storage.view_creation_path(slot),
-            user.as_str(),
-            context.txid,
-        );
+        let view_path =
+            context
+                .storage
+                .compute_path(query.creation_path.as_str(), user.as_str(), context.txid);
         let vsel = crate::sql::parser::parse_view_select(view_sql, arena)?;
         // The view body has its own scope: no outer CTEs, deeper view depth,
         // and the creator's path for its own references.
-        let dependencies = context.storage.snapshot_view_dependencies(slot, arena)?;
+        let dependencies = query.dependencies;
         let expanded = if let Some(execution) = context.execution {
             with_exec_context(
                 vsel.with,

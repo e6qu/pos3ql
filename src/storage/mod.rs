@@ -4254,6 +4254,18 @@ impl StoredQueryDependencyCatalog {
         dependencies: StoredQueryDependencyView<'_>,
         entries_per_image: usize,
     ) -> Result<u8, SqlError> {
+        let count = Self::validate_image_size(dependencies, entries_per_image)?;
+        let start = image * entries_per_image;
+        let target = &mut self.entries[start..start + entries_per_image];
+        target.fill(StoredQueryDependency::EMPTY);
+        target[..dependencies.entries().len()].copy_from_slice(dependencies.entries());
+        Ok(count)
+    }
+
+    fn validate_image_size(
+        dependencies: StoredQueryDependencyView<'_>,
+        entries_per_image: usize,
+    ) -> Result<u8, SqlError> {
         if dependencies.entries().len() > entries_per_image {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -4261,10 +4273,6 @@ impl StoredQueryDependencyCatalog {
                 entries_per_image
             ));
         }
-        let start = image * entries_per_image;
-        let target = &mut self.entries[start..start + entries_per_image];
-        target.fill(StoredQueryDependency::EMPTY);
-        target[..dependencies.entries().len()].copy_from_slice(dependencies.entries());
         Ok(dependencies.entries().len() as u8)
     }
 
@@ -5151,6 +5159,23 @@ pub struct ViewDef {
 }
 
 impl ViewDef {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        created_at: 0,
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        persistence: RelationPersistence::Permanent,
+        return_rule: u16::MAX,
+        options: ViewOptions::DEFAULT,
+        columns: ViewColumns::EMPTY,
+        ownership: Ownership::BOOTSTRAP,
+        pending_schema: None,
+        pending_name: None,
+        pending_options: None,
+        pending_columns: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
     }
@@ -17329,24 +17354,7 @@ impl Storage {
         }
         let mut views = FixedVec::new(budget, "views", config.max_views)?;
         for _ in 0..config.max_views {
-            views
-                .push(ViewDef {
-                    database: DatabaseOid::POSTGRES,
-                    created_at: 0,
-                    schema: SqlName::parse("").expect("empty name fits"),
-                    name: SqlName::parse("").expect("empty name fits"),
-                    persistence: RelationPersistence::Permanent,
-                    return_rule: u16::MAX,
-                    options: ViewOptions::DEFAULT,
-                    columns: ViewColumns::EMPTY,
-                    ownership: Ownership::BOOTSTRAP,
-                    pending_schema: None,
-                    pending_name: None,
-                    pending_options: None,
-                    pending_columns: None,
-                    ddl_state: CatalogDdlState::Absent,
-                })
-                .expect("sized to max_views");
+            views.push(ViewDef::EMPTY).expect("sized to max_views");
         }
         let mut rules = FixedVec::new(budget, "rules", config.max_rules)?;
         for _ in 0..config.max_rules {
@@ -20617,8 +20625,21 @@ impl Storage {
                 }
             };
         }
-        clear_catalog!(views);
-        clear_catalog!(rules);
+        for view in self.views.iter_mut() {
+            if view.database == database {
+                *view = ViewDef::EMPTY;
+            }
+        }
+        for slot in 0..self.rules.len() {
+            if self.rules[slot].database == database {
+                let pending = self.rules[slot]
+                    .pending
+                    .map(|pending| pending.dependency_slot);
+                self.rules[slot] = RuleDef::EMPTY;
+                self.clear_pending_dependency_chain(pending);
+                self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
+            }
+        }
         {
             let mut catalog = self
                 .policy_catalog
@@ -40109,7 +40130,7 @@ impl Storage {
             v.database == current_database()
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema.as_str()
-                && v.name.as_str() == name.as_str()
+                && v.name_for(txid).as_str() == name.as_str()
         });
         if existing.is_some() && !or_replace {
             return Err(sql_err!(
@@ -40129,44 +40150,13 @@ impl Storage {
                 self.views.len()
             ));
         };
-        if let Some(old) = existing {
-            self.pending_replace_view(old, txid);
-        }
-        let ownership = self.initial_ownership(txid);
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::View,
-            slot: new as u16,
-        });
-        let created_at = self.catalog_sequence.next();
-        self.views[new] = ViewDef {
-            database: current_database(),
-            created_at,
-            schema,
-            name,
-            persistence: definition.persistence,
-            return_rule: u16::MAX,
-            options: definition.options,
-            columns: definition.columns,
-            ownership,
-            pending_schema: None,
-            pending_name: None,
-            pending_options: None,
-            pending_columns: None,
-            ddl_state: CatalogDdlState::PendingCreate { txid },
-        };
-        if definition.persistence == RelationPersistence::Temporary {
-            self.mark_temporary_transaction(txid);
-        }
-        let mut source = StackStr::<RULE_SQL_MAX>::new();
-        use core::fmt::Write as _;
-        let _ = source.write_str(definition.query.sql.as_str());
         let rule_definition = RuleDefinition {
             name: SqlName::parse("_RETURN").expect("fixed name fits"),
             target: RuleTarget::View(new as u16),
             event: RewriteEvent::Select,
             mode: RewriteMode::Instead,
             enabled: RuleEnabled::Origin,
-            source,
+            source: definition.query.sql,
             condition: None,
             actions: {
                 let mut actions = [RuleTextSpan::EMPTY; MAX_RULE_ACTIONS];
@@ -40180,23 +40170,37 @@ impl Storage {
             returning_action: None,
             creation_path: definition.query.creation_path,
         };
-        let (rule, prior) = match self.create_rule(
-            rule_definition,
-            definition.query.dependencies.view(),
-            false,
-            txid,
-        ) {
-            Ok(created) => created,
-            Err(error) => {
-                self.views[new].ddl_state = CatalogDdlState::Absent;
-                if let Some(old) = existing {
-                    self.rollback_view_drop(old, txid);
-                }
-                return Err(error);
-            }
+        // Reserve and populate the return rule before changing either view.
+        // Capacity errors must leave an existing replacement target untouched.
+        let rule =
+            self.create_new_rule(rule_definition, definition.query.dependencies.view(), txid)?;
+        if let Some(old) = existing {
+            self.pending_replace_view(old, txid);
+        }
+        let ownership = self.initial_ownership(txid);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::View,
+            slot: new as u16,
+        });
+        self.views[new] = ViewDef {
+            database: current_database(),
+            created_at: self.catalog_sequence.next(),
+            schema,
+            name,
+            persistence: definition.persistence,
+            return_rule: rule as u16,
+            options: definition.options,
+            columns: definition.columns,
+            ownership,
+            pending_schema: None,
+            pending_name: None,
+            pending_options: None,
+            pending_columns: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
         };
-        debug_assert!(prior.is_none());
-        self.views[new].return_rule = rule as u16;
+        if definition.persistence == RelationPersistence::Temporary {
+            self.mark_temporary_transaction(txid);
+        }
         Ok((new, existing))
     }
 
@@ -40216,17 +40220,17 @@ impl Storage {
                 "checkpoint view slot is unavailable"
             ));
         }
-        let (created, replaced) = self.create_view(schema, name, definition, true, 0)?;
-        if replaced.is_some() {
-            self.rollback_view_create(created);
+        if self.find_view(schema.as_str(), name.as_str(), 0).is_some() {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "checkpoint contains a duplicate view"
             ));
         }
+        let (created, replaced) = self.create_view(schema, name, definition, false, 0)?;
+        debug_assert!(replaced.is_none());
         if created != slot {
             self.views[slot] = self.views[created].clone();
-            self.views[created].ddl_state = CatalogDdlState::Absent;
+            self.views[created] = ViewDef::EMPTY;
             let return_rule = usize::from(self.views[slot].return_rule);
             self.rules[return_rule].definition.target = RuleTarget::View(slot as u16);
             if let Some(pending) = &mut self.rules[return_rule].pending {
@@ -40259,7 +40263,7 @@ impl Storage {
             v.database == current_database()
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema
-                && v.name.as_str() == name
+                && v.name_for(txid).as_str() == name
         }) else {
             return Ok(None);
         };
@@ -40654,7 +40658,8 @@ impl Storage {
             class: AccessClass::View,
             slot: slot as u16,
         });
-        self.views[slot].ddl_state = self.views[slot].ddl_state.commit_drop();
+        let _ = self.views[slot].ddl_state.commit_drop();
+        self.views[slot] = ViewDef::EMPTY;
     }
 
     /// Discards an uncommitted CREATE VIEW (rollback): the slot is freed.
@@ -40664,7 +40669,8 @@ impl Storage {
             class: AccessClass::View,
             slot: slot as u16,
         });
-        self.views[slot].ddl_state = self.views[slot].ddl_state.rollback_create();
+        let _ = self.views[slot].ddl_state.rollback_create();
+        self.views[slot] = ViewDef::EMPTY;
     }
 
     /// Discards an uncommitted DROP VIEW (rollback). A committed view becomes
@@ -49467,6 +49473,18 @@ impl Storage {
             });
             return Ok((slot, prior));
         }
+        self.create_new_rule(definition, dependencies, txid)
+            .map(|slot| (slot, None))
+    }
+
+    /// The caller validates the target or publishes a new view owning it.
+    /// No definition is published until its dependency image fits.
+    fn create_new_rule(
+        &mut self,
+        definition: RuleDefinition,
+        dependencies: StoredQueryDependencyView<'_>,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
         let slot = self
             .rules
             .iter()
@@ -49478,6 +49496,10 @@ impl Storage {
                     self.rules.len()
                 )
             })?;
+        self.write_committed_dependencies(
+            StoredQueryDependencyOwner::Rule(slot as u16),
+            dependencies,
+        )?;
         let created_at = self.catalog_sequence.next();
         self.rules[slot] = RuleDef {
             database: current_database(),
@@ -49486,11 +49508,7 @@ impl Storage {
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
-        self.write_committed_dependencies(
-            StoredQueryDependencyOwner::Rule(slot as u16),
-            dependencies,
-        )?;
-        Ok((slot, None))
+        Ok(slot)
     }
 
     pub(crate) fn alter_rule(
@@ -49569,7 +49587,12 @@ impl Storage {
         if let RuleTarget::Table(table) = self.rules[slot].definition.target {
             self.tables[usize::from(table)].pending_has_rules_txid = prior_table_rule_txid;
         }
-        self.rules[slot].ddl_state = self.rules[slot].ddl_state.rollback_create();
+        let _ = self.rules[slot].ddl_state.rollback_create();
+        let pending = self.rules[slot]
+            .pending
+            .map(|pending| pending.dependency_slot);
+        self.rules[slot] = RuleDef::EMPTY;
+        self.clear_pending_dependency_chain(pending);
         self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
     }
 
@@ -49660,8 +49683,8 @@ impl Storage {
         let pending = self.rules[slot]
             .pending
             .map(|pending| pending.dependency_slot);
-        self.rules[slot].pending = None;
-        self.rules[slot].ddl_state = self.rules[slot].ddl_state.commit_drop();
+        let _ = self.rules[slot].ddl_state.commit_drop();
+        self.rules[slot] = RuleDef::EMPTY;
         self.clear_pending_dependency_chain(pending);
         self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
     }
@@ -49692,8 +49715,7 @@ impl Storage {
             let pending = self.rules[slot]
                 .pending
                 .map(|pending| pending.dependency_slot);
-            self.rules[slot].pending = None;
-            self.rules[slot].ddl_state = CatalogDdlState::Absent;
+            self.rules[slot] = RuleDef::EMPTY;
             self.clear_pending_dependency_chain(pending);
             self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
         }
@@ -49729,6 +49751,12 @@ impl Storage {
                 "journal rewrite rule duplicates an existing identity"
             ));
         }
+        // Recovery may relocate a view's return rule to preserve durable rule
+        // slots. Validate the new image before touching that existing graph.
+        StoredQueryDependencyCatalog::validate_image_size(
+            dependencies.view(),
+            self.stored_query_dependencies_per_image,
+        )?;
         if self.rules[slot].ddl_state != CatalogDdlState::Absent {
             let occupied = self.rules[slot];
             let occupied_definition = occupied.definition;
@@ -49757,6 +49785,10 @@ impl Storage {
                 }
             }
         }
+        self.write_committed_dependencies(
+            StoredQueryDependencyOwner::Rule(slot as u16),
+            dependencies.view(),
+        )?;
         self.rules[slot] = RuleDef {
             database: current_database(),
             created_at,
@@ -49764,10 +49796,6 @@ impl Storage {
             pending: None,
             ddl_state: CatalogDdlState::Present,
         };
-        self.write_committed_dependencies(
-            StoredQueryDependencyOwner::Rule(slot as u16),
-            dependencies.view(),
-        )?;
         if let RuleTarget::Table(table) = definition.target {
             self.tables[usize::from(table)].def.has_rules = true;
         }
@@ -51802,6 +51830,390 @@ mod tests {
 
     fn test_budget(config: &Config) -> Budget {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
+    }
+
+    fn test_view_definition(dependencies: StoredQueryDependencies) -> ViewDefinition {
+        ViewDefinition {
+            persistence: RelationPersistence::Permanent,
+            columns: ViewColumns::EMPTY,
+            query: StoredQueryDefinition {
+                sql: StackStr::from_str("SELECT 1"),
+                creation_path: StackStr::from_str("public"),
+                dependencies,
+            },
+            options: ViewOptions::DEFAULT,
+        }
+    }
+
+    fn oversized_test_dependencies() -> StoredQueryDependencies {
+        let mut dependencies = StoredQueryDependencies::EMPTY;
+        dependencies.push(StoredQueryDependency::EMPTY).unwrap();
+        dependencies
+            .push(StoredQueryDependency {
+                slot: 1,
+                ..StoredQueryDependency::EMPTY
+            })
+            .unwrap();
+        dependencies
+    }
+
+    #[test]
+    fn failed_rule_creation_preserves_capacity_and_dependency_images() {
+        let mut config = test_config();
+        config.max_rules = 1;
+        config.max_stored_query_dependencies_per_object = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("rule_target", &[])).unwrap();
+        let definition = RuleDefinition {
+            name: SqlName::parse("test_rule").unwrap(),
+            target: RuleTarget::Table(table as u16),
+            ..RuleDefinition::EMPTY
+        };
+        let oversized = oversized_test_dependencies();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage
+                    .create_rule(definition, oversized.view(), false, 7)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.rule(0).ddl_state, CatalogDdlState::Absent);
+            assert_eq!(storage.rule(0).created_at, 0);
+            assert!(storage.rule_dependencies(0, 7).entries().is_empty());
+            let (slot, _) = storage
+                .create_rule(definition, StoredQueryDependencies::EMPTY.view(), false, 7)
+                .unwrap();
+            let prior = storage.alter_rule(slot, definition, 7).unwrap();
+            assert!(prior.is_none());
+            storage.rollback_rule_create(slot, None);
+            assert_eq!(storage.rule(slot).created_at, 0);
+            assert!(storage.rule(slot).pending.is_none());
+            assert!(
+                storage
+                    .stored_query_dependencies
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .iter()
+                    .all(|pending| !pending.used)
+            );
+            let (reused, _) = storage
+                .create_rule(definition, StoredQueryDependencies::EMPTY.view(), false, 8)
+                .unwrap();
+            assert_eq!(reused, slot);
+            storage.commit_rule_create(reused);
+            storage.drop_rule(reused, 8);
+            storage.commit_rule_drop(reused);
+            assert_eq!(storage.rule(reused).definition.name, SqlName::EMPTY);
+            assert_eq!(storage.rule(reused).created_at, 0);
+        });
+    }
+
+    #[test]
+    fn failed_view_creation_and_replacement_leave_both_catalogs_unchanged() {
+        let mut config = test_config();
+        config.max_views = 3;
+        config.max_rules = 2;
+        config.max_stored_query_dependencies_per_object = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let schema = SqlName::parse("public").unwrap();
+        let name = SqlName::parse("test_view").unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage
+                    .create_view(
+                        schema,
+                        name,
+                        test_view_definition(oversized_test_dependencies()),
+                        false,
+                        7,
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert!(storage.views.iter().all(|view| view.created_at == 0
+                && view.ddl_state == CatalogDdlState::Absent
+                && view.return_rule == u16::MAX));
+            assert_eq!(storage.rule(0).ddl_state, CatalogDdlState::Absent);
+            let (slot, _) = storage
+                .create_view(
+                    schema,
+                    name,
+                    test_view_definition(StoredQueryDependencies::EMPTY),
+                    false,
+                    7,
+                )
+                .unwrap();
+            storage.commit_view_create(slot);
+            assert_eq!(
+                storage
+                    .create_view(
+                        schema,
+                        name,
+                        test_view_definition(oversized_test_dependencies()),
+                        true,
+                        8,
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.view(slot).ddl_state, CatalogDdlState::Present);
+            assert_eq!(storage.rule(0).ddl_state, CatalogDdlState::Present);
+            assert_eq!(storage.rule(1).ddl_state, CatalogDdlState::Absent);
+            let (filler, _) = storage
+                .create_view(
+                    schema,
+                    SqlName::parse("filler").unwrap(),
+                    test_view_definition(StoredQueryDependencies::EMPTY),
+                    false,
+                    8,
+                )
+                .unwrap();
+            storage.commit_view_create(filler);
+            assert_eq!(
+                storage
+                    .create_view(
+                        schema,
+                        name,
+                        test_view_definition(StoredQueryDependencies::EMPTY),
+                        true,
+                        8,
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.view(slot).ddl_state, CatalogDdlState::Present);
+            assert_eq!(storage.rule(0).ddl_state, CatalogDdlState::Present);
+            assert_eq!(storage.view_sql(slot), "SELECT 1");
+            assert_eq!(storage.views[2].created_at, 0);
+            storage.drop_view("public", "test_view", 8).unwrap();
+            storage.commit_view_drop(slot);
+            assert_eq!(storage.view(slot).created_at, 0);
+            assert_eq!(storage.view(slot).name, SqlName::EMPTY);
+            assert_eq!(storage.view(slot).return_rule, u16::MAX);
+            assert_eq!(storage.rule(0).created_at, 0);
+            let (reused, _) = storage
+                .create_view(
+                    schema,
+                    name,
+                    test_view_definition(StoredQueryDependencies::EMPTY),
+                    false,
+                    9,
+                )
+                .unwrap();
+            assert_eq!(reused, slot);
+            storage.rollback_view_create(reused);
+            assert_eq!(storage.view(slot).created_at, 0);
+            assert_eq!(storage.view(slot).return_rule, u16::MAX);
+            assert_eq!(storage.rule(0).created_at, 0);
+        });
+    }
+
+    #[test]
+    fn checkpoint_duplicate_view_rejection_preserves_existing_view_and_rule() {
+        let mut config = test_config();
+        config.max_views = 3;
+        config.max_rules = 3;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let schema = SqlName::parse("public").unwrap();
+        let name = SqlName::parse("test_view").unwrap();
+        storage
+            .restore_view_at(
+                2,
+                schema,
+                name,
+                test_view_definition(StoredQueryDependencies::EMPTY),
+            )
+            .unwrap();
+        let return_rule = storage.view_return_rule(2);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage
+                    .restore_view_at(
+                        1,
+                        schema,
+                        name,
+                        test_view_definition(StoredQueryDependencies::EMPTY)
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(storage.view(2).ddl_state, CatalogDdlState::Present);
+            assert_eq!(
+                storage.rule(return_rule).ddl_state,
+                CatalogDdlState::Present
+            );
+            assert_eq!(
+                storage.rule(return_rule).definition.target,
+                RuleTarget::View(2)
+            );
+            assert_eq!(storage.live_views().count(), 1);
+            assert_eq!(storage.rules_visible_to(0).count(), 1);
+            for slot in [0, 1] {
+                assert_eq!(storage.view(slot).created_at, 0);
+                assert_eq!(storage.view(slot).return_rule, u16::MAX);
+            }
+        });
+    }
+
+    #[test]
+    fn failed_rule_replay_preserves_view_link_and_original_dependencies() {
+        let mut config = test_config();
+        config.max_views = 2;
+        config.max_rules = 2;
+        config.max_stored_query_dependencies_per_object = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("rule_target", &[])).unwrap();
+        let schema = SqlName::parse("public").unwrap();
+        let name = SqlName::parse("test_view").unwrap();
+        let mut dependencies = StoredQueryDependencies::EMPTY;
+        dependencies.push(StoredQueryDependency::EMPTY).unwrap();
+        storage
+            .restore_view_at(0, schema, name, test_view_definition(dependencies))
+            .unwrap();
+        let definition = RuleDefinition {
+            name: SqlName::parse("replayed_rule").unwrap(),
+            target: RuleTarget::Table(table as u16),
+            ..RuleDefinition::EMPTY
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage
+                    .replay_rule(0, 42, definition, oversized_test_dependencies())
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.view_return_rule(0), 0);
+            assert_eq!(storage.view_sql(0), "SELECT 1");
+            assert_eq!(storage.rule(1).ddl_state, CatalogDdlState::Absent);
+            assert_eq!(
+                storage.rule_dependencies(0, 0).entries(),
+                &[StoredQueryDependency::EMPTY]
+            );
+            assert!(!storage.table_has_rules(table, 0));
+            storage
+                .replay_rule(0, 42, definition, StoredQueryDependencies::EMPTY)
+                .unwrap();
+            assert_eq!(storage.view_return_rule(0), 1);
+            assert_eq!(storage.view_sql(0), "SELECT 1");
+            assert_eq!(
+                storage.rule_dependencies(1, 0).entries(),
+                &[StoredQueryDependency::EMPTY]
+            );
+            assert!(storage.rule_dependencies(0, 0).entries().is_empty());
+            assert!(storage.table_has_rules(table, 0));
+        });
+    }
+
+    #[test]
+    fn view_creation_and_drop_use_transactional_names() {
+        let mut config = test_config();
+        config.max_views = 2;
+        config.max_rules = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let schema = SqlName::parse("public").unwrap();
+        let old = SqlName::parse("old_view").unwrap();
+        let new = SqlName::parse("new_view").unwrap();
+        let (slot, _) = storage
+            .create_view(
+                schema,
+                old,
+                test_view_definition(StoredQueryDependencies::EMPTY),
+                false,
+                7,
+            )
+            .unwrap();
+        storage.commit_view_create(slot);
+        crate::mem::guard::forbid_alloc(|| {
+            let prior = storage.stage_view_rename(slot, new, 8).unwrap();
+            assert_eq!(
+                storage
+                    .create_view(
+                        schema,
+                        new,
+                        test_view_definition(StoredQueryDependencies::EMPTY),
+                        false,
+                        8
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DUPLICATE_TABLE
+            );
+            let (reused_name, _) = storage
+                .create_view(
+                    schema,
+                    old,
+                    test_view_definition(StoredQueryDependencies::EMPTY),
+                    false,
+                    8,
+                )
+                .unwrap();
+            storage.rollback_view_create(reused_name);
+            assert_eq!(
+                storage.drop_view("public", "new_view", 8).unwrap(),
+                Some(slot)
+            );
+            storage.rollback_view_drop(slot, 8);
+            storage.rollback_view_rename(slot, prior);
+            assert!(storage.find_view("public", "old_view", 8).is_some());
+            assert!(storage.find_view("public", "new_view", 8).is_none());
+        });
+    }
+
+    #[test]
+    fn database_removal_clears_view_rules_and_pending_dependency_chains() {
+        let mut config = test_config();
+        config.max_views = 2;
+        config.max_rules = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let schema = SqlName::parse("public").unwrap();
+        let name = SqlName::parse("test_view").unwrap();
+        let (slot, _) = storage
+            .create_view(
+                schema,
+                name,
+                test_view_definition(StoredQueryDependencies::EMPTY),
+                false,
+                7,
+            )
+            .unwrap();
+        storage.commit_view_create(slot);
+        let rule = storage.view_return_rule(slot);
+        let definition = storage.rule(rule).definition;
+        storage.alter_rule(rule, definition, 8).unwrap();
+        storage.alter_rule(rule, definition, 8).unwrap();
+        let other_database = DatabaseOid::parse(USER_DATABASE_OID_BASE + 1).unwrap();
+        storage.views[slot].database = other_database;
+        storage.rules[rule].database = other_database;
+        crate::mem::guard::forbid_alloc(|| {
+            storage.clear_database_catalog(other_database);
+            assert_eq!(storage.view(slot).created_at, 0);
+            assert_eq!(storage.view(slot).return_rule, u16::MAX);
+            assert_eq!(storage.rule(rule).created_at, 0);
+            assert!(storage.rule(rule).pending.is_none());
+            assert!(storage.rule_dependencies(rule, 8).entries().is_empty());
+            assert!(
+                storage
+                    .stored_query_dependencies
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .iter()
+                    .all(|pending| !pending.used)
+            );
+        });
     }
 
     fn make_def(name: &str, columns: &[(&str, ColType, bool)]) -> TableDef {

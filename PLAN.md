@@ -384,6 +384,19 @@ temporary-object transaction registry has its own mutex, so temporary relation
 resolution, PREPARE eligibility checks, commit, and rollback cannot collide on
 an interior borrow or lose an owner. Concurrent updates, exact capacities, and
 `Send + Sync` have direct coverage.
+View and rewrite-rule creation now validates dependency capacity before
+publishing a definition or retiring a replacement target. Recovery validates
+an incoming rule image before relocating an existing view's return rule;
+checkpoint duplicate rejection preserves the existing view and rule. Committed
+drops, rolled-back creates, checkpoint slot relocation, and database removal
+clear complete reusable definitions and release pending rule dependencies.
+Allocation-free regression fixtures cover failed creation and replacement,
+recovery errors, durable view slots, dependency preservation, database cleanup,
+transactional view names, and slot reuse. View creation and drop now select the
+owner's pending name consistently with view lookup.
+This establishes the failure invariants needed for the shared view/rule
+publication boundary; their definition vectors remain unsynchronized.
+
 The remaining catalog definition containers and row mutation paths still
 require synchronization before fixed workers can overlap execution.
 

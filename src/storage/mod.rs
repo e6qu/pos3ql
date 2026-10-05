@@ -13457,7 +13457,9 @@ impl<F: Fn(&IndexDef) -> bool> Iterator for IndexIter<'_, F> {
         while let Some(definition) = catalog.get(self.next_slot) {
             let slot = self.next_slot;
             self.next_slot += 1;
-            if (self.accept)(definition) { return Some((slot, *definition)); }
+            if (self.accept)(definition) {
+                return Some((slot, *definition));
+            }
         }
         None
     }
@@ -19984,14 +19986,18 @@ impl Storage {
                 let mut definition = indexes[source_slot];
                 if definition.database != source
                     || definition.ddl_state != CatalogDdlState::Present
-                    || self.tables.iter().any(|table| table.database == source
-                        && table.live && table.def.schema == definition.schema
-                        && table.def.name == definition.table
-                        && table.def.persistence == RelationPersistence::Temporary)
+                    || self.tables.iter().any(|table| {
+                        table.database == source
+                            && table.live
+                            && table.def.schema == definition.schema
+                            && table.def.name == definition.table
+                            && table.def.persistence == RelationPersistence::Temporary
+                    })
                 {
                     continue;
                 }
-                let target_slot = indexes.iter()
+                let target_slot = indexes
+                    .iter()
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                     .ok_or_else(|| {
                         sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "index catalog is full")
@@ -20017,8 +20023,7 @@ impl Storage {
             }
             for target_slot in 0..indexes.len() {
                 if indexes[target_slot].database != target
-                    || indexes[target_slot].ddl_state
-                        != (CatalogDdlState::PendingCreate { txid })
+                    || indexes[target_slot].ddl_state != (CatalogDdlState::PendingCreate { txid })
                 {
                     continue;
                 }
@@ -20026,11 +20031,13 @@ impl Storage {
                     continue;
                 };
                 let source_parent = indexes[usize::from(source_parent_slot)];
-                let target_parent = indexes.iter().position(|candidate| {
-                    candidate.database == target
-                        && candidate.ddl_state == (CatalogDdlState::PendingCreate { txid })
-                        && candidate.created_at == source_parent.created_at
-                })
+                let target_parent = indexes
+                    .iter()
+                    .position(|candidate| {
+                        candidate.database == target
+                            && candidate.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                            && candidate.created_at == source_parent.created_at
+                    })
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::INTERNAL_ERROR,
@@ -20791,7 +20798,11 @@ impl Storage {
             for slot in 0..indexes.len() {
                 if indexes[slot].database == database {
                     indexes[slot] = IndexDef::EMPTY;
-                    let (state, ranges) = Self::brin_entry_mut(&mut maintenance, slot, self.brin_unsummarized_ranges_per_index);
+                    let (state, ranges) = Self::brin_entry_mut(
+                        &mut maintenance,
+                        slot,
+                        self.brin_unsummarized_ranges_per_index,
+                    );
                     *state = BrinMaintenanceState::EMPTY;
                     ranges.fill(0);
                 }
@@ -22617,15 +22628,15 @@ impl Storage {
 
     pub(crate) fn checkpoint_indexes(&self) -> impl Iterator<Item = (usize, IndexDef)> + '_ {
         self.matching_indexes(|value| {
-                value.ddl_state == CatalogDdlState::Present
-                    && !self.tables.iter().any(|table| {
-                        table.database == value.database
-                            && table.live
-                            && table.def.schema == value.schema
-                            && table.def.name == value.table
-                            && table.def.persistence == RelationPersistence::Temporary
-                    })
-            })
+            value.ddl_state == CatalogDdlState::Present
+                && !self.tables.iter().any(|table| {
+                    table.database == value.database
+                        && table.live
+                        && table.def.schema == value.schema
+                        && table.def.name == value.table
+                        && table.def.persistence == RelationPersistence::Temporary
+                })
+        })
     }
 
     pub(crate) fn checkpoint_comments(&self) -> impl Iterator<Item = CommentEntry> + '_ {
@@ -45100,11 +45111,11 @@ impl Storage {
 
     pub(crate) fn index_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         let slot = self.index_catalog().iter().position(|index| {
-                index.database == current_database()
-                    && index.visible_to(txid)
-                    && index.schema.as_str() == schema
-                    && index.name_for(txid).as_str() == name
-            });
+            index.database == current_database()
+                && index.visible_to(txid)
+                && index.schema.as_str() == schema
+                && index.name_for(txid).as_str() == name
+        });
         if slot.is_some_and(|slot| {
             self.index_table_slot_to(slot, txid).is_some_and(|table| {
                 self.table_def(table, txid).persistence == RelationPersistence::Temporary
@@ -45149,9 +45160,15 @@ impl Storage {
     /// The transaction-visible index definition. Returning the copy keeps a
     /// caller from retaining a catalog borrow across cache reconstruction.
     pub fn index_definition(&self, schema: &str, name: &str, txid: u32) -> Option<IndexDef> {
-        self.index_catalog().iter().find(|index| index.database == current_database()
-            && index.visible_to(txid) && index.schema.as_str() == schema
-            && index.name_for(txid).as_str() == name).copied()
+        self.index_catalog()
+            .iter()
+            .find(|index| {
+                index.database == current_database()
+                    && index.visible_to(txid)
+                    && index.schema.as_str() == schema
+                    && index.name_for(txid).as_str() == name
+            })
+            .copied()
     }
 
     pub(crate) fn rename_index(
@@ -45161,8 +45178,15 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<PendingIndexName>, SqlError> {
         let image = self.index(slot);
-        if self.non_index_relation_kind_in(image.schema.as_str(), name.as_str(), txid).is_some() {
-            return Err(sql_err!(sqlstate::DUPLICATE_TABLE, "relation \"{}\" already exists", name.as_str()));
+        if self
+            .non_index_relation_kind_in(image.schema.as_str(), name.as_str(), txid)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists",
+                name.as_str()
+            ));
         }
         let mut catalog = self.index_catalog();
         let index = catalog[slot];
@@ -45172,32 +45196,26 @@ impl Storage {
         if index.name_for(txid) == name {
             return Ok(index.pending_name);
         }
-        if let Some(blocker) = catalog.iter()
-            .enumerate()
-            .find_map(|(other, candidate)| {
-                (other != slot
-                    && candidate.database == index.database
-                    && candidate.ddl_state != CatalogDdlState::Absent
-                    && candidate.schema == index.schema
-                    && candidate
-                        .pending_name
-                        .is_some_and(|pending| pending.name == name && pending.txid != txid))
-                .then_some(candidate.pending_name?.txid)
-            })
-        {
+        if let Some(blocker) = catalog.iter().enumerate().find_map(|(other, candidate)| {
+            (other != slot
+                && candidate.database == index.database
+                && candidate.ddl_state != CatalogDdlState::Absent
+                && candidate.schema == index.schema
+                && candidate
+                    .pending_name
+                    .is_some_and(|pending| pending.name == name && pending.txid != txid))
+            .then_some(candidate.pending_name?.txid)
+        }) {
             drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if catalog.iter()
-            .enumerate()
-            .any(|(other, candidate)| {
-                other != slot
-                    && candidate.database == index.database
-                    && candidate.visible_to(txid)
-                    && candidate.schema == index.schema
-                    && candidate.name_for(txid) == name
-            })
-        {
+        if catalog.iter().enumerate().any(|(other, candidate)| {
+            other != slot
+                && candidate.database == index.database
+                && candidate.visible_to(txid)
+                && candidate.schema == index.schema
+                && candidate.name_for(txid) == name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",
@@ -45798,19 +45816,22 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         let mut catalog = self.index_catalog();
-        if let Some(blocker) = catalog.iter()
-            .find_map(|index| {
-                (index.database == current_database()
-                    && index.schema.as_str() == schema
-                    && index.name_for(txid).as_str() == name)
-                    .then_some(index.ddl_state.pending_txid()?)
-                    .filter(|&owner| owner != txid)
-            })
-        {
+        if let Some(blocker) = catalog.iter().find_map(|index| {
+            (index.database == current_database()
+                && index.schema.as_str() == schema
+                && index.name_for(txid).as_str() == name)
+                .then_some(index.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
+        }) {
             drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
-        let Some(i) = catalog.iter().position(|index| index.database == current_database() && index.visible_to(txid) && index.schema.as_str() == schema && index.name_for(txid).as_str() == name) else {
+        let Some(i) = catalog.iter().position(|index| {
+            index.database == current_database()
+                && index.visible_to(txid)
+                && index.schema.as_str() == schema
+                && index.name_for(txid).as_str() == name
+        }) else {
             return Ok(None);
         };
         catalog[i].ddl_state = catalog[i].ddl_state.drop_by(txid);
@@ -45917,14 +45938,14 @@ impl Storage {
             .find_visible(schema, table, txid)
             .map(|slot| (self.tables[slot].def.schema, self.tables[slot].def.name));
         self.matching_indexes(move |x| {
-                x.database == current_database()
-                    && x.visible_to(txid)
-                    && ((x.schema.as_str() == schema && x.table.as_str() == table)
-                        || committed_binding.is_some_and(|(old_schema, old_table)| {
-                            x.schema == old_schema && x.table == old_table
-                        }))
-            })
-            .map(move |(_, index)| self.project_index_binding(index, txid))
+            x.database == current_database()
+                && x.visible_to(txid)
+                && ((x.schema.as_str() == schema && x.table.as_str() == table)
+                    || committed_binding.is_some_and(|(old_schema, old_table)| {
+                        x.schema == old_schema && x.table == old_table
+                    }))
+        })
+        .map(move |(_, index)| self.project_index_binding(index, txid))
     }
 
     pub fn unique_indexes_for<'a>(
@@ -45938,8 +45959,10 @@ impl Storage {
 
     /// All committed indexes, for checkpoint serialization.
     pub fn live_indexes(&self) -> impl Iterator<Item = IndexDef> + '_ {
-        self.matching_indexes(|index| index.database == current_database()
-            && index.ddl_state == CatalogDdlState::Present).map(|(_, index)| index)
+        self.matching_indexes(|index| {
+            index.database == current_database() && index.ddl_state == CatalogDdlState::Present
+        })
+        .map(|(_, index)| index)
     }
 
     pub(crate) fn index_count(&self) -> usize {
@@ -45964,8 +45987,12 @@ impl Storage {
         }
     }
 
-    fn matching_indexes<F: Fn(&IndexDef) -> bool>(&self, accept: F) -> IndexIter<\'_, F> {
-        IndexIter { catalog: &self.index_catalog, next_slot: 0, accept }
+    fn matching_indexes<F: Fn(&IndexDef) -> bool>(&self, accept: F) -> IndexIter<'_, F> {
+        IndexIter {
+            catalog: &self.index_catalog,
+            next_slot: 0,
+            accept,
+        }
     }
 
     /// Keeps the dropped catalog identity available during `sql_drop`.
@@ -52303,7 +52330,9 @@ mod tests {
         config.max_indexes = WORKERS;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        storage.create_table(make_def("index_target", &[("id", ColType::Int4, false)])).unwrap();
+        storage
+            .create_table(make_def("index_target", &[("id", ColType::Int4, false)]))
+            .unwrap();
         let barrier = std::sync::Barrier::new(WORKERS + 1);
         let finished = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -52315,10 +52344,19 @@ mod tests {
                     barrier.wait();
                     crate::mem::guard::forbid_alloc(|| {
                         for iteration in 0..16 {
-                            let slot = storage.create_index(test_index_definition(name), 0).unwrap();
-                            assert_eq!(storage.index_definition("public", name, 0).unwrap().created_at,
-                                storage.index(slot).created_at);
-                            if iteration != 15 { storage.rollback_index_create(slot); }
+                            let slot = storage
+                                .create_index(test_index_definition(name), 0)
+                                .unwrap();
+                            assert_eq!(
+                                storage
+                                    .index_definition("public", name, 0)
+                                    .unwrap()
+                                    .created_at,
+                                storage.index(slot).created_at
+                            );
+                            if iteration != 15 {
+                                storage.rollback_index_create(slot);
+                            }
                         }
                     });
                     finished.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -52349,14 +52387,29 @@ mod tests {
             assert_eq!(storage.index_count(), WORKERS);
             assert_eq!(storage.index_catalog().capacity(), WORKERS);
             assert_eq!(storage.index_catalog().len(), WORKERS);
-            assert_eq!(storage.indexes_for("public", "index_target", 0).count(), WORKERS);
-            for slot in 0..WORKERS { storage.commit_index_create(slot); }
+            assert_eq!(
+                storage.indexes_for("public", "index_target", 0).count(),
+                WORKERS
+            );
+            for slot in 0..WORKERS {
+                storage.commit_index_create(slot);
+            }
             assert_eq!(storage.checkpoint_indexes().count(), WORKERS);
             assert_eq!(storage.live_indexes().count(), WORKERS);
-            assert_eq!(storage.create_index(test_index_definition("overflow"), 0).unwrap_err().sqlstate,
-                sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(storage.create_index(test_index_definition("index_a"), 0).unwrap_err().sqlstate,
-                sqlstate::DUPLICATE_TABLE);
+            assert_eq!(
+                storage
+                    .create_index(test_index_definition("overflow"), 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                storage
+                    .create_index(test_index_definition("index_a"), 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DUPLICATE_TABLE
+            );
         });
     }
 
@@ -52366,14 +52419,27 @@ mod tests {
         config.max_indexes = 1;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        storage.create_table(make_def("index_target", &[("id", ColType::Int4, false)])).unwrap();
+        storage
+            .create_table(make_def("index_target", &[("id", ColType::Int4, false)]))
+            .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             for committed in [false, true] {
-                let slot = storage.create_index(test_index_definition("retired"), 17).unwrap();
-                storage.rename_index(slot, SqlName::parse("pending_name").unwrap(), 17).unwrap();
-                storage.alter_index_definition(slot, IndexMutableDefinition {
-                    clustered: true, ..IndexMutableDefinition::DEFAULT
-                }, 17).unwrap();
+                let slot = storage
+                    .create_index(test_index_definition("retired"), 17)
+                    .unwrap();
+                storage
+                    .rename_index(slot, SqlName::parse("pending_name").unwrap(), 17)
+                    .unwrap();
+                storage
+                    .alter_index_definition(
+                        slot,
+                        IndexMutableDefinition {
+                            clustered: true,
+                            ..IndexMutableDefinition::DEFAULT
+                        },
+                        17,
+                    )
+                    .unwrap();
                 let mut maintenance = storage.brin_maintenance();
                 maintenance.states[slot].summarized_until_page = 128;
                 maintenance.unsummarized_ranges[0] = 1;
@@ -52393,7 +52459,13 @@ mod tests {
                 assert!(image.pending_definition.is_none());
                 assert_eq!(image.n_cols, 0);
                 assert_eq!(storage.brin_maintenance().states[slot].index_created_at, 0);
-                assert!(storage.brin_maintenance().unsummarized_ranges.iter().all(|range| *range == 0));
+                assert!(
+                    storage
+                        .brin_maintenance()
+                        .unsummarized_ranges
+                        .iter()
+                        .all(|range| *range == 0)
+                );
                 assert!(storage.index_table_slot(slot).is_none());
             }
         });
@@ -52404,21 +52476,35 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let slot = storage.create_index(test_index_definition("local_index"), 17).unwrap();
-        let foreign = storage.create_index(test_index_definition("remote_index"), 18).unwrap();
+        let slot = storage
+            .create_index(test_index_definition("local_index"), 17)
+            .unwrap();
+        let foreign = storage
+            .create_index(test_index_definition("remote_index"), 18)
+            .unwrap();
         storage.commit_index_create(foreign);
         storage.index_catalog()[foreign].database = DatabaseOid::TEMPLATE1;
         crate::mem::guard::forbid_alloc(|| {
-            storage.rename_index(slot, SqlName::parse("remote_index").unwrap(), 17).unwrap();
+            storage
+                .rename_index(slot, SqlName::parse("remote_index").unwrap(), 17)
+                .unwrap();
             storage.rollback_index_rename(slot, None);
             storage.index_catalog()[foreign].pending_name = Some(PendingIndexName {
-                txid: 18, name: SqlName::parse("remote_pending").unwrap(),
+                txid: 18,
+                name: SqlName::parse("remote_pending").unwrap(),
             });
-            storage.rename_index(slot, SqlName::parse("remote_pending").unwrap(), 17).unwrap();
+            storage
+                .rename_index(slot, SqlName::parse("remote_pending").unwrap(), 17)
+                .unwrap();
             storage.index_catalog()[foreign].database = DatabaseOid::POSTGRES;
             storage.rollback_index_rename(slot, None);
-            assert_eq!(storage.rename_index(slot, SqlName::parse("remote_index").unwrap(), 17)
-                .unwrap_err().sqlstate, sqlstate::DUPLICATE_TABLE);
+            assert_eq!(
+                storage
+                    .rename_index(slot, SqlName::parse("remote_index").unwrap(), 17)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DUPLICATE_TABLE
+            );
         });
     }
 

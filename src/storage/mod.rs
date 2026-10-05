@@ -16955,15 +16955,12 @@ impl Storage {
         let name = dependency.name.as_str();
         let slot = match dependency.class {
             DependencyClass::Table => self.find_visible(schema, name, txid),
-            DependencyClass::View => self
-                .view_entries()
-                .map(|(_, entry)| entry)
-                .position(|view| {
-                    view.database == current_database()
-                        && view.visible_to(txid)
-                        && view.schema_for(txid).as_str() == schema
-                        && view.name_for(txid).as_str() == name
-                }),
+            DependencyClass::View => self.view_rule_catalog().views.iter().position(|view| {
+                view.database == current_database()
+                    && view.visible_to(txid)
+                    && view.schema_for(txid).as_str() == schema
+                    && view.name_for(txid).as_str() == name
+            }),
             DependencyClass::Domain => self.domain_slot(schema, name, txid),
             DependencyClass::Enum => self.enum_slot(schema, name, txid),
             DependencyClass::Sequence => self.sequence_slot(schema, name, txid),
@@ -20108,8 +20105,9 @@ impl Storage {
                     TriggerTarget::View(source_view) => {
                         let source_view = &self.view(usize::from(source_view));
                         TriggerTarget::View(
-                            self.view_entries()
-                                .map(|(_, entry)| entry)
+                            self.view_rule_catalog()
+                                .views
+                                .iter()
                                 .position(|view| {
                                     view.database == target
                                         && view.visible_to(txid)
@@ -21870,15 +21868,12 @@ impl Storage {
         }
         let slot = match class {
             AccessClass::Table => self.find_visible(schema, name, txid),
-            AccessClass::View => self
-                .view_entries()
-                .map(|(_, entry)| entry)
-                .position(|view| {
-                    view.database == current_database()
-                        && view.visible_to(txid)
-                        && view.schema_for(txid).as_str() == schema
-                        && view.name_for(txid).as_str() == name
-                }),
+            AccessClass::View => self.view_rule_catalog().views.iter().position(|view| {
+                view.database == current_database()
+                    && view.visible_to(txid)
+                    && view.schema_for(txid).as_str() == schema
+                    && view.name_for(txid).as_str() == name
+            }),
             AccessClass::MaterializedView => self.matview_slot(schema, name, txid),
             AccessClass::Sequence => self.sequence_slot(schema, name, txid),
             AccessClass::Schema => self.find_schema_visible(name, txid),
@@ -22169,8 +22164,9 @@ impl Storage {
             }
             AccessClass::View => {
                 let created_at = self.view(source_slot).created_at;
-                self.view_entries()
-                    .map(|(_, entry)| entry)
+                self.view_rule_catalog()
+                    .views
+                    .iter()
                     .position(|candidate| {
                         candidate.database == target_database && candidate.created_at == created_at
                     })?
@@ -27903,7 +27899,7 @@ impl Storage {
             }
             return Some(ResolvedRelation::Table(t));
         }
-        let view = self.view_entries().map(|(_, entry)| entry).position(|v| {
+        let view = self.view_rule_catalog().views.iter().position(|v| {
             v.database == current_database()
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema
@@ -40477,16 +40473,17 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if let Some(blocker) = self.view_entries().map(|(_, entry)| entry).find_map(|v| {
+        let blocker = self.view_rule_catalog().views.iter().find_map(|v| {
             (v.database == current_database()
                 && v.schema_for(txid).as_str() == schema
                 && v.name.as_str() == name)
                 .then_some(v.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
-        }) {
+        });
+        if let Some(blocker) = blocker {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
-        let Some(i) = self.view_entries().map(|(_, entry)| entry).position(|v| {
+        let Some(i) = self.view_rule_catalog().views.iter().position(|v| {
             v.database == current_database()
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema
@@ -40876,17 +40873,18 @@ impl Storage {
         // CREATE OR REPLACE installs the replacement before retiring this
         // slot. Comments belong to the logical same-named object and survive;
         // an ordinary DROP has no replacement and removes them.
-        let replaced =
-            self.view_entries()
-                .map(|(_, entry)| entry)
-                .enumerate()
-                .any(|(other, view)| {
-                    other != slot
-                        && view.database == database
-                        && view.ddl_state == CatalogDdlState::Present
-                        && view.schema == schema
-                        && view.name == name
-                });
+        let replaced = self
+            .view_rule_catalog()
+            .views
+            .iter()
+            .enumerate()
+            .any(|(other, view)| {
+                other != slot
+                    && view.database == database
+                    && view.ddl_state == CatalogDdlState::Present
+                    && view.schema == schema
+                    && view.name == name
+            });
         if !replaced {
             self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
             self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());

@@ -420,6 +420,9 @@ maintenance images and binds partition parents in the target database. Rename
 checks and comment updates are scoped to the index's database. Allocation-free
 four-worker publication and rollback, nested readers, exact retained capacity,
 loud exhaustion, and complete slot retirement have direct regression coverage.
+Forced-spill SQL Logic Test replay now uses eight deterministic query slices
+within the existing 15-minute job limit. Replay progress streams to CI logs
+while preserving both harness and log-write failures.
 
 The remaining catalog definition containers and row mutation paths still
 require synchronization before fixed workers can overlap execution.

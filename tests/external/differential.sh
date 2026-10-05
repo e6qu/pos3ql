@@ -519,12 +519,12 @@ if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; th
     exit 1
   fi
   SLT_LIMIT=${POS3QL_SLT_LIMIT:-600}
-  if "$SLT_VENV/bin/python" "$EXT/slt_diff.py" --pg "$PG_PORT" --p3 "$P3_PORT" \
+  if (set -o pipefail; "$SLT_VENV/bin/python" -u "$EXT/slt_diff.py" --pg "$PG_PORT" --p3 "$P3_PORT" \
        --limit "$SLT_LIMIT" \
        --query-shards "$SLT_QUERY_SHARDS" --query-shard "$SLT_QUERY_SHARD" \
        vendor/test/sqllogictest/test/*.test vendor/test/sqllogictest/test/evidence/*.test \
        "$EXT"/sqllogictest/*.test \
-       > "$WORK/slt.out" 2>&1; then
+       2>&1 | tee "$WORK/slt.out"); then
     ok "sqllogictest differential ($(grep '^TOTAL' "$WORK/slt.out"))"
   else
     bad "sqllogictest differential"

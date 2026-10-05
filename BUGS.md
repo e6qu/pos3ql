@@ -1058,6 +1058,9 @@ The first complete CI run reached the forced-spill SQL Logic Test worker's
 15-minute ceiling. The subsequent scan audit found metadata paths copied every
 definition, including unused entries; they now borrow under the index guard,
 and physical-binding iterators filter before copying retained definitions.
+A second run reached the same ceiling in a different SQL Logic Test slice.
+Forced-spill replay now distributes the complete query set across eight slices,
+and its nested harnesses stream progress without masking command failures.
 No external blocker remains.
 
 | ID | Status | Found | Description | Reproducer | Blocker |

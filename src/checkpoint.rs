@@ -8096,16 +8096,10 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (slot, database) in storage.databases_visible_to(0) {
+        for (_, database) in storage.databases_visible_to(0) {
             use core::fmt::Write;
-            let definition = storage.database_definition(slot, 0);
-            let owner = storage.object_owner(
-                crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Database,
-                    slot: slot as u16,
-                },
-                0,
-            );
+            let definition = database.definition_for(0);
+            let owner = usize::from(database.ownership.owner_to(0));
             let hex = |value: &str| {
                 let mut encoded = StackStr::<256>::new();
                 if value.is_empty() {

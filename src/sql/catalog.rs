@@ -27755,7 +27755,7 @@ fn pg_stat_database<'a>(
             Datum::Oid(database.oid.get() as u32),
             text(database.definition_for(txid).name.as_str(), arena)?,
             backends,
-            storage.database_cumulative_statistics(slot),
+            storage.database_cumulative_statistics(slot, database.oid),
         )?;
     }
     finish(definition, &rows[..count], arena)
@@ -29940,7 +29940,9 @@ fn pg_database<'a>(
             &[
                 Datum::Int4(database.oid.get()),
                 text(database_definition.name.as_str(), arena)?,
-                Datum::Int4(Storage::role_oid(storage.object_owner(object, txid))),
+                Datum::Int4(Storage::role_oid(usize::from(
+                    database.ownership.owner_to(txid),
+                ))),
                 Datum::Int4(database_definition.encoding.code()),
                 text(
                     core::str::from_utf8(&[database_definition.locale_provider.code()])

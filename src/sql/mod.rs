@@ -2920,8 +2920,7 @@ impl Engine {
     }
 
     pub(crate) fn database_login(&self, name: &str) -> Option<DatabaseLogin> {
-        let slot = self.storage.database_slot(name, 0)?;
-        let database = self.storage.database(slot);
+        let (slot, database) = self.storage.database_named(name, 0)?;
         let definition = database.definition_for(0);
         Some(DatabaseLogin {
             slot: slot as u16,

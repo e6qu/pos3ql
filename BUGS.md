@@ -1016,5 +1016,21 @@ reached the fixed 15-minute ceiling while making normal progress. Coverage now
 uses four deterministic library slices, and the CI timeout guard requires each
 slice explicitly.
 
+The view and rewrite-rule lifecycle audit found rule creation published its
+definition before validating dependency capacity. A rejected image could leak
+a live rule slot, including a failed view's return rule. Recovery could relocate
+an existing return rule and change its view link before rejecting the incoming
+dependencies. Both paths now validate before publishing or relocating, and
+view replacement leaves the old view untouched until creation succeeds.
+Checkpoint duplicate detection previously created a replacement and discarded
+only the new view, leaving the old view and return rule pending-dropped; it now
+rejects duplicates before mutation. Reusable view and rule slots now clear their
+entire definitions, and rule cleanup releases pending dependency chains.
+View creation and drop also used committed names while lookup used the owner's
+pending rename, allowing duplicate creation or missing a drop after a rename.
+Both now use the same transaction-visible name. Allocation-free fixtures cover
+these errors, preserved dependency images,
+checkpoint slot identity, and complete slot reuse. No external blocker remains.
+
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -42617,7 +42617,7 @@ fn stored_query_dependent_closure<'a>(
                 continue;
             }
             let dependency_hit = storage
-                .routine_dependencies_for(slot, txid)
+                .snapshot_routine_dependencies_for(slot, txid, arena)?
                 .entries()
                 .iter()
                 .any(|dependency| {
@@ -42650,7 +42650,7 @@ fn stored_query_dependent_closure<'a>(
                 continue;
             }
             let hit = storage
-                .view_dependencies(slot)
+                .snapshot_view_dependencies(slot, arena)?
                 .entries()
                 .iter()
                 .any(|dependency| {
@@ -42676,7 +42676,7 @@ fn stored_query_dependent_closure<'a>(
                 continue;
             }
             let hit = storage
-                .rule_dependencies(slot, txid)
+                .snapshot_rule_dependencies(slot, txid, arena)?
                 .entries()
                 .iter()
                 .any(|dependency| {
@@ -42700,7 +42700,7 @@ fn stored_query_dependent_closure<'a>(
                 continue;
             }
             let hit = storage
-                .matview_dependencies(slot)
+                .snapshot_matview_dependencies(slot, arena)?
                 .entries()
                 .iter()
                 .any(|dependency| {
@@ -43362,7 +43362,10 @@ fn report_stored_query_dependents(
                 continue;
             }
             let mut depth = 0usize;
-            for dependency in storage.routine_dependencies_for(slot, txid).entries() {
+            for dependency in storage
+                .snapshot_routine_dependencies_for(slot, txid, arena)?
+                .entries()
+            {
                 let parent_depth = match dependency.class {
                     class if class == root.class && dependency.slot as usize == root.slot => 1,
                     DependencyClass::View if view_depth[dependency.slot as usize] != 0 => {
@@ -43420,7 +43423,7 @@ fn report_stored_query_dependents(
                 continue;
             }
             let mut depth = 0usize;
-            for dependency in storage.view_dependencies(slot).entries() {
+            for dependency in storage.snapshot_view_dependencies(slot, arena)?.entries() {
                 let parent_depth = match dependency.class {
                     class if class == root.class && dependency.slot as usize == root.slot => 1,
                     DependencyClass::View => view_depth[dependency.slot as usize]
@@ -43460,7 +43463,10 @@ fn report_stored_query_dependents(
                 continue;
             }
             let mut depth = 0usize;
-            for dependency in storage.matview_dependencies(slot).entries() {
+            for dependency in storage
+                .snapshot_matview_dependencies(slot, arena)?
+                .entries()
+            {
                 let parent_depth = match dependency.class {
                     class if class == root.class && dependency.slot as usize == root.slot => 1,
                     DependencyClass::View if view_depth[dependency.slot as usize] != 0 => {
@@ -43640,7 +43646,10 @@ fn report_stored_query_dependents(
                         let _ = write!(parent, "{}", root.suffix.as_str());
                     }
                 } else {
-                    for dependency in storage.routine_dependencies_for(slot, txid).entries() {
+                    for dependency in storage
+                        .snapshot_routine_dependencies_for(slot, txid, arena)?
+                        .entries()
+                    {
                         match dependency.class {
                             DependencyClass::Routine
                                 if routine_depth[dependency.slot as usize] == depth - 1 =>
@@ -43719,7 +43728,8 @@ fn report_stored_query_dependents(
                             let _ = write!(parent, "{}", root.suffix.as_str());
                         }
                     } else {
-                        for dependency in storage.view_dependencies(slot).entries() {
+                        for dependency in storage.snapshot_view_dependencies(slot, arena)?.entries()
+                        {
                             if dependency.class == DependencyClass::View
                                 && view_depth[dependency.slot as usize] == depth - 1
                             {
@@ -43787,7 +43797,10 @@ fn report_stored_query_dependents(
                             let _ = write!(parent, "{}", root.suffix.as_str());
                         }
                     } else {
-                        for dependency in storage.matview_dependencies(slot).entries() {
+                        for dependency in storage
+                            .snapshot_matview_dependencies(slot, arena)?
+                            .entries()
+                        {
                             if dependency.class == DependencyClass::View
                                 && view_depth[dependency.slot as usize] == depth - 1
                             {

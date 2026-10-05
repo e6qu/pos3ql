@@ -16707,7 +16707,15 @@ impl Storage {
             .expect("stored-query dependency catalog lock poisoned");
         let count = catalog.image_count(image);
         let source = catalog.image(image, count, self.stored_query_dependencies_per_image);
-        let mut snapshot = self.empty_stored_query_dependencies(arena)?;
+        let mut snapshot =
+            StoredQueryDependencies::with_arena_limit(usize::from(count).max(1), arena).map_err(
+                |_| {
+                    sql_err!(
+                        sqlstate::OUT_OF_MEMORY,
+                        "SQL statement arena is full while copying stored-query dependencies"
+                    )
+                },
+            )?;
         for dependency in source {
             snapshot.push(*dependency)?;
         }
@@ -52118,7 +52126,7 @@ mod tests {
     fn view_rule_catalog_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ViewRuleCatalog>();
-        assert_send_sync::<Mutex<ViewRuleCatalog>>();
+        assert_send_sync::<std::sync::Mutex<ViewRuleCatalog>>();
         assert_send_sync::<ViewRuleIter<'_, ViewDef>>();
 
         const WORKERS: usize = 4;

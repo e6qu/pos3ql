@@ -20780,7 +20780,10 @@ fn pg_depend<'a>(
     for (view_slot, _) in storage.views_visible_to(txid) {
         let rewrite_oid = storage.rule(storage.view_return_rule(view_slot)).oid();
         push(2618, rewrite_oid, PG_CLASS_OID, view_oid(view_slot), 0, "i")?;
-        for dependency in storage.view_dependencies(view_slot).entries() {
+        for dependency in storage
+            .snapshot_view_dependencies(view_slot, arena)?
+            .entries()
+        {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
             };
@@ -20819,7 +20822,10 @@ fn pg_depend<'a>(
             crate::storage::RuleTarget::View(slot) => view_oid(usize::from(slot)),
         };
         push(2618, rule.oid(), PG_CLASS_OID, relation_oid, 0, "i")?;
-        for dependency in storage.rule_dependencies(slot, txid).entries() {
+        for dependency in storage
+            .snapshot_rule_dependencies(slot, txid, arena)?
+            .entries()
+        {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
             };
@@ -20850,7 +20856,10 @@ fn pg_depend<'a>(
     }
     for (materialized_slot, _) in storage.matviews_visible_to(txid) {
         let table_slot = storage.matview_table(materialized_slot);
-        for dependency in storage.matview_dependencies(materialized_slot).entries() {
+        for dependency in storage
+            .snapshot_matview_dependencies(materialized_slot, arena)?
+            .entries()
+        {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
             };
@@ -31175,7 +31184,10 @@ fn info_view_table_usage<'a>(
     let def = schema::require("view_table_usage", true);
     let mut count = 0usize;
     for (view_slot, _) in storage.views_visible_to(txid) {
-        for dependency in storage.view_dependencies(view_slot).entries() {
+        for dependency in storage
+            .snapshot_view_dependencies(view_slot, arena)?
+            .entries()
+        {
             if matches!(
                 dependency.class,
                 crate::storage::DependencyClass::Table | crate::storage::DependencyClass::View
@@ -31191,7 +31203,10 @@ fn info_view_table_usage<'a>(
         .map_err(|_| arena_full())?;
     let mut index = 0usize;
     for (view_slot, view) in storage.views_visible_to(txid) {
-        for dependency in storage.view_dependencies(view_slot).entries() {
+        for dependency in storage
+            .snapshot_view_dependencies(view_slot, arena)?
+            .entries()
+        {
             let (schema, name): (SqlName, SqlName) = match dependency.class {
                 crate::storage::DependencyClass::Table => {
                     let slot = dependency.slot as usize;

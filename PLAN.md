@@ -442,6 +442,12 @@ row mutation remain unsynchronized.
 The remaining catalog definition containers and row mutation paths still
 require synchronization before fixed workers can overlap execution.
 
+Next, synchronize system settings and prepared transaction metadata, then table
+definitions and row mutation state. Preserve transaction publication and
+response barriers when replacing the reactor's local queue drain with fixed
+workers, and qualify one-through-N worker scaling before claiming concurrent
+execution complete.
+
 Authorization graph traversal now has one mutex-protected, startup-sized bitmap
 per query workspace. Every role membership, object privilege, grant-option,
 and column privilege check selects scratch through the typed worker-local lease
@@ -758,10 +764,10 @@ deterministic slices after three and then four slices exhausted the fixed
 all six slices so corpus growth cannot silently restore the oversized shape.
 PostgreSQL regression differential coverage likewise uses four stable
 filename-grouped slices after the second of two uninstrumented slices reached
-the same ceiling on a slower runner. Forced-spill sqllogictest coverage uses
-four query slices after the second of two slices spent more than 11 minutes in
-normal differential progress following its instrumented build and reached the
-same ceiling.
+the same ceiling on a slower runner. Forced-spill sqllogictest coverage now uses
+eight query slices after both the two- and four-slice layouts reached the same
+ceiling during normal differential progress. The timeout guard pins all eight
+slices.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

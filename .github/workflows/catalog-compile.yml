@@ -21,3 +21,6 @@ jobs:
       - run: cargo clean -p pos3ql
       - run: cargo check --all-targets --locked
       - run: cargo clippy --lib --bins --locked -- -D warnings
+      - run: cargo test --lib --locked database_catalog_is_synchronized -- --nocapture
+      - run: cargo test --lib --locked database_reservation_rejects -- --nocapture
+      - run: cargo test --lib --locked database_retirement_and_failed_clone -- --nocapture

@@ -424,6 +424,20 @@ Forced-spill SQL Logic Test replay now uses eight deterministic query slices
 within the existing 15-minute job limit. Replay progress streams to CI logs
 while preserving both harness and log-write failures.
 
+Database identities, definitions, pending renames, and ownership now share a
+startup-bounded mutex. Creation reserves names and OIDs against every retained
+entry, including other transactions' pending creates and renames. Recovery
+rejects duplicate identities before mutation. Owned login, template, checkpoint,
+and catalog images release the guard before nested reads. Creation and retirement
+publish matching statistics while holding statistics before database locks;
+statistics readers reject an image from a reused slot. Committed drops,
+rolled-back creates, and failed template clones clear the complete reusable
+identity. Allocation-free four-worker publication and rollback, nested readers,
+pending-name and OID collisions, exact capacity, OID exhaustion, recovery
+rejection, and partial-clone cleanup have direct regression coverage. Template
+catalog cloning still requires exclusive storage access while table state and
+row mutation remain unsynchronized.
+
 The remaining catalog definition containers and row mutation paths still
 require synchronization before fixed workers can overlap execution.
 

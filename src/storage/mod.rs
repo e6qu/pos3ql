@@ -19272,7 +19272,7 @@ impl Storage {
             .enumerate()
             .find_map(|(slot, database)| {
                 (database.visible_to(txid) && database.definition_for(txid).name.as_str() == name)
-                    .then_some((slot, *database))
+                    .then(|| (slot, *database))
             })
     }
 
@@ -21505,8 +21505,9 @@ impl Storage {
     }
 
     pub(crate) fn commit_database_drop(&mut self, slot: usize) {
-        let oid = self.database(slot).oid;
-        let name = self.database(slot).definition.name;
+        let image = self.database(slot);
+        let oid = image.oid;
+        let name = image.definition.name;
         self.drop_object_comments(CommentClass::Database, "", name.as_str());
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Database,
@@ -52513,6 +52514,310 @@ mod tests {
             },
             options: ViewOptions::DEFAULT,
         }
+    }
+
+    fn test_database_definition(name: &str) -> DatabaseDefinition {
+        DatabaseDefinition::builtin(name, false, true, "C")
+    }
+
+    #[test]
+    fn database_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DatabaseDef>();
+        assert_send_sync::<std::sync::Mutex<FixedVec<DatabaseDef>>>();
+        assert_send_sync::<DatabaseIter<'_>>();
+        const WORKERS: usize = 4;
+        let names = ["database_a", "database_b", "database_c", "database_d"];
+        let staged = ["staged_a", "staged_b", "staged_c", "staged_d"];
+        let mut config = test_config();
+        config.max_databases = 3 + WORKERS;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let barrier = std::sync::Barrier::new(WORKERS + 1);
+        let finished = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                let barrier = &barrier;
+                let finished = &finished;
+                scope.spawn(move || {
+                    barrier.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        let txid = worker as u32 + 20;
+                        for iteration in 0..16 {
+                            let slot = storage
+                                .reserve_database(
+                                    None,
+                                    test_database_definition(names[worker]),
+                                    0,
+                                    txid,
+                                )
+                                .unwrap();
+                            let image = storage.database_named(names[worker], txid).unwrap().1;
+                            assert_eq!(image.ddl_state, CatalogDdlState::PendingCreate { txid });
+                            storage
+                                .alter_database_definition(
+                                    slot,
+                                    test_database_definition(staged[worker]),
+                                    txid,
+                                )
+                                .unwrap();
+                            if iteration % 2 == 0 {
+                                storage.retire_database(slot, true);
+                            } else {
+                                storage.publish_database_create(slot);
+                                storage.commit_database_alter(slot, txid);
+                                assert_eq!(
+                                    storage
+                                        .database_named(staged[worker], 0)
+                                        .unwrap()
+                                        .1
+                                        .definition
+                                        .name
+                                        .as_str(),
+                                    staged[worker]
+                                );
+                                if iteration != 15 {
+                                    storage.drop_database(slot, txid);
+                                    storage.retire_database(slot, false);
+                                }
+                            }
+                        }
+                    });
+                    finished.fetch_add(1, std::sync::atomic::Ordering::Release);
+                });
+            }
+            barrier.wait();
+            crate::mem::guard::forbid_alloc(|| {
+                while finished.load(std::sync::atomic::Ordering::Acquire) != WORKERS {
+                    let statistics = storage.cumulative_statistics();
+                    let catalog = storage.database_catalog();
+                    for (slot, database) in catalog.iter().enumerate() {
+                        assert_eq!(statistics.databases[slot].oid, database.oid);
+                        if database.ddl_state == CatalogDdlState::Absent {
+                            assert_eq!(database.definition.name, SqlName::EMPTY);
+                            assert!(database.pending.is_none());
+                            assert!(database.ownership.pending.is_none());
+                        } else {
+                            assert!(
+                                catalog[..slot]
+                                    .iter()
+                                    .all(|other| other.ddl_state == CatalogDdlState::Absent
+                                        || other.oid != database.oid)
+                            );
+                        }
+                    }
+                    drop(catalog);
+                    drop(statistics);
+                    for (slot, database) in storage.databases_visible_to(0) {
+                        let _ = storage.database_named(database.definition.name.as_str(), 0);
+                        assert_eq!(
+                            storage
+                                .database_cumulative_statistics(slot, database.oid)
+                                .oid,
+                            database.oid
+                        );
+                    }
+                    storage.reset_current_database_statistics();
+                    std::thread::yield_now();
+                }
+            });
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.database_count(), 3 + WORKERS);
+            assert_eq!(storage.database_catalog().capacity(), 3 + WORKERS);
+            assert_eq!(storage.database_catalog().len(), 3 + WORKERS);
+            assert_eq!(storage.databases_visible_to(0).count(), 3 + WORKERS);
+            assert_eq!(
+                storage
+                    .reserve_database(None, test_database_definition("overflow"), 0, 30)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+        });
+    }
+
+    #[test]
+    fn database_reservation_rejects_pending_and_recovery_collisions() {
+        let mut config = test_config();
+        config.max_databases = 7;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let first = storage
+                .reserve_database(None, test_database_definition("pending_database"), 0, 11)
+                .unwrap();
+            let first_oid = storage.database(first).oid;
+            assert_eq!(
+                storage
+                    .reserve_database(None, test_database_definition("pending_database"), 0, 12)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            storage.release_row_locks(12);
+            let second = storage
+                .reserve_database(None, test_database_definition("other_database"), 0, 12)
+                .unwrap();
+            assert_ne!(first_oid, storage.database(second).oid);
+            assert_eq!(
+                storage
+                    .reserve_database(Some(first_oid), test_database_definition("same_oid"), 0, 12)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DUPLICATE_OBJECT
+            );
+            storage
+                .alter_database_definition(first, test_database_definition("pending_rename"), 11)
+                .unwrap();
+            assert_eq!(
+                storage
+                    .reserve_database(None, test_database_definition("pending_rename"), 0, 12)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            storage.release_row_locks(12);
+            assert_eq!(
+                storage
+                    .alter_database_definition(
+                        second,
+                        test_database_definition("pending_rename"),
+                        12
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            storage.release_row_locks(12);
+            assert_eq!(
+                storage
+                    .restore_database(first_oid, test_database_definition("recovery_oid"), 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DUPLICATE_OBJECT
+            );
+            assert_eq!(
+                storage
+                    .restore_database(
+                        DatabaseOid(USER_DATABASE_OID_BASE + 100),
+                        test_database_definition("pending_rename"),
+                        0
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DUPLICATE_OBJECT
+            );
+            assert_eq!(storage.databases_visible_to(11).count(), 4);
+            assert_eq!(storage.databases_visible_to(12).count(), 4);
+            storage.retire_database(first, true);
+            storage.retire_database(second, true);
+            let maximum = storage
+                .reserve_database(
+                    Some(DatabaseOid(i32::MAX)),
+                    test_database_definition("maximum_oid"),
+                    0,
+                    13,
+                )
+                .unwrap();
+            assert_eq!(
+                storage
+                    .reserve_database(None, test_database_definition("oid_overflow"), 0, 14)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.databases_visible_to(13).count(), 4);
+            storage.retire_database(maximum, true);
+            assert_eq!(storage.databases_visible_to(0).count(), 3);
+        });
+    }
+
+    #[test]
+    fn database_retirement_and_failed_clone_clear_complete_images() {
+        let mut config = test_config();
+        config.max_databases = 4;
+        config.max_schemas = 5;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for committed in [false, true] {
+                let slot = storage
+                    .create_database(
+                        None,
+                        DatabaseOid::TEMPLATE1,
+                        test_database_definition("retired_database"),
+                        0,
+                        17,
+                    )
+                    .unwrap();
+                storage
+                    .alter_database_definition(slot, test_database_definition("pending_name"), 17)
+                    .unwrap();
+                let oid = storage.database(slot).oid;
+                storage.cumulative_statistics().databases[slot].sessions = 123;
+                if committed {
+                    storage.commit_database_create(slot);
+                    storage.drop_database(slot, 17);
+                    storage.commit_database_drop(slot);
+                } else {
+                    storage.rollback_database_create(slot);
+                }
+                let image = storage.database(slot);
+                assert_eq!(image.ddl_state, CatalogDdlState::Absent);
+                assert_eq!(image.definition.name, SqlName::EMPTY);
+                assert!(image.pending.is_none());
+                assert!(image.ownership.pending.is_none());
+                assert_eq!(
+                    storage.database_cumulative_statistics(slot, oid).sessions,
+                    0
+                );
+                assert!(
+                    !storage
+                        .schemas
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|schema| schema.database == oid && schema.visible_to(0))
+                );
+            }
+            storage
+                .alloc_schema(
+                    SqlName::parse("clone_extra").unwrap(),
+                    CatalogDdlState::Present,
+                    Some(Ownership::BOOTSTRAP),
+                )
+                .unwrap();
+            assert_eq!(
+                storage
+                    .create_database(
+                        None,
+                        DatabaseOid::POSTGRES,
+                        test_database_definition("failed_clone"),
+                        0,
+                        19
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.databases_visible_to(19).count(), 3);
+            assert_eq!(storage.database(3).ddl_state, CatalogDdlState::Absent);
+            assert_eq!(storage.database(3).definition.name, SqlName::EMPTY);
+            assert_eq!(storage.cumulative_statistics().databases[3].sessions, 0);
+            assert_eq!(
+                storage
+                    .schemas
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|schema| schema.visible_to(19))
+                    .count(),
+                4
+            );
+            assert!(storage.find_schema("clone_extra").is_some());
+        });
     }
 
     fn test_index_definition(name: &str) -> IndexDef {

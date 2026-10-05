@@ -52444,6 +52444,14 @@ mod tests {
             .create_table(make_def("index_target", &[("id", ColType::Int4, false)]))
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
+            let mut invalid = test_index_definition("invalid_generation");
+            invalid.created_at = u64::from(MAX_INDEX_OID_GENERATION) + 1;
+            assert_eq!(
+                storage.create_index(invalid, 17).unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.index(0).created_at, 0);
+            assert_eq!(storage.brin_maintenance().states[0].index_created_at, 0);
             for committed in [false, true] {
                 let slot = storage
                     .create_index(test_index_definition("retired"), 17)
@@ -52543,7 +52551,6 @@ mod tests {
             storage
                 .rename_index(slot, SqlName::parse("remote_pending").unwrap(), 17)
                 .unwrap();
-            storage.commit_index_rename(slot, 17);
             assert_eq!(
                 storage
                     .create_index(test_index_definition("remote_pending"), 19)
@@ -52552,6 +52559,7 @@ mod tests {
                 sqlstate::INTERNAL_LOCK_WAIT
             );
             storage.release_row_locks(19);
+            storage.commit_index_rename(slot, 17);
             assert!(
                 storage
                     .comment_text(CommentClass::Relation, "public", "remote_pending", 0, 0)

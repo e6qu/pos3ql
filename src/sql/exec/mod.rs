@@ -49313,14 +49313,13 @@ pub fn create_database(
         ));
     }
     let template_name = options.template.unwrap_or("template1");
-    let Some(template_slot) = storage.database_slot(template_name, txn.txid) else {
+    let Some((_, template)) = storage.database_named(template_name, txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::INVALID_CATALOG_NAME,
             "template database \"{}\" does not exist",
             template_name
         ));
     };
-    let template = storage.database(template_slot);
     let template_oid = template.oid;
     let template_definition = template.definition_for(txn.txid);
     let template_owner = usize::from(template.ownership.owner_to(txn.txid));

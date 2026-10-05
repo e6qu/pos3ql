@@ -27771,11 +27771,7 @@ fn pg_stat_database_conflicts<'a>(
         .alloc_slice_with(storage.database_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
-    for slot in 0..storage.database_count() {
-        let database = storage.database(slot);
-        if !database.visible_to(txid) {
-            continue;
-        }
+    for (_, database) in storage.databases_visible_to(txid) {
         rows[count] = row(
             &[
                 Datum::Oid(database.oid.get() as u32),

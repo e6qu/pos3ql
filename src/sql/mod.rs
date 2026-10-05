@@ -15800,9 +15800,9 @@ impl Engine {
                 let mut connections = self.database_connection_count(template, txn.txid);
                 if self
                     .storage
-                    .database_slot(template, txn.txid)
-                    .is_some_and(|slot| {
-                        self.storage.database(slot).oid == self.storage.current_database_oid()
+                    .database_named(template, txn.txid)
+                    .is_some_and(|(_, database)| {
+                        database.oid == self.storage.current_database_oid()
                     })
                 {
                     connections = connections.saturating_sub(1);

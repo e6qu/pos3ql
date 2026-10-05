@@ -45186,7 +45186,8 @@ impl Storage {
     /// The transaction-visible index definition. Returning the copy keeps a
     /// caller from retaining a catalog borrow across cache reconstruction.
     pub fn index_definition(&self, schema: &str, name: &str, txid: u32) -> Option<IndexDef> {
-        self.index_catalog()
+        let index = self
+            .index_catalog()
             .iter()
             .find(|index| {
                 index.database == current_database()
@@ -45194,7 +45195,17 @@ impl Storage {
                     && index.schema.as_str() == schema
                     && index.name_for(txid).as_str() == name
             })
-            .copied()
+            .copied();
+        if let Some(index) = index
+            && self
+                .find_visible(index.schema.as_str(), index.table.as_str(), txid)
+                .is_some_and(|table| {
+                    self.table_def(table, txid).persistence == RelationPersistence::Temporary
+                })
+        {
+            self.mark_temporary_transaction(txid);
+        }
+        index
     }
 
     pub(crate) fn rename_index(

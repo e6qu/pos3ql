@@ -394,8 +394,16 @@ Allocation-free regression fixtures cover failed creation and replacement,
 recovery errors, durable view slots, dependency preservation, database cleanup,
 transactional view names, and slot reuse. View creation and drop now select the
 owner's pending name consistently with view lookup.
-This establishes the failure invariants needed for the shared view/rule
-publication boundary; their definition vectors remain unsynchronized.
+View definitions and rewrite rules now share one startup-bounded mutex.
+Creation, replacement, commit, rollback, recovery relocation, database cloning
+and removal, and schema rewrites publish the view and return-rule graph under
+one guard. Iterators return owned images and release the guard before nested
+catalog reads. Stored-query parsing copies SQL, creation path, and dependencies
+from one guarded image into fixed statement memory. Dependency rebinding
+releases its catalog guard before resolving view identities, preserving the
+view-to-dependency lock order. Four-worker publication, nested-reader progress,
+exact capacities, loud exhaustion, slot reuse, and `Send + Sync` have direct
+coverage.
 
 The remaining catalog definition containers and row mutation paths still
 require synchronization before fixed workers can overlap execution.

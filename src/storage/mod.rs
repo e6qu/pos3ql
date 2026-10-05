@@ -34348,7 +34348,14 @@ impl Storage {
     }
 
     pub(crate) fn view_sql(&self, slot: usize) -> StackStr<VIEW_SQL_MAX> {
-        self.view_sql_for(&self.view(slot))
+        let catalog = self.view_rule_catalog();
+        let rule = &catalog.rules[usize::from(catalog.views[slot].return_rule)];
+        StackStr::from_str(
+            rule.definition
+                .action_sql()
+                .next()
+                .expect("every view has one _RETURN action"),
+        )
     }
 
     pub(crate) fn view_sql_for(&self, view: &ViewDef) -> StackStr<VIEW_SQL_MAX> {
@@ -34362,11 +34369,8 @@ impl Storage {
     }
 
     pub(crate) fn view_creation_path(&self, slot: usize) -> StackStr<128> {
-        self.view_creation_path_for(&self.view(slot))
-    }
-
-    pub(crate) fn view_creation_path_for(&self, view: &ViewDef) -> StackStr<128> {
-        self.rule(usize::from(view.return_rule))
+        let catalog = self.view_rule_catalog();
+        catalog.rules[usize::from(catalog.views[slot].return_rule)]
             .definition
             .creation_path
     }
@@ -49826,12 +49830,17 @@ impl Storage {
     }
 
     pub(crate) fn drop_rule(&mut self, slot: usize, txid: u32) {
-        self.view_rule_catalog().rules[slot].ddl_state = self.rule(slot).ddl_state.drop_by(txid);
+        let mut catalog = self.view_rule_catalog();
+        catalog.rules[slot].ddl_state = catalog.rules[slot].ddl_state.drop_by(txid);
     }
 
     pub(crate) fn commit_rule_create(&mut self, slot: usize) {
-        self.view_rule_catalog().rules[slot].ddl_state = self.rule(slot).ddl_state.commit_create();
-        if let RuleTarget::Table(table) = self.rule(slot).definition.target {
+        let target = {
+            let mut catalog = self.view_rule_catalog();
+            catalog.rules[slot].ddl_state = catalog.rules[slot].ddl_state.commit_create();
+            catalog.rules[slot].definition.target
+        };
+        if let RuleTarget::Table(table) = target {
             let table = &mut self.tables[usize::from(table)];
             table.def.has_rules = true;
             table.pending_has_rules_txid = None;
@@ -49979,8 +49988,8 @@ impl Storage {
     }
 
     pub(crate) fn rollback_rule_drop(&mut self, slot: usize, txid: u32) {
-        self.view_rule_catalog().rules[slot].ddl_state =
-            self.rule(slot).ddl_state.rollback_drop(txid);
+        let mut catalog = self.view_rule_catalog();
+        catalog.rules[slot].ddl_state = catalog.rules[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn replay_rule(
@@ -50076,8 +50085,8 @@ impl Storage {
                     *comment = CommentEntry::empty();
                 }
             }
-            self.view_rule_catalog().rules[slot] = RuleDef::EMPTY;
-            self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
+            let mut catalog = self.view_rule_catalog();
+            self.clear_rule_slot_in(&mut catalog, slot);
         }
     }
 
@@ -52103,6 +52112,112 @@ mod tests {
             },
             options: ViewOptions::DEFAULT,
         }
+    }
+
+    #[test]
+    fn view_rule_catalog_is_synchronized_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ViewRuleCatalog>();
+        assert_send_sync::<Mutex<ViewRuleCatalog>>();
+        assert_send_sync::<ViewRuleIter<'_, ViewDef>>();
+
+        const WORKERS: usize = 4;
+        let mut config = test_config();
+        config.max_views = WORKERS;
+        config.max_rules = WORKERS;
+        config.max_stored_query_dependencies_per_object = 1;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let arena = Arena::new(&mut budget, "view snapshot test", 1 << 16).unwrap();
+        let barrier = std::sync::Barrier::new(WORKERS + 1);
+        let finished = std::sync::atomic::AtomicUsize::new(0);
+        let names = ["worker_a", "worker_b", "worker_c", "worker_d"];
+
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let storage = &storage;
+                let barrier = &barrier;
+                let finished = &finished;
+                scope.spawn(move || {
+                    let schema = SqlName::parse("public").unwrap();
+                    let name = SqlName::parse(names[worker]).unwrap();
+                    barrier.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        for iteration in 0..16 {
+                            let (slot, prior) = storage
+                                .create_view(
+                                    schema,
+                                    name,
+                                    test_view_definition(StoredQueryDependencies::EMPTY),
+                                    false,
+                                    worker as u32 + 20,
+                                )
+                                .unwrap();
+                            assert!(prior.is_none());
+                            if iteration == 15 {
+                                storage.commit_view_create(slot);
+                            } else {
+                                storage.rollback_view_create(slot);
+                            }
+                        }
+                    });
+                    finished.fetch_add(1, std::sync::atomic::Ordering::Release);
+                });
+            }
+            barrier.wait();
+            crate::mem::guard::forbid_alloc(|| {
+                while finished.load(std::sync::atomic::Ordering::Acquire) != WORKERS {
+                    let catalog = storage.view_rule_catalog();
+                    for (slot, view) in catalog.views.iter().enumerate() {
+                        if view.ddl_state == CatalogDdlState::Absent {
+                            assert_eq!(view.return_rule, u16::MAX);
+                            continue;
+                        }
+                        let rule = &catalog.rules[usize::from(view.return_rule)];
+                        assert_eq!(rule.definition.target, RuleTarget::View(slot as u16));
+                        assert_eq!(rule.ddl_state, view.ddl_state);
+                    }
+                    for (slot, rule) in catalog.rules.iter().enumerate() {
+                        if rule.ddl_state != CatalogDdlState::Absent {
+                            let RuleTarget::View(view) = rule.definition.target else {
+                                panic!("unexpected table rule");
+                            };
+                            assert_eq!(catalog.views[usize::from(view)].return_rule, slot as u16);
+                        }
+                    }
+                    drop(catalog);
+                    std::thread::yield_now();
+                }
+            });
+        });
+
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.view_count(), WORKERS);
+            assert_eq!(storage.rule_count(), WORKERS);
+            assert_eq!(storage.checkpoint_views().count(), WORKERS);
+            for (slot, view) in storage.views_visible_to(0) {
+                let rule = storage.rule(usize::from(view.return_rule));
+                assert_eq!(rule.definition.target, RuleTarget::View(slot as u16));
+                let query = storage.snapshot_view_query(slot, &arena).unwrap();
+                assert_eq!(query.sql.as_str(), "SELECT 1");
+                assert_eq!(query.creation_path.as_str(), "public");
+                assert!(query.dependencies.entries().is_empty());
+                assert_eq!(storage.view_sql(slot), query.sql);
+            }
+            assert_eq!(
+                storage
+                    .create_view(
+                        SqlName::parse("public").unwrap(),
+                        SqlName::parse("overflow").unwrap(),
+                        test_view_definition(StoredQueryDependencies::EMPTY),
+                        false,
+                        30,
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+        });
     }
 
     fn oversized_test_dependencies() -> StoredQueryDependencies {

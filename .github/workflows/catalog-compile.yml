@@ -20,6 +20,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
       - run: cargo clean -p pos3ql
       - run: cargo check --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked --lib view_rule_catalog_is_synchronized_and_startup_bounded -- --nocapture
       - run: cargo test --locked --lib view_ -- --nocapture
       - run: cargo test --locked --lib rule_ -- --nocapture

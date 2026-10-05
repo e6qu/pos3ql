@@ -13424,6 +13424,16 @@ struct ViewRuleIter<'a, T> {
     catalog: &'a std::sync::Mutex<ViewRuleCatalog>,
     entries: fn(&ViewRuleCatalog) -> &FixedVec<T>,
     next_slot: usize,
+    txid: u32,
+    accept: fn(&T, u32) -> bool,
+}
+
+impl<T> ViewRuleIter<'_, T> {
+    fn accepting(mut self, txid: u32, accept: fn(&T, u32) -> bool) -> Self {
+        self.txid = txid;
+        self.accept = accept;
+        self
+    }
 }
 
 impl<T: Copy> Iterator for ViewRuleIter<'_, T> {
@@ -13434,10 +13444,15 @@ impl<T: Copy> Iterator for ViewRuleIter<'_, T> {
             .catalog
             .lock()
             .expect("view and rule catalog lock poisoned");
-        let slot = self.next_slot;
-        let definition = *(self.entries)(&catalog).get(slot)?;
-        self.next_slot += 1;
-        Some((slot, definition))
+        let entries = (self.entries)(&catalog);
+        while let Some(definition) = entries.get(self.next_slot) {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            if (self.accept)(definition, self.txid) {
+                return Some((slot, *definition));
+            }
+        }
+        None
     }
 }
 
@@ -22340,13 +22355,10 @@ impl Storage {
     }
 
     pub(crate) fn checkpoint_views(&self) -> impl Iterator<Item = (usize, ViewDef)> + '_ {
-        self.view_entries()
-            .map(|(_, entry)| entry)
-            .enumerate()
-            .filter(|(_, value)| {
-                value.ddl_state == CatalogDdlState::Present
-                    && value.persistence != RelationPersistence::Temporary
-            })
+        self.view_entries().accepting(0, |value, _| {
+            value.ddl_state == CatalogDdlState::Present
+                && value.persistence != RelationPersistence::Temporary
+        })
     }
 
     pub(crate) fn checkpoint_publications(
@@ -34257,26 +34269,21 @@ impl Storage {
 
     /// Whether any live view exists (lets the executor skip view expansion).
     pub fn has_any_view(&self) -> bool {
-        self.view_entries().map(|(_, entry)| entry).any(|view| {
+        self.view_rule_catalog().views.iter().any(|view| {
             view.database == current_database() && view.ddl_state != CatalogDdlState::Absent
         })
     }
 
-    /// Committed views as (name, SELECT text), for checkpoint serialization.
+    /// Owned committed view images for nested catalog reads.
     pub fn live_views(&self) -> impl Iterator<Item = ViewDef> + '_ {
-        self.view_entries().map(|(_, entry)| entry).filter(|view| {
-            view.database == current_database() && view.ddl_state == CatalogDdlState::Present
-        })
+        self.views_with_slots().map(|(_, view)| view)
     }
 
     /// Committed views with their slot indices, for OID assignment.
     pub fn views_with_slots(&self) -> impl Iterator<Item = (usize, ViewDef)> + '_ {
-        self.view_entries()
-            .map(|(_, entry)| entry)
-            .enumerate()
-            .filter(|(_, view)| {
-                view.database == current_database() && view.ddl_state == CatalogDdlState::Present
-            })
+        self.view_entries().accepting(0, |view, _| {
+            view.database == current_database() && view.ddl_state == CatalogDdlState::Present
+        })
     }
 
     /// Views visible to `txid`, including the transaction's own DDL.
@@ -34284,10 +34291,9 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, ViewDef)> + '_ {
-        self.view_entries()
-            .map(|(_, entry)| entry)
-            .enumerate()
-            .filter(move |(_, view)| view.database == current_database() && view.visible_to(txid))
+        self.view_entries().accepting(txid, |view, txid| {
+            view.database == current_database() && view.visible_to(txid)
+        })
     }
 
     fn view_rule_catalog(&self) -> std::sync::MutexGuard<'_, ViewRuleCatalog> {
@@ -34301,6 +34307,8 @@ impl Storage {
             catalog: &self.view_rule_catalog,
             entries: |catalog| &catalog.views,
             next_slot: 0,
+            txid: 0,
+            accept: |_, _| true,
         }
     }
 
@@ -34309,6 +34317,8 @@ impl Storage {
             catalog: &self.view_rule_catalog,
             entries: |catalog| &catalog.rules,
             next_slot: 0,
+            txid: 0,
+            accept: |_, _| true,
         }
     }
 
@@ -36409,12 +36419,16 @@ impl Storage {
     /// The stored SELECT text of a view visible to `txid`, if `name` names one
     /// (own uncommitted CREATE/DROP included; another transaction's excluded).
     pub fn find_view(&self, schema: &str, name: &str, txid: u32) -> Option<ViewDef> {
-        self.view_entries().map(|(_, entry)| entry).find(|v| {
-            v.database == current_database()
-                && v.visible_to(txid)
-                && v.schema_for(txid).as_str() == schema
-                && v.name_for(txid).as_str() == name
-        })
+        self.view_rule_catalog()
+            .views
+            .iter()
+            .find(|v| {
+                v.database == current_database()
+                    && v.visible_to(txid)
+                    && v.schema_for(txid).as_str() == schema
+                    && v.name_for(txid).as_str() == name
+            })
+            .copied()
     }
 
     // --- Materialized-view catalog (parallel to views; data lives in a
@@ -49609,14 +49623,12 @@ impl Storage {
     }
 
     pub(crate) fn rule_slot(&self, target: RuleTarget, name: &str, txid: u32) -> Option<usize> {
-        self.rule_entries()
-            .map(|(_, entry)| entry)
-            .position(|rule| {
-                rule.database == current_database()
-                    && rule.visible_to(txid)
-                    && rule.definition_for(txid).target == target
-                    && rule.definition_for(txid).name.as_str() == name
-            })
+        self.view_rule_catalog().rules.iter().position(|rule| {
+            rule.database == current_database()
+                && rule.visible_to(txid)
+                && rule.definition_for(txid).target == target
+                && rule.definition_for(txid).name.as_str() == name
+        })
     }
 
     pub(crate) fn rules_for(
@@ -49626,8 +49638,9 @@ impl Storage {
         txid: u32,
     ) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
         self.rule_entries()
-            .map(|(_, entry)| entry)
-            .enumerate()
+            .accepting(txid, |rule, txid| {
+                rule.database == current_database() && rule.visible_to(txid)
+            })
             .filter(move |(_, rule)| {
                 rule.database == current_database()
                     && rule.visible_to(txid)
@@ -49661,10 +49674,9 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
-        self.rule_entries()
-            .map(|(_, entry)| entry)
-            .enumerate()
-            .filter(move |(_, rule)| rule.database == current_database() && rule.visible_to(txid))
+        self.rule_entries().accepting(txid, |rule, txid| {
+            rule.database == current_database() && rule.visible_to(txid)
+        })
     }
 
     pub(crate) fn rule_count(&self) -> usize {
@@ -49672,13 +49684,21 @@ impl Storage {
     }
 
     fn validate_rule_target(&self, target: RuleTarget, txid: u32) -> Result<(), SqlError> {
+        self.validate_rule_target_in(&self.view_rule_catalog(), target, txid)
+    }
+
+    fn validate_rule_target_in(
+        &self,
+        catalog: &ViewRuleCatalog,
+        target: RuleTarget,
+        txid: u32,
+    ) -> Result<(), SqlError> {
         let visible = match target {
             RuleTarget::Table(slot) => self
                 .tables
                 .get(usize::from(slot))
                 .is_some_and(|table| table.visible_to(txid)),
-            RuleTarget::View(slot) => self
-                .view_rule_catalog()
+            RuleTarget::View(slot) => catalog
                 .views
                 .get(usize::from(slot))
                 .is_some_and(|view| view.visible_to(txid)),
@@ -49699,8 +49719,8 @@ impl Storage {
         or_replace: bool,
         txid: u32,
     ) -> Result<(usize, Option<PendingRuleDefinition>), SqlError> {
-        self.validate_rule_target(definition.target, txid)?;
         let mut catalog = self.view_rule_catalog();
+        self.validate_rule_target_in(&catalog, definition.target, txid)?;
         if let Some(slot) = catalog.rules.iter().position(|rule| {
             rule.database == current_database()
                 && rule.visible_to(txid)
@@ -50013,8 +50033,8 @@ impl Storage {
                 "journal rewrite-rule slot is out of range"
             ));
         }
-        self.validate_rule_target(definition.target, 0)?;
         let mut catalog = self.view_rule_catalog();
+        self.validate_rule_target_in(&catalog, definition.target, 0)?;
         if catalog.rules.iter().enumerate().any(|(other, rule)| {
             other != slot
                 && rule.database == current_database()
@@ -52194,6 +52214,15 @@ mod tests {
                         }
                     }
                     drop(catalog);
+                    for (slot, view) in storage.checkpoint_views() {
+                        let query = storage.snapshot_view_query(slot, &arena).unwrap();
+                        assert_eq!(query.sql.as_str(), "SELECT 1");
+                        assert_eq!(query.creation_path.as_str(), "public");
+                        assert_eq!(
+                            storage.rule(usize::from(view.return_rule)).ddl_state,
+                            CatalogDdlState::Present
+                        );
+                    }
                     std::thread::yield_now();
                 }
             });

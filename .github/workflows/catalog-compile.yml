@@ -20,3 +20,7 @@ jobs:
           key: catalog-compile-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - run: cargo clean -p pos3ql
       - run: cargo check --all-targets --locked
+      - run: cargo clippy --lib --bins --locked -- -D warnings
+      - run: cargo test --lib --locked index_catalog_is_synchronized -- --nocapture
+      - run: cargo test --lib --locked index_slot_retirement -- --nocapture
+      - run: cargo test --lib --locked index_rename_checks -- --nocapture

@@ -10577,6 +10577,35 @@ pub struct IndexDef {
 }
 
 impl IndexDef {
+    pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        created_at: 0,
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        pending_name: None,
+        table: SqlName::EMPTY,
+        method: crate::sql::ast::IndexAccessMethod::Btree,
+        ownership: Ownership::BOOTSTRAP,
+        columns: [0; MAX_INDEX_COLS],
+        expressions: [None; MAX_INDEX_COLS],
+        include_columns: [0; MAX_INDEX_COLS],
+        collations: [Collation::Default; MAX_INDEX_COLS],
+        explicit_collations: [false; MAX_INDEX_COLS],
+        operator_classes: [None; MAX_INDEX_COLS],
+        resolved_operator_classes: [None; MAX_INDEX_COLS],
+        operator_class_options: [IndexOperatorClassOptions::DEFAULT; MAX_INDEX_COLS],
+        descending: [false; MAX_INDEX_COLS],
+        nulls_first: [false; MAX_INDEX_COLS],
+        n_cols: 0,
+        n_include_cols: 0,
+        nulls_not_distinct: false,
+        predicate: None,
+        unique: false,
+        mutable: IndexMutableDefinition::DEFAULT,
+        pending_definition: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
     /// Whether `txid` sees this index exist.
     pub fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
@@ -13415,6 +13444,22 @@ impl<D: Copy> Iterator for ForeignCatalogIter<'_, D> {
     }
 }
 
+struct IndexIter<'a> {
+    catalog: &'a std::sync::Mutex<FixedVec<IndexDef>>,
+    next_slot: usize,
+}
+
+impl Iterator for IndexIter<'_> {
+    type Item = (usize, IndexDef);
+    fn next(&mut self) -> Option<Self::Item> {
+        let catalog = self.catalog.lock().expect("index catalog lock poisoned");
+        let slot = self.next_slot;
+        let definition = *catalog.get(slot)?;
+        self.next_slot += 1;
+        Some((slot, definition))
+    }
+}
+
 struct ViewRuleCatalog {
     views: FixedVec<ViewDef>,
     rules: FixedVec<RuleDef>,
@@ -13533,7 +13578,8 @@ pub struct Storage {
     enum_member_pending_base: usize,
     enum_member_replay_image: usize,
     domain_graph_scratch: std::sync::Mutex<FixedVec<u8>>,
-    indexes: FixedVec<IndexDef>,
+    index_catalog: std::sync::Mutex<FixedVec<IndexDef>>,
+    index_catalog_capacity: usize,
     brin_maintenance: std::sync::Mutex<BrinMaintenance>,
     brin_unsummarized_ranges_per_index: usize,
     databases: FixedVec<DatabaseDef>,
@@ -15921,21 +15967,22 @@ impl Storage {
                 self.table_def(object.slot as usize, txid).persistence
                     == RelationPersistence::Temporary
             }
-            AccessClass::Index => self
-                .indexes
-                .get(object.slot as usize)
-                .and_then(|index| {
-                    self.tables.iter().enumerate().find_map(|(slot, table)| {
-                        (table.database == index.database
-                            && table.visible_to(txid)
-                            && self.table_def(slot, txid).schema == index.schema
-                            && self.table_def(slot, txid).name == index.table)
-                            .then_some(slot)
+            AccessClass::Index => {
+                let index = self.index_catalog().get(object.slot as usize).copied();
+                index
+                    .and_then(|index| {
+                        self.tables.iter().enumerate().find_map(|(slot, table)| {
+                            (table.database == index.database
+                                && table.visible_to(txid)
+                                && self.table_def(slot, txid).schema == index.schema
+                                && self.table_def(slot, txid).name == index.table)
+                                .then_some(slot)
+                        })
                     })
-                })
-                .is_some_and(|table| {
-                    self.table_def(table, txid).persistence == RelationPersistence::Temporary
-                }),
+                    .is_some_and(|table| {
+                        self.table_def(table, txid).persistence == RelationPersistence::Temporary
+                    })
+            }
             AccessClass::Sequence => {
                 self.sequence_for(object.slot as usize, txid).persistence
                     == RelationPersistence::Temporary
@@ -17931,36 +17978,7 @@ impl Storage {
                 .expect("sized to every index's BRIN range capacity");
         }
         for _ in 0..config.max_indexes {
-            indexes
-                .push(IndexDef {
-                    database: DatabaseOid::POSTGRES,
-                    created_at: 0,
-                    schema: SqlName::parse("").expect("empty name fits"),
-                    name: SqlName::parse("").expect("empty name fits"),
-                    pending_name: None,
-                    table: SqlName::parse("").expect("empty name fits"),
-                    method: crate::sql::ast::IndexAccessMethod::Btree,
-                    ownership: Ownership::BOOTSTRAP,
-                    columns: [0; MAX_INDEX_COLS],
-                    expressions: [None; MAX_INDEX_COLS],
-                    include_columns: [0; MAX_INDEX_COLS],
-                    collations: [Collation::Default; MAX_INDEX_COLS],
-                    explicit_collations: [false; MAX_INDEX_COLS],
-                    operator_classes: [None; MAX_INDEX_COLS],
-                    resolved_operator_classes: [None; MAX_INDEX_COLS],
-                    operator_class_options: [IndexOperatorClassOptions::DEFAULT; MAX_INDEX_COLS],
-                    descending: [false; MAX_INDEX_COLS],
-                    nulls_first: [false; MAX_INDEX_COLS],
-                    n_cols: 0,
-                    n_include_cols: 0,
-                    nulls_not_distinct: false,
-                    predicate: None,
-                    unique: false,
-                    mutable: IndexMutableDefinition::DEFAULT,
-                    pending_definition: None,
-                    ddl_state: CatalogDdlState::Absent,
-                })
-                .expect("sized to max_indexes");
+            indexes.push(IndexDef::EMPTY).expect("sized to max_indexes");
             brin_maintenance
                 .push(BrinMaintenanceState::EMPTY)
                 .expect("sized to max_indexes");
@@ -18192,7 +18210,8 @@ impl Storage {
             enum_member_pending_base,
             enum_member_replay_image,
             domain_graph_scratch: std::sync::Mutex::new(domain_graph_scratch),
-            indexes,
+            index_catalog: std::sync::Mutex::new(indexes),
+            index_catalog_capacity: config.max_indexes,
             brin_maintenance: std::sync::Mutex::new(BrinMaintenance {
                 states: brin_maintenance,
                 unsummarized_ranges: brin_unsummarized_ranges,
@@ -19957,8 +19976,8 @@ impl Storage {
             }
             drop(operator_catalog);
 
-            for source_slot in 0..self.indexes.len() {
-                let mut definition = self.indexes[source_slot];
+            for source_slot in 0..self.index_count() {
+                let mut definition = self.index(source_slot);
                 if definition.database != source
                     || definition.ddl_state != CatalogDdlState::Present
                     || self.access_object_is_temporary(
@@ -19972,8 +19991,8 @@ impl Storage {
                     continue;
                 }
                 let target_slot = self
-                    .indexes
-                    .iter()
+                    .index_entries()
+                    .map(|(_, entry)| entry)
                     .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
                     .ok_or_else(|| {
                         sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "index catalog is full")
@@ -19995,19 +20014,19 @@ impl Storage {
                         *collation = Collation::Catalog(target);
                     }
                 }
-                self.indexes[target_slot] = definition;
+                self.index_catalog()[target_slot] = definition;
             }
-            for target_slot in 0..self.indexes.len() {
-                if self.indexes[target_slot].database != target
-                    || self.indexes[target_slot].ddl_state
+            for target_slot in 0..self.index_count() {
+                if self.index(target_slot).database != target
+                    || self.index(target_slot).ddl_state
                         != (CatalogDdlState::PendingCreate { txid })
                 {
                     continue;
                 }
-                let Some(source_parent_slot) = self.indexes[target_slot].mutable.parent else {
+                let Some(source_parent_slot) = self.index(target_slot).mutable.parent else {
                     continue;
                 };
-                let source_parent = self.indexes[usize::from(source_parent_slot)];
+                let source_parent = self.index(usize::from(source_parent_slot));
                 let target_parent = self
                     .index_slot(
                         source_parent.schema.as_str(),
@@ -20020,7 +20039,7 @@ impl Storage {
                             "template partitioned index parent was not cloned"
                         )
                     })?;
-                self.indexes[target_slot].mutable.parent = Some(target_parent as u16);
+                self.index_catalog()[target_slot].mutable.parent = Some(target_parent as u16);
             }
 
             for source_slot in 0..self.policy_count() {
@@ -20566,7 +20585,7 @@ impl Storage {
                 AccessClass::Schema => self.schema_def(usize::from(entry.object.slot)).database,
                 AccessClass::Domain => self.domain(usize::from(entry.object.slot)).database,
                 AccessClass::Enum => self.enum_for(usize::from(entry.object.slot), 0).database,
-                AccessClass::Index => self.indexes[usize::from(entry.object.slot)].database,
+                AccessClass::Index => self.index(usize::from(entry.object.slot)).database,
                 AccessClass::Routine => self.routine(usize::from(entry.object.slot)).database,
                 AccessClass::Composite => self.composite(usize::from(entry.object.slot)).database,
                 AccessClass::Statistics => {
@@ -20776,7 +20795,11 @@ impl Storage {
                 }
             }
         }
-        clear_catalog!(indexes);
+        for definition in self.index_catalog().iter_mut() {
+            if definition.database == database {
+                *definition = IndexDef::EMPTY;
+            }
+        }
         {
             let mut catalog = self
                 .extended_statistics_catalog
@@ -21108,7 +21131,13 @@ impl Storage {
                 }
             }
         }
-        commit_catalog!(indexes);
+        for definition in self.index_catalog().iter_mut() {
+            if definition.database == database
+                && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+            {
+                definition.ddl_state = definition.ddl_state.commit_create();
+            }
+        }
         {
             let mut catalog = self.extension_catalog();
             for definition in catalog.definitions.iter_mut() {
@@ -21478,7 +21507,7 @@ impl Storage {
             AccessClass::Schema => self.schema_def(slot).ownership,
             AccessClass::Domain => self.domain(slot).ownership,
             AccessClass::Enum => self.enum_for(slot, 0).ownership,
-            AccessClass::Index => self.indexes[slot].ownership,
+            AccessClass::Index => self.index(slot).ownership,
             AccessClass::Routine => self.routine(slot).ownership,
             AccessClass::Composite => self.composite(slot).ownership,
             AccessClass::Tablespace => self.tablespace(slot).ownership,
@@ -21520,7 +21549,7 @@ impl Storage {
             AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => {
                 unreachable!("type ownership is synchronized separately")
             }
-            AccessClass::Index => &mut self.indexes[slot].ownership,
+            AccessClass::Index => unreachable!("index ownership is synchronized separately"),
             AccessClass::Routine => {
                 unreachable!("routine ownership is synchronized separately")
             }
@@ -21879,12 +21908,15 @@ impl Storage {
             AccessClass::Schema => self.find_schema_visible(name, txid),
             AccessClass::Domain => self.domain_slot(schema, name, txid),
             AccessClass::Enum => self.enum_slot(schema, name, txid),
-            AccessClass::Index => self.indexes.iter().position(|index| {
-                index.database == current_database()
-                    && index.visible_to(txid)
-                    && index.schema.as_str() == schema
-                    && index.name_for(txid).as_str() == name
-            }),
+            AccessClass::Index => self
+                .index_entries()
+                .map(|(_, entry)| entry)
+                .position(|index| {
+                    index.database == current_database()
+                        && index.visible_to(txid)
+                        && index.schema.as_str() == schema
+                        && index.name_for(txid).as_str() == name
+                }),
             AccessClass::Routine => RoutineIter {
                 catalog: &self.routines,
                 next_slot: 0,
@@ -21965,7 +21997,7 @@ impl Storage {
                 (definition.schema, definition.name)
             }
             AccessClass::Index => {
-                let definition = &self.indexes[slot];
+                let definition = &self.index(slot);
                 (definition.schema, definition.name_for(txid))
             }
             AccessClass::Routine => {
@@ -22042,7 +22074,7 @@ impl Storage {
             AccessClass::Schema => self.schema_def(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Domain => self.domain(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Enum => self.enum_for(slot, 0).ddl_state == CatalogDdlState::Present,
-            AccessClass::Index => self.indexes[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Index => self.index(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Routine => self.routine(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Composite => self.composite(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::Tablespace => self.tablespace(slot).ddl_state == CatalogDdlState::Present,
@@ -22083,7 +22115,7 @@ impl Storage {
             AccessClass::Schema => self.schema_def(slot).visible_to(txid),
             AccessClass::Domain => self.domain(slot).visible_to(txid),
             AccessClass::Enum => self.enum_for(slot, txid).visible_to(txid),
-            AccessClass::Index => self.indexes[slot].visible_to(txid),
+            AccessClass::Index => self.index(slot).visible_to(txid),
             AccessClass::Routine => self.routine(slot).visible_to(txid),
             AccessClass::Composite => self.composite(slot).visible_to(txid),
             AccessClass::Tablespace => self.tablespace(slot).visible_to(txid),
@@ -22120,7 +22152,7 @@ impl Storage {
             AccessClass::Schema => Some(self.schema_def(slot).database),
             AccessClass::Domain => Some(self.domain(slot).database),
             AccessClass::Enum => Some(self.enum_for(slot, 0).database),
-            AccessClass::Index => Some(self.indexes[slot].database),
+            AccessClass::Index => Some(self.index(slot).database),
             AccessClass::Routine => Some(self.routine(slot).database),
             AccessClass::Composite => Some(self.composite(slot).database),
             AccessClass::Statistics => Some(self.extended_statistics(slot).database),
@@ -22218,10 +22250,12 @@ impl Storage {
                 })?
             }
             AccessClass::Index => {
-                let created_at = self.indexes[source_slot].created_at;
-                self.indexes.iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
-                })?
+                let created_at = self.index(source_slot).created_at;
+                self.index_entries()
+                    .map(|(_, entry)| entry)
+                    .position(|candidate| {
+                        candidate.database == target_database && candidate.created_at == created_at
+                    })?
             }
             AccessClass::Routine => {
                 let created_at = self.routine(source_slot).created_at;
@@ -22595,17 +22629,20 @@ impl Storage {
         .filter(|(_, value)| value.live)
     }
 
-    pub(crate) fn checkpoint_indexes(&self) -> impl Iterator<Item = (usize, &IndexDef)> {
-        self.indexes.iter().enumerate().filter(|(_, value)| {
-            value.ddl_state == CatalogDdlState::Present
-                && !self.tables.iter().any(|table| {
-                    table.database == value.database
-                        && table.live
-                        && table.def.schema == value.schema
-                        && table.def.name == value.table
-                        && table.def.persistence == RelationPersistence::Temporary
-                })
-        })
+    pub(crate) fn checkpoint_indexes(&self) -> impl Iterator<Item = (usize, IndexDef)> + '_ {
+        self.index_entries()
+            .map(|(_, entry)| entry)
+            .enumerate()
+            .filter(|(_, value)| {
+                value.ddl_state == CatalogDdlState::Present
+                    && !self.tables.iter().any(|table| {
+                        table.database == value.database
+                            && table.live
+                            && table.def.schema == value.schema
+                            && table.def.name == value.table
+                            && table.def.persistence == RelationPersistence::Temporary
+                    })
+            })
     }
 
     pub(crate) fn checkpoint_comments(&self) -> impl Iterator<Item = CommentEntry> + '_ {
@@ -22652,7 +22689,7 @@ impl Storage {
             AccessClass::Schema => self.schema_count(),
             AccessClass::Domain => self.domain_count(),
             AccessClass::Enum => self.enum_count(),
-            AccessClass::Index => self.indexes.len(),
+            AccessClass::Index => self.index_count(),
             AccessClass::Routine => self.routine_count(),
             AccessClass::Composite => self.composite_count(),
             AccessClass::Tablespace => self.tablespace_capacity(),
@@ -22716,7 +22753,7 @@ impl Storage {
             (AccessClass::Schema, self.schema_count()),
             (AccessClass::Domain, self.domain_count()),
             (AccessClass::Enum, self.enum_count()),
-            (AccessClass::Index, self.indexes.len()),
+            (AccessClass::Index, self.index_count()),
             (AccessClass::Routine, self.routine_count()),
             (AccessClass::Composite, self.composite_count()),
             (AccessClass::Tablespace, self.tablespace_capacity()),
@@ -22981,6 +23018,21 @@ impl Storage {
             }
             return prior;
         }
+        if object.class == AccessClass::Index {
+            let mut catalog = self.index_catalog();
+            let ownership = &mut catalog[usize::from(object.slot)].ownership;
+            let prior = ownership.pending;
+            if txid == 0 {
+                ownership.owner = owner as u16;
+                ownership.pending = None;
+            } else {
+                ownership.pending = Some(PendingOwnership {
+                    txid,
+                    owner: owner as u16,
+                });
+            }
+            return prior;
+        }
         if object.class == AccessClass::View {
             let mut catalog = self.view_rule_catalog();
             let ownership = &mut catalog.views[usize::from(object.slot)].ownership;
@@ -23151,6 +23203,17 @@ impl Storage {
             }
             return;
         }
+        if object.class == AccessClass::Index {
+            let mut catalog = self.index_catalog();
+            let ownership = &mut catalog[usize::from(object.slot)].ownership;
+            if let Some(pending) = ownership.pending
+                && pending.txid == txid
+            {
+                ownership.owner = pending.owner;
+                ownership.pending = None;
+            }
+            return;
+        }
         if object.class == AccessClass::View {
             let mut catalog = self.view_rule_catalog();
             let ownership = &mut catalog.views[usize::from(object.slot)].ownership;
@@ -23271,6 +23334,12 @@ impl Storage {
         }
         if object.class == AccessClass::Sequence {
             self.sequence_catalog().definitions[usize::from(object.slot)]
+                .ownership
+                .pending = prior;
+            return;
+        }
+        if object.class == AccessClass::Index {
+            self.index_catalog()[usize::from(object.slot)]
                 .ownership
                 .pending = prior;
             return;
@@ -26679,10 +26748,14 @@ impl Storage {
                 rename_schema_qualified_sql(&mut expression, prior, name)?;
             }
         }
-        for definition in self.indexes.iter().filter(|definition| {
-            definition.database == current_database()
-                && definition.ddl_state != CatalogDdlState::Absent
-        }) {
+        for definition in self
+            .index_entries()
+            .map(|(_, entry)| entry)
+            .filter(|definition| {
+                definition.database == current_database()
+                    && definition.ddl_state != CatalogDdlState::Absent
+            })
+        {
             for expression in definition.expressions.iter().flatten() {
                 let mut expression = *expression;
                 rename_schema_qualified_sql(&mut expression, prior, name)?;
@@ -26776,7 +26849,7 @@ impl Storage {
                 }
             }
         }
-        for definition in self.indexes.iter_mut().filter(|definition| {
+        for definition in self.index_catalog().iter_mut().filter(|definition| {
             definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
@@ -27916,7 +27989,12 @@ impl Storage {
     /// The kind of a relation named `name` in `schema` (visible to `txid`), or
     /// `None` if no relation of that name exists there. A materialized view
     /// shares its backing table's slot, so it is tested before a plain table.
-    pub fn relation_kind_in(&self, schema: &str, name: &str, txid: u32) -> Option<StoredRelKind> {
+    fn non_index_relation_kind_in(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Option<StoredRelKind> {
         if self.find_matview(schema, name, txid).is_some() {
             return Some(StoredRelKind::Matview);
         }
@@ -27933,7 +28011,14 @@ impl Storage {
         if self.find_sequence(schema, name, txid).is_some() {
             return Some(StoredRelKind::Sequence);
         }
-        if self.indexes.iter().any(|i| {
+        None
+    }
+
+    pub fn relation_kind_in(&self, schema: &str, name: &str, txid: u32) -> Option<StoredRelKind> {
+        if let Some(kind) = self.non_index_relation_kind_in(schema, name, txid) {
+            return Some(kind);
+        }
+        if self.index_entries().map(|(_, entry)| entry).any(|i| {
             i.database == current_database()
                 && i.visible_to(txid)
                 && i.schema.as_str() == schema
@@ -31516,8 +31601,8 @@ impl Storage {
         let mut key = [Datum::Null; MAX_INDEX_COLS];
         if let Some(created_at) = enforcer.index_created_at {
             let index = self
-                .indexes
-                .iter()
+                .index_entries()
+                .map(|(_, entry)| entry)
                 .find(|index| {
                     index.ddl_state != CatalogDdlState::Absent
                         && index.created_at == created_at
@@ -32038,7 +32123,7 @@ impl Storage {
         summarized_until_page: u64,
         ranges: &[u64],
     ) -> Result<(), SqlError> {
-        if self.indexes[index_slot].method != crate::sql::ast::IndexAccessMethod::Brin
+        if self.index(index_slot).method != crate::sql::ast::IndexAccessMethod::Brin
             || !(1..=131_072).contains(&pages_per_range)
             || summarized_until_page == 0
             || !summarized_until_page.is_multiple_of(u64::from(pages_per_range))
@@ -32054,7 +32139,7 @@ impl Storage {
                 "invalid BRIN maintenance state"
             ));
         }
-        let created_at = self.indexes[index_slot].created_at;
+        let created_at = self.index(index_slot).created_at;
         let mut maintenance = self.brin_maintenance();
         let (state, stored_ranges) = Self::brin_entry_mut(
             &mut maintenance,
@@ -32127,7 +32212,7 @@ impl Storage {
         use crate::store::{NavigationKind, NavigationSpec};
         let enforcer = self.tables[table_index].enforcers[binding]?;
         let created_at = enforcer.index_created_at?;
-        let index = self.indexes.iter().find(|index| {
+        let index = self.index_entries().map(|(_, entry)| entry).find(|index| {
             index.created_at == created_at
                 && index.database == self.tables[table_index].database
                 && index.ddl_state != CatalogDdlState::Absent
@@ -32878,7 +32963,7 @@ impl Storage {
         let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         if let Some(created_at) = enforcer.index_created_at {
             let table = &self.tables[table_index];
-            return self.indexes.iter().any(|index| {
+            return self.index_entries().map(|(_, entry)| entry).any(|index| {
                 index.ddl_state == CatalogDdlState::Present
                     && index.database == table.database
                     && index.schema == table.def.schema
@@ -32898,7 +32983,7 @@ impl Storage {
                 .uniques()
                 .iter()
                 .any(|unique| unique.columns() == columns)
-            || self.indexes.iter().any(|index| {
+            || self.index_entries().map(|(_, entry)| entry).any(|index| {
                 index.ddl_state == CatalogDdlState::Present
                     && index.database == table.database
                     && index.schema == definition.schema
@@ -33314,14 +33399,18 @@ impl Storage {
         let table_name = self.tables[table_index].def.name;
         let table_database = self.tables[table_index].database;
         let table_definition = self.tables[table_index].def;
-        for index in self.indexes.iter().filter(|index| {
-            txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
-                index.visible_to(owner)
-            }) && index.database == table_database
-                && index.schema == table_schema
-                && index.table == table_name
-                && !index.mutable_for(txid.unwrap_or(0)).kind.is_partitioned()
-        }) {
+        for index in self
+            .index_entries()
+            .map(|(_, entry)| entry)
+            .filter(|index| {
+                txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
+                    index.visible_to(owner)
+                }) && index.database == table_database
+                    && index.schema == table_schema
+                    && index.table == table_name
+                    && !index.mutable_for(txid.unwrap_or(0)).kind.is_partitioned()
+            })
+        {
             let uses_catalog_comparison = index.resolved_operator_classes[..index.n_cols]
                 .iter()
                 .any(|class| matches!(class, Some(IndexOperatorClass::Catalog(_))));
@@ -45026,12 +45115,15 @@ impl Storage {
     }
 
     pub(crate) fn index_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        let slot = self.indexes.iter().position(|index| {
-            index.database == current_database()
-                && index.visible_to(txid)
-                && index.schema.as_str() == schema
-                && index.name_for(txid).as_str() == name
-        });
+        let slot = self
+            .index_entries()
+            .map(|(_, entry)| entry)
+            .position(|index| {
+                index.database == current_database()
+                    && index.visible_to(txid)
+                    && index.schema.as_str() == schema
+                    && index.name_for(txid).as_str() == name
+            });
         if slot.is_some_and(|slot| {
             self.index_table_slot_to(slot, txid).is_some_and(|table| {
                 self.table_def(table, txid).persistence == RelationPersistence::Temporary
@@ -45077,7 +45169,7 @@ impl Storage {
     /// caller from retaining a catalog borrow across cache reconstruction.
     pub fn index_definition(&self, schema: &str, name: &str, txid: u32) -> Option<IndexDef> {
         self.index_slot(schema, name, txid)
-            .map(|slot| self.indexes[slot])
+            .map(|slot| self.index(slot))
     }
 
     pub(crate) fn rename_index(
@@ -45086,7 +45178,7 @@ impl Storage {
         name: SqlName,
         txid: u32,
     ) -> Result<Option<PendingIndexName>, SqlError> {
-        let index = self.indexes[slot];
+        let index = self.index(slot);
         if !index.visible_to(txid) {
             return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"));
         }
@@ -45094,8 +45186,8 @@ impl Storage {
             return Ok(index.pending_name);
         }
         if let Some(blocker) = self
-            .indexes
-            .iter()
+            .index_entries()
+            .map(|(_, entry)| entry)
             .enumerate()
             .find_map(|(other, candidate)| {
                 (other != slot
@@ -45108,12 +45200,17 @@ impl Storage {
         {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
-        if self.indexes.iter().enumerate().any(|(other, candidate)| {
-            other != slot
-                && candidate.visible_to(txid)
-                && candidate.schema == index.schema
-                && candidate.name_for(txid) == name
-        }) {
+        if self
+            .index_entries()
+            .map(|(_, entry)| entry)
+            .enumerate()
+            .any(|(other, candidate)| {
+                other != slot
+                    && candidate.visible_to(txid)
+                    && candidate.schema == index.schema
+                    && candidate.name_for(txid) == name
+            })
+        {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",
@@ -45127,7 +45224,8 @@ impl Storage {
                 name.as_str()
             ));
         }
-        let index = &mut self.indexes[slot];
+        let mut catalog = self.index_catalog();
+        let index = &mut catalog[slot];
         if let Some(pending) = index.pending_name
             && pending.txid != txid
         {
@@ -45144,7 +45242,8 @@ impl Storage {
 
     pub(crate) fn commit_index_rename(&mut self, slot: usize, txid: u32) {
         let (schema, old_name, new_name) = {
-            let index = &mut self.indexes[slot];
+            let mut catalog = self.index_catalog();
+            let index = &mut catalog[slot];
             let Some(pending) = index.pending_name else {
                 return;
             };
@@ -45171,13 +45270,13 @@ impl Storage {
     }
 
     pub(crate) fn rollback_index_rename(&mut self, slot: usize, prior: Option<PendingIndexName>) {
-        self.indexes[slot].pending_name = prior;
+        self.index_catalog()[slot].pending_name = prior;
     }
 
     /// Registers an index as an uncommitted CREATE owned by `def.pending`'s
     /// transaction; returns its slot. Errors on a duplicate visible name or
     /// another transaction's uncommitted DDL on the name.
-    pub fn create_index(&mut self, mut def: IndexDef, txid: u32) -> Result<usize, SqlError> {
+    pub fn create_index(&self, mut def: IndexDef, txid: u32) -> Result<usize, SqlError> {
         let created_at = (def.created_at != 0)
             .then(|| bounded_catalog_generation(def.created_at, MAX_INDEX_OID_GENERATION, "index"))
             .transpose()?;
@@ -45381,50 +45480,6 @@ impl Storage {
                 "partitioned index cannot be selected as replica identity"
             ));
         }
-        if def.mutable.clustered
-            && self.indexes.iter().any(|index| {
-                index.database == current_database()
-                    && index.visible_to(txid)
-                    && index.schema == def.schema
-                    && index.table == def.table
-                    && index.mutable_for(txid).clustered
-            })
-        {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
-                "relation already has a clustered index"
-            ));
-        }
-        if def.mutable.replica_identity
-            && self.indexes.iter().any(|index| {
-                index.database == current_database()
-                    && index.visible_to(txid)
-                    && index.schema == def.schema
-                    && index.table == def.table
-                    && index.mutable_for(txid).replica_identity
-            })
-        {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
-                "relation already has a replica identity index"
-            ));
-        }
-        if let Some(blocker) = self.indexes.iter().find_map(|index| {
-            (index.database == current_database()
-                && index.schema.as_str() == def.schema.as_str()
-                && index.name_for(txid).as_str() == def.name.as_str())
-            .then_some(index.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, def.name.as_str()));
-        }
-        if self.relation_name_taken(def.schema.as_str(), def.name.as_str(), txid) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_TABLE,
-                "relation \"{}\" already exists",
-                def.name.as_str()
-            ));
-        }
         let brin_summarized_until_page = if def.method == crate::sql::ast::IndexAccessMethod::Brin {
             let table = self
                 .find_visible(def.schema.as_str(), def.table.as_str(), txid)
@@ -45446,22 +45501,78 @@ impl Storage {
         } else {
             0
         };
-        let Some(i) = self
-            .indexes
+        let ownership = self.initial_ownership(txid);
+        if self
+            .non_index_relation_kind_in(def.schema.as_str(), def.name.as_str(), txid)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists",
+                def.name.as_str()
+            ));
+        }
+        let mut catalog = self.index_catalog();
+        if def.mutable.clustered
+            && catalog.iter().any(|index| {
+                index.database == current_database()
+                    && index.visible_to(txid)
+                    && index.schema == def.schema
+                    && index.table == def.table
+                    && index.mutable_for(txid).clustered
+            })
+        {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
+                "relation already has a clustered index"
+            ));
+        }
+        if def.mutable.replica_identity
+            && catalog.iter().any(|index| {
+                index.database == current_database()
+                    && index.visible_to(txid)
+                    && index.schema == def.schema
+                    && index.table == def.table
+                    && index.mutable_for(txid).replica_identity
+            })
+        {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
+                "relation already has a replica identity index"
+            ));
+        }
+        if let Some(blocker) = catalog.iter().find_map(|index| {
+            (index.database == current_database()
+                && index.schema.as_str() == def.schema.as_str()
+                && index.name_for(txid).as_str() == def.name.as_str())
+            .then_some(index.ddl_state.pending_txid()?)
+            .filter(|&owner| owner != txid)
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, def.name.as_str()));
+        }
+        if catalog.iter().any(|index| {
+            index.database == def.database
+                && index.visible_to(txid)
+                && index.schema == def.schema
+                && index.name_for(txid) == def.name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists",
+                def.name.as_str()
+            ));
+        }
+        let Some(i) = catalog
             .iter()
             .position(|x| x.ddl_state == CatalogDdlState::Absent)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many indexes (limit {})",
-                self.indexes.len()
+                self.index_count()
             ));
         };
-        let ownership = self.initial_ownership(txid);
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::Index,
-            slot: i as u16,
-        });
         let created_at = match created_at {
             Some(created_at) => {
                 self.catalog_sequence.observe(created_at);
@@ -45470,13 +45581,6 @@ impl Storage {
             None => self
                 .catalog_sequence
                 .next_bounded(MAX_INDEX_OID_GENERATION, "index")?,
-        };
-        self.indexes[i] = IndexDef {
-            created_at,
-            ownership,
-            pending_definition: None,
-            ddl_state: CatalogDdlState::PendingCreate { txid },
-            ..def
         };
         let mut maintenance = self.brin_maintenance();
         let (state, ranges) =
@@ -45488,6 +45592,15 @@ impl Storage {
             ..BrinMaintenanceState::EMPTY
         };
         ranges.fill(0);
+        drop(maintenance);
+        catalog[i] = IndexDef {
+            created_at,
+            ownership,
+            pending_definition: None,
+            pending_name: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+            ..def
+        };
         Ok(i)
     }
 
@@ -45497,7 +45610,8 @@ impl Storage {
         definition: IndexMutableDefinition,
         txid: u32,
     ) -> Result<Option<PendingIndexDefinition>, SqlError> {
-        let options_valid = match self.indexes[slot].method {
+        let mut catalog = self.index_catalog();
+        let options_valid = match catalog[slot].method {
             crate::sql::ast::IndexAccessMethod::Btree => {
                 definition.options.pages_per_range.is_none()
                     && definition.options.autosummarize.is_none()
@@ -45559,7 +45673,7 @@ impl Storage {
         }
         if definition.clustered
             && matches!(
-                self.indexes[slot].method,
+                catalog[slot].method,
                 crate::sql::ast::IndexAccessMethod::Hash
                     | crate::sql::ast::IndexAccessMethod::Brin
                     | crate::sql::ast::IndexAccessMethod::Gist
@@ -45570,7 +45684,7 @@ impl Storage {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
                 "cannot cluster on index \"{}\" because access method does not support clustering",
-                self.indexes[slot].name.as_str()
+                catalog[slot].name.as_str()
             ));
         }
         if definition.clustered && !matches!(definition.kind, IndexKind::Ordinary) {
@@ -45585,19 +45699,17 @@ impl Storage {
                 "partitioned index cannot be selected as replica identity"
             ));
         }
-        let pending = self.indexes[slot].pending_definition;
+        let pending = catalog[slot].pending_definition;
         if let Some(pending) = pending
             && pending.txid != txid
         {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                pending.txid,
-                self.indexes[slot].name.as_str(),
-            ));
+            let name = catalog[slot].name;
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, pending.txid, name.as_str()));
         }
         if definition.clustered {
-            let index = self.indexes[slot];
-            if self.indexes.iter().enumerate().any(|(other_slot, other)| {
+            let index = catalog[slot];
+            if catalog.iter().enumerate().any(|(other_slot, other)| {
                 other_slot != slot
                     && other.database == current_database()
                     && other.visible_to(txid)
@@ -45612,8 +45724,8 @@ impl Storage {
             }
         }
         if definition.replica_identity {
-            let index = self.indexes[slot];
-            if self.indexes.iter().enumerate().any(|(other_slot, other)| {
+            let index = catalog[slot];
+            if catalog.iter().enumerate().any(|(other_slot, other)| {
                 other_slot != slot
                     && other.database == current_database()
                     && other.visible_to(txid)
@@ -45627,14 +45739,15 @@ impl Storage {
                 ));
             }
         }
-        let index = &mut self.indexes[slot];
+        let index = &mut catalog[slot];
         let prior = index.pending_definition;
         index.pending_definition = Some(PendingIndexDefinition { txid, definition });
         Ok(prior)
     }
 
     pub(crate) fn commit_index_definition(&mut self, slot: usize, txid: u32) {
-        let index = &mut self.indexes[slot];
+        let mut catalog = self.index_catalog();
+        let index = &mut catalog[slot];
         if let Some(pending) = index.pending_definition
             && pending.txid == txid
         {
@@ -45648,7 +45761,7 @@ impl Storage {
         slot: usize,
         prior: Option<PendingIndexDefinition>,
     ) {
-        self.indexes[slot].pending_definition = prior;
+        self.index_catalog()[slot].pending_definition = prior;
     }
 
     /// Marks every index visible to `txid` on a table pending-dropped
@@ -45656,11 +45769,11 @@ impl Storage {
     /// Commit finalizes via [`Self::commit_indexes_for`]; rollback reverts via
     /// [`Self::rollback_indexes_for`].
     pub fn drop_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
-        for i in 0..self.indexes.len() {
-            if self.indexes[i].database == current_database()
-                && self.indexes[i].visible_to(txid)
-                && self.indexes[i].schema.as_str() == schema
-                && self.indexes[i].table.as_str() == table
+        for i in 0..self.index_count() {
+            if self.index(i).database == current_database()
+                && self.index(i).visible_to(txid)
+                && self.index(i).schema.as_str() == schema
+                && self.index(i).table.as_str() == table
             {
                 self.pending_drop_index(i, txid);
             }
@@ -45670,15 +45783,13 @@ impl Storage {
     /// Promotes this transaction's pending index drops on a table (cascaded
     /// from its DROP TABLE) into the committed catalog.
     pub fn commit_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
-        for slot in 0..self.indexes.len() {
-            if self.indexes[slot].database == current_database()
-                && self.indexes[slot].schema.as_str() == schema
-                && self.indexes[slot].table.as_str() == table
-                && self.indexes[slot].ddl_state == (CatalogDdlState::PendingDrop { txid })
+        for slot in 0..self.index_count() {
+            if self.index(slot).database == current_database()
+                && self.index(slot).schema.as_str() == schema
+                && self.index(slot).table.as_str() == table
+                && self.index(slot).ddl_state == (CatalogDdlState::PendingDrop { txid })
             {
-                let oid = crate::sql::catalog::explicit_index_oid(&self.indexes[slot]);
-                self.reset_index_statistics(oid);
-                self.indexes[slot].ddl_state = self.indexes[slot].ddl_state.commit_drop();
+                self.commit_index_drop(slot);
             }
         }
     }
@@ -45686,7 +45797,7 @@ impl Storage {
     /// Discards this transaction's pending index drops on a table (a rolled
     /// back DROP TABLE): committed indexes become visible again.
     pub fn rollback_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
-        for x in self.indexes.iter_mut() {
+        for x in self.index_catalog().iter_mut() {
             if x.database == current_database()
                 && x.schema.as_str() == schema
                 && x.table.as_str() == table
@@ -45706,13 +45817,17 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        if let Some(blocker) = self.indexes.iter().find_map(|index| {
-            (index.database == current_database()
-                && index.schema.as_str() == schema
-                && index.name_for(txid).as_str() == name)
-                .then_some(index.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
-        }) {
+        if let Some(blocker) = self
+            .index_entries()
+            .map(|(_, entry)| entry)
+            .find_map(|index| {
+                (index.database == current_database()
+                    && index.schema.as_str() == schema
+                    && index.name_for(txid).as_str() == name)
+                    .then_some(index.ddl_state.pending_txid()?)
+                    .filter(|&owner| owner != txid)
+            })
+        {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.index_slot(schema, name, txid) else {
@@ -45725,13 +45840,17 @@ impl Storage {
     /// Overlays a pending DROP on a slot: the owner's own pending-create
     /// simply evaporates.
     fn pending_drop_index(&mut self, slot: usize, txid: u32) {
-        let x = &mut self.indexes[slot];
+        let mut catalog = self.index_catalog();
+        let x = &mut catalog[slot];
         x.ddl_state = x.ddl_state.drop_by(txid);
     }
 
     /// Promotes an uncommitted CREATE INDEX into the committed catalog.
     pub fn commit_index_create(&mut self, slot: usize) {
-        self.indexes[slot].ddl_state = self.indexes[slot].ddl_state.commit_create();
+        {
+            let mut catalog = self.index_catalog();
+            catalog[slot].ddl_state = catalog[slot].ddl_state.commit_create();
+        }
         if let Some(table) = self.index_table_slot(slot) {
             self.tables[table].mark_dirty();
         }
@@ -45739,22 +45858,42 @@ impl Storage {
 
     /// Promotes an uncommitted DROP INDEX into the committed catalog.
     pub fn commit_index_drop(&mut self, slot: usize) {
-        let (schema, name) = (self.indexes[slot].schema, self.indexes[slot].name);
-        self.reset_index_statistics(crate::sql::catalog::explicit_index_oid(&self.indexes[slot]));
-        self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
-        self.indexes[slot].ddl_state = self.indexes[slot].ddl_state.commit_drop();
+        let index = self.index(slot);
+        let table = self.index_table_slot(slot);
+        self.reset_index_statistics(crate::sql::catalog::explicit_index_oid(&index));
+        self.drop_object_comments(
+            CommentClass::Relation,
+            index.schema.as_str(),
+            index.name.as_str(),
+        );
         self.clear_extension_dependencies_for_object(AccessObject {
             class: AccessClass::Index,
             slot: slot as u16,
         });
-        if let Some(table) = self.index_table_slot(slot) {
+        self.retire_index(slot);
+        if let Some(table) = table {
             self.tables[table].mark_dirty();
         }
     }
 
-    /// The committed table named by an index slot. The definition stays in
-    /// the reusable catalog slot after DROP, so this also resolves the table
-    /// while finalizing a drop.
+    fn retire_index(&self, slot: usize) {
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Index,
+            slot: slot as u16,
+        });
+        let mut catalog = self.index_catalog();
+        let mut maintenance = self.brin_maintenance();
+        let (state, ranges) = Self::brin_entry_mut(
+            &mut maintenance,
+            slot,
+            self.brin_unsummarized_ranges_per_index,
+        );
+        *state = BrinMaintenanceState::EMPTY;
+        ranges.fill(0);
+        catalog[slot] = IndexDef::EMPTY;
+    }
+
+    /// The committed table named by a retained index definition.
     pub fn index_table_slot(&self, slot: usize) -> Option<usize> {
         self.index_table_slot_to(slot, 0)
     }
@@ -45762,19 +45901,20 @@ impl Storage {
     /// The transaction-visible table named by an index. DDL execution must
     /// use this form so a just-created table is not mistaken for corruption.
     pub(crate) fn index_table_slot_to(&self, slot: usize, txid: u32) -> Option<usize> {
-        let index = self.indexes.get(slot)?;
+        let index = self.index_catalog().get(slot).copied()?;
         self.find_visible(index.schema.as_str(), index.table.as_str(), txid)
     }
 
     /// Discards an uncommitted CREATE INDEX (rollback): the slot is freed.
-    pub fn rollback_index_create(&mut self, slot: usize) {
-        self.indexes[slot].ddl_state = self.indexes[slot].ddl_state.rollback_create();
+    pub fn rollback_index_create(&self, slot: usize) {
+        self.retire_index(slot);
     }
 
     /// Discards an uncommitted DROP INDEX (rollback); a same-transaction
     /// pending-create reverts to pending-create.
     pub fn rollback_index_drop(&mut self, slot: usize, txid: u32) {
-        let x = &mut self.indexes[slot];
+        let mut catalog = self.index_catalog();
+        let x = &mut catalog[slot];
         x.ddl_state = x.ddl_state.rollback_drop(txid);
     }
 
@@ -45791,9 +45931,8 @@ impl Storage {
         let committed_binding = self
             .find_visible(schema, table, txid)
             .map(|slot| (self.tables[slot].def.schema, self.tables[slot].def.name));
-        self.indexes
-            .iter()
-            .copied()
+        self.index_entries()
+            .map(|(_, entry)| entry)
             .filter(move |x| {
                 x.database == current_database()
                     && x.visible_to(txid)
@@ -45815,29 +45954,46 @@ impl Storage {
     }
 
     /// All committed indexes, for checkpoint serialization.
-    pub fn live_indexes(&self) -> impl Iterator<Item = &IndexDef> {
-        self.indexes.iter().filter(|index| {
-            index.database == current_database() && index.ddl_state == CatalogDdlState::Present
-        })
+    pub fn live_indexes(&self) -> impl Iterator<Item = IndexDef> + '_ {
+        self.index_entries()
+            .map(|(_, entry)| entry)
+            .filter(|index| {
+                index.database == current_database() && index.ddl_state == CatalogDdlState::Present
+            })
     }
 
     pub(crate) fn index_count(&self) -> usize {
-        self.indexes.len()
+        self.index_catalog_capacity
+    }
+
+    fn index_catalog(&self) -> std::sync::MutexGuard<'_, FixedVec<IndexDef>> {
+        self.index_catalog
+            .lock()
+            .expect("index catalog lock poisoned")
+    }
+
+    fn index(&self, slot: usize) -> IndexDef {
+        self.index_catalog()[slot]
+    }
+
+    fn index_entries(&self) -> IndexIter<'_> {
+        IndexIter {
+            catalog: &self.index_catalog,
+            next_slot: 0,
+        }
     }
 
     /// Keeps the dropped catalog identity available during `sql_drop`.
     pub(crate) fn index_for_event_trigger(&self, slot: usize, txid: u32) -> Option<IndexDef> {
-        self.indexes
-            .get(slot)
-            .copied()
+        let index = self.index_catalog().get(slot).copied();
+        index
             .filter(|index| index.database == current_database())
             .map(|index| self.project_index_binding(index, txid))
     }
 
     pub(crate) fn index_visible_to(&self, slot: usize, txid: u32) -> Option<IndexDef> {
-        self.indexes
-            .get(slot)
-            .copied()
+        let index = self.index_catalog().get(slot).copied();
+        index
             .filter(|index| index.database == current_database() && index.visible_to(txid))
             .map(|index| self.project_index_binding(index, txid))
     }
@@ -46457,8 +46613,8 @@ impl Storage {
             )
         })?;
         if self
-            .indexes
-            .iter()
+            .index_entries()
+            .map(|(_, entry)| entry)
             .any(|index| index.visible_to(txid) && index.mutable_for(txid).tablespace == id)
             || self.databases.iter().any(|database| {
                 database.visible_to(txid) && database.definition_for(txid).tablespace == id
@@ -46593,7 +46749,7 @@ impl Storage {
         let name = self.tables[index].def.name;
         self.tables[index].def.schema = new_schema;
         self.tables[index].mark_dirty();
-        for x in self.indexes.iter_mut() {
+        for x in self.index_catalog().iter_mut() {
             if x.database == database_oid
                 && x.ddl_state == CatalogDdlState::Present
                 && x.schema.as_str() == old_schema.as_str()
@@ -46692,7 +46848,7 @@ impl Storage {
         }
         let current = self.tables[index].def;
         if current.name != def.name {
-            for index_def in self.indexes.iter_mut() {
+            for index_def in self.index_catalog().iter_mut() {
                 if index_def.database == database_oid
                     && index_def.schema == current.schema
                     && index_def.table == current.name
@@ -46745,7 +46901,7 @@ impl Storage {
             );
         }
         drop(sequence_catalog);
-        for index_def in self.indexes.iter_mut() {
+        for index_def in self.index_catalog().iter_mut() {
             if index_def.database != database_oid
                 || index_def.ddl_state != CatalogDdlState::Present
                 || index_def.schema != old.schema
@@ -52882,7 +53038,7 @@ mod tests {
         assert_eq!(catalog.columns.capacity(), 23);
         assert_eq!(catalog.defaults.capacity(), 24);
         assert_eq!(catalog.parameters.capacity(), 25);
-        assert_eq!(storage.indexes.len(), 6);
+        assert_eq!(storage.index_count(), 6);
         assert_eq!(storage.extended_statistics_count(), 31);
         let brin_maintenance = storage.brin_maintenance();
         assert_eq!(brin_maintenance.states.len(), 6);

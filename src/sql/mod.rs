@@ -6284,8 +6284,9 @@ impl Engine {
                 }
                 DdlUndo::IndexDropped(slot) => {
                     let slot = *slot as usize;
+                    let table = self.storage.index_table_slot(slot);
                     self.storage.commit_index_drop(slot);
-                    if let Some(table) = self.storage.index_table_slot(slot)
+                    if let Some(table) = table
                         && !self.commit_index_tables.contains(&table)
                     {
                         self.commit_index_tables

@@ -1054,6 +1054,10 @@ image. Index readers use owned definitions and release catalog guards before
 nested resolution; expression-key evaluation retains its owned definition
 through the evaluation callback. Allocation-free concurrent publication,
 rollback, nested reads, exhaustion, and slot-reuse fixtures cover these paths.
+The first complete CI run reached the forced-spill SQL Logic Test worker's
+15-minute ceiling. The subsequent scan audit found metadata paths copied every
+definition, including unused entries; they now borrow under the index guard,
+and physical-binding iterators filter before copying retained definitions.
 No external blocker remains.
 
 | ID | Status | Found | Description | Reproducer | Blocker |

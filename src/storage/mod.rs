@@ -21929,15 +21929,12 @@ impl Storage {
             AccessClass::Schema => self.find_schema_visible(name, txid),
             AccessClass::Domain => self.domain_slot(schema, name, txid),
             AccessClass::Enum => self.enum_slot(schema, name, txid),
-            AccessClass::Index => self
-                .index_entries()
-                .map(|(_, entry)| entry)
-                .position(|index| {
-                    index.database == current_database()
-                        && index.visible_to(txid)
-                        && index.schema.as_str() == schema
-                        && index.name_for(txid).as_str() == name
-                }),
+            AccessClass::Index => self.index_catalog().iter().position(|index| {
+                index.database == current_database()
+                    && index.visible_to(txid)
+                    && index.schema.as_str() == schema
+                    && index.name_for(txid).as_str() == name
+            }),
             AccessClass::Routine => RoutineIter {
                 catalog: &self.routines,
                 next_slot: 0,
@@ -22272,11 +22269,9 @@ impl Storage {
             }
             AccessClass::Index => {
                 let created_at = self.index(source_slot).created_at;
-                self.index_entries()
-                    .map(|(_, entry)| entry)
-                    .position(|candidate| {
-                        candidate.database == target_database && candidate.created_at == created_at
-                    })?
+                self.index_catalog().iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
             }
             AccessClass::Routine => {
                 let created_at = self.routine(source_slot).created_at;
@@ -26767,12 +26762,11 @@ impl Storage {
             }
         }
         for definition in self
-            .index_entries()
-            .map(|(_, entry)| entry)
-            .filter(|definition| {
+            .matching_indexes(|definition| {
                 definition.database == current_database()
                     && definition.ddl_state != CatalogDdlState::Absent
             })
+            .map(|(_, definition)| definition)
         {
             for expression in definition.expressions.iter().flatten() {
                 let mut expression = *expression;
@@ -28036,7 +28030,7 @@ impl Storage {
         if let Some(kind) = self.non_index_relation_kind_in(schema, name, txid) {
             return Some(kind);
         }
-        if self.index_entries().map(|(_, entry)| entry).any(|i| {
+        if self.index_catalog().iter().any(|i| {
             i.database == current_database()
                 && i.visible_to(txid)
                 && i.schema.as_str() == schema
@@ -31620,13 +31614,14 @@ impl Storage {
         let index;
         if let Some(created_at) = enforcer.index_created_at {
             index = self
-                .index_entries()
-                .map(|(_, entry)| entry)
+                .index_catalog()
+                .iter()
                 .find(|index| {
                     index.ddl_state != CatalogDdlState::Absent
                         && index.created_at == created_at
                         && index.database == table.database
                 })
+                .copied()
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -32233,11 +32228,15 @@ impl Storage {
         use crate::store::{NavigationKind, NavigationSpec};
         let enforcer = self.tables[table_index].enforcers[binding]?;
         let created_at = enforcer.index_created_at?;
-        let index = self.index_entries().map(|(_, entry)| entry).find(|index| {
-            index.created_at == created_at
-                && index.database == self.tables[table_index].database
-                && index.ddl_state != CatalogDdlState::Absent
-        })?;
+        let index = self
+            .index_catalog()
+            .iter()
+            .find(|index| {
+                index.created_at == created_at
+                    && index.database == self.tables[table_index].database
+                    && index.ddl_state != CatalogDdlState::Absent
+            })
+            .copied()?;
         let classify = |class: Option<IndexOperatorClass>| -> Option<NavigationKind> {
             Some(match class {
                 Some(IndexOperatorClass::Gist(
@@ -32984,7 +32983,7 @@ impl Storage {
         let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         if let Some(created_at) = enforcer.index_created_at {
             let table = &self.tables[table_index];
-            return self.index_entries().map(|(_, entry)| entry).any(|index| {
+            return self.index_catalog().iter().any(|index| {
                 index.ddl_state == CatalogDdlState::Present
                     && index.database == table.database
                     && index.schema == table.def.schema
@@ -33004,7 +33003,7 @@ impl Storage {
                 .uniques()
                 .iter()
                 .any(|unique| unique.columns() == columns)
-            || self.index_entries().map(|(_, entry)| entry).any(|index| {
+            || self.index_catalog().iter().any(|index| {
                 index.ddl_state == CatalogDdlState::Present
                     && index.database == table.database
                     && index.schema == definition.schema
@@ -33421,9 +33420,7 @@ impl Storage {
         let table_database = self.tables[table_index].database;
         let table_definition = self.tables[table_index].def;
         for index in self
-            .index_entries()
-            .map(|(_, entry)| entry)
-            .filter(|index| {
+            .matching_indexes(|index| {
                 txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
                     index.visible_to(owner)
                 }) && index.database == table_database
@@ -33431,6 +33428,7 @@ impl Storage {
                     && index.table == table_name
                     && !index.mutable_for(txid.unwrap_or(0)).kind.is_partitioned()
             })
+            .map(|(_, index)| index)
         {
             let uses_catalog_comparison = index.resolved_operator_classes[..index.n_cols]
                 .iter()
@@ -46011,14 +46009,6 @@ impl Storage {
         self.index_catalog()[slot]
     }
 
-    fn index_entries(&self) -> IndexIter<'_> {
-        IndexIter {
-            catalog: &self.index_catalog,
-            next_slot: 0,
-            accept: |_| true,
-        }
-    }
-
     fn matching_indexes<F: Fn(&IndexDef) -> bool>(&self, accept: F) -> IndexIter<'_, F> {
         IndexIter {
             catalog: &self.index_catalog,
@@ -46657,8 +46647,8 @@ impl Storage {
             )
         })?;
         if self
-            .index_entries()
-            .map(|(_, entry)| entry)
+            .index_catalog()
+            .iter()
             .any(|index| index.visible_to(txid) && index.mutable_for(txid).tablespace == id)
             || self.databases.iter().any(|database| {
                 database.visible_to(txid) && database.definition_for(txid).tablespace == id

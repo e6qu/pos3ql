@@ -412,6 +412,8 @@ publication under one guard. Rename and mutable-definition checks share their
 publication guard; ownership, database cloning and removal, schema rewrites,
 commit, and rollback use the same catalog boundary. Readers retain owned
 definitions, and checkpoint and table iterators filter before copying.
+Metadata scans borrow under the guard and copy only selected definitions,
+avoiding work proportional to unused catalog capacity during row evaluation.
 Committed drops and rolled-back creates clear the entire definition, access
 entries, and BRIN maintenance image before slot reuse. Database cloning retains
 maintenance images and binds partition parents in the target database. Rename

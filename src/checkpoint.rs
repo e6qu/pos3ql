@@ -2627,6 +2627,7 @@ impl Checkpointer {
         let mut next_rowid = 1u64;
         let mut latest_transaction_id = None;
         let mut saw_large_object_allocator = false;
+        let mut database_identities = Vec::with_capacity(storage.database_count());
         // manifest table index → live slot index
         let mut slot_of: Vec<Option<usize>> = Vec::new();
         // (mindex, def, cols_seen, per-column sequence positions)
@@ -3602,6 +3603,15 @@ impl Checkpointer {
                     {
                         return Err(CheckpointSetupError::Corrupt("db field is too long"));
                     }
+                    if database_identities.iter().any(|&(seen_oid, seen_name)| {
+                        seen_oid == oid || seen_name == definition.name
+                    }) {
+                        return Err(CheckpointSetupError::Corrupt("duplicate database record"));
+                    }
+                    if database_identities.len() == storage.database_count() {
+                        return Err(CheckpointSetupError::Corrupt("too many database records"));
+                    }
+                    database_identities.push((oid, definition.name));
                     if let Some(slot) = storage.database_slot_by_oid(oid, 0) {
                         storage
                             .alter_database_definition(slot, definition, 0)
@@ -17148,6 +17158,71 @@ mod stored_dependency_tests {
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;
     use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependencies};
+
+    #[test]
+    fn manifest_database_duplicates_reject_before_replacement() {
+        let result = std::thread::Builder::new()
+            .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
+            .spawn(|| {
+                let mut config = Config::default_dev();
+                config.object_store_sim = true;
+                config.object_store_bucket = format!("database-manifest-{}", std::process::id());
+                config.data_dir = std::env::temp_dir()
+                    .join(format!("pos3ql-database-manifest-{}", std::process::id()))
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                config.block_cache_bytes = 0;
+                config.disk_cache_bytes = 0;
+                config.memtable_bytes = 1 << 16;
+                config.max_tables = 4;
+                config.table_rows = 128;
+                config.txn_rows = 128;
+                config.value_index_rows = 512;
+                config.max_value_indexes = 8;
+                let bytes = config.memtable_bytes
+                    + Storage::extra_budget_bytes(&config)
+                    + Checkpointer::budget_bytes(&config)
+                    + (1 << 20);
+                for (first_oid, second_oid, first_name, second_name) in [
+                    (5, 5, "postgres", "replacement"),
+                    (5, 100_001, "postgres", "postgres"),
+                    (100_001, 100_001, "first", "replacement"),
+                    (100_001, 100_002, "first", "first"),
+                ] {
+                    let mut budget = Budget::new(bytes);
+                    let mut storage = Storage::new(&config, &mut budget).unwrap();
+                    let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+                    let mut manifest = String::from("pos3ql-manifest-v14\nlsn 0\n");
+                    for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
+                        let encoded = name
+                            .as_bytes()
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>();
+                        manifest.push_str(&format!(
+                            "db {oid} {encoded} 706f737467726573 1 6 99 0 -1 43 43 - -\n"
+                        ));
+                    }
+                    manifest.push_str("end\n");
+                    assert!(matches!(
+                        checkpointer.load_manifest_text(&mut storage, &manifest),
+                        Err(CheckpointSetupError::Corrupt("duplicate database record"))
+                    ));
+                    assert!(storage.database_named(first_name, 0).is_some());
+                    if first_name != second_name {
+                        assert!(storage.database_named(second_name, 0).is_none());
+                    }
+                }
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            })
+            .unwrap()
+            .join();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
 
     #[test]
     fn checkpoint_maintenance_capacities_are_exactly_budgeted() {

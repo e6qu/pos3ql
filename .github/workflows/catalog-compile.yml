@@ -24,3 +24,4 @@ jobs:
       - run: cargo test --lib --locked database_catalog_is_synchronized -- --nocapture
       - run: cargo test --lib --locked database_reservation_rejects -- --nocapture
       - run: cargo test --lib --locked database_retirement_and_failed_clone -- --nocapture
+      - run: cargo test --lib --locked manifest_database_duplicates -- --nocapture

@@ -1064,7 +1064,8 @@ and its nested harnesses stream progress without masking command failures.
 The database lifecycle audit found OID allocation and name checks ignored
 other transactions' pending creates, allowing duplicate identities. Pending
 rename targets now reserve names as well. Recovery rejects duplicate retained
-OIDs and names before publishing. Failed clones, rolled-back creates, and
+OIDs and names before publishing. Manifest parsing also rejects repeated OIDs
+or names before replacement, including bootstrap identities. Failed clones, rolled-back creates, and
 committed drops clear pending definitions, ownership, identity, and statistics.
 Database readers retain owned images; template authorization and checkpoint
 serialization take ownership from the same definition image. Statistics compare

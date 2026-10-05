@@ -2005,12 +2005,7 @@ fn record_relation_column_references<'a>(
                         .col_alias
                         .and_then(|aliases| aliases.get(column).copied())
                         .map_or_else(
-                            || {
-                                arena
-                                    .alloc_str(name.as_str())
-                                    .map(|name| &*name)
-                                    .map_err(|_| arena_full())
-                            },
+                            || arena.alloc_str(name.as_str()).map_err(|_| arena_full()),
                             Ok,
                         )?;
                 }

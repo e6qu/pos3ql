@@ -397,8 +397,9 @@ owner's pending name consistently with view lookup.
 View definitions and rewrite rules now share one startup-bounded mutex.
 Creation, replacement, commit, rollback, recovery relocation, database cloning
 and removal, and schema rewrites publish the view and return-rule graph under
-one guard. Iterators return owned images and release the guard before nested
-catalog reads. Stored-query parsing copies SQL, creation path, and dependencies
+one guard. Iterators filter before copying owned images and release the guard
+before nested catalog reads; metadata scans borrow only under that guard.
+Stored-query parsing copies SQL, creation path, and dependencies
 from one guarded image into fixed statement memory. Dependency rebinding
 releases its catalog guard before resolving view identities, preserving the
 view-to-dependency lock order. Four-worker publication, nested-reader progress,

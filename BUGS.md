@@ -1042,6 +1042,18 @@ View and return-rule publication shares one mutex;
 query snapshots keep SQL, creation path, and dependencies together, and owned
 iterator images allow nested catalog reads. Concurrent publication and rollback
 check both directions of the view/rule graph without runtime allocation.
+The index lifecycle audit found committed drops and rolled-back creates retained
+old names, pending definitions, ownership, and BRIN maintenance in reusable
+slots. Retirement now clears the full definition and maintenance image; table
+drop cascades use the same cleanup, and commit captures the backing table before
+freeing its index slot. Rename collision checks and comment rewrites could affect
+another database; both now include database identity. Pending rename targets
+also reserve names during creation. Database cloning publishes partition-parent
+links together with index definitions and copies the associated maintenance
+image. Index readers use owned definitions and release catalog guards before
+nested resolution; expression-key evaluation retains its owned definition
+through the evaluation callback. Allocation-free concurrent publication,
+rollback, nested reads, exhaustion, and slot-reuse fixtures cover these paths.
 No external blocker remains.
 
 | ID | Status | Found | Description | Reproducer | Blocker |

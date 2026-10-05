@@ -10606,6 +10606,22 @@ impl IndexDef {
         ddl_state: CatalogDdlState::Absent,
     };
 
+    fn name_blocker(&self, name: SqlName, txid: u32) -> Option<u32> {
+        if self.ddl_state == CatalogDdlState::Absent {
+            return None;
+        }
+        if let Some(pending) = self.pending_name
+            && pending.name == name
+            && pending.txid != txid
+        {
+            return Some(pending.txid);
+        }
+        (self.name_for(txid) == name)
+            .then(|| self.ddl_state.pending_txid())
+            .flatten()
+            .filter(|owner| *owner != txid)
+    }
+
     /// Whether `txid` sees this index exist.
     pub fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
@@ -19982,6 +19998,7 @@ impl Storage {
             drop(operator_catalog);
 
             let mut indexes = self.index_catalog();
+            let mut maintenance = self.brin_maintenance();
             for source_slot in 0..indexes.len() {
                 let mut definition = indexes[source_slot];
                 if definition.database != source
@@ -20019,6 +20036,12 @@ impl Storage {
                         *collation = Collation::Catalog(target);
                     }
                 }
+                maintenance.states[target_slot] = maintenance.states[source_slot];
+                let ranges_per_index = self.brin_unsummarized_ranges_per_index;
+                for range in 0..ranges_per_index {
+                    maintenance.unsummarized_ranges[target_slot * ranges_per_index + range] =
+                        maintenance.unsummarized_ranges[source_slot * ranges_per_index + range];
+                }
                 indexes[target_slot] = definition;
             }
             for target_slot in 0..indexes.len() {
@@ -20047,6 +20070,7 @@ impl Storage {
                 indexes[target_slot].mutable.parent = Some(target_parent as u16);
             }
 
+            drop(maintenance);
             drop(indexes);
 
             for source_slot in 0..self.policy_count() {
@@ -32118,7 +32142,9 @@ impl Storage {
         summarized_until_page: u64,
         ranges: &[u64],
     ) -> Result<(), SqlError> {
-        if self.index(index_slot).method != crate::sql::ast::IndexAccessMethod::Brin
+        let indexes = self.index_catalog();
+        let index = indexes[index_slot];
+        if index.method != crate::sql::ast::IndexAccessMethod::Brin
             || !(1..=131_072).contains(&pages_per_range)
             || summarized_until_page == 0
             || !summarized_until_page.is_multiple_of(u64::from(pages_per_range))
@@ -32134,7 +32160,7 @@ impl Storage {
                 "invalid BRIN maintenance state"
             ));
         }
-        let created_at = self.index(index_slot).created_at;
+        let created_at = index.created_at;
         let mut maintenance = self.brin_maintenance();
         let (state, stored_ranges) = Self::brin_entry_mut(
             &mut maintenance,
@@ -45199,12 +45225,9 @@ impl Storage {
         if let Some(blocker) = catalog.iter().enumerate().find_map(|(other, candidate)| {
             (other != slot
                 && candidate.database == index.database
-                && candidate.ddl_state != CatalogDdlState::Absent
-                && candidate.schema == index.schema
-                && candidate
-                    .pending_name
-                    .is_some_and(|pending| pending.name == name && pending.txid != txid))
-            .then_some(candidate.pending_name?.txid)
+                && candidate.schema == index.schema)
+                .then(|| candidate.name_blocker(name, txid))
+                .flatten()
         }) {
             drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
@@ -45540,11 +45563,9 @@ impl Storage {
             ));
         }
         if let Some(blocker) = catalog.iter().find_map(|index| {
-            (index.database == current_database()
-                && index.schema.as_str() == def.schema.as_str()
-                && index.name_for(txid).as_str() == def.name.as_str())
-            .then_some(index.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
+            (index.database == def.database && index.schema == def.schema)
+                .then(|| index.name_blocker(def.name, txid))
+                .flatten()
         }) {
             drop(catalog);
             return Err(self.catalog_ddl_wait_error(txid, blocker, def.name.as_str()));
@@ -52458,6 +52479,8 @@ mod tests {
                 assert!(image.pending_name.is_none());
                 assert!(image.pending_definition.is_none());
                 assert_eq!(image.n_cols, 0);
+                assert!(image.ownership.pending.is_none());
+                assert_eq!(image.ownership.owner, Ownership::BOOTSTRAP.owner);
                 assert_eq!(storage.brin_maintenance().states[slot].index_created_at, 0);
                 assert!(
                     storage
@@ -52484,6 +52507,30 @@ mod tests {
             .unwrap();
         storage.commit_index_create(foreign);
         storage.index_catalog()[foreign].database = DatabaseOid::TEMPLATE1;
+        storage
+            .apply_comment(
+                CommentClass::Relation,
+                SqlName::parse("public").unwrap(),
+                SqlName::parse("local_index").unwrap(),
+                0,
+                Some(StackStr::from_str("local")),
+            )
+            .unwrap();
+        {
+            let mut comments = storage.comment_catalog();
+            let local = comments
+                .entries
+                .iter()
+                .position(|entry| entry.used)
+                .unwrap();
+            let foreign = comments
+                .entries
+                .iter()
+                .position(|entry| !entry.used)
+                .unwrap();
+            comments.entries[foreign] = comments.entries[local];
+            comments.entries[foreign].database = Some(DatabaseOid::TEMPLATE1);
+        }
         crate::mem::guard::forbid_alloc(|| {
             storage
                 .rename_index(slot, SqlName::parse("remote_index").unwrap(), 17)
@@ -52496,6 +52543,29 @@ mod tests {
             storage
                 .rename_index(slot, SqlName::parse("remote_pending").unwrap(), 17)
                 .unwrap();
+            storage.commit_index_rename(slot, 17);
+            assert_eq!(
+                storage
+                    .create_index(test_index_definition("remote_pending"), 19)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            storage.release_row_locks(19);
+            assert!(
+                storage
+                    .comment_text(CommentClass::Relation, "public", "remote_pending", 0, 0)
+                    .is_some()
+            );
+            assert!(
+                storage
+                    .comment_catalog()
+                    .entries
+                    .iter()
+                    .any(|entry| entry.used
+                        && entry.database == Some(DatabaseOid::TEMPLATE1)
+                        && entry.name.as_str() == "local_index")
+            );
             storage.index_catalog()[foreign].database = DatabaseOid::POSTGRES;
             storage.rollback_index_rename(slot, None);
             assert_eq!(

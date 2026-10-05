@@ -4672,12 +4672,15 @@ pub fn resolve_view_for_dml<'a>(
     let check_option = storage.view(view_slot).check_option_for(txid);
     // The body re-resolves under the view creator's search path.
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let view_path =
-        storage.compute_path(storage.view_creation_path(view_slot), user.as_str(), txid);
+    let view_path = storage.compute_path(
+        storage.view_creation_path(view_slot).as_str(),
+        user.as_str(),
+        txid,
+    );
     // Copy the definition into the arena so the parsed AST no longer borrows
     // storage (the caller then takes a mutable storage borrow to run the DML).
     let sql = arena
-        .alloc_str(storage.view_sql(view_slot))
+        .alloc_str(storage.view_sql(view_slot).as_str())
         .map_err(|_| arena_full())?;
     let name = name.name;
     let not_updatable = || {

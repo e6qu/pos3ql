@@ -36131,8 +36131,9 @@ fn rewrite_view_column_dependents(
         }
 
         let view = storage.view(view_slot).clone();
-        let view_sql =
-            StackStr::<{ crate::storage::VIEW_SQL_MAX }>::from_str(storage.view_sql(view_slot));
+        let view_sql = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::from_str(
+            storage.view_sql(view_slot).as_str(),
+        );
         let rewritten = rewrite_relation_column_identifiers(view_sql.as_str(), rename, arena)?;
         if rewritten == view_sql {
             return Err(sql_err!(
@@ -36140,7 +36141,8 @@ fn rewrite_view_column_dependents(
                 "dependent view column binding has no matching stored identifier"
             ));
         }
-        let creation_path = StackStr::<128>::from_str(storage.view_creation_path(view_slot));
+        let creation_path =
+            StackStr::<128>::from_str(storage.view_creation_path(view_slot).as_str());
         let user = super::eval::funcs::system::session_user_owned();
         let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
         let rebound = super::query::stored_query_dependencies(
@@ -37122,9 +37124,12 @@ pub fn comment(
                     ));
                 };
                 let user = super::eval::funcs::system::session_user_owned();
-                let view_path =
-                    storage.compute_path(storage.view_creation_path(slot), user.as_str(), txid);
-                let view_sql = match arena.alloc_str(storage.view_sql(slot)) {
+                let view_path = storage.compute_path(
+                    storage.view_creation_path(slot).as_str(),
+                    user.as_str(),
+                    txid,
+                );
+                let view_sql = match arena.alloc_str(storage.view_sql(slot).as_str()) {
                     Ok(sql) => sql,
                     Err(_) => return sql_fail(super::query::arena_full_pub()),
                 };
@@ -45547,9 +45552,11 @@ fn rewrite_composite_dependent_views(
             continue;
         }
         let view = storage.view(view_slot).clone();
-        let view_sql =
-            StackStr::<{ crate::storage::VIEW_SQL_MAX }>::from_str(storage.view_sql(view_slot));
-        let creation_path = StackStr::<128>::from_str(storage.view_creation_path(view_slot));
+        let view_sql = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::from_str(
+            storage.view_sql(view_slot).as_str(),
+        );
+        let creation_path =
+            StackStr::<128>::from_str(storage.view_creation_path(view_slot).as_str());
         let user = super::eval::funcs::system::session_user_owned();
         let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
         let mut sites = [false; crate::storage::VIEW_SQL_MAX];
@@ -57340,10 +57347,14 @@ pub(crate) fn view_trigger_definition(
     let view = storage.view(view_slot);
     let mut columns = [ColDesc::new("", 0, 0); MAX_COLUMNS];
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(storage.view_creation_path(view_slot), user.as_str(), txid);
+    let path = storage.compute_path(
+        storage.view_creation_path(view_slot).as_str(),
+        user.as_str(),
+        txid,
+    );
     let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;
     let n_columns = super::query::describe_stored_query(
-        storage.view_sql(view_slot),
+        storage.view_sql(view_slot).as_str(),
         storage,
         txid,
         path,
@@ -57997,9 +58008,13 @@ fn materialize_view_rows<'a>(
     capacity: usize,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(storage.view_creation_path(view_slot), user.as_str(), txid);
+    let path = storage.compute_path(
+        storage.view_creation_path(view_slot).as_str(),
+        user.as_str(),
+        txid,
+    );
     let source = arena
-        .alloc_str(storage.view_sql(view_slot))
+        .alloc_str(storage.view_sql(view_slot).as_str())
         .map_err(|_| super::query::arena_full_pub())?;
     let select = super::parser::parse_query(source, arena)?;
     let dependencies = storage.snapshot_view_dependencies(view_slot, arena)?;

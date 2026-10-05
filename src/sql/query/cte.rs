@@ -4651,11 +4651,11 @@ fn subst_tableref<'a>(
             crate::storage::ViewSecurity::Invoker => context.authorization_role,
         };
         let view_sql = arena
-            .alloc_str(context.storage.view_sql(slot))
+            .alloc_str(context.storage.view_sql(slot).as_str())
             .map_err(|_| arena_full())?;
         let user = crate::sql::eval::funcs::system::session_user_owned();
         let view_path = context.storage.compute_path(
-            context.storage.view_creation_path(slot),
+            context.storage.view_creation_path(slot).as_str(),
             user.as_str(),
             context.txid,
         );

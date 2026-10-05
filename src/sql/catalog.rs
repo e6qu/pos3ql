@@ -13606,7 +13606,7 @@ pub fn view_def_text<'a>(
     for (slot, _) in storage.views_visible_to(txid) {
         if view_oid(slot) == oid {
             return arena
-                .alloc_str_display(format_args!("{};", storage.view_sql(slot)))
+                .alloc_str_display(format_args!("{};", storage.view_sql(slot).as_str()))
                 .map(Some)
                 .map_err(|_| arena_full());
         }
@@ -15868,7 +15868,11 @@ pub(crate) fn describe_view<'a>(
     out: &mut [super::types::ColDesc<'a>],
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(storage.view_creation_path_for(view), user.as_str(), txid);
+    let path = storage.compute_path(
+        storage.view_creation_path_for(view).as_str(),
+        user.as_str(),
+        txid,
+    );
     let slot = storage
         .views_visible_to(txid)
         .find_map(|(slot, candidate)| {
@@ -15877,7 +15881,7 @@ pub(crate) fn describe_view<'a>(
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "view does not exist"))?;
     let dependencies = storage.snapshot_view_dependencies(slot, arena)?;
     let count = super::query::describe_stored_query(
-        storage.view_sql_for(view),
+        storage.view_sql_for(view).as_str(),
         storage,
         txid,
         path,
@@ -15919,10 +15923,14 @@ fn describe_stored_view<'a>(
     out: &mut [super::types::ColDesc<'a>],
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(storage.view_creation_path(slot), user.as_str(), txid);
+    let path = storage.compute_path(
+        storage.view_creation_path(slot).as_str(),
+        user.as_str(),
+        txid,
+    );
     let dependencies = storage.snapshot_view_dependencies(slot, arena)?;
     let count = super::query::describe_stored_query(
-        storage.view_sql(slot),
+        storage.view_sql(slot).as_str(),
         storage,
         txid,
         path,
@@ -30199,7 +30207,7 @@ fn pg_views<'a>(
                     txid,
                     arena,
                 )?,
-                text(storage.view_sql(slot), arena)?,
+                text(storage.view_sql(slot).as_str(), arena)?,
             ],
             arena,
         )?;
@@ -31137,7 +31145,7 @@ fn info_views<'a>(
                 text("postgres", arena)?,
                 text(view.schema_for(txid).as_str(), arena)?,
                 text(view.name_for(txid).as_str(), arena)?,
-                text(storage.view_sql_for(view), arena)?,
+                text(storage.view_sql_for(view).as_str(), arena)?,
                 text(
                     match view.check_option_for(txid) {
                         None => "NONE",

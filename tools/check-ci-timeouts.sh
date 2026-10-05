@@ -59,10 +59,14 @@ for spill_entry in \
     '- { name: copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: types, corpus_shard: "none", auxiliary: types }' \
     '- { name: grouping, corpus_shard: "none", auxiliary: grouping }' \
-    '- { name: slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "4" }' \
-    '- { name: slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "4" }' \
-    '- { name: slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "4" }' \
-    '- { name: slt-d, corpus_shard: "none", auxiliary: slt, slt_query_shard: "3", slt_query_shards: "4" }'; do
+    '- { name: slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "8" }' \
+    '- { name: slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "8" }' \
+    '- { name: slt-c, corpus_shard: "none", auxiliary: slt, slt_query_shard: "2", slt_query_shards: "8" }' \
+    '- { name: slt-d, corpus_shard: "none", auxiliary: slt, slt_query_shard: "3", slt_query_shards: "8" }' \
+    '- { name: slt-e, corpus_shard: "none", auxiliary: slt, slt_query_shard: "4", slt_query_shards: "8" }' \
+    '- { name: slt-f, corpus_shard: "none", auxiliary: slt, slt_query_shard: "5", slt_query_shards: "8" }' \
+    '- { name: slt-g, corpus_shard: "none", auxiliary: slt, slt_query_shard: "6", slt_query_shards: "8" }' \
+    '- { name: slt-h, corpus_shard: "none", auxiliary: slt, slt_query_shard: "7", slt_query_shards: "8" }'; do
     if ! grep -Fq -- "$spill_entry" "$spill_matrix"; then
         printf 'CI timeout guard: missing forced-spill shard definition %s\n' "$spill_entry" >&2
         failed=1

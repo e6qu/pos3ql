@@ -1471,14 +1471,14 @@ ensure_psycopg_venv || exit 1
 # through the cache tiers — while the reference PostgreSQL sees plain SQL.
 # Pure-SQL semantics must be indistinguishable from the in-memory run.
 if [[ -n "${POS3QL_REFERENCE_PG_HOST:-}" || -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
-  if POS3QL_DIFF_OBJECT_STORE=on POS3QL_DIFF_MEMTABLE=256KiB POS3QL_DIFF_OBJECT_STORE_PREFIX="spilldiff-$$/" POS3QL_EXTRA_CONF="object_store_endpoint = 127.0.0.1:${S3_TEST_PORT}
+  if (set -o pipefail; POS3QL_DIFF_OBJECT_STORE=on POS3QL_DIFF_MEMTABLE=256KiB POS3QL_DIFF_OBJECT_STORE_PREFIX="spilldiff-$$/" POS3QL_EXTRA_CONF="object_store_endpoint = 127.0.0.1:${S3_TEST_PORT}
 object_store_bucket = ${S3_TEST_BUCKET}
 object_store_region = ${S3_TEST_REGION}
 object_store_access_key = ${S3_TEST_ACCESS_KEY}
 object_store_secret_key = ${S3_TEST_SECRET_KEY}
 wal_upload = on
 wal_upload_sync = on
-work_arena_bytes = 192MiB" tests/external/differential.sh > "$WORK/spilldiff.out" 2>&1; then
+work_arena_bytes = 192MiB" tests/external/differential.sh 2>&1 | tee "$WORK/spilldiff.out"); then
     ok "forced-spill differential ($(grep -c '^PASS' "$WORK/spilldiff.out") corpora)"
   else
     bad "forced-spill differential"

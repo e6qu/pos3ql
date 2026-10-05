@@ -13954,7 +13954,7 @@ fn pg_description<'a>(
                 else {
                     continue;
                 };
-                (crate::storage::policy_oid(policy), PG_POLICY_OID)
+                (crate::storage::policy_oid(&policy), PG_POLICY_OID)
             }
             crate::storage::CommentClass::Statistics => {
                 let Some((slot, _)) = storage
@@ -14619,7 +14619,7 @@ pub fn comment_text_for<'a>(
                         i32::try_from(csub) == Ok(oid)
                             && storage
                                 .policies_with_slots_visible_to(txid)
-                                .any(|(_, policy)| crate::storage::policy_oid(policy) == oid)
+                                .any(|(_, policy)| crate::storage::policy_oid(&policy) == oid)
                     })
             }
             "pg_statistic_ext" => {
@@ -16785,7 +16785,7 @@ fn pg_policy<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(3256),
-                Datum::Int4(crate::storage::policy_oid(policy)),
+                Datum::Int4(crate::storage::policy_oid(&policy)),
                 text(policy.name.as_str(), arena)?,
                 Datum::Int4(table_oid(storage, usize::from(policy.table))),
                 text(
@@ -16793,7 +16793,7 @@ fn pg_policy<'a>(
                     arena,
                 )?,
                 Datum::Bool(policy.permissive),
-                policy_role_oids(storage.policy_roles(slot, txid), arena)?,
+                policy_role_oids(&storage.policy_roles(slot, txid), arena)?,
                 policy_definition
                     .using
                     .map(|source| text(source.as_str(), arena))
@@ -16838,7 +16838,7 @@ fn pg_policies<'a>(
                     },
                     arena,
                 )?,
-                policy_role_names(storage, storage.policy_roles(slot, txid), txid, arena)?,
+                policy_role_names(storage, &storage.policy_roles(slot, txid), txid, arena)?,
                 text(policy_command_name(policy.command), arena)?,
                 policy_definition
                     .using

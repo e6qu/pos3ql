@@ -61588,6 +61588,9 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
              state template_app.state NOT NULL,
              label text COLLATE template_app.byte_order
          );
+         ALTER TABLE template_app.items ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY template_reader_rows ON template_app.items
+           TO template_reader USING (id > 0);
          CREATE TABLE template_app.item_audit(id integer);
          CREATE RULE audit_template_insert AS ON INSERT TO template_app.items DO ALSO
            INSERT INTO template_app.item_audit VALUES (NEW.id);
@@ -61666,6 +61669,8 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
           WHERE relname IN ('template_private_rows', 'template_private_view',
                             'template_private_sequence');
          SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes';
+         SELECT roles[1] FROM pg_policies
+          WHERE schemaname = 'template_app' AND policyname = 'template_reader_rows';
          SELECT obj_description('template_app.items'::regclass, 'pg_class');
          SELECT has_table_privilege('template_reader', 'template_app.items', 'SELECT');
          SELECT collname FROM pg_collation WHERE collname = 'byte_order';
@@ -61688,6 +61693,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             "4|2",
             "0",
             "1",
+            "template_reader",
             "copied template table",
             "t",
             "byte_order",
@@ -61885,6 +61891,8 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
           WHERE schemaname = 'template_app' AND tablename = 'cloned_items'
             AND indexname = 'items_pkey';
          SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes';
+         SELECT roles[1] FROM pg_policies
+          WHERE schemaname = 'template_app' AND policyname = 'template_reader_rows';
          SELECT has_table_privilege('template_reader', 'template_app.cloned_items', 'SELECT');
          SELECT obj_description('template_app.cloned_items'::regclass, 'pg_class');
          SELECT collname FROM pg_collation WHERE oid = (
@@ -61906,6 +61914,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             "1",
             "1",
             "1",
+            "template_reader",
             "t",
             "copied template table",
             "byte_order",

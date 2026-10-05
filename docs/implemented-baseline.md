@@ -506,7 +506,12 @@ active production roadmap is [PLAN.md](../PLAN.md).
   A 1,025-policy relation qualifies enforcement, catalog output, named
   exhaustion, checkpoint publication, and empty-cache recovery. Policy role
   lists accept every startup-configured role plus `PUBLIC`, with startup-sized
-  committed, transactional, and recovery images. Routine configuration and
+  committed, transactional, and recovery images. One mutex owns definitions
+  and every role image so readers observe complete pairs across DDL, replay,
+  checkpoint, and database lifecycle work. Checkpoint formatting releases the
+  role image before selecting dependencies. Template cloning preserves the
+  source role image together with its definition and dependencies. Routine
+  configuration and
   trigger arguments use the parser's complete 64-item boundary. Routine input
   signatures match PostgreSQL's exact
   100-argument limit, while output metadata accepts 1,664 columns;

@@ -9044,7 +9044,7 @@ pub fn drop_owned(
                     storage,
                     txn.txid,
                     slot,
-                    policy,
+                    &policy,
                     tables,
                     views,
                     sequences,
@@ -9088,7 +9088,7 @@ pub fn drop_owned(
                         storage,
                         txn.txid,
                         slot,
-                        policy,
+                        &policy,
                         tables,
                         views,
                         sequences,
@@ -27327,7 +27327,10 @@ pub fn alter_policy(
             Err(error) => return sql_fail(error),
         }
     } else {
-        match arena.alloc_slice_copy(storage.policy_roles(slot, txn.txid)) {
+        let current_roles = storage.policy_roles(slot, txn.txid);
+        let copied_roles = arena.alloc_slice_copy(&current_roles);
+        drop(current_roles);
+        match copied_roles {
             Ok(roles) => &*roles,
             Err(_) => return sql_fail(arena_full()),
         }
@@ -27353,7 +27356,7 @@ pub fn alter_policy(
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
-    let policy = *storage.policy(slot);
+    let policy = storage.policy(slot);
     let (table_schema, table_name) = {
         let table_definition = storage.table_def(table, txn.txid);
         (table_definition.schema, table_definition.name)
@@ -27464,7 +27467,7 @@ fn drop_policy_slot(
     txn: &mut TxnState,
     slot: usize,
 ) -> Result<(), SqlError> {
-    let policy = *storage.policy(slot);
+    let policy = storage.policy(slot);
     let (table_schema, table_name) = {
         let table_definition = storage.table_def(usize::from(policy.table), txn.txid);
         (table_definition.schema, table_definition.name)
@@ -37454,7 +37457,7 @@ pub fn comment(
                 CommentClass::Policy,
                 SqlName::EMPTY,
                 policy.name,
-                crate::storage::policy_oid(policy) as u32,
+                crate::storage::policy_oid(&policy) as u32,
             )
         }
         CommentTarget::Constraint {
@@ -42482,7 +42485,7 @@ fn apply_type_drop_to_stored_queries(
                 storage,
                 txn.txid,
                 slot,
-                policy,
+                &policy,
                 selected_domains,
                 selected_enum,
                 selected_composite,
@@ -42513,7 +42516,7 @@ fn apply_type_drop_to_stored_queries(
                     storage,
                     txn.txid,
                     slot,
-                    policy,
+                    &policy,
                     selected_domains,
                     selected_enum,
                     selected_composite,
@@ -42876,7 +42879,7 @@ fn policy_dependents_exist(
         .policies_with_slots_visible_to(txid)
         .any(|(slot, policy)| {
             policy_depends_on_dependency_drop(
-                storage, txid, slot, policy, root, views, matviews, routines,
+                storage, txid, slot, &policy, root, views, matviews, routines,
             )
         })
 }
@@ -42895,7 +42898,7 @@ fn drop_policy_dependents(
             let policy = storage.policy(slot);
             policy.visible_to(txn.txid)
                 && policy_depends_on_dependency_drop(
-                    storage, txn.txid, slot, policy, root, views, matviews, routines,
+                    storage, txn.txid, slot, &policy, root, views, matviews, routines,
                 )
         };
         if selected {
@@ -44869,7 +44872,7 @@ fn rewrite_table_policy_column_references(
         return Ok(());
     }
     for slot in 0..storage.policy_count() {
-        let policy = *storage.policy(slot);
+        let policy = storage.policy(slot);
         if !policy.visible_to(txn.txid) || usize::from(policy.table) != table {
             continue;
         }
@@ -44898,9 +44901,10 @@ fn rewrite_table_policy_column_references(
         }
         let dependencies =
             validate_policy_definition(storage, table, &definition, txn.txid, arena)?;
-        let roles = arena
-            .alloc_slice_copy(storage.policy_roles(slot, txn.txid))
-            .map_err(|_| arena_full())?;
+        let current_roles = storage.policy_roles(slot, txn.txid);
+        let copied_roles = arena.alloc_slice_copy(&current_roles);
+        drop(current_roles);
+        let roles = copied_roles.map_err(|_| arena_full())?;
         let prior = storage.alter_policy(slot, definition, roles, &dependencies, txn.txid)?;
         let table_definition = storage.table_def(table, txn.txid);
         let table_schema = table_definition.schema;

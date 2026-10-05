@@ -10293,18 +10293,30 @@ impl Checkpointer {
                     let _ = write!(with_check, "{byte:02x}");
                 }
             }
+            // Serialize the role image before looking up dependencies. Both
+            // images are mutex guarded, and dependency lookup consults the
+            // policy definition to select its committed image.
+            write!(
+                &mut self.manifest_buf,
+                "pol {} {} {} {} {} {} {}{}",
+                policy.created_at,
+                policy.command.code(),
+                u8::from(policy.permissive),
+                schema.as_str(),
+                table_name.as_str(),
+                name.as_str(),
+                roles.len(),
+                ManifestPolicyRoles {
+                    storage,
+                    roles: &roles,
+                },
+            )
+            .map_err(|_| manifest_full())?;
+            drop(roles);
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "pol {} {} {} {} {} {} {}{} {} {} {}",
-                    policy.created_at,
-                    policy.command.code(),
-                    u8::from(policy.permissive),
-                    schema.as_str(),
-                    table_name.as_str(),
-                    name.as_str(),
-                    roles.len(),
-                    ManifestPolicyRoles { storage, roles },
+                    " {} {} {}",
                     if definition.using.is_some() {
                         using.as_str()
                     } else {

@@ -24807,6 +24807,39 @@ fn serial_auto_increment() {
 }
 
 #[test]
+fn table_serial_state_wal_recovery_rejects_unknown_positions() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(&mut engine, &mut budget, "CREATE TABLE serial_replay (id bigint)");
+    let table = engine.storage.find_table("public", "serial_replay").unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        apply_wal_op(
+            &mut engine.storage,
+            1,
+            WalOp::SequenceSet { schema: "public", table: "serial_replay", column: 0, last: 81 },
+        ).unwrap();
+        for column in [1, u16::MAX] {
+            assert_eq!(
+                apply_wal_op(
+                    &mut engine.storage,
+                    2,
+                    WalOp::SequenceSet { schema: "public", table: "serial_replay", column, last: 99 },
+                ).unwrap_err().sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+        }
+        assert_eq!(
+            apply_wal_op(
+                &mut engine.storage,
+                2,
+                WalOp::SequenceSet { schema: "public", table: "missing_serial", column: 0, last: 99 },
+            ).unwrap_err().sqlstate,
+            sqlstate::UNDEFINED_TABLE
+        );
+        assert_eq!(engine.storage.table_serial_value(table, 0), 81);
+    });
+}
+
+#[test]
 fn on_conflict_do_nothing() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();

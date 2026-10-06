@@ -5110,11 +5110,10 @@ impl Engine {
             };
             let name = def.name;
             let schema = def.schema;
-            for c in 0..def.n_columns {
+            for (c, &last) in serial_values.iter().enumerate().take(def.n_columns) {
                 if !def.columns()[c].auto_increment {
                     continue;
                 }
-                let last = serial_values[c];
                 let lsn = self.storage.lsn() + 1;
                 if let Err(e) = self.wal.stage(
                     txn.txid,

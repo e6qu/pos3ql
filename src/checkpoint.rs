@@ -8700,11 +8700,12 @@ impl Checkpointer {
                     )?;
                 }
             }
+            let serial_values = storage.table_serial_values(slot);
             for (ci, c) in table.def.columns().iter().enumerate() {
                 if c.auto_increment {
                     write_manifest(
                         &mut self.manifest_buf,
-                        format_args!("seq {ci} {}", storage.table_serial_value(slot, ci)),
+                        format_args!("seq {ci} {}", serial_values[ci]),
                     )?;
                 }
             }

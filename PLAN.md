@@ -55,6 +55,8 @@ image; acknowledgement clears dirty state only for unchanged positions staged
 by that transaction. Integer overflow leaves the prior position intact.
 This prepares serial state for overlapping execution; definitions, rows,
 statistics, physical maintenance, and engine publication remain exclusive.
+Default assignment borrows its visible definition instead of copying the full
+maximum-width image for each generated value.
 
 Completion evidence:
 

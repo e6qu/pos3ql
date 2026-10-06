@@ -11,7 +11,10 @@ fn cluster_metadata_reload_applies_one_owned_settings_image() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ActiveSystemSettings>();
     let settings = ActiveSystemSettings::new([None; crate::storage::MAX_SYSTEM_SETTINGS]);
-    let names = [SqlName::parse("statement_timeout").unwrap(), SqlName::parse("lock_timeout").unwrap()];
+    let names = [
+        SqlName::parse("statement_timeout").unwrap(),
+        SqlName::parse("lock_timeout").unwrap(),
+    ];
     let barrier = std::sync::Barrier::new(5);
     let guc = GucState::new();
     std::thread::scope(|scope| {
@@ -39,7 +42,10 @@ fn cluster_metadata_reload_applies_one_owned_settings_image() {
         crate::mem::guard::forbid_alloc(|| {
             for _ in 0..256 {
                 settings.apply(&guc).unwrap();
-                assert_eq!(guc.get_owned("statement_timeout"), guc.get_owned("lock_timeout"));
+                assert_eq!(
+                    guc.get_owned("statement_timeout"),
+                    guc.get_owned("lock_timeout")
+                );
                 std::thread::yield_now();
             }
         });
@@ -75,7 +81,10 @@ fn cluster_metadata_preparing_transactions_stay_private_until_finalized() {
         assert_eq!(prepared.find(gid), Some(slot));
         assert_eq!(prepared.entries().count(), 1);
         assert_eq!(prepared.catalog_entries().count(), 0);
-        assert_eq!(prepared.reserve(metadata).unwrap_err().sqlstate, sqlstate::DUPLICATE_OBJECT);
+        assert_eq!(
+            prepared.reserve(metadata).unwrap_err().sqlstate,
+            sqlstate::DUPLICATE_OBJECT
+        );
         prepared.set_lsn_range(slot, 1, 2);
         assert_eq!(prepared.catalog_entries().count(), 1);
         assert_eq!(prepared.catalog_entries().next().unwrap().1.first_lsn, 1);
@@ -97,8 +106,10 @@ fn cluster_metadata_preparing_transactions_stay_private_until_finalized() {
                 gid: ast::PreparedTransactionId::parse("invalid").unwrap(),
                 ..metadata
             };
-            assert_eq!(prepared.reserve(invalid).unwrap_err().sqlstate,
-                sqlstate::INVALID_PARAMETER_VALUE);
+            assert_eq!(
+                prepared.reserve(invalid).unwrap_err().sqlstate,
+                sqlstate::INVALID_PARAMETER_VALUE
+            );
             assert_eq!(prepared.catalog_entries().next().unwrap().1, recovered);
         }
     });

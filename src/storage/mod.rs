@@ -18431,12 +18431,12 @@ impl Storage {
         let staged: Result<(), SqlError> = (|| {
             for entry in entries {
                 PreparedTransactionCatalog::validate_entry(&catalog.candidate, entry)?;
-                catalog.candidate
-                    .push(entry)
-                    .map_err(|_| sql_err!(
+                catalog.candidate.push(entry).map_err(|_| {
+                    sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "prepared transaction catalog capacity exhausted"
-                    ))?;
+                    )
+                })?;
             }
             Ok(())
         })();
@@ -18679,12 +18679,15 @@ impl Storage {
         arena: &'a Arena,
     ) -> Result<&'a [PreparedTransactionCatalogEntry], SqlError> {
         self.with_prepared_transaction_catalog(|entries| {
-            arena.alloc_slice_with(entries.len(), |index| entries[index])
+            arena
+                .alloc_slice_with(entries.len(), |index| entries[index])
                 .map(|image| &*image)
-                .map_err(|_| sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "statement memory exhausted for prepared transaction catalog snapshot"
-                ))
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "statement memory exhausted for prepared transaction catalog snapshot"
+                    )
+                })
         })
     }
 
@@ -26163,14 +26166,17 @@ impl Storage {
     }
 
     fn system_settings_catalog(&self) -> std::sync::MutexGuard<'_, FixedVec<SystemSetting>> {
-        self.system_settings.lock().expect("system settings catalog lock poisoned")
+        self.system_settings
+            .lock()
+            .expect("system settings catalog lock poisoned")
     }
 
-    pub(crate) fn system_settings(&self) -> core::iter::Enumerate<
-        core::array::IntoIter<SystemSetting, MAX_SYSTEM_SETTINGS>,
-    > {
+    pub(crate) fn system_settings(
+        &self,
+    ) -> core::iter::Enumerate<core::array::IntoIter<SystemSetting, MAX_SYSTEM_SETTINGS>> {
         let catalog = self.system_settings_catalog();
-        let image: [SystemSetting; MAX_SYSTEM_SETTINGS] = core::array::from_fn(|slot| catalog[slot]);
+        let image: [SystemSetting; MAX_SYSTEM_SETTINGS] =
+            core::array::from_fn(|slot| catalog[slot]);
         image.into_iter().enumerate()
     }
 
@@ -26247,11 +26253,7 @@ impl Storage {
         }
     }
 
-    pub(crate) fn rollback_system_setting(
-        &self,
-        slot: usize,
-        prior: Option<PendingRoleSetting>,
-    ) {
+    pub(crate) fn rollback_system_setting(&self, slot: usize, prior: Option<PendingRoleSetting>) {
         let mut catalog = self.system_settings_catalog();
         catalog[slot].pending = prior;
         if !catalog[slot].live && prior.is_none() {
@@ -52678,9 +52680,11 @@ mod tests {
         DatabaseDefinition::builtin(name, false, true, "C")
     }
 
-    fn test_prepared_catalog_entry(transaction_id: u32, gid: &str, generation: u64)
-        -> PreparedTransactionCatalogEntry
-    {
+    fn test_prepared_catalog_entry(
+        transaction_id: u32,
+        gid: &str,
+        generation: u64,
+    ) -> PreparedTransactionCatalogEntry {
         PreparedTransactionCatalogEntry {
             transaction_id,
             gid: StackStr::from_str(gid),
@@ -52712,15 +52716,19 @@ mod tests {
                         let value = Some(StackStr::from_str(name.as_str()));
                         let txid = worker as u32 + 20;
                         for iteration in 0..16 {
-                            let (slot, prior) = storage.change_system_setting(name, value, txid)
-                                .unwrap().unwrap();
+                            let (slot, prior) = storage
+                                .change_system_setting(name, value, txid)
+                                .unwrap()
+                                .unwrap();
                             if iteration % 2 == 0 {
                                 storage.rollback_system_setting(slot, prior);
                             } else {
                                 storage.commit_system_setting(slot);
                                 if iteration != 15 {
-                                    let (slot, _) = storage.change_system_setting(name, None, txid)
-                                        .unwrap().unwrap();
+                                    let (slot, _) = storage
+                                        .change_system_setting(name, None, txid)
+                                        .unwrap()
+                                        .unwrap();
                                     storage.commit_system_setting(slot);
                                 }
                             }
@@ -52746,24 +52754,56 @@ mod tests {
         });
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(storage.system_settings_catalog().len(), MAX_SYSTEM_SETTINGS);
-            assert_eq!(storage.system_settings_catalog().capacity(), MAX_SYSTEM_SETTINGS);
-            assert_eq!(storage.system_settings().filter(|(_, image)| image.live).count(), names.len());
+            assert_eq!(
+                storage.system_settings_catalog().capacity(),
+                MAX_SYSTEM_SETTINGS
+            );
+            assert_eq!(
+                storage
+                    .system_settings()
+                    .filter(|(_, image)| image.live)
+                    .count(),
+                names.len()
+            );
             let retained = storage.system_settings();
             for name in names {
-                storage.install_system_setting(SqlName::parse(name).unwrap(), None).unwrap();
+                storage
+                    .install_system_setting(SqlName::parse(name).unwrap(), None)
+                    .unwrap();
             }
-            assert_eq!(retained.filter(|(_, image)| image.live).count(), names.len());
-            assert_eq!(storage.system_settings().filter(|(_, image)| image.live).count(), 0);
+            assert_eq!(
+                retained.filter(|(_, image)| image.live).count(),
+                names.len()
+            );
+            assert_eq!(
+                storage
+                    .system_settings()
+                    .filter(|(_, image)| image.live)
+                    .count(),
+                0
+            );
             for index in 0..MAX_SYSTEM_SETTINGS {
                 use core::fmt::Write;
                 let mut name = StackStr::<64>::new();
                 write!(name, "setting_{index}").unwrap();
-                storage.install_system_setting(SqlName::parse(name.as_str()).unwrap(),
-                    Some(StackStr::from_str("value"))).unwrap();
+                storage
+                    .install_system_setting(
+                        SqlName::parse(name.as_str()).unwrap(),
+                        Some(StackStr::from_str("value")),
+                    )
+                    .unwrap();
             }
-            assert_eq!(storage.change_system_setting(SqlName::parse("overflow").unwrap(),
-                Some(StackStr::from_str("value")), 30).unwrap_err().sqlstate,
-                sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                storage
+                    .change_system_setting(
+                        SqlName::parse("overflow").unwrap(),
+                        Some(StackStr::from_str("value")),
+                        30
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
         });
     }
 
@@ -52774,32 +52814,94 @@ mod tests {
         let storage = Storage::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let name = SqlName::parse("pending_setting").unwrap();
-            let (slot, prior) = storage.change_system_setting(name,
-                Some(StackStr::from_str("first")), 11).unwrap().unwrap();
-            assert_eq!(storage.change_system_setting(name, None, 12).unwrap_err().sqlstate,
-                sqlstate::INTERNAL_LOCK_WAIT);
+            let (slot, prior) = storage
+                .change_system_setting(name, Some(StackStr::from_str("first")), 11)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                storage
+                    .change_system_setting(name, None, 12)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
             storage.release_row_locks(12);
-            assert_eq!(storage.install_system_setting(name, Some(StackStr::from_str("replayed")))
-                .unwrap_err().sqlstate, sqlstate::OBJECT_IN_USE);
+            assert_eq!(
+                storage
+                    .install_system_setting(name, Some(StackStr::from_str("replayed")))
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::OBJECT_IN_USE
+            );
             storage.rollback_system_setting(slot, prior);
-            assert!(storage.change_system_setting(name, None, 12).unwrap().is_none());
-            storage.install_system_setting(name, Some(StackStr::from_str("retained"))).unwrap();
-            let (slot, prior) = storage.change_system_setting(name, None, 11).unwrap().unwrap();
-            assert!(storage.system_settings().find(|(index, _)| *index == slot).unwrap().1.live);
+            assert!(
+                storage
+                    .change_system_setting(name, None, 12)
+                    .unwrap()
+                    .is_none()
+            );
+            storage
+                .install_system_setting(name, Some(StackStr::from_str("retained")))
+                .unwrap();
+            let (slot, prior) = storage
+                .change_system_setting(name, None, 11)
+                .unwrap()
+                .unwrap();
+            assert!(
+                storage
+                    .system_settings()
+                    .find(|(index, _)| *index == slot)
+                    .unwrap()
+                    .1
+                    .live
+            );
             storage.rollback_system_setting(slot, prior);
-            assert_eq!(storage.system_settings().find(|(index, _)| *index == slot).unwrap().1
-                .value.as_str(), "retained");
+            assert_eq!(
+                storage
+                    .system_settings()
+                    .find(|(index, _)| *index == slot)
+                    .unwrap()
+                    .1
+                    .value
+                    .as_str(),
+                "retained"
+            );
             let oversized = [b'x'; ROLE_SETTING_VALUE_MAX + 1];
             let oversized = StackStr::from_str(core::str::from_utf8(&oversized).unwrap());
-            assert_eq!(storage.change_system_setting(name, Some(oversized), 11)
-                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(storage.install_system_setting(name, Some(oversized))
-                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(storage.system_settings().find(|(index, _)| *index == slot).unwrap().1
-                .value.as_str(), "retained");
-            let (slot, _) = storage.change_system_setting(name, None, 11).unwrap().unwrap();
+            assert_eq!(
+                storage
+                    .change_system_setting(name, Some(oversized), 11)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                storage
+                    .install_system_setting(name, Some(oversized))
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                storage
+                    .system_settings()
+                    .find(|(index, _)| *index == slot)
+                    .unwrap()
+                    .1
+                    .value
+                    .as_str(),
+                "retained"
+            );
+            let (slot, _) = storage
+                .change_system_setting(name, None, 11)
+                .unwrap()
+                .unwrap();
             storage.commit_system_setting(slot);
-            let image = storage.system_settings().find(|(index, _)| *index == slot).unwrap().1;
+            let image = storage
+                .system_settings()
+                .find(|(index, _)| *index == slot)
+                .unwrap()
+                .1;
             assert_eq!(image.name, SqlName::EMPTY);
             assert!(image.value.as_str().is_empty());
             assert!(!image.live);
@@ -52816,9 +52918,13 @@ mod tests {
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
         let mut arena = Arena::new(&mut budget, "prepared reader", 4096).unwrap();
-        let initial = [test_prepared_catalog_entry(10, "first", 1),
-            test_prepared_catalog_entry(11, "second", 1)];
-        storage.replace_prepared_transaction_catalog(initial).unwrap();
+        let initial = [
+            test_prepared_catalog_entry(10, "first", 1),
+            test_prepared_catalog_entry(11, "second", 1),
+        ];
+        storage
+            .replace_prepared_transaction_catalog(initial)
+            .unwrap();
         let barrier = std::sync::Barrier::new(5);
         std::thread::scope(|scope| {
             for worker in 0..4 {
@@ -52829,10 +52935,20 @@ mod tests {
                     crate::mem::guard::forbid_alloc(|| {
                         for iteration in 0..16 {
                             let generation = worker * 100 + iteration + 1;
-                            storage.replace_prepared_transaction_catalog([
-                                test_prepared_catalog_entry(generation as u32 * 2, "first", generation),
-                                test_prepared_catalog_entry(generation as u32 * 2 + 1, "second", generation),
-                            ]).unwrap();
+                            storage
+                                .replace_prepared_transaction_catalog([
+                                    test_prepared_catalog_entry(
+                                        generation as u32 * 2,
+                                        "first",
+                                        generation,
+                                    ),
+                                    test_prepared_catalog_entry(
+                                        generation as u32 * 2 + 1,
+                                        "second",
+                                        generation,
+                                    ),
+                                ])
+                                .unwrap();
                         }
                     });
                 });
@@ -52841,13 +52957,18 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 for _ in 0..256 {
                     arena.reset();
-                    let image = storage.prepared_transaction_catalog_snapshot(&arena).unwrap();
+                    let image = storage
+                        .prepared_transaction_catalog_snapshot(&arena)
+                        .unwrap();
                     assert_eq!(image.len(), 2);
                     assert_eq!(image[0].prepared_lsn, image[1].prepared_lsn);
                     assert_eq!(image[0].transaction_id + 1, image[1].transaction_id);
                     assert_eq!(image[0].gid.as_str(), "first");
                     assert_eq!(image[1].gid.as_str(), "second");
-                    assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries.len()), 2);
+                    assert_eq!(
+                        storage.with_prepared_transaction_catalog(|entries| entries.len()),
+                        2
+                    );
                     std::thread::yield_now();
                 }
             });
@@ -52869,44 +52990,104 @@ mod tests {
         let storage = Storage::new(&config, &mut budget).unwrap();
         let tiny_arena = Arena::new(&mut budget, "small prepared snapshot", 8).unwrap();
         let mut tiny_snapshot = FixedVec::new(&mut budget, "small prepared roster", 1).unwrap();
-        let initial = [test_prepared_catalog_entry(10, "first", 1),
-            test_prepared_catalog_entry(11, "second", 1)];
+        let initial = [
+            test_prepared_catalog_entry(10, "first", 1),
+            test_prepared_catalog_entry(11, "second", 1),
+        ];
         tiny_snapshot.push(initial[0]).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            storage.replace_prepared_transaction_catalog(initial).unwrap();
-            for duplicate in [test_prepared_catalog_entry(10, "third", 1),
-                test_prepared_catalog_entry(12, "first", 1)] {
-                assert_eq!(storage.replace_prepared_transaction_catalog([initial[0], duplicate])
-                    .unwrap_err().sqlstate, sqlstate::DUPLICATE_OBJECT);
-                assert_eq!(storage.install_prepared_transaction_catalog_entry(duplicate)
-                    .unwrap_err().sqlstate, sqlstate::DUPLICATE_OBJECT);
-                assert_eq!(storage.with_prepared_transaction_catalog(|entries| [entries[0], entries[1]]), initial);
+            storage
+                .replace_prepared_transaction_catalog(initial)
+                .unwrap();
+            for duplicate in [
+                test_prepared_catalog_entry(10, "third", 1),
+                test_prepared_catalog_entry(12, "first", 1),
+            ] {
+                assert_eq!(
+                    storage
+                        .replace_prepared_transaction_catalog([initial[0], duplicate])
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DUPLICATE_OBJECT
+                );
+                assert_eq!(
+                    storage
+                        .install_prepared_transaction_catalog_entry(duplicate)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DUPLICATE_OBJECT
+                );
+                assert_eq!(
+                    storage.with_prepared_transaction_catalog(|entries| [entries[0], entries[1]]),
+                    initial
+                );
             }
-            assert_eq!(storage.replace_prepared_transaction_catalog([
-                initial[0], initial[1], test_prepared_catalog_entry(12, "third", 1)])
-                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(storage.prepared_transaction_catalog_snapshot(&tiny_arena)
-                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(storage.copy_prepared_transaction_catalog(&mut tiny_snapshot)
-                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                storage
+                    .replace_prepared_transaction_catalog([
+                        initial[0],
+                        initial[1],
+                        test_prepared_catalog_entry(12, "third", 1)
+                    ])
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                storage
+                    .prepared_transaction_catalog_snapshot(&tiny_arena)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                storage
+                    .copy_prepared_transaction_catalog(&mut tiny_snapshot)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
             assert_eq!(tiny_snapshot.len(), 1);
             assert_eq!(tiny_snapshot[0], initial[0]);
             let oversized_gid = [b'x'; 200];
             let oversized_gid = core::str::from_utf8(&oversized_gid).unwrap();
-            for invalid in [test_prepared_catalog_entry(0, "invalid", 1),
+            for invalid in [
+                test_prepared_catalog_entry(0, "invalid", 1),
                 test_prepared_catalog_entry(12, "invalid", 0),
                 test_prepared_catalog_entry(12, "invalid\0gid", 1),
-                test_prepared_catalog_entry(12, oversized_gid, 1)] {
-                assert_eq!(storage.replace_prepared_transaction_catalog([invalid])
-                    .unwrap_err().sqlstate, sqlstate::INVALID_PARAMETER_VALUE);
-                assert_eq!(storage.install_prepared_transaction_catalog_entry(invalid)
-                    .unwrap_err().sqlstate, sqlstate::INVALID_PARAMETER_VALUE);
-                assert_eq!(storage.with_prepared_transaction_catalog(|entries| [entries[0], entries[1]]), initial);
+                test_prepared_catalog_entry(12, oversized_gid, 1),
+            ] {
+                assert_eq!(
+                    storage
+                        .replace_prepared_transaction_catalog([invalid])
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::INVALID_PARAMETER_VALUE
+                );
+                assert_eq!(
+                    storage
+                        .install_prepared_transaction_catalog_entry(invalid)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::INVALID_PARAMETER_VALUE
+                );
+                assert_eq!(
+                    storage.with_prepared_transaction_catalog(|entries| [entries[0], entries[1]]),
+                    initial
+                );
             }
             storage.replace_prepared_transaction_catalog([]).unwrap();
-            assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries.len()), 0);
-            storage.install_prepared_transaction_catalog_entry(initial[0]).unwrap();
-            assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries[0]), initial[0]);
+            assert_eq!(
+                storage.with_prepared_transaction_catalog(|entries| entries.len()),
+                0
+            );
+            storage
+                .install_prepared_transaction_catalog_entry(initial[0])
+                .unwrap();
+            assert_eq!(
+                storage.with_prepared_transaction_catalog(|entries| entries[0]),
+                initial[0]
+            );
         });
     }
 
@@ -52918,11 +53099,24 @@ mod tests {
         let storage = Storage::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let entry = test_prepared_catalog_entry(10, "disabled", 1);
-            assert_eq!(storage.replace_prepared_transaction_catalog([entry])
-                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(storage.install_prepared_transaction_catalog_entry(entry)
-                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries.len()), 0);
+            assert_eq!(
+                storage
+                    .replace_prepared_transaction_catalog([entry])
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                storage
+                    .install_prepared_transaction_catalog_entry(entry)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                storage.with_prepared_transaction_catalog(|entries| entries.len()),
+                0
+            );
             let catalog = storage.prepared_transactions.lock().unwrap();
             assert_eq!(catalog.entries.capacity(), 0);
             assert_eq!(catalog.candidate.capacity(), 0);

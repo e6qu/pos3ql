@@ -561,16 +561,30 @@ struct ActiveSystemSettingsImage {
 
 impl ActiveSystemSettings {
     fn new(entries: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS]) -> Self {
-        Self { image: std::sync::Mutex::new(ActiveSystemSettingsImage { entries, reloaded: false }) }
+        Self {
+            image: std::sync::Mutex::new(ActiveSystemSettingsImage {
+                entries,
+                reloaded: false,
+            }),
+        }
     }
 
     fn replace(&self, entries: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS]) {
-        *self.image.lock().expect("active system settings lock poisoned") =
-            ActiveSystemSettingsImage { entries, reloaded: true };
+        *self
+            .image
+            .lock()
+            .expect("active system settings lock poisoned") = ActiveSystemSettingsImage {
+            entries,
+            reloaded: true,
+        };
     }
 
     fn apply(&self, guc: &GucState) -> Result<(), SqlError> {
-        let image = self.image.lock().expect("active system settings lock poisoned").entries;
+        let image = self
+            .image
+            .lock()
+            .expect("active system settings lock poisoned")
+            .entries;
         guc.reset_cluster_defaults();
         for setting in image.iter().flatten() {
             guc.set_cluster_default(setting.name.as_str(), setting.value.as_str())?;
@@ -579,8 +593,13 @@ impl ActiveSystemSettings {
     }
 
     fn take_reload(&self) -> bool {
-        core::mem::take(&mut self.image.lock()
-            .expect("active system settings lock poisoned").reloaded)
+        core::mem::take(
+            &mut self
+                .image
+                .lock()
+                .expect("active system settings lock poisoned")
+                .reloaded,
+        )
     }
 }
 
@@ -3248,15 +3267,18 @@ impl Engine {
             Some(c) => c.load_into(&mut storage)?,
             None => 0,
         };
-        let replay_floor = storage.with_prepared_transaction_catalog(|entries| entries.iter()
-            .map(|prepared| prepared.first_lsn.saturating_sub(1))
-            .min()
-            .unwrap_or(floor)
-            .min(floor));
+        let replay_floor = storage.with_prepared_transaction_catalog(|entries| {
+            entries
+                .iter()
+                .map(|prepared| prepared.first_lsn.saturating_sub(1))
+                .min()
+                .unwrap_or(floor)
+                .min(floor)
+        });
         let expected_prepared: Vec<crate::util::StackStr<199>> = storage
-            .with_prepared_transaction_catalog(|entries| entries.iter()
-            .map(|prepared| prepared.gid)
-            .collect());
+            .with_prepared_transaction_catalog(|entries| {
+                entries.iter().map(|prepared| prepared.gid).collect()
+            });
         let mut wal = Wal::open(config, budget)?;
         let mut prepared_transactions = two_phase::PreparedTransactions::new(config, budget)?;
         // Recovery merges two partial sources by LSN and applies the merge in
@@ -6572,17 +6594,19 @@ impl Engine {
 
     fn refresh_prepared_transaction_catalog(&self) -> Result<(), SqlError> {
         self.storage.replace_prepared_transaction_catalog(
-            self.prepared_transactions.catalog_entries().map(|(_, metadata)| {
-                crate::storage::PreparedTransactionCatalogEntry {
-                    transaction_id: metadata.transaction_id,
-                    gid: crate::util::StackStr::from_str(metadata.gid.as_str()),
-                    prepared_at: metadata.prepared_at,
-                    owner: metadata.owner,
-                    database: metadata.database,
-                    first_lsn: metadata.first_lsn,
-                    prepared_lsn: metadata.prepared_lsn,
-                }
-            }),
+            self.prepared_transactions
+                .catalog_entries()
+                .map(
+                    |(_, metadata)| crate::storage::PreparedTransactionCatalogEntry {
+                        transaction_id: metadata.transaction_id,
+                        gid: crate::util::StackStr::from_str(metadata.gid.as_str()),
+                        prepared_at: metadata.prepared_at,
+                        owner: metadata.owner,
+                        database: metadata.database,
+                        first_lsn: metadata.first_lsn,
+                        prepared_lsn: metadata.prepared_lsn,
+                    },
+                ),
         )
     }
 

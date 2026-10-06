@@ -1698,7 +1698,8 @@ impl Checkpointer {
                 budget,
                 "checkpoint prepared transaction snapshot",
                 config.max_prepared_transactions,
-            ).map_err(CheckpointSetupError::Budget)?,
+            )
+            .map_err(CheckpointSetupError::Budget)?,
             manifest_etag: None,
             manifest_present: false,
             manifest_lsn: 0,
@@ -3746,17 +3747,18 @@ impl Checkpointer {
                     }
                     let name = sql_name(&name)?;
                     if system_setting_names.contains(&name) {
-                        return Err(CheckpointSetupError::Corrupt("duplicate system setting record"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate system setting record",
+                        ));
                     }
                     if system_setting_names.len() == crate::storage::MAX_SYSTEM_SETTINGS {
-                        return Err(CheckpointSetupError::Corrupt("too many system setting records"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "too many system setting records",
+                        ));
                     }
                     system_setting_names.push(name);
                     storage
-                        .install_system_setting(
-                            name,
-                            Some(crate::util::StackStr::from_str(&value)),
-                        )
+                        .install_system_setting(name, Some(crate::util::StackStr::from_str(&value)))
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest system setting rejected: {}",

@@ -51,14 +51,18 @@ impl PreparedTransactionImage {
 
     fn new(metadata: PreparedTransactionMetadata) -> Result<Self, SqlError> {
         if metadata.transaction_id == 0 {
-            return Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE,
-                "prepared transaction identity cannot be zero"));
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "prepared transaction identity cannot be zero"
+            ));
         }
         match (metadata.first_lsn, metadata.prepared_lsn) {
             (0, 0) => Ok(Self::Preparing(metadata)),
             (first, prepared) if first > 0 && prepared >= first => Ok(Self::Prepared(metadata)),
-            _ => Err(sql_err!(sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid prepared transaction WAL range")),
+            _ => Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid prepared transaction WAL range"
+            )),
         }
     }
 }
@@ -103,18 +107,26 @@ impl PreparedTransactions {
     }
 
     pub(crate) fn find(&self, gid: PreparedTransactionId) -> Option<usize> {
-        self.slots
-            .iter()
-            .position(|slot| slot.metadata.is_some_and(|image| image.metadata().gid == gid))
+        self.slots.iter().position(|slot| {
+            slot.metadata
+                .is_some_and(|image| image.metadata().gid == gid)
+        })
     }
 
-    pub(crate) fn reserve(&mut self, metadata: PreparedTransactionMetadata) -> Result<Option<usize>, SqlError> {
-        if self.slots.iter().any(|slot| slot.metadata.is_some_and(|image| {
-            let retained = image.metadata();
-            retained.gid == metadata.gid || retained.transaction_id == metadata.transaction_id
-        })) {
-            return Err(sql_err!(sqlstate::DUPLICATE_OBJECT,
-                "prepared transaction identity is already reserved"));
+    pub(crate) fn reserve(
+        &mut self,
+        metadata: PreparedTransactionMetadata,
+    ) -> Result<Option<usize>, SqlError> {
+        if self.slots.iter().any(|slot| {
+            slot.metadata.is_some_and(|image| {
+                let retained = image.metadata();
+                retained.gid == metadata.gid || retained.transaction_id == metadata.transaction_id
+            })
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "prepared transaction identity is already reserved"
+            ));
         }
         let metadata = PreparedTransactionImage::new(metadata)?;
         let Some(index) = self.slots.iter().position(|slot| slot.metadata.is_none()) else {
@@ -137,9 +149,12 @@ impl PreparedTransactions {
     }
 
     pub(crate) fn set_lsn_range(&mut self, index: usize, first_lsn: u64, prepared_lsn: u64) {
-        assert!(first_lsn > 0 && prepared_lsn >= first_lsn,
-            "finalized prepared transaction retains its complete WAL range");
-        let Some(PreparedTransactionImage::Preparing(mut metadata)) = self.slots[index].metadata else {
+        assert!(
+            first_lsn > 0 && prepared_lsn >= first_lsn,
+            "finalized prepared transaction retains its complete WAL range"
+        );
+        let Some(PreparedTransactionImage::Preparing(mut metadata)) = self.slots[index].metadata
+        else {
             panic!("finalization owns a preparing transaction reservation");
         };
         metadata.first_lsn = first_lsn;
@@ -159,10 +174,13 @@ impl PreparedTransactions {
     pub(crate) fn catalog_entries(
         &self,
     ) -> impl Iterator<Item = (usize, PreparedTransactionMetadata)> + '_ {
-        self.slots.iter().enumerate().filter_map(|(index, slot)| match slot.metadata {
-            Some(PreparedTransactionImage::Prepared(metadata)) => Some((index, metadata)),
-            Some(PreparedTransactionImage::Preparing(_)) | None => None,
-        })
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.metadata {
+                Some(PreparedTransactionImage::Prepared(metadata)) => Some((index, metadata)),
+                Some(PreparedTransactionImage::Preparing(_)) | None => None,
+            })
     }
 
     pub(crate) fn release(&mut self, index: usize) {
@@ -178,7 +196,8 @@ impl PreparedTransactions {
 impl PreparedTransactionSlot {
     pub(crate) fn metadata(&self) -> PreparedTransactionMetadata {
         self.metadata
-            .expect("prepared transaction slot is occupied").metadata()
+            .expect("prepared transaction slot is occupied")
+            .metadata()
     }
 
     pub(crate) fn push_record(&mut self, lsn: u64, raw: &[u8]) -> Result<(), SqlError> {

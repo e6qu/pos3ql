@@ -3989,8 +3989,8 @@ fn next_auto_value<'x>(
     seq_session: &crate::sql::guc::SeqSession,
     txid: u32,
 ) -> Result<Datum<'x>, SqlError> {
-    let def = *storage.table_def(table_index, txid);
-    let column = def.columns()[col];
+    let def = storage.table_def(table_index, txid);
+    let column = &def.columns()[col];
     if let Some(slot) = storage.generated_sequence_slot(
         def.schema.as_str(),
         def.name.as_str(),

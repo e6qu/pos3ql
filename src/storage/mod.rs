@@ -54489,6 +54489,38 @@ mod tests {
     }
 
     #[test]
+    fn table_serial_state_slot_reuse_and_replay_do_not_inherit_staging() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("old_serial", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_table_serial_value(table, 0, 91);
+            let old_image = storage.stage_table_serial_values(table, 10).unwrap();
+            storage.commit_drop(table);
+            let replacement = storage
+                .create_table(make_def("new_serial", &[("id", ColType::Int8, true)]))
+                .unwrap();
+            assert_eq!(replacement, table);
+            assert_eq!(storage.table_serial_value(replacement, 0), 0);
+            assert_eq!(old_image[0], 91);
+            assert!(storage.stage_table_serial_values(replacement, 11).is_none());
+            storage.set_table_serial_value(replacement, 0, 3);
+            storage.stage_table_serial_values(replacement, 11).unwrap();
+            storage.acknowledge_table_serial_values(replacement, 10);
+            storage.replay_table_serial_value(replacement, 0, 6);
+            storage.acknowledge_table_serial_values(replacement, 11);
+            assert_eq!(storage.stage_table_serial_values(replacement, 12).unwrap()[0], 6);
+            storage.install_table_serial_values(replacement, [14; MAX_COLUMNS]);
+            storage.acknowledge_table_serial_values(replacement, 12);
+            assert_eq!(storage.table_serial_value(replacement, 0), 14);
+            assert!(storage.stage_table_serial_values(replacement, 13).is_none());
+        });
+    }
+
+    #[test]
     fn table_serial_state_range_errors_leave_counters_and_staging_unchanged() {
         let config = test_config();
         let mut budget = test_budget(&config);

@@ -125,6 +125,6 @@ A lower bound is widened for PostgreSQL's geometric tolerance and can only
 retain extra nodes. Exact `<->` evaluation owns the final order. Legacy rosters,
 non-finite origins, absent or unbounded limits, residual predicates, row-level
 security, row locking, `WITH TIES`, and oversized top-k scratch requests decline
-ranking and use the existing complete exact path. This conservative fallback is
-part of correctness: filtering or lock skipping below `LIMIT` must never turn a
+ranking and select the existing complete exact plan. This conservative choice
+preserves correctness: filtering or lock skipping below `LIMIT` must never turn a
 physical top-k cutoff into a short result.

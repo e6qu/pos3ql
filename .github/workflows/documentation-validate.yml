@@ -1,0 +1,17 @@
+name: Documentation validation
+on:
+  push:
+    branches: [codex/streamline-project-documentation]
+concurrency:
+  group: documentation-validation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 tools/check-docs.py
+      - run: bash tools/check-bugs.sh
+      - run: bash tools/check-vendor.sh
+      - run: bash -n tools/package-release.sh tools/test-release-package.sh

@@ -118,10 +118,12 @@ runs its executable, starts it from the packaged configuration, probes
 5. Confirm WAL, checkpoint, and block-object request counters continue advancing and
    that no publication errors remain in logs.
 
-If replacement startup fails, leave clients on the current process and resolve
-the reported recovery or object-store error. An interrupted promotion is safe
-to retry: transition state grants no writer ownership, and startup repeats the
-conditional root invalidation before activation.
+If replacement startup fails, resolve the reported recovery or object-store
+error and route only to a process whose fence-validating readiness succeeds.
+Promotion may already have displaced the prior writer; its continued liveness
+does not prove ownership. An interrupted promotion is safe to retry: transition
+state grants no writer ownership, and startup repeats conditional root
+invalidation before activation.
 
 For recovery from a named backup or a point in retained history, follow
 [backup and restore](backup-restore.md). Those commands are offline operations

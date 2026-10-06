@@ -12,7 +12,7 @@ edition = "2024"
 [dependencies]
 libc = "0.2"
 # The single whitelisted exception to the libc-only policy (see AGENTS.md and
-# PLAN.md Stage G): TLS is never hand-rolled. rustls runs isolated — every
+# CONTRIBUTING.md): TLS is never hand-rolled. rustls runs isolated — every
 # call from the object-store client enters through `mem::guard::tls_scope`, whose
 # allocations are counted against a startup-configured budget and abort loudly
 # past it, so the static-memory discipline holds everywhere else.

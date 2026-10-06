@@ -125,7 +125,7 @@ receipt. The first attempt requires an empty destination prefix.
 
 ## Qualification
 
-Required CI has three independent layers:
+Qualification separates required CI from external-service evidence:
 
 1. Golden-wire tests compare exact requests, canonical signing inputs, parsed
    responses, pagination, error mapping, TLS transport, and retry behavior with
@@ -137,9 +137,11 @@ Required CI has three independent layers:
    recovery, delta-checkpoint carry-forward, and cold start with both local
    caches absent. The deterministic profile fixture forces multi-page listing
    through the same qualification executable.
-3. The identical qualification executable can target independently operated
+3. The identical qualification executable can also target independently operated
    S3-compatible endpoints when credentials are available. It contains no
-   provider selection or provider-specific expectations.
+   provider selection or provider-specific expectations. This optional run is
+   not evidence supplied by the local MinIO and SeaweedFS CI jobs; representative
+   independent-service qualification remains on the roadmap.
 
 For example:
 

@@ -1,6 +1,7 @@
 # AGENTS.md
 
 Project documents: [README.md](README.md), [PLAN.md](PLAN.md), [BUGS.md](BUGS.md), and [docs/terminology.md](docs/terminology.md).
+Development and review workflow: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Boyscout Rule
 
@@ -21,5 +22,6 @@ Leave every file better than you found it. Fix every bug you encounter, includin
 - Update PLAN.md and BUGS.md in every PR.
 - Do not put phase numbers or BUG IDs in source comments.
 - Preserve provenance for stated facts and downloaded artifacts.
-- PRs are squash-merged; one commit is sufficient.
+- Every commit message is exactly one line, at most 80 characters, without a body, trailers, AI attribution, or authored-by/co-authored-by text. Use ordinary Git author metadata.
+- PRs are squash-merged after every required check passes on the checked head. Supply the subject and an explicitly empty body; one commit is sufficient.
 - Batch related implementation, tests, fixes, and documentation into one complete PR. Do not create micro-PRs or defer connected work without a real blocker.

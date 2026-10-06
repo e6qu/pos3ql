@@ -30163,7 +30163,7 @@ fn pg_prepared_xacts<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_prepared_xacts", false);
-    let entries = storage.prepared_transaction_catalog();
+    let entries = storage.prepared_transaction_catalog_snapshot(arena)?;
     let output = arena
         .alloc_slice_with(entries.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;

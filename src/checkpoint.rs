@@ -902,6 +902,7 @@ pub(crate) struct Checkpointer {
     roster_scratch: Vec<(BlockId, Option<BlockType>)>,
     doomed_blocks: Vec<StackStr<80>>,
     manifest_buf: FixedBuf,
+    prepared_transaction_snapshot: FixedVec<crate::storage::PreparedTransactionCatalogEntry>,
     manifest_etag: Option<EntityTag>,
     manifest_present: bool,
     manifest_lsn: u64,
@@ -1099,6 +1100,8 @@ impl Checkpointer {
             + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
             + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table)
             + config.table_rows * core::mem::size_of::<u64>()
+            + config.max_prepared_transactions
+                * core::mem::size_of::<crate::storage::PreparedTransactionCatalogEntry>()
             + table_bookkeeping
             + (2usize.saturating_mul(table_capacity) + 1)
                 .saturating_mul(config.max_spill_generations_per_table)
@@ -1691,6 +1694,12 @@ impl Checkpointer {
             doomed_blocks: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             manifest_buf: FixedBuf::new(budget, "manifest_buf", manifest_capacity)
                 .map_err(CheckpointSetupError::Budget)?,
+            prepared_transaction_snapshot: FixedVec::new(
+                budget,
+                "checkpoint prepared transaction snapshot",
+                config.max_prepared_transactions,
+            )
+            .map_err(CheckpointSetupError::Budget)?,
             manifest_etag: None,
             manifest_present: false,
             manifest_lsn: 0,
@@ -2628,6 +2637,7 @@ impl Checkpointer {
         let mut latest_transaction_id = None;
         let mut saw_large_object_allocator = false;
         let mut database_identities = Vec::with_capacity(storage.database_count());
+        let mut system_setting_names = Vec::with_capacity(crate::storage::MAX_SYSTEM_SETTINGS);
         // manifest table index → live slot index
         let mut slot_of: Vec<Option<usize>> = Vec::new();
         // (mindex, def, cols_seen, per-column sequence positions)
@@ -3735,11 +3745,20 @@ impl Checkpointer {
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid sset record"));
                     }
+                    let name = sql_name(&name)?;
+                    if system_setting_names.contains(&name) {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate system setting record",
+                        ));
+                    }
+                    if system_setting_names.len() == crate::storage::MAX_SYSTEM_SETTINGS {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "too many system setting records",
+                        ));
+                    }
+                    system_setting_names.push(name);
                     storage
-                        .install_system_setting(
-                            sql_name(&name)?,
-                            Some(crate::util::StackStr::from_str(&value)),
-                        )
+                        .install_system_setting(name, Some(crate::util::StackStr::from_str(&value)))
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest system setting rejected: {}",
@@ -8222,7 +8241,8 @@ impl Checkpointer {
                 format_args!("sset {} {}", name.as_str(), value.as_str()),
             )?;
         }
-        for prepared in storage.prepared_transaction_catalog() {
+        storage.copy_prepared_transaction_catalog(&mut self.prepared_transaction_snapshot)?;
+        for prepared in self.prepared_transaction_snapshot.iter() {
             use core::fmt::Write;
             let mut owner = StackStr::<130>::new();
             for byte in storage
@@ -17160,7 +17180,7 @@ mod stored_dependency_tests {
     use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependencies};
 
     #[test]
-    fn manifest_database_duplicates_reject_before_replacement() {
+    fn manifest_catalog_duplicates_reject_before_replacement() {
         let result = std::thread::Builder::new()
             .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
             .spawn(|| {
@@ -17180,6 +17200,7 @@ mod stored_dependency_tests {
                 config.txn_rows = 128;
                 config.value_index_rows = 512;
                 config.max_value_indexes = 8;
+                config.max_prepared_transactions = 2;
                 let bytes = config.memtable_bytes
                     + Storage::extra_budget_bytes(&config)
                     + Checkpointer::budget_bytes(&config)
@@ -17214,6 +17235,31 @@ mod stored_dependency_tests {
                         assert!(storage.database_named(second_name, 0).is_none());
                     }
                 }
+                {
+                    let mut budget = Budget::new(bytes);
+                    let mut storage = Storage::new(&config, &mut budget).unwrap();
+                    let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+                    assert!(matches!(checkpointer.load_manifest_text(&mut storage,
+                        "pos3ql-manifest-v14\nlsn 0\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\nend\n"),
+                        Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
+                    assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
+                        .value.as_str(), "first");
+                }
+                for (transaction_id, gid) in [(10, "7365636f6e64"), (11, "6669727374")] {
+                    let mut budget = Budget::new(bytes);
+                    let mut storage = Storage::new(&config, &mut budget).unwrap();
+                    let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+                    let manifest = format!("pos3ql-manifest-v14\nlsn 0\nptx 10 1 2 0 5 706f737467726573 6669727374\nptx {transaction_id} 1 2 0 5 706f737467726573 {gid}\nend\n");
+                    match checkpointer.load_manifest_text(&mut storage, &manifest) {
+                        Err(CheckpointSetupError::ObjectStore(message)) => {
+                            assert!(message.contains("duplicate prepared transaction catalog identity"));
+                        }
+                        other => panic!("expected duplicate prepared transaction rejection: {other:?}"),
+                    }
+                    assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries.len()), 1);
+                    assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries[0].gid)
+                        .as_str(), "first");
+                }
                 std::fs::remove_dir_all(&config.data_dir).unwrap();
                 crate::object_store::sim::drop_namespace(&config.object_store_bucket);
             })
@@ -17228,6 +17274,13 @@ mod stored_dependency_tests {
     fn checkpoint_maintenance_capacities_are_exactly_budgeted() {
         let base = Config::default_dev();
         let base_bytes = Checkpointer::budget_bytes(&base);
+
+        let mut prepared = base.clone();
+        prepared.max_prepared_transactions += 1;
+        assert_eq!(
+            Checkpointer::budget_bytes(&prepared) - base_bytes,
+            core::mem::size_of::<crate::storage::PreparedTransactionCatalogEntry>()
+        );
 
         let mut commit = base.clone();
         commit.checkpoint_commit_batches += 1;

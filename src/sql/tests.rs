@@ -7,6 +7,115 @@
 use super::*;
 
 #[test]
+fn cluster_metadata_reload_applies_one_owned_settings_image() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ActiveSystemSettings>();
+    let settings = ActiveSystemSettings::new([None; crate::storage::MAX_SYSTEM_SETTINGS]);
+    let names = [
+        SqlName::parse("statement_timeout").unwrap(),
+        SqlName::parse("lock_timeout").unwrap(),
+    ];
+    let barrier = std::sync::Barrier::new(5);
+    let guc = GucState::new();
+    std::thread::scope(|scope| {
+        for worker in 0..4 {
+            let settings = &settings;
+            let barrier = &barrier;
+            let names = &names;
+            scope.spawn(move || {
+                barrier.wait();
+                crate::mem::guard::forbid_alloc(|| {
+                    for iteration in 0..16 {
+                        use core::fmt::Write;
+                        let mut value = crate::util::StackStr::new();
+                        write!(value, "{}", worker * 100 + iteration + 1).unwrap();
+                        let mut image = [None; crate::storage::MAX_SYSTEM_SETTINGS];
+                        for (index, &name) in names.iter().enumerate() {
+                            image[index] = Some(ActiveSystemSetting { name, value });
+                        }
+                        settings.replace(image);
+                    }
+                });
+            });
+        }
+        barrier.wait();
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..256 {
+                settings.apply(&guc).unwrap();
+                assert_eq!(
+                    guc.get_owned("statement_timeout"),
+                    guc.get_owned("lock_timeout")
+                );
+                std::thread::yield_now();
+            }
+        });
+    });
+    crate::mem::guard::forbid_alloc(|| {
+        assert!(settings.take_reload());
+        assert!(!settings.take_reload());
+        settings.replace([None; crate::storage::MAX_SYSTEM_SETTINGS]);
+        settings.apply(&guc).unwrap();
+        assert_eq!(guc.get_owned("statement_timeout").unwrap().as_str(), "0");
+        assert_eq!(guc.get_owned("lock_timeout").unwrap().as_str(), "0");
+    });
+}
+
+#[test]
+fn cluster_metadata_preparing_transactions_stay_private_until_finalized() {
+    let mut config = test_config("prepared-publication");
+    config.max_prepared_transactions = 2;
+    let mut budget = Budget::new(two_phase::PreparedTransactions::budget_bytes(&config));
+    let mut prepared = two_phase::PreparedTransactions::new(&config, &mut budget).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let gid = ast::PreparedTransactionId::parse("preparing").unwrap();
+        let metadata = two_phase::PreparedTransactionMetadata {
+            gid,
+            transaction_id: 10,
+            owner: 0,
+            database: crate::storage::DatabaseOid::POSTGRES,
+            prepared_at: 0,
+            first_lsn: 0,
+            prepared_lsn: 0,
+        };
+        let slot = prepared.reserve(metadata).unwrap().unwrap();
+        assert_eq!(prepared.find(gid), Some(slot));
+        assert_eq!(prepared.entries().count(), 1);
+        assert_eq!(prepared.catalog_entries().count(), 0);
+        assert_eq!(
+            prepared.reserve(metadata).unwrap_err().sqlstate,
+            sqlstate::DUPLICATE_OBJECT
+        );
+        prepared.set_lsn_range(slot, 1, 2);
+        assert_eq!(prepared.catalog_entries().count(), 1);
+        assert_eq!(prepared.catalog_entries().next().unwrap().1.first_lsn, 1);
+        assert_eq!(prepared.catalog_entries().next().unwrap().1.prepared_lsn, 2);
+        prepared.release(slot);
+        assert_eq!(prepared.catalog_entries().count(), 0);
+        let recovered = two_phase::PreparedTransactionMetadata {
+            first_lsn: 3,
+            prepared_lsn: 4,
+            ..metadata
+        };
+        prepared.reserve(recovered).unwrap().unwrap();
+        assert_eq!(prepared.catalog_entries().count(), 1);
+        for (first_lsn, prepared_lsn) in [(0, 1), (2, 0), (2, 1)] {
+            let invalid = two_phase::PreparedTransactionMetadata {
+                first_lsn,
+                prepared_lsn,
+                transaction_id: 12,
+                gid: ast::PreparedTransactionId::parse("invalid").unwrap(),
+                ..metadata
+            };
+            assert_eq!(
+                prepared.reserve(invalid).unwrap_err().sqlstate,
+                sqlstate::INVALID_PARAMETER_VALUE
+            );
+            assert_eq!(prepared.catalog_entries().next().unwrap().1, recovered);
+        }
+    });
+}
+
+#[test]
 fn engine_ownership_is_thread_transferable() {
     let (engine, budget) = test_engine();
     std::thread::spawn(move || {
@@ -5560,6 +5669,7 @@ fn unassigned_wal_transactions_stay_full_xid_gaps_after_cold_recovery() {
 #[test]
 fn prepare_transaction_is_strictly_configured_and_eligible() {
     assert!(ast::PreparedTransactionId::parse("").is_some());
+    assert!(ast::PreparedTransactionId::parse("invalid\0gid").is_none());
     assert!(ast::PreparedTransactionId::parse(&"g".repeat(199)).is_some());
     assert!(ast::PreparedTransactionId::parse(&"g".repeat(200)).is_none());
 

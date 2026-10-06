@@ -52,6 +52,9 @@ impl PreparedTransactionId {
     pub const EMPTY: Self = Self(StackStr::new());
 
     pub fn parse(value: &str) -> Option<Self> {
+        if value.as_bytes().contains(&0) {
+            return None;
+        }
         let value = StackStr::from_str(value);
         (!value.is_truncated()).then_some(Self(value))
     }

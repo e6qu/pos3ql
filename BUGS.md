@@ -1077,5 +1077,40 @@ readers exercising nested resolution and statistics reset. Partial-clone
 exhaustion verifies both cloned catalog cleanup and preservation of the source.
 No external blocker remains.
 
+The cluster metadata audit found RESET checked absence outside publication and
+could ignore a pending concurrent SET. Name reservation and the missing-setting
+result now share one guard. RESET ALL retained reusable slot numbers; it now
+retains owned names. Recovery also allowed repeated system-setting records to
+replace earlier values and accepted duplicate prepared GIDs or transaction
+identities. Parsing and prepared-catalog validation reject these before mutation.
+Replay cannot overwrite an unresolved pending setting, and truncated setting
+values fail before publication. Prepared-catalog replacement stages a complete
+bounded candidate, so exhaustion or invalid metadata preserves the prior image.
+Preparing reservations remain private until a typed transition installs the
+final WAL range; recovery rejects partially initialized ranges.
+Owned statement and checkpoint snapshots release guards before nested reads.
+Active defaults and reload notification publish together; applying defaults
+copies one image before updating connection-local settings. Concurrent,
+allocation-free publication and snapshot regressions cover these paths.
+
+The prepared identifier audit found escape strings accepted zero bytes and
+silently stripped hexadecimal and Unicode escape prefixes. The decoder now
+handles these escapes and surrogate pairs in statement memory, rejects zero
+bytes and invalid UTF-8, and preserves encoding, Unicode escape, and syntax
+SQLSTATEs through parsing. Prepared identifiers also reject zero bytes at their
+constructor. Allocation-free lexer and parser fixtures and PostgreSQL
+differential queries cover the class. Semantics follow PostgreSQL 18's
+[scanner](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/scan.l).
+The remaining table-boundary audit also found name reservation scanned pending
+creates and renames in other databases. It now filters database identity before
+checking either name, with an allocation-free regression that preserves local
+reservation and allows the same name in another database.
+Fresh table allocation also published a retained identity before fallible value-
+cache initialization. The shared allocation path now builds the cache before
+returning or rebinding dependencies, and clears the rejected identity, ownership,
+and partial cache on error. Replay and transactional-create regressions exhaust
+the pool after one successful acquire, preserve an existing table, and reuse the
+rejected slot and released cache capacity.
+
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

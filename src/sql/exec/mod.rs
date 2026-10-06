@@ -7025,14 +7025,9 @@ fn stage_system_setting(
     name: SqlName,
     value: Option<crate::util::StackStr<{ crate::storage::ROLE_SETTING_VALUE_MAX }>>,
 ) -> Result<(), SqlError> {
-    if value.is_none()
-        && !storage
-            .system_settings()
-            .any(|(_, setting)| setting.visible_to(txn.txid) && setting.name == name)
-    {
+    let Some((slot, prior)) = storage.change_system_setting(name, value, txn.txid)? else {
         return Ok(());
-    }
-    let (slot, prior) = storage.change_system_setting(name, value, txn.txid)?;
+    };
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage(
         txn.txid,
@@ -7115,17 +7110,16 @@ pub fn alter_system(
             }
         }
         (None, None) => {
-            let mut targets = [usize::MAX; crate::storage::MAX_SYSTEM_SETTINGS];
+            let mut targets = [SqlName::EMPTY; crate::storage::MAX_SYSTEM_SETTINGS];
             let mut count = 0;
-            for (slot, setting) in storage.system_settings() {
+            for (_, setting) in storage.system_settings() {
                 if setting.visible_to(txn.txid) {
-                    targets[count] = slot;
+                    targets[count] = setting.name;
                     count += 1;
                 }
             }
-            for slot in &targets[..count] {
-                let setting = *storage.system_setting(*slot);
-                if let Err(error) = stage_system_setting(storage, wal, txn, setting.name, None) {
+            for &name in &targets[..count] {
+                if let Err(error) = stage_system_setting(storage, wal, txn, name, None) {
                     return sql_fail(error);
                 }
             }

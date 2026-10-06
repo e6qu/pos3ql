@@ -12969,6 +12969,7 @@ impl PreparedTransactionCatalog {
             || entry.first_lsn == 0
             || entry.prepared_lsn < entry.first_lsn
             || entry.gid.is_truncated()
+            || entry.gid.as_str().as_bytes().contains(&0)
         {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
@@ -52890,8 +52891,12 @@ mod tests {
                 .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(tiny_snapshot.len(), 1);
             assert_eq!(tiny_snapshot[0], initial[0]);
+            let oversized_gid = [b'x'; 200];
+            let oversized_gid = core::str::from_utf8(&oversized_gid).unwrap();
             for invalid in [test_prepared_catalog_entry(0, "invalid", 1),
-                test_prepared_catalog_entry(12, "invalid", 0)] {
+                test_prepared_catalog_entry(12, "invalid", 0),
+                test_prepared_catalog_entry(12, "invalid\0gid", 1),
+                test_prepared_catalog_entry(12, oversized_gid, 1)] {
                 assert_eq!(storage.replace_prepared_transaction_catalog([invalid])
                     .unwrap_err().sqlstate, sqlstate::INVALID_PARAMETER_VALUE);
                 assert_eq!(storage.install_prepared_transaction_catalog_entry(invalid)
@@ -52902,6 +52907,26 @@ mod tests {
             assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries.len()), 0);
             storage.install_prepared_transaction_catalog_entry(initial[0]).unwrap();
             assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries[0]), initial[0]);
+        });
+    }
+
+    #[test]
+    fn cluster_metadata_disabled_prepared_catalog_rejects_publication() {
+        let mut config = test_config();
+        config.max_prepared_transactions = 0;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let entry = test_prepared_catalog_entry(10, "disabled", 1);
+            assert_eq!(storage.replace_prepared_transaction_catalog([entry])
+                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.install_prepared_transaction_catalog_entry(entry)
+                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries.len()), 0);
+            let catalog = storage.prepared_transactions.lock().unwrap();
+            assert_eq!(catalog.entries.capacity(), 0);
+            assert_eq!(catalog.candidate.capacity(), 0);
+            assert!(catalog.candidate.is_empty());
         });
     }
 

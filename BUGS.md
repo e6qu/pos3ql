@@ -11,7 +11,8 @@ obsolete plan references, duplicated progress histories, and ambiguous status
 and qualification language. Failed replacement guidance now requires validated
 writer ownership. Release documentation preserves its relative link layout and
 CI checks source and packaged destinations. These corrections introduce no
-deferred bug.
+deferred bug. The no-op guard's obsolete debt-exemption guidance was removed;
+its accepted source remains unchanged from the former zero-debt budget.
 Resolved investigations remain available in the
 [historical record](docs/history/README.md).
 

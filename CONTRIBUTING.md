@@ -48,8 +48,8 @@ Protect the interactive machine. Full builds, full test gates, and large
 benchmark/evidence regeneration run on GitHub runners. Local work is serial,
 low priority, and monitored: preserve at least 64 GiB free disk, keep generated
 `target` data below 2 GiB, and keep each workload at or below 1 GiB sampled
-aggregate RSS with a 180-second deadline. Use the provided resource guard for
-local fun-refactor invocations and checks. If it refuses or a limit is reached,
+aggregate RSS with a 180-second deadline. Use the workspace's provided resource
+guard for local checks. If it refuses or a limit is reached,
 move the workload to CI; do not bypass the guard or raise limits automatically.
 
 On a suitable dedicated runner, a focused regression can be selected with:

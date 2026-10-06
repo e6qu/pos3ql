@@ -467,6 +467,8 @@ SQLSTATEs at the parse boundary. Allocation-free fixtures and differential
 queries cover valid decoding and rejection.
 Table name reservation now scopes pending creates and renames to their database;
 the table definition and row mutation synchronization work remains outstanding.
+Fresh table allocation validates value-cache capacity before returning and
+cleans rejected identities and partial caches for replay and transactional DDL.
 
 Next, synchronize table definitions and row mutation state. Preserve transaction publication and
 response barriers when replacing the reactor's local queue drain with fixed

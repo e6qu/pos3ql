@@ -34347,6 +34347,14 @@ impl Storage {
         table.n_spill_ssts = 0;
         let schema = table.def.schema;
         let name = table.def.name;
+        if let Err(error) = self.refresh_enforcers(slot) {
+            self.rollback_create(slot);
+            let table = &mut self.tables[slot];
+            table.def = TableDef::empty();
+            table.ownership = Ownership::BOOTSTRAP;
+            table.created_at = 0;
+            return Err(error);
+        }
         self.rename_stored_query_dependency(DependencyClass::Table, slot, None, schema, name);
         Ok(slot)
     }
@@ -34487,9 +34495,6 @@ impl Storage {
         // the enum has itself been loaded (WAL/checkpoint order guarantees it).
         self.bind_user_type_columns(&mut def)?;
         let slot = self.alloc_table(def, None)?;
-        // Build the (empty) enforcers now; replay repopulates them once its rows
-        // are applied (see the rebuild in Engine startup).
-        self.refresh_enforcers(slot)?;
         Ok(slot)
     }
 
@@ -34610,9 +34615,6 @@ impl Storage {
         if def.persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
         }
-        // Build the enforcers now (fallible pool acquire surfaces at CREATE, not
-        // at commit); this transaction's inserts maintain them at commit.
-        self.refresh_enforcers(slot)?;
         Ok(slot)
     }
 
@@ -52805,6 +52807,48 @@ mod tests {
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
+        });
+    }
+
+    #[test]
+    fn cluster_metadata_failed_table_creation_releases_identity_and_value_bindings() {
+        let mut config = test_config();
+        config.max_value_indexes = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut retained = make_def("retained", &[("id", ColType::Int4, true)]);
+        retained.columns[0].unique = true;
+        let retained_slot = storage.create_table(retained).unwrap();
+        let mut rejected = make_def("rejected", &[("a", ColType::Int4, true), ("b", ColType::Int4, true)]);
+        rejected.columns[0].unique = true;
+        rejected.columns[1].unique = true;
+        crate::mem::guard::forbid_alloc(|| {
+            let slot = storage.tables.iter().position(Table::is_free).unwrap();
+            for owner in [None, Some(7)] {
+                let result = match owner {
+                    None => storage.create_table(rejected),
+                    Some(txid) => storage.create_table_in(rejected, txid),
+                };
+                assert_eq!(result.unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert!(storage.find_visible("public", "rejected", owner.unwrap_or(0)).is_none());
+                let rejected = &storage.tables[slot];
+                assert!(rejected.is_free());
+                assert_eq!(rejected.def.name, SqlName::EMPTY);
+                assert_eq!(rejected.def.n_columns, 0);
+                assert_eq!(rejected.created_at, 0);
+                assert_eq!(rejected.ownership.owner, Ownership::BOOTSTRAP.owner);
+                assert!(rejected.ownership.pending.is_none());
+                assert!(rejected.pending_ddl.is_none());
+                assert_eq!(rejected.n_enforcers, 0);
+                assert!(rejected.enforcers.iter().all(Option::is_none));
+                assert_eq!(storage.tables[retained_slot].n_enforcers, 1);
+                let mut replacement = retained;
+                replacement.name = SqlName::parse("replacement").unwrap();
+                let reused = storage.create_table_in(replacement, 8).unwrap();
+                assert_eq!(reused, slot);
+                assert_eq!(storage.tables[reused].n_enforcers, 1);
+                storage.rollback_create(reused);
+            }
         });
     }
 

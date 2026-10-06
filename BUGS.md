@@ -1105,6 +1105,12 @@ The remaining table-boundary audit also found name reservation scanned pending
 creates and renames in other databases. It now filters database identity before
 checking either name, with an allocation-free regression that preserves local
 reservation and allows the same name in another database.
+Fresh table allocation also published a retained identity before fallible value-
+cache initialization. The shared allocation path now builds the cache before
+returning or rebinding dependencies, and clears the rejected identity, ownership,
+and partial cache on error. Replay and transactional-create regressions exhaust
+the pool after one successful acquire, preserve an existing table, and reuse the
+rejected slot and released cache capacity.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

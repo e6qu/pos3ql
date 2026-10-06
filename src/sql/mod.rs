@@ -5101,7 +5101,7 @@ impl Engine {
             if !self.storage.table(i).visible_to(txn.txid) {
                 continue;
             }
-            let def = *self.storage.table_def(i, txn.txid);
+            let def = self.storage.table_def(i, txn.txid);
             if def.persistence == crate::storage::RelationPersistence::Temporary {
                 continue;
             }
@@ -5110,8 +5110,9 @@ impl Engine {
             };
             let name = def.name;
             let schema = def.schema;
-            for (c, &last) in serial_values.iter().enumerate().take(def.n_columns) {
-                if !def.columns()[c].auto_increment {
+            let n_columns = def.n_columns;
+            for (c, &last) in serial_values.iter().enumerate().take(n_columns) {
+                if !self.storage.table_def(i, txn.txid).columns()[c].auto_increment {
                     continue;
                 }
                 let lsn = self.storage.lsn() + 1;
@@ -19258,11 +19259,15 @@ fn replay_transaction_batches(
                             column,
                             last,
                         } => {
-                            if let Some(table_slot) = storage.find_table(schema, table)
-                                && usize::from(column) < crate::storage::MAX_COLUMNS
-                            {
-                                storage.replay_table_serial_value(table_slot, usize::from(column), last);
-                            }
+                            let table_slot = storage.find_visible(schema, table, transaction_id)
+                                .ok_or_else(|| sql_err!(
+                                    sqlstate::UNDEFINED_TABLE,
+                                    "journal sets a sequence of unknown table \"{}\"",
+                                    table
+                                ))?;
+                            storage.replay_table_serial_value(
+                                table_slot, usize::from(column), last, transaction_id,
+                            )?;
                         }
                         WalOp::SequenceAdvance {
                             schema,
@@ -19994,9 +19999,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     ),
                 });
             };
-            if (column as usize) < crate::storage::MAX_COLUMNS {
-                storage.replay_table_serial_value(index, column as usize, last);
-            }
+            storage.replay_table_serial_value(index, column as usize, last, 0)?;
         }
         WalOp::Analyze {
             schema,

@@ -28574,7 +28574,8 @@ impl Storage {
             for c in 0..n_columns {
                 if auto[c] {
                     let prior = self.table_serial_value(i, c);
-                    self.replay_table_serial_value(i, c, prior.max(max[c]));
+                    self.replay_table_serial_value(i, c, prior.max(max[c]), 0)
+                        .expect("recovered serial column exists");
                 }
             }
         }
@@ -34180,13 +34181,27 @@ impl Storage {
         }
     }
 
-    pub(crate) fn replay_table_serial_value(&mut self, index: usize, column: usize, value: i64) {
+    pub(crate) fn replay_table_serial_value(
+        &mut self,
+        index: usize,
+        column: usize,
+        value: i64,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if column >= self.table_def(index, txid).n_columns {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "journal serial column {} is outside the table definition",
+                column
+            ));
+        }
         let serial = self.tables[index]
             .serial
             .get_mut()
             .expect("table serial state lock poisoned");
         serial.values[column] = value;
         serial.staged_by = None;
+        Ok(())
     }
 
     pub(crate) fn install_table_serial_values(&mut self, index: usize, values: [i64; MAX_COLUMNS]) {
@@ -54510,7 +54525,7 @@ mod tests {
             storage.set_table_serial_value(replacement, 0, 3);
             storage.stage_table_serial_values(replacement, 11).unwrap();
             storage.acknowledge_table_serial_values(replacement, 10);
-            storage.replay_table_serial_value(replacement, 0, 6);
+            storage.replay_table_serial_value(replacement, 0, 6, 0).unwrap();
             storage.acknowledge_table_serial_values(replacement, 11);
             assert_eq!(storage.stage_table_serial_values(replacement, 12).unwrap()[0], 6);
             storage.install_table_serial_values(replacement, [14; MAX_COLUMNS]);
@@ -54554,9 +54569,16 @@ mod tests {
         });
         storage.install_table_serial_values(table, [19; MAX_COLUMNS]);
         assert!(storage.stage_table_serial_values(table, 12).is_none());
-        storage.replay_table_serial_value(table, 0, 25);
+        storage.replay_table_serial_value(table, 0, 25, 0).unwrap();
         assert_eq!(storage.table_serial_value(table, 0), 25);
         assert!(storage.stage_table_serial_values(table, 12).is_none());
+        for column in [1, MAX_COLUMNS, usize::MAX] {
+            assert_eq!(
+                storage.replay_table_serial_value(table, column, 99, 0).unwrap_err().sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+        }
+        assert_eq!(storage.table_serial_value(table, 0), 25);
     }
 
     fn make_def(name: &str, columns: &[(&str, ColType, bool)]) -> TableDef {

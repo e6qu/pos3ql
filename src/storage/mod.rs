@@ -14899,7 +14899,8 @@ impl Storage {
                     .saturating_add(transaction.idx_tup_fetch);
                 if let Some(database_slot) = self
                     .database_catalog()
-                    .definitions.iter()
+                    .definitions
+                    .iter()
                     .position(|database| database.oid == self.tables[table].database)
                 {
                     let database = &mut databases[database_slot];
@@ -14978,7 +14979,8 @@ impl Storage {
                         relation.n_ins_since_vacuum.saturating_add(n_tup_ins);
                     if let Some(database_slot) = self
                         .database_catalog()
-                        .definitions.iter()
+                        .definitions
+                        .iter()
                         .position(|database| database.oid == self.tables[table].database)
                     {
                         let database = &mut databases[database_slot];
@@ -15075,7 +15077,8 @@ impl Storage {
             }
             if let Some(database_slot) = self
                 .database_catalog()
-                .definitions.iter()
+                .definitions
+                .iter()
                 .position(|database| database.oid == self.tables[table].database)
             {
                 let database = &mut databases[database_slot];

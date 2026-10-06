@@ -1101,6 +1101,10 @@ SQLSTATEs through parsing. Prepared identifiers also reject zero bytes at their
 constructor. Allocation-free lexer and parser fixtures and PostgreSQL
 differential queries cover the class. Semantics follow PostgreSQL 18's
 [scanner](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/scan.l).
+The remaining table-boundary audit also found name reservation scanned pending
+creates and renames in other databases. It now filters database identity before
+checking either name, with an allocation-free regression that preserves local
+reservation and allows the same name in another database.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

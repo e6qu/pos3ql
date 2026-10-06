@@ -34621,6 +34621,7 @@ impl Storage {
         self.tables
             .iter()
             .enumerate()
+            .filter(|(_, table)| table.database == current_database())
             .filter(|(index, table)| {
                 (table.def.schema.as_str() == schema && table.def.name.as_str() == name)
                     || self.pending_table_def(*index).is_some_and(|pending| {
@@ -52804,6 +52805,35 @@ mod tests {
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
+        });
+    }
+
+    #[test]
+    fn cluster_metadata_table_names_reserve_only_within_their_database() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let foreign = storage
+                .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 7)
+                .unwrap();
+            storage.tables[foreign].database = DatabaseOid::TEMPLATE1;
+            let local = storage
+                .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 8)
+                .unwrap();
+            assert_eq!(storage.ddl_name_locked_by_other("public", "reserved", 9), Some(8));
+            storage.rollback_create(local);
+            assert_eq!(storage.ddl_name_locked_by_other("public", "reserved", 9), None);
+            storage.commit_create(foreign);
+            let mut renamed = storage.tables[foreign].def;
+            renamed.name = SqlName::parse("pending_name").unwrap();
+            storage.write_table_def(foreign, 7, renamed, &[None; MAX_COLUMNS], false).unwrap();
+            assert_eq!(storage.ddl_name_locked_by_other("public", "pending_name", 9), None);
+            let local = storage
+                .create_table_in(make_def("pending_name", &[("id", ColType::Int4, true)]), 9)
+                .unwrap();
+            assert_eq!(storage.ddl_name_locked_by_other("public", "pending_name", 10), Some(9));
+            storage.rollback_create(local);
         });
     }
 

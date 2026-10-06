@@ -7251,7 +7251,8 @@ impl Engine {
                 column,
                 prior,
             } => {
-                self.storage.set_table_serial_value(table as usize, column as usize, prior);
+                self.storage
+                    .set_table_serial_value(table as usize, column as usize, prior);
             }
             DdlUndo::OwnedSequenceReset { sequence, prior } => {
                 self.storage
@@ -19259,14 +19260,20 @@ fn replay_transaction_batches(
                             column,
                             last,
                         } => {
-                            let table_slot = storage.find_visible(schema, table, transaction_id)
-                                .ok_or_else(|| sql_err!(
-                                    sqlstate::UNDEFINED_TABLE,
-                                    "journal sets a sequence of unknown table \"{}\"",
-                                    table
-                                ))?;
+                            let table_slot = storage
+                                .find_visible(schema, table, transaction_id)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_TABLE,
+                                        "journal sets a sequence of unknown table \"{}\"",
+                                        table
+                                    )
+                                })?;
                             storage.replay_table_serial_value(
-                                table_slot, usize::from(column), last, transaction_id,
+                                table_slot,
+                                usize::from(column),
+                                last,
+                                transaction_id,
                             )?;
                         }
                         WalOp::SequenceAdvance {

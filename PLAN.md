@@ -43,7 +43,7 @@ is not proof that the production topology or its performance is complete.
 ### 1. Table definitions and row mutation
 
 Synchronize table identity, ownership, transaction-visible definition versions,
-row state, statistics, serial state, and physical maintenance. Readers must keep
+row state, statistics, and physical maintenance. Readers must keep
 consistent definition images without copying a wide definition for each row.
 Publication, rollback, slot retirement, template cloning, and recovery must use
 one coherent lifecycle and release guards before nested catalog resolution.

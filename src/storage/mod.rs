@@ -19862,7 +19862,10 @@ impl Storage {
                     target_table.created_at = created_at;
                     target_table.ownership = ownership;
                     target_table.statistics = statistics;
-                    *target_table.serial.get_mut().expect("table serial state lock poisoned") = TableSerialState {
+                    *target_table
+                        .serial
+                        .get_mut()
+                        .expect("table serial state lock poisoned") = TableSerialState {
                         values: serial_values,
                         ..TableSerialState::EMPTY
                     };
@@ -34479,7 +34482,10 @@ impl Storage {
         table.statistics_wal_dirty = false;
         // A reused slot must not inherit the dropped table's sequences or
         // spilled rows.
-        *table.serial.get_mut().expect("table serial state lock poisoned") = TableSerialState::EMPTY;
+        *table
+            .serial
+            .get_mut()
+            .expect("table serial state lock poisoned") = TableSerialState::EMPTY;
         table.spill_ssts.fill(None);
         table.spill_through_lsn.fill(0);
         table.n_spill_ssts = 0;
@@ -54459,14 +54465,19 @@ mod tests {
                             let value = storage
                                 .next_table_serial_value(table, 0, 1, ColType::Int8)
                                 .unwrap();
-                            assert!(!seen[value as usize - 1]
-                                .swap(true, std::sync::atomic::Ordering::Relaxed));
+                            assert!(
+                                !seen[value as usize - 1]
+                                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                            );
                         }
                     });
                 });
             }
         });
-        assert!(seen.iter().all(|value| value.load(std::sync::atomic::Ordering::Relaxed)));
+        assert!(
+            seen.iter()
+                .all(|value| value.load(std::sync::atomic::Ordering::Relaxed))
+        );
         assert_eq!(storage.table_serial_value(table, 0), 256);
     }
 
@@ -54483,7 +54494,9 @@ mod tests {
             storage.set_table_serial_value(table, 0, 7);
             let captured = storage.stage_table_serial_values(table, 10).unwrap();
             assert_eq!(captured[0], 7);
-            storage.next_table_serial_value(table, 0, 1, ColType::Int8).unwrap();
+            storage
+                .next_table_serial_value(table, 0, 1, ColType::Int8)
+                .unwrap();
             storage.acknowledge_table_serial_values(table, 10);
             assert_eq!(storage.stage_table_serial_values(table, 11).unwrap()[0], 8);
             assert_eq!(captured[0], 7);
@@ -54525,9 +54538,14 @@ mod tests {
             storage.set_table_serial_value(replacement, 0, 3);
             storage.stage_table_serial_values(replacement, 11).unwrap();
             storage.acknowledge_table_serial_values(replacement, 10);
-            storage.replay_table_serial_value(replacement, 0, 6, 0).unwrap();
+            storage
+                .replay_table_serial_value(replacement, 0, 6, 0)
+                .unwrap();
             storage.acknowledge_table_serial_values(replacement, 11);
-            assert_eq!(storage.stage_table_serial_values(replacement, 12).unwrap()[0], 6);
+            assert_eq!(
+                storage.stage_table_serial_values(replacement, 12).unwrap()[0],
+                6
+            );
             storage.install_table_serial_values(replacement, [14; MAX_COLUMNS]);
             storage.acknowledge_table_serial_values(replacement, 12);
             assert_eq!(storage.table_serial_value(replacement, 0), 14);
@@ -54553,7 +54571,10 @@ mod tests {
                     storage.set_table_serial_value(table, 0, value);
                     storage.stage_table_serial_values(table, 10).unwrap();
                     assert_eq!(
-                        storage.next_table_serial_value(table, 0, step, ctype).unwrap_err().sqlstate,
+                        storage
+                            .next_table_serial_value(table, 0, step, ctype)
+                            .unwrap_err()
+                            .sqlstate,
                         sqlstate::NUMERIC_OUT_OF_RANGE
                     );
                     assert_eq!(storage.table_serial_value(table, 0), value);
@@ -54562,7 +54583,10 @@ mod tests {
                 }
             }
             assert_eq!(
-                storage.next_table_serial_value(table, 0, 1, ColType::Text).unwrap_err().sqlstate,
+                storage
+                    .next_table_serial_value(table, 0, 1, ColType::Text)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::DATATYPE_MISMATCH
             );
             assert_eq!(storage.table_serial_value(table, 0), i64::MAX);
@@ -54574,7 +54598,10 @@ mod tests {
         assert!(storage.stage_table_serial_values(table, 12).is_none());
         for column in [1, MAX_COLUMNS, usize::MAX] {
             assert_eq!(
-                storage.replay_table_serial_value(table, column, 99, 0).unwrap_err().sqlstate,
+                storage
+                    .replay_table_serial_value(table, column, 99, 0)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::INTERNAL_ERROR
             );
         }

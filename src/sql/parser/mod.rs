@@ -8866,7 +8866,10 @@ mod tests {
         for (sql, state) in [
             (r"SELECT E'\000'", sqlstate::CHARACTER_NOT_IN_REPERTOIRE),
             (r"SELECT E'\xff'", sqlstate::CHARACTER_NOT_IN_REPERTOIRE),
-            (r"PREPARE TRANSACTION E'\x00'", sqlstate::CHARACTER_NOT_IN_REPERTOIRE),
+            (
+                r"PREPARE TRANSACTION E'\x00'",
+                sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+            ),
             (r"COMMIT PREPARED E'\u0'", sqlstate::INVALID_ESCAPE_SEQUENCE),
             (r"ROLLBACK PREPARED E'\U00110000'", sqlstate::SYNTAX_ERROR),
             (r"SELECT E'\uD800'", sqlstate::SYNTAX_ERROR),

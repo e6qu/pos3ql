@@ -52819,7 +52819,10 @@ mod tests {
         let mut retained = make_def("retained", &[("id", ColType::Int4, true)]);
         retained.columns[0].unique = true;
         let retained_slot = storage.create_table(retained).unwrap();
-        let mut rejected = make_def("rejected", &[("a", ColType::Int4, true), ("b", ColType::Int4, true)]);
+        let mut rejected = make_def(
+            "rejected",
+            &[("a", ColType::Int4, true), ("b", ColType::Int4, true)],
+        );
         rejected.columns[0].unique = true;
         rejected.columns[1].unique = true;
         crate::mem::guard::forbid_alloc(|| {
@@ -52829,8 +52832,15 @@ mod tests {
                     None => storage.create_table(rejected),
                     Some(txid) => storage.create_table_in(rejected, txid),
                 };
-                assert_eq!(result.unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-                assert!(storage.find_visible("public", "rejected", owner.unwrap_or(0)).is_none());
+                assert_eq!(
+                    result.unwrap_err().sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
+                assert!(
+                    storage
+                        .find_visible("public", "rejected", owner.unwrap_or(0))
+                        .is_none()
+                );
                 let rejected = &storage.tables[slot];
                 assert!(rejected.is_free());
                 assert_eq!(rejected.def.name, SqlName::EMPTY);
@@ -52865,18 +52875,32 @@ mod tests {
             let local = storage
                 .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 8)
                 .unwrap();
-            assert_eq!(storage.ddl_name_locked_by_other("public", "reserved", 9), Some(8));
+            assert_eq!(
+                storage.ddl_name_locked_by_other("public", "reserved", 9),
+                Some(8)
+            );
             storage.rollback_create(local);
-            assert_eq!(storage.ddl_name_locked_by_other("public", "reserved", 9), None);
+            assert_eq!(
+                storage.ddl_name_locked_by_other("public", "reserved", 9),
+                None
+            );
             storage.commit_create(foreign);
             let mut renamed = storage.tables[foreign].def;
             renamed.name = SqlName::parse("pending_name").unwrap();
-            storage.write_table_def(foreign, 7, renamed, &[None; MAX_COLUMNS], false).unwrap();
-            assert_eq!(storage.ddl_name_locked_by_other("public", "pending_name", 9), None);
+            storage
+                .write_table_def(foreign, 7, renamed, &[None; MAX_COLUMNS], false)
+                .unwrap();
+            assert_eq!(
+                storage.ddl_name_locked_by_other("public", "pending_name", 9),
+                None
+            );
             let local = storage
                 .create_table_in(make_def("pending_name", &[("id", ColType::Int4, true)]), 9)
                 .unwrap();
-            assert_eq!(storage.ddl_name_locked_by_other("public", "pending_name", 10), Some(9));
+            assert_eq!(
+                storage.ddl_name_locked_by_other("public", "pending_name", 10),
+                Some(9)
+            );
             storage.rollback_create(local);
         });
     }

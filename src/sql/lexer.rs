@@ -8,9 +8,9 @@
 //! Token text borrows from the query where possible and from the
 //! per-statement arena when unescaping or case-folding had to copy.
 
+use super::eval::sqlstate;
 use crate::mem::arena::{Arena, ArenaFull};
 use crate::util::StackStr;
-use super::eval::sqlstate;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Tok<'a> {
@@ -374,7 +374,8 @@ impl<'a> Lexer<'a> {
                         let mut value = 0u8;
                         let mut digits = 0;
                         while digits < 2 {
-                            let Some(digit) = bytes.get(i + 2 + digits).and_then(|b| hex_digit(*b)) else {
+                            let Some(digit) = bytes.get(i + 2 + digits).and_then(|b| hex_digit(*b))
+                            else {
                                 break;
                             };
                             value = value * 16 + digit;
@@ -390,7 +391,8 @@ impl<'a> Lexer<'a> {
                     if matches!(esc, b'u' | b'U') {
                         let (mut codepoint, mut next) = self.unicode_escape(bytes, i)?;
                         if (0xD800..=0xDBFF).contains(&codepoint) {
-                            let (low, end) = self.unicode_escape(bytes, next)
+                            let (low, end) = self
+                                .unicode_escape(bytes, next)
                                 .map_err(|_| self.surrogate_error(next))?;
                             if !(0xDC00..=0xDFFF).contains(&low) {
                                 return Err(self.surrogate_error(next));
@@ -400,12 +402,14 @@ impl<'a> Lexer<'a> {
                         } else if (0xDC00..=0xDFFF).contains(&codepoint) {
                             return Err(self.surrogate_error(i));
                         }
-                        let character = char::from_u32(codepoint).filter(|c| *c != '\0')
-                            .ok_or(LexError {
-                                at: i,
-                                message: "invalid Unicode escape value",
-                                kind: LexErrorKind::Syntax,
-                            })?;
+                        let character =
+                            char::from_u32(codepoint)
+                                .filter(|c| *c != '\0')
+                                .ok_or(LexError {
+                                    at: i,
+                                    message: "invalid Unicode escape value",
+                                    kind: LexErrorKind::Syntax,
+                                })?;
                         let mut encoded = [0u8; 4];
                         let encoded = character.encode_utf8(&mut encoded).as_bytes();
                         scratch[w..w + encoded.len()].copy_from_slice(encoded);
@@ -461,7 +465,9 @@ impl<'a> Lexer<'a> {
         };
         let mut value = 0u32;
         for offset in 0..digits {
-            let digit = bytes.get(at + 2 + offset).and_then(|b| hex_digit(*b))
+            let digit = bytes
+                .get(at + 2 + offset)
+                .and_then(|b| hex_digit(*b))
                 .ok_or(invalid)?;
             value = (value << 4) | u32::from(digit);
         }

@@ -1,243 +1,108 @@
 # PostgreSQL 18 compatibility
 
-PostgreSQL compatibility is a tested client boundary, not a claim that pos3ql
-contains PostgreSQL's server internals. The compatibility major is PostgreSQL
-18; the server currently reports 18.4, while the newly vendored upstream
-regression slice is pinned to 18.6 so stable-branch changes are tested rather
-than silently inherited from a developer machine. Older 18.4-derived fixtures
-retain their exact provenance. The command inventory, curated differential
-corpus, driver probes, and vendored upstream regression slices are ratchets:
-support exists only where
-the same operation returns compatible SQL, SQLSTATE, row shape, value, catalog
-metadata, and wire representation.
+Compatibility is verified at SQL, SQLSTATE, result shape/value, catalog, and
+wire boundaries. The server reports `18.4 (pos3ql 0.1)`; the vendored regression
+slice is pinned to PostgreSQL 18.6. Older fixtures retain their exact provenance.
+Command classification does not imply support for every grammar production,
+planner transformation, function, or PostgreSQL subsystem.
 
 ## Implemented boundary
 
-| Area | Implemented |
+| Area | Accepted surface |
 |---|---|
-| Client protocol | PostgreSQL v3 simple and extended query flow, prepared statements and portals, text and binary parameters/results, COPY, cancellation, TLS, authentication, notices, notifications, and logical-replication mode. |
-| SQL | The PostgreSQL 18 top-level command inventory has either an executable implementation or a tested architecture rejection. Implemented relational execution includes DDL/DML, `MERGE`, transactions and two-phase transactions, CTEs, joins, grouping, windows, set operations, views, materialized views, inheritance and partitioning, triggers, rules, cursors, and maintenance commands within their tested forms. This is not a claim that every PostgreSQL grammar production or planner transformation is implemented. |
-| Types and expressions | The native scalar, array, range, multirange, enum, domain, composite, JSON/JSONB/jsonpath, XML, temporal, network, geometric, catalog-reference, ACL, transaction, bit-string, binary-string, UUID, and full-text families documented in this repository, including their modeled operators, functions, aggregates, casts, COPY, wire, indexes, WAL, checkpoint, and recovery paths. |
-| Server programming | SQL functions, PL/pgSQL functions/procedures/triggers/anonymous blocks, set-returning and table functions, dynamic SQL, transition tables, event triggers, privileges, security-definer state, and configuration scopes within the bounded executor. |
-| Catalogs and tools | PostgreSQL 18-shaped catalogs and monitoring views required by the tested psql, pg_dump/pg_restore, psycopg, pgJDBC, Npgsql, node-postgres, and pgx paths. Catalog rows describe pos3ql's real modeled objects; absent PostgreSQL subsystems expose documented empty/zero states where that is truthful. |
-| Replication | PostgreSQL 18 logical publication/subscription and pgoutput v1-v4 at the documented object-native boundary, including interoperability with PostgreSQL publishers, subscribers, and `pg_recvlogical`. |
-| Durability | Object-native immutable commit/checkpoint data and compare-and-swap publication through the versioned S3-compatible profile. PostgreSQL heap pages and physical XLOG are not used. |
+| Protocol | v3.0/3.2 simple and extended queries, prepared statements/portals, text/binary values, COPY, cancellation, TLS, authentication, notices, notifications, and logical replication mode |
+| Relational SQL | Tested DDL/DML, MERGE, MVCC transactions, savepoints/two-phase transactions, locks, CTEs, joins, grouping, windows, set operations, views/materialized views, inheritance/partitioning, triggers/rules, cursors, and maintenance |
+| Types | Modeled native scalar/array, range/multirange, enum/domain/composite, JSON/JSONB/jsonpath, XML, temporal, network/geometric, full-text, catalog-reference, ACL, transaction, bit/binary string, and UUID families |
+| Programming | SQL and PL/pgSQL functions/procedures/triggers, anonymous blocks, set-returning/table functions, dynamic SQL, transition/event triggers, privileges, security-definer state, and configuration scopes |
+| Catalogs/tools | Typed PostgreSQL-shaped catalogs and monitoring for tested psql, pg_dump/pg_restore, psycopg, pgJDBC, Npgsql, node-postgres, and pgx paths |
+| Replication | PostgreSQL publication/subscription and pgoutput interoperability within the [logical replication boundary](logical-replication.md) |
+| Persistence | Immutable object-native commits/checkpoints, recovery, backups, and [versioned durable formats](durable-format.md) |
 
-The exact top-level command disposition lives in
-[`tests/postgresql18_commands.tsv`](../tests/postgresql18_commands.tsv). The
-logical-replication boundary is specified separately in
-[`logical-replication.md`](logical-replication.md).
+The source repository's `tests/postgresql18_commands.tsv` records executable
+commands and explicit architecture rejections. Curated differential queries,
+raw-wire/driver probes, and the vendored regression schedule are continuing
+ratchets. Unsupported clauses and type combinations must reject explicitly.
 
-## Deliberate and current limits
+## Physical access paths
 
-Atomic transaction capacity is configurable at startup: savepoint count,
-deferred constraint/trigger metadata, retained trigger row bytes, and ANALYZE
-undo entries. Exhaustion reports a program-limit error rather than growing
-runtime memory. TRUNCATE includes inheritance and partition descendants and
-foreign-key cascade closure, with table lists bounded by configured physical
-table capacity across SQL, prepared transactions, durability, and pgoutput.
-The differential corpus checks these SQL semantics against PostgreSQL 18.6;
-fixed-allocation and object-cold tests exercise larger declared capacities.
+| Method | Object-native path |
+|---|---|
+| Btree | Equality, composite leading-prefix/range probes, parameterized joins and DML; compatible ordered and covering scans |
+| Hash | Equality-only single-key probes, including expression/partial, prepared, query/join, and DML paths |
+| BRIN | Bitmap equality/range and built-in range/network inclusion; explicit summary maintenance and modeled options |
+| GiST | Built-in network, range/multirange, geometry, and full-text predicates; geometric distance ordering |
+| GIN | Array, full-text, JSONB, and jsonpath bitmap predicates; conservative posting navigation where a required token exists |
+| SP-GiST | Built-in network, range, geometry, locale-independent text ordering/prefix, and geometric distance ordering |
 
-Geometric path and polygon point lists are bounded by statement memory. Their
-text and binary wire forms, constructors and operators, GiST lookup,
-checkpoint publication, and empty-cache recovery are qualified beyond the
-former 128-point implementation limit, including SQL comparison with
-PostgreSQL.
+Methods retain catalog and operator-class identity, transaction overlays, WAL,
+checkpoint, and cold-recovery behavior. MVCC and SQL rechecks are authoritative.
+[Immutable navigation](index-navigation.md) specifies pruning, covering payloads,
+legacy formats, and finite geometric nearest-neighbor eligibility. Residual
+filters, row security, locking, ties, or unrankable origins retain complete exact
+ordering. Expression results are recomputed from fetched rows rather than
+projected directly from an index expression tuple. Native PostgreSQL index page
+layouts and custom native callbacks are not implemented.
 
-- PostgreSQL heap layout, page identifiers, `ctid` semantics, HOT, vacuum's
-  physical implementation, physical XLOG, physical streaming replication,
-  hot standby, and binary-WAL tooling are not targets.
-- Modeled BRIN indexes physically execute bitmap equality/range scans and every built-in range/network inclusion strategy over
-  durable object-block indexes for plain, multicolumn, expression, partial,
-  prepared, join, and DML paths. PostgreSQL 18's built-in BRIN operator
-  classes, families, strategy operators, support procedures, and relation
-  options retain exact catalog and recovery identities. Minmax-multi and Bloom
-  parameters plus explicit summarize/desummarize maintenance retain PostgreSQL
-  catalog, rollback, WAL, checkpoint, and cold-recovery behavior. Modeled hash indexes
-  physically execute their PostgreSQL equality-only single-key
-  boundary for plain, expression, partial, prepared, query, join, and DML
-  probes. Their method and built-in operator-class identities persist through
-  catalogs, WAL, checkpoints, copied and partitioned indexes, reindexing, and
-  object-cold recovery. Modeled btree indexes physically execute complete
-  single/composite and expression equality probes (including prepared
-  parameters) and equality-leading
-  prefixes with lower, upper, or two-sided bounds on the following column for queries and direct
-  UPDATE/DELETE target scans. Exact resident probes use the
-  complete startup-bounded hash map; durable equality probes use per-block
-  filters. Checkpoints externally sort durable keys using PostgreSQL type and
-  collation semantics, and prefix/range probes seek by immutable per-block key
-  bounds. Compatible `ORDER BY` clauses use forward/backward compact-key
-  ordering with equality-fixed prefixes and exact PostgreSQL NULL placement;
-  key- or `INCLUDE`-covered projections execute as index-only scans from
-  versioned immutable payloads, including cold recovery and committed
-  post-checkpoint overlays. Nested-loop joins and
-  joined UPDATE/DELETE sources parameterize exact or range keys from rows
-  already bound on their outer side. Partial indexes have distinct filtered
-  generations and are selected only when the query conservatively implies the
-  stored predicate; expression and partial keys also support compatible
-  ordered traversal. Expression-key results themselves are recomputed from a
-  fetched row rather than projected directly from an index tuple.
-- Modeled GiST indexes physically scan bounded immutable encoded-key
-  generations for supported network containment, planar-geometric
-  relationships, range/multirange relationships, and `tsvector`/`tsquery`
-  predicates. Geometric keys use object-native bounding-box nodes to prune
-  disjoint subtrees. Each selected key is evaluated exactly before its row
-  identity becomes a candidate. The nine PostgreSQL 18 built-in classes,
-  nine families, 100
-  strategy rows, 68 support rows, `tsvector` `siglen`, relation
-  `fillfactor`/`buffering`, included columns, DML maintenance, WAL,
-  checkpoints, and object-cold recovery share one typed boundary. Built-in
-  point, box, polygon, and circle classes execute `<-> point`
-  K-nearest-neighbor ordering over compact immutable keys, including prepared
-  origins, filters, `LIMIT`, covering scans, overlays, and cold recovery.
-  PostgreSQL GiST tree pages and native/custom operator classes are not
-  implemented.
-- Modeled GIN indexes physically execute array containment/overlap,
-  `tsvector` search, JSONB containment/existence, and jsonpath predicates as
-  bitmap plans. Array, full-text, `jsonb_ops`, and `jsonb_path_ops` values are
-  extracted into dedicated object-native posting trees; exact SQL and MVCC
-  rechecks make token-hash collisions conservative. Modeled SP-GiST indexes
-  physically execute network, range, box, point, polygon, locale-independent
-  text-order, and prefix predicates.
-  PostgreSQL 18.6's four GIN and seven SP-GiST classes, 11 families, 90
-  strategy rows, 56 support rows, method-specific DDL/options, cloning,
-  partition children, reindexing, DML, WAL, checkpoints, and object-cold
-  recovery share one typed boundary. Built-in point, box, and polygon SP-GiST
-  classes execute the same `<-> point` K-nearest-neighbor boundary.
-  Geometric predicate navigation uses the same immutable bounding-box tree
-  boundary, including both point classes, box and polygon. Network, range,
-  full-text, GIN posting, and ranked nearest-neighbor navigation are
-  implemented. Finite unfiltered limits prune by conservative node distance;
-  residual filters, row security, locking, ties, and unbounded orders retain
-  complete exact ordering. PostgreSQL page layout and posting-list format, and
-  native/custom callbacks are not implemented.
-- PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
-  complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
-  exist. Query execution is currently serialized through one server process.
-- Tables, indexes, ordinary and materialized views, routines, casts, operators,
-  operator families/classes, triggers, row-level security policies, publications, collations, conversions,
-  text-search objects, event triggers, tablespaces, and comments use independent
-  startup-sized pools. Their configured exhaustion is a loud program-limit
-  error; object-cold recovery preserves catalogs larger than their former
-  fixed or table-derived limits. Checkpoint bookkeeping covers every configured
-  physical-table slot, including the internal large-object table. The complete
-  checkpoint catalog image has a named startup-reserved
-  `checkpoint_manifest_bytes` bound and fails before publication if it is full.
-  Policies use `max_policies` (default 256) without a second per-table ceiling;
-  their predicates are statement-arena bounded. Routine call signatures match
-  PostgreSQL's 100-input-argument limit. Executable routine results accept
-  1,664 output columns; configuration settings and trigger arguments retain
-  their documented 64-item definition bounds. Policy role lists accept the
-  complete startup-sized role catalog plus `PUBLIC`. Enum label sets use
-  `max_enum_labels_per_type` (default 256) across transactional catalogs, WAL,
-  checkpoints, and recovery; exhaustion is SQLSTATE 54000 before catalog
-  mutation. `RETURNS TABLE`
-  catalog argument metadata keeps input and output shapes independent. Trigger
-  arguments are zero-based and NULL when absent, matching PostgreSQL.
-  Database and schema catalogs, connection counters, statistics, cloning, and
-  publication membership are also startup-sized and survive object-cold
-  recovery above their former 32-slot limits. Catalog builders for
-  startup-sized objects allocate row references from the fixed statement arena
-  according to transaction-visible cardinality. Remaining per-object inline
-  bounds and the documented catalog-identity widths still limit accepted scale.
-- Index tuples and partition keys enforce PostgreSQL 18's exact 32-attribute
-  boundaries. Tables, views, named composites, and record column definition
-  lists accept PostgreSQL's 1,600-column relation width. The bounded parser
-  supports 64 table constraints of each modeled kind, 64 domain checks, and 64
-  LIST-bound values. Accepted widths are preserved through record typing,
-  catalogs, WAL, checkpoints, and object-cold recovery; wider constraint
-  collections and LIST bounds remain loud program-limit errors. Constraint
-  positions are also durable catalog and referential-trigger OID identities.
-  The 64-entry stride is retained by manifest v14 until an explicit format and
-  OID migration can preserve existing identities.
-- Statement lists are bounded by the fixed statement arena, not by compiled
-  staging arrays: select lists, `IN` lists, `ARRAY` constructors, `CASE` arms,
-  function arguments up to PostgreSQL's own 100, `VALUES` rows, CTEs,
-  row-locking clauses, named windows, `ALTER TABLE` actions, aggregates,
-  scalar subqueries, set-operation branches, `DISTINCT ON` / `ORDER BY` /
-  window partition and ordering keys, GRANT role lists, and `RETURNING` lists
-  all cross the former 64-item (and 256-row) boundaries. Wire Parse/Bind and
-  SQL `PREPARE`/`EXECUTE` accept PostgreSQL's complete 65,535 parameters;
-  prepared metadata, portal values, decoded values, and inferred OIDs remain
-  within configured startup buffers and statement memory. Arena exhaustion is
-  SQLSTATE `54000`. `GROUP BY` accepts PostgreSQL 18's 1,664 target-list entry
-  width, grouping-set expansion accepts exactly 4,096 sets, `CUBE` accepts 12
-  elements, and `GROUPING()` accepts 31 arguments. Variable-width masks and
-  recycled per-set scratch keep the complete accepted shape within fixed
-  statement memory. Query results accept PostgreSQL's complete 1,664-column
-  target-list width through simple and extended protocol, including one Bind
-  format per column. Join range tables and accumulated `USING` merge state use
-  statement memory; compact access-path proofs remain optional for wider
-  joins, which execute in identity order with full-row decoding. PostgreSQL 18
-  differential and allocation-forbidden coverage crosses 64 relations through
-  plans, stored views, windows, materialization, subqueries, and joined DML.
-  Explicit `USING` lists follow the 1,600-column relation shape. High-column
-  dependencies, publications, triggers, and column privileges retain complete
-  column sets even when physical scans use full-row decoding.
-  Stored results recover with empty local caches.
-- Program length does not share that 64-item arity limit. Simple-protocol
-  batches, SQL-language bodies, and PL/pgSQL bodies are sized from their source
-  in the fixed statement arena. PL/pgSQL locals, branches, exception handlers
-  and conditions, and nested loop-control state are arena-backed. Arena
-  exhaustion is reported before a simple batch executes, while accepted stored
-  functions, procedures, triggers, event triggers, and anonymous blocks retain
-  their complete programs across WAL, checkpoints, and object-cold recovery.
-- Event-trigger command and dropped-object graphs are statement-arena bounded,
-  including dependent objects and duplicate suppression; they have no separate
-  256-object limit. `max_ddl_per_transaction` is independently startup-sized
-  and may exceed 256. Retry-safe `nextval`, `currval`, `lastval`, and `setval`
-  effects likewise use statement memory rather than a 1,024-call array. The
-  persistent log grows from the arena tail and survives front-only executor
-  scratch rewinds. The accepted widths are exercised against PostgreSQL 18 and
-  through empty-cache object recovery; statement-memory exhaustion remains
-  SQLSTATE `54000`.
-- Mutable-routine replay has the same statement-memory contract, including
-  pending arguments retained across modification retries. Cursor materialized
-  row indexes are sized from `cursor_bytes` instead of a separate row-count
-  constant, and pgoutput logical-message indexes use the fixed work arena.
-  Differential and allocation-forbidden coverage crosses 1,024 calls and
-  messages and 65,536 cursor rows.
-- Every accepted 128-byte `search_path` is represented completely through name
-  resolution and `current_schema`/`current_schemas`; there is no narrower
-  sixteen-entry resolver bound. `string_to_table` and
-  `regexp_split_to_table` results use exact statement-arena slices rather than
-  1,024-entry stack arrays. Checkpoint deletion markers use the startup-sized
-  row overlay, so deletion count does not select a hidden full-rewrite path.
-- Array values accept up to 65,535 elements, the durable format's unsigned
-  16-bit count. Text and binary input, aggregates, mutation, variadic calls,
-  comparisons, `unnest`, output, WAL, checkpoints, and object-cold recovery
-  have no narrower 1,024-element scratch limit. Wider values fail explicitly
-  with SQLSTATE `54000`, as do accepted-width operations that exhaust the
-  fixed statement arena. `format()` output also uses statement memory rather
-  than a separate 4 KiB compiled buffer.
-- Multirange values have no separate 64-component or 1 KiB rendered-text
-  limit. Text and binary input/output, binary COPY, constructors, aggregates,
-  set operations, comparison, hashing, bounds, `unnest`, indexes, rows, WAL,
-  checkpoints, and object-cold recovery use streaming component readers or
-  exact statement-arena slices. Arena exhaustion is SQLSTATE `54000`.
-- Compatibility is not universal merely because all top-level command names
-  are classified. Unsupported clauses, type combinations, functions, catalog
-  objects, and physical assumptions must return explicit errors.
-- The vendored PostgreSQL suite deliberately selects statement-boundary ranges.
-  Omitted ranges depend on an architecture listed above or on a known
-  unsupported input family; the executable manifest makes every omission
-  reviewable instead of converting it into an expected-failure budget.
+## Capacity boundaries
 
-## Extensions are not a target
+Named exhaustion is part of the fixed-memory contract. Explicit rejection of a
+smaller width does not make that width PostgreSQL-compatible. These principal
+boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 
-pos3ql already implements PostgreSQL's SQL-extension package lifecycle:
-control files, versioned SQL scripts and update paths, dependencies, trusted
-installation, schema selection and relocation, extension membership,
-configuration-table dump metadata, ownership, comments, catalogs,
-transactions, WAL, checkpoints, dump/restore, and object-store recovery. This
-remains accepted SQL behavior, not a commitment to PostgreSQL's extension
-ecosystem.
+| Kind | Boundary | Source or qualification |
+|---|---|---|
+| PostgreSQL relation shape | 1,600 columns: tables, views, named composites, record definitions, explicit USING lists | `src/storage/rowenc.rs`; wide relation and record differential fixtures |
+| PostgreSQL executable result | 1,664 columns: SELECT targets, routine/table-function results, Describe and Bind formats | Wide result and routine fixtures |
+| PostgreSQL statement shapes | 100 routine inputs; 32 index/partition attributes; 4,096 grouping sets; 12 CUBE elements; 31 GROUPING arguments | Parser/type boundaries and accepted/rejected differential cases |
+| PostgreSQL wire parameters | 65,535 Parse/Bind and SQL PREPARE/EXECUTE parameters | Fixed prepared/portal buffers plus statement memory; maximum-width wire fixture |
+| Durable array count | 65,535 elements; exact slices or streaming traversal | Array text/binary, execution, persistence, and cold-recovery fixtures |
+| Durable constraint identity | 64 constraints per modeled table kind and 64 domain checks | Manifest v14 and 64-position catalog/trigger OID stride; SQLSTATE 54000 on the next item |
+| Other definition breadth | Documented 64-item constructs, including LIST bounds, inheritance parents, trigger arguments, and routine configuration entries | Shared parse/storage boundary; widening requires review of representation and identity |
+| Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |
+| Statement memory | Lists, joins, programs, volatile/routine retry logs, event graphs, JSON widths, split/table-function rows, and variable-width geometry | Fixed arenas; arena exhaustion is a program-limit error |
+| Value-specific limits | Full-text, XML/XPath, JSON/path nesting, rendered values, GUC bytes, and finite catalog identities | Typed source boundaries and specialized contracts below |
 
-Third-party PostgreSQL extensions, including SQL-only packages, are not a
-compatibility target and are not certified. The repository's `pos3ql_base` and
-`pos3ql_ext` packages are conformance fixtures, not user extensions. pos3ql
-does not load PostgreSQL C shared libraries and does not implement PostgreSQL's
-server ABI, hooks, background workers, custom native types, native procedural-
-language handlers, native foreign-data wrappers, or native index access-method
-callbacks. No native or sandbox extension ABI is planned.
+Startup-sized catalogs have independent capacities; table count does not silently
+size unrelated classes. Transaction bounds also cover prepared and subscription
+slots. `max_catalog_versions_per_object` bounds retained definition/undo versions.
+`checkpoint_manifest_bytes`, live-block, replay, merge, garbage-batch, and backup
+rosters are separate reservations. Deletion batches limit work per beat, not the
+number of objects cleanup may ultimately process.
+
+Wire and durable identity widths are validated at startup and recovery. Arrays,
+programs, statement lists, multiranges, and mutable-routine results have no
+additional former 64/256/1,024-item staging ceiling. Effective search paths use
+the accepted GUC byte representation; cursor indexes use `cursor_bytes`.
+JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
+[SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;
+accepted width can still exhaust its named statement or startup budget.
+
+## Architecture boundaries and remaining gaps
+
+- Query execution is still serial. Workspace and catalog synchronization
+  prepare for the [remaining concurrency work](../PLAN.md#remaining-sequence).
+- PostgreSQL's cost model and exact EXPLAIN text are not compatibility complete.
+  PostgreSQL parallel-query/JIT and planner/executor hooks do not exist.
+- Heap layout, heap-version `ctid`, HOT, physical vacuum internals, physical
+  XLOG/streaming replication, hot standby, and binary-WAL tools are non-goals.
+  Object-native row identities are not exposed as invented heap addresses.
+- Logical copies are asynchronous independently durable databases; transparent
+  shared-storage replicas and active-active writers are not implemented.
+- Monitoring fields for absent PostgreSQL subsystems use documented truthful
+  empty/zero states; real modeled activity must not be accepted and ignored.
+- Smaller definition and XPath subsets remain documented scale/surface
+  differences. Incompatible format changes need a verified offline migration.
+- Regression schedule omissions must remain explicit and reviewable, rather
+  than being hidden behind an expected-failure budget.
+
+## Extensions
+
+The SQL-extension package lifecycle is implemented: control/version scripts,
+updates, dependencies, trusted installation, relocation, membership, ownership,
+comments, catalogs, transactions, dump/restore, and durable recovery.
+The repository's fixture packages qualify that lifecycle.
+
+Third-party SQL-only or native extensions are not compatibility targets or
+certified. PostgreSQL C libraries, server ABI/hooks, background workers, native
+procedural languages, foreign-data wrappers, and custom index callbacks are
+outside scope. No native or sandbox extension ABI is planned.

@@ -2,14 +2,15 @@
 
 Everything under `vendor/` is **third-party** and is **never compiled into the
 pos3ql binary**: there is no `build.rs`, no `include_str!`/`include_bytes!`, and
-nothing in `src/` references these paths. The shipped engine depends only on
-`libc` (MIT OR Apache-2.0), declared in `Cargo.toml` — which is *not* vendored
-here; Cargo fetches it. This directory is for material we keep in-tree but do
-not distribute as part of the compiled program.
+nothing in `src/` references these paths. Runtime dependencies are libc and
+the isolated, budgeted object-store TLS component (rustls, compiled root data,
+and their dependencies), declared in `Cargo.toml` and pinned in `Cargo.lock`.
+Cargo fetches them; they are not vendored here. This directory holds test
+material and its provenance, not runtime dependencies.
 
 Each item records its **upstream source**, the **exact pinned commit/tag** it
 was taken at, and its **license** (a `COPYRIGHT`/`LICENSE` file alongside it),
-and every file is checksum-pinned in `SHA256SUMS`.
+and every corpus file is checksum-pinned in `SHA256SUMS`.
 
 ## Layout — what is here and what it is for
 
@@ -28,7 +29,7 @@ dependency; it must still be clearly marked (source + pinned commit + license +
 checksum), which it is. If we ever vendor something that *is* linked into the
 build, it must go **outside `vendor/test/`** and satisfy the stricter rule that
 its license be compatible with pos3ql's **AGPL-3.0-or-later**. Today there is no
-such item — the only build dependency is `libc`, via Cargo.
+such item. Runtime dependencies come from Cargo as described above.
 
 ## Test-only corpora (`vendor/test/`)
 

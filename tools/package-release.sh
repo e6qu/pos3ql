@@ -28,9 +28,18 @@ install -m 0644 "$ROOT/packaging/pos3ql.service" \
 install -m 0644 "$ROOT/packaging/pos3ql-failover.service" \
   "$STAGE/$NAME/lib/systemd/system/pos3ql-failover.service"
 install -m 0644 "$ROOT/packaging/README.md" "$STAGE/$NAME/README.md"
+DOCUMENTS="$STAGE/$NAME/share/doc/pos3ql"
 install -m 0644 "$ROOT/LICENSE" "$ROOT/README.md" "$ROOT/PLAN.md" \
-  "$ROOT/docs/operations.md" "$ROOT/docs/object-storage.md" \
-  "$ROOT/docs/backup-restore.md" "$STAGE/$NAME/share/doc/pos3ql/"
+  "$ROOT/BUGS.md" "$ROOT/AGENTS.md" "$ROOT/CONTRIBUTING.md" "$DOCUMENTS/"
+cp -R "$ROOT/docs" "$DOCUMENTS/docs"
+mkdir -p "$DOCUMENTS/packaging" "$DOCUMENTS/benchmarks"
+install -m 0644 "$ROOT/packaging/README.md" "$DOCUMENTS/packaging/README.md"
+install -m 0644 "$ROOT/benchmarks/README.md" "$DOCUMENTS/benchmarks/README.md"
+# Keep the previously shipped operator paths as links to the canonical tree.
+for document in operations object-storage backup-restore; do
+  printf '# Operator documentation\n\nSee [%s](docs/%s.md).\n' \
+    "$document" "$document" > "$DOCUMENTS/$document.md"
+done
 
 ARCHIVE="$OUTPUT/$NAME.tar.gz"
 if [[ $(tar --version) == *"GNU tar"* ]]; then

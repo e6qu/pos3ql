@@ -63,6 +63,9 @@ jobs:
       - name: BUGS.md discipline guard
         run: bash tools/check-bugs.sh
 
+      - name: Documentation links
+        run: python3 tools/check-docs.py
+
       - name: Object-store architecture guard
         run: bash tools/check-object-store-boundary.sh
 

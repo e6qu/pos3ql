@@ -19287,8 +19287,11 @@ impl Storage {
             .iter()
             .enumerate()
             .find_map(|(slot, database)| {
-                (database.visible_to(txid) && database.definition_for(txid).name.as_str() == name)
-                    .then(|| (slot, *database))
+                if database.visible_to(txid) && database.definition_for(txid).name.as_str() == name {
+                    Some((slot, *database))
+                } else {
+                    None
+                }
             })
     }
 

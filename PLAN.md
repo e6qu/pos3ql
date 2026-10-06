@@ -1,7 +1,7 @@
 # pos3ql roadmap
 
-Reviewed after PR #599 on 2026-10-06, against
-`708d5b475845492bdaa29dd573a6f508770acc62`.
+Reviewed after PR #600 on 2026-10-06, against
+`f41033821b8f9b15fab1c52fa34ba630c954015b`.
 
 [Architecture](README.md) · [Current capabilities](docs/implemented-baseline.md) ·
 [Compatibility](docs/postgresql-18-compatibility.md) · [Contributing](CONTRIBUTING.md)
@@ -43,10 +43,20 @@ is not proof that the production topology or its performance is complete.
 ### 1. Table definitions and row mutation
 
 Synchronize table identity, ownership, transaction-visible definition versions,
-row state, statistics, serial state, and physical maintenance. Readers must keep
+row state, statistics, and physical maintenance. Readers must keep
 consistent definition images without copying a wide definition for each row.
 Publication, rollback, slot retirement, template cloning, and recovery must use
 one coherent lifecycle and release guards before nested catalog resolution.
+
+Table-owned serial positions now have a per-table synchronization boundary.
+Counter advances, transactional resets, replay, checkpoint reads, template
+cloning, and slot reuse use the same state API. WAL captures one consistent
+image; acknowledgement clears dirty state only for unchanged positions staged
+by that transaction. Integer overflow leaves the prior position intact.
+This prepares serial state for overlapping execution; definitions, rows,
+statistics, physical maintenance, and engine publication remain exclusive.
+Default assignment borrows its visible definition instead of copying the full
+maximum-width image for each generated value.
 
 Completion evidence:
 

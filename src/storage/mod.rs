@@ -2705,6 +2705,28 @@ impl RowHeap {
     }
 }
 
+struct TableSerialState {
+    values: [i64; MAX_COLUMNS],
+    dirty: bool,
+    /// Only the transaction that captured unchanged absolute positions may
+    /// acknowledge them. Every subsequent mutation invalidates this claim.
+    staged_by: Option<u32>,
+}
+
+impl TableSerialState {
+    const EMPTY: Self = Self {
+        values: [0; MAX_COLUMNS],
+        dirty: false,
+        staged_by: None,
+    };
+
+    fn set(&mut self, column: usize, value: i64) {
+        self.values[column] = value;
+        self.dirty = true;
+        self.staged_by = None;
+    }
+}
+
 pub struct Table {
     /// Database catalog owning this relation. Slots are process-global while
     /// relation names are database-local, so the database identity is part of
@@ -2760,9 +2782,7 @@ pub struct Table {
     /// scan — explicit inserts do not advance it, deletes and TRUNCATE
     /// (without RESTART IDENTITY) do not rewind it, and a rolled-back insert
     /// still consumes its number.
-    pub serial_last: [i64; MAX_COLUMNS],
-    /// Whether `serial_last` changed since it was last written to the WAL.
-    pub serial_dirty: bool,
+    serial: std::sync::Mutex<TableSerialState>,
     /// The SSTs holding this table's spilled rows, in flush order. Full
     /// rewrites replace the list, delta checkpoints append, and paced
     /// compaction merges adjacent members. A row's map entry names the list
@@ -16014,8 +16034,7 @@ impl Storage {
                 continue;
             }
             self.clear_table_rows(slot);
-            self.tables[slot].serial_last = [0; MAX_COLUMNS];
-            self.tables[slot].serial_dirty = false;
+            self.install_table_serial_values(slot, [0; MAX_COLUMNS]);
             self.tables[slot].statistics = TableStatistics::EMPTY;
             self.tables[slot].statistics_wal_dirty = false;
             self.set_spill_list(slot, &[]);
@@ -17543,8 +17562,7 @@ impl Storage {
                     statistics_wal_dirty: false,
                     pending_statistics_tail: None,
                     pending_statistics_txid: None,
-                    serial_last: [0; MAX_COLUMNS],
-                    serial_dirty: false,
+                    serial: std::sync::Mutex::new(TableSerialState::EMPTY),
                     spill_ssts: vec![None; config.max_spill_generations_per_table]
                         .into_boxed_slice(),
                     spill_through_lsn: vec![0; config.max_spill_generations_per_table]
@@ -19830,7 +19848,7 @@ impl Storage {
                 let created_at = self.tables[source_slot].created_at;
                 let ownership = self.tables[source_slot].ownership.committed();
                 let statistics = self.tables[source_slot].statistics;
-                let serial_last = self.tables[source_slot].serial_last;
+                let serial_values = self.table_serial_values(source_slot);
                 let n_spill_ssts = self.tables[source_slot].n_spill_ssts;
                 let target_slot = self.alloc_table(
                     definition,
@@ -19844,7 +19862,13 @@ impl Storage {
                     target_table.created_at = created_at;
                     target_table.ownership = ownership;
                     target_table.statistics = statistics;
-                    target_table.serial_last = serial_last;
+                    *target_table
+                        .serial
+                        .get_mut()
+                        .expect("table serial state lock poisoned") = TableSerialState {
+                        values: serial_values,
+                        ..TableSerialState::EMPTY
+                    };
                     target_table.n_spill_ssts = n_spill_ssts;
                 }
                 for member in 0..n_spill_ssts {
@@ -28552,7 +28576,9 @@ impl Storage {
             }
             for c in 0..n_columns {
                 if auto[c] {
-                    self.tables[i].serial_last[c] = self.tables[i].serial_last[c].max(max[c]);
+                    let prior = self.table_serial_value(i, c);
+                    self.replay_table_serial_value(i, c, prior.max(max[c]), 0)
+                        .expect("recovered serial column exists");
                 }
             }
         }
@@ -34075,6 +34101,122 @@ impl Storage {
         &mut self.tables[index]
     }
 
+    pub(crate) fn table_serial_value(&self, index: usize, column: usize) -> i64 {
+        self.tables[index]
+            .serial
+            .lock()
+            .expect("table serial state lock poisoned")
+            .values[column]
+    }
+
+    pub(crate) fn table_serial_values(&self, index: usize) -> [i64; MAX_COLUMNS] {
+        self.tables[index]
+            .serial
+            .lock()
+            .expect("table serial state lock poisoned")
+            .values
+    }
+
+    pub(crate) fn set_table_serial_value(&self, index: usize, column: usize, value: i64) {
+        self.tables[index]
+            .serial
+            .lock()
+            .expect("table serial state lock poisoned")
+            .set(column, value);
+    }
+
+    pub(crate) fn next_table_serial_value(
+        &self,
+        index: usize,
+        column: usize,
+        step: i64,
+        ctype: ColType,
+    ) -> Result<i64, SqlError> {
+        let (minimum, maximum, type_name) = match ctype {
+            ColType::Int2 => (i64::from(i16::MIN), i64::from(i16::MAX), "smallint"),
+            ColType::Int4 => (i64::from(i32::MIN), i64::from(i32::MAX), "integer"),
+            ColType::Int8 => (i64::MIN, i64::MAX, "bigint"),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "table serial counter requires an integer column"
+                ));
+            }
+        };
+        let mut serial = self.tables[index]
+            .serial
+            .lock()
+            .expect("table serial state lock poisoned");
+        let next = serial.values[column]
+            .checked_add(step)
+            .filter(|value| (minimum..=maximum).contains(value))
+            .ok_or_else(|| {
+                sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "{} out of range", type_name)
+            })?;
+        serial.set(column, next);
+        Ok(next)
+    }
+
+    pub(crate) fn stage_table_serial_values(
+        &self,
+        index: usize,
+        txid: u32,
+    ) -> Option<[i64; MAX_COLUMNS]> {
+        let mut serial = self.tables[index]
+            .serial
+            .lock()
+            .expect("table serial state lock poisoned");
+        if !serial.dirty {
+            return None;
+        }
+        serial.staged_by = Some(txid);
+        Some(serial.values)
+    }
+
+    pub(crate) fn acknowledge_table_serial_values(&self, index: usize, txid: u32) {
+        let mut serial = self.tables[index]
+            .serial
+            .lock()
+            .expect("table serial state lock poisoned");
+        if serial.staged_by == Some(txid) {
+            serial.dirty = false;
+            serial.staged_by = None;
+        }
+    }
+
+    pub(crate) fn replay_table_serial_value(
+        &mut self,
+        index: usize,
+        column: usize,
+        value: i64,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if column >= self.table_def(index, txid).n_columns {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "journal serial column {} is outside the table definition",
+                column
+            ));
+        }
+        let serial = self.tables[index]
+            .serial
+            .get_mut()
+            .expect("table serial state lock poisoned");
+        serial.values[column] = value;
+        serial.staged_by = None;
+        Ok(())
+    }
+
+    pub(crate) fn install_table_serial_values(&mut self, index: usize, values: [i64; MAX_COLUMNS]) {
+        *self.tables[index]
+            .serial
+            .get_mut()
+            .expect("table serial state lock poisoned") = TableSerialState {
+            values,
+            ..TableSerialState::EMPTY
+        };
+    }
+
     pub fn table_def(&self, index: usize, txid: u32) -> &TableDef {
         match self.pending_table_def(index) {
             Some(pending) if pending.txid == txid => &pending.def,
@@ -34340,8 +34482,10 @@ impl Storage {
         table.statistics_wal_dirty = false;
         // A reused slot must not inherit the dropped table's sequences or
         // spilled rows.
-        table.serial_last = [0; MAX_COLUMNS];
-        table.serial_dirty = false;
+        *table
+            .serial
+            .get_mut()
+            .expect("table serial state lock poisoned") = TableSerialState::EMPTY;
         table.spill_ssts.fill(None);
         table.spill_through_lsn.fill(0);
         table.n_spill_ssts = 0;
@@ -54296,6 +54440,172 @@ mod tests {
                     .all(|pending| !pending.used)
             );
         });
+    }
+
+    #[test]
+    fn table_serial_state_concurrent_advances_are_unique_and_allocation_free() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("serial_counter", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        let seen: [std::sync::atomic::AtomicBool; 256] =
+            core::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let storage = &storage;
+                let barrier = &barrier;
+                let seen = &seen;
+                scope.spawn(move || {
+                    barrier.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        for _ in 0..64 {
+                            let value = storage
+                                .next_table_serial_value(table, 0, 1, ColType::Int8)
+                                .unwrap();
+                            assert!(
+                                !seen[value as usize - 1]
+                                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                            );
+                        }
+                    });
+                });
+            }
+        });
+        assert!(
+            seen.iter()
+                .all(|value| value.load(std::sync::atomic::Ordering::Relaxed))
+        );
+        assert_eq!(storage.table_serial_value(table, 0), 256);
+    }
+
+    #[test]
+    fn table_serial_state_staging_preserves_later_advances_and_retry_positions() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("serial_staging", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(storage.stage_table_serial_values(table, 10).is_none());
+            storage.set_table_serial_value(table, 0, 7);
+            let captured = storage.stage_table_serial_values(table, 10).unwrap();
+            assert_eq!(captured[0], 7);
+            storage
+                .next_table_serial_value(table, 0, 1, ColType::Int8)
+                .unwrap();
+            storage.acknowledge_table_serial_values(table, 10);
+            assert_eq!(storage.stage_table_serial_values(table, 11).unwrap()[0], 8);
+            assert_eq!(captured[0], 7);
+            storage.acknowledge_table_serial_values(table, 10);
+            // A failed staging attempt receives no acknowledgement. The next
+            // transaction captures the same nontransactional position.
+            assert_eq!(storage.stage_table_serial_values(table, 12).unwrap()[0], 8);
+            storage.acknowledge_table_serial_values(table, 11);
+            assert_eq!(storage.stage_table_serial_values(table, 12).unwrap()[0], 8);
+            storage.acknowledge_table_serial_values(table, 12);
+            assert!(storage.stage_table_serial_values(table, 13).is_none());
+            storage.set_table_serial_value(table, 0, 0);
+            assert_eq!(storage.stage_table_serial_values(table, 13).unwrap()[0], 0);
+            storage.set_table_serial_value(table, 0, 8);
+            storage.acknowledge_table_serial_values(table, 13);
+            assert_eq!(storage.stage_table_serial_values(table, 14).unwrap()[0], 8);
+        });
+    }
+
+    #[test]
+    fn table_serial_state_slot_reuse_and_replay_do_not_inherit_staging() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("old_serial", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_table_serial_value(table, 0, 91);
+            let old_image = storage.stage_table_serial_values(table, 10).unwrap();
+            storage.commit_drop(table);
+            let replacement = storage
+                .create_table(make_def("new_serial", &[("id", ColType::Int8, true)]))
+                .unwrap();
+            assert_eq!(replacement, table);
+            assert_eq!(storage.table_serial_value(replacement, 0), 0);
+            assert_eq!(old_image[0], 91);
+            assert!(storage.stage_table_serial_values(replacement, 11).is_none());
+            storage.set_table_serial_value(replacement, 0, 3);
+            storage.stage_table_serial_values(replacement, 11).unwrap();
+            storage.acknowledge_table_serial_values(replacement, 10);
+            storage
+                .replay_table_serial_value(replacement, 0, 6, 0)
+                .unwrap();
+            storage.acknowledge_table_serial_values(replacement, 11);
+            assert_eq!(
+                storage.stage_table_serial_values(replacement, 12).unwrap()[0],
+                6
+            );
+            storage.install_table_serial_values(replacement, [14; MAX_COLUMNS]);
+            storage.acknowledge_table_serial_values(replacement, 12);
+            assert_eq!(storage.table_serial_value(replacement, 0), 14);
+            assert!(storage.stage_table_serial_values(replacement, 13).is_none());
+        });
+    }
+
+    #[test]
+    fn table_serial_state_range_errors_leave_counters_and_staging_unchanged() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("serial_limits", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (ctype, minimum, maximum) in [
+                (ColType::Int2, i64::from(i16::MIN), i64::from(i16::MAX)),
+                (ColType::Int4, i64::from(i32::MIN), i64::from(i32::MAX)),
+                (ColType::Int8, i64::MIN, i64::MAX),
+            ] {
+                for (value, step) in [(minimum, -1), (maximum, 1)] {
+                    storage.set_table_serial_value(table, 0, value);
+                    storage.stage_table_serial_values(table, 10).unwrap();
+                    assert_eq!(
+                        storage
+                            .next_table_serial_value(table, 0, step, ctype)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::NUMERIC_OUT_OF_RANGE
+                    );
+                    assert_eq!(storage.table_serial_value(table, 0), value);
+                    storage.acknowledge_table_serial_values(table, 10);
+                    assert!(storage.stage_table_serial_values(table, 11).is_none());
+                }
+            }
+            assert_eq!(
+                storage
+                    .next_table_serial_value(table, 0, 1, ColType::Text)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATATYPE_MISMATCH
+            );
+            assert_eq!(storage.table_serial_value(table, 0), i64::MAX);
+        });
+        storage.install_table_serial_values(table, [19; MAX_COLUMNS]);
+        assert!(storage.stage_table_serial_values(table, 12).is_none());
+        storage.replay_table_serial_value(table, 0, 25, 0).unwrap();
+        assert_eq!(storage.table_serial_value(table, 0), 25);
+        assert!(storage.stage_table_serial_values(table, 12).is_none());
+        for column in [1, MAX_COLUMNS, usize::MAX] {
+            assert_eq!(
+                storage
+                    .replay_table_serial_value(table, column, 99, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+        }
+        assert_eq!(storage.table_serial_value(table, 0), 25);
     }
 
     fn make_def(name: &str, columns: &[(&str, ColType, bool)]) -> TableDef {

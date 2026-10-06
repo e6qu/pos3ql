@@ -28,6 +28,11 @@ reader images release guards before nested resolution. The latest database and
 cluster changes cover pending identity reservation, retirement, duplicate
 recovery records, coherent snapshots, and exact retained capacity.
 
+Table-owned serial positions have per-table synchronization and consistent WAL
+and checkpoint images. Later changes invalidate staging acknowledgement; range
+errors leave positions unchanged. Generated-value assignment borrows its visible
+definition without copying the full maximum-width image.
+
 The reactor still executes statements serially. Table definitions and row
 mutation, engine-owned prepared slots and WAL publication, fixed workers, and
 scaling qualification remain open. Catalog metadata synchronization does not

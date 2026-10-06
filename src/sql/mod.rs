@@ -6572,7 +6572,7 @@ impl Engine {
 
     fn refresh_prepared_transaction_catalog(&self) -> Result<(), SqlError> {
         self.storage.replace_prepared_transaction_catalog(
-            self.prepared_transactions.entries().map(|(_, metadata)| {
+            self.prepared_transactions.catalog_entries().map(|(_, metadata)| {
                 crate::storage::PreparedTransactionCatalogEntry {
                     transaction_id: metadata.transaction_id,
                     gid: crate::util::StackStr::from_str(metadata.gid.as_str()),
@@ -6690,7 +6690,11 @@ impl Engine {
             first_lsn: 0,
             prepared_lsn: 0,
         };
-        let Some(slot) = self.prepared_transactions.reserve(metadata) else {
+        let reserved = match self.prepared_transactions.reserve(metadata) {
+            Ok(reserved) => reserved,
+            Err(error) => return Err(fail(self, txn, cursors, error)),
+        };
+        let Some(slot) = reserved else {
             return Err(fail(
                 self,
                 txn,
@@ -19064,7 +19068,7 @@ fn replay_transaction_batches(
                     first_lsn: batch.first().map_or(*lsn, |(record_lsn, _)| *record_lsn),
                     prepared_lsn: *lsn,
                 };
-                let slot = prepared.reserve(metadata).ok_or_else(|| {
+                let slot = prepared.reserve(metadata)?.ok_or_else(|| {
                     sql_err!(
                         sqlstate::OUT_OF_MEMORY,
                         "recovered prepared transactions exceed max_prepared_transactions ({})",

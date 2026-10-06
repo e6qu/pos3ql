@@ -55,6 +55,53 @@ fn cluster_metadata_reload_applies_one_owned_settings_image() {
 }
 
 #[test]
+fn cluster_metadata_preparing_transactions_stay_private_until_finalized() {
+    let mut config = test_config("prepared-publication");
+    config.max_prepared_transactions = 2;
+    let mut budget = Budget::new(two_phase::PreparedTransactions::budget_bytes(&config));
+    let mut prepared = two_phase::PreparedTransactions::new(&config, &mut budget).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let gid = ast::PreparedTransactionId::parse("preparing").unwrap();
+        let metadata = two_phase::PreparedTransactionMetadata {
+            gid,
+            transaction_id: 10,
+            owner: 0,
+            database: crate::storage::DatabaseOid::POSTGRES,
+            prepared_at: 0,
+            first_lsn: 0,
+            prepared_lsn: 0,
+        };
+        let slot = prepared.reserve(metadata).unwrap().unwrap();
+        assert_eq!(prepared.find(gid), Some(slot));
+        assert_eq!(prepared.entries().count(), 1);
+        assert_eq!(prepared.catalog_entries().count(), 0);
+        prepared.set_lsn_range(slot, 1, 2);
+        assert_eq!(prepared.catalog_entries().count(), 1);
+        assert_eq!(prepared.catalog_entries().next().unwrap().1.first_lsn, 1);
+        assert_eq!(prepared.catalog_entries().next().unwrap().1.prepared_lsn, 2);
+        prepared.release(slot);
+        assert_eq!(prepared.catalog_entries().count(), 0);
+        let recovered = two_phase::PreparedTransactionMetadata {
+            first_lsn: 3,
+            prepared_lsn: 4,
+            ..metadata
+        };
+        prepared.reserve(recovered).unwrap().unwrap();
+        assert_eq!(prepared.catalog_entries().count(), 1);
+        for (first_lsn, prepared_lsn) in [(0, 1), (2, 0), (2, 1)] {
+            let invalid = two_phase::PreparedTransactionMetadata {
+                first_lsn,
+                prepared_lsn,
+                ..metadata
+            };
+            assert_eq!(prepared.reserve(invalid).unwrap_err().sqlstate,
+                sqlstate::INVALID_PARAMETER_VALUE);
+            assert_eq!(prepared.catalog_entries().next().unwrap().1, recovered);
+        }
+    });
+}
+
+#[test]
 fn engine_ownership_is_thread_transferable() {
     let (engine, budget) = test_engine();
     std::thread::spawn(move || {

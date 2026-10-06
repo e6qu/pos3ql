@@ -1086,6 +1086,8 @@ identities. Parsing and prepared-catalog validation reject these before mutation
 Replay cannot overwrite an unresolved pending setting, and truncated setting
 values fail before publication. Prepared-catalog replacement stages a complete
 bounded candidate, so exhaustion or invalid metadata preserves the prior image.
+Preparing reservations remain private until a typed transition installs the
+final WAL range; recovery rejects partially initialized ranges.
 Owned statement and checkpoint snapshots release guards before nested reads.
 Active defaults and reload notification publish together; applying defaults
 copies one image before updating connection-local settings. Concurrent,

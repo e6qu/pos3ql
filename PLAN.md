@@ -452,7 +452,8 @@ a separate publication mutex; applying defaults retains one owned image.
 Prepared transaction catalog metadata now uses one mutex and two exactly
 charged startup-sized rosters. Replacement validates a candidate before atomic
 publication; identity collisions and capacity or metadata errors preserve the
-published image. SQL copies snapshots into statement memory, and checkpoints
+published image. Preparing and finalized transaction images are distinct typed
+states; only finalized WAL ranges enter the catalog. SQL copies snapshots into statement memory, and checkpoints
 use an exactly charged roster before nested role reads. Recovery rejects
 duplicate prepared identities and repeated system setting records. Allocation-
 free four-worker publication, nested snapshots, coherent default application,

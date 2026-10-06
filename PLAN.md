@@ -424,8 +424,29 @@ Forced-spill SQL Logic Test replay now uses eight deterministic query slices
 within the existing 15-minute job limit. Replay progress streams to CI logs
 while preserving both harness and log-write failures.
 
+Database identities, definitions, pending renames, and ownership now share a
+startup-bounded mutex. Creation reserves names and OIDs against every retained
+entry, including other transactions' pending creates and renames. A guarded monotonic
+OID frontier prevents identity reuse after retirement or rollback. Recovery
+rejects duplicate identities and repeated manifest records before mutation. Owned login, template, checkpoint,
+and catalog images release the guard before nested reads. Creation and retirement
+publish matching statistics while holding statistics before database locks;
+statistics readers reject an image from a reused slot. Committed drops,
+rolled-back creates, and failed template clones clear the complete reusable
+identity. Allocation-free four-worker publication and rollback, nested readers,
+pending-name and OID collisions, exact capacity, OID exhaustion, recovery
+rejection, and partial-clone cleanup have direct regression coverage. Template
+catalog cloning still requires exclusive storage access while table state and
+row mutation remain unsynchronized.
+
 The remaining catalog definition containers and row mutation paths still
 require synchronization before fixed workers can overlap execution.
+
+Next, synchronize system settings and prepared transaction metadata, then table
+definitions and row mutation state. Preserve transaction publication and
+response barriers when replacing the reactor's local queue drain with fixed
+workers, and qualify one-through-N worker scaling before claiming concurrent
+execution complete.
 
 Authorization graph traversal now has one mutex-protected, startup-sized bitmap
 per query workspace. Every role membership, object privilege, grant-option,
@@ -743,10 +764,10 @@ deterministic slices after three and then four slices exhausted the fixed
 all six slices so corpus growth cannot silently restore the oversized shape.
 PostgreSQL regression differential coverage likewise uses four stable
 filename-grouped slices after the second of two uninstrumented slices reached
-the same ceiling on a slower runner. Forced-spill sqllogictest coverage uses
-four query slices after the second of two slices spent more than 11 minutes in
-normal differential progress following its instrumented build and reached the
-same ceiling.
+the same ceiling on a slower runner. Forced-spill sqllogictest coverage now uses
+eight query slices after both the two- and four-slice layouts reached the same
+ceiling during normal differential progress. The timeout guard pins all eight
+slices.
 
 Foreign statement context now follows the same workspace boundary. Each leased
 workspace owns the transaction identity, isolation flag, and fixed savepoint

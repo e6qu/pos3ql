@@ -1061,6 +1061,20 @@ and physical-binding iterators filter before copying retained definitions.
 A second run reached the same ceiling in a different SQL Logic Test slice.
 Forced-spill replay now distributes the complete query set across eight slices,
 and its nested harnesses stream progress without masking command failures.
+The database lifecycle audit found OID allocation and name checks ignored
+other transactions' pending creates, allowing duplicate identities. Pending
+rename targets now reserve names as well. A monotonic OID frontier survives
+retirement and rollback, preventing old reader images from matching the
+statistics of a new database in the same slot. Recovery rejects duplicate retained
+OIDs and names before publishing. Manifest parsing also rejects repeated OIDs
+or names before replacement, including bootstrap identities. Failed clones, rolled-back creates, and
+committed drops clear pending definitions, ownership, identity, and statistics.
+Database readers retain owned images; template authorization and checkpoint
+serialization take ownership from the same definition image. Statistics compare
+the captured OID before returning a reusable slot's counters. Publication follows
+the existing statistics-to-database lock order, with allocation-free concurrent
+readers exercising nested resolution and statistics reset. Partial-clone
+exhaustion verifies both cloned catalog cleanup and preservation of the source.
 No external blocker remains.
 
 | ID | Status | Found | Description | Reproducer | Blocker |

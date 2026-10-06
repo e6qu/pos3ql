@@ -2920,8 +2920,7 @@ impl Engine {
     }
 
     pub(crate) fn database_login(&self, name: &str) -> Option<DatabaseLogin> {
-        let slot = self.storage.database_slot(name, 0)?;
-        let database = self.storage.database(slot);
+        let (slot, database) = self.storage.database_named(name, 0)?;
         let definition = database.definition_for(0);
         Some(DatabaseLogin {
             slot: slot as u16,
@@ -15801,9 +15800,9 @@ impl Engine {
                 let mut connections = self.database_connection_count(template, txn.txid);
                 if self
                     .storage
-                    .database_slot(template, txn.txid)
-                    .is_some_and(|slot| {
-                        self.storage.database(slot).oid == self.storage.current_database_oid()
+                    .database_named(template, txn.txid)
+                    .is_some_and(|(_, database)| {
+                        database.oid == self.storage.current_database_oid()
                     })
                 {
                     connections = connections.saturating_sub(1);

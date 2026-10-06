@@ -6,6 +6,11 @@ finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet these inclusion criteria.
 
+Table-owned serial advances previously used unchecked signed addition. The
+counter boundary now checks all integer widths before mutation. Dirty-state
+acknowledgement is tied to the transaction's unchanged staged positions so a
+later advance or reset cannot be lost. These repairs introduce no deferred bug.
+
 The 2026-10-06 documentation review corrected stale width and dependency claims,
 obsolete plan references, duplicated progress histories, and ambiguous status
 and qualification language. Failed replacement guidance now requires validated

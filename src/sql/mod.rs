@@ -5098,20 +5098,23 @@ impl Engine {
         // rolled-back transaction left dirty): absolute positions, so replay
         // is idempotent.
         for i in 0..self.storage.table_count() {
-            if !self.storage.table(i).serial_dirty || !self.storage.table(i).visible_to(txn.txid) {
+            if !self.storage.table(i).visible_to(txn.txid) {
                 continue;
             }
             let def = *self.storage.table_def(i, txn.txid);
             if def.persistence == crate::storage::RelationPersistence::Temporary {
                 continue;
             }
+            let Some(serial_values) = self.storage.stage_table_serial_values(i, txn.txid) else {
+                continue;
+            };
             let name = def.name;
             let schema = def.schema;
             for c in 0..def.n_columns {
                 if !def.columns()[c].auto_increment {
                     continue;
                 }
-                let last = self.storage.table(i).serial_last[c];
+                let last = serial_values[c];
                 let lsn = self.storage.lsn() + 1;
                 if let Err(e) = self.wal.stage(
                     txn.txid,
@@ -5879,7 +5882,7 @@ impl Engine {
         // nontransactional and must be journaled by a later commit.
         for i in 0..self.storage.table_count() {
             if self.storage.table(i).visible_to(txn.txid) {
-                self.storage.table_mut(i).serial_dirty = false;
+                self.storage.acknowledge_table_serial_values(i, txn.txid);
             }
         }
         for i in 0..self.storage.sequence_count() {
@@ -7248,9 +7251,7 @@ impl Engine {
                 column,
                 prior,
             } => {
-                let table = self.storage.table_mut(table as usize);
-                table.serial_last[column as usize] = prior;
-                table.serial_dirty = true;
+                self.storage.set_table_serial_value(table as usize, column as usize, prior);
             }
             DdlUndo::OwnedSequenceReset { sequence, prior } => {
                 self.storage
@@ -19261,8 +19262,7 @@ fn replay_transaction_batches(
                             if let Some(table_slot) = storage.find_table(schema, table)
                                 && usize::from(column) < crate::storage::MAX_COLUMNS
                             {
-                                storage.table_mut(table_slot).serial_last[usize::from(column)] =
-                                    last;
+                                storage.replay_table_serial_value(table_slot, usize::from(column), last);
                             }
                         }
                         WalOp::SequenceAdvance {
@@ -19995,9 +19995,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     ),
                 });
             };
-            let t = storage.table_mut(index);
             if (column as usize) < crate::storage::MAX_COLUMNS {
-                t.serial_last[column as usize] = last;
+                storage.replay_table_serial_value(index, column as usize, last);
             }
         }
         WalOp::Analyze {

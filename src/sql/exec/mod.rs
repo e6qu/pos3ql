@@ -4033,17 +4033,12 @@ fn next_auto_value<'x>(
         };
     }
     let step = def.columns()[col].auto_increment_step;
-    let table = storage.table_mut(table_index);
-    let next = table.serial_last[col] + step;
-    let bound_error =
-        |what: &'static str| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "{} out of range", what);
+    let next = storage.next_table_serial_value(table_index, col, step, ctype)?;
     let out = match ctype {
         ColType::Int8 => Datum::Int8(next),
-        ColType::Int2 => Datum::Int2(i16::try_from(next).map_err(|_| bound_error("smallint"))?),
-        _ => Datum::Int4(i32::try_from(next).map_err(|_| bound_error("integer"))?),
+        ColType::Int2 => Datum::Int2(next as i16),
+        _ => Datum::Int4(next as i32),
     };
-    table.serial_last[col] = next;
-    table.serial_dirty = true;
     Ok(out)
 }
 
@@ -52875,15 +52870,13 @@ pub fn apply_replication_truncate(
                         return Err(error);
                     }
                 } else {
-                    let prior = storage.table(table).serial_last[column];
+                    let prior = storage.table_serial_value(table, column);
                     txn.record_ddl(crate::sql::txn::DdlUndo::SequenceReset {
                         table: table as u32,
                         column: column as u16,
                         prior,
                     })?;
-                    let table_state = storage.table_mut(table);
-                    table_state.serial_last[column] = 0;
-                    table_state.serial_dirty = true;
+                    storage.set_table_serial_value(table, column, 0);
                 }
             }
         }
@@ -61305,7 +61298,7 @@ pub fn truncate(
                     }
                     continue;
                 }
-                let prior = storage.table(table_index).serial_last[c];
+                let prior = storage.table_serial_value(table_index, c);
                 if let Err(e) = txn.record_ddl(crate::sql::txn::DdlUndo::SequenceReset {
                     table: table_index as u32,
                     column: c as u16,
@@ -61313,9 +61306,7 @@ pub fn truncate(
                 }) {
                     return sql_fail(e);
                 }
-                let t = storage.table_mut(table_index);
-                t.serial_last[c] = 0;
-                t.serial_dirty = true;
+                storage.set_table_serial_value(table_index, c, 0);
             }
         }
     }

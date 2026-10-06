@@ -8704,7 +8704,7 @@ impl Checkpointer {
                 if c.auto_increment {
                     write_manifest(
                         &mut self.manifest_buf,
-                        format_args!("seq {ci} {}", table.serial_last[ci]),
+                        format_args!("seq {ci} {}", storage.table_serial_value(slot, ci)),
                     )?;
                 }
             }
@@ -15419,7 +15419,7 @@ fn finish_pending(
                     ))
                 })?
             };
-        storage.table_mut(slot).serial_last = serials;
+        storage.install_table_serial_values(slot, serials);
         if slot_of.len() <= manifest_index {
             slot_of.resize(manifest_index + 1, None);
         }

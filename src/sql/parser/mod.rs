@@ -239,7 +239,9 @@ impl ParseError {
 
 impl From<LexError> for ParseError {
     fn from(e: LexError) -> Self {
-        ParseError::new(e.at, e.message)
+        let mut error = ParseError::new(e.at, e.message);
+        error.sqlstate = e.kind.sqlstate();
+        error
     }
 }
 
@@ -8855,6 +8857,25 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 let error = parser.next_stmt().unwrap_err();
                 assert_eq!(error.message.as_str(), "conflicting or redundant options");
+            });
+        }
+    }
+
+    #[test]
+    fn cluster_metadata_escape_errors_preserve_postgresql_sqlstates() {
+        for (sql, state) in [
+            (r"SELECT E'\000'", sqlstate::CHARACTER_NOT_IN_REPERTOIRE),
+            (r"SELECT E'\xff'", sqlstate::CHARACTER_NOT_IN_REPERTOIRE),
+            (r"PREPARE TRANSACTION E'\x00'", sqlstate::CHARACTER_NOT_IN_REPERTOIRE),
+            (r"COMMIT PREPARED E'\u0'", sqlstate::INVALID_ESCAPE_SEQUENCE),
+            (r"ROLLBACK PREPARED E'\U00110000'", sqlstate::SYNTAX_ERROR),
+            (r"SELECT E'\uD800'", sqlstate::SYNTAX_ERROR),
+        ] {
+            let mut budget = Budget::new(1 << 20);
+            let arena = Arena::new(&mut budget, "escape parser", 1 << 16).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                let mut parser = Parser::new(sql, &arena).unwrap();
+                assert_eq!(parser.next_stmt().unwrap_err().sqlstate, state);
             });
         }
     }

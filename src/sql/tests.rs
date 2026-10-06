@@ -5669,6 +5669,7 @@ fn unassigned_wal_transactions_stay_full_xid_gaps_after_cold_recovery() {
 #[test]
 fn prepare_transaction_is_strictly_configured_and_eligible() {
     assert!(ast::PreparedTransactionId::parse("").is_some());
+    assert!(ast::PreparedTransactionId::parse("invalid\0gid").is_none());
     assert!(ast::PreparedTransactionId::parse(&"g".repeat(199)).is_some());
     assert!(ast::PreparedTransactionId::parse(&"g".repeat(200)).is_none());
 

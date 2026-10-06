@@ -1093,5 +1093,14 @@ Active defaults and reload notification publish together; applying defaults
 copies one image before updating connection-local settings. Concurrent,
 allocation-free publication and snapshot regressions cover these paths.
 
+The prepared identifier audit found escape strings accepted zero bytes and
+silently stripped hexadecimal and Unicode escape prefixes. The decoder now
+handles these escapes and surrogate pairs in statement memory, rejects zero
+bytes and invalid UTF-8, and preserves encoding, Unicode escape, and syntax
+SQLSTATEs through parsing. Prepared identifiers also reject zero bytes at their
+constructor. Allocation-free lexer and parser fixtures and PostgreSQL
+differential queries cover the class. Semantics follow PostgreSQL 18's
+[scanner](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/scan.l).
+
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

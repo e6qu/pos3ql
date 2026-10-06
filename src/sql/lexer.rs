@@ -10,6 +10,7 @@
 
 use crate::mem::arena::{Arena, ArenaFull};
 use crate::util::StackStr;
+use super::eval::sqlstate;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Tok<'a> {
@@ -30,11 +31,29 @@ pub enum Tok<'a> {
     Eof,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LexError {
     /// Byte offset in the query.
     pub at: usize,
     pub message: StackStrMsg,
+    pub kind: LexErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LexErrorKind {
+    Syntax,
+    Encoding,
+    UnicodeEscape,
+}
+
+impl LexErrorKind {
+    pub fn sqlstate(self) -> &'static str {
+        match self {
+            Self::Syntax => sqlstate::SYNTAX_ERROR,
+            Self::Encoding => sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+            Self::UnicodeEscape => sqlstate::INVALID_ESCAPE_SEQUENCE,
+        }
+    }
 }
 
 pub type StackStrMsg = &'static str;
@@ -89,6 +108,9 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn next_token(&mut self) -> Result<Tok<'a>, LexError> {
+        if self.at == 0 && self.text.as_bytes().contains(&0) {
+            return Err(self.encoding_error(0));
+        }
         self.skip_ws_and_comments()?;
         self.token_start = self.at;
         let rest = self.rest();
@@ -201,6 +223,7 @@ impl<'a> Lexer<'a> {
                 return Err(LexError {
                     at: start,
                     message: "identifier longer than 128 bytes",
+                    kind: LexErrorKind::Syntax,
                 });
             }
             let stored = self.arena_str(folded.as_str(), start)?;
@@ -264,6 +287,7 @@ impl<'a> Lexer<'a> {
                     return Err(LexError {
                         at: start,
                         message: "unterminated string",
+                        kind: LexErrorKind::Syntax,
                     });
                 }
                 Some(b'\'') if bytes.get(i + 1) == Some(&b'\'') => {
@@ -316,6 +340,7 @@ impl<'a> Lexer<'a> {
                     return Err(LexError {
                         at: start,
                         message: "unterminated string",
+                        kind: LexErrorKind::Syntax,
                     });
                 }
                 Some(b'\'') if bytes.get(i + 1) == Some(&b'\'') => {
@@ -328,6 +353,7 @@ impl<'a> Lexer<'a> {
                     let esc = bytes.get(i + 1).ok_or(LexError {
                         at: start,
                         message: "unterminated string",
+                        kind: LexErrorKind::Syntax,
                     })?;
                     if matches!(esc, b'0'..=b'7') {
                         let mut value = 0u16;
@@ -344,12 +370,56 @@ impl<'a> Lexer<'a> {
                         i += 1 + digits;
                         continue;
                     }
+                    if *esc == b'x' {
+                        let mut value = 0u8;
+                        let mut digits = 0;
+                        while digits < 2 {
+                            let Some(digit) = bytes.get(i + 2 + digits).and_then(|b| hex_digit(*b)) else {
+                                break;
+                            };
+                            value = value * 16 + digit;
+                            digits += 1;
+                        }
+                        if digits != 0 {
+                            scratch[w] = value;
+                            w += 1;
+                            i += 2 + digits;
+                            continue;
+                        }
+                    }
+                    if matches!(esc, b'u' | b'U') {
+                        let (mut codepoint, mut next) = self.unicode_escape(bytes, i)?;
+                        if (0xD800..=0xDBFF).contains(&codepoint) {
+                            let (low, end) = self.unicode_escape(bytes, next)
+                                .map_err(|_| self.surrogate_error(next))?;
+                            if !(0xDC00..=0xDFFF).contains(&low) {
+                                return Err(self.surrogate_error(next));
+                            }
+                            codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + low - 0xDC00;
+                            next = end;
+                        } else if (0xDC00..=0xDFFF).contains(&codepoint) {
+                            return Err(self.surrogate_error(i));
+                        }
+                        let character = char::from_u32(codepoint).filter(|c| *c != '\0')
+                            .ok_or(LexError {
+                                at: i,
+                                message: "invalid Unicode escape value",
+                                kind: LexErrorKind::Syntax,
+                            })?;
+                        let mut encoded = [0u8; 4];
+                        let encoded = character.encode_utf8(&mut encoded).as_bytes();
+                        scratch[w..w + encoded.len()].copy_from_slice(encoded);
+                        w += encoded.len();
+                        i = next;
+                        continue;
+                    }
                     let replacement = match esc {
                         b'n' => b'\n',
                         b't' => b'\t',
                         b'r' => b'\r',
                         b'b' => 8,
                         b'f' => 12,
+                        b'v' => 11,
                         b'\\' => b'\\',
                         b'\'' => b'\'',
                         other => *other,
@@ -367,12 +437,51 @@ impl<'a> Lexer<'a> {
         }
         self.at = i + 1;
         let out = &scratch[..w];
+        if out.contains(&0) {
+            return Err(self.encoding_error(start));
+        }
         core::str::from_utf8(out)
             .map(Tok::Str)
-            .map_err(|_| LexError {
-                at: start,
-                message: "invalid UTF-8 after unescaping",
-            })
+            .map_err(|_| self.encoding_error(start))
+    }
+
+    fn unicode_escape(&self, bytes: &[u8], at: usize) -> Result<(u32, usize), LexError> {
+        let invalid = LexError {
+            at,
+            message: "invalid Unicode escape",
+            kind: LexErrorKind::UnicodeEscape,
+        };
+        if bytes.get(at) != Some(&b'\\') {
+            return Err(invalid);
+        }
+        let digits = match bytes.get(at + 1) {
+            Some(b'u') => 4,
+            Some(b'U') => 8,
+            _ => return Err(invalid),
+        };
+        let mut value = 0u32;
+        for offset in 0..digits {
+            let digit = bytes.get(at + 2 + offset).and_then(|b| hex_digit(*b))
+                .ok_or(invalid)?;
+            value = (value << 4) | u32::from(digit);
+        }
+        Ok((value, at + 2 + digits))
+    }
+
+    fn encoding_error(&self, at: usize) -> LexError {
+        LexError {
+            at,
+            message: "invalid byte sequence for encoding UTF8",
+            kind: LexErrorKind::Encoding,
+        }
+    }
+
+    fn surrogate_error(&self, at: usize) -> LexError {
+        LexError {
+            at,
+            message: "invalid Unicode surrogate pair",
+            kind: LexErrorKind::Syntax,
+        }
     }
 
     /// Lexes a `B'…'` (binary) or `X'…'` (hexadecimal) bit-string literal.
@@ -390,6 +499,7 @@ impl<'a> Lexer<'a> {
                     return Err(LexError {
                         at: start,
                         message: "unterminated bit string",
+                        kind: LexErrorKind::Syntax,
                     });
                 }
                 Some(b'\'') => break,
@@ -421,6 +531,7 @@ impl<'a> Lexer<'a> {
                     return Err(LexError {
                         at: start,
                         message: "unterminated quoted identifier",
+                        kind: LexErrorKind::Syntax,
                     });
                 }
                 Some(b'"') if bytes.get(i + 1) == Some(&b'"') => {
@@ -437,6 +548,7 @@ impl<'a> Lexer<'a> {
             return Err(LexError {
                 at: start,
                 message: "zero-length quoted identifier",
+                kind: LexErrorKind::Syntax,
             });
         }
         if !has_escape {
@@ -471,11 +583,13 @@ impl<'a> Lexer<'a> {
             let n: u32 = rest[1..1 + digits].parse().map_err(|_| LexError {
                 at: start,
                 message: "parameter number too large",
+                kind: LexErrorKind::Syntax,
             })?;
             if n == 0 {
                 return Err(LexError {
                     at: start,
                     message: "there is no parameter $0",
+                    kind: LexErrorKind::Syntax,
                 });
             }
             self.at += 1 + digits;
@@ -496,6 +610,7 @@ impl<'a> Lexer<'a> {
             return Err(LexError {
                 at: start,
                 message: "unterminated dollar-quoted string",
+                kind: LexErrorKind::Syntax,
             });
         };
         let body = &self.text[body_start..body_start + close_rel];
@@ -548,6 +663,7 @@ impl<'a> Lexer<'a> {
         LexError {
             at: self.at,
             message,
+            kind: LexErrorKind::Syntax,
         }
     }
 
@@ -555,6 +671,7 @@ impl<'a> Lexer<'a> {
         LexError {
             at,
             message: "statement too large for SQL arena",
+            kind: LexErrorKind::Syntax,
         }
     }
 
@@ -562,6 +679,15 @@ impl<'a> Lexer<'a> {
         self.arena
             .alloc_str(s)
             .map_err(|_: ArenaFull| self.arena_full(at))
+    }
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -603,6 +729,63 @@ mod tests {
         assert_eq!(lex_all(r"E'a\nb'"), ["Str(\"a\\nb\")"]);
         assert_eq!(lex_all("$$raw $ text$$"), ["Str(\"raw $ text\")"]);
         assert_eq!(lex_all("$q$has $$ inside$q$"), ["Str(\"has $$ inside\")"]);
+    }
+
+    #[test]
+    fn cluster_metadata_escape_strings_decode_without_allocation() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "escape strings", 1 << 16).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (sql, expected) in [
+                (r"E'\101\102\103'", "ABC"),
+                (r"E'\x41\x4a\x4B'", "AJK"),
+                (r"E'\x7Z'", "\u{7}Z"),
+                (r"E'\xq\q'", "xqq"),
+                (r"E'\303\251'", "é"),
+                (r"E'\xC3\xA9'", "é"),
+                (r"E'\u00E9\U0001F600'", "é😀"),
+                (r"E'\uD83D\uDE00'", "😀"),
+                (r"E'\U0000D83D\U0000DE00'", "😀"),
+                (r"E'\U0010FFFF'", "\u{10ffff}"),
+                (r"E'\v\b\f\n\r\t'", "\u{b}\u{8}\u{c}\n\r\t"),
+                (r"E'\\u0000'", r"\u0000"),
+            ] {
+                let mut lexer = Lexer::new(sql, &arena);
+                assert_eq!(lexer.next_token().unwrap(), Tok::Str(expected));
+                assert_eq!(lexer.next_token().unwrap(), Tok::Eof);
+            }
+        });
+    }
+
+    #[test]
+    fn cluster_metadata_escape_strings_reject_invalid_encoding_and_unicode() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "invalid escape strings", 1 << 16).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (sql, kind) in [
+                (r"E'\000'", LexErrorKind::Encoding),
+                (r"E'\400'", LexErrorKind::Encoding),
+                (r"E'\x00'", LexErrorKind::Encoding),
+                (r"E'\xff'", LexErrorKind::Encoding),
+                (r"E'\xc0\x80'", LexErrorKind::Encoding),
+                (r"E'\xed\xa0\x80'", LexErrorKind::Encoding),
+                (r"E'\u0'", LexErrorKind::UnicodeEscape),
+                (r"E'\U0000000'", LexErrorKind::UnicodeEscape),
+                (r"E'\uZZZZ'", LexErrorKind::UnicodeEscape),
+                (r"E'\u0000'", LexErrorKind::Syntax),
+                (r"E'\U00110000'", LexErrorKind::Syntax),
+                (r"E'\uDC00'", LexErrorKind::Syntax),
+                (r"E'\uD800'", LexErrorKind::Syntax),
+                (r"E'\uD800\u0041'", LexErrorKind::Syntax),
+                (r"E'\uD800\x41'", LexErrorKind::Syntax),
+                ("'zero\0byte'", LexErrorKind::Encoding),
+                ("$$zero\0byte$$", LexErrorKind::Encoding),
+                ("\"zero\0byte\"", LexErrorKind::Encoding),
+            ] {
+                assert_eq!(Lexer::new(sql, &arena).next_token().unwrap_err().kind, kind);
+            }
+            assert!(super::super::ast::PreparedTransactionId::parse("invalid\0gid").is_none());
+        });
     }
 
     #[test]

@@ -460,6 +460,12 @@ free four-worker publication, nested snapshots, coherent default application,
 rollback, capacity, and recovery regressions cover these boundaries. Engine-owned
 prepared transaction slots and WAL publication still require exclusive execution.
 
+Prepared identifiers reject zero bytes at construction. Escape strings decode
+hexadecimal bytes, Unicode values and surrogate pairs in bounded statement
+memory; malformed Unicode and invalid UTF-8 retain PostgreSQL's distinct
+SQLSTATEs at the parse boundary. Allocation-free fixtures and differential
+queries cover valid decoding and rejection.
+
 Next, synchronize table definitions and row mutation state. Preserve transaction publication and
 response barriers when replacing the reactor's local queue drain with fixed
 workers, and qualify one-through-N worker scaling before claiming concurrent

@@ -12955,6 +12955,38 @@ pub(crate) struct PreparedTransactionCatalogEntry {
     pub prepared_lsn: u64,
 }
 
+struct PreparedTransactionCatalog {
+    entries: FixedVec<PreparedTransactionCatalogEntry>,
+    candidate: FixedVec<PreparedTransactionCatalogEntry>,
+}
+
+impl PreparedTransactionCatalog {
+    fn validate_entry(
+        entries: &[PreparedTransactionCatalogEntry],
+        entry: PreparedTransactionCatalogEntry,
+    ) -> Result<(), SqlError> {
+        if entry.transaction_id == 0
+            || entry.first_lsn == 0
+            || entry.prepared_lsn < entry.first_lsn
+            || entry.gid.is_truncated()
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid prepared transaction catalog metadata"
+            ));
+        }
+        if entries.iter().any(|retained| {
+            retained.transaction_id == entry.transaction_id || retained.gid == entry.gid
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "duplicate prepared transaction catalog identity"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One transaction-owned PostgreSQL foreign session. This identity prevents a
 /// remote transaction from being reused by another local transaction or
 /// endpoint.
@@ -13684,8 +13716,8 @@ pub struct Storage {
     role_catalog: std::sync::Mutex<RoleCatalog>,
     /// One mutex-protected authorization bitmap per fixed query workspace.
     role_graph_scratch: FixedVec<std::sync::Mutex<FixedVec<bool>>>,
-    system_settings: FixedVec<SystemSetting>,
-    prepared_transactions: FixedVec<PreparedTransactionCatalogEntry>,
+    system_settings: std::sync::Mutex<FixedVec<SystemSetting>>,
+    prepared_transactions: std::sync::Mutex<PreparedTransactionCatalog>,
     acl_catalog: std::sync::Mutex<AclCatalog>,
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
     /// fixed slots reused as comments are added and removed.
@@ -17385,7 +17417,7 @@ impl Storage {
                 * (size_of::<std::sync::Mutex<FixedVec<bool>>>()
                     + config.max_roles * size_of::<bool>())
             + MAX_SYSTEM_SETTINGS * size_of::<SystemSetting>()
-            + config.max_prepared_transactions * size_of::<PreparedTransactionCatalogEntry>()
+            + 2 * config.max_prepared_transactions * size_of::<PreparedTransactionCatalogEntry>()
             + config.max_acl_entries * size_of::<AclEntry>()
             + config.max_column_acl_entries * size_of::<ColumnAclEntry>()
             + config.max_default_acl_entries * size_of::<DefaultAclEntry>()
@@ -18026,6 +18058,11 @@ impl Storage {
             "prepared_transaction_catalog",
             config.max_prepared_transactions,
         )?;
+        let prepared_transaction_candidate = FixedVec::new(
+            budget,
+            "prepared transaction catalog candidate",
+            config.max_prepared_transactions,
+        )?;
         let mut acl_entries = FixedVec::new(budget, "acl_entries", config.max_acl_entries)?;
         for slot in 0..3 {
             acl_entries
@@ -18338,8 +18375,11 @@ impl Storage {
                 settings: role_settings,
             }),
             role_graph_scratch,
-            system_settings,
-            prepared_transactions,
+            system_settings: std::sync::Mutex::new(system_settings),
+            prepared_transactions: std::sync::Mutex::new(PreparedTransactionCatalog {
+                entries: prepared_transactions,
+                candidate: prepared_transaction_candidate,
+            }),
             acl_catalog: std::sync::Mutex::new(AclCatalog {
                 objects: acl_entries,
                 columns: column_acl_entries,
@@ -18379,15 +18419,34 @@ impl Storage {
     }
 
     pub(crate) fn replace_prepared_transaction_catalog(
-        &mut self,
+        &self,
         entries: impl IntoIterator<Item = PreparedTransactionCatalogEntry>,
-    ) {
-        self.prepared_transactions.clear();
-        for entry in entries {
-            self.prepared_transactions
-                .push(entry)
-                .expect("prepared transaction catalog matches its configured capacity");
+    ) -> Result<(), SqlError> {
+        let mut catalog = self
+            .prepared_transactions
+            .lock()
+            .expect("prepared transaction catalog lock poisoned");
+        catalog.candidate.clear();
+        let staged: Result<(), SqlError> = (|| {
+            for entry in entries {
+                PreparedTransactionCatalog::validate_entry(&catalog.candidate, entry)?;
+                catalog.candidate
+                    .push(entry)
+                    .map_err(|_| sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "prepared transaction catalog capacity exhausted"
+                    ))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            catalog.candidate.clear();
+            return Err(error);
         }
+        let PreparedTransactionCatalog { entries, candidate } = &mut *catalog;
+        core::mem::swap(entries, candidate);
+        candidate.clear();
+        Ok(())
     }
 
     pub(crate) fn install_foreign_client(
@@ -18603,15 +18662,60 @@ impl Storage {
         }
     }
 
-    pub(crate) fn prepared_transaction_catalog(&self) -> &[PreparedTransactionCatalogEntry] {
-        &self.prepared_transactions
+    pub(crate) fn with_prepared_transaction_catalog<T>(
+        &self,
+        read: impl FnOnce(&[PreparedTransactionCatalogEntry]) -> T,
+    ) -> T {
+        let catalog = self
+            .prepared_transactions
+            .lock()
+            .expect("prepared transaction catalog lock poisoned");
+        read(&catalog.entries)
+    }
+
+    pub(crate) fn prepared_transaction_catalog_snapshot<'a>(
+        &self,
+        arena: &'a Arena,
+    ) -> Result<&'a [PreparedTransactionCatalogEntry], SqlError> {
+        self.with_prepared_transaction_catalog(|entries| {
+            arena.alloc_slice_with(entries.len(), |index| entries[index])
+                .map(|image| &*image)
+                .map_err(|_| sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement memory exhausted for prepared transaction catalog snapshot"
+                ))
+        })
+    }
+
+    pub(crate) fn copy_prepared_transaction_catalog(
+        &self,
+        target: &mut FixedVec<PreparedTransactionCatalogEntry>,
+    ) -> Result<(), SqlError> {
+        self.with_prepared_transaction_catalog(|entries| {
+            if entries.len() > target.capacity() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "prepared transaction catalog snapshot capacity exhausted"
+                ));
+            }
+            target.clear();
+            for &entry in entries {
+                target.push(entry).expect("snapshot capacity checked");
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn install_prepared_transaction_catalog_entry(
-        &mut self,
+        &self,
         entry: PreparedTransactionCatalogEntry,
     ) -> Result<(), SqlError> {
-        self.prepared_transactions.push(entry).map_err(|_| {
+        let mut catalog = self
+            .prepared_transactions
+            .lock()
+            .expect("prepared transaction catalog lock poisoned");
+        PreparedTransactionCatalog::validate_entry(&catalog.entries, entry)?;
+        catalog.entries.push(entry).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "prepared transaction manifest exceeds max_prepared_transactions"
@@ -26057,33 +26161,47 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn system_settings(&self) -> impl Iterator<Item = (usize, &SystemSetting)> {
-        self.system_settings.iter().enumerate()
+    fn system_settings_catalog(&self) -> std::sync::MutexGuard<'_, FixedVec<SystemSetting>> {
+        self.system_settings.lock().expect("system settings catalog lock poisoned")
     }
 
-    pub(crate) fn system_setting(&self, slot: usize) -> &SystemSetting {
-        &self.system_settings[slot]
+    pub(crate) fn system_settings(&self) -> core::iter::Enumerate<
+        core::array::IntoIter<SystemSetting, MAX_SYSTEM_SETTINGS>,
+    > {
+        let catalog = self.system_settings_catalog();
+        let image: [SystemSetting; MAX_SYSTEM_SETTINGS] = core::array::from_fn(|slot| catalog[slot]);
+        image.into_iter().enumerate()
+    }
+
+    fn validate_system_setting_value(
+        value: Option<StackStr<ROLE_SETTING_VALUE_MAX>>,
+    ) -> Result<(), SqlError> {
+        if value.is_some_and(|value| value.is_truncated()) {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "system setting exceeds its fixed value capacity"
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn change_system_setting(
-        &mut self,
+        &self,
         name: SqlName,
         value: Option<StackStr<ROLE_SETTING_VALUE_MAX>>,
         txid: u32,
-    ) -> Result<(usize, Option<PendingRoleSetting>), SqlError> {
-        let existing = self.system_settings.iter().position(|setting| {
+    ) -> Result<Option<(usize, Option<PendingRoleSetting>)>, SqlError> {
+        Self::validate_system_setting_value(value)?;
+        let mut catalog = self.system_settings_catalog();
+        let existing = catalog.iter().position(|setting| {
             (setting.live || setting.pending.is_some()) && setting.name == name
         });
         let slot = match existing {
             Some(slot) => slot,
             None if value.is_none() => {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "system setting does not exist"
-                ));
+                return Ok(None);
             }
-            None => self
-                .system_settings
+            None => catalog
                 .iter()
                 .position(|setting| !setting.live && setting.pending.is_none())
                 .ok_or_else(|| {
@@ -26094,69 +26212,78 @@ impl Storage {
                     )
                 })?,
         };
-        if let Some(pending) = self.system_settings[slot].pending
+        if let Some(pending) = catalog[slot].pending
             && pending.txid != txid
         {
+            drop(catalog);
             self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent system setting DDL"
             ));
         }
-        let prior = self.system_settings[slot].pending;
+        let prior = catalog[slot].pending;
         if existing.is_none() {
-            self.system_settings[slot].name = name;
+            catalog[slot].name = name;
         }
-        self.system_settings[slot].pending = Some(PendingRoleSetting {
+        catalog[slot].pending = Some(PendingRoleSetting {
             txid,
             exists: value.is_some(),
             value: value.unwrap_or_default(),
         });
-        Ok((slot, prior))
+        Ok(Some((slot, prior)))
     }
 
-    pub(crate) fn commit_system_setting(&mut self, slot: usize) {
-        let Some(pending) = self.system_settings[slot].pending.take() else {
+    pub(crate) fn commit_system_setting(&self, slot: usize) {
+        let mut catalog = self.system_settings_catalog();
+        let Some(pending) = catalog[slot].pending.take() else {
             return;
         };
-        self.system_settings[slot].live = pending.exists;
-        self.system_settings[slot].value = pending.value;
+        catalog[slot].live = pending.exists;
+        catalog[slot].value = pending.value;
         if !pending.exists {
-            self.system_settings[slot] = SystemSetting::EMPTY;
+            catalog[slot] = SystemSetting::EMPTY;
         }
     }
 
     pub(crate) fn rollback_system_setting(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingRoleSetting>,
     ) {
-        self.system_settings[slot].pending = prior;
-        if !self.system_settings[slot].live && prior.is_none() {
-            self.system_settings[slot] = SystemSetting::EMPTY;
+        let mut catalog = self.system_settings_catalog();
+        catalog[slot].pending = prior;
+        if !catalog[slot].live && prior.is_none() {
+            catalog[slot] = SystemSetting::EMPTY;
         }
     }
 
     pub(crate) fn install_system_setting(
-        &mut self,
+        &self,
         name: SqlName,
         value: Option<StackStr<ROLE_SETTING_VALUE_MAX>>,
     ) -> Result<(), SqlError> {
-        if let Some(slot) = self
-            .system_settings
+        Self::validate_system_setting_value(value)?;
+        let mut catalog = self.system_settings_catalog();
+        if let Some(slot) = catalog
             .iter()
-            .position(|setting| setting.live && setting.name == name)
+            .position(|setting| (setting.live || setting.pending.is_some()) && setting.name == name)
         {
+            if catalog[slot].pending.is_some() {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_IN_USE,
+                    "cannot replay a system setting with an unresolved transactional image"
+                ));
+            }
             if let Some(value) = value {
-                self.system_settings[slot].value = value;
+                catalog[slot].value = value;
             } else {
-                self.system_settings[slot] = SystemSetting::EMPTY;
+                catalog[slot] = SystemSetting::EMPTY;
             }
             return Ok(());
         }
         let Some(value) = value else { return Ok(()) };
-        let slot = self
-            .system_settings
+        let slot = catalog
             .iter()
             .position(|setting| !setting.live && setting.pending.is_none())
             .ok_or_else(|| {
@@ -26166,7 +26293,7 @@ impl Storage {
                     MAX_SYSTEM_SETTINGS
                 )
             })?;
-        self.system_settings[slot] = SystemSetting {
+        catalog[slot] = SystemSetting {
             name,
             value,
             live: true,
@@ -52548,6 +52675,234 @@ mod tests {
 
     fn test_database_definition(name: &str) -> DatabaseDefinition {
         DatabaseDefinition::builtin(name, false, true, "C")
+    }
+
+    fn test_prepared_catalog_entry(transaction_id: u32, gid: &str, generation: u64)
+        -> PreparedTransactionCatalogEntry
+    {
+        PreparedTransactionCatalogEntry {
+            transaction_id,
+            gid: StackStr::from_str(gid),
+            prepared_at: generation as i64,
+            owner: 0,
+            database: DatabaseOid::POSTGRES,
+            first_lsn: generation,
+            prepared_lsn: generation,
+        }
+    }
+
+    #[test]
+    fn cluster_metadata_system_settings_publish_owned_bounded_images() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Mutex<FixedVec<SystemSetting>>>();
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let names = ["setting_a", "setting_b", "setting_c", "setting_d"];
+        let barrier = std::sync::Barrier::new(names.len() + 1);
+        std::thread::scope(|scope| {
+            for (worker, name) in names.iter().enumerate() {
+                let storage = &storage;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        let name = SqlName::parse(name).unwrap();
+                        let value = Some(StackStr::from_str(name.as_str()));
+                        let txid = worker as u32 + 20;
+                        for iteration in 0..16 {
+                            let (slot, prior) = storage.change_system_setting(name, value, txid)
+                                .unwrap().unwrap();
+                            if iteration % 2 == 0 {
+                                storage.rollback_system_setting(slot, prior);
+                            } else {
+                                storage.commit_system_setting(slot);
+                                if iteration != 15 {
+                                    let (slot, _) = storage.change_system_setting(name, None, txid)
+                                        .unwrap().unwrap();
+                                    storage.commit_system_setting(slot);
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+            barrier.wait();
+            crate::mem::guard::forbid_alloc(|| {
+                for _ in 0..256 {
+                    for (_, image) in storage.system_settings() {
+                        if image.live {
+                            assert_eq!(image.name.as_str(), image.value.as_str());
+                        } else if image.pending.is_none() {
+                            assert_eq!(image.name, SqlName::EMPTY);
+                            assert!(image.value.as_str().is_empty());
+                        }
+                        let _ = storage.system_settings().count();
+                    }
+                    std::thread::yield_now();
+                }
+            });
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.system_settings_catalog().len(), MAX_SYSTEM_SETTINGS);
+            assert_eq!(storage.system_settings_catalog().capacity(), MAX_SYSTEM_SETTINGS);
+            assert_eq!(storage.system_settings().filter(|(_, image)| image.live).count(), names.len());
+            let retained = storage.system_settings();
+            for name in names {
+                storage.install_system_setting(SqlName::parse(name).unwrap(), None).unwrap();
+            }
+            assert_eq!(retained.filter(|(_, image)| image.live).count(), names.len());
+            assert_eq!(storage.system_settings().filter(|(_, image)| image.live).count(), 0);
+            for index in 0..MAX_SYSTEM_SETTINGS {
+                use core::fmt::Write;
+                let mut name = StackStr::<64>::new();
+                write!(name, "setting_{index}").unwrap();
+                storage.install_system_setting(SqlName::parse(name.as_str()).unwrap(),
+                    Some(StackStr::from_str("value"))).unwrap();
+            }
+            assert_eq!(storage.change_system_setting(SqlName::parse("overflow").unwrap(),
+                Some(StackStr::from_str("value")), 30).unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        });
+    }
+
+    #[test]
+    fn cluster_metadata_system_settings_reserve_reset_names_and_reject_truncation() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let name = SqlName::parse("pending_setting").unwrap();
+            let (slot, prior) = storage.change_system_setting(name,
+                Some(StackStr::from_str("first")), 11).unwrap().unwrap();
+            assert_eq!(storage.change_system_setting(name, None, 12).unwrap_err().sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT);
+            storage.release_row_locks(12);
+            assert_eq!(storage.install_system_setting(name, Some(StackStr::from_str("replayed")))
+                .unwrap_err().sqlstate, sqlstate::OBJECT_IN_USE);
+            storage.rollback_system_setting(slot, prior);
+            assert!(storage.change_system_setting(name, None, 12).unwrap().is_none());
+            storage.install_system_setting(name, Some(StackStr::from_str("retained"))).unwrap();
+            let (slot, prior) = storage.change_system_setting(name, None, 11).unwrap().unwrap();
+            assert!(storage.system_settings().find(|(index, _)| *index == slot).unwrap().1.live);
+            storage.rollback_system_setting(slot, prior);
+            assert_eq!(storage.system_settings().find(|(index, _)| *index == slot).unwrap().1
+                .value.as_str(), "retained");
+            let oversized = [b'x'; ROLE_SETTING_VALUE_MAX + 1];
+            let oversized = StackStr::from_str(core::str::from_utf8(&oversized).unwrap());
+            assert_eq!(storage.change_system_setting(name, Some(oversized), 11)
+                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.install_system_setting(name, Some(oversized))
+                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.system_settings().find(|(index, _)| *index == slot).unwrap().1
+                .value.as_str(), "retained");
+            let (slot, _) = storage.change_system_setting(name, None, 11).unwrap().unwrap();
+            storage.commit_system_setting(slot);
+            let image = storage.system_settings().find(|(index, _)| *index == slot).unwrap().1;
+            assert_eq!(image.name, SqlName::EMPTY);
+            assert!(image.value.as_str().is_empty());
+            assert!(!image.live);
+            assert!(image.pending.is_none());
+        });
+    }
+
+    #[test]
+    fn cluster_metadata_prepared_catalog_snapshots_are_atomic_and_startup_bounded() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PreparedTransactionCatalog>();
+        let mut config = test_config();
+        config.max_prepared_transactions = 2;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let mut arena = Arena::new(&mut budget, "prepared reader", 4096).unwrap();
+        let initial = [test_prepared_catalog_entry(10, "first", 1),
+            test_prepared_catalog_entry(11, "second", 1)];
+        storage.replace_prepared_transaction_catalog(initial).unwrap();
+        let barrier = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let storage = &storage;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        for iteration in 0..16 {
+                            let generation = worker * 100 + iteration + 1;
+                            storage.replace_prepared_transaction_catalog([
+                                test_prepared_catalog_entry(generation as u32 * 2, "first", generation),
+                                test_prepared_catalog_entry(generation as u32 * 2 + 1, "second", generation),
+                            ]).unwrap();
+                        }
+                    });
+                });
+            }
+            barrier.wait();
+            crate::mem::guard::forbid_alloc(|| {
+                for _ in 0..256 {
+                    arena.reset();
+                    let image = storage.prepared_transaction_catalog_snapshot(&arena).unwrap();
+                    assert_eq!(image.len(), 2);
+                    assert_eq!(image[0].prepared_lsn, image[1].prepared_lsn);
+                    assert_eq!(image[0].transaction_id + 1, image[1].transaction_id);
+                    assert_eq!(image[0].gid.as_str(), "first");
+                    assert_eq!(image[1].gid.as_str(), "second");
+                    assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries.len()), 2);
+                    std::thread::yield_now();
+                }
+            });
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            let catalog = storage.prepared_transactions.lock().unwrap();
+            assert_eq!(catalog.entries.capacity(), 2);
+            assert_eq!(catalog.candidate.capacity(), 2);
+            assert_eq!(catalog.entries.len(), 2);
+            assert!(catalog.candidate.is_empty());
+        });
+    }
+
+    #[test]
+    fn cluster_metadata_prepared_catalog_rejection_preserves_published_images() {
+        let mut config = test_config();
+        config.max_prepared_transactions = 2;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let tiny_arena = Arena::new(&mut budget, "small prepared snapshot", 8).unwrap();
+        let mut tiny_snapshot = FixedVec::new(&mut budget, "small prepared roster", 1).unwrap();
+        let initial = [test_prepared_catalog_entry(10, "first", 1),
+            test_prepared_catalog_entry(11, "second", 1)];
+        tiny_snapshot.push(initial[0]).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.replace_prepared_transaction_catalog(initial).unwrap();
+            for duplicate in [test_prepared_catalog_entry(10, "third", 1),
+                test_prepared_catalog_entry(12, "first", 1)] {
+                assert_eq!(storage.replace_prepared_transaction_catalog([initial[0], duplicate])
+                    .unwrap_err().sqlstate, sqlstate::DUPLICATE_OBJECT);
+                assert_eq!(storage.install_prepared_transaction_catalog_entry(duplicate)
+                    .unwrap_err().sqlstate, sqlstate::DUPLICATE_OBJECT);
+                assert_eq!(storage.with_prepared_transaction_catalog(|entries| [entries[0], entries[1]]), initial);
+            }
+            assert_eq!(storage.replace_prepared_transaction_catalog([
+                initial[0], initial[1], test_prepared_catalog_entry(12, "third", 1)])
+                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.prepared_transaction_catalog_snapshot(&tiny_arena)
+                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.copy_prepared_transaction_catalog(&mut tiny_snapshot)
+                .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(tiny_snapshot.len(), 1);
+            assert_eq!(tiny_snapshot[0], initial[0]);
+            for invalid in [test_prepared_catalog_entry(0, "invalid", 1),
+                test_prepared_catalog_entry(12, "invalid", 0)] {
+                assert_eq!(storage.replace_prepared_transaction_catalog([invalid])
+                    .unwrap_err().sqlstate, sqlstate::INVALID_PARAMETER_VALUE);
+                assert_eq!(storage.install_prepared_transaction_catalog_entry(invalid)
+                    .unwrap_err().sqlstate, sqlstate::INVALID_PARAMETER_VALUE);
+                assert_eq!(storage.with_prepared_transaction_catalog(|entries| [entries[0], entries[1]]), initial);
+            }
+            storage.replace_prepared_transaction_catalog([]).unwrap();
+            assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries.len()), 0);
+            storage.install_prepared_transaction_catalog_entry(initial[0]).unwrap();
+            assert_eq!(storage.with_prepared_transaction_catalog(|entries| entries[0]), initial[0]);
+        });
     }
 
     #[test]

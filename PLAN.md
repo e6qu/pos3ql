@@ -442,8 +442,24 @@ row mutation remain unsynchronized.
 The remaining catalog definition containers and row mutation paths still
 require synchronization before fixed workers can overlap execution.
 
-Next, synchronize system settings and prepared transaction metadata, then table
-definitions and row mutation state. Preserve transaction publication and
+System settings now publish their complete fixed-capacity image under one
+mutex. Owned iterators release that guard before SQL, WAL, checkpoint, or reload
+work. RESET checks absence and pending-name reservation atomically, while RESET
+ALL retains names instead of reusable slots. Replay rejects unresolved pending
+images and truncated values. Active cluster defaults and their reload flag share
+a separate publication mutex; applying defaults retains one owned image.
+
+Prepared transaction catalog metadata now uses one mutex and two exactly
+charged startup-sized rosters. Replacement validates a candidate before atomic
+publication; identity collisions and capacity or metadata errors preserve the
+published image. SQL copies snapshots into statement memory, and checkpoints
+use an exactly charged roster before nested role reads. Recovery rejects
+duplicate prepared identities and repeated system setting records. Allocation-
+free four-worker publication, nested snapshots, coherent default application,
+rollback, capacity, and recovery regressions cover these boundaries. Engine-owned
+prepared transaction slots and WAL publication still require exclusive execution.
+
+Next, synchronize table definitions and row mutation state. Preserve transaction publication and
 response barriers when replacing the reactor's local queue drain with fixed
 workers, and qualify one-through-N worker scaling before claiming concurrent
 execution complete.

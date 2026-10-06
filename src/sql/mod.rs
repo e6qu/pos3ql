@@ -443,8 +443,7 @@ pub struct Engine {
     /// `CONNECTION LIMIT` without allocating in the server loop.
     role_connections: FixedVec<u16>,
     database_connections: FixedVec<u16>,
-    active_system_settings: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS],
-    system_settings_reloaded: bool,
+    active_system_settings: ActiveSystemSettings,
     object_store_credentials_reload_requested: bool,
     discard_protocol_state: bool,
     clean_shutdown_path: std::path::PathBuf,
@@ -549,6 +548,40 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
 struct ActiveSystemSetting {
     name: crate::storage::SqlName,
     value: crate::util::StackStr<{ crate::storage::ROLE_SETTING_VALUE_MAX }>,
+}
+
+struct ActiveSystemSettings {
+    image: std::sync::Mutex<ActiveSystemSettingsImage>,
+}
+
+struct ActiveSystemSettingsImage {
+    entries: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS],
+    reloaded: bool,
+}
+
+impl ActiveSystemSettings {
+    fn new(entries: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS]) -> Self {
+        Self { image: std::sync::Mutex::new(ActiveSystemSettingsImage { entries, reloaded: false }) }
+    }
+
+    fn replace(&self, entries: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS]) {
+        *self.image.lock().expect("active system settings lock poisoned") =
+            ActiveSystemSettingsImage { entries, reloaded: true };
+    }
+
+    fn apply(&self, guc: &GucState) -> Result<(), SqlError> {
+        let image = self.image.lock().expect("active system settings lock poisoned").entries;
+        guc.reset_cluster_defaults();
+        for setting in image.iter().flatten() {
+            guc.set_cluster_default(setting.name.as_str(), setting.value.as_str())?;
+        }
+        Ok(())
+    }
+
+    fn take_reload(&self) -> bool {
+        core::mem::take(&mut self.image.lock()
+            .expect("active system settings lock poisoned").reloaded)
+    }
 }
 
 struct ConfigurationReloadScope {
@@ -2969,30 +3002,26 @@ impl Engine {
     }
 
     pub(crate) fn apply_system_settings(&self, guc: &GucState) -> Result<(), SqlError> {
-        guc.reset_cluster_defaults();
-        for setting in self.active_system_settings.iter().flatten() {
-            guc.set_cluster_default(setting.name.as_str(), setting.value.as_str())?;
-        }
-        Ok(())
+        self.active_system_settings.apply(guc)
     }
 
-    fn reload_system_settings(&mut self) {
-        self.active_system_settings = [None; crate::storage::MAX_SYSTEM_SETTINGS];
+    fn reload_system_settings(&self) {
+        let mut image = [None; crate::storage::MAX_SYSTEM_SETTINGS];
         let mut count = 0usize;
         for (_, setting) in self.storage.system_settings() {
             if setting.live {
-                self.active_system_settings[count] = Some(ActiveSystemSetting {
+                image[count] = Some(ActiveSystemSetting {
                     name: setting.name,
                     value: setting.value,
                 });
                 count += 1;
             }
         }
-        self.system_settings_reloaded = true;
+        self.active_system_settings.replace(image);
     }
 
-    pub(crate) fn take_system_settings_reload(&mut self) -> bool {
-        core::mem::take(&mut self.system_settings_reloaded)
+    pub(crate) fn take_system_settings_reload(&self) -> bool {
+        self.active_system_settings.take_reload()
     }
 
     pub(crate) fn take_object_store_credentials_reload(&mut self) -> bool {
@@ -3219,18 +3248,15 @@ impl Engine {
             Some(c) => c.load_into(&mut storage)?,
             None => 0,
         };
-        let replay_floor = storage
-            .prepared_transaction_catalog()
-            .iter()
+        let replay_floor = storage.with_prepared_transaction_catalog(|entries| entries.iter()
             .map(|prepared| prepared.first_lsn.saturating_sub(1))
             .min()
             .unwrap_or(floor)
-            .min(floor);
+            .min(floor));
         let expected_prepared: Vec<crate::util::StackStr<199>> = storage
-            .prepared_transaction_catalog()
-            .iter()
+            .with_prepared_transaction_catalog(|entries| entries.iter()
             .map(|prepared| prepared.gid)
-            .collect();
+            .collect());
         let mut wal = Wal::open(config, budget)?;
         let mut prepared_transactions = two_phase::PreparedTransactions::new(config, budget)?;
         // Recovery merges two partial sources by LSN and applies the merge in
@@ -3450,8 +3476,7 @@ impl Engine {
             replication_system_id: crate::object_store::writer_id(config),
             role_connections,
             database_connections,
-            active_system_settings,
-            system_settings_reloaded: false,
+            active_system_settings: ActiveSystemSettings::new(active_system_settings),
             object_store_credentials_reload_requested: false,
             discard_protocol_state: false,
             clean_shutdown_path,
@@ -6545,7 +6570,7 @@ impl Engine {
         self.commit_txn(txn, guc)
     }
 
-    fn refresh_prepared_transaction_catalog(&mut self) {
+    fn refresh_prepared_transaction_catalog(&self) -> Result<(), SqlError> {
         self.storage.replace_prepared_transaction_catalog(
             self.prepared_transactions.entries().map(|(_, metadata)| {
                 crate::storage::PreparedTransactionCatalogEntry {
@@ -6558,7 +6583,7 @@ impl Engine {
                     prepared_lsn: metadata.prepared_lsn,
                 }
             }),
-        );
+        )
     }
 
     fn prepare_transaction(
@@ -8429,7 +8454,7 @@ impl Engine {
         if self.post_publish_cleanup.is_some() {
             self.finish_post_publish_cleanup()?;
         }
-        self.refresh_prepared_transaction_catalog();
+        self.refresh_prepared_transaction_catalog()?;
         let Some(ckpt) = self.ckpt.as_mut() else {
             // The explicit non-durable test mode has no publication target.
             // PostgreSQL still treats CHECKPOINT as a successful maintenance
@@ -14223,7 +14248,9 @@ impl Engine {
         if reset_workspace {
             self.work.reset();
         }
-        self.refresh_prepared_transaction_catalog();
+        if let Err(error) = self.refresh_prepared_transaction_catalog() {
+            return Ok(Err(error));
+        }
         // Drop any diagnostic detail a swallowed error left behind, and
         // install this session's effective search path in the worker-local
         // execution context used by every name resolution below.

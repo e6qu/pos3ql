@@ -1077,5 +1077,19 @@ readers exercising nested resolution and statistics reset. Partial-clone
 exhaustion verifies both cloned catalog cleanup and preservation of the source.
 No external blocker remains.
 
+The cluster metadata audit found RESET checked absence outside publication and
+could ignore a pending concurrent SET. Name reservation and the missing-setting
+result now share one guard. RESET ALL retained reusable slot numbers; it now
+retains owned names. Recovery also allowed repeated system-setting records to
+replace earlier values and accepted duplicate prepared GIDs or transaction
+identities. Parsing and prepared-catalog validation reject these before mutation.
+Replay cannot overwrite an unresolved pending setting, and truncated setting
+values fail before publication. Prepared-catalog replacement stages a complete
+bounded candidate, so exhaustion or invalid metadata preserves the prior image.
+Owned statement and checkpoint snapshots release guards before nested reads.
+Active defaults and reload notification publish together; applying defaults
+copies one image before updating connection-local settings. Concurrent,
+allocation-free publication and snapshot regressions cover these paths.
+
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

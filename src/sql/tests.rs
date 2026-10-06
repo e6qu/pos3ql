@@ -7,6 +7,54 @@
 use super::*;
 
 #[test]
+fn cluster_metadata_reload_applies_one_owned_settings_image() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ActiveSystemSettings>();
+    let settings = ActiveSystemSettings::new([None; crate::storage::MAX_SYSTEM_SETTINGS]);
+    let names = [SqlName::parse("statement_timeout").unwrap(), SqlName::parse("lock_timeout").unwrap()];
+    let barrier = std::sync::Barrier::new(5);
+    let guc = GucState::new();
+    std::thread::scope(|scope| {
+        for worker in 0..4 {
+            let settings = &settings;
+            let barrier = &barrier;
+            let names = &names;
+            scope.spawn(move || {
+                barrier.wait();
+                crate::mem::guard::forbid_alloc(|| {
+                    for iteration in 0..16 {
+                        use core::fmt::Write;
+                        let mut value = crate::util::StackStr::new();
+                        write!(value, "{}", worker * 100 + iteration + 1).unwrap();
+                        let mut image = [None; crate::storage::MAX_SYSTEM_SETTINGS];
+                        for (index, &name) in names.iter().enumerate() {
+                            image[index] = Some(ActiveSystemSetting { name, value });
+                        }
+                        settings.replace(image);
+                    }
+                });
+            });
+        }
+        barrier.wait();
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..256 {
+                settings.apply(&guc).unwrap();
+                assert_eq!(guc.get_owned("statement_timeout"), guc.get_owned("lock_timeout"));
+                std::thread::yield_now();
+            }
+        });
+    });
+    crate::mem::guard::forbid_alloc(|| {
+        assert!(settings.take_reload());
+        assert!(!settings.take_reload());
+        settings.replace([None; crate::storage::MAX_SYSTEM_SETTINGS]);
+        settings.apply(&guc).unwrap();
+        assert_eq!(guc.get_owned("statement_timeout").unwrap().as_str(), "0");
+        assert_eq!(guc.get_owned("lock_timeout").unwrap().as_str(), "0");
+    });
+}
+
+#[test]
 fn engine_ownership_is_thread_transferable() {
     let (engine, budget) = test_engine();
     std::thread::spawn(move || {

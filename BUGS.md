@@ -6,6 +6,9 @@ finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet these inclusion criteria.
 
+Engine fixtures now charge retained reader capacity through one constructor,
+preserving prior workspace headroom for every configured table/workspace size.
+
 DML definition readers now retain immutable startup-budgeted images across
 mutable callbacks, rollback, publication, and table identity reuse. Per-row
 UPDATE and MERGE readers reuse those images. Exhaustion and stale identity

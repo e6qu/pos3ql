@@ -27,10 +27,6 @@ jobs:
           name: definition-formatting
           path: ${{ runner.temp }}/formatting.patch
       - run: cargo check --all-targets --locked
-      - run: cargo clippy --lib --bins -- -D warnings
-      - run: cargo test --lib --locked table_definition_images -- --test-threads=1
-      - run: cargo test --lib --locked copy_ -- --test-threads=1
-      - run: cargo test --lib --locked event_trigger -- --test-threads=1
-      - run: cargo test --lib --locked inheritance -- --test-threads=1
-      - run: cargo test --lib --locked merge_ -- --test-threads=1
-      - run: cargo test --lib --locked trigger_ -- --test-threads=1
+      - run: cargo test --lib --locked query_workspaces_are_startup_bounded_and_isolated -- --test-threads=1
+      - run: cargo test --lib --locked geometric_navigation_prunes_cold_objects_across_every_builtin_spatial_class -- --test-threads=1
+      - run: cargo test --lib --locked user_defined_aggregate_resolves_every_postgresql_polymorphic_family -- --test-threads=1

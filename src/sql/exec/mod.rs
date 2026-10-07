@@ -51553,7 +51553,7 @@ pub fn copy_statement_begin(
             responder,
         },
         setup.table_index,
-        &definition,
+        definition,
         TriggerEvents::INSERT,
         true,
         ColumnSet::EMPTY,
@@ -51627,7 +51627,7 @@ pub fn copy_statement_end(
             responder,
         },
         setup.table_index.into(),
-        &definition,
+        definition,
         TriggerEvents::INSERT,
         ColumnSet::EMPTY,
         transition_capture.as_ref().map(TransitionCapture::rows),
@@ -51748,9 +51748,9 @@ pub fn copy_row(
             def.columns()[setup.targets[n_fields]].name.as_str()
         ));
     }
-    let checks = parse_checks(&def, arena)?;
-    let default_exprs = parse_defaults(&def, arena)?;
-    let generated_exprs = parse_generated(&def, arena)?;
+    let checks = parse_checks(def, arena)?;
+    let default_exprs = parse_defaults(def, arena)?;
+    let generated_exprs = parse_generated(def, arena)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
     let mut explicit = [false; MAX_COLUMNS];
     for (i, field) in fields.iter().enumerate().take(setup.n_targets) {
@@ -51784,7 +51784,7 @@ pub fn copy_row(
         storage,
         txn.txid,
         seq_session,
-        &def,
+        def,
         &default_exprs,
         &mut values,
         &explicit,
@@ -51793,14 +51793,14 @@ pub fn copy_row(
     fill_auto_increment(
         storage,
         setup.table_index,
-        &def,
+        def,
         &mut values,
         &explicit,
         seq_session,
         txn.txid,
     )?;
     compute_generated(
-        &def,
+        def,
         &generated_exprs,
         &mut values,
         storage,
@@ -51811,7 +51811,7 @@ pub fn copy_row(
         storage,
         txn.txid,
         seq_session,
-        &def,
+        def,
         &values[..def.n_columns],
         arena,
     )? {
@@ -51826,7 +51826,7 @@ pub fn copy_row(
         inserted,
         setup.table_index,
         setup.security_role,
-        &def,
+        def,
         &checks,
         &generated_exprs,
         &mut values,
@@ -51865,9 +51865,9 @@ pub fn copy_row_binary(
             setup.n_targets
         ));
     }
-    let checks = parse_checks(&def, arena)?;
-    let default_exprs = parse_defaults(&def, arena)?;
-    let generated_exprs = parse_generated(&def, arena)?;
+    let checks = parse_checks(def, arena)?;
+    let default_exprs = parse_defaults(def, arena)?;
+    let generated_exprs = parse_generated(def, arena)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
     let mut explicit = [false; MAX_COLUMNS];
     for i in 0..setup.n_targets {
@@ -51894,7 +51894,7 @@ pub fn copy_row_binary(
         storage,
         txn.txid,
         seq_session,
-        &def,
+        def,
         &default_exprs,
         &mut values,
         &explicit,
@@ -51903,14 +51903,14 @@ pub fn copy_row_binary(
     fill_auto_increment(
         storage,
         setup.table_index,
-        &def,
+        def,
         &mut values,
         &explicit,
         seq_session,
         txn.txid,
     )?;
     compute_generated(
-        &def,
+        def,
         &generated_exprs,
         &mut values,
         storage,
@@ -51921,7 +51921,7 @@ pub fn copy_row_binary(
         storage,
         txn.txid,
         seq_session,
-        &def,
+        def,
         &values[..def.n_columns],
         arena,
     )? {
@@ -51936,7 +51936,7 @@ pub fn copy_row_binary(
         inserted,
         setup.table_index,
         setup.security_role,
-        &def,
+        def,
         &checks,
         &generated_exprs,
         &mut values,
@@ -53983,7 +53983,7 @@ pub fn copy_out(
             }
             count += u64::from(emit_copy_out_row(
                 storage,
-                &def,
+                def,
                 txid,
                 setup,
                 arena,
@@ -54059,7 +54059,7 @@ pub fn copy_out(
             rowenc::decode(bytes, &physical_schema[..physical.n_columns], &mut values)?;
             emit_copy_out_row(
                 storage,
-                &def,
+                def,
                 txid,
                 setup,
                 arena,
@@ -55321,7 +55321,7 @@ pub fn merge<'a>(
                 ..
             } if !default_values => {
                 if columns.is_empty() {
-                    insert_columns |= all_columns_mask(&def);
+                    insert_columns |= all_columns_mask(def);
                 } else {
                     let mut assigned = ColumnSet::EMPTY;
                     for name in columns {
@@ -55346,7 +55346,7 @@ pub fn merge<'a>(
     let reads_target = match (|| -> Result<ColumnSet, SqlError> {
         let mut columns = expression_dml_target_columns(
             statement.on,
-            &def,
+            def,
             target_alias,
             storage,
             txn.txid,
@@ -55356,7 +55356,7 @@ pub fn merge<'a>(
             if let Some(expression) = when.condition() {
                 columns |= expression_dml_target_columns(
                     expression,
-                    &def,
+                    def,
                     target_alias,
                     storage,
                     txn.txid,
@@ -55368,7 +55368,7 @@ pub fn merge<'a>(
                     for (_, expression) in assignments {
                         columns |= expression_dml_target_columns(
                             expression,
-                            &def,
+                            def,
                             target_alias,
                             storage,
                             txn.txid,
@@ -55380,7 +55380,7 @@ pub fn merge<'a>(
                     for expression in values {
                         columns |= expression_dml_target_columns(
                             expression,
-                            &def,
+                            def,
                             target_alias,
                             storage,
                             txn.txid,
@@ -55393,7 +55393,7 @@ pub fn merge<'a>(
         }
         columns |= returning_dml_target_columns(
             statement.returning,
-            &def,
+            def,
             statement.target_alias,
             storage,
             txn.txid,
@@ -55584,7 +55584,7 @@ pub fn merge<'a>(
                     responder,
                 },
                 table_index,
-                &def,
+                def,
                 event,
                 true,
                 if event == TriggerEvents::UPDATE {
@@ -55820,7 +55820,7 @@ pub fn merge<'a>(
                 rowenc::decode(bytes, target_schema, &mut values)?;
                 if let Some(plan) = select_security {
                     let context = RowCtx {
-                        def: &def,
+                        def: def,
                         values: &values[..def.n_columns],
                         alias: None,
                     };
@@ -55995,7 +55995,7 @@ pub fn merge<'a>(
             }
             if let Some(plan) = select_security {
                 let context = RowCtx {
-                    def: &def,
+                    def: def,
                     values: &vals[..def.n_columns],
                     alias: None,
                 };
@@ -56060,15 +56060,15 @@ pub fn merge<'a>(
         None
     };
 
-    let checks = match parse_checks(&def, arena) {
+    let checks = match parse_checks(def, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
     };
-    let generated = match parse_generated(&def, arena) {
+    let generated = match parse_generated(def, arena) {
         Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
-    let defaults = match parse_defaults(&def, arena) {
+    let defaults = match parse_defaults(def, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -56104,7 +56104,7 @@ pub fn merge<'a>(
                 continue;
             }
             let lookup = MergeLookup {
-                target_def: &def,
+                target_def: def,
                 target_alias,
                 target: target_vals[j],
                 source_def,
@@ -56148,7 +56148,7 @@ pub fn merge<'a>(
                 };
                 if let Some(plan) = action_security {
                     let policy_row = RowCtx {
-                        def: &def,
+                        def: def,
                         values: target_vals[j],
                         alias: None,
                     };
@@ -56203,7 +56203,7 @@ pub fn merge<'a>(
                             responder,
                             scratch as *mut _,
                             target_tables[j],
-                            &def,
+                            def,
                             TriggerEvents::DELETE,
                             true,
                             false,
@@ -56271,7 +56271,7 @@ pub fn merge<'a>(
                             responder,
                             scratch as *mut _,
                             target_tables[j],
-                            &def,
+                            def,
                             TriggerEvents::DELETE,
                             false,
                             false,
@@ -56290,7 +56290,7 @@ pub fn merge<'a>(
                             match emit_merge_returning(
                                 storage,
                                 txn.txid,
-                                &def,
+                                def,
                                 target_alias,
                                 target_vals[j],
                                 source_def,
@@ -56399,7 +56399,7 @@ pub fn merge<'a>(
                             new_values[ci] = value;
                         }
                         if let Err(e) = compute_generated(
-                            &def,
+                            def,
                             &generated,
                             &mut new_values,
                             storage,
@@ -56416,7 +56416,7 @@ pub fn merge<'a>(
                             responder,
                             scratch as *mut _,
                             target_tables[j],
-                            &def,
+                            def,
                             TriggerEvents::UPDATE,
                             true,
                             false,
@@ -56430,7 +56430,7 @@ pub fn merge<'a>(
                             break;
                         }
                         if let Err(e) = compute_generated(
-                            &def,
+                            def,
                             &generated,
                             &mut new_values,
                             storage,
@@ -56441,7 +56441,7 @@ pub fn merge<'a>(
                         }
                         if let Some(plan) = update_check {
                             let policy_row = RowCtx {
-                                def: &def,
+                                def: def,
                                 values: &new_values[..def.n_columns],
                                 alias: None,
                             };
@@ -56473,7 +56473,7 @@ pub fn merge<'a>(
                                 Err(error) => return sql_fail(error),
                             }
                         }
-                        if let Err(e) = check_not_null(&def, &new_values) {
+                        if let Err(e) = check_not_null(def, &new_values) {
                             return sql_fail(e);
                         }
                         let updated_table = if foreign_target {
@@ -56505,7 +56505,7 @@ pub fn merge<'a>(
                         if let Err(e) = enforce_row_constraints(
                             storage,
                             updated_table,
-                            &def,
+                            def,
                             constraint_schema,
                             &new_values[..def.n_columns],
                             (!foreign_target).then_some(target_ids[j]),
@@ -56652,7 +56652,7 @@ pub fn merge<'a>(
                             responder,
                             scratch as *mut _,
                             updated_table,
-                            &def,
+                            def,
                             TriggerEvents::UPDATE,
                             false,
                             false,
@@ -56676,7 +56676,7 @@ pub fn merge<'a>(
                             match emit_merge_returning(
                                 storage,
                                 txn.txid,
-                                &def,
+                                def,
                                 target_alias,
                                 &new_values[..def.n_columns],
                                 source_def,
@@ -56749,7 +56749,7 @@ pub fn merge<'a>(
                             storage,
                             txn,
                             table_index,
-                            &def,
+                            def,
                             columns,
                             values,
                             default_values,
@@ -56771,7 +56771,7 @@ pub fn merge<'a>(
                                     match emit_merge_returning(
                                         storage,
                                         txn.txid,
-                                        &def,
+                                        def,
                                         target_alias,
                                         inserted,
                                         source_def,
@@ -56831,7 +56831,7 @@ pub fn merge<'a>(
                     responder,
                 },
                 table_index.into(),
-                &def,
+                def,
                 event,
                 if event == TriggerEvents::UPDATE {
                     merge_update_columns
@@ -58240,7 +58240,7 @@ where
     ) {
         return sql_fail(error);
     }
-    let checks = match parse_checks(&def, arena) {
+    let checks = match parse_checks(def, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
     };
@@ -58249,7 +58249,7 @@ where
     // errors up front, independent of whether any row actually conflicts.
     let arbiter = match &statement.on_conflict {
         _ if def.kind == crate::storage::TableKind::Foreign => Arbiter::Any,
-        Some(oc) => match resolve_arbiter(storage, &def, oc, txn.txid) {
+        Some(oc) => match resolve_arbiter(storage, def, oc, txn.txid) {
             Ok(a) => a,
             Err(e) => return sql_fail(e),
         },
@@ -58288,7 +58288,7 @@ where
     let conflict_read_columns = match (|| -> Result<ColumnSet, SqlError> {
         let mut columns = returning_dml_target_columns(
             statement.returning,
-            &def,
+            def,
             None,
             storage,
             txn.txid,
@@ -58298,7 +58298,7 @@ where
             for target in conflict.target {
                 columns |= expression_dml_target_columns(
                     target.expression,
-                    &def,
+                    def,
                     None,
                     storage,
                     txn.txid,
@@ -58308,13 +58308,13 @@ where
             if let Some(assignments) = conflict.update {
                 for (_, expression) in assignments {
                     columns |= expression_dml_target_columns(
-                        expression, &def, None, storage, txn.txid, arena,
+                        expression, def, None, storage, txn.txid, arena,
                     )?;
                 }
             }
             if let Some(expression) = conflict.update_where {
                 columns |= expression_dml_target_columns(
-                    expression, &def, None, storage, txn.txid, arena,
+                    expression, def, None, storage, txn.txid, arena,
                 )?;
             }
         }
@@ -58414,7 +58414,7 @@ where
             responder,
         },
         table_index,
-        &def,
+        def,
         1,
         true,
         ColumnSet::EMPTY,
@@ -58435,7 +58435,7 @@ where
                 responder,
             },
             table_index,
-            &def,
+            def,
             2,
             true,
             updated_columns,
@@ -58450,7 +58450,7 @@ where
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match describe_returning_items(
             statement.returning,
-            Some(&def),
+            Some(def),
             None,
             Some(storage),
             txn.txid,
@@ -58539,15 +58539,15 @@ where
                 (&*rows, count)
             };
 
-        let default_exprs = match parse_defaults(&def, arena) {
+        let default_exprs = match parse_defaults(def, arena) {
             Ok(d) => d,
             Err(e) => return sql_fail(e),
         };
-        let view_default_exprs = match parse_view_defaults(view_check, &def, arena) {
+        let view_default_exprs = match parse_view_defaults(view_check, def, arena) {
             Ok(d) => d,
             Err(e) => return sql_fail(e),
         };
-        let generated_exprs = match parse_generated(&def, arena) {
+        let generated_exprs = match parse_generated(def, arena) {
             Ok(g) => g,
             Err(e) => return sql_fail(e),
         };
@@ -58595,12 +58595,12 @@ where
             let mut explicit = [false; MAX_COLUMNS];
             for i in 0..n_src {
                 // A generated column cannot be a target of INSERT ... SELECT.
-                if let Err(e) = reject_generated_write(&def, targets[i]) {
+                if let Err(e) = reject_generated_write(def, targets[i]) {
                     return sql_fail(e);
                 }
-                match identity_action(&def, targets[i], statement.overriding) {
+                match identity_action(def, targets[i], statement.overriding) {
                     IdentityAction::Reject => {
-                        return sql_fail(reject_identity_write(&def, targets[i]));
+                        return sql_fail(reject_identity_write(def, targets[i]));
                     }
                     // OVERRIDING USER VALUE: skip the query's value, use identity.
                     IdentityAction::UseSequence => continue,
@@ -58633,7 +58633,7 @@ where
                         storage,
                         txn.txid,
                         view_check,
-                        &def,
+                        def,
                         i,
                         default_exprs[i],
                         view_default_exprs[i],
@@ -58648,7 +58648,7 @@ where
             if let Err(e) = fill_auto_increment(
                 storage,
                 table_index,
-                &def,
+                def,
                 &mut values,
                 &explicit,
                 seq_session,
@@ -58660,7 +58660,7 @@ where
                 storage,
                 txn,
                 table_index,
-                &def,
+                def,
                 &mut values,
                 &generated_exprs,
                 statement,
@@ -58699,7 +58699,7 @@ where
                     responder,
                 },
                 table_index.into(),
-                &def,
+                def,
                 2,
                 updated_columns,
                 conflict_transition_capture
@@ -58722,7 +58722,7 @@ where
                 responder,
             },
             table_index.into(),
-            &def,
+            def,
             1,
             ColumnSet::EMPTY,
             transition_capture.as_ref().map(TransitionCapture::rows),
@@ -58746,15 +58746,15 @@ where
 
     // Non-constant DEFAULT expressions (now(), nextval(...), …) and GENERATED
     // expressions, re-parsed once and evaluated per row below.
-    let default_exprs = match parse_defaults(&def, arena) {
+    let default_exprs = match parse_defaults(def, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
-    let view_default_exprs = match parse_view_defaults(view_check, &def, arena) {
+    let view_default_exprs = match parse_view_defaults(view_check, def, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
-    let generated_exprs = match parse_generated(&def, arena) {
+    let generated_exprs = match parse_generated(def, arena) {
         Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
@@ -58806,12 +58806,12 @@ where
         for (i, expression) in row_exprs.iter().enumerate() {
             if !matches!(expression, Expr::DefaultMarker) {
                 // A generated column rejects any explicit non-DEFAULT value.
-                if let Err(e) = reject_generated_write(&def, targets[i]) {
+                if let Err(e) = reject_generated_write(def, targets[i]) {
                     return sql_fail(e);
                 }
-                match identity_action(&def, targets[i], statement.overriding) {
+                match identity_action(def, targets[i], statement.overriding) {
                     IdentityAction::Reject => {
-                        return sql_fail(reject_identity_write(&def, targets[i]));
+                        return sql_fail(reject_identity_write(def, targets[i]));
                     }
                     IdentityAction::UseSequence => ignore[targets[i]] = true,
                     IdentityAction::Accept => explicit[targets[i]] = true,
@@ -58868,7 +58868,7 @@ where
                     storage,
                     txn.txid,
                     view_check,
-                    &def,
+                    def,
                     i,
                     default_exprs[i],
                     view_default_exprs[i],
@@ -58883,7 +58883,7 @@ where
         if let Err(e) = fill_auto_increment(
             storage,
             table_index,
-            &def,
+            def,
             &mut values,
             &explicit,
             seq_session,
@@ -58895,7 +58895,7 @@ where
             storage,
             txn,
             table_index,
-            &def,
+            def,
             &mut values,
             &generated_exprs,
             statement,
@@ -58934,7 +58934,7 @@ where
                 responder,
             },
             table_index.into(),
-            &def,
+            def,
             2,
             updated_columns,
             conflict_transition_capture
@@ -58957,7 +58957,7 @@ where
             responder,
         },
         table_index.into(),
-        &def,
+        def,
         1,
         ColumnSet::EMPTY,
         transition_capture.as_ref().map(TransitionCapture::rows),
@@ -59487,7 +59487,7 @@ pub(crate) fn update<'a>(
         if let Some(expression) = statement.where_clause {
             columns |= expression_dml_target_columns(
                 expression,
-                &def,
+                def,
                 statement.alias,
                 storage,
                 txn.txid,
@@ -59497,7 +59497,7 @@ pub(crate) fn update<'a>(
         for (_, expression) in statement.assignments {
             columns |= expression_dml_target_columns(
                 expression,
-                &def,
+                def,
                 statement.alias,
                 storage,
                 txn.txid,
@@ -59506,7 +59506,7 @@ pub(crate) fn update<'a>(
         }
         columns |= returning_dml_target_columns(
             statement.returning,
-            &def,
+            def,
             statement.alias,
             storage,
             txn.txid,
@@ -59547,7 +59547,7 @@ pub(crate) fn update<'a>(
     ) {
         return sql_fail(error);
     }
-    let checks = match parse_checks(&def, arena) {
+    let checks = match parse_checks(def, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
     };
@@ -59567,11 +59567,11 @@ pub(crate) fn update<'a>(
             ));
         }
     }
-    let generated_exprs = match parse_generated(&def, arena) {
+    let generated_exprs = match parse_generated(def, arena) {
         Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
-    let defaults = match parse_defaults(&def, arena) {
+    let defaults = match parse_defaults(def, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -59588,7 +59588,7 @@ pub(crate) fn update<'a>(
             responder,
         },
         table_index,
-        &def,
+        def,
         2,
         true,
         updated_columns,
@@ -59684,7 +59684,7 @@ pub(crate) fn update<'a>(
             collect_join_matches_with_transition(
                 storage,
                 table_index,
-                &def,
+                def,
                 statement.alias,
                 schema,
                 from,
@@ -59701,7 +59701,7 @@ pub(crate) fn update<'a>(
             collect_join_matches(
                 storage,
                 table_index,
-                &def,
+                def,
                 statement.alias,
                 schema,
                 from,
@@ -59804,7 +59804,7 @@ pub(crate) fn update<'a>(
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match describe_returning_items(
             statement.returning,
-            Some(&def),
+            Some(def),
             statement.alias,
             Some(storage),
             txn.txid,
@@ -59874,7 +59874,7 @@ pub(crate) fn update<'a>(
             }
             let mut physical_new = values;
             let context = RowCtx {
-                def: &def,
+                def: def,
                 values: &values[..def.n_columns],
                 alias: statement.alias,
             };
@@ -60082,7 +60082,7 @@ pub(crate) fn update<'a>(
             // Every generated column is recomputed from the updated row (a change
             // to any dependency must flow through).
             if let Err(e) = compute_generated(
-                &def,
+                def,
                 &generated_exprs,
                 &mut physical_new,
                 storage,
@@ -60114,7 +60114,7 @@ pub(crate) fn update<'a>(
                 responder,
                 scratch as *mut _,
                 row_table,
-                &def,
+                def,
                 TriggerEvents::UPDATE,
                 true,
                 false,
@@ -60128,13 +60128,13 @@ pub(crate) fn update<'a>(
                 continue;
             }
             if let Err(e) =
-                compute_generated(&def, &generated_exprs, new_values, storage, txn.txid, arena)
+                compute_generated(def, &generated_exprs, new_values, storage, txn.txid, arena)
             {
                 return sql_fail(e);
             }
             if let Some(plan) = row_security_check {
                 let context = RowCtx {
-                    def: &def,
+                    def: def,
                     values: &new_values[..def.n_columns],
                     alias: None,
                 };
@@ -60168,7 +60168,7 @@ pub(crate) fn update<'a>(
             }
             if let Err(error) = enforce_view_check(
                 view_check,
-                &def,
+                def,
                 &new_values[..def.n_columns],
                 ViewCheckContext {
                     storage,
@@ -60180,13 +60180,13 @@ pub(crate) fn update<'a>(
             ) {
                 return sql_fail(error);
             }
-            if let Err(e) = check_not_null(&def, new_values) {
+            if let Err(e) = check_not_null(def, new_values) {
                 return sql_fail(e);
             }
             if let Err(e) = enforce_row_constraints(
                 storage,
                 row_table,
-                &def,
+                def,
                 schema,
                 &new_values[..def.n_columns],
                 remote_tuple.is_none().then_some(rowid),
@@ -60256,7 +60256,7 @@ pub(crate) fn update<'a>(
                 responder,
                 scratch as *mut _,
                 row_table,
-                &def,
+                def,
                 TriggerEvents::UPDATE,
                 false,
                 false,
@@ -60281,7 +60281,7 @@ pub(crate) fn update<'a>(
                 && let Err(error) = emit_projected(
                     storage,
                     txn.txid,
-                    &def,
+                    def,
                     statement.alias,
                     &new_values[..def.n_columns],
                     statement.returning,
@@ -60411,7 +60411,7 @@ pub(crate) fn update<'a>(
             responder,
             scratch as *mut _,
             target_table,
-            &def,
+            def,
             TriggerEvents::UPDATE,
             false,
             false,
@@ -60439,7 +60439,7 @@ pub(crate) fn update<'a>(
             if let Err(e) = emit_projected(
                 storage,
                 txn.txid,
-                &def,
+                def,
                 statement.alias,
                 &new_values[..def.n_columns],
                 statement.returning,
@@ -60468,7 +60468,7 @@ pub(crate) fn update<'a>(
             responder,
         },
         table_index.into(),
-        &def,
+        def,
         2,
         updated_columns,
         transition_capture.as_ref().map(TransitionCapture::rows),
@@ -60535,7 +60535,7 @@ pub(crate) fn delete<'a>(
         if let Some(expression) = statement.where_clause {
             columns |= expression_dml_target_columns(
                 expression,
-                &def,
+                def,
                 statement.alias,
                 storage,
                 txn.txid,
@@ -60544,7 +60544,7 @@ pub(crate) fn delete<'a>(
         }
         columns |= returning_dml_target_columns(
             statement.returning,
-            &def,
+            def,
             statement.alias,
             storage,
             txn.txid,
@@ -60583,7 +60583,7 @@ pub(crate) fn delete<'a>(
             responder,
         },
         table_index,
-        &def,
+        def,
         4,
         true,
         ColumnSet::EMPTY,
@@ -60648,7 +60648,7 @@ pub(crate) fn delete<'a>(
             collect_join_matches_with_transition(
                 storage,
                 table_index,
-                &def,
+                def,
                 statement.alias,
                 schema,
                 using,
@@ -60665,7 +60665,7 @@ pub(crate) fn delete<'a>(
             collect_join_matches(
                 storage,
                 table_index,
-                &def,
+                def,
                 statement.alias,
                 schema,
                 using,
@@ -60730,7 +60730,7 @@ pub(crate) fn delete<'a>(
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         match describe_returning_items(
             statement.returning,
-            Some(&def),
+            Some(def),
             statement.alias,
             Some(storage),
             txn.txid,
@@ -60790,7 +60790,7 @@ pub(crate) fn delete<'a>(
                 responder,
                 scratch as *mut _,
                 row_table,
-                &def,
+                def,
                 TriggerEvents::DELETE,
                 true,
                 false,
@@ -60842,7 +60842,7 @@ pub(crate) fn delete<'a>(
                 responder,
                 scratch as *mut _,
                 row_table,
-                &def,
+                def,
                 TriggerEvents::DELETE,
                 false,
                 false,
@@ -60862,7 +60862,7 @@ pub(crate) fn delete<'a>(
                 && let Err(error) = emit_projected(
                     storage,
                     txn.txid,
-                    &def,
+                    def,
                     statement.alias,
                     &old_transition[..def.n_columns],
                     statement.returning,
@@ -60913,7 +60913,7 @@ pub(crate) fn delete<'a>(
                 responder,
                 scratch as *mut _,
                 row_table,
-                &def,
+                def,
                 TriggerEvents::DELETE,
                 true,
                 false,
@@ -60949,7 +60949,7 @@ pub(crate) fn delete<'a>(
                 && let Err(e) = emit_projected(
                     storage,
                     txn.txid,
-                    &def,
+                    def,
                     statement.alias,
                     &old_values[..def.n_columns],
                     statement.returning,
@@ -61001,7 +61001,7 @@ pub(crate) fn delete<'a>(
                 responder,
                 scratch as *mut _,
                 row_table,
-                &def,
+                def,
                 TriggerEvents::DELETE,
                 false,
                 false,
@@ -61033,7 +61033,7 @@ pub(crate) fn delete<'a>(
             responder,
         },
         table_index.into(),
-        &def,
+        def,
         4,
         ColumnSet::EMPTY,
         transition_capture.as_ref().map(TransitionCapture::rows),

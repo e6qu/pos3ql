@@ -92,6 +92,12 @@ impl TableDefinitionImages {
         table: usize,
         transaction: u32,
     ) -> Result<&'a TableDef, SqlError> {
+        if !Arc::ptr_eq(&self.pool, &storage.table_definition_images) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "table definition reader belongs to different storage"
+            ));
+        }
         let source = storage.table(table);
         let mut slot = self.head.get();
         while let Some(index) = slot {

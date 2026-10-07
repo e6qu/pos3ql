@@ -5,8 +5,11 @@
 //! bytes are reclaimed when the memtable flushes to object storage (later
 //! phase). All capacities are fixed at startup.
 
+mod definition_images;
 pub(crate) mod foreign;
 pub(crate) mod rowenc;
+
+pub(crate) use definition_images::TableDefinitionImages;
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -13477,15 +13480,8 @@ impl CatalogSequence {
     }
 
     fn next(&self) -> u64 {
-        let prior = self
-            .0
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |value| value.checked_add(1),
-            )
-            .expect("catalog sequence exhausted");
-        prior.checked_add(1).expect("catalog sequence exhausted")
+        self.next_bounded(u64::MAX, "catalog sequence")
+            .expect("catalog sequence exhausted")
     }
 
     fn next_bounded(&self, maximum: u64, object: &str) -> Result<u64, SqlError> {
@@ -13675,6 +13671,7 @@ impl Iterator for MatviewIter<'_> {
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
+    table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
     pending_row_versions: FixedVec<PendingVersionSlot>,
     pending_row_version_free: Option<usize>,
@@ -17373,6 +17370,10 @@ impl Storage {
     }
 
     /// Bytes drawn beyond the row heap itself, for the memory plan.
+    pub(crate) fn table_definition_image_budget_bytes(config: &Config) -> usize {
+        definition_images::TableDefinitionImagePool::budget_bytes(config)
+    }
+
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
             + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
@@ -17383,6 +17384,7 @@ impl Storage {
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>())
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
+            + Self::table_definition_image_budget_bytes(config)
             + committed_row_version_capacity(config)
                 .saturating_mul(size_of::<CommittedVersionSlot>())
             + config.max_views * size_of::<ViewDef>()
@@ -17504,6 +17506,8 @@ impl Storage {
         let foreign = foreign::ForeignCatalog::new(config, budget)?;
         let table_capacity = table_slot_capacity(config);
         let mut tables = FixedVec::new(budget, "tables", table_capacity)?;
+        let table_definition_images =
+            definition_images::TableDefinitionImagePool::new(config, budget)?;
         budget.draw_array(
             table_capacity.saturating_mul(config.max_spill_generations_per_table),
             size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>(),
@@ -18269,6 +18273,7 @@ impl Storage {
         let storage = Self {
             heap,
             tables,
+            table_definition_images,
             max_row_versions_per_row: config.max_row_versions_per_row,
             pending_row_versions,
             pending_row_version_free: None,
@@ -34222,6 +34227,10 @@ impl Storage {
             Some(pending) if pending.txid == txid => &pending.def,
             _ => &self.tables[index].def,
         }
+    }
+
+    pub(crate) fn table_definition_images(&self) -> TableDefinitionImages {
+        TableDefinitionImages::new(&self.table_definition_images)
     }
 
     pub fn has_pending_table_def(&self, index: usize, txid: u32) -> bool {
@@ -54606,6 +54615,212 @@ mod tests {
             );
         }
         assert_eq!(storage.table_serial_value(table, 0), 25);
+    }
+
+    #[test]
+    fn table_definition_images_survive_publication_rollback_and_slot_reuse() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("original", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let committed = storage.table_definition_images();
+            let original = committed.definition(&storage, table, 0).unwrap();
+            assert!(core::ptr::eq(
+                original,
+                committed.definition(&storage, table, 0).unwrap()
+            ));
+            storage
+                .write_table_def(
+                    table,
+                    7,
+                    make_def("pending", &[("id", ColType::Int8, true)]),
+                    &[None; MAX_COLUMNS],
+                    false,
+                )
+                .unwrap();
+            let pending = storage.table_definition_images();
+            let pending_image = pending.definition(&storage, table, 7).unwrap();
+            let other_transaction = storage.table_definition_images();
+            assert_eq!(
+                other_transaction
+                    .definition(&storage, table, 8)
+                    .unwrap()
+                    .name
+                    .as_str(),
+                "original"
+            );
+            storage.rollback_table_def(table, 7);
+            assert_eq!(pending_image.name.as_str(), "pending");
+            assert!(core::ptr::eq(
+                pending_image,
+                pending.definition(&storage, table, 7).unwrap()
+            ));
+            let rolled_back = storage.table_definition_images();
+            assert_eq!(
+                rolled_back
+                    .definition(&storage, table, 7)
+                    .unwrap()
+                    .name
+                    .as_str(),
+                "original"
+            );
+            storage
+                .write_table_def(
+                    table,
+                    7,
+                    make_def("published", &[("id", ColType::Int8, true)]),
+                    &[None; MAX_COLUMNS],
+                    false,
+                )
+                .unwrap();
+            storage.commit_table_def(table, 7);
+            assert_eq!(original.name.as_str(), "original");
+            let published = storage.table_definition_images();
+            assert_eq!(
+                published
+                    .definition(&storage, table, 0)
+                    .unwrap()
+                    .name
+                    .as_str(),
+                "published"
+            );
+            storage.commit_drop(table);
+            let replacement = storage
+                .create_table(make_def("replacement", &[("id", ColType::Int8, true)]))
+                .unwrap();
+            assert_eq!(replacement, table);
+            assert_eq!(original.name.as_str(), "original");
+            assert_eq!(pending_image.name.as_str(), "pending");
+            assert_eq!(
+                committed
+                    .definition(&storage, table, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let reused = storage.table_definition_images();
+            assert_eq!(
+                reused.definition(&storage, table, 0).unwrap().name.as_str(),
+                "replacement"
+            );
+        });
+    }
+
+    #[test]
+    fn table_definition_images_reject_a_different_storage_owner() {
+        let config = test_config();
+        let mut first_budget = test_budget(&config);
+        let mut second_budget = test_budget(&config);
+        let mut first = Storage::new(&config, &mut first_budget).unwrap();
+        let mut second = Storage::new(&config, &mut second_budget).unwrap();
+        let table = first
+            .create_table(make_def("first", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        let other = second
+            .create_table(make_def("second", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        let definitions = first.table_definition_images();
+        crate::mem::guard::forbid_alloc(|| {
+            let image = definitions.definition(&first, table, 0).unwrap();
+            assert_eq!(
+                definitions
+                    .definition(&second, other, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            assert_eq!(image.name.as_str(), "first");
+        });
+    }
+
+    #[test]
+    fn table_definition_images_keep_their_pool_alive_after_storage_drops() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("retained", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        let definitions = storage.table_definition_images();
+        crate::mem::guard::forbid_alloc(|| {
+            let image = definitions.definition(&storage, table, 0).unwrap();
+            drop(storage);
+            assert_eq!(image.name.as_str(), "retained");
+            assert_eq!(image.columns()[0].name.as_str(), "id");
+        });
+    }
+
+    #[test]
+    fn table_definition_images_exhaustion_preserves_readers_and_releases_capacity() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("bounded", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        let capacity = table_slot_capacity(&config)
+            * (config.max_catalog_versions_per_object + 1)
+            * config.query_workspace_slots;
+        let mut owners = Vec::with_capacity(capacity);
+        crate::mem::guard::forbid_alloc(|| {
+            let retained_owner = storage.table_definition_images();
+            let retained = retained_owner.definition(&storage, table, 0).unwrap();
+            for _ in 1..capacity {
+                let owner = storage.table_definition_images();
+                owner.definition(&storage, table, 0).unwrap();
+                owners.push(owner);
+            }
+            let exhausted = storage.table_definition_images();
+            assert_eq!(
+                exhausted
+                    .definition(&storage, table, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(retained.name.as_str(), "bounded");
+            drop(owners.pop().unwrap());
+            exhausted.definition(&storage, table, 0).unwrap();
+            assert_eq!(retained.name.as_str(), "bounded");
+            drop(exhausted);
+            owners.clear();
+            let recovered = storage.table_definition_images();
+            recovered.definition(&storage, table, 0).unwrap();
+        });
+    }
+
+    #[test]
+    fn table_definition_images_concurrent_owners_reuse_cells_without_allocation() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("shared", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        let retained = storage.table_definition_images();
+        let image = retained.definition(&storage, table, 0).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let storage = &storage;
+                scope.spawn(move || {
+                    crate::mem::guard::forbid_alloc(|| {
+                        for _ in 0..256 {
+                            let definitions = storage.table_definition_images();
+                            let current = definitions.definition(storage, table, 0).unwrap();
+                            assert_eq!(current.name.as_str(), "shared");
+                            assert!(core::ptr::eq(
+                                current,
+                                definitions.definition(storage, table, 0).unwrap()
+                            ));
+                        }
+                    });
+                });
+            }
+        });
+        assert_eq!(image.name.as_str(), "shared");
     }
 
     fn make_def(name: &str, columns: &[(&str, ColType, bool)]) -> TableDef {

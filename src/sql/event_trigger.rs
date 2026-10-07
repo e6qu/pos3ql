@@ -16,9 +16,8 @@ pub(crate) const MAX_ADDRESS_PARTS: usize = crate::storage::MAX_DEFINITION_ITEMS
 type EventIdentity = StackStr<8192>;
 type EventAddressPart = StackStr<512>;
 
-#[derive(Clone, Copy)]
 pub(crate) struct BeforeDdl<'a> {
-    altered_table: Option<(usize, &'a crate::storage::TableDef)>,
+    altered_table: Option<(usize, crate::storage::TableDefinitionImages)>,
     dependent_drops: &'a [(EventObjectRef, bool)],
 }
 
@@ -59,10 +58,9 @@ pub(crate) fn capture_before<'a>(
         _ => None,
     };
     if let Some(slot) = alter_root {
-        let definition = arena
-            .alloc(*storage.table_def(slot, txid))
-            .map_err(|_| crate::sql::query::arena_full_pub())?;
-        before.altered_table = Some((slot, definition));
+        let definitions = storage.table_definition_images();
+        definitions.definition(storage, slot, txid)?;
+        before.altered_table = Some((slot, definitions));
     }
 
     let table_is_explicitly_dropped = |slot: usize| {
@@ -3179,16 +3177,18 @@ fn table_index_positions(
 
 fn push_alter_table_drops(
     statement: &Stmt<'_>,
-    before: BeforeDdl<'_>,
+    before: &BeforeDdl<'_>,
     storage: &Storage,
     txid: u32,
     output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
-    let (slot, old) = match before.altered_table {
+    let (slot, definitions) = match before.altered_table.as_ref() {
         Some(state) => state,
         None => return Ok(()),
     };
+    let slot = *slot;
+    let old = definitions.definition(storage, slot, txid)?;
     let Stmt::AlterTable(alter) = statement else {
         return Ok(());
     };
@@ -3892,7 +3892,7 @@ fn push_drop_dependents(
 }
 
 pub(crate) struct CollectChanges<'a, 'b> {
-    pub before: BeforeDdl<'a>,
+    pub before: &'b BeforeDdl<'a>,
     pub undo: &'b [DdlUndo],
     pub undo_origins: &'b [u32],
     pub origin: u32,
@@ -3998,8 +3998,8 @@ pub(crate) fn collect<'a>(
         };
         if mutation != Mutation::Drop {
             if let Stmt::AlterTable(_) = statement
-                && let Some((root, _)) = before.altered_table
-                && matches!(reference, ObjectRef::Table(slot) if slot != root)
+                && let Some((root, _)) = before.altered_table.as_ref()
+                && matches!(reference, ObjectRef::Table(slot) if slot != *root)
             {
                 continue;
             }

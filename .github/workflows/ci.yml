@@ -160,6 +160,34 @@ jobs:
       - name: Test library shard
         run: sh tools/test-lib-shard.sh '${{ matrix.partition }}'
 
+  wide-execution:
+    name: wide execution and cold recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache Rust build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Rebuild checked-out crate
+        run: cargo clean -p pos3ql
+
+      # This production-width fixture also runs in instrumented release
+      # coverage; its unoptimized replay exceeds the shared debug job budget.
+      - name: Wide mutable routine replay, cursor positions, and cold recovery
+        run: >-
+          cargo test --lib --release --locked
+          sql::tests::remaining_execution_widths_are_allocation_free_and_survive_cold_recovery
+          -- --exact --test-threads=1
+
   object-store-compatibility:
     name: object-store (${{ matrix.implementation }})
     strategy:

@@ -2305,6 +2305,7 @@ impl Server {
                         == worker
                             .bootstrap
                             .copy_setup
+                            .as_ref()
                             .expect("copying stage owns setup")
                             .n_targets
                         && binary
@@ -2359,10 +2360,11 @@ impl Server {
                                         let setup = worker
                                             .bootstrap
                                             .copy_setup
+                                            .as_ref()
                                             .expect("copying stage owns setup");
                                         if let Err(error) = worker.apply.copy_binary_row(
                                             &mut self.engine,
-                                            &setup,
+                                            setup,
                                             &worker.bootstrap.line.readable()[..length],
                                         ) {
                                             local_failure = Some(error);
@@ -2378,10 +2380,11 @@ impl Server {
                                     let setup = worker
                                         .bootstrap
                                         .copy_setup
+                                        .as_ref()
                                         .expect("copying stage owns setup");
                                     if let Err(error) = worker.apply.copy_line(
                                         &mut self.engine,
-                                        &setup,
+                                        setup,
                                         worker.bootstrap.line.readable(),
                                     ) {
                                         local_failure = Some(error);
@@ -2413,8 +2416,9 @@ impl Server {
                         let setup = worker
                             .bootstrap
                             .copy_setup
+                            .as_ref()
                             .expect("copying stage owns setup");
-                        if let Err(error) = worker.apply.finish_copy_table(&mut self.engine, &setup)
+                        if let Err(error) = worker.apply.finish_copy_table(&mut self.engine, setup)
                         {
                             local_failure = Some(error);
                             return Err(crate::pg::replication_client::ClientError::PublisherError);

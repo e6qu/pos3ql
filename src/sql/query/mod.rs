@@ -5419,8 +5419,8 @@ fn rewrite_grouped_expr<'a>(
         }
         Expr::Slice { base, lower, upper } => alloc(Expr::Slice {
             base: rewrite(base)?,
-            lower: lower.map(&rewrite).transpose()?,
-            upper: upper.map(&rewrite).transpose()?,
+            lower: lower.map(rewrite).transpose()?,
+            upper: upper.map(rewrite).transpose()?,
         }),
         Expr::Field { base, field } => alloc(Expr::Field { base: rewrite(base)?, field }),
         Expr::RecordFieldIndex { base, index } => {

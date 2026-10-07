@@ -11,6 +11,8 @@ iteration. Recovery, rollback, cloning, and slot reuse use the same map access
 boundary. Locks are charged at startup; capacity failure preserves retained
 rows. Query-scope definition ownership and shared row publication remain
 explicit roadmap work. This change introduces no deferred defect.
+All-target lint also corrected catalog test loops and an obsolete conversion;
+worker transaction and catalog identities are preserved.
 
 SQL and wire engine fixtures now charge retained reader capacity through one
 constructor,

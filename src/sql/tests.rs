@@ -6014,7 +6014,7 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
             .iter()
             .any(|(_, state)| recovered
                 .storage
-                .row_pending_last(*state)
+                .row_pending_last(state)
                 .is_some_and(|pending| {
                     pending.txid
                         == recovered
@@ -50772,7 +50772,7 @@ fn parked_statement_rewinds_partial_rows_before_replay() {
                 .iter()
                 .all(|(_, state)| {
                     storage
-                        .row_pending_last(*state)
+                        .row_pending_last(state)
                         .is_none_or(|pending| pending.txid != waiter.txid)
                 })
         },

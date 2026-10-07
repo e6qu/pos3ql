@@ -176,7 +176,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: a, corpus_shard: "0-of-6", auxiliary: none }
+          # Split the former first slice so wide JSON and the other wide
+          # execution fixtures do not share one cold-build job budget.
+          - { name: a, corpus_shard: "0-of-12", auxiliary: none }
+          - { name: g, corpus_shard: "6-of-12", auxiliary: none }
           - { name: b, corpus_shard: "1-of-6", auxiliary: none }
           - { name: c, corpus_shard: "2-of-6", auxiliary: none }
           - { name: d, corpus_shard: "3-of-6", auxiliary: none }
@@ -260,7 +263,8 @@ jobs:
           # Keep instrumented corpus and auxiliary phases in independent
           # workers so cold setup plus measurement stays below 15 minutes.
           - { name: corpus-a, corpus_shard: "0-of-6", auxiliary: none }
-          - { name: corpus-b, corpus_shard: "1-of-6", auxiliary: none }
+          - { name: corpus-b, corpus_shard: "1-of-12", auxiliary: none }
+          - { name: corpus-g, corpus_shard: "7-of-12", auxiliary: none }
           - { name: corpus-c, corpus_shard: "2-of-6", auxiliary: none }
           - { name: corpus-d, corpus_shard: "3-of-6", auxiliary: none }
           - { name: corpus-e, corpus_shard: "4-of-6", auxiliary: none }

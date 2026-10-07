@@ -6,6 +6,21 @@ finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet these inclusion criteria.
 
+Row maps now return detached row-state images from shared lookups and guarded
+iteration. Recovery, rollback, cloning, and slot reuse use the same map access
+boundary. Locks are charged at startup; capacity failure preserves retained
+rows. Query-scope definition ownership and shared row publication remain
+explicit roadmap work. This change introduces no deferred defect.
+All-target lint also corrected catalog test loops and an obsolete conversion;
+worker transaction and catalog identities are preserved.
+The first forced-spill slice and an instrumented reference corpus slice
+exhausted their fixed CI deadlines. Each now has two complementary slices;
+the timeout guard proves all current and future corpus ordinals still have
+exactly one owner in both matrices. No test or limit was
+removed or reduced. The ordinary PostgreSQL regression
+file slice also has complementary workers; upstream ranges stay together and
+statement progress is streamed so deadline failures retain diagnostics.
+
 SQL and wire engine fixtures now charge retained reader capacity through one
 constructor,
 preserving prior workspace headroom for every configured table/workspace size.

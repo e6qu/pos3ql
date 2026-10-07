@@ -7,9 +7,11 @@
 
 mod definition_images;
 pub(crate) mod foreign;
+mod row_map;
 pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
+pub(crate) use row_map::RowMap;
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -2746,7 +2748,7 @@ pub struct Table {
     /// Monotonic creation stamp (catalog sequence), giving dependency
     /// reports PostgreSQL's OID ordering.
     pub created_at: u64,
-    pub rows: FixedMap<u64, RowState>,
+    pub rows: RowMap,
     /// Committed existence: whether the table is part of the last-committed
     /// catalog image. `pending_ddl` overlays an uncommitted CREATE/DROP.
     pub live: bool,
@@ -17546,7 +17548,7 @@ impl Storage {
                     ownership: Ownership::BOOTSTRAP,
                     pending_def_tail: None,
                     pending_def_txid: None,
-                    rows: FixedMap::new(
+                    rows: RowMap::new(
                         budget,
                         "table_rows",
                         if slot == config.max_tables {
@@ -19886,7 +19888,6 @@ impl Storage {
                         .rows
                         .iter()
                         .nth(position)
-                        .map(|(rowid, state)| (*rowid, *state))
                         .expect("row position remains stable while cloning another table");
                     if state.pending.len() != 0 {
                         return Err(sql_err!(
@@ -28544,8 +28545,8 @@ impl Storage {
             self.tables[i].def.schema(&mut schema);
             let mut max = [0i64; MAX_COLUMNS];
             let mut rowids: Vec<(u64, RowHome)> = Vec::new();
-            for (&rowid, state) in self.tables[i].rows.iter() {
-                if let Some(home) = self.resident_visible_to(*state, 0) {
+            for (rowid, state) in self.tables[i].rows.iter() {
+                if let Some(home) = self.resident_visible_to(state, 0) {
                     rowids.push((rowid, home));
                 }
             }
@@ -29015,7 +29016,7 @@ impl Storage {
                     SpillOverlayMode::VisibleScan => self.tables[slot]
                         .rows
                         .get(&rowid)
-                        .is_none_or(Self::redundant_spilled_row_state),
+                        .is_none_or(|state| Self::redundant_spilled_row_state(&state)),
                     SpillOverlayMode::CommittedCheckpoint => {
                         self.tables[slot].rows.get(&rowid).is_none_or(|state| {
                             matches!(
@@ -29672,8 +29673,8 @@ impl Storage {
         table_slot: usize,
         each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        for (&rowid, state) in self.tables[table_slot].rows.iter() {
-            if each(rowid, *state)?.is_break() {
+        for (rowid, state) in self.tables[table_slot].rows.iter() {
+            if each(rowid, state)?.is_break() {
                 return Ok(core::ops::ControlFlow::Break(()));
             }
         }
@@ -29685,11 +29686,11 @@ impl Storage {
         table_slot: usize,
         each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        for (&rowid, state) in self.tables[table_slot].rows.iter() {
-            if Self::redundant_spilled_row_state(state) {
+        for (rowid, state) in self.tables[table_slot].rows.iter() {
+            if Self::redundant_spilled_row_state(&state) {
                 continue;
             }
-            if each(rowid, *state)?.is_break() {
+            if each(rowid, state)?.is_break() {
                 return Ok(core::ops::ControlFlow::Break(()));
             }
         }
@@ -29715,7 +29716,7 @@ impl Storage {
             CheckpointValueEntry<'entry>,
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<bool, SqlError> {
-        let rows = &self.tables[table_slot].rows;
+        let rows = self.tables[table_slot].rows.read();
         let mut walked = 0usize;
         while cursor.resident_slot < rows.backing_slot_count() && walked < max_rows {
             let slot = cursor.resident_slot;
@@ -29794,7 +29795,7 @@ impl Storage {
     ) -> Result<bool, SqlError> {
         let mut walked = 0usize;
         if !cursor.resident_done {
-            let rows = &self.tables[table_slot].rows;
+            let rows = self.tables[table_slot].rows.read();
             while cursor.resident_slot < rows.backing_slot_count() && walked < max_rows {
                 let slot = cursor.resident_slot;
                 cursor.resident_slot += 1;
@@ -29922,7 +29923,7 @@ impl Storage {
     /// One row's state by id, through the same seam as the enumeration.
     pub fn row_state(&self, table_slot: usize, rowid: u64) -> Result<Option<RowState>, SqlError> {
         if let Some(state) = self.tables[table_slot].rows.get(&rowid) {
-            return Ok(Some(*state));
+            return Ok(Some(state));
         }
         Ok(self
             .spill_probe_at(table_slot, rowid, u64::MAX)?
@@ -29946,7 +29947,7 @@ impl Storage {
     /// by later changes without point-reading the immutable table for every
     /// unchanged index entry.
     pub(crate) fn resident_row_state(&self, table_slot: usize, rowid: u64) -> Option<RowState> {
-        self.tables[table_slot].rows.get(&rowid).copied()
+        self.tables[table_slot].rows.get(&rowid)
     }
 
     /// The single visibility choke point for heap and object-resident row
@@ -30757,7 +30758,7 @@ impl Storage {
         loop {
             let mut batch = [0u64; 512];
             let mut n = 0usize;
-            for (&rowid, state) in table.rows.iter() {
+            for (rowid, state) in table.rows.iter() {
                 if state.committed.is_none() && state.history.is_empty() && state.pending.is_none()
                 {
                     batch[n] = rowid;
@@ -31184,7 +31185,7 @@ impl Storage {
             if !table.live && table.pending_ddl.is_none() {
                 continue;
             }
-            for (&rowid, state) in table.rows.iter() {
+            for (rowid, state) in table.rows.iter() {
                 let overflow = |e| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -31318,7 +31319,7 @@ impl Storage {
         let conflicting_owner = self.tables[table_index]
             .rows
             .get(&rowid)
-            .and_then(|state| self.row_locked_by_other(*state, txid));
+            .and_then(|state| self.row_locked_by_other(state, txid));
         if let Some(owner) = conflicting_owner {
             self.wait_for_transaction(txid, owner)?;
             return Err(sql_err!(
@@ -31327,12 +31328,12 @@ impl Storage {
             ));
         }
         let existed = match self.tables[table_index].rows.get(&rowid) {
-            Some(state) => self.resident_visible_to(*state, txid).is_some(),
+            Some(state) => self.resident_visible_to(state, txid).is_some(),
             None => self
                 .spill_probe_at(table_index, rowid, u64::MAX)?
                 .is_some_and(|version| version.len.is_some()),
         };
-        if let Some(state) = self.tables[table_index].rows.get(&rowid).copied() {
+        if let Some(state) = self.tables[table_index].rows.get(&rowid) {
             let (changed_columns, changes_existence) = self.pending_change_footprint(
                 table_index,
                 rowid,
@@ -31373,7 +31374,6 @@ impl Storage {
             let state = self.tables[table_index]
                 .rows
                 .get(&rowid)
-                .copied()
                 .expect("row state was just observed");
             if oldest_snapshot.is_some()
                 && state.pending.is_none()
@@ -31556,8 +31556,8 @@ impl Storage {
         loop {
             let mut batch = [0u64; 512];
             let mut n = 0usize;
-            for (&rowid, state) in table.rows.iter() {
-                if Self::redundant_spilled_row_state(state) {
+            for (rowid, state) in table.rows.iter() {
+                if Self::redundant_spilled_row_state(&state) {
                     batch[n] = rowid;
                     n += 1;
                     if n == batch.len() {
@@ -31650,7 +31650,7 @@ impl Storage {
         txid: u32,
         prior: Option<Option<RowLoc>>,
     ) {
-        let Some(state) = self.tables[table_index].rows.get(&rowid).copied() else {
+        let Some(state) = self.tables[table_index].rows.get(&rowid) else {
             return;
         };
         // Only touch a pending change this transaction owns (or an empty slot).
@@ -31802,11 +31802,7 @@ impl Storage {
             clear_pending_versions(pending_versions, pending_free, &mut state.pending);
         }
         let table = &mut self.tables[table_index];
-        let state = table
-            .rows
-            .get(&rowid)
-            .copied()
-            .expect("row present after commit");
+        let state = table.rows.get(&rowid).expect("row present after commit");
         if state.committed.is_none() {
             // A rowid that ever reached an SST — even if its latest version was
             // heap-resident — must tombstone, or a cold start resurrects the
@@ -31864,11 +31860,7 @@ impl Storage {
             clear_pending_versions(pending_versions, pending_free, &mut state.pending);
         }
         let table = &mut self.tables[table_index];
-        let state = table
-            .rows
-            .get(&rowid)
-            .copied()
-            .expect("row present after rewrite");
+        let state = table.rows.get(&rowid).expect("row present after rewrite");
         if state.committed.is_none() && table.n_spill_ssts == 0 {
             table.rows.remove(&rowid);
         }
@@ -32195,7 +32187,7 @@ impl Storage {
             // committed change remains in the bounded resident overlay
             // until its replacement generation publishes.
             let mut hashes = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
-            for (&rowid, state) in self.tables[table_index].rows.iter() {
+            for (rowid, state) in self.tables[table_index].rows.iter() {
                 if state.committed_lsn <= handle.published_lsn {
                     continue;
                 }
@@ -32821,7 +32813,7 @@ impl Storage {
         // Overlay entries supersede or extend the published base. Duplicate
         // rowids are harmless because the ordinary WHERE/MVCC path rechecks
         // them; callers sort and deduplicate candidates before execution.
-        for (&rowid, state) in table.rows.iter() {
+        for (rowid, state) in table.rows.iter() {
             if state.committed_lsn <= handle.published_lsn {
                 continue;
             }
@@ -32940,7 +32932,7 @@ impl Storage {
                 return Err(error);
             }
         }
-        for (&rowid, state) in table.rows.iter() {
+        for (rowid, state) in table.rows.iter() {
             if state.committed_lsn <= handle.published_lsn {
                 continue;
             }
@@ -33008,7 +33000,7 @@ impl Storage {
 
         // New committed keys are not in the immutable generation. Rank them
         // before opening the tree so they participate in the initial cutoff.
-        for (&rowid, state) in table.rows.iter() {
+        for (rowid, state) in table.rows.iter() {
             if state.committed_lsn <= handle.published_lsn {
                 continue;
             }
@@ -33241,7 +33233,7 @@ impl Storage {
                 return Err(error);
             }
         }
-        for (&rowid, state) in table.rows.iter() {
+        for (rowid, state) in table.rows.iter() {
             if state.committed_lsn <= handle.published_lsn {
                 continue;
             }
@@ -47836,7 +47828,7 @@ impl Storage {
                 loop {
                     let mut batch = [0u64; 512];
                     let mut count = 0usize;
-                    for (&rowid, state) in table.rows.iter() {
+                    for (rowid, state) in table.rows.iter() {
                         if state.committed.is_none()
                             && state.history.is_empty()
                             && state.pending.is_none()
@@ -52819,6 +52811,29 @@ mod tests {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
     }
 
+    #[test]
+    fn table_state_row_map_controls_are_charged_at_startup() {
+        let mut config = test_config();
+        config.query_workspace_slots = 2;
+        let bytes = config.memtable_bytes + Storage::extra_budget_bytes(&config);
+        let mut budget = Budget::new(bytes);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage.configure_collation(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        assert!(size_of::<RowMap>() > size_of::<FixedMap<u64, RowState>>());
+        assert_eq!(storage.tables.len(), table_slot_capacity(&config));
+        for (slot, table) in storage.tables.iter().enumerate() {
+            assert_eq!(
+                table.rows.capacity(),
+                if slot == config.max_tables {
+                    config.large_object_pages
+                } else {
+                    config.table_rows
+                }
+            );
+        }
+    }
+
     fn test_view_definition(dependencies: StoredQueryDependencies) -> ViewDefinition {
         ViewDefinition {
             persistence: RelationPersistence::Permanent,
@@ -53819,7 +53834,7 @@ mod tests {
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let mut invalid = test_index_definition("invalid_generation");
-            invalid.created_at = u64::from(MAX_INDEX_OID_GENERATION) + 1;
+            invalid.created_at = MAX_INDEX_OID_GENERATION + 1;
             assert_eq!(
                 storage.create_index(invalid, 17).unwrap_err().sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
@@ -53980,13 +53995,13 @@ mod tests {
         let names = ["worker_a", "worker_b", "worker_c", "worker_d"];
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for (worker, worker_name) in names.iter().copied().enumerate() {
                 let storage = &storage;
                 let barrier = &barrier;
                 let finished = &finished;
                 scope.spawn(move || {
                     let schema = SqlName::parse("public").unwrap();
-                    let name = SqlName::parse(names[worker]).unwrap();
+                    let name = SqlName::parse(worker_name).unwrap();
                     barrier.wait();
                     crate::mem::guard::forbid_alloc(|| {
                         for iteration in 0..16 {
@@ -55475,11 +55490,11 @@ mod tests {
         let storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for (worker, worker_name) in names.iter().copied().enumerate() {
                 let storage = &storage;
                 scope.spawn(move || {
                     let txid = worker as u32 + 1;
-                    let name = SqlName::parse(names[worker]).unwrap();
+                    let name = SqlName::parse(worker_name).unwrap();
                     let (role, _) = storage
                         .create_role(name, RoleAttributes::ORDINARY, txid)
                         .unwrap();
@@ -55505,7 +55520,7 @@ mod tests {
                         .change_role_setting(
                             RoleSettingScope::RoleAllDatabases(role as u16),
                             SqlName::parse("application_name").unwrap(),
-                            Some(StackStr::from_str(names[worker])),
+                            Some(StackStr::from_str(worker_name)),
                             txid,
                         )
                         .unwrap();
@@ -55535,8 +55550,8 @@ mod tests {
         for (slot, role) in storage.live_roles() {
             assert_eq!(storage.role_name(slot, 0), role.name);
         }
-        for worker in 0..WORKERS {
-            let role = storage.find_role(names[worker]).unwrap();
+        for worker_name in names.iter().copied() {
+            let role = storage.find_role(worker_name).unwrap();
             assert!(storage.role_can_admin(role, BOOTSTRAP_ROLE as usize, 0));
         }
         assert!(
@@ -55603,14 +55618,14 @@ mod tests {
         let storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for (worker, worker_name) in names.iter().copied().enumerate() {
                 let storage = &storage;
                 scope.spawn(move || {
                     let slot = storage
                         .create_access_method(
                             0,
                             AccessMethodDefinition {
-                                name: SqlName::parse(names[worker]).unwrap(),
+                                name: SqlName::parse(worker_name).unwrap(),
                                 handler: TableAccessMethodHandler::Heap,
                             },
                             worker as u32 + 1,
@@ -55625,21 +55640,21 @@ mod tests {
                     let mut operator = OperatorDef::EMPTY;
                     operator.database = DatabaseOid::POSTGRES;
                     operator.created_at = 100 + worker as u64;
-                    operator.definition.name = SqlName::parse(names[worker]).unwrap();
+                    operator.definition.name = SqlName::parse(worker_name).unwrap();
                     operator.ddl_state = CatalogDdlState::Present;
                     catalog.operators[worker] = operator;
 
                     let mut family = OperatorFamilyDef::EMPTY;
                     family.database = DatabaseOid::POSTGRES;
                     family.created_at = 200 + worker as u64;
-                    family.definition.name = SqlName::parse(names[worker]).unwrap();
+                    family.definition.name = SqlName::parse(worker_name).unwrap();
                     family.ddl_state = CatalogDdlState::Present;
                     catalog.families[worker] = family;
 
                     let mut class = OperatorClassDef::EMPTY;
                     class.database = DatabaseOid::POSTGRES;
                     class.created_at = 300 + worker as u64;
-                    class.definition.name = SqlName::parse(names[worker]).unwrap();
+                    class.definition.name = SqlName::parse(worker_name).unwrap();
                     class.ddl_state = CatalogDdlState::Present;
                     catalog.classes[worker] = class;
                 });
@@ -56921,7 +56936,7 @@ mod tests {
         let storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for (worker, parameter) in parameters.iter().copied().enumerate() {
                 let storage = &storage;
                 scope.spawn(move || {
                     let txid = worker as u32 + 1;
@@ -56978,7 +56993,7 @@ mod tests {
                         .unwrap();
                     storage.commit_default_acl(default_slot, txid);
 
-                    let parameter = crate::sql::ast::ParameterName::parse(parameters[worker])
+                    let parameter = crate::sql::ast::ParameterName::parse(parameter)
                         .expect("parameter name fits");
                     let (parameter_slot, _) = storage
                         .change_parameter_acl(
@@ -57453,14 +57468,14 @@ mod tests {
         let mut storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for (worker, worker_name) in names.iter().copied().enumerate() {
                 let storage = &storage;
                 scope.spawn(move || {
                     let txid = worker as u32 + 1;
                     let slot = storage
                         .create_tablespace(
                             0,
-                            SqlName::parse(names[worker]).unwrap(),
+                            SqlName::parse(worker_name).unwrap(),
                             StackStr::from_str("/data"),
                             TablespaceOptions::DEFAULT,
                             BOOTSTRAP_ROLE,
@@ -57613,11 +57628,11 @@ mod tests {
         let mut storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for worker_name in names.iter().copied() {
                 let storage = &storage;
                 scope.spawn(move || {
                     storage
-                        .create_schema(SqlName::parse(names[worker]).unwrap())
+                        .create_schema(SqlName::parse(worker_name).unwrap())
                         .unwrap();
                 });
             }
@@ -58944,7 +58959,7 @@ mod tests {
         storage.compact_heap(&mut scratch).unwrap();
 
         let compacted = storage
-            .row_pending_last(*storage.table(slot).rows.get(&1).unwrap())
+            .row_pending_last(storage.table(slot).rows.get(&1).unwrap())
             .unwrap()
             .loc
             .unwrap();

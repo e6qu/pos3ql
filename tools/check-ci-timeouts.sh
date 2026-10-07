@@ -49,7 +49,8 @@ done
 # auxiliary probes. Each worker has a fixed 15-minute ceiling.
 spill_matrix=.github/workflows/coverage.yml
 for spill_entry in \
-    '- { name: a, corpus_shard: "0-of-6", auxiliary: none }' \
+    '- { name: a, corpus_shard: "0-of-12", auxiliary: none }' \
+    '- { name: g, corpus_shard: "6-of-12", auxiliary: none }' \
     '- { name: b, corpus_shard: "1-of-6", auxiliary: none }' \
     '- { name: c, corpus_shard: "2-of-6", auxiliary: none }' \
     '- { name: d, corpus_shard: "3-of-6", auxiliary: none }' \
@@ -73,13 +74,40 @@ for spill_entry in \
     fi
 done
 
+# Mixed partition widths must cover every ordinal exactly once, including
+# future corpora. Check one complete repetition of their assignment cycle.
+if ! python3 - "$spill_matrix" <<'PY'
+import math
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text()
+for job in ("spill-differential", "reference-diff"):
+    match = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  [a-z][a-z-]*:\n|\Z)", text)
+    if match is None:
+        sys.exit(f"CI timeout guard: missing {job} matrix")
+    partitions = [(int(index), int(count)) for index, count in
+                  re.findall(r'corpus_shard: "([0-9]+)-of-([0-9]+)"', match[1])]
+    if not partitions or any(count == 0 or index >= count for index, count in partitions):
+        sys.exit(f"CI timeout guard: invalid {job} corpus partitions")
+    for ordinal in range(math.lcm(*(count for _, count in partitions))):
+        owners = sum(ordinal % count == index for index, count in partitions)
+        if owners != 1:
+            sys.exit(f"CI timeout guard: {job} corpus ordinal {ordinal} has {owners} owners")
+PY
+then
+    failed=1
+fi
+
 # Coverage instrumentation plus the complete SQL differential workload no
 # longer fits combined workers under the 15-minute ceiling. Keep all corpus
 # slices and each independent auxiliary phase explicit.
 reference_matrix=.github/workflows/coverage.yml
 for reference_entry in \
     '- { name: corpus-a, corpus_shard: "0-of-6", auxiliary: none }' \
-    '- { name: corpus-b, corpus_shard: "1-of-6", auxiliary: none }' \
+    '- { name: corpus-b, corpus_shard: "1-of-12", auxiliary: none }' \
+    '- { name: corpus-g, corpus_shard: "7-of-12", auxiliary: none }' \
     '- { name: corpus-c, corpus_shard: "2-of-6", auxiliary: none }' \
     '- { name: corpus-d, corpus_shard: "3-of-6", auxiliary: none }' \
     '- { name: corpus-e, corpus_shard: "4-of-6", auxiliary: none }' \
@@ -130,7 +158,7 @@ for differential_shard in \
     fuzz-6 fuzz-7 fuzz-8 fuzz-9 fuzz-10 core \
     corpus-1 corpus-2 corpus-3 corpus-4 corpus-execution-widths \
     auxiliary-pg-regress-a auxiliary-pg-regress-b \
-    auxiliary-pg-regress-c auxiliary-pg-regress-d \
+    auxiliary-pg-regress-c auxiliary-pg-regress-d auxiliary-pg-regress-e \
     auxiliary-exact auxiliary-copy auxiliary-types \
     auxiliary-listen auxiliary-composites; do
     if ! grep -Fq -- "- shard: $differential_shard" "$differential_workflow"; then
@@ -142,10 +170,39 @@ if (( $(grep -Fc 'pg_regress_shard: "0"' "$differential_workflow") != 1 )) \
     || (( $(grep -Fc 'pg_regress_shard: "1"' "$differential_workflow") != 1 )) \
     || (( $(grep -Fc 'pg_regress_shard: "2"' "$differential_workflow") != 1 )) \
     || (( $(grep -Fc 'pg_regress_shard: "3"' "$differential_workflow") != 1 )) \
-    || ! grep -Fq -- 'POSTGRES_REGRESS_SHARDS: "4"' "$differential_workflow"; then
-    printf '%s\n' 'CI timeout guard: PostgreSQL regression inputs must retain four file slices' >&2
+    || (( $(grep -Fc 'pg_regress_shard: "7"' "$differential_workflow") != 1 )) \
+    || (( $(grep -Fc 'pg_regress_shards: "8"' "$differential_workflow") != 2 )) \
+    || ! grep -Fq -- "POSTGRES_REGRESS_SHARDS: \${{ matrix.pg_regress_shards || '4' }}" "$differential_workflow"; then
+    printf '%s\n' 'CI timeout guard: PostgreSQL regression inputs must retain complete file slices' >&2
     failed=1
 fi
+# Split file slices retain upstream dependency order and exactly one owner.
+if ! python3 - "$differential_workflow" <<'PY_GUARD'
+import math
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text()
+blocks = re.split(r"(?m)^          - shard: ", text)[1:]
+partitions = []
+for block in blocks:
+    index = re.search(r'pg_regress_shard: "([0-9]+)"', block)
+    if index is None:
+        continue
+    count = re.search(r'pg_regress_shards: "([0-9]+)"', block)
+    partitions.append((int(index[1]), int(count[1]) if count else 4))
+if not partitions or any(count == 0 or index >= count for index, count in partitions):
+    sys.exit("CI timeout guard: invalid PostgreSQL regression file partitions")
+for ordinal in range(math.lcm(*(count for _, count in partitions))):
+    owners = sum(ordinal % count == index for index, count in partitions)
+    if owners != 1:
+        sys.exit(f"CI timeout guard: PostgreSQL regression file ordinal {ordinal} has {owners} owners")
+PY_GUARD
+then
+    failed=1
+fi
+
 for auxiliary_phase in pg_regress exact copy types listen composites; do
     if ! grep -Fq -- "auxiliary_phase: $auxiliary_phase" "$differential_workflow"; then
         printf 'CI timeout guard: missing auxiliary phase %s\n' "$auxiliary_phase" >&2

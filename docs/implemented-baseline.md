@@ -42,6 +42,12 @@ errors. COPY owns its reader across data messages; DDL event graphs retain
 pre-change images outside the statement arena. Live definition publication
 remains exclusive.
 
+Relation row maps have a per-table read boundary. Point reads return copied
+row-state images; scans and checkpoint batches retain a coherent map guard.
+Mutation and lifecycle cleanup require exclusive access. The startup table
+budget includes the row-map lock controls. Row-version pools, heap access,
+statistics, maintenance, and query-scope definition ownership remain exclusive.
+
 The reactor still executes statements serially. Table definitions and row
 mutation, engine-owned prepared slots and WAL publication, fixed workers, and
 scaling qualification remain open. Catalog metadata synchronization does not

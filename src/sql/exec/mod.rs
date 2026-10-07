@@ -4650,7 +4650,7 @@ where
     let mut existing = [Datum::Null; MAX_COLUMNS];
     let mut new_values = [Datum::Null; MAX_COLUMNS];
     {
-        let state = *storage
+        let state = storage
             .table(table_index)
             .rows
             .get(&rowid)
@@ -64024,7 +64024,7 @@ fn alter_table_relation(
         .table(table_index)
         .rows
         .iter()
-        .any(|(_, state)| storage.row_locked_by_other(*state, txn.txid).is_some())
+        .any(|(_, state)| storage.row_locked_by_other(state, txn.txid).is_some())
     {
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE,

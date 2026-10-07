@@ -355,14 +355,14 @@ fi
 if want_auxiliary pg_regress; then
 printf '%s\n' '' '=== vendored PostgreSQL regression inputs ==='
 reset_pair
-if "$ROOT_VENV/bin/python" "$EXT/postgres_regress_diff.py" \
+if (set -o pipefail; "$ROOT_VENV/bin/python" -u "$EXT/postgres_regress_diff.py" \
     --pg "$PG_PORT" --p3 "$P3_PORT" \
     --setup "$EXT/postgres_regress_setup.sql" \
     --manifest "$EXT/postgres_regress_schedule.tsv" \
     --shard-index "$POSTGRES_REGRESS_SHARD" \
     --shard-count "$POSTGRES_REGRESS_SHARDS" \
-    --max-print "${POSTGRES_REGRESS_MAX_PRINT:-30}" \
-    > "$WORK/postgres-regress.out" 2>&1; then
+    --max-print "${POSTGRES_REGRESS_MAX_PRINT:-30}" --progress \
+    2>&1 | tee "$WORK/postgres-regress.out"); then
   ok "vendored PostgreSQL regression inputs ($(tail -1 "$WORK/postgres-regress.out"))"
 else
   bad "vendored PostgreSQL regression inputs"

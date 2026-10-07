@@ -99,8 +99,14 @@ jobs:
       - name: Rebuild checked-out crate
         run: cargo clean -p pos3ql
 
-      - name: Install stack sampler
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+      - name: Focused compile, lint and ownership regressions
+        run: |
+          cargo fmt
+          git diff --binary > "$RUNNER_TEMP/routine-format.patch"
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --lib --locked routine_candidate_lookup -- --test-threads=1
+          cargo test --lib --locked row_version_ownership -- --test-threads=1
 
       - name: Differential conformance (corpora + fuzzer vs real PostgreSQL)
         env:
@@ -148,18 +154,10 @@ jobs:
           FUZZ_BUDGET: "0"
           POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
           POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
-        run: |
-          PATH="${{ github.workspace }}/.ci-bin:$PATH" bash tests/external/ci_diff.sh &
-          regression=$!
-          for sample in $(seq 1 8); do
-            sleep 60
-            if ! kill -0 "$regression" 2>/dev/null; then
-              break
-            fi
-            server=$(pgrep -n -x pos3ql || true)
-            if test -n "$server"; then
-              echo "=== UUID server stack sample $sample ==="
-              sudo gdb --batch --quiet -p "$server" -ex 'thread apply all bt 18' || true
-            fi
-          done
-          wait "$regression"
+        run: PATH="${{ github.workspace }}/.ci-bin:$PATH" bash tests/external/ci_diff.sh
+      - name: Retain runner formatter patch
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: routine-format
+          path: ${{ runner.temp }}/routine-format.patch

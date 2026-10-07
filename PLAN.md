@@ -94,8 +94,11 @@ The timeout guard verifies complete, disjoint corpus assignment for both
 matrices across mixed partition widths. The ordinary PostgreSQL regression
 file slice also has complementary workers; upstream ranges stay together and
 statement progress is streamed through the outer harness so deadline failures
-retain diagnostics. The retained UUID timestamp/window probe exposed a slow
-execution path under instrumentation; runner profiling is validating its repair.
+retain diagnostics. Runner stack samples traced the UUID timestamp/window deadline to copying wide
+routine payloads before candidate filtering. Routine lookup now filters compact
+transaction-visible identity and kind under the catalog guard before copying
+candidates, then releases the guard before nested overload/catalog resolution.
+The complete upstream probe remains the PostgreSQL and deadline regression.
 
 Completion evidence:
 

@@ -7083,9 +7083,28 @@ struct TextSearchIter<'a> {
     next_slot: usize,
 }
 
+struct RoutineLookup<'a> {
+    database: DatabaseOid,
+    schema: &'a str,
+    name: &'a str,
+    transaction: u32,
+    kind: RoutineCallKind,
+}
+
+impl RoutineLookup<'_> {
+    fn matches(&self, routine: &RoutineDef) -> bool {
+        routine.database == self.database
+            && routine.visible_to(self.transaction)
+            && self.kind.accepts(routine.kind_for(self.transaction))
+            && routine.schema_for(self.transaction).as_str() == self.schema
+            && routine.name_for(self.transaction).as_str() == self.name
+    }
+}
+
 struct RoutineIter<'a> {
     catalog: &'a std::sync::Mutex<FixedVec<RoutineDef>>,
     next_slot: usize,
+    lookup: Option<RoutineLookup<'a>>,
 }
 
 struct CastIter<'a> {
@@ -7360,10 +7379,17 @@ impl Iterator for RoutineIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let catalog = self.catalog.lock().expect("routine catalog lock poisoned");
-        let slot = self.next_slot;
-        let definition = catalog.get(slot).copied()?;
-        self.next_slot += 1;
-        Some((slot, definition))
+        while let Some(definition) = catalog.get(self.next_slot) {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            // Check compact metadata before copying the bounded body and
+            // argument arrays. Release the guard before overload resolution
+            // calls back into other catalogs.
+            if self.lookup.as_ref().is_none_or(|lookup| lookup.matches(definition)) {
+                return Some((slot, *definition));
+            }
+        }
+        None
     }
 }
 
@@ -22012,6 +22038,7 @@ impl Storage {
             AccessClass::Routine => RoutineIter {
                 catalog: &self.routines,
                 next_slot: 0,
+            lookup: None,
             }
             .find_map(|(slot, routine)| {
                 (routine.database == current_database()
@@ -22352,6 +22379,7 @@ impl Storage {
                 RoutineIter {
                     catalog: &self.routines,
                     next_slot: 0,
+            lookup: None,
                 }
                 .find_map(|(slot, candidate)| {
                     (candidate.database == target_database && candidate.created_at == created_at)
@@ -26828,6 +26856,7 @@ impl Storage {
         for (_, definition) in (RoutineIter {
             catalog: &self.routines,
             next_slot: 0,
+            lookup: None,
         })
         .filter(|(_, definition)| {
             definition.database == current_database()
@@ -41323,6 +41352,27 @@ impl Storage {
         RoutineIter {
             catalog: &self.routines,
             next_slot: 0,
+            lookup: None,
+        }
+    }
+
+    fn routine_candidates<'a>(
+        &'a self,
+        schema: &'a str,
+        name: &'a str,
+        transaction: u32,
+        kind: RoutineCallKind,
+    ) -> RoutineIter<'a> {
+        RoutineIter {
+            catalog: &self.routines,
+            next_slot: 0,
+            lookup: Some(RoutineLookup {
+                database: current_database(),
+                schema,
+                name,
+                transaction,
+                kind,
+            }),
         }
     }
 
@@ -41435,7 +41485,7 @@ impl Storage {
         kind: RoutineCallKind,
     ) -> Option<usize> {
         let resolve = |schema: &str, routine_name: &str| {
-            let mut candidates = self.routine_entries().filter_map(|(slot, routine)| {
+            let mut candidates = self.routine_candidates(schema, routine_name, txid, kind).filter_map(|(slot, routine)| {
                 let definition = routine.definition_for(txid);
                 if routine.database != current_database()
                     || !routine.visible_to(txid)
@@ -42266,7 +42316,7 @@ impl Storage {
         txid: u32,
         kind: RoutineCallKind,
     ) -> Option<usize> {
-        self.routine_entries().find_map(|(slot, routine)| {
+        self.routine_candidates(schema, name, txid, kind).find_map(|(slot, routine)| {
             let definition = routine.definition_for(txid);
             (routine.database == current_database()
                 && routine.visible_to(txid)
@@ -42291,7 +42341,7 @@ impl Storage {
         kind: RoutineCallKind,
     ) -> Option<usize> {
         let exact =
-            self.routine_entries().find_map(|(slot, routine)| {
+            self.routine_candidates(schema, name, txid, kind).find_map(|(slot, routine)| {
                 let definition = routine.definition_for(txid);
                 (routine.database == current_database()
                     && routine.visible_to(txid)
@@ -42307,7 +42357,7 @@ impl Storage {
         if exact.is_some() {
             return exact;
         }
-        let concrete = self.routine_entries().filter_map(|(slot, routine)| {
+        let concrete = self.routine_candidates(schema, name, txid, kind).filter_map(|(slot, routine)| {
             let definition = routine.definition_for(txid);
             (routine.database == current_database()
                 && routine.visible_to(txid)
@@ -42331,7 +42381,7 @@ impl Storage {
         if first.is_some() && concrete.next().is_none() {
             return first;
         }
-        let polymorphic = self.routine_entries().filter_map(|(slot, routine)| {
+        let polymorphic = self.routine_candidates(schema, name, txid, kind).filter_map(|(slot, routine)| {
             let definition = routine.definition_for(txid);
             (routine.database == current_database()
                 && routine.visible_to(txid)
@@ -42404,7 +42454,7 @@ impl Storage {
             polymorphic == saw_polymorphic
         };
         for (implicit, polymorphic) in [(false, false), (true, false), (true, true)] {
-            let mut candidates = self.routine_entries().filter_map(|(slot, routine)| {
+            let mut candidates = self.routine_candidates(schema, name, txid, call_kind).filter_map(|(slot, routine)| {
                 matches(&routine, implicit, polymorphic).then_some(slot)
             });
             let first = candidates.next();
@@ -55590,6 +55640,56 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn routine_candidate_lookup_preserves_visibility_identity_and_guard_release() {
+        let mut config = test_config();
+        config.max_routines = 4;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        {
+            let mut catalog = storage.routines.lock().unwrap();
+            for slot in 1..4 {
+                catalog[slot].schema = SqlName::parse("public").unwrap();
+                catalog[slot].name = SqlName::parse("probe").unwrap();
+                catalog[slot].ddl_state = CatalogDdlState::Present;
+            }
+            catalog[1].pending_identity = Some(PendingRoutineIdentity {
+                txid: 7,
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("renamed").unwrap(),
+            });
+            catalog[2].database = DatabaseOid::parse(USER_DATABASE_OID_BASE + 1).unwrap();
+            catalog[3].ddl_state = CatalogDdlState::PendingCreate { txid: 7 };
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            let slots = |name, transaction, kind| {
+                let mut candidates = storage.routine_candidates("public", name, transaction, kind);
+                let candidate = candidates.next().map(|(slot, routine)| {
+                    assert!(storage.routines.try_lock().is_ok());
+                    assert!(routine.visible_to(transaction));
+                    slot
+                });
+                assert!(candidates.next().is_none());
+                candidate
+            };
+            assert_eq!(slots("probe", 0, RoutineCallKind::Scalar), Some(1));
+            assert_eq!(slots("probe", 7, RoutineCallKind::Scalar), Some(3));
+            assert_eq!(slots("renamed", 7, RoutineCallKind::Scalar), Some(1));
+            assert_eq!(slots("renamed", 0, RoutineCallKind::Scalar), None);
+            assert_eq!(slots("probe", 0, RoutineCallKind::Procedure), None);
+            assert_eq!(slots("absent", 0, RoutineCallKind::Scalar), None);
+            assert_eq!(storage.routine_slot_in("public", "renamed", &[], 7, RoutineCallKind::Scalar), Some(1));
+            assert_eq!(storage.routine_slot_in_oids("public", "renamed", &[], 7, RoutineCallKind::Scalar), Some(1));
+            assert_eq!(storage.routine_slot_in_named_oids("public", "renamed", &[], &[], 7, RoutineCallKind::Scalar), Some(1));
+            let retained = storage.routine_candidates("public", "renamed", 7, RoutineCallKind::Scalar).next().unwrap().1;
+            storage.routines.lock().unwrap()[1].ddl_state = CatalogDdlState::Absent;
+            assert!(retained.visible_to(7));
+            assert_eq!(retained.name_for(7).as_str(), "renamed");
+            assert_eq!(slots("renamed", 7, RoutineCallKind::Scalar), None);
+            assert_eq!(storage.routine_entries().count(), 4);
+        });
     }
 
     #[test]

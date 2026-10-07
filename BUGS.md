@@ -13,7 +13,10 @@ and heap relocation require exclusive ownership. Fixed capacities and named
 exhaustion remain unchanged, with exact startup charging for pool controls.
 The combined row-map/version lifecycle remains roadmap work; this change
 introduces no deferred defect. The outer differential harness now also streams
-regression progress instead of hiding it until completion.
+regression progress instead of hiding it until completion. Runner stack samples
+identified wide routine copies during per-row type resolution. Lookup now
+filters transaction-visible metadata before copying candidate payloads, with
+no routine guard held across nested catalog resolution.
 
 Row maps now return detached row-state images from shared lookups and guarded
 iteration. Recovery, rollback, cloning, and slot reuse use the same map access

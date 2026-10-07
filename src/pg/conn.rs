@@ -5235,7 +5235,7 @@ mod tests {
         config.sql_arena_bytes = 32 << 20;
         config.prepared_bytes = 512 << 10;
         config.portal_bytes = 512 << 10;
-        let mut budget = Budget::new(1 << 30);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -5444,7 +5444,7 @@ mod tests {
         config.large_object_pages = 64;
         config.wal_bytes = 1 << 20;
         config.wal_buffer_bytes = 1 << 16;
-        let mut budget = Budget::new(1 << 30);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -5540,7 +5540,7 @@ mod tests {
         config.table_rows = 256;
         config.wal_bytes = 1 << 20;
         config.wal_buffer_bytes = 1 << 16;
-        let mut budget = Budget::new(1 << 30);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -5622,7 +5622,7 @@ mod tests {
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 30);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -5705,7 +5705,7 @@ mod tests {
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 30);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -5830,7 +5830,7 @@ mod tests {
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 30);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -5934,7 +5934,7 @@ mod tests {
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 30);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -6036,7 +6036,7 @@ mod tests {
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 30);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -6184,7 +6184,7 @@ mod tests {
         let mut config = Config::default_dev();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 30);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine budget");
         let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
         connection.recv.append(b"E\0\0\0\x04S\0\0\0\x04");

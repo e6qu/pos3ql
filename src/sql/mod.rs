@@ -22116,5 +22116,13 @@ fn validate_recovered_enabled_subscription(
     connection.require_endpoint_for(subscription).map(|_| ())
 }
 
+// Retained reader cells have a separate exact startup charge. Preserve each
+// fixture's existing SQL/workspace headroom, including deliberate undersizing
+// of other resources, as its table and query-workspace capacities change.
+#[cfg(test)]
+pub(crate) fn test_engine_budget(config: &Config, base: usize) -> Budget {
+    Budget::new(base + Storage::table_definition_image_budget_bytes(config))
+}
+
 #[cfg(test)]
 mod tests;

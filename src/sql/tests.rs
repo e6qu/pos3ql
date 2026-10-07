@@ -10788,13 +10788,6 @@ fn test_engine() -> (Engine, Budget) {
 // headroom while accounting for those deliberately wider catalog slots.
 const WIDE_CATALOG_TEST_BUDGET_BYTES: usize = 512 << 20;
 
-// Retained reader cells have a separate exact startup charge. Preserve each
-// fixture's existing SQL/workspace headroom, including deliberate undersizing
-// of other resources, as its table and query-workspace capacities change.
-fn test_engine_budget(config: &Config, base: usize) -> Budget {
-    Budget::new(base + Storage::table_definition_image_budget_bytes(config))
-}
-
 const fn test_engine_budget_bytes(base: usize) -> usize {
     base + WIDE_CATALOG_TEST_BUDGET_BYTES + crate::sql::exec::record_shape_pool_bytes(0)
 }

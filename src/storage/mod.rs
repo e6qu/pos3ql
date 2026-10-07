@@ -11,7 +11,7 @@ mod row_map;
 pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
-pub use row_map::RowMap;
+pub(crate) use row_map::RowMap;
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -31674,7 +31674,7 @@ impl Storage {
                 if (state.committed.is_none()
                     && state.history.is_empty()
                     && state.pending.is_none())
-                    || Self::redundant_spilled_row_state(&state)
+                    || Self::redundant_spilled_row_state(state)
                 {
                     tables[table_index].rows.remove(&rowid);
                 }
@@ -52823,11 +52823,14 @@ mod tests {
         assert!(size_of::<RowMap>() > size_of::<FixedMap<u64, RowState>>());
         assert_eq!(storage.tables.len(), table_slot_capacity(&config));
         for (slot, table) in storage.tables.iter().enumerate() {
-            assert_eq!(table.rows.capacity(), if slot == config.max_tables {
-                config.large_object_pages
-            } else {
-                config.table_rows
-            });
+            assert_eq!(
+                table.rows.capacity(),
+                if slot == config.max_tables {
+                    config.large_object_pages
+                } else {
+                    config.table_rows
+                }
+            );
         }
     }
 
@@ -53831,7 +53834,7 @@ mod tests {
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let mut invalid = test_index_definition("invalid_generation");
-            invalid.created_at = u64::from(MAX_INDEX_OID_GENERATION) + 1;
+            invalid.created_at = MAX_INDEX_OID_GENERATION + 1;
             assert_eq!(
                 storage.create_index(invalid, 17).unwrap_err().sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
@@ -53992,13 +53995,13 @@ mod tests {
         let names = ["worker_a", "worker_b", "worker_c", "worker_d"];
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for (worker, worker_name) in names.iter().copied().enumerate() {
                 let storage = &storage;
                 let barrier = &barrier;
                 let finished = &finished;
                 scope.spawn(move || {
                     let schema = SqlName::parse("public").unwrap();
-                    let name = SqlName::parse(names[worker]).unwrap();
+                    let name = SqlName::parse(worker_name).unwrap();
                     barrier.wait();
                     crate::mem::guard::forbid_alloc(|| {
                         for iteration in 0..16 {
@@ -55487,11 +55490,11 @@ mod tests {
         let storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for (worker, worker_name) in names.iter().copied().enumerate() {
                 let storage = &storage;
                 scope.spawn(move || {
                     let txid = worker as u32 + 1;
-                    let name = SqlName::parse(names[worker]).unwrap();
+                    let name = SqlName::parse(worker_name).unwrap();
                     let (role, _) = storage
                         .create_role(name, RoleAttributes::ORDINARY, txid)
                         .unwrap();
@@ -55517,7 +55520,7 @@ mod tests {
                         .change_role_setting(
                             RoleSettingScope::RoleAllDatabases(role as u16),
                             SqlName::parse("application_name").unwrap(),
-                            Some(StackStr::from_str(names[worker])),
+                            Some(StackStr::from_str(worker_name)),
                             txid,
                         )
                         .unwrap();
@@ -55547,8 +55550,8 @@ mod tests {
         for (slot, role) in storage.live_roles() {
             assert_eq!(storage.role_name(slot, 0), role.name);
         }
-        for worker in 0..WORKERS {
-            let role = storage.find_role(names[worker]).unwrap();
+        for worker_name in names.iter().copied() {
+            let role = storage.find_role(worker_name).unwrap();
             assert!(storage.role_can_admin(role, BOOTSTRAP_ROLE as usize, 0));
         }
         assert!(
@@ -55615,14 +55618,14 @@ mod tests {
         let storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for (worker, worker_name) in names.iter().copied().enumerate() {
                 let storage = &storage;
                 scope.spawn(move || {
                     let slot = storage
                         .create_access_method(
                             0,
                             AccessMethodDefinition {
-                                name: SqlName::parse(names[worker]).unwrap(),
+                                name: SqlName::parse(worker_name).unwrap(),
                                 handler: TableAccessMethodHandler::Heap,
                             },
                             worker as u32 + 1,
@@ -55637,21 +55640,21 @@ mod tests {
                     let mut operator = OperatorDef::EMPTY;
                     operator.database = DatabaseOid::POSTGRES;
                     operator.created_at = 100 + worker as u64;
-                    operator.definition.name = SqlName::parse(names[worker]).unwrap();
+                    operator.definition.name = SqlName::parse(worker_name).unwrap();
                     operator.ddl_state = CatalogDdlState::Present;
                     catalog.operators[worker] = operator;
 
                     let mut family = OperatorFamilyDef::EMPTY;
                     family.database = DatabaseOid::POSTGRES;
                     family.created_at = 200 + worker as u64;
-                    family.definition.name = SqlName::parse(names[worker]).unwrap();
+                    family.definition.name = SqlName::parse(worker_name).unwrap();
                     family.ddl_state = CatalogDdlState::Present;
                     catalog.families[worker] = family;
 
                     let mut class = OperatorClassDef::EMPTY;
                     class.database = DatabaseOid::POSTGRES;
                     class.created_at = 300 + worker as u64;
-                    class.definition.name = SqlName::parse(names[worker]).unwrap();
+                    class.definition.name = SqlName::parse(worker_name).unwrap();
                     class.ddl_state = CatalogDdlState::Present;
                     catalog.classes[worker] = class;
                 });
@@ -56933,7 +56936,7 @@ mod tests {
         let storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for (worker, parameter) in parameters.iter().copied().enumerate() {
                 let storage = &storage;
                 scope.spawn(move || {
                     let txid = worker as u32 + 1;
@@ -56990,7 +56993,7 @@ mod tests {
                         .unwrap();
                     storage.commit_default_acl(default_slot, txid);
 
-                    let parameter = crate::sql::ast::ParameterName::parse(parameters[worker])
+                    let parameter = crate::sql::ast::ParameterName::parse(parameter)
                         .expect("parameter name fits");
                     let (parameter_slot, _) = storage
                         .change_parameter_acl(
@@ -57465,14 +57468,14 @@ mod tests {
         let mut storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for (worker, worker_name) in names.iter().copied().enumerate() {
                 let storage = &storage;
                 scope.spawn(move || {
                     let txid = worker as u32 + 1;
                     let slot = storage
                         .create_tablespace(
                             0,
-                            SqlName::parse(names[worker]).unwrap(),
+                            SqlName::parse(worker_name).unwrap(),
                             StackStr::from_str("/data"),
                             TablespaceOptions::DEFAULT,
                             BOOTSTRAP_ROLE,
@@ -57625,11 +57628,11 @@ mod tests {
         let mut storage = Storage::new(&config, &mut budget).unwrap();
 
         std::thread::scope(|scope| {
-            for worker in 0..WORKERS {
+            for worker_name in names.iter().copied() {
                 let storage = &storage;
                 scope.spawn(move || {
                     storage
-                        .create_schema(SqlName::parse(names[worker]).unwrap())
+                        .create_schema(SqlName::parse(worker_name).unwrap())
                         .unwrap();
                 });
             }

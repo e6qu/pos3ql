@@ -170,7 +170,10 @@ mod tests {
                             let mut count = 0;
                             for (_, state) in rows.iter() {
                                 assert_eq!(state.committed_lsn, state.checkpoint_change_lsn);
-                                assert_eq!(*epoch.get_or_insert(state.committed_lsn), state.committed_lsn);
+                                assert_eq!(
+                                    *epoch.get_or_insert(state.committed_lsn),
+                                    state.committed_lsn
+                                );
                                 count += 1;
                             }
                             assert_eq!(count, 4);

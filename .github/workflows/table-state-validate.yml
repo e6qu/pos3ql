@@ -1,0 +1,28 @@
+name: Table state validation
+on:
+  push:
+    branches: [codex/table-state-boundary]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Produce formatting patch
+        run: |
+          cargo fmt --all
+          git diff > /tmp/table-state-format.patch
+      - uses: actions/upload-artifact@v6
+        with:
+          name: table-state-format
+          path: /tmp/table-state-format.patch
+      - name: Check all targets
+        run: cargo check --all-targets --locked
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Table state regressions
+        run: cargo test --lib --locked table_state -- --test-threads=1

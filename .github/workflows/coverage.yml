@@ -263,7 +263,8 @@ jobs:
           # Keep instrumented corpus and auxiliary phases in independent
           # workers so cold setup plus measurement stays below 15 minutes.
           - { name: corpus-a, corpus_shard: "0-of-6", auxiliary: none }
-          - { name: corpus-b, corpus_shard: "1-of-6", auxiliary: none }
+          - { name: corpus-b, corpus_shard: "1-of-12", auxiliary: none }
+          - { name: corpus-g, corpus_shard: "7-of-12", auxiliary: none }
           - { name: corpus-c, corpus_shard: "2-of-6", auxiliary: none }
           - { name: corpus-d, corpus_shard: "3-of-6", auxiliary: none }
           - { name: corpus-e, corpus_shard: "4-of-6", auxiliary: none }

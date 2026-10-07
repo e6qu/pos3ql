@@ -83,15 +83,18 @@ import sys
 from pathlib import Path
 
 text = Path(sys.argv[1]).read_text()
-matrix = text.split("  spill-differential:", 1)[1].split("  reference-diff:", 1)[0]
-partitions = [(int(index), int(count)) for index, count in
-              re.findall(r'corpus_shard: "([0-9]+)-of-([0-9]+)"', matrix)]
-if not partitions or any(count == 0 or index >= count for index, count in partitions):
-    sys.exit("CI timeout guard: invalid forced-spill corpus partitions")
-for ordinal in range(math.lcm(*(count for _, count in partitions))):
-    owners = sum(ordinal % count == index for index, count in partitions)
-    if owners != 1:
-        sys.exit(f"CI timeout guard: forced-spill corpus ordinal {ordinal} has {owners} owners")
+for job in ("spill-differential", "reference-diff"):
+    match = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  [a-z][a-z-]*:\n|\Z)", text)
+    if match is None:
+        sys.exit(f"CI timeout guard: missing {job} matrix")
+    partitions = [(int(index), int(count)) for index, count in
+                  re.findall(r'corpus_shard: "([0-9]+)-of-([0-9]+)"', match[1])]
+    if not partitions or any(count == 0 or index >= count for index, count in partitions):
+        sys.exit(f"CI timeout guard: invalid {job} corpus partitions")
+    for ordinal in range(math.lcm(*(count for _, count in partitions))):
+        owners = sum(ordinal % count == index for index, count in partitions)
+        if owners != 1:
+            sys.exit(f"CI timeout guard: {job} corpus ordinal {ordinal} has {owners} owners")
 PY
 then
     failed=1
@@ -103,7 +106,8 @@ fi
 reference_matrix=.github/workflows/coverage.yml
 for reference_entry in \
     '- { name: corpus-a, corpus_shard: "0-of-6", auxiliary: none }' \
-    '- { name: corpus-b, corpus_shard: "1-of-6", auxiliary: none }' \
+    '- { name: corpus-b, corpus_shard: "1-of-12", auxiliary: none }' \
+    '- { name: corpus-g, corpus_shard: "7-of-12", auxiliary: none }' \
     '- { name: corpus-c, corpus_shard: "2-of-6", auxiliary: none }' \
     '- { name: corpus-d, corpus_shard: "3-of-6", auxiliary: none }' \
     '- { name: corpus-e, corpus_shard: "4-of-6", auxiliary: none }' \

@@ -13,9 +13,10 @@ rows. Query-scope definition ownership and shared row publication remain
 explicit roadmap work. This change introduces no deferred defect.
 All-target lint also corrected catalog test loops and an obsolete conversion;
 worker transaction and catalog identities are preserved.
-The first forced-spill corpus slice repeatedly exhausted its fixed CI deadline.
-It is now split into two disjoint slices; the timeout guard proves all current
-and future corpus ordinals still have exactly one owner. No test or limit was
+The first forced-spill slice and an instrumented reference corpus slice
+exhausted their fixed CI deadlines. Each now has two complementary slices;
+the timeout guard proves all current and future corpus ordinals still have
+exactly one owner in both matrices. No test or limit was
 removed or reduced.
 
 SQL and wire engine fixtures now charge retained reader capacity through one

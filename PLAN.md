@@ -82,6 +82,9 @@ Live definition publication remains exclusive. Query scopes retain definition
 references beyond lookup, so their ownership must change before definitions
 can move behind shared publication guards. Retained DML images do not close
 that query-scope boundary. These changes remain prerequisites for fixed workers.
+Forced-spill differential coverage splits the former first corpus slice into
+two workers within the unchanged 15-minute ceiling. Its timeout guard verifies
+complete, disjoint corpus assignment across both partition widths.
 
 Completion evidence:
 

@@ -49,7 +49,8 @@ done
 # auxiliary probes. Each worker has a fixed 15-minute ceiling.
 spill_matrix=.github/workflows/coverage.yml
 for spill_entry in \
-    '- { name: a, corpus_shard: "0-of-6", auxiliary: none }' \
+    '- { name: a, corpus_shard: "0-of-12", auxiliary: none }' \
+    '- { name: g, corpus_shard: "6-of-12", auxiliary: none }' \
     '- { name: b, corpus_shard: "1-of-6", auxiliary: none }' \
     '- { name: c, corpus_shard: "2-of-6", auxiliary: none }' \
     '- { name: d, corpus_shard: "3-of-6", auxiliary: none }' \
@@ -72,6 +73,29 @@ for spill_entry in \
         failed=1
     fi
 done
+
+# Mixed partition widths must cover every ordinal exactly once, including
+# future corpora. Check one complete repetition of their assignment cycle.
+if ! python3 - "$spill_matrix" <<'PY'
+import math
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text()
+matrix = text.split("  spill-differential:", 1)[1].split("  reference-diff:", 1)[0]
+partitions = [(int(index), int(count)) for index, count in
+              re.findall(r'corpus_shard: "([0-9]+)-of-([0-9]+)"', matrix)]
+if not partitions or any(count == 0 or index >= count for index, count in partitions):
+    sys.exit("CI timeout guard: invalid forced-spill corpus partitions")
+for ordinal in range(math.lcm(*(count for _, count in partitions))):
+    owners = sum(ordinal % count == index for index, count in partitions)
+    if owners != 1:
+        sys.exit(f"CI timeout guard: forced-spill corpus ordinal {ordinal} has {owners} owners")
+PY
+then
+    failed=1
+fi
 
 # Coverage instrumentation plus the complete SQL differential workload no
 # longer fits combined workers under the 15-minute ceiling. Keep all corpus

@@ -56100,7 +56100,7 @@ pub fn merge<'a>(
                 continue;
             }
             let lookup = MergeLookup {
-                target_def,
+                target_def: def,
                 target_alias,
                 target: target_vals[j],
                 source_def,

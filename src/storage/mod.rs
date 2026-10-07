@@ -1,17 +1,19 @@
 //! Table storage: the in-memory write path of the LSM.
 //!
 //! Row bytes live in one fixed heap (the memtable); each table maps rowid →
-//! location. Updates write a new copy and repoint the map — superseded
-//! bytes are reclaimed when the memtable flushes to object storage (later
-//! phase). All capacities are fixed at startup.
+//! location. Updates write a new copy and repoint the map. Compaction reclaims
+//! superseded bytes; object storage retains durable versions. All capacities
+//! are fixed at startup.
 
 mod definition_images;
 pub(crate) mod foreign;
 mod row_map;
+mod row_versions;
 pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_map::RowMap;
+use row_versions::RowVersionPools;
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -13675,10 +13677,7 @@ pub struct Storage {
     tables: FixedVec<Table>,
     table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
-    pending_row_versions: FixedVec<PendingVersionSlot>,
-    pending_row_version_free: Option<usize>,
-    committed_row_versions: FixedVec<CommittedVersionSlot>,
-    committed_row_version_free: Option<usize>,
+    row_versions: RowVersionPools,
     large_objects: std::sync::Mutex<LargeObjectCatalog>,
     large_object_page_table: u32,
     max_catalog_versions_per_object: u32,
@@ -14687,12 +14686,13 @@ fn rename_table_sql_identity(
 
 impl Storage {
     fn clear_table_rows(&mut self, slot: usize) {
+        let row_versions = self.row_versions.exclusive();
         let (tables, pending_versions, pending_free, committed_versions, committed_free) = (
             &mut self.tables,
-            &mut self.pending_row_versions,
-            &mut self.pending_row_version_free,
-            &mut self.committed_row_versions,
-            &mut self.committed_row_version_free,
+            &mut row_versions.pending_row_versions,
+            &mut row_versions.pending_row_version_free,
+            &mut row_versions.committed_row_versions,
+            &mut row_versions.committed_row_version_free,
         );
         for (_, state) in tables[slot].rows.iter() {
             release_pending_chain(pending_versions, pending_free, state.pending.tail);
@@ -14703,14 +14703,15 @@ impl Storage {
 
     fn remove_row_state(&mut self, table: usize, rowid: u64) -> Option<RowState> {
         let state = self.tables[table].rows.remove(&rowid)?;
+        let row_versions = self.row_versions.exclusive();
         release_pending_chain(
-            &mut self.pending_row_versions,
-            &mut self.pending_row_version_free,
+            &mut row_versions.pending_row_versions,
+            &mut row_versions.pending_row_version_free,
             state.pending.tail,
         );
         release_committed_chain(
-            &mut self.committed_row_versions,
-            &mut self.committed_row_version_free,
+            &mut row_versions.committed_row_versions,
+            &mut row_versions.committed_row_version_free,
             state.history.tail,
         );
         Some(state)
@@ -17385,6 +17386,7 @@ impl Storage {
             + table_slot_capacity(config)
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>())
+            + RowVersionPools::control_bytes()
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
             + Self::table_definition_image_budget_bytes(config)
             + committed_row_version_capacity(config)
@@ -17515,16 +17517,7 @@ impl Storage {
             size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>(),
             "table spill-generation rosters",
         )?;
-        let pending_row_versions = FixedVec::new(
-            budget,
-            "pending_row_versions",
-            pending_row_version_capacity(config),
-        )?;
-        let committed_row_versions = FixedVec::new(
-            budget,
-            "committed_row_versions",
-            committed_row_version_capacity(config),
-        )?;
+        let row_versions = RowVersionPools::new(config, budget)?;
         let pending_table_defs = FixedVec::new(
             budget,
             "pending_table_defs",
@@ -18277,10 +18270,7 @@ impl Storage {
             tables,
             table_definition_images,
             max_row_versions_per_row: config.max_row_versions_per_row,
-            pending_row_versions,
-            pending_row_version_free: None,
-            committed_row_versions,
-            committed_row_version_free: None,
+            row_versions,
             large_objects: std::sync::Mutex::new(LargeObjectCatalog {
                 definitions: large_objects,
                 next_oid: LargeObjectOid::parse(16_384),
@@ -28710,7 +28700,7 @@ impl Storage {
     }
 
     pub(crate) fn row_pending_last(&self, state: RowState) -> Option<PendingChange> {
-        pending_last(&self.pending_row_versions, state.pending)
+        pending_last(&self.row_versions.read().pending_row_versions, state.pending)
     }
 
     pub(crate) fn row_history_get(
@@ -28718,7 +28708,7 @@ impl Storage {
         state: RowState,
         index: usize,
     ) -> Option<CommittedVersion> {
-        committed_history_get(&self.committed_row_versions, state.history, index)
+        committed_history_get(&self.row_versions.read().committed_row_versions, state.history, index)
     }
 
     pub(crate) fn row_locked_by_other(&self, state: RowState, txid: u32) -> Option<u32> {
@@ -28730,7 +28720,7 @@ impl Storage {
 
     fn resident_visible_to(&self, state: RowState, txid: u32) -> Option<RowHome> {
         match pending_visible_at(
-            &self.pending_row_versions,
+            &self.row_versions.read().pending_row_versions,
             state.pending,
             txid,
             SNAPSHOT_ALL,
@@ -29983,8 +29973,9 @@ impl Storage {
         command_snapshot: u32,
         commit_snapshot: u64,
     ) -> Result<Option<RowHome>, SqlError> {
+        let row_versions = self.row_versions.read();
         match pending_visible_at(
-            &self.pending_row_versions,
+            &row_versions.pending_row_versions,
             state.pending,
             txid,
             command_snapshot,
@@ -29994,10 +29985,11 @@ impl Storage {
             None => {}
         }
         if let Some(home) =
-            committed_visible_at(&self.committed_row_versions, state.history, commit_snapshot)
+            committed_visible_at(&row_versions.committed_row_versions, state.history, commit_snapshot)
         {
             return Ok(home);
         }
+        drop(row_versions);
         Ok(self
             .spill_probe_at(table_slot, rowid, commit_snapshot)?
             .and_then(|version| {
@@ -30605,10 +30597,11 @@ impl Storage {
     }
 
     pub(crate) fn release_table_histories(&mut self, slot: usize) {
+        let row_versions = self.row_versions.exclusive();
         let (tables, versions, free) = (
             &mut self.tables,
-            &mut self.committed_row_versions,
-            &mut self.committed_row_version_free,
+            &mut row_versions.committed_row_versions,
+            &mut row_versions.committed_row_version_free,
         );
         for (_, state) in tables[slot].rows.iter_mut() {
             prune_committed_history(versions, free, &mut state.history, None);
@@ -31176,6 +31169,7 @@ impl Storage {
         scratch: &mut FixedVec<(u32, u64, RowHeapImage, RowLoc)>,
     ) -> Result<(), SqlError> {
         scratch.clear();
+        let row_versions = self.row_versions.exclusive();
         for (index, table) in self.tables.iter().enumerate() {
             // A transaction may have inserted rows into its pending CREATE
             // before a concurrent checkpoint. Those bytes are private, not
@@ -31200,7 +31194,7 @@ impl Storage {
                 }
                 let mut history_slot = state.history.tail;
                 while let Some(slot) = history_slot {
-                    let entry = &self.committed_row_versions[slot];
+                    let entry = &row_versions.committed_row_versions[slot];
                     if let Some(RowHome::Heap(loc)) = entry.version.home {
                         scratch
                             .push((index as u32, rowid, RowHeapImage::History(slot), loc))
@@ -31210,7 +31204,7 @@ impl Storage {
                 }
                 let mut pending_slot = state.pending.tail;
                 while let Some(slot) = pending_slot {
-                    let entry = &self.pending_row_versions[slot];
+                    let entry = &row_versions.pending_row_versions[slot];
                     if let Some(loc) = entry.change.loc {
                         scratch
                             .push((index as u32, rowid, RowHeapImage::Pending(slot), loc))
@@ -31257,10 +31251,10 @@ impl Storage {
                         .committed = Some(RowHome::Heap(new_loc));
                 }
                 RowHeapImage::History(slot) => {
-                    self.committed_row_versions[slot].version.home = Some(RowHome::Heap(new_loc));
+                    row_versions.committed_row_versions[slot].version.home = Some(RowHome::Heap(new_loc));
                 }
                 RowHeapImage::Pending(slot) => {
-                    self.pending_row_versions[slot].change.loc = Some(new_loc);
+                    row_versions.pending_row_versions[slot].change.loc = Some(new_loc);
                 }
             }
         }
@@ -31342,10 +31336,13 @@ impl Storage {
                 txid,
                 track_statistics,
             )?;
+            let current_command = state.pending.tail.map(|slot| {
+                self.row_versions.read().pending_row_versions[slot].change.cid
+            });
             if let Some(slot) = state.pending.tail
-                && self.pending_row_versions[slot].change.cid == cid
+                && current_command == Some(cid)
             {
-                let last = &mut self.pending_row_versions[slot].change;
+                let last = &mut self.row_versions.exclusive().pending_row_versions[slot].change;
                 let prior = Some(last.loc);
                 last.loc = loc;
                 // Same-command undo retains only the prior location. Keep a
@@ -31360,10 +31357,11 @@ impl Storage {
                 return Ok(prior);
             }
             {
+                let row_versions = self.row_versions.exclusive();
                 let (tables, versions, free) = (
                     &mut self.tables,
-                    &mut self.committed_row_versions,
-                    &mut self.committed_row_version_free,
+                    &mut row_versions.committed_row_versions,
+                    &mut row_versions.committed_row_version_free,
                 );
                 let state = tables[table_index]
                     .rows
@@ -31387,10 +31385,11 @@ impl Storage {
                     self.max_row_versions_per_row
                 ));
             }
+            let row_versions = self.row_versions.exclusive();
             let (tables, versions, free) = (
                 &mut self.tables,
-                &mut self.pending_row_versions,
-                &mut self.pending_row_version_free,
+                &mut row_versions.pending_row_versions,
+                &mut row_versions.pending_row_version_free,
             );
             let state = tables[table_index]
                 .rows
@@ -31452,9 +31451,10 @@ impl Storage {
             }
         }
         let mut pending = PendingVersions::empty();
+        let row_versions = self.row_versions.exclusive();
         push_pending_version(
-            &mut self.pending_row_versions,
-            &mut self.pending_row_version_free,
+            &mut row_versions.pending_row_versions,
+            &mut row_versions.pending_row_version_free,
             &mut pending,
             self.max_row_versions_per_row,
             PendingChange {
@@ -31609,10 +31609,11 @@ impl Storage {
     /// A successful manifest publish made every resident historical image
     /// reachable through the table's installed versioned SST list.
     pub fn release_durable_histories(&mut self) {
+        let row_versions = self.row_versions.exclusive();
         let (tables, versions, free) = (
             &mut self.tables,
-            &mut self.committed_row_versions,
-            &mut self.committed_row_version_free,
+            &mut row_versions.committed_row_versions,
+            &mut row_versions.committed_row_version_free,
         );
         for table in tables
             .iter_mut()
@@ -31654,17 +31655,18 @@ impl Storage {
             return;
         };
         // Only touch a pending change this transaction owns (or an empty slot).
-        if let Some(p) = pending_last(&self.pending_row_versions, state.pending)
+        if let Some(p) = pending_last(&self.row_versions.read().pending_row_versions, state.pending)
             && p.txid != txid
         {
             return;
         }
         match prior {
             None => {
+                let row_versions = self.row_versions.exclusive();
                 let (tables, versions, free) = (
                     &mut self.tables,
-                    &mut self.pending_row_versions,
-                    &mut self.pending_row_version_free,
+                    &mut row_versions.pending_row_versions,
+                    &mut row_versions.pending_row_version_free,
                 );
                 let state = tables[table_index]
                     .rows
@@ -31681,7 +31683,7 @@ impl Storage {
             }
             Some(loc) => {
                 if let Some(slot) = state.pending.tail {
-                    self.pending_row_versions[slot].change.loc = loc;
+                    self.row_versions.exclusive().pending_row_versions[slot].change.loc = loc;
                 }
             }
         }
@@ -31740,7 +31742,7 @@ impl Storage {
             let Some(state) = self.tables[table_index].rows.get(&rowid) else {
                 return;
             };
-            match pending_last(&self.pending_row_versions, state.pending) {
+            match pending_last(&self.row_versions.read().pending_row_versions, state.pending) {
                 Some(p) if p.txid == txid => (state.committed, state.committed_lsn, p),
                 _ => return,
             }
@@ -31765,12 +31767,13 @@ impl Storage {
 
         let retain_history = !self.snapshot_state().active.is_empty();
         {
+            let row_versions = self.row_versions.exclusive();
             let (tables, committed_versions, committed_free, pending_versions, pending_free) = (
                 &mut self.tables,
-                &mut self.committed_row_versions,
-                &mut self.committed_row_version_free,
-                &mut self.pending_row_versions,
-                &mut self.pending_row_version_free,
+                &mut row_versions.committed_row_versions,
+                &mut row_versions.committed_row_version_free,
+                &mut row_versions.pending_row_versions,
+                &mut row_versions.pending_row_version_free,
             );
             let state = tables[table_index]
                 .rows
@@ -31834,18 +31837,19 @@ impl Storage {
             let Some(state) = self.tables[table_index].rows.get(&rowid) else {
                 return;
             };
-            match pending_last(&self.pending_row_versions, state.pending) {
+            match pending_last(&self.row_versions.read().pending_row_versions, state.pending) {
                 Some(pending) if pending.txid == txid => pending.loc,
                 _ => return,
             }
         };
         {
+            let row_versions = self.row_versions.exclusive();
             let (tables, committed_versions, committed_free, pending_versions, pending_free) = (
                 &mut self.tables,
-                &mut self.committed_row_versions,
-                &mut self.committed_row_version_free,
-                &mut self.pending_row_versions,
-                &mut self.pending_row_version_free,
+                &mut row_versions.committed_row_versions,
+                &mut row_versions.committed_row_version_free,
+                &mut row_versions.pending_row_versions,
+                &mut row_versions.pending_row_version_free,
             );
             let state = tables[table_index]
                 .rows
@@ -33638,7 +33642,7 @@ impl Storage {
     pub(crate) fn has_visible_pending_rows(&self, table_index: usize, txid: u32) -> bool {
         self.tables[table_index].rows.iter().any(|(_, state)| {
             pending_visible_at(
-                &self.pending_row_versions,
+                &self.row_versions.read().pending_row_versions,
                 state.pending,
                 txid,
                 self.read_snapshot(),
@@ -47810,10 +47814,11 @@ impl Storage {
         // reader holds no row lock. Wake the shared wait graph when it ends.
         let wait_owner = self.transaction_wait_owner(txid);
         self.lock_state().row.resource_released(wait_owner);
+        let row_versions = self.row_versions.exclusive();
         let (tables, versions, free) = (
             &mut self.tables,
-            &mut self.committed_row_versions,
-            &mut self.committed_row_version_free,
+            &mut row_versions.committed_row_versions,
+            &mut row_versions.committed_row_version_free,
         );
         for table in tables.iter_mut() {
             for (_, state) in table.rows.iter_mut() {
@@ -52677,9 +52682,10 @@ mod tests {
         // committed-snapshot filtering applies only when no visible own image
         // overlays it.
         let mut pending = state;
+        let row_versions = storage.row_versions.exclusive();
         push_pending_version(
-            &mut storage.pending_row_versions,
-            &mut storage.pending_row_version_free,
+            &mut row_versions.pending_row_versions,
+            &mut row_versions.pending_row_version_free,
             &mut pending.pending,
             storage.max_row_versions_per_row,
             PendingChange {
@@ -54969,11 +54975,11 @@ mod tests {
 
         assert_eq!(storage.tables.len(), 3); // two relations plus large-object pages
         assert_eq!(
-            storage.pending_row_versions.capacity(),
+            storage.row_versions.read().pending_row_versions.capacity(),
             pending_row_version_capacity(&config)
         );
         assert_eq!(
-            storage.committed_row_versions.capacity(),
+            storage.row_versions.read().committed_row_versions.capacity(),
             committed_row_version_capacity(&config)
         );
         assert!(
@@ -58939,9 +58945,10 @@ mod tests {
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
         };
+        let row_versions = storage.row_versions.exclusive();
         push_pending_version(
-            &mut storage.pending_row_versions,
-            &mut storage.pending_row_version_free,
+            &mut row_versions.pending_row_versions,
+            &mut row_versions.pending_row_version_free,
             &mut state.pending,
             storage.max_row_versions_per_row,
             PendingChange {

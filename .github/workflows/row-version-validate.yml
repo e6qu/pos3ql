@@ -1,0 +1,35 @@
+name: row-version validation
+on:
+  push:
+    branches: [codex/row-version-ownership]
+concurrency:
+  group: row-version-validation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format on runner and retain patch
+        run: |
+          cargo fmt
+          git diff --binary > "$RUNNER_TEMP/row-version-format.patch"
+      - name: Compile all targets
+        run: cargo check --all-targets --locked
+      - name: All-target lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Verify row-version ownership and storage accounting
+        run: |
+          cargo test --lib --locked row_version_ownership -- --test-threads=1
+          cargo test --lib --locked table_state -- --test-threads=1
+          cargo test --lib --locked catalog_object_pools_follow_their_independent_startup_capacities -- --test-threads=1
+      - name: Retain formatter patch
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: row-version-format
+          path: ${{ runner.temp }}/row-version-format.patch

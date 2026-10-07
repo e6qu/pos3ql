@@ -140,10 +140,14 @@ mod tests {
             }
             let pending_before = commands;
             let history_before = history;
-            assert!(push_pending_version(&mut state.pending_row_versions, &mut state.pending_row_version_free,
-                &mut commands, 3, pending(3)).is_err());
-            assert!(push_committed_version(&mut state.committed_row_versions, &mut state.committed_row_version_free,
-                &mut history, 3, committed(3)).is_err());
+            let pending_error = push_pending_version(&mut state.pending_row_versions, &mut state.pending_row_version_free,
+                &mut commands, 3, pending(3)).unwrap_err();
+            let history_error = push_committed_version(&mut state.committed_row_versions, &mut state.committed_row_version_free,
+                &mut history, 3, committed(3)).unwrap_err();
+            assert_eq!(pending_error.sqlstate, crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(history_error.sqlstate, crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(pending_error.message.as_str(), "pending row-version pool is exhausted");
+            assert_eq!(history_error.message.as_str(), "committed row-version pool is exhausted");
             assert_eq!(commands, pending_before);
             assert_eq!(history, history_before);
             assert_eq!(pop_pending_version(&mut state.pending_row_versions, &mut state.pending_row_version_free,

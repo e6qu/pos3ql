@@ -31336,25 +31336,25 @@ impl Storage {
                 txid,
                 track_statistics,
             )?;
-            let current_command = state.pending.tail.map(|slot| {
-                self.row_versions.read().pending_row_versions[slot].change.cid
-            });
-            if let Some(slot) = state.pending.tail
-                && current_command == Some(cid)
             {
-                let last = &mut self.row_versions.exclusive().pending_row_versions[slot].change;
-                let prior = Some(last.loc);
-                last.loc = loc;
-                // Same-command undo retains only the prior location. Keep a
-                // conservative union of every attempted image so restoring a
-                // prior location can over-invalidate but can never lose an
-                // index dependency that the restored image changed.
-                last.changed_columns |= changed_columns;
-                last.changes_existence |= changes_existence;
-                if track_statistics {
-                    self.record_relation_write(txid, table_index, existed, loc.is_some())?;
+                let row_versions = self.row_versions.exclusive();
+                if let Some(slot) = state.pending.tail
+                    && row_versions.pending_row_versions[slot].change.cid == cid
+                {
+                    let last = &mut row_versions.pending_row_versions[slot].change;
+                    let prior = Some(last.loc);
+                    last.loc = loc;
+                    // Same-command undo retains only the prior location. Keep a
+                    // conservative union of every attempted image so restoring a
+                    // prior location can over-invalidate but can never lose an
+                    // index dependency that the restored image changed.
+                    last.changed_columns |= changed_columns;
+                    last.changes_existence |= changes_existence;
+                    if track_statistics {
+                        self.record_relation_write(txid, table_index, existed, loc.is_some())?;
+                    }
+                    return Ok(prior);
                 }
-                return Ok(prior);
             }
             {
                 let row_versions = self.row_versions.exclusive();

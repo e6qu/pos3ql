@@ -16833,7 +16833,7 @@ impl Engine {
             statement,
             tag,
             event_trigger::CollectChanges {
-                before: event_before,
+                before: &event_before,
                 undo: &txn.ddl()[event_ddl_mark..],
                 undo_origins: &txn.ddl_origins()[event_ddl_mark..],
                 origin: event_ddl_origin,

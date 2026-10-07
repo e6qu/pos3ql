@@ -33,12 +33,14 @@ and checkpoint images. Later changes invalidate staging acknowledgement; range
 errors leave positions unchanged. Generated-value assignment borrows its visible
 definition without copying the full maximum-width image.
 
-INSERT, UPDATE, DELETE, and MERGE retain immutable definition images from a
+INSERT, UPDATE, DELETE, MERGE, and COPY retain immutable definition images from a
 startup-budgeted pool. Physical UPDATE and MERGE rows reuse one image per table
 and transaction within the statement. Returned references borrow their reader
 owner, remain valid across definition changes and slot reuse, and do not borrow
 mutable storage. Pool exhaustion and stale identity reacquisition are explicit
-errors. Live definition publication and COPY reader integration remain open.
+errors. COPY owns its reader across data messages; DDL event graphs retain
+pre-change images outside the statement arena. Live definition publication
+remains exclusive.
 
 The reactor still executes statements serially. Table definitions and row
 mutation, engine-owned prepared slots and WAL publication, fixed workers, and

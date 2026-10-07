@@ -50922,8 +50922,8 @@ pub fn cluster(
 
 /// COPY's per-statement setup: the resolved table and target columns, in
 /// COPY's column order. Held by the connection across CopyData messages.
-#[derive(Clone, Copy)]
 pub struct CopySetup {
+    definitions: crate::storage::TableDefinitionImages,
     pub table_index: usize,
     pub txid: u32,
     pub targets: [usize; MAX_COLUMNS],
@@ -51409,7 +51409,10 @@ pub fn copy_begin(
             }
         }
     }
+    let definitions = storage.table_definition_images();
+    definitions.definition(storage, table_index, txid)?;
     Ok(CopySetup {
+        definitions,
         table_index,
         txid,
         targets,
@@ -51483,7 +51486,10 @@ pub(crate) fn subscription_copy_setup(
         }
         targets[index] = local;
     }
+    let definitions = storage.table_definition_images();
+    definitions.definition(storage, table_index, txid)?;
     Ok(CopySetup {
+        definitions,
         table_index,
         txid,
         targets,
@@ -51522,7 +51528,7 @@ pub fn copy_statement_begin(
     responder: &mut Responder,
     scratch: &mut DmlScratch,
 ) -> Result<(), SqlError> {
-    let definition = *storage.table_def(setup.table_index, txn.txid);
+    let definition = setup.definitions.definition(storage, setup.table_index, txn.txid)?;
     if let Some(role) = setup.security_role {
         let _ = super::query::plan_row_security(
             storage,
@@ -51568,7 +51574,7 @@ pub fn copy_statement_end(
     scratch: &mut DmlScratch,
     inserted: &DmlScratch,
 ) -> Result<(), SqlError> {
-    let definition = *storage.table_def(setup.table_index, txn.txid);
+    let definition = setup.definitions.definition(storage, setup.table_index, txn.txid)?;
     let mut transition_capture = if transition_capture_required(
         storage,
         setup.table_index,
@@ -51711,7 +51717,7 @@ pub fn copy_row(
     scratch: &mut DmlScratch,
     inserted: &mut DmlScratch,
 ) -> Result<CopyRowOutcome, SqlError> {
-    let def = *storage.table_def(setup.table_index, txn.txid);
+    let def = setup.definitions.definition(storage, setup.table_index, txn.txid)?;
     let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
     let fmt = &setup.fmt;
     let n_fields = if fmt.csv {
@@ -51847,7 +51853,7 @@ pub fn copy_row_binary(
     scratch: &mut DmlScratch,
     inserted: &mut DmlScratch,
 ) -> Result<CopyRowOutcome, SqlError> {
-    let def = *storage.table_def(setup.table_index, txn.txid);
+    let def = setup.definitions.definition(storage, setup.table_index, txn.txid)?;
     let malformed = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid COPY binary row");
     let mut reader = crate::pg::wire::MsgIn::new(row);
     let count = reader.i16().map_err(|_| malformed())?;
@@ -53894,7 +53900,7 @@ pub fn copy_out(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<u64, SqlError> {
-    let def = *storage.table_def(setup.table_index, txid);
+    let def = setup.definitions.definition(storage, setup.table_index, txid)?;
     let security = setup
         .security_role
         .map(|role| {

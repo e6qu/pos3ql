@@ -58,7 +58,7 @@ statistics, physical maintenance, and engine publication remain exclusive.
 Default assignment borrows its visible definition instead of copying the full
 maximum-width image for each generated value.
 
-INSERT, UPDATE, DELETE, and MERGE retain immutable table definitions across
+INSERT, UPDATE, DELETE, MERGE, and COPY retain immutable table definitions across
 mutable callbacks. UPDATE and MERGE capture each physical table once per
 statement instead of copying the maximum-width definition per row. Reader
 owners release their startup-reserved cells when execution returns, including
@@ -66,8 +66,11 @@ errors; retained images survive definition rollback, publication, and table
 slot reuse. Reacquiring a reused identity fails with a serialization error.
 The global image capacity is table slots × query workspace slots ×
 (maximum catalog versions per object + 1); exhaustion is a named program limit.
-Live definition publication, COPY reader integration, rows, and maintenance
-still require their shared synchronization boundary before fixed workers.
+COPY retains its owner across data messages; DDL event triggers retain their
+pre-change image without consuming statement arena space. Nested-trigger pool
+exhaustion rolls back the outer mutation and releases capacity for retry.
+Live definition publication, rows, and maintenance still require their shared
+synchronization boundary before fixed workers.
 
 Completion evidence:
 

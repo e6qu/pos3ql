@@ -7,6 +7,47 @@
 use super::*;
 
 #[test]
+fn table_definition_images_nested_trigger_exhaustion_rolls_back_and_retries() {
+    let mut config = test_config("definition-image-exhaustion");
+    config.max_tables = 2;
+    config.max_catalog_versions_per_object = 1;
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 27));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for statement in [
+        "CREATE TABLE image_target (id integer)",
+        "CREATE TABLE image_audit (id integer)",
+        "CREATE FUNCTION image_record() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO image_audit VALUES (NEW.id); RETURN NEW; END $$",
+        "CREATE TRIGGER image_record AFTER INSERT ON image_target FOR EACH ROW EXECUTE FUNCTION image_record()",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(!String::from_utf8_lossy(&output).contains("ERROR"), "{statement}: {}", String::from_utf8_lossy(&output));
+    }
+    let table = engine.storage.find_visible("public", "image_target", 0).unwrap();
+    let capacity = crate::storage::table_slot_capacity(&config)
+        * (config.max_catalog_versions_per_object + 1)
+        * config.query_workspace_slots;
+    let mut owners = Vec::with_capacity(capacity - 1);
+    for _ in 1..capacity {
+        let definitions = engine.storage.table_definition_images();
+        definitions.definition(&engine.storage, table, 0).unwrap();
+        owners.push(definitions);
+    }
+    let output = run_with(&mut engine, &mut budget, "INSERT INTO image_target VALUES (1)");
+    assert!(String::from_utf8_lossy(&output).contains("table definition image pool is exhausted"), "{}", String::from_utf8_lossy(&output));
+    for table in ["image_target", "image_audit"] {
+        assert_eq!(data_rows(&run_with(&mut engine, &mut budget, &format!("SELECT count(*) FROM {table}"))), ["0"]);
+    }
+    drop(owners.pop().unwrap());
+    for id in 1..=2 {
+        let output = run_with(&mut engine, &mut budget, &format!("INSERT INTO image_target VALUES ({id})"));
+        assert!(!String::from_utf8_lossy(&output).contains("ERROR"), "{}", String::from_utf8_lossy(&output));
+    }
+    for table in ["image_target", "image_audit"] {
+        assert_eq!(data_rows(&run_with(&mut engine, &mut budget, &format!("SELECT id FROM {table} ORDER BY id"))), ["1", "2"]);
+    }
+}
+
+#[test]
 fn cluster_metadata_reload_applies_one_owned_settings_image() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ActiveSystemSettings>();

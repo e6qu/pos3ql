@@ -10,7 +10,9 @@ DML definition readers now retain immutable startup-budgeted images across
 mutable callbacks, rollback, publication, and table identity reuse. Per-row
 UPDATE and MERGE readers reuse those images. Exhaustion and stale identity
 reacquisition fail explicitly; error returns release the retained capacity.
-These changes introduce no deferred defect.
+COPY and DDL pre-change readers use the same pool. Nested-trigger exhaustion
+rolls back the outer mutation and frees capacity for retry. These changes
+introduce no deferred defect.
 
 Table-owned serial advances previously used unchecked signed addition. The
 counter boundary now checks all integer widths before mutation. Dirty-state

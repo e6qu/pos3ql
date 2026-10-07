@@ -5,8 +5,8 @@
 //! bytes are reclaimed when the memtable flushes to object storage (later
 //! phase). All capacities are fixed at startup.
 
-pub(crate) mod foreign;
 mod definition_images;
+pub(crate) mod foreign;
 pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
@@ -17377,6 +17377,10 @@ impl Storage {
     }
 
     /// Bytes drawn beyond the row heap itself, for the memory plan.
+    pub(crate) fn table_definition_image_budget_bytes(config: &Config) -> usize {
+        definition_images::TableDefinitionImagePool::budget_bytes(config)
+    }
+
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
             + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
@@ -17387,7 +17391,7 @@ impl Storage {
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>())
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
-            + definition_images::TableDefinitionImagePool::budget_bytes(config)
+            + Self::table_definition_image_budget_bytes(config)
             + committed_row_version_capacity(config)
                 .saturating_mul(size_of::<CommittedVersionSlot>())
             + config.max_views * size_of::<ViewDef>()
@@ -17509,7 +17513,8 @@ impl Storage {
         let foreign = foreign::ForeignCatalog::new(config, budget)?;
         let table_capacity = table_slot_capacity(config);
         let mut tables = FixedVec::new(budget, "tables", table_capacity)?;
-        let table_definition_images = definition_images::TableDefinitionImagePool::new(config, budget)?;
+        let table_definition_images =
+            definition_images::TableDefinitionImagePool::new(config, budget)?;
         budget.draw_array(
             table_capacity.saturating_mul(config.max_spill_generations_per_table),
             size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>(),
@@ -54624,34 +54629,107 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage.create_table(make_def("original", &[("id", ColType::Int8, true)])).unwrap();
+        let table = storage
+            .create_table(make_def("original", &[("id", ColType::Int8, true)]))
+            .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let committed = storage.table_definition_images();
             let original = committed.definition(&storage, table, 0).unwrap();
-            assert!(core::ptr::eq(original, committed.definition(&storage, table, 0).unwrap()));
-            storage.write_table_def(table, 7, make_def("pending", &[("id", ColType::Int8, true)]), &[None; MAX_COLUMNS], false).unwrap();
+            assert!(core::ptr::eq(
+                original,
+                committed.definition(&storage, table, 0).unwrap()
+            ));
+            storage
+                .write_table_def(
+                    table,
+                    7,
+                    make_def("pending", &[("id", ColType::Int8, true)]),
+                    &[None; MAX_COLUMNS],
+                    false,
+                )
+                .unwrap();
             let pending = storage.table_definition_images();
             let pending_image = pending.definition(&storage, table, 7).unwrap();
             let other_transaction = storage.table_definition_images();
-            assert_eq!(other_transaction.definition(&storage, table, 8).unwrap().name.as_str(), "original");
+            assert_eq!(
+                other_transaction
+                    .definition(&storage, table, 8)
+                    .unwrap()
+                    .name
+                    .as_str(),
+                "original"
+            );
             storage.rollback_table_def(table, 7);
             assert_eq!(pending_image.name.as_str(), "pending");
-            assert!(core::ptr::eq(pending_image, pending.definition(&storage, table, 7).unwrap()));
+            assert!(core::ptr::eq(
+                pending_image,
+                pending.definition(&storage, table, 7).unwrap()
+            ));
             let rolled_back = storage.table_definition_images();
-            assert_eq!(rolled_back.definition(&storage, table, 7).unwrap().name.as_str(), "original");
-            storage.write_table_def(table, 7, make_def("published", &[("id", ColType::Int8, true)]), &[None; MAX_COLUMNS], false).unwrap();
+            assert_eq!(
+                rolled_back
+                    .definition(&storage, table, 7)
+                    .unwrap()
+                    .name
+                    .as_str(),
+                "original"
+            );
+            storage
+                .write_table_def(
+                    table,
+                    7,
+                    make_def("published", &[("id", ColType::Int8, true)]),
+                    &[None; MAX_COLUMNS],
+                    false,
+                )
+                .unwrap();
             storage.commit_table_def(table, 7);
             assert_eq!(original.name.as_str(), "original");
             let published = storage.table_definition_images();
-            assert_eq!(published.definition(&storage, table, 0).unwrap().name.as_str(), "published");
+            assert_eq!(
+                published
+                    .definition(&storage, table, 0)
+                    .unwrap()
+                    .name
+                    .as_str(),
+                "published"
+            );
             storage.commit_drop(table);
-            let replacement = storage.create_table(make_def("replacement", &[("id", ColType::Int8, true)])).unwrap();
+            let replacement = storage
+                .create_table(make_def("replacement", &[("id", ColType::Int8, true)]))
+                .unwrap();
             assert_eq!(replacement, table);
             assert_eq!(original.name.as_str(), "original");
             assert_eq!(pending_image.name.as_str(), "pending");
-            assert_eq!(committed.definition(&storage, table, 0).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(
+                committed
+                    .definition(&storage, table, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
             let reused = storage.table_definition_images();
-            assert_eq!(reused.definition(&storage, table, 0).unwrap().name.as_str(), "replacement");
+            assert_eq!(
+                reused.definition(&storage, table, 0).unwrap().name.as_str(),
+                "replacement"
+            );
+        });
+    }
+
+    #[test]
+    fn table_definition_images_reject_a_different_storage_owner() {
+        let config = test_config();
+        let mut first_budget = test_budget(&config);
+        let mut second_budget = test_budget(&config);
+        let mut first = Storage::new(&config, &mut first_budget).unwrap();
+        let mut second = Storage::new(&config, &mut second_budget).unwrap();
+        let table = first.create_table(make_def("first", &[("id", ColType::Int8, true)])).unwrap();
+        let other = second.create_table(make_def("second", &[("id", ColType::Int8, true)])).unwrap();
+        let definitions = first.table_definition_images();
+        crate::mem::guard::forbid_alloc(|| {
+            let image = definitions.definition(&first, table, 0).unwrap();
+            assert_eq!(definitions.definition(&second, other, 0).unwrap_err().sqlstate, sqlstate::INTERNAL_ERROR);
+            assert_eq!(image.name.as_str(), "first");
         });
     }
 
@@ -54660,7 +54738,9 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage.create_table(make_def("retained", &[("id", ColType::Int8, true)])).unwrap();
+        let table = storage
+            .create_table(make_def("retained", &[("id", ColType::Int8, true)]))
+            .unwrap();
         let definitions = storage.table_definition_images();
         crate::mem::guard::forbid_alloc(|| {
             let image = definitions.definition(&storage, table, 0).unwrap();
@@ -54675,8 +54755,12 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage.create_table(make_def("bounded", &[("id", ColType::Int8, true)])).unwrap();
-        let capacity = table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1) * config.query_workspace_slots;
+        let table = storage
+            .create_table(make_def("bounded", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        let capacity = table_slot_capacity(&config)
+            * (config.max_catalog_versions_per_object + 1)
+            * config.query_workspace_slots;
         let mut owners = Vec::with_capacity(capacity);
         crate::mem::guard::forbid_alloc(|| {
             let retained_owner = storage.table_definition_images();
@@ -54687,7 +54771,13 @@ mod tests {
                 owners.push(owner);
             }
             let exhausted = storage.table_definition_images();
-            assert_eq!(exhausted.definition(&storage, table, 0).unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                exhausted
+                    .definition(&storage, table, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
             assert_eq!(retained.name.as_str(), "bounded");
             drop(owners.pop().unwrap());
             exhausted.definition(&storage, table, 0).unwrap();
@@ -54704,7 +54794,9 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage.create_table(make_def("shared", &[("id", ColType::Int8, true)])).unwrap();
+        let table = storage
+            .create_table(make_def("shared", &[("id", ColType::Int8, true)]))
+            .unwrap();
         let retained = storage.table_definition_images();
         let image = retained.definition(&storage, table, 0).unwrap();
         std::thread::scope(|scope| {
@@ -54716,7 +54808,10 @@ mod tests {
                             let definitions = storage.table_definition_images();
                             let current = definitions.definition(storage, table, 0).unwrap();
                             assert_eq!(current.name.as_str(), "shared");
-                            assert!(core::ptr::eq(current, definitions.definition(storage, table, 0).unwrap()));
+                            assert!(core::ptr::eq(
+                                current,
+                                definitions.definition(storage, table, 0).unwrap()
+                            ));
                         }
                     });
                 });

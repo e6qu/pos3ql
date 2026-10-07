@@ -69,7 +69,10 @@ impl TableDefinitionImagePool {
         // SAFETY: occupied was initialized above; the only remaining field
         // explicitly permits uninitialized bytes.
         let cells = unsafe { cells.assume_init() };
-        Ok(Arc::new(Self { cells, allocation: Mutex::new(()) }))
+        Ok(Arc::new(Self {
+            cells,
+            allocation: Mutex::new(()),
+        }))
     }
 }
 
@@ -83,7 +86,10 @@ pub(crate) struct TableDefinitionImages {
 
 impl TableDefinitionImages {
     pub(super) fn new(pool: &Arc<TableDefinitionImagePool>) -> Self {
-        Self { pool: Arc::clone(pool), head: Cell::new(None) }
+        Self {
+            pool: Arc::clone(pool),
+            head: Cell::new(None),
+        }
     }
 
     pub(crate) fn definition<'a>(
@@ -115,8 +121,17 @@ impl TableDefinitionImages {
             }
             slot = image.next;
         }
-        let _allocation = self.pool.allocation.lock().expect("table definition image lock poisoned");
-        let Some(index) = self.pool.cells.iter().position(|cell| !cell.occupied.load(Ordering::Acquire)) else {
+        let _allocation = self
+            .pool
+            .allocation
+            .lock()
+            .expect("table definition image lock poisoned");
+        let Some(index) = self
+            .pool
+            .cells
+            .iter()
+            .position(|cell| !cell.occupied.load(Ordering::Acquire))
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "table definition image pool is exhausted (capacity {})",
@@ -135,7 +150,11 @@ impl TableDefinitionImages {
             core::ptr::addr_of_mut!((*target).transaction).write(transaction);
             core::ptr::addr_of_mut!((*target).database).write(source.database);
             core::ptr::addr_of_mut!((*target).created_at).write(source.created_at);
-            core::ptr::copy_nonoverlapping(definition, core::ptr::addr_of_mut!((*target).definition), 1);
+            core::ptr::copy_nonoverlapping(
+                definition,
+                core::ptr::addr_of_mut!((*target).definition),
+                1,
+            );
         }
         cell.occupied.store(true, Ordering::Release);
         self.head.set(Some(index));
@@ -170,7 +189,10 @@ mod tests {
         let mut budget = Budget::new(bytes);
         let pool = TableDefinitionImagePool::new(&config, &mut budget).unwrap();
         assert_eq!(budget.used(), bytes);
-        assert_eq!(pool.cells.len(), TableDefinitionImagePool::capacity(&config));
+        assert_eq!(
+            pool.cells.len(),
+            TableDefinitionImagePool::capacity(&config)
+        );
         let mut too_small = Budget::new(bytes - 1);
         let error = match TableDefinitionImagePool::new(&config, &mut too_small) {
             Ok(_) => panic!("undersized definition budget must fail"),

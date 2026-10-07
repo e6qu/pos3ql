@@ -51528,7 +51528,9 @@ pub fn copy_statement_begin(
     responder: &mut Responder,
     scratch: &mut DmlScratch,
 ) -> Result<(), SqlError> {
-    let definition = setup.definitions.definition(storage, setup.table_index, txn.txid)?;
+    let definition = setup
+        .definitions
+        .definition(storage, setup.table_index, txn.txid)?;
     if let Some(role) = setup.security_role {
         let _ = super::query::plan_row_security(
             storage,
@@ -51574,7 +51576,9 @@ pub fn copy_statement_end(
     scratch: &mut DmlScratch,
     inserted: &DmlScratch,
 ) -> Result<(), SqlError> {
-    let definition = setup.definitions.definition(storage, setup.table_index, txn.txid)?;
+    let definition = setup
+        .definitions
+        .definition(storage, setup.table_index, txn.txid)?;
     let mut transition_capture = if transition_capture_required(
         storage,
         setup.table_index,
@@ -51717,7 +51721,9 @@ pub fn copy_row(
     scratch: &mut DmlScratch,
     inserted: &mut DmlScratch,
 ) -> Result<CopyRowOutcome, SqlError> {
-    let def = setup.definitions.definition(storage, setup.table_index, txn.txid)?;
+    let def = setup
+        .definitions
+        .definition(storage, setup.table_index, txn.txid)?;
     let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
     let fmt = &setup.fmt;
     let n_fields = if fmt.csv {
@@ -51799,14 +51805,7 @@ pub fn copy_row(
         seq_session,
         txn.txid,
     )?;
-    compute_generated(
-        def,
-        &generated_exprs,
-        &mut values,
-        storage,
-        txn.txid,
-        arena,
-    )?;
+    compute_generated(def, &generated_exprs, &mut values, storage, txn.txid, arena)?;
     if !setup.filter.accepts(
         storage,
         txn.txid,
@@ -51853,7 +51852,9 @@ pub fn copy_row_binary(
     scratch: &mut DmlScratch,
     inserted: &mut DmlScratch,
 ) -> Result<CopyRowOutcome, SqlError> {
-    let def = setup.definitions.definition(storage, setup.table_index, txn.txid)?;
+    let def = setup
+        .definitions
+        .definition(storage, setup.table_index, txn.txid)?;
     let malformed = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid COPY binary row");
     let mut reader = crate::pg::wire::MsgIn::new(row);
     let count = reader.i16().map_err(|_| malformed())?;
@@ -51909,14 +51910,7 @@ pub fn copy_row_binary(
         seq_session,
         txn.txid,
     )?;
-    compute_generated(
-        def,
-        &generated_exprs,
-        &mut values,
-        storage,
-        txn.txid,
-        arena,
-    )?;
+    compute_generated(def, &generated_exprs, &mut values, storage, txn.txid, arena)?;
     if !setup.filter.accepts(
         storage,
         txn.txid,
@@ -53900,7 +53894,9 @@ pub fn copy_out(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<u64, SqlError> {
-    let def = setup.definitions.definition(storage, setup.table_index, txid)?;
+    let def = setup
+        .definitions
+        .definition(storage, setup.table_index, txid)?;
     let security = setup
         .security_role
         .map(|role| {
@@ -56544,10 +56540,14 @@ pub fn merge<'a>(
                             }
                         } else {
                             let out = if updated_table == target_tables[j] {
-                                let row_definition = match definitions.definition(storage, updated_table, txn.txid) {
-                Ok(definition) => definition,
-                Err(error) => return sql_fail(error),
-            };
+                                let row_definition = match definitions.definition(
+                                    storage,
+                                    updated_table,
+                                    txn.txid,
+                                ) {
+                                    Ok(definition) => definition,
+                                    Err(error) => return sql_fail(error),
+                                };
                                 let mut physical_new = [Datum::Null; MAX_COLUMNS];
                                 physical_new[..def.n_columns]
                                     .copy_from_slice(&new_values[..def.n_columns]);
@@ -58286,14 +58286,8 @@ where
         return sql_fail(error);
     }
     let conflict_read_columns = match (|| -> Result<ColumnSet, SqlError> {
-        let mut columns = returning_dml_target_columns(
-            statement.returning,
-            def,
-            None,
-            storage,
-            txn.txid,
-            arena,
-        )?;
+        let mut columns =
+            returning_dml_target_columns(statement.returning, def, None, storage, txn.txid, arena)?;
         if let Some(conflict) = statement.on_conflict {
             for target in conflict.target {
                 columns |= expression_dml_target_columns(
@@ -58313,9 +58307,8 @@ where
                 }
             }
             if let Some(expression) = conflict.update_where {
-                columns |= expression_dml_target_columns(
-                    expression, def, None, storage, txn.txid, arena,
-                )?;
+                columns |=
+                    expression_dml_target_columns(expression, def, None, storage, txn.txid, arena)?;
             }
         }
         Ok(columns)

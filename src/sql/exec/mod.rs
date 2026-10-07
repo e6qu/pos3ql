@@ -55281,7 +55281,11 @@ pub fn merge<'a>(
             MergeAction::DoNothing => {}
         }
     }
-    let def = *storage.table_def(table_index, txn.txid);
+    let definitions = storage.table_definition_images();
+    let def = match definitions.definition(storage, table_index, txn.txid) {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
     let foreign_target = def.kind == crate::storage::TableKind::Foreign;
     let target_alias = statement.target_alias.or(Some(statement.target.name));
     let mut update_columns = ColumnSet::EMPTY;
@@ -55971,7 +55975,10 @@ pub fn merge<'a>(
                 Ok(b) => &*b,
                 Err(_) => return sql_fail(super::query::arena_full_pub()),
             };
-            let row_definition = *storage.table_def(row_table, txn.txid);
+            let row_definition = match definitions.definition(storage, row_table, txn.txid) {
+                Ok(definition) => definition,
+                Err(error) => return sql_fail(error),
+            };
             let mut row_schema = [ColType::Bool; MAX_COLUMNS];
             row_definition.schema(&mut row_schema);
             let mut vals = [Datum::Null; MAX_COLUMNS];
@@ -56531,7 +56538,10 @@ pub fn merge<'a>(
                             }
                         } else {
                             let out = if updated_table == target_tables[j] {
-                                let row_definition = *storage.table_def(updated_table, txn.txid);
+                                let row_definition = match definitions.definition(storage, updated_table, txn.txid) {
+                Ok(definition) => definition,
+                Err(error) => return sql_fail(error),
+            };
                                 let mut physical_new = [Datum::Null; MAX_COLUMNS];
                                 physical_new[..def.n_columns]
                                     .copy_from_slice(&new_values[..def.n_columns]);
@@ -58167,7 +58177,11 @@ where
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
-    let def = *storage.table_def(table_index, txn.txid);
+    let definitions = storage.table_definition_images();
+    let def = match definitions.definition(storage, table_index, txn.txid) {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
     if def.kind == crate::storage::TableKind::Foreign
         && statement.on_conflict.is_some_and(|conflict| {
             conflict.update.is_some()
@@ -59432,7 +59446,11 @@ pub(crate) fn update<'a>(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
-    let def = *storage.table_def(table_index, txn.txid);
+    let definitions = storage.table_definition_images();
+    let def = match definitions.definition(storage, table_index, txn.txid) {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
     let authorization_role = match authorization.role(storage, txn.txid) {
         Ok(role) => role,
         Err(error) => return sql_fail(error),
@@ -59836,7 +59854,10 @@ pub(crate) fn update<'a>(
             Ok(b) => b,
             Err(error) => return sql_fail(error),
         };
-        let row_definition = *storage.table_def(row_table, txn.txid);
+        let row_definition = match definitions.definition(storage, row_table, txn.txid) {
+            Ok(definition) => definition,
+            Err(error) => return sql_fail(error),
+        };
         let mut row_schema = [ColType::Bool; MAX_COLUMNS];
         row_definition.schema(&mut row_schema);
         let row_schema = &row_schema[..row_definition.n_columns];
@@ -60498,7 +60519,11 @@ pub(crate) fn delete<'a>(
     ) {
         return sql_fail(error);
     }
-    let def = *storage.table_def(table_index, txn.txid);
+    let definitions = storage.table_definition_images();
+    let def = match definitions.definition(storage, table_index, txn.txid) {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
     let reads_target = match (|| -> Result<ColumnSet, SqlError> {
         let mut columns = ColumnSet::EMPTY;
         if let Some(expression) = statement.where_clause {

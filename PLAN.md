@@ -1,7 +1,7 @@
 # pos3ql roadmap
 
-Reviewed after PR #600 on 2026-10-06, against
-`f41033821b8f9b15fab1c52fa34ba630c954015b`.
+Reviewed after PR #601 on 2026-10-07, against
+`a91caa4d5bf838fcc75edb8273094eddceeb5b07`.
 
 [Architecture](README.md) · [Current capabilities](docs/implemented-baseline.md) ·
 [Compatibility](docs/postgresql-18-compatibility.md) · [Contributing](CONTRIBUTING.md)
@@ -57,6 +57,17 @@ This prepares serial state for overlapping execution; definitions, rows,
 statistics, physical maintenance, and engine publication remain exclusive.
 Default assignment borrows its visible definition instead of copying the full
 maximum-width image for each generated value.
+
+INSERT, UPDATE, DELETE, and MERGE retain immutable table definitions across
+mutable callbacks. UPDATE and MERGE capture each physical table once per
+statement instead of copying the maximum-width definition per row. Reader
+owners release their startup-reserved cells when execution returns, including
+errors; retained images survive definition rollback, publication, and table
+slot reuse. Reacquiring a reused identity fails with a serialization error.
+The global image capacity is table slots × query workspace slots ×
+(maximum catalog versions per object + 1); exhaustion is a named program limit.
+Live definition publication, COPY reader integration, rows, and maintenance
+still require their shared synchronization boundary before fixed workers.
 
 Completion evidence:
 

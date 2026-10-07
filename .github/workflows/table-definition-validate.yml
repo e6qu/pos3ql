@@ -1,0 +1,33 @@
+name: Table definition validation
+on:
+  push:
+    branches: [codex/table-definition-images]
+concurrency:
+  group: table-definition-validation
+  cancel-in-progress: true
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - run: cargo fmt --all
+      - run: git diff -- src > "$RUNNER_TEMP/formatting.patch"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: definition-formatting
+          path: ${{ runner.temp }}/formatting.patch
+      - run: cargo check --all-targets --locked
+      - run: cargo test --lib --locked table_definition_images -- --test-threads=1
+      - run: cargo test --lib --locked inheritance -- --test-threads=1
+      - run: cargo test --lib --locked merge_ -- --test-threads=1
+      - run: cargo test --lib --locked trigger_ -- --test-threads=1

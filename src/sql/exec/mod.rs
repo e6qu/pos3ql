@@ -2690,7 +2690,7 @@ fn build_inherited_table_def(
                 definition.n_columns = count;
             }
         }
-        inherit_table_checks(parent_definition, &mut definition, false)?;
+        inherit_table_checks(&parent_definition, &mut definition, false)?;
         definition.inheritance.append(parent)?;
     }
     for column in own.columns() {
@@ -3321,7 +3321,7 @@ fn like_source<'s>(
     txid: u32,
 ) -> Result<&'s TableDef, SqlError> {
     match resolve_dml_table(storage, &like.source, txid) {
-        Ok(i) => Ok(storage.table_def(i, txid)),
+        Ok(i) => Ok(&storage.table_def(i, txid)),
         Err(e) => Err(e),
     }
 }
@@ -14412,9 +14412,9 @@ fn publication_members(
                     function
                 ));
             }
-            let referenced = crate::sql::exec::ddl::check_referenced_columns(filter, definition)?;
+            let referenced = crate::sql::exec::ddl::check_referenced_columns(filter, &definition)?;
             let (type_oid, _) =
-                describe::infer_type_catalog(filter, Some(definition), storage, txid)?;
+                describe::infer_type_catalog(filter, Some(&definition), storage, txid)?;
             if type_oid != ColType::Bool.oid() {
                 return Err(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
@@ -50437,7 +50437,7 @@ pub fn drop_index(
             if let Some(table) = storage.index_table_slot_to(slot, txn.txid)
                 && attached_constraint_index(
                     storage,
-                    storage.table_def(table, txn.txid),
+                    &storage.table_def(table, txn.txid),
                     definition.name_for(txn.txid).as_str(),
                     txn.txid,
                 ) == Some(slot)
@@ -51396,8 +51396,8 @@ pub fn copy_begin(
             "COPY FORCE_NULL cannot be used with COPY TO"
         ));
     }
-    let fmt = CopyFmt::resolve(def, statement.table.name, &statement.options)?;
-    let filter = CopyFilter::resolve(statement, def)?;
+    let fmt = CopyFmt::resolve(&def, statement.table.name, &statement.options)?;
+    let filter = CopyFilter::resolve(statement, &def)?;
     if !statement.to {
         for &target in &targets[..n_targets] {
             if def.columns()[target].default.is_generated() {
@@ -63676,7 +63676,7 @@ fn alter_table_inner(
             Some(crate::storage::ResolvedRelation::Table(root))
                 if !statement.only
                     && ordinary_inheritance_propagates(
-                        storage.table_def(root, txn.txid),
+                        &storage.table_def(root, txn.txid),
                         statement.actions,
                     )
                     && (0..storage.table_count()).any(|child| {
@@ -67443,7 +67443,7 @@ fn collect_matches<'a>(
                 if row_matches_values(
                     storage,
                     txid,
-                    def,
+                    &def,
                     alias,
                     &values,
                     where_clause,
@@ -67476,7 +67476,7 @@ fn collect_matches<'a>(
         super::query::dml_indexed_candidates(
             storage,
             table_index,
-            def,
+            &def,
             alias,
             txid,
             where_clause,
@@ -67512,7 +67512,7 @@ fn collect_matches<'a>(
                 leaf,
                 rowid,
                 txid,
-                def,
+                &def,
                 alias,
                 schema,
                 loc,
@@ -69004,7 +69004,7 @@ pub(crate) fn require_rewrite_input_privileges(
             let definition = storage.table_def(table, txid);
             let mut insert_columns = ColumnSet::EMPTY;
             if insert.columns.is_empty() {
-                insert_columns = all_columns_mask(definition);
+                insert_columns = all_columns_mask(&definition);
             } else {
                 for name in insert.columns {
                     let column = definition.column_index(name).ok_or_else(|| {
@@ -69028,7 +69028,7 @@ pub(crate) fn require_rewrite_input_privileges(
             )?;
             let read_columns = returning_dml_target_columns(
                 insert.returning,
-                definition,
+                &definition,
                 None,
                 storage,
                 txid,
@@ -69062,7 +69062,7 @@ pub(crate) fn require_rewrite_input_privileges(
                 updated_columns.insert(column);
                 read_columns |= expression_dml_target_columns(
                     expression,
-                    definition,
+                    &definition,
                     update.alias,
                     storage,
                     txid,
@@ -69072,7 +69072,7 @@ pub(crate) fn require_rewrite_input_privileges(
             if let Some(expression) = update.where_clause {
                 read_columns |= expression_dml_target_columns(
                     expression,
-                    definition,
+                    &definition,
                     update.alias,
                     storage,
                     txid,
@@ -69081,7 +69081,7 @@ pub(crate) fn require_rewrite_input_privileges(
             }
             read_columns |= returning_dml_target_columns(
                 update.returning,
-                definition,
+                &definition,
                 update.alias,
                 storage,
                 txid,
@@ -69118,7 +69118,7 @@ pub(crate) fn require_rewrite_input_privileges(
             )?;
             let mut read_columns = returning_dml_target_columns(
                 delete.returning,
-                definition,
+                &definition,
                 delete.alias,
                 storage,
                 txid,
@@ -69127,7 +69127,7 @@ pub(crate) fn require_rewrite_input_privileges(
             if let Some(expression) = delete.where_clause {
                 read_columns |= expression_dml_target_columns(
                     expression,
-                    definition,
+                    &definition,
                     delete.alias,
                     storage,
                     txid,

@@ -2207,7 +2207,7 @@ pub(crate) fn resolve_constraint_name(
             if definition.schema.as_str() != schema {
                 continue;
             }
-            if let Some(timing) = named_constraint_timing(definition, written.name) {
+            if let Some(timing) = named_constraint_timing(&definition, written.name) {
                 found = true;
                 if !timing.is_deferrable() && mode == crate::sql::ast::ConstraintMode::Deferred {
                     return Err(sql_err!(

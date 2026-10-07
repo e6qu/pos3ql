@@ -40,7 +40,12 @@ owner, remain valid across definition changes and slot reuse, and do not borrow
 mutable storage. Pool exhaustion and stale identity reacquisition are explicit
 errors. COPY owns its reader across data messages; DDL event graphs retain
 pre-change images outside the statement arena. Live definition publication
-remains exclusive.
+remains exclusive. Live table and transaction-visible definition borrows retain
+a read guard over the relation's complete slot state. Table iteration returns
+guards, and lifecycle mutation requires exclusive storage access. Slot locks
+are included in the startup budget. Shared mutation APIs, row-version pools,
+heap access, and cross-table lock ordering still require implementation before
+worker execution.
 
 The reactor still executes statements serially. Table definitions and row
 mutation, engine-owned prepared slots and WAL publication, fixed workers, and

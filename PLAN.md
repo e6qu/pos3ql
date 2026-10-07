@@ -1,7 +1,7 @@
 # pos3ql roadmap
 
-Reviewed after PR #601 on 2026-10-07, against
-`a91caa4d5bf838fcc75edb8273094eddceeb5b07`.
+Reviewed after PR #602 on 2026-10-07, against
+`44b832030d131ca113528546eaf402ed05e69b42`.
 
 [Architecture](README.md) · [Current capabilities](docs/implemented-baseline.md) ·
 [Compatibility](docs/postgresql-18-compatibility.md) · [Contributing](CONTRIBUTING.md)
@@ -70,8 +70,14 @@ The global image capacity is table slots × query workspace slots ×
 COPY retains its owner across data messages; DDL event triggers retain their
 pre-change image without consuming statement arena space. Nested-trigger pool
 exhaustion rolls back the outer mutation and releases capacity for retry.
-Live definition publication, rows, and maintenance still require their shared
-synchronization boundary before fixed workers.
+Live table access now retains a per-slot read guard over identity, ownership,
+definition, row state, statistics, and maintenance fields. Transaction-visible
+definition reads retain that guard; table iteration cannot return an unguarded
+payload. Startup accounting includes each slot's lock. Recovery, rollback,
+publication, and slot reuse obtain mutable payloads only through exclusive
+storage access, which excludes every retained guard. This establishes the
+table access boundary; shared mutation APIs, row-version pools, heap access,
+and cross-table lock ordering remain before fixed workers.
 
 Completion evidence:
 

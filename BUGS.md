@@ -6,6 +6,12 @@ finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet these inclusion criteria.
 
+Live table and transaction-visible definition references now retain their
+relation's read guard. Identity, rows, statistics, and maintenance use one slot
+boundary; exclusive lifecycle mutation cannot coexist with retained references.
+The lock storage is charged at startup. Shared table mutation and engine
+publication remain roadmap work, not deferred defects.
+
 SQL and wire engine fixtures now charge retained reader capacity through one
 constructor,
 preserving prior workspace headroom for every configured table/workspace size.

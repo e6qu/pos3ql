@@ -1586,7 +1586,7 @@ pub(super) fn plan_modification<'a>(
                 .then(|| {
                     let definition = storage.table_def(slot, txid);
                     query::dml_index_access_plan(
-                        storage, slot, definition, alias, txid, predicate, arena,
+                        storage, slot, &definition, alias, txid, predicate, arena,
                     )
                 })
                 .transpose()?
@@ -1594,7 +1594,7 @@ pub(super) fn plan_modification<'a>(
                 .map(|plan| (plan, plan.index_name()));
             let index = index.filter(|(plan, _)| {
                 let expected_rows =
-                    plan.expected_rows(storage, slot, storage.table_def(slot, txid), txid);
+                    plan.expected_rows(storage, slot, &storage.table_def(slot, txid), txid);
                 let resident_exact = !matches!(
                     plan.method(),
                     crate::sql::ast::IndexAccessMethod::Brin
@@ -1622,7 +1622,7 @@ pub(super) fn plan_modification<'a>(
             let index_name = index.as_ref().map(|(plan, name)| {
                 (
                     name.as_str(),
-                    plan.expected_rows(storage, slot, storage.table_def(slot, txid), txid),
+                    plan.expected_rows(storage, slot, &storage.table_def(slot, txid), txid),
                     plan.method(),
                 )
             });

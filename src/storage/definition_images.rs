@@ -109,7 +109,8 @@ impl TableDefinitionImages {
                 "table definition reader belongs to different storage"
             ));
         }
-        let source = storage.table(table);
+        let definition = storage.table_def(table, transaction);
+        let source = &definition.table;
         let mut slot = self.head.get();
         while let Some(index) = slot {
             // SAFETY: this owner retains every cell in its immutable chain.
@@ -145,7 +146,6 @@ impl TableDefinitionImages {
         };
         let cell = &self.pool.cells[index];
         let target = cell.image.get().cast::<Image>();
-        let definition = storage.table_def(table, transaction);
         // SAFETY: the allocation lock gives this writer exclusive ownership
         // of the free cell. Acquire observes the previous owner's release.
         // Copy directly into the reserved slot instead of a wide stack image.
@@ -156,7 +156,7 @@ impl TableDefinitionImages {
             core::ptr::addr_of_mut!((*target).database).write(source.database);
             core::ptr::addr_of_mut!((*target).created_at).write(source.created_at);
             core::ptr::copy_nonoverlapping(
-                definition,
+                &*definition,
                 core::ptr::addr_of_mut!((*target).definition),
                 1,
             );

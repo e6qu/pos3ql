@@ -6,9 +6,9 @@
 //! phase). All capacities are fixed at startup.
 
 mod definition_images;
-mod table_slots;
 pub(crate) mod foreign;
 pub(crate) mod rowenc;
+mod table_slots;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub use table_slots::TableDefinitionRead;
@@ -17382,7 +17382,8 @@ impl Storage {
             + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
             + 2 * config.collation_scratch_bytes
             + table_slot_capacity(config)
-                * (size_of::<std::sync::RwLock<Table>>() + FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
+                * (size_of::<std::sync::RwLock<Table>>()
+                    + FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
             + table_slot_capacity(config)
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>())
@@ -19826,7 +19827,9 @@ impl Storage {
             drop(type_catalog);
 
             for source_slot in 0..self.tables.len() {
-                if self.tables.read(source_slot).database != source || !self.tables.read(source_slot).live {
+                if self.tables.read(source_slot).database != source
+                    || !self.tables.read(source_slot).live
+                {
                     continue;
                 }
                 if self.tables.read(source_slot).def.persistence == RelationPersistence::Temporary {
@@ -19885,7 +19888,9 @@ impl Storage {
                 }
                 let row_count = self.tables.read(source_slot).rows.len();
                 for position in 0..row_count {
-                    let (rowid, mut state) = self.tables.read(source_slot)
+                    let (rowid, mut state) = self
+                        .tables
+                        .read(source_slot)
                         .rows
                         .iter()
                         .nth(position)
@@ -19902,7 +19907,8 @@ impl Storage {
                     // committed image. Snapshot-retention chains belong only
                     // to transactions reading the source database.
                     state.history = CommittedHistory::empty();
-                    self.tables.get_mut(target_slot)
+                    self.tables
+                        .get_mut(target_slot)
                         .rows
                         .insert(rowid, state)
                         .map_err(|_| {
@@ -20345,7 +20351,11 @@ impl Storage {
                 let mut definition = self.policy(source_slot);
                 if definition.database != source
                     || definition.ddl_state != CatalogDdlState::Present
-                    || self.tables.read(usize::from(definition.table)).def.persistence
+                    || self
+                        .tables
+                        .read(usize::from(definition.table))
+                        .def
+                        .persistence
                         == RelationPersistence::Temporary
                 {
                     continue;
@@ -20473,7 +20483,11 @@ impl Storage {
                 let mut definition = self.extended_statistics(source_slot);
                 if definition.database != source
                     || definition.ddl_state != CatalogDdlState::Present
-                    || self.tables.read(usize::from(definition.table)).def.persistence
+                    || self
+                        .tables
+                        .read(usize::from(definition.table))
+                        .def
+                        .persistence
                         == RelationPersistence::Temporary
                 {
                     continue;
@@ -20835,7 +20849,8 @@ impl Storage {
                 {
                     continue;
                 }
-                let Some(attachment) = self.tables.read(target_slot).def.partition.attachment else {
+                let Some(attachment) = self.tables.read(target_slot).def.partition.attachment
+                else {
                     continue;
                 };
                 let source_parent = &self.tables.read(usize::from(attachment.parent)).def;
@@ -20851,11 +20866,12 @@ impl Storage {
                             "template partition parent was not cloned"
                         )
                     })?;
-                self.tables.get_mut(target_slot).def.partition.attachment = Some(PartitionAttachment {
-                    parent: target_parent as u16,
-                    bound: attachment.bound,
-                    state: attachment.state,
-                });
+                self.tables.get_mut(target_slot).def.partition.attachment =
+                    Some(PartitionAttachment {
+                        parent: target_parent as u16,
+                        bound: attachment.bound,
+                        state: attachment.state,
+                    });
             }
             self.rebind_domain_base_types_to(txid)?;
             self.rebind_user_type_declarations_to(txid)?;
@@ -21878,7 +21894,7 @@ impl Storage {
     fn ownership_mut(&mut self, object: AccessObject) -> &mut Ownership {
         let slot = object.slot as usize;
         match object.class {
-            AccessClass::Table => self.tables.get_mut(slot).ownership,
+            AccessClass::Table => &mut self.tables.get_mut(slot).ownership,
             AccessClass::View => {
                 unreachable!("view ownership is synchronized separately")
             }
@@ -28516,7 +28532,9 @@ impl Storage {
     }
 
     /// Live SQL tables with their slot indices, excluding internal storage.
-    pub fn live_tables(&self) -> impl Iterator<Item = (usize, std::sync::RwLockReadGuard<'_, Table>)> {
+    pub fn live_tables(
+        &self,
+    ) -> impl Iterator<Item = (usize, std::sync::RwLockReadGuard<'_, Table>)> {
         self.tables.iter().enumerate().filter(|(slot, table)| {
             *slot != self.large_object_page_table()
                 && table.database == current_database()
@@ -29015,7 +29033,9 @@ impl Storage {
                 commit_lsn,
             }) = verdict
                 && match overlay_mode {
-                    SpillOverlayMode::VisibleScan => self.tables.read(slot)
+                    SpillOverlayMode::VisibleScan => self
+                        .tables
+                        .read(slot)
                         .rows
                         .get(&rowid)
                         .is_none_or(Self::redundant_spilled_row_state),
@@ -30184,7 +30204,7 @@ impl Storage {
         // reltuples/relpages remain changed even if the surrounding
         // transaction rolls back. Column pg_statistic rows stay in the
         // transaction-private version written above.
-        let committed = self.tables.get_mut(table_slot).statistics;
+        let committed = &mut self.tables.get_mut(table_slot).statistics;
         committed.valid = statistics.valid;
         committed.rows = statistics.rows;
         committed.average_row_width = statistics.average_row_width;
@@ -30297,7 +30317,11 @@ impl Storage {
     }
 
     fn clear_pending_table_statistics(&mut self, table_slot: usize) {
-        let mut tail = self.tables.get_mut(table_slot).pending_statistics_tail.take();
+        let mut tail = self
+            .tables
+            .get_mut(table_slot)
+            .pending_statistics_tail
+            .take();
         while let Some(slot) = tail {
             let entry = &mut self.pending_table_statistics[slot as usize];
             tail = entry.previous;
@@ -31252,7 +31276,8 @@ impl Storage {
             };
             match image {
                 RowHeapImage::Committed => {
-                    self.tables.get_mut(table_index as usize)
+                    self.tables
+                        .get_mut(table_index as usize)
                         .rows
                         .get_mut(&rowid)
                         .expect("scratch entries come from the maps")
@@ -31307,7 +31332,9 @@ impl Storage {
         loc: Option<RowLoc>,
         track_statistics: bool,
     ) -> Result<Option<Option<RowLoc>>, SqlError> {
-        if let Some(owner) = self.tables.read(table_index)
+        if let Some(owner) = self
+            .tables
+            .read(table_index)
             .pending_def_txid
             .filter(|owner| *owner != txid)
         {
@@ -31318,7 +31345,9 @@ impl Storage {
             ));
         }
         let oldest_snapshot = self.oldest_snapshot();
-        let conflicting_owner = self.tables.read(table_index)
+        let conflicting_owner = self
+            .tables
+            .read(table_index)
             .rows
             .get(&rowid)
             .and_then(|state| self.row_locked_by_other(*state, txid));
@@ -31367,13 +31396,16 @@ impl Storage {
                     &mut self.committed_row_versions,
                     &mut self.committed_row_version_free,
                 );
-                let state = tables.get_mut(table_index)
+                let state = tables
+                    .get_mut(table_index)
                     .rows
                     .get_mut(&rowid)
                     .expect("row state was just observed");
                 prune_committed_history(versions, free, &mut state.history, oldest_snapshot);
             }
-            let state = self.tables.read(table_index)
+            let state = self
+                .tables
+                .read(table_index)
                 .rows
                 .get(&rowid)
                 .copied()
@@ -31395,7 +31427,8 @@ impl Storage {
                 &mut self.pending_row_versions,
                 &mut self.pending_row_version_free,
             );
-            let state = tables.get_mut(table_index)
+            let state = tables
+                .get_mut(table_index)
                 .rows
                 .get_mut(&rowid)
                 .expect("row state was just observed");
@@ -31446,7 +31479,9 @@ impl Storage {
         if table.rows.len() == table.rows.capacity() {
             // Entries the spill lists reproduce are droppable on demand.
             self.evict_redundant_entries(table_index);
-            if self.tables.read(table_index).rows.len() == self.tables.read(table_index).rows.capacity() {
+            if self.tables.read(table_index).rows.len()
+                == self.tables.read(table_index).rows.capacity()
+            {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "table row limit reached ({} rows in memtable)",
@@ -31468,7 +31503,8 @@ impl Storage {
                 changes_existence,
             },
         )?;
-        self.tables.get_mut(table_index)
+        self.tables
+            .get_mut(table_index)
             .rows
             .insert(
                 rowid,
@@ -31669,7 +31705,8 @@ impl Storage {
                     &mut self.pending_row_versions,
                     &mut self.pending_row_version_free,
                 );
-                let state = tables.get_mut(table_index)
+                let state = tables
+                    .get_mut(table_index)
                     .rows
                     .get_mut(&rowid)
                     .expect("row state was just observed");
@@ -32080,7 +32117,7 @@ impl Storage {
             .value_indexes
             .as_mut()
             .expect("value index pool present");
-        for &slot in &slots[..self.tables[table_index].n_enforcers] {
+        for &slot in &slots[..self.tables.read(table_index).n_enforcers] {
             pool.get_mut(slot).remove_rowid(rowid);
         }
         for &(ei, hash) in &inserts[..n_inserts] {
@@ -34102,7 +34139,8 @@ impl Storage {
     }
 
     pub(crate) fn table_slot_visible_to(&self, index: usize, txid: u32) -> bool {
-        self.tables.read(index).database == current_database() && self.tables.read(index).visible_to(txid)
+        self.tables.read(index).database == current_database()
+            && self.tables.read(index).visible_to(txid)
     }
 
     pub fn table_mut(&mut self, index: usize) -> &mut Table {
@@ -34110,7 +34148,8 @@ impl Storage {
     }
 
     pub(crate) fn table_serial_value(&self, index: usize, column: usize) -> i64 {
-        self.tables.read(index)
+        self.tables
+            .read(index)
             .serial
             .lock()
             .expect("table serial state lock poisoned")
@@ -34118,7 +34157,8 @@ impl Storage {
     }
 
     pub(crate) fn table_serial_values(&self, index: usize) -> [i64; MAX_COLUMNS] {
-        self.tables.read(index)
+        self.tables
+            .read(index)
             .serial
             .lock()
             .expect("table serial state lock poisoned")
@@ -34126,7 +34166,8 @@ impl Storage {
     }
 
     pub(crate) fn set_table_serial_value(&self, index: usize, column: usize, value: i64) {
-        self.tables.read(index)
+        self.tables
+            .read(index)
             .serial
             .lock()
             .expect("table serial state lock poisoned")
@@ -34151,7 +34192,8 @@ impl Storage {
                 ));
             }
         };
-        let mut serial = self.tables.read(index)
+        let table = self.tables.read(index);
+        let mut serial = table
             .serial
             .lock()
             .expect("table serial state lock poisoned");
@@ -34170,7 +34212,8 @@ impl Storage {
         index: usize,
         txid: u32,
     ) -> Option<[i64; MAX_COLUMNS]> {
-        let mut serial = self.tables.read(index)
+        let table = self.tables.read(index);
+        let mut serial = table
             .serial
             .lock()
             .expect("table serial state lock poisoned");
@@ -34182,7 +34225,8 @@ impl Storage {
     }
 
     pub(crate) fn acknowledge_table_serial_values(&self, index: usize, txid: u32) {
-        let mut serial = self.tables.read(index)
+        let table = self.tables.read(index);
+        let mut serial = table
             .serial
             .lock()
             .expect("table serial state lock poisoned");
@@ -34206,7 +34250,9 @@ impl Storage {
                 column
             ));
         }
-        let serial = self.tables.get_mut(index)
+        let serial = self
+            .tables
+            .get_mut(index)
             .serial
             .get_mut()
             .expect("table serial state lock poisoned");
@@ -34216,7 +34262,9 @@ impl Storage {
     }
 
     pub(crate) fn install_table_serial_values(&mut self, index: usize, values: [i64; MAX_COLUMNS]) {
-        *self.tables.get_mut(index)
+        *self
+            .tables
+            .get_mut(index)
             .serial
             .get_mut()
             .expect("table serial state lock poisoned") = TableSerialState {
@@ -34227,7 +34275,8 @@ impl Storage {
 
     pub fn table_def(&self, index: usize, txid: u32) -> TableDefinitionRead<'_> {
         let table = self.tables.read(index);
-        let pending = table.pending_def_tail
+        let pending = table
+            .pending_def_tail
             .map(|slot| &self.pending_table_defs[slot as usize].version)
             .filter(|pending| pending.txid == txid);
         TableDefinitionRead { table, pending }
@@ -34793,7 +34842,10 @@ impl Storage {
     /// Committed drop (journal replay): rows are retained; the slot is freed at
     /// checkpoint.
     pub fn drop_table(&mut self, index: usize) {
-        let (schema, name) = (self.tables.read(index).def.schema, self.tables.read(index).def.name);
+        let (schema, name) = (
+            self.tables.read(index).def.schema,
+            self.tables.read(index).def.name,
+        );
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
@@ -34834,7 +34886,10 @@ impl Storage {
     /// Applies a committed DROP: the table leaves the image and its rows are
     /// reclaimed.
     pub fn commit_drop(&mut self, index: usize) {
-        let (schema, name) = (self.tables.read(index).def.schema, self.tables.read(index).def.name);
+        let (schema, name) = (
+            self.tables.read(index).def.schema,
+            self.tables.read(index).def.name,
+        );
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
@@ -37241,7 +37296,10 @@ impl Storage {
     }
 
     pub fn commit_matview_drop(&mut self, slot: usize) {
-        let definition = self.tables.read(usize::from(self.matview(slot).backing_table)).def;
+        let definition = self
+            .tables
+            .read(usize::from(self.matview(slot).backing_table))
+            .def;
         let (schema, name) = (definition.schema, definition.name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.matview_catalog()[slot] = MatviewDef::EMPTY;
@@ -46470,9 +46528,12 @@ impl Storage {
         table: &'a str,
         txid: u32,
     ) -> impl Iterator<Item = IndexDef> + 'a {
-        let committed_binding = self
-            .find_visible(schema, table, txid)
-            .map(|slot| (self.tables.read(slot).def.schema, self.tables.read(slot).def.name));
+        let committed_binding = self.find_visible(schema, table, txid).map(|slot| {
+            (
+                self.tables.read(slot).def.schema,
+                self.tables.read(slot).def.name,
+            )
+        });
         self.matching_indexes(move |x| {
             x.database == current_database()
                 && x.visible_to(txid)
@@ -47362,7 +47423,7 @@ impl Storage {
     /// (DROP SCHEMA CASCADE severing an inbound reference), returning it for
     /// transactional undo.
     pub fn drop_fk(&mut self, index: usize, fk_name: &str) -> Option<ForeignKey> {
-        let def = self.tables.get_mut(index).def;
+        let def = &mut self.tables.get_mut(index).def;
         let at = (0..def.n_fkeys).find(|&f| def.fkeys[f].name.as_str() == fk_name)?;
         let removed = def.fkeys[at];
         for f in at..def.n_fkeys - 1 {
@@ -50571,7 +50632,9 @@ impl Storage {
 
     pub(crate) fn rollback_rule_create(&mut self, slot: usize, prior_table_rule_txid: Option<u32>) {
         if let RuleTarget::Table(table) = self.rule(slot).definition.target {
-            self.tables.get_mut(usize::from(table)).pending_has_rules_txid = prior_table_rule_txid;
+            self.tables
+                .get_mut(usize::from(table))
+                .pending_has_rules_txid = prior_table_rule_txid;
         }
         let mut catalog = self.view_rule_catalog();
         let _ = catalog.rules[slot].ddl_state.rollback_create();
@@ -50582,13 +50645,15 @@ impl Storage {
         let RuleTarget::Table(table) = target else {
             return None;
         };
-        self.tables.read(usize::from(table))
+        self.tables
+            .read(usize::from(table))
             .pending_has_rules_txid
             .replace(txid)
     }
 
     pub(crate) fn table_has_rules(&self, table: usize, txid: u32) -> bool {
-        self.tables.read(table).def.has_rules || self.tables.read(table).pending_has_rules_txid == Some(txid)
+        self.tables.read(table).def.has_rules
+            || self.tables.read(table).pending_has_rules_txid == Some(txid)
     }
 
     pub(crate) fn commit_rule_alter(&mut self, slot: usize, txid: u32) {
@@ -52823,6 +52888,120 @@ mod tests {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
     }
 
+    #[test]
+    fn table_state_guards_protect_identity_definition_and_rows_together() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TableSlots>();
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("guarded_even", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        let names = [SqlName::parse("guarded_even").unwrap(), SqlName::parse("guarded_odd").unwrap()];
+        {
+            let table = storage.tables.get_mut(table);
+            table.created_at = 0;
+            table.generation = 0;
+            table.rows.insert(1, RowState::committed_only_at(RowLoc { offset: 0, len: 4 }, 0)).unwrap();
+        }
+        let slots = &storage.tables;
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        for _ in 0..1000 {
+                            let image = slots.read(table);
+                            assert_eq!(image.created_at, image.generation);
+                            assert_eq!(image.def.name, names[(image.generation & 1) as usize]);
+                            assert_eq!(image.rows.get(&1).unwrap().committed_lsn, image.generation);
+                        }
+                    });
+                });
+            }
+            start.wait();
+            crate::mem::guard::forbid_alloc(|| {
+                for generation in 1..=500 {
+                    let mut image = slots.write(table);
+                    image.created_at = generation;
+                    image.def.name = names[(generation & 1) as usize];
+                    image.rows.get_mut(&1).unwrap().committed_lsn = generation;
+                    image.generation = generation;
+                }
+            });
+        });
+        assert_eq!(storage.table(table).generation, 500);
+    }
+
+    #[test]
+    fn table_state_definition_guards_exclude_writers_only_for_their_slot() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let first = storage.create_table(make_def("guarded_first", &[])).unwrap();
+        let second = storage.create_table(make_def("guarded_second", &[])).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let definition = storage.table_def(first, 0);
+            let same_slot = storage.table(first);
+            assert_eq!(definition.name, same_slot.def.name);
+            assert!(storage.tables.try_write(first).is_none());
+            assert!(storage.tables.try_write(second).is_some());
+            drop(definition);
+            assert!(storage.tables.try_write(first).is_none());
+            drop(same_slot);
+            assert!(storage.tables.try_write(first).is_some());
+        });
+    }
+
+    #[test]
+    fn table_state_pending_definition_guards_preserve_transaction_visibility() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("guarded_original", &[])).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut pending = *storage.table_def(table, 17);
+            pending.name = SqlName::parse("guarded_pending").unwrap();
+            storage.write_table_def(table, 17, pending, &[None; MAX_COLUMNS], false).unwrap();
+            {
+                let owner = storage.table_def(table, 17);
+                let other = storage.table_def(table, 19);
+                assert_eq!(owner.name.as_str(), "guarded_pending");
+                assert_eq!(other.name.as_str(), "guarded_original");
+                assert!(storage.tables.try_write(table).is_none());
+            }
+            storage.rollback_table_def(table, 17);
+            assert_eq!(storage.table_def(table, 17).name.as_str(), "guarded_original");
+            storage.write_table_def(table, 17, pending, &[None; MAX_COLUMNS], false).unwrap();
+            storage.commit_table_def(table, 17);
+            assert_eq!(storage.table_def(table, 19).name.as_str(), "guarded_pending");
+        });
+    }
+
+    #[test]
+    fn table_state_slot_lock_storage_is_charged_at_startup() {
+        let config = test_config();
+        let bytes = config.memtable_bytes + Storage::extra_budget_bytes(&config);
+        let mut budget = Budget::new(bytes);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        assert_eq!(storage.tables.len(), table_slot_capacity(&config));
+        // Collation initialization owns the only remaining startup draw.
+        assert_eq!(budget.remaining(), 2 * config.collation_scratch_bytes);
+        let slot_bytes = 2 * size_of::<std::sync::RwLock<Table>>();
+        let mut exact = Budget::new(slot_bytes);
+        let slots = TableSlots::new(&mut exact, 2).unwrap();
+        assert_eq!(slots.len(), 0);
+        assert_eq!(exact.remaining(), 0);
+        let error = match TableSlots::new(&mut Budget::new(slot_bytes - 1), 2) {
+            Ok(_) => panic!("table state allocation accepted an undersized budget"),
+            Err(error) => error,
+        };
+        assert_eq!(error.what, "tables");
+    }
+
     fn test_view_definition(dependencies: StoredQueryDependencies) -> ViewDefinition {
         ViewDefinition {
             persistence: RelationPersistence::Permanent,
@@ -52983,7 +53162,11 @@ mod tests {
         rejected.columns[0].unique = true;
         rejected.columns[1].unique = true;
         crate::mem::guard::forbid_alloc(|| {
-            let slot = storage.tables.iter().position(|table| table.is_free()).unwrap();
+            let slot = storage
+                .tables
+                .iter()
+                .position(|table| table.is_free())
+                .unwrap();
             for owner in [None, Some(7)] {
                 let result = match owner {
                     None => storage.create_table(rejected),
@@ -58794,7 +58977,9 @@ mod tests {
         storage.clear_dirty_through(&[captured]);
         assert!(storage.table(slot).dirty);
         assert_eq!(
-            storage.tables.read(slot)
+            storage
+                .tables
+                .read(slot)
                 .rows
                 .get(&1)
                 .unwrap()
@@ -58805,7 +58990,9 @@ mod tests {
         storage.clear_dirty_through(&[current]);
         assert!(!storage.table(slot).dirty);
         assert_eq!(
-            storage.tables.read(slot)
+            storage
+                .tables
+                .read(slot)
                 .rows
                 .get(&1)
                 .unwrap()

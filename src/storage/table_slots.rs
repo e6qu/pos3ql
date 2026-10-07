@@ -54,6 +54,20 @@ impl TableSlots {
             .iter_mut()
             .map(|slot| slot.get_mut().expect("table state lock poisoned"))
     }
+
+    #[cfg(test)]
+    pub(super) fn write(&self, index: usize) -> std::sync::RwLockWriteGuard<'_, Table> {
+        self.slots[index].write().expect("table state lock poisoned")
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_write(&self, index: usize) -> Option<std::sync::RwLockWriteGuard<'_, Table>> {
+        match self.slots[index].try_write() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("table state lock poisoned"),
+        }
+    }
 }
 
 /// A live definition borrow retains the relation guard. Pending versions

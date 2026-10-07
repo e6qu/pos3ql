@@ -1,0 +1,165 @@
+name: UUID query validation
+on:
+  push:
+    branches: [codex/row-version-ownership]
+concurrency:
+  group: uuid-query-validation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  differential:
+    name: differential (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # Hard ceiling on every CI job: 15 minutes. The cap guarantees a
+    # pathological query can never wedge CI.
+    timeout-minutes: 15
+
+    strategy:
+      # Report every shard's result rather than cancelling siblings on the
+      # first failure — a divergence in one shard should not hide others.
+      fail-fast: false
+      matrix:
+        include:
+          - shard: auxiliary-pg-regress-e
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "1"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+            auxiliary_phase: pg_regress
+            pg_regress_shard: "7"
+            pg_regress_shards: "8"
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          # Match pos3ql: C/byte collation so ordering/min/max agree, and UTF8
+          # server encoding (vanilla PostgreSQL's real-world default, and what
+          # pos3ql advertises) so text columns decode to str, not raw bytes.
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Enable PostgreSQL prepared transactions
+        if: matrix.run_fast == '1'
+        run: |
+          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          test -n "$postgres_container"
+          docker exec "$postgres_container" psql -U postgres -X -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET max_prepared_transactions = 8"
+          docker restart "$postgres_container"
+          for _ in $(seq 1 50); do
+            pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+
+      - name: Install SQL extension oracle fixtures
+        if: matrix.run_fast == '1'
+        run: |
+          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          test -n "$postgres_container"
+          docker exec "$postgres_container" mkdir -p /tmp/pos3ql-extensions
+          docker cp tests/external/extensions/. "$postgres_container":/tmp/pos3ql-extensions/
+
+      - name: Expose PostgreSQL 18 dump tools from the service image
+        run: |
+          mkdir -p .ci-bin
+          for client in pg_dump pg_restore; do
+            printf '%s\n' '#!/bin/sh' "exec docker run --rm --network host -v \"\$PWD:\$PWD\" -w \"\$PWD\" -v /tmp:/tmp postgres:18 $client \"\$@\"" > ".ci-bin/$client"
+          done
+          chmod +x .ci-bin/pg_dump .ci-bin/pg_restore
+          echo "${{ github.workspace }}/.ci-bin" >> "$GITHUB_PATH"
+
+      - name: Cache Rust build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # `target` is cached by dependency lockfile, not source revision. Keep
+      # dependencies warm but rebuild this checkout's crate every time.
+      - name: Rebuild checked-out crate
+        run: cargo clean -p pos3ql
+
+      - name: Install stack sampler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+
+      - name: Differential conformance (corpora + fuzzer vs real PostgreSQL)
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          P3_PORT: "15599"
+          # Replay the whole vendored sqllogictest corpus (~11k blocks): each of
+          # the eight slt shards runs all files and all statements but one
+          # eighth of the query blocks, so even one pathologically slow file
+          # (select4's joins) is balanced under the cap. SLT_LIMIT is the
+          # per-file block cap (all).
+          SLT_LIMIT: "50000"
+          SLT_QUERY_SHARDS: "8"
+          SLT_QUERY_SHARD: ${{ matrix.query_shard }}
+          # Unsupported SQL is a measured compatibility debt, not a green
+          # escape hatch. Wide range tables now execute too, so no shard may
+          # classify any block as unsupported.
+          SLT_UNSUPPORTED_BUDGET: "0"
+          RUN_FAST: ${{ matrix.run_fast }}
+          RUN_CORE: ${{ matrix.run_core }}
+          RUN_CORPUS: ${{ matrix.run_corpus }}
+          RUN_AUX: ${{ matrix.run_aux }}
+          AUXILIARY_PHASE: ${{ matrix.auxiliary_phase }}
+          POSTGRES_REGRESS_SHARD: ${{ matrix.pg_regress_shard || '0' }}
+          POSTGRES_REGRESS_SHARDS: ${{ matrix.pg_regress_shards || '4' }}
+          RUN_SLT: ${{ matrix.run_slt }}
+          RUN_FUZZ: ${{ matrix.run_fuzz }}
+          FAST_CORPUS_SHARDS: "4"
+          FAST_CORPUS_SHARD: ${{ matrix.corpus_shard }}
+          FAST_CORPUS_ONLY: ${{ matrix.corpus_only }}
+          FAST_CORPUS_EXCLUDE: ${{ matrix.corpus_exclude }}
+          # The fuzz shards cover disjoint slices of the same 10k-statement
+          # seeded sequence. Ignored on the other shards (RUN_FUZZ=0).
+          FUZZ_START: ${{ matrix.fuzz_start }}
+          FUZZ_COUNT: ${{ matrix.fuzz_count }}
+          FUZZ_SEED: "3"
+          # Generated PostgreSQL-valid statements must execute, not be silently
+          # classified as unsupported by the differential harness.
+          FUZZ_UNSUPPORTED_BUDGET: "0"
+          # Ratchet budget: allowed fuzz divergences before failing (see BUGS.md
+          # A ceiling, not an exact target — the residual divergences are
+          # PostgreSQL-implementation-specific (unspecified within-row operand
+          # order, plan-dependent projection placement). Ratchet toward zero.
+          FUZZ_BUDGET: "0"
+          POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
+          POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
+        run: |
+          PATH="${{ github.workspace }}/.ci-bin:$PATH" bash tests/external/ci_diff.sh &
+          regression=$!
+          for sample in $(seq 1 8); do
+            sleep 60
+            if ! kill -0 "$regression" 2>/dev/null; then
+              break
+            fi
+            server=$(pgrep -n -x pos3ql || true)
+            if test -n "$server"; then
+              echo "=== UUID server stack sample $sample ==="
+              sudo gdb --batch --quiet -p "$server" -ex 'thread apply all bt 18' || true
+            fi
+          done
+          wait "$regression"

@@ -1448,7 +1448,7 @@ if want diff; then
 
 step "differential vs real PostgreSQL 18 (when installed)"
 if [[ -n "${POS3QL_REFERENCE_PG_HOST:-}" || -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
-  if tests/external/differential.sh > "$WORK/differential.out" 2>&1; then
+  if (set -o pipefail; tests/external/differential.sh 2>&1 | tee "$WORK/differential.out"); then
     ok "differential suite ($(grep -c '^PASS' "$WORK/differential.out") corpora)"
   else
     bad "differential suite"

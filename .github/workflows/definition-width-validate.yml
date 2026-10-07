@@ -31,6 +31,6 @@ jobs:
           key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - run: cargo clean -p pos3ql
-      - run: cargo test --lib --locked --no-run
+      - run: cargo test --lib --release --locked --no-run
       - name: Run isolated wide routine and cursor regression
-        run: /usr/bin/time -v timeout 360s cargo test --lib --locked remaining_execution_widths_are_allocation_free_and_survive_cold_recovery -- --nocapture --test-threads=1
+        run: /usr/bin/time -v timeout 360s cargo test --lib --release --locked remaining_execution_widths_are_allocation_free_and_survive_cold_recovery -- --nocapture --test-threads=1

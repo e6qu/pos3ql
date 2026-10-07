@@ -40,7 +40,9 @@ owner, remain valid across definition changes and slot reuse, and do not borrow
 mutable storage. Pool exhaustion and stale identity reacquisition are explicit
 errors. COPY owns its reader across data messages; DDL event graphs retain
 pre-change images outside the statement arena. Live definition publication
-remains exclusive.
+remains exclusive. Routine lookup filters transaction-visible identity
+and kind under the catalog guard before copying candidate payloads, releasing
+the guard before nested overload and type resolution.
 
 Relation row maps have a per-table read boundary. Point reads return copied
 row-state images; scans and checkpoint batches retain a coherent map guard.

@@ -7385,7 +7385,11 @@ impl Iterator for RoutineIter<'_> {
             // Check compact metadata before copying the bounded body and
             // argument arrays. Release the guard before overload resolution
             // calls back into other catalogs.
-            if self.lookup.as_ref().is_none_or(|lookup| lookup.matches(definition)) {
+            if self
+                .lookup
+                .as_ref()
+                .is_none_or(|lookup| lookup.matches(definition))
+            {
                 return Some((slot, *definition));
             }
         }
@@ -22038,7 +22042,7 @@ impl Storage {
             AccessClass::Routine => RoutineIter {
                 catalog: &self.routines,
                 next_slot: 0,
-            lookup: None,
+                lookup: None,
             }
             .find_map(|(slot, routine)| {
                 (routine.database == current_database()
@@ -22379,7 +22383,7 @@ impl Storage {
                 RoutineIter {
                     catalog: &self.routines,
                     next_slot: 0,
-            lookup: None,
+                    lookup: None,
                 }
                 .find_map(|(slot, candidate)| {
                     (candidate.database == target_database && candidate.created_at == created_at)
@@ -41485,46 +41489,48 @@ impl Storage {
         kind: RoutineCallKind,
     ) -> Option<usize> {
         let resolve = |schema: &str, routine_name: &str| {
-            let mut candidates = self.routine_candidates(schema, routine_name, txid, kind).filter_map(|(slot, routine)| {
-                let definition = routine.definition_for(txid);
-                if routine.database != current_database()
-                    || !routine.visible_to(txid)
-                    || !kind.accepts(definition.kind)
-                    || definition.schema_for(txid).as_str() != schema
-                    || definition.name_for(txid).as_str() != routine_name
-                {
-                    return None;
-                }
-                let variadic_index = definition.arguments().len().checked_sub(1)?;
-                let variadic_parameter = definition.parameter_for_input(variadic_index)?;
-                let RoutineParameterMode::Variadic { .. } = variadic_parameter.mode else {
-                    return None;
-                };
-                let ColType::Array(element) = variadic_parameter.ctype else {
-                    return None;
-                };
-                let fixed = &definition.arguments()[..variadic_index];
-                if argument_type_oids.len() < fixed.len() + usize::from(!explicit_variadic)
-                    || explicit_variadic && argument_type_oids.len() != fixed.len() + 1
-                    || !fixed.iter().zip(argument_type_oids).all(|(argument, oid)| {
-                        self.routine_argument_oid(argument, txid)
-                            .is_some_and(|expected| {
-                                self.routine_implicit_cast(*oid, expected, txid)
-                            })
-                    })
-                {
-                    return None;
-                }
-                let expected = if explicit_variadic {
-                    self.routine_argument_oid(&definition.arguments()[variadic_index], txid)?
-                } else {
-                    element.element_oid()
-                };
-                argument_type_oids[variadic_index..]
-                    .iter()
-                    .all(|oid| self.routine_implicit_cast(*oid, expected, txid))
-                    .then_some(slot)
-            });
+            let mut candidates = self
+                .routine_candidates(schema, routine_name, txid, kind)
+                .filter_map(|(slot, routine)| {
+                    let definition = routine.definition_for(txid);
+                    if routine.database != current_database()
+                        || !routine.visible_to(txid)
+                        || !kind.accepts(definition.kind)
+                        || definition.schema_for(txid).as_str() != schema
+                        || definition.name_for(txid).as_str() != routine_name
+                    {
+                        return None;
+                    }
+                    let variadic_index = definition.arguments().len().checked_sub(1)?;
+                    let variadic_parameter = definition.parameter_for_input(variadic_index)?;
+                    let RoutineParameterMode::Variadic { .. } = variadic_parameter.mode else {
+                        return None;
+                    };
+                    let ColType::Array(element) = variadic_parameter.ctype else {
+                        return None;
+                    };
+                    let fixed = &definition.arguments()[..variadic_index];
+                    if argument_type_oids.len() < fixed.len() + usize::from(!explicit_variadic)
+                        || explicit_variadic && argument_type_oids.len() != fixed.len() + 1
+                        || !fixed.iter().zip(argument_type_oids).all(|(argument, oid)| {
+                            self.routine_argument_oid(argument, txid)
+                                .is_some_and(|expected| {
+                                    self.routine_implicit_cast(*oid, expected, txid)
+                                })
+                        })
+                    {
+                        return None;
+                    }
+                    let expected = if explicit_variadic {
+                        self.routine_argument_oid(&definition.arguments()[variadic_index], txid)?
+                    } else {
+                        element.element_oid()
+                    };
+                    argument_type_oids[variadic_index..]
+                        .iter()
+                        .all(|oid| self.routine_implicit_cast(*oid, expected, txid))
+                        .then_some(slot)
+                });
             let first = candidates.next();
             if first.is_some() && candidates.next().is_none() {
                 first
@@ -42316,20 +42322,21 @@ impl Storage {
         txid: u32,
         kind: RoutineCallKind,
     ) -> Option<usize> {
-        self.routine_candidates(schema, name, txid, kind).find_map(|(slot, routine)| {
-            let definition = routine.definition_for(txid);
-            (routine.database == current_database()
-                && routine.visible_to(txid)
-                && kind.accepts(definition.kind)
-                && definition.schema_for(txid).as_str() == schema
-                && definition.name_for(txid).as_str() == name
-                && definition.accepts_input_arity(argument_types.len())
-                && definition.arguments()[..argument_types.len()]
-                    .iter()
-                    .zip(argument_types)
-                    .all(|(parameter, value)| parameter.ctype == *value))
-            .then_some(slot)
-        })
+        self.routine_candidates(schema, name, txid, kind)
+            .find_map(|(slot, routine)| {
+                let definition = routine.definition_for(txid);
+                (routine.database == current_database()
+                    && routine.visible_to(txid)
+                    && kind.accepts(definition.kind)
+                    && definition.schema_for(txid).as_str() == schema
+                    && definition.name_for(txid).as_str() == name
+                    && definition.accepts_input_arity(argument_types.len())
+                    && definition.arguments()[..argument_types.len()]
+                        .iter()
+                        .zip(argument_types)
+                        .all(|(parameter, value)| parameter.ctype == *value))
+                .then_some(slot)
+            })
     }
 
     fn routine_slot_in_oids(
@@ -42341,63 +42348,70 @@ impl Storage {
         kind: RoutineCallKind,
     ) -> Option<usize> {
         let exact =
-            self.routine_candidates(schema, name, txid, kind).find_map(|(slot, routine)| {
+            self.routine_candidates(schema, name, txid, kind)
+                .find_map(|(slot, routine)| {
+                    let definition = routine.definition_for(txid);
+                    (routine.database == current_database()
+                        && routine.visible_to(txid)
+                        && kind.accepts(definition.kind)
+                        && definition.schema_for(txid).as_str() == schema
+                        && definition.name_for(txid).as_str() == name
+                        && definition.argument_count == argument_type_oids.len()
+                        && definition.arguments().iter().zip(argument_type_oids).all(
+                            |(argument, oid)| {
+                                self.routine_argument_oid(argument, txid) == Some(*oid)
+                            },
+                        ))
+                    .then_some(slot)
+                });
+        if exact.is_some() {
+            return exact;
+        }
+        let concrete = self
+            .routine_candidates(schema, name, txid, kind)
+            .filter_map(|(slot, routine)| {
                 let definition = routine.definition_for(txid);
                 (routine.database == current_database()
                     && routine.visible_to(txid)
                     && kind.accepts(definition.kind)
                     && definition.schema_for(txid).as_str() == schema
                     && definition.name_for(txid).as_str() == name
-                    && definition.argument_count == argument_type_oids.len()
-                    && definition.arguments().iter().zip(argument_type_oids).all(
-                        |(argument, oid)| self.routine_argument_oid(argument, txid) == Some(*oid),
-                    ))
+                    && definition.accepts_input_arity(argument_type_oids.len())
+                    && definition.arguments()[..argument_type_oids.len()]
+                        .iter()
+                        .zip(argument_type_oids)
+                        .all(|(argument, oid)| {
+                            self.routine_argument_oid(argument, txid)
+                                .is_some_and(|expected| {
+                                    self.routine_implicit_cast(*oid, expected, txid)
+                                })
+                        }))
                 .then_some(slot)
             });
-        if exact.is_some() {
-            return exact;
-        }
-        let concrete = self.routine_candidates(schema, name, txid, kind).filter_map(|(slot, routine)| {
-            let definition = routine.definition_for(txid);
-            (routine.database == current_database()
-                && routine.visible_to(txid)
-                && kind.accepts(definition.kind)
-                && definition.schema_for(txid).as_str() == schema
-                && definition.name_for(txid).as_str() == name
-                && definition.accepts_input_arity(argument_type_oids.len())
-                && definition.arguments()[..argument_type_oids.len()]
-                    .iter()
-                    .zip(argument_type_oids)
-                    .all(|(argument, oid)| {
-                        self.routine_argument_oid(argument, txid)
-                            .is_some_and(|expected| {
-                                self.routine_implicit_cast(*oid, expected, txid)
-                            })
-                    }))
-            .then_some(slot)
-        });
         let mut concrete = concrete;
         let first = concrete.next();
         if first.is_some() && concrete.next().is_none() {
             return first;
         }
-        let polymorphic = self.routine_candidates(schema, name, txid, kind).filter_map(|(slot, routine)| {
-            let definition = routine.definition_for(txid);
-            (routine.database == current_database()
-                && routine.visible_to(txid)
-                && kind.accepts(definition.kind)
-                && definition.schema_for(txid).as_str() == schema
-                && definition.name_for(txid).as_str() == name
-                && definition.accepts_input_arity(argument_type_oids.len())
-                && self
-                    .polymorphic_call_binding(
-                        &definition.arguments()[..argument_type_oids.len()],
-                        argument_type_oids,
-                        txid,
-                    )
-                    .is_some())
-            .then_some(slot)
-        });
+        let polymorphic = self
+            .routine_candidates(schema, name, txid, kind)
+            .filter_map(|(slot, routine)| {
+                let definition = routine.definition_for(txid);
+                (routine.database == current_database()
+                    && routine.visible_to(txid)
+                    && kind.accepts(definition.kind)
+                    && definition.schema_for(txid).as_str() == schema
+                    && definition.name_for(txid).as_str() == name
+                    && definition.accepts_input_arity(argument_type_oids.len())
+                    && self
+                        .polymorphic_call_binding(
+                            &definition.arguments()[..argument_type_oids.len()],
+                            argument_type_oids,
+                            txid,
+                        )
+                        .is_some())
+                .then_some(slot)
+            });
         let mut polymorphic = polymorphic;
         let first = polymorphic.next();
         if first.is_some() && polymorphic.next().is_none() {
@@ -42454,9 +42468,11 @@ impl Storage {
             polymorphic == saw_polymorphic
         };
         for (implicit, polymorphic) in [(false, false), (true, false), (true, true)] {
-            let mut candidates = self.routine_candidates(schema, name, txid, call_kind).filter_map(|(slot, routine)| {
-                matches(&routine, implicit, polymorphic).then_some(slot)
-            });
+            let mut candidates = self
+                .routine_candidates(schema, name, txid, call_kind)
+                .filter_map(|(slot, routine)| {
+                    matches(&routine, implicit, polymorphic).then_some(slot)
+                });
             let first = candidates.next();
             if first.is_some() && candidates.next().is_none() {
                 return first;
@@ -55680,10 +55696,30 @@ mod tests {
             assert_eq!(slots("renamed", 0, RoutineCallKind::Scalar), None);
             assert_eq!(slots("probe", 0, RoutineCallKind::Procedure), None);
             assert_eq!(slots("absent", 0, RoutineCallKind::Scalar), None);
-            assert_eq!(storage.routine_slot_in("public", "renamed", &[], 7, RoutineCallKind::Scalar), Some(1));
-            assert_eq!(storage.routine_slot_in_oids("public", "renamed", &[], 7, RoutineCallKind::Scalar), Some(1));
-            assert_eq!(storage.routine_slot_in_named_oids("public", "renamed", &[], &[], 7, RoutineCallKind::Scalar), Some(1));
-            let retained = storage.routine_candidates("public", "renamed", 7, RoutineCallKind::Scalar).next().unwrap().1;
+            assert_eq!(
+                storage.routine_slot_in("public", "renamed", &[], 7, RoutineCallKind::Scalar),
+                Some(1)
+            );
+            assert_eq!(
+                storage.routine_slot_in_oids("public", "renamed", &[], 7, RoutineCallKind::Scalar),
+                Some(1)
+            );
+            assert_eq!(
+                storage.routine_slot_in_named_oids(
+                    "public",
+                    "renamed",
+                    &[],
+                    &[],
+                    7,
+                    RoutineCallKind::Scalar
+                ),
+                Some(1)
+            );
+            let retained = storage
+                .routine_candidates("public", "renamed", 7, RoutineCallKind::Scalar)
+                .next()
+                .unwrap()
+                .1;
             storage.routines.lock().unwrap()[1].ddl_state = CatalogDdlState::Absent;
             assert!(retained.visible_to(7));
             assert_eq!(retained.name_for(7).as_str(), "renamed");

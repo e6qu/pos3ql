@@ -99,6 +99,9 @@ routine payloads before candidate filtering. Routine lookup now filters compact
 transaction-visible identity and kind under the catalog guard before copying
 candidates, then releases the guard before nested overload/catalog resolution.
 The complete upstream probe remains the PostgreSQL and deadline regression.
+[Stack sampling](https://github.com/e6qu/pos3ql/actions/runs/37693402941)
+identified the copy path; [focused validation](https://github.com/e6qu/pos3ql/actions/runs/37695506990)
+passed the full probe with zero mismatches after filtering candidates.
 
 Completion evidence:
 

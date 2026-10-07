@@ -4650,7 +4650,7 @@ where
     let mut existing = [Datum::Null; MAX_COLUMNS];
     let mut new_values = [Datum::Null; MAX_COLUMNS];
     {
-        let state = *storage
+        let state = storage
             .table(table_index)
             .rows
             .get(&rowid)

@@ -6,6 +6,12 @@ finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet these inclusion criteria.
 
+Row maps now return detached row-state images from shared lookups and guarded
+iteration. Recovery, rollback, cloning, and slot reuse use the same map access
+boundary. Locks are charged at startup; capacity failure preserves retained
+rows. Query-scope definition ownership and shared row publication remain
+explicit roadmap work. This change introduces no deferred defect.
+
 SQL and wire engine fixtures now charge retained reader capacity through one
 constructor,
 preserving prior workspace headroom for every configured table/workspace size.

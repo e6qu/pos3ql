@@ -6,8 +6,8 @@
 //! phase). All capacities are fixed at startup.
 
 mod definition_images;
-mod row_map;
 pub(crate) mod foreign;
+mod row_map;
 pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
@@ -28546,7 +28546,7 @@ impl Storage {
             let mut max = [0i64; MAX_COLUMNS];
             let mut rowids: Vec<(u64, RowHome)> = Vec::new();
             for (rowid, state) in self.tables[i].rows.iter() {
-                if let Some(home) = self.resident_visible_to(*state, 0) {
+                if let Some(home) = self.resident_visible_to(state, 0) {
                     rowids.push((rowid, home));
                 }
             }
@@ -29016,7 +29016,7 @@ impl Storage {
                     SpillOverlayMode::VisibleScan => self.tables[slot]
                         .rows
                         .get(&rowid)
-                        .is_none_or(Self::redundant_spilled_row_state),
+                        .is_none_or(|state| Self::redundant_spilled_row_state(&state)),
                     SpillOverlayMode::CommittedCheckpoint => {
                         self.tables[slot].rows.get(&rowid).is_none_or(|state| {
                             matches!(
@@ -29674,7 +29674,7 @@ impl Storage {
         each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
         for (rowid, state) in self.tables[table_slot].rows.iter() {
-            if each(rowid, *state)?.is_break() {
+            if each(rowid, state)?.is_break() {
                 return Ok(core::ops::ControlFlow::Break(()));
             }
         }
@@ -29690,7 +29690,7 @@ impl Storage {
             if Self::redundant_spilled_row_state(&state) {
                 continue;
             }
-            if each(rowid, *state)?.is_break() {
+            if each(rowid, state)?.is_break() {
                 return Ok(core::ops::ControlFlow::Break(()));
             }
         }
@@ -31319,7 +31319,7 @@ impl Storage {
         let conflicting_owner = self.tables[table_index]
             .rows
             .get(&rowid)
-            .and_then(|state| self.row_locked_by_other(*state, txid));
+            .and_then(|state| self.row_locked_by_other(state, txid));
         if let Some(owner) = conflicting_owner {
             self.wait_for_transaction(txid, owner)?;
             return Err(sql_err!(
@@ -31328,7 +31328,7 @@ impl Storage {
             ));
         }
         let existed = match self.tables[table_index].rows.get(&rowid) {
-            Some(state) => self.resident_visible_to(*state, txid).is_some(),
+            Some(state) => self.resident_visible_to(state, txid).is_some(),
             None => self
                 .spill_probe_at(table_index, rowid, u64::MAX)?
                 .is_some_and(|version| version.len.is_some()),
@@ -31802,10 +31802,7 @@ impl Storage {
             clear_pending_versions(pending_versions, pending_free, &mut state.pending);
         }
         let table = &mut self.tables[table_index];
-        let state = table
-            .rows
-            .get(&rowid)
-            .expect("row present after commit");
+        let state = table.rows.get(&rowid).expect("row present after commit");
         if state.committed.is_none() {
             // A rowid that ever reached an SST — even if its latest version was
             // heap-resident — must tombstone, or a cold start resurrects the
@@ -31863,10 +31860,7 @@ impl Storage {
             clear_pending_versions(pending_versions, pending_free, &mut state.pending);
         }
         let table = &mut self.tables[table_index];
-        let state = table
-            .rows
-            .get(&rowid)
-            .expect("row present after rewrite");
+        let state = table.rows.get(&rowid).expect("row present after rewrite");
         if state.committed.is_none() && table.n_spill_ssts == 0 {
             table.rows.remove(&rowid);
         }
@@ -52815,6 +52809,26 @@ mod tests {
 
     fn test_budget(config: &Config) -> Budget {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
+    }
+
+    #[test]
+    fn table_state_row_map_controls_are_charged_at_startup() {
+        let mut config = test_config();
+        config.query_workspace_slots = 2;
+        let bytes = config.memtable_bytes + Storage::extra_budget_bytes(&config);
+        let mut budget = Budget::new(bytes);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage.configure_collation(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        assert!(size_of::<RowMap>() > size_of::<FixedMap<u64, RowState>>());
+        assert_eq!(storage.tables.len(), table_slot_capacity(&config));
+        for (slot, table) in storage.tables.iter().enumerate() {
+            assert_eq!(table.rows.capacity(), if slot == config.max_tables {
+                config.large_object_pages
+            } else {
+                config.table_rows
+            });
+        }
     }
 
     fn test_view_definition(dependencies: StoredQueryDependencies) -> ViewDefinition {

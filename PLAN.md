@@ -1,7 +1,7 @@
 # pos3ql roadmap
 
-Reviewed after PR #601 on 2026-10-07, against
-`a91caa4d5bf838fcc75edb8273094eddceeb5b07`.
+Reviewed after PR #602 on 2026-10-07, against
+`44b832030d131ca113528546eaf402ed05e69b42`.
 
 [Architecture](README.md) · [Current capabilities](docs/implemented-baseline.md) ·
 [Compatibility](docs/postgresql-18-compatibility.md) · [Contributing](CONTRIBUTING.md)
@@ -70,8 +70,18 @@ The global image capacity is table slots × query workspace slots ×
 COPY retains its owner across data messages; DDL event triggers retain their
 pre-change image without consuming statement arena space. Nested-trigger pool
 exhaustion rolls back the outer mutation and releases capacity for retry.
-Live definition publication, rows, and maintenance still require their shared
-synchronization boundary before fixed workers.
+Relation row maps now use a per-table read boundary. Point reads and iteration
+return detached row-state images; full walks and checkpoint batches retain a
+consistent map view. Row mutation, recovery, rollback, template cloning, and
+slot reuse require exclusive map access. Table startup accounting includes the
+lock controls, and exhaustion preserves existing rows. This protects the map;
+row-version pools, heap access, statistics, and maintenance still need their
+shared mutation boundaries.
+
+Live definition publication remains exclusive. Query scopes retain definition
+references beyond lookup, so their ownership must change before definitions
+can move behind shared publication guards. Retained DML images do not close
+that query-scope boundary. These changes remain prerequisites for fixed workers.
 
 Completion evidence:
 

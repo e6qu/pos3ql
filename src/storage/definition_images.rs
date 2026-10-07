@@ -21,7 +21,6 @@ struct Image {
 }
 
 struct ImageCell {
-    occupied: AtomicBool,
     image: UnsafeCell<MaybeUninit<Image>>,
 }
 
@@ -32,6 +31,7 @@ unsafe impl Sync for ImageCell {}
 
 pub(super) struct TableDefinitionImagePool {
     cells: Box<[ImageCell]>,
+    occupied: Box<[AtomicBool]>,
     allocation: Mutex<()>,
 }
 
@@ -48,29 +48,34 @@ impl TableDefinitionImagePool {
 
     pub(super) fn budget_bytes(config: &Config) -> usize {
         Self::capacity(config)
-            .saturating_mul(size_of::<ImageCell>())
+            .saturating_mul(size_of::<ImageCell>() + size_of::<AtomicBool>())
             .saturating_add(Self::shared_bytes())
     }
 
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Arc<Self>, BudgetError> {
         let capacity = Self::capacity(config);
         budget.draw(Self::shared_bytes(), "table definition image owner")?;
+        budget.draw_array(
+            capacity,
+            size_of::<AtomicBool>(),
+            "table definition image occupancy",
+        )?;
         budget.draw_array(capacity, size_of::<ImageCell>(), "table definition images")?;
-        let mut cells = Box::<[ImageCell]>::new_uninit_slice(capacity);
-        for cell in &mut cells {
-            // SAFETY: each cell's AtomicBool is initialized exactly once.
-            // UnsafeCell<MaybeUninit<Image>> permits uninitialized payload
-            // bytes, so startup need not touch the reserved definition pages.
-            unsafe {
-                core::ptr::addr_of_mut!((*cell.as_mut_ptr()).occupied)
-                    .write(AtomicBool::new(false));
-            }
+        let mut occupied = Box::<[AtomicBool]>::new_uninit_slice(capacity);
+        for flag in &mut occupied {
+            flag.write(AtomicBool::new(false));
         }
-        // SAFETY: occupied was initialized above; the only remaining field
-        // explicitly permits uninitialized bytes.
+        // SAFETY: every atomic flag was initialized above. Keeping these
+        // flags dense avoids touching a page in each reserved wide image.
+        let occupied = unsafe { occupied.assume_init() };
+        let cells = Box::<[ImageCell]>::new_uninit_slice(capacity);
+        // SAFETY: ImageCell's only field is UnsafeCell<MaybeUninit<Image>>,
+        // whose payload explicitly permits uninitialized bytes. Image pages
+        // remain untouched until a reader captures a definition into them.
         let cells = unsafe { cells.assume_init() };
         Ok(Arc::new(Self {
             cells,
+            occupied,
             allocation: Mutex::new(()),
         }))
     }
@@ -128,9 +133,9 @@ impl TableDefinitionImages {
             .expect("table definition image lock poisoned");
         let Some(index) = self
             .pool
-            .cells
+            .occupied
             .iter()
-            .position(|cell| !cell.occupied.load(Ordering::Acquire))
+            .position(|flag| !flag.load(Ordering::Acquire))
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -156,7 +161,7 @@ impl TableDefinitionImages {
                 1,
             );
         }
-        cell.occupied.store(true, Ordering::Release);
+        self.pool.occupied[index].store(true, Ordering::Release);
         self.head.set(Some(index));
         // SAFETY: every field is initialized and this owner now retains the
         // immutable image. The reference cannot outlive the owner's borrow.
@@ -172,7 +177,7 @@ impl Drop for TableDefinitionImages {
             // SAFETY: Drop has exclusive access to the owner, so all returned
             // references are finished before its cells become reusable.
             slot = unsafe { (*cell.image.get()).assume_init_ref().next };
-            cell.occupied.store(false, Ordering::Release);
+            self.pool.occupied[index].store(false, Ordering::Release);
         }
     }
 }

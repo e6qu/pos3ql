@@ -64,6 +64,7 @@ statement instead of copying the maximum-width definition per row. Reader
 owners release their startup-reserved cells when execution returns, including
 errors; retained images survive definition rollback, publication, and table
 slot reuse. Reacquiring a reused identity fails with a serialization error.
+Dense occupancy flags avoid touching unused image pages at startup.
 The global image capacity is table slots × query workspace slots ×
 (maximum catalog versions per object + 1); exhaustion is a named program limit.
 COPY retains its owner across data messages; DDL event triggers retain their

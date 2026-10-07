@@ -24,6 +24,7 @@ cargo test --locked --lib -- --list > "$list"
 
 set -- --exact \
     --skip sim::storage::storage_vopr \
+    --skip sql::tests::remaining_execution_widths_are_allocation_free_and_survive_cold_recovery \
     --skip sql::tests::external_cold_order_and_distinct_runs_use_object_storage \
     --skip sql::tests::external_recursive_runs_use_object_storage \
     --skip sql::tests::external_lateral_runs_use_object_storage \

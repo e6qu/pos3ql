@@ -15,8 +15,11 @@ mutable callbacks, rollback, publication, and table identity reuse. Per-row
 UPDATE and MERGE readers reuse those images. Exhaustion and stale identity
 reacquisition fail explicitly; error returns release the retained capacity.
 COPY and DDL pre-change readers use the same pool. Nested-trigger exhaustion
-rolls back the outer mutation and frees capacity for retry. These changes
-introduce no deferred defect. Clippy also exposed deprecated atomic update
+rolls back the outer mutation and frees capacity for retry. Dense pool occupancy avoids touching every reserved wide image at startup.
+The wide mutable-replay/cursor fixture now has a dedicated optimized gate;
+unoptimized runs at both merged main and the reader head exceeded an isolated
+six-minute deadline. Optimized runs passed within the unchanged CI ceiling.
+These changes introduce no deferred defect. Clippy also exposed deprecated atomic update
 calls; the catalog clock now reuses its bounded compare-and-exchange boundary
 and TLS accounting retains its saturating compare-and-exchange behavior.
 

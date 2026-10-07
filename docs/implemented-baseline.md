@@ -46,7 +46,8 @@ Relation row maps have a per-table read boundary. Point reads return copied
 row-state images; scans and checkpoint batches retain a coherent map guard.
 Mutation and lifecycle cleanup require exclusive access. The startup table
 budget includes the row-map lock controls. Pending and committed row-version
-arrays share one guarded owner with their free lists. Visibility reads retain
+arrays share one guarded owner; each array owns its free-list control.
+Visibility reads retain
 one view across both chains; mutations and compaction require exclusive owner
 access. Pool controls are charged at startup. Detached chain handles do not
 retain version slots across mutation. Heap access, the combined row lifecycle,

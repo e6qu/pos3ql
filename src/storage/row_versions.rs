@@ -2,20 +2,51 @@
 
 use core::mem::size_of;
 use std::sync::{RwLock, RwLockReadGuard};
+use core::ops::{Index, IndexMut};
+use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql_err;
 
 use super::{
-    CommittedVersionSlot, PendingVersionSlot, committed_row_version_capacity,
-    pending_row_version_capacity,
+    CommittedHistory, CommittedVersion, CommittedVersionSlot, PendingChange, PendingVersionSlot,
+    PendingVersions, RowHome, RowLoc, committed_row_version_capacity, pending_row_version_capacity,
 };
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
 
+/// The allocator's reusable slots always belong to its own backing array.
+pub(super) struct RowVersionPool<T> {
+    slots: FixedVec<T>,
+    free: Option<usize>,
+}
+
+impl<T> RowVersionPool<T> {
+    fn new(budget: &mut Budget, name: &'static str, capacity: usize) -> Result<Self, BudgetError> {
+        Ok(Self { slots: FixedVec::new(budget, name, capacity)?, free: None })
+    }
+
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize { self.slots.capacity() }
+
+    #[cfg(test)]
+    fn len(&self) -> usize { self.slots.len() }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool { self.slots.is_empty() }
+}
+
+impl<T> Index<usize> for RowVersionPool<T> {
+    type Output = T;
+    fn index(&self, index: usize) -> &Self::Output { &self.slots[index] }
+}
+
+impl<T> IndexMut<usize> for RowVersionPool<T> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output { &mut self.slots[index] }
+}
+
 pub(super) struct RowVersionState {
-    pub(super) pending_row_versions: FixedVec<PendingVersionSlot>,
-    pub(super) pending_row_version_free: Option<usize>,
-    pub(super) committed_row_versions: FixedVec<CommittedVersionSlot>,
-    pub(super) committed_row_version_free: Option<usize>,
+    pub(super) pending_row_versions: RowVersionPool<PendingVersionSlot>,
+    pub(super) committed_row_versions: RowVersionPool<CommittedVersionSlot>,
 }
 
 pub(super) struct RowVersionPools {
@@ -31,18 +62,16 @@ impl RowVersionPools {
         budget.draw(Self::control_bytes(), "row-version pool controls")?;
         Ok(Self {
             state: RwLock::new(RowVersionState {
-                pending_row_versions: FixedVec::new(
+                pending_row_versions: RowVersionPool::new(
                     budget,
                     "pending_row_versions",
                     pending_row_version_capacity(config),
                 )?,
-                pending_row_version_free: None,
-                committed_row_versions: FixedVec::new(
+                committed_row_versions: RowVersionPool::new(
                     budget,
                     "committed_row_versions",
                     committed_row_version_capacity(config),
                 )?,
-                committed_row_version_free: None,
             }),
         })
     }
@@ -58,15 +87,240 @@ impl RowVersionPools {
     }
 }
 
+pub(super) fn pending_last(
+    pool: &RowVersionPool<PendingVersionSlot>,
+    versions: PendingVersions,
+) -> Option<PendingChange> {
+    versions.tail.map(|slot| pool[slot].change)
+}
+
+pub(super) fn pending_visible_at(
+    pool: &RowVersionPool<PendingVersionSlot>,
+    versions: PendingVersions,
+    txid: u32,
+    snapshot: u32,
+) -> Option<Option<RowLoc>> {
+    let mut slot = versions.tail;
+    while let Some(index) = slot {
+        let entry = &pool[index];
+        if entry.change.txid == txid && entry.change.cid < snapshot {
+            return Some(entry.change.loc);
+        }
+        slot = entry.previous;
+    }
+    None
+}
+
+pub(super) fn push_pending_version(
+    pool: &mut RowVersionPool<PendingVersionSlot>,
+    versions: &mut PendingVersions,
+    maximum: usize,
+    change: PendingChange,
+) -> Result<(), SqlError> {
+    let (pool, free) = (&mut pool.slots, &mut pool.free);
+    if versions.len >= maximum {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "one row exceeds max_row_versions_per_row ({}) pending command versions",
+            maximum
+        ));
+    }
+    let previous = versions.tail;
+    let slot = match free.take() {
+        Some(slot) => {
+            debug_assert!(!pool[slot].used);
+            *free = pool[slot].previous;
+            pool[slot] = PendingVersionSlot {
+                used: true,
+                previous,
+                change,
+            };
+            slot
+        }
+        None => {
+            let slot = pool.len();
+            pool.push(PendingVersionSlot {
+                used: true,
+                previous,
+                change,
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "pending row-version pool is exhausted"
+                )
+            })?;
+            slot
+        }
+    };
+    versions.tail = Some(slot);
+    versions.len += 1;
+    Ok(())
+}
+
+pub(super) fn pop_pending_version(
+    pool: &mut RowVersionPool<PendingVersionSlot>,
+    versions: &mut PendingVersions,
+) -> Option<PendingChange> {
+    let (pool, free) = (&mut pool.slots, &mut pool.free);
+    let slot = versions.tail?;
+    let entry = pool[slot];
+    debug_assert!(entry.used);
+    pool[slot].used = false;
+    pool[slot].previous = *free;
+    *free = Some(slot);
+    versions.tail = entry.previous;
+    versions.len -= 1;
+    Some(entry.change)
+}
+
+pub(super) fn clear_pending_versions(
+    pool: &mut RowVersionPool<PendingVersionSlot>,
+    versions: &mut PendingVersions,
+) {
+    while pop_pending_version(pool, versions).is_some() {}
+}
+
+pub(super) fn release_pending_chain(
+    pool: &mut RowVersionPool<PendingVersionSlot>,
+    mut slot: Option<usize>,
+) {
+    let (pool, free) = (&mut pool.slots, &mut pool.free);
+    while let Some(index) = slot {
+        let entry = pool[index];
+        debug_assert!(entry.used);
+        pool[index].used = false;
+        pool[index].previous = *free;
+        *free = Some(index);
+        slot = entry.previous;
+    }
+}
+
+pub(super) fn committed_history_get(
+    pool: &RowVersionPool<CommittedVersionSlot>,
+    history: CommittedHistory,
+    index: usize,
+) -> Option<CommittedVersion> {
+    if index >= history.len() {
+        return None;
+    }
+    let mut slot = history.tail;
+    for _ in 0..index {
+        slot = pool[slot?].previous;
+    }
+    slot.map(|slot| pool[slot].version)
+}
+
+pub(super) fn committed_visible_at(
+    pool: &RowVersionPool<CommittedVersionSlot>,
+    history: CommittedHistory,
+    commit_snapshot: u64,
+) -> Option<Option<RowHome>> {
+    let mut slot = history.tail;
+    while let Some(index) = slot {
+        let entry = &pool[index];
+        if entry.version.lsn <= commit_snapshot {
+            return Some(entry.version.home);
+        }
+        slot = entry.previous;
+    }
+    None
+}
+
+pub(super) fn push_committed_version(
+    pool: &mut RowVersionPool<CommittedVersionSlot>,
+    history: &mut CommittedHistory,
+    maximum: usize,
+    version: CommittedVersion,
+) -> Result<(), SqlError> {
+    let (pool, free) = (&mut pool.slots, &mut pool.free);
+    if history.len >= maximum {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "one row exceeds max_row_versions_per_row ({}) committed snapshot versions",
+            maximum
+        ));
+    }
+    let previous = history.tail;
+    let slot = match free.take() {
+        Some(slot) => {
+            debug_assert!(!pool[slot].used);
+            *free = pool[slot].previous;
+            pool[slot] = CommittedVersionSlot {
+                used: true,
+                previous,
+                version,
+            };
+            slot
+        }
+        None => {
+            let slot = pool.len();
+            pool.push(CommittedVersionSlot {
+                used: true,
+                previous,
+                version,
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "committed row-version pool is exhausted"
+                )
+            })?;
+            slot
+        }
+    };
+    history.tail = Some(slot);
+    history.len += 1;
+    Ok(())
+}
+
+pub(super) fn release_committed_chain(
+    pool: &mut RowVersionPool<CommittedVersionSlot>,
+    mut slot: Option<usize>,
+) {
+    let (pool, free) = (&mut pool.slots, &mut pool.free);
+    while let Some(index) = slot {
+        let entry = pool[index];
+        debug_assert!(entry.used);
+        pool[index].used = false;
+        pool[index].previous = *free;
+        *free = Some(index);
+        slot = entry.previous;
+    }
+}
+
+/// Keeps every version newer than the oldest snapshot and the first version
+/// at or before it. That is the minimal chain that can answer every active
+/// snapshot.
+pub(super) fn prune_committed_history(
+    pool: &mut RowVersionPool<CommittedVersionSlot>,
+    history: &mut CommittedHistory,
+    oldest_snapshot: Option<u64>,
+) {
+    let Some(oldest) = oldest_snapshot else {
+        release_committed_chain(pool, history.tail.take());
+        history.len = 0;
+        return;
+    };
+    let mut slot = history.tail;
+    let mut retained = 0usize;
+    while let Some(index) = slot {
+        retained += 1;
+        let entry = pool[index];
+        if entry.version.lsn <= oldest {
+            pool[index].previous = None;
+            release_committed_chain(pool, entry.previous);
+            history.len = retained;
+            return;
+        }
+        slot = entry.previous;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{
-        ColumnSet, CommittedHistory, CommittedVersion, PendingChange, PendingVersions, RowHome,
-        RowLoc, clear_pending_versions, committed_history_get, committed_visible_at, pending_last,
-        pending_visible_at, pop_pending_version, prune_committed_history, push_committed_version,
-        push_pending_version,
-    };
+    use crate::storage::ColumnSet;
 
     fn pools(capacity: usize) -> RowVersionPools {
         let mut budget = Budget::new(
@@ -74,10 +328,8 @@ mod tests {
         );
         RowVersionPools {
             state: RwLock::new(RowVersionState {
-                pending_row_versions: FixedVec::new(&mut budget, "test pending", capacity).unwrap(),
-                pending_row_version_free: None,
-                committed_row_versions: FixedVec::new(&mut budget, "test history", capacity).unwrap(),
-                committed_row_version_free: None,
+                pending_row_versions: RowVersionPool::new(&mut budget, "test pending", capacity).unwrap(),
+                committed_row_versions: RowVersionPool::new(&mut budget, "test history", capacity).unwrap(),
             }),
         }
     }
@@ -105,9 +357,9 @@ mod tests {
         let mut commands = PendingVersions::empty();
         let mut history = CommittedHistory::empty();
         let state = pools.exclusive();
-        push_pending_version(&mut state.pending_row_versions, &mut state.pending_row_version_free,
+        push_pending_version(&mut state.pending_row_versions,
             &mut commands, 2, pending(1)).unwrap();
-        push_committed_version(&mut state.committed_row_versions, &mut state.committed_row_version_free,
+        push_committed_version(&mut state.committed_row_versions,
             &mut history, 2, committed(3)).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let reader = pools.read();
@@ -133,16 +385,16 @@ mod tests {
         let mut history = CommittedHistory::empty();
         crate::mem::guard::forbid_alloc(|| {
             for command in 1..=2 {
-                push_pending_version(&mut state.pending_row_versions, &mut state.pending_row_version_free,
+                push_pending_version(&mut state.pending_row_versions,
                     &mut commands, 3, pending(command)).unwrap();
-                push_committed_version(&mut state.committed_row_versions, &mut state.committed_row_version_free,
+                push_committed_version(&mut state.committed_row_versions,
                     &mut history, 3, committed(u64::from(command))).unwrap();
             }
             let pending_before = commands;
             let history_before = history;
-            let pending_error = push_pending_version(&mut state.pending_row_versions, &mut state.pending_row_version_free,
+            let pending_error = push_pending_version(&mut state.pending_row_versions,
                 &mut commands, 3, pending(3)).unwrap_err();
-            let history_error = push_committed_version(&mut state.committed_row_versions, &mut state.committed_row_version_free,
+            let history_error = push_committed_version(&mut state.committed_row_versions,
                 &mut history, 3, committed(3)).unwrap_err();
             assert_eq!(pending_error.sqlstate, crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(history_error.sqlstate, crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED);
@@ -150,31 +402,31 @@ mod tests {
             assert_eq!(history_error.message.as_str(), "committed row-version pool is exhausted");
             assert_eq!(commands, pending_before);
             assert_eq!(history, history_before);
-            assert_eq!(pop_pending_version(&mut state.pending_row_versions, &mut state.pending_row_version_free,
+            assert_eq!(pop_pending_version(&mut state.pending_row_versions,
                 &mut commands).unwrap().cid, 2);
             assert_eq!(pending_visible_at(&state.pending_row_versions, commands, 7, 2), Some(pending(1).loc));
-            push_pending_version(&mut state.pending_row_versions, &mut state.pending_row_version_free,
+            push_pending_version(&mut state.pending_row_versions,
                 &mut commands, 3, pending(4)).unwrap();
             assert_eq!(state.pending_row_versions.len(), 2);
-            prune_committed_history(&mut state.committed_row_versions, &mut state.committed_row_version_free,
+            prune_committed_history(&mut state.committed_row_versions,
                 &mut history, Some(2));
             assert_eq!(history.len(), 1);
             assert_eq!(committed_history_get(&state.committed_row_versions, history, 0).unwrap().lsn, 2);
-            push_committed_version(&mut state.committed_row_versions, &mut state.committed_row_version_free,
+            push_committed_version(&mut state.committed_row_versions,
                 &mut history, 3, committed(5)).unwrap();
             assert_eq!(state.committed_row_versions.len(), 2);
-            clear_pending_versions(&mut state.pending_row_versions, &mut state.pending_row_version_free, &mut commands);
-            prune_committed_history(&mut state.committed_row_versions, &mut state.committed_row_version_free,
+            clear_pending_versions(&mut state.pending_row_versions, &mut commands);
+            prune_committed_history(&mut state.committed_row_versions,
                 &mut history, None);
             assert!(commands.is_none());
             assert!(history.is_empty());
             for epoch in 6..106 {
-                push_pending_version(&mut state.pending_row_versions, &mut state.pending_row_version_free,
+                push_pending_version(&mut state.pending_row_versions,
                     &mut commands, 2, pending(epoch)).unwrap();
-                push_committed_version(&mut state.committed_row_versions, &mut state.committed_row_version_free,
+                push_committed_version(&mut state.committed_row_versions,
                     &mut history, 2, committed(u64::from(epoch))).unwrap();
-                clear_pending_versions(&mut state.pending_row_versions, &mut state.pending_row_version_free, &mut commands);
-                prune_committed_history(&mut state.committed_row_versions, &mut state.committed_row_version_free,
+                clear_pending_versions(&mut state.pending_row_versions, &mut commands);
+                prune_committed_history(&mut state.committed_row_versions,
                     &mut history, None);
             }
             assert_eq!(state.pending_row_versions.len(), 2);
@@ -190,9 +442,9 @@ mod tests {
         let mut commands = PendingVersions::empty();
         let mut history = CommittedHistory::empty();
         let state = pools.exclusive();
-        push_pending_version(&mut state.pending_row_versions, &mut state.pending_row_version_free,
+        push_pending_version(&mut state.pending_row_versions,
             &mut commands, 1, pending(0)).unwrap();
-        push_committed_version(&mut state.committed_row_versions, &mut state.committed_row_version_free,
+        push_committed_version(&mut state.committed_row_versions,
             &mut history, 1, committed(0)).unwrap();
         let barrier = std::sync::Barrier::new(4);
         std::thread::scope(|scope| {
@@ -244,8 +496,8 @@ mod tests {
         assert_eq!(reader.committed_row_versions.capacity(), committed_row_version_capacity(&config));
         assert!(reader.pending_row_versions.is_empty());
         assert!(reader.committed_row_versions.is_empty());
-        assert_eq!(reader.pending_row_version_free, None);
-        assert_eq!(reader.committed_row_version_free, None);
+        assert_eq!(reader.pending_row_versions.free, None);
+        assert_eq!(reader.committed_row_versions.free, None);
         let mut short = Budget::new(bytes - 1);
         assert!(RowVersionPools::new(&config, &mut short).is_err());
     }

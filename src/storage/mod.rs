@@ -13,7 +13,7 @@ pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_map::RowMap;
-use row_versions::RowVersionPools;
+use row_versions::{RowVersionPools, pending_last, pending_visible_at, push_pending_version, pop_pending_version, clear_pending_versions, release_pending_chain, committed_history_get, committed_visible_at, push_committed_version, release_committed_chain, prune_committed_history};
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -2413,238 +2413,6 @@ struct PendingVersionSlot {
     used: bool,
     previous: Option<usize>,
     change: PendingChange,
-}
-
-fn pending_last(
-    pool: &FixedVec<PendingVersionSlot>,
-    versions: PendingVersions,
-) -> Option<PendingChange> {
-    versions.tail.map(|slot| pool[slot].change)
-}
-
-fn pending_visible_at(
-    pool: &FixedVec<PendingVersionSlot>,
-    versions: PendingVersions,
-    txid: u32,
-    snapshot: u32,
-) -> Option<Option<RowLoc>> {
-    let mut slot = versions.tail;
-    while let Some(index) = slot {
-        let entry = &pool[index];
-        if entry.change.txid == txid && entry.change.cid < snapshot {
-            return Some(entry.change.loc);
-        }
-        slot = entry.previous;
-    }
-    None
-}
-
-fn push_pending_version(
-    pool: &mut FixedVec<PendingVersionSlot>,
-    free: &mut Option<usize>,
-    versions: &mut PendingVersions,
-    maximum: usize,
-    change: PendingChange,
-) -> Result<(), SqlError> {
-    if versions.len >= maximum {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "one row exceeds max_row_versions_per_row ({}) pending command versions",
-            maximum
-        ));
-    }
-    let previous = versions.tail;
-    let slot = match free.take() {
-        Some(slot) => {
-            debug_assert!(!pool[slot].used);
-            *free = pool[slot].previous;
-            pool[slot] = PendingVersionSlot {
-                used: true,
-                previous,
-                change,
-            };
-            slot
-        }
-        None => {
-            let slot = pool.len();
-            pool.push(PendingVersionSlot {
-                used: true,
-                previous,
-                change,
-            })
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "pending row-version pool is exhausted"
-                )
-            })?;
-            slot
-        }
-    };
-    versions.tail = Some(slot);
-    versions.len += 1;
-    Ok(())
-}
-
-fn pop_pending_version(
-    pool: &mut FixedVec<PendingVersionSlot>,
-    free: &mut Option<usize>,
-    versions: &mut PendingVersions,
-) -> Option<PendingChange> {
-    let slot = versions.tail?;
-    let entry = pool[slot];
-    debug_assert!(entry.used);
-    pool[slot].used = false;
-    pool[slot].previous = *free;
-    *free = Some(slot);
-    versions.tail = entry.previous;
-    versions.len -= 1;
-    Some(entry.change)
-}
-
-fn clear_pending_versions(
-    pool: &mut FixedVec<PendingVersionSlot>,
-    free: &mut Option<usize>,
-    versions: &mut PendingVersions,
-) {
-    while pop_pending_version(pool, free, versions).is_some() {}
-}
-
-fn release_pending_chain(
-    pool: &mut FixedVec<PendingVersionSlot>,
-    free: &mut Option<usize>,
-    mut slot: Option<usize>,
-) {
-    while let Some(index) = slot {
-        let entry = pool[index];
-        debug_assert!(entry.used);
-        pool[index].used = false;
-        pool[index].previous = *free;
-        *free = Some(index);
-        slot = entry.previous;
-    }
-}
-
-fn committed_history_get(
-    pool: &FixedVec<CommittedVersionSlot>,
-    history: CommittedHistory,
-    index: usize,
-) -> Option<CommittedVersion> {
-    if index >= history.len() {
-        return None;
-    }
-    let mut slot = history.tail;
-    for _ in 0..index {
-        slot = pool[slot?].previous;
-    }
-    slot.map(|slot| pool[slot].version)
-}
-
-fn committed_visible_at(
-    pool: &FixedVec<CommittedVersionSlot>,
-    history: CommittedHistory,
-    commit_snapshot: u64,
-) -> Option<Option<RowHome>> {
-    let mut slot = history.tail;
-    while let Some(index) = slot {
-        let entry = &pool[index];
-        if entry.version.lsn <= commit_snapshot {
-            return Some(entry.version.home);
-        }
-        slot = entry.previous;
-    }
-    None
-}
-
-fn push_committed_version(
-    pool: &mut FixedVec<CommittedVersionSlot>,
-    free: &mut Option<usize>,
-    history: &mut CommittedHistory,
-    maximum: usize,
-    version: CommittedVersion,
-) -> Result<(), SqlError> {
-    if history.len >= maximum {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "one row exceeds max_row_versions_per_row ({}) committed snapshot versions",
-            maximum
-        ));
-    }
-    let previous = history.tail;
-    let slot = match free.take() {
-        Some(slot) => {
-            debug_assert!(!pool[slot].used);
-            *free = pool[slot].previous;
-            pool[slot] = CommittedVersionSlot {
-                used: true,
-                previous,
-                version,
-            };
-            slot
-        }
-        None => {
-            let slot = pool.len();
-            pool.push(CommittedVersionSlot {
-                used: true,
-                previous,
-                version,
-            })
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "committed row-version pool is exhausted"
-                )
-            })?;
-            slot
-        }
-    };
-    history.tail = Some(slot);
-    history.len += 1;
-    Ok(())
-}
-
-fn release_committed_chain(
-    pool: &mut FixedVec<CommittedVersionSlot>,
-    free: &mut Option<usize>,
-    mut slot: Option<usize>,
-) {
-    while let Some(index) = slot {
-        let entry = pool[index];
-        debug_assert!(entry.used);
-        pool[index].used = false;
-        pool[index].previous = *free;
-        *free = Some(index);
-        slot = entry.previous;
-    }
-}
-
-/// Keeps every version newer than the oldest snapshot and the first version
-/// at or before it. That is the minimal chain that can answer every active
-/// snapshot.
-fn prune_committed_history(
-    pool: &mut FixedVec<CommittedVersionSlot>,
-    free: &mut Option<usize>,
-    history: &mut CommittedHistory,
-    oldest_snapshot: Option<u64>,
-) {
-    let Some(oldest) = oldest_snapshot else {
-        release_committed_chain(pool, free, history.tail.take());
-        history.len = 0;
-        return;
-    };
-    let mut slot = history.tail;
-    let mut retained = 0usize;
-    while let Some(index) = slot {
-        retained += 1;
-        let entry = pool[index];
-        if entry.version.lsn <= oldest {
-            pool[index].previous = None;
-            release_committed_chain(pool, free, entry.previous);
-            history.len = retained;
-            return;
-        }
-        slot = entry.previous;
-    }
 }
 
 /// The command-id a read that should see *all* of its own transaction's
@@ -14687,16 +14455,14 @@ fn rename_table_sql_identity(
 impl Storage {
     fn clear_table_rows(&mut self, slot: usize) {
         let row_versions = self.row_versions.exclusive();
-        let (tables, pending_versions, pending_free, committed_versions, committed_free) = (
+        let (tables, pending_versions, committed_versions) = (
             &mut self.tables,
             &mut row_versions.pending_row_versions,
-            &mut row_versions.pending_row_version_free,
             &mut row_versions.committed_row_versions,
-            &mut row_versions.committed_row_version_free,
         );
         for (_, state) in tables[slot].rows.iter() {
-            release_pending_chain(pending_versions, pending_free, state.pending.tail);
-            release_committed_chain(committed_versions, committed_free, state.history.tail);
+            release_pending_chain(pending_versions, state.pending.tail);
+            release_committed_chain(committed_versions, state.history.tail);
         }
         tables[slot].rows.clear();
     }
@@ -14704,14 +14470,10 @@ impl Storage {
     fn remove_row_state(&mut self, table: usize, rowid: u64) -> Option<RowState> {
         let state = self.tables[table].rows.remove(&rowid)?;
         let row_versions = self.row_versions.exclusive();
-        release_pending_chain(
-            &mut row_versions.pending_row_versions,
-            &mut row_versions.pending_row_version_free,
+        release_pending_chain(&mut row_versions.pending_row_versions,
             state.pending.tail,
         );
-        release_committed_chain(
-            &mut row_versions.committed_row_versions,
-            &mut row_versions.committed_row_version_free,
+        release_committed_chain(&mut row_versions.committed_row_versions,
             state.history.tail,
         );
         Some(state)
@@ -30598,13 +30360,12 @@ impl Storage {
 
     pub(crate) fn release_table_histories(&mut self, slot: usize) {
         let row_versions = self.row_versions.exclusive();
-        let (tables, versions, free) = (
+        let (tables, versions) = (
             &mut self.tables,
             &mut row_versions.committed_row_versions,
-            &mut row_versions.committed_row_version_free,
         );
         for (_, state) in tables[slot].rows.iter_mut() {
-            prune_committed_history(versions, free, &mut state.history, None);
+            prune_committed_history(versions, &mut state.history, None);
         }
     }
 
@@ -31358,16 +31119,15 @@ impl Storage {
             }
             {
                 let row_versions = self.row_versions.exclusive();
-                let (tables, versions, free) = (
+                let (tables, versions) = (
                     &mut self.tables,
                     &mut row_versions.committed_row_versions,
-                    &mut row_versions.committed_row_version_free,
                 );
                 let state = tables[table_index]
                     .rows
                     .get_mut(&rowid)
                     .expect("row state was just observed");
-                prune_committed_history(versions, free, &mut state.history, oldest_snapshot);
+                prune_committed_history(versions, &mut state.history, oldest_snapshot);
             }
             let state = self.tables[table_index]
                 .rows
@@ -31386,18 +31146,15 @@ impl Storage {
                 ));
             }
             let row_versions = self.row_versions.exclusive();
-            let (tables, versions, free) = (
+            let (tables, versions) = (
                 &mut self.tables,
                 &mut row_versions.pending_row_versions,
-                &mut row_versions.pending_row_version_free,
             );
             let state = tables[table_index]
                 .rows
                 .get_mut(&rowid)
                 .expect("row state was just observed");
-            push_pending_version(
-                versions,
-                free,
+            push_pending_version(versions,
                 &mut state.pending,
                 self.max_row_versions_per_row,
                 PendingChange {
@@ -31452,9 +31209,7 @@ impl Storage {
         }
         let mut pending = PendingVersions::empty();
         let row_versions = self.row_versions.exclusive();
-        push_pending_version(
-            &mut row_versions.pending_row_versions,
-            &mut row_versions.pending_row_version_free,
+        push_pending_version(&mut row_versions.pending_row_versions,
             &mut pending,
             self.max_row_versions_per_row,
             PendingChange {
@@ -31610,17 +31365,16 @@ impl Storage {
     /// reachable through the table's installed versioned SST list.
     pub fn release_durable_histories(&mut self) {
         let row_versions = self.row_versions.exclusive();
-        let (tables, versions, free) = (
+        let (tables, versions) = (
             &mut self.tables,
             &mut row_versions.committed_row_versions,
-            &mut row_versions.committed_row_version_free,
         );
         for table in tables
             .iter_mut()
             .filter(|table| table.live && table.def.persistence != RelationPersistence::Temporary)
         {
             for (_, state) in table.rows.iter_mut() {
-                prune_committed_history(versions, free, &mut state.history, None);
+                prune_committed_history(versions, &mut state.history, None);
             }
         }
     }
@@ -31663,16 +31417,15 @@ impl Storage {
         match prior {
             None => {
                 let row_versions = self.row_versions.exclusive();
-                let (tables, versions, free) = (
+                let (tables, versions) = (
                     &mut self.tables,
                     &mut row_versions.pending_row_versions,
-                    &mut row_versions.pending_row_version_free,
                 );
                 let state = tables[table_index]
                     .rows
                     .get_mut(&rowid)
                     .expect("row state was just observed");
-                pop_pending_version(versions, free, &mut state.pending);
+                pop_pending_version(versions, &mut state.pending);
                 if (state.committed.is_none()
                     && state.history.is_empty()
                     && state.pending.is_none())
@@ -31768,21 +31521,17 @@ impl Storage {
         let retain_history = !self.snapshot_state().active.is_empty();
         {
             let row_versions = self.row_versions.exclusive();
-            let (tables, committed_versions, committed_free, pending_versions, pending_free) = (
+            let (tables, committed_versions, pending_versions) = (
                 &mut self.tables,
                 &mut row_versions.committed_row_versions,
-                &mut row_versions.committed_row_version_free,
                 &mut row_versions.pending_row_versions,
-                &mut row_versions.pending_row_version_free,
             );
             let state = tables[table_index]
                 .rows
                 .get_mut(&rowid)
                 .expect("row present after read");
             if retain_history && (old_committed.is_some() || old_lsn != 0) {
-                push_committed_version(
-                    committed_versions,
-                    committed_free,
+                push_committed_version(committed_versions,
                     &mut state.history,
                     self.max_row_versions_per_row,
                     CommittedVersion {
@@ -31792,9 +31541,7 @@ impl Storage {
                 )
                 .expect("write_pending reserved historical-version capacity");
             } else if !retain_history {
-                prune_committed_history(
-                    committed_versions,
-                    committed_free,
+                prune_committed_history(committed_versions,
                     &mut state.history,
                     None,
                 );
@@ -31802,7 +31549,7 @@ impl Storage {
             state.committed = new_loc.map(RowHome::Heap);
             state.committed_lsn = commit_lsn;
             state.checkpoint_change_lsn = commit_lsn;
-            clear_pending_versions(pending_versions, pending_free, &mut state.pending);
+            clear_pending_versions(pending_versions, &mut state.pending);
         }
         let table = &mut self.tables[table_index];
         let state = table.rows.get(&rowid).expect("row present after commit");
@@ -31844,12 +31591,10 @@ impl Storage {
         };
         {
             let row_versions = self.row_versions.exclusive();
-            let (tables, committed_versions, committed_free, pending_versions, pending_free) = (
+            let (tables, committed_versions, pending_versions) = (
                 &mut self.tables,
                 &mut row_versions.committed_row_versions,
-                &mut row_versions.committed_row_version_free,
                 &mut row_versions.pending_row_versions,
-                &mut row_versions.pending_row_version_free,
             );
             let state = tables[table_index]
                 .rows
@@ -31857,11 +31602,11 @@ impl Storage {
                 .expect("row present after read");
             // Definition rewrites are rejected while a historical snapshot
             // is active, so no old-schema row image can be retained here.
-            prune_committed_history(committed_versions, committed_free, &mut state.history, None);
+            prune_committed_history(committed_versions, &mut state.history, None);
             state.committed = new_loc.map(RowHome::Heap);
             state.committed_lsn = commit_lsn;
             state.checkpoint_change_lsn = commit_lsn;
-            clear_pending_versions(pending_versions, pending_free, &mut state.pending);
+            clear_pending_versions(pending_versions, &mut state.pending);
         }
         let table = &mut self.tables[table_index];
         let state = table.rows.get(&rowid).expect("row present after rewrite");
@@ -47815,14 +47560,13 @@ impl Storage {
         let wait_owner = self.transaction_wait_owner(txid);
         self.lock_state().row.resource_released(wait_owner);
         let row_versions = self.row_versions.exclusive();
-        let (tables, versions, free) = (
+        let (tables, versions) = (
             &mut self.tables,
             &mut row_versions.committed_row_versions,
-            &mut row_versions.committed_row_version_free,
         );
         for table in tables.iter_mut() {
             for (_, state) in table.rows.iter_mut() {
-                prune_committed_history(versions, free, &mut state.history, oldest);
+                prune_committed_history(versions, &mut state.history, oldest);
             }
         }
         if oldest.is_none() {
@@ -52683,9 +52427,7 @@ mod tests {
         // overlays it.
         let mut pending = state;
         let row_versions = storage.row_versions.exclusive();
-        push_pending_version(
-            &mut row_versions.pending_row_versions,
-            &mut row_versions.pending_row_version_free,
+        push_pending_version(&mut row_versions.pending_row_versions,
             &mut pending.pending,
             storage.max_row_versions_per_row,
             PendingChange {
@@ -58946,9 +58688,7 @@ mod tests {
             pending: PendingVersions::empty(),
         };
         let row_versions = storage.row_versions.exclusive();
-        push_pending_version(
-            &mut row_versions.pending_row_versions,
-            &mut row_versions.pending_row_version_free,
+        push_pending_version(&mut row_versions.pending_row_versions,
             &mut state.pending,
             storage.max_row_versions_per_row,
             PendingChange {

@@ -76,7 +76,8 @@ consistent map view. Row mutation, recovery, rollback, template cloning, and
 slot reuse require exclusive map access. Table startup accounting includes the
 lock controls, and exhaustion preserves existing rows. This protects the map;
 pending and committed version arrays now share one guarded owner with their
-free lists. Visibility holds one view across both chains and releases it before
+free lists. Each array owns its free-list control, so allocator calls cannot
+pair it with another pool. Visibility holds one view across both chains and releases it before
 object-store lookup. Rollback, pruning, publication, removal, and compaction
 require exclusive pool ownership; pool controls are charged at startup.
 Heap access, statistics, maintenance, and the combined row-map/version lifecycle

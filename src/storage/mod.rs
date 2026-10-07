@@ -6,13 +6,12 @@
 //! phase). All capacities are fixed at startup.
 
 mod definition_images;
+mod row_map;
 pub(crate) mod foreign;
 pub(crate) mod rowenc;
-mod table_slots;
 
 pub(crate) use definition_images::TableDefinitionImages;
-pub use table_slots::TableDefinitionRead;
-use table_slots::TableSlots;
+pub use row_map::RowMap;
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -2749,7 +2748,7 @@ pub struct Table {
     /// Monotonic creation stamp (catalog sequence), giving dependency
     /// reports PostgreSQL's OID ordering.
     pub created_at: u64,
-    pub rows: FixedMap<u64, RowState>,
+    pub rows: RowMap,
     /// Committed existence: whether the table is part of the last-committed
     /// catalog image. `pending_ddl` overlays an uncommitted CREATE/DROP.
     pub live: bool,
@@ -13673,7 +13672,7 @@ impl Iterator for MatviewIter<'_> {
 
 pub struct Storage {
     pub heap: RowHeap,
-    tables: TableSlots,
+    tables: FixedVec<Table>,
     table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
     pending_row_versions: FixedVec<PendingVersionSlot>,
@@ -14695,15 +14694,15 @@ impl Storage {
             &mut self.committed_row_versions,
             &mut self.committed_row_version_free,
         );
-        for (_, state) in tables.get_mut(slot).rows.iter() {
+        for (_, state) in tables[slot].rows.iter() {
             release_pending_chain(pending_versions, pending_free, state.pending.tail);
             release_committed_chain(committed_versions, committed_free, state.history.tail);
         }
-        tables.get_mut(slot).rows.clear();
+        tables[slot].rows.clear();
     }
 
     fn remove_row_state(&mut self, table: usize, rowid: u64) -> Option<RowState> {
-        let state = self.tables.get_mut(table).rows.remove(&rowid)?;
+        let state = self.tables[table].rows.remove(&rowid)?;
         release_pending_chain(
             &mut self.pending_row_versions,
             &mut self.pending_row_version_free,
@@ -14802,7 +14801,7 @@ impl Storage {
                 indexes
                     .push(IndexCumulativeStatistics {
                         oid,
-                        database: self.tables.read(table).database,
+                        database: self.tables[table].database,
                         ..IndexCumulativeStatistics::EMPTY
                     })
                     .map_err(|_| {
@@ -14954,7 +14953,7 @@ impl Storage {
                     .database_catalog()
                     .definitions
                     .iter()
-                    .position(|database| database.oid == self.tables.read(table).database)
+                    .position(|database| database.oid == self.tables[table].database)
                 {
                     let database = &mut databases[database_slot];
                     database.tup_returned = database
@@ -15034,7 +15033,7 @@ impl Storage {
                         .database_catalog()
                         .definitions
                         .iter()
-                        .position(|database| database.oid == self.tables.read(table).database)
+                        .position(|database| database.oid == self.tables[table].database)
                     {
                         let database = &mut databases[database_slot];
                         database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
@@ -15132,7 +15131,7 @@ impl Storage {
                 .database_catalog()
                 .definitions
                 .iter()
-                .position(|database| database.oid == self.tables.read(table).database)
+                .position(|database| database.oid == self.tables[table].database)
             {
                 let database = &mut databases[database_slot];
                 database.tup_returned = database
@@ -15952,14 +15951,14 @@ impl Storage {
             }
         }
         for slot in 0..self.table_count() {
-            if self.tables.read(slot).database != current_database()
-                || !self.tables.read(slot).live
-                || self.tables.read(slot).def.persistence != RelationPersistence::Temporary
-                || self.tables.read(slot).def.schema != schema
+            if self.tables[slot].database != current_database()
+                || !self.tables[slot].live
+                || self.tables[slot].def.persistence != RelationPersistence::Temporary
+                || self.tables[slot].def.schema != schema
             {
                 continue;
             }
-            let name = self.tables.read(slot).def.name;
+            let name = self.tables[slot].def.name;
             self.drop_indexes_for(schema.as_str(), name.as_str(), 0);
             self.commit_indexes_for(schema.as_str(), name.as_str(), 0);
             self.commit_drop(slot);
@@ -15985,24 +15984,24 @@ impl Storage {
             return Ok(());
         };
         for slot in 0..self.table_count() {
-            if self.tables.read(slot).database != current_database()
-                || !self.tables.read(slot).live
-                || self.tables.read(slot).def.persistence != RelationPersistence::Temporary
-                || self.tables.read(slot).def.schema != schema
+            if self.tables[slot].database != current_database()
+                || !self.tables[slot].live
+                || self.tables[slot].def.persistence != RelationPersistence::Temporary
+                || self.tables[slot].def.schema != schema
             {
                 continue;
             }
-            match self.tables.read(slot).def.on_commit {
+            match self.tables[slot].def.on_commit {
                 OnCommitAction::PreserveRows => {}
                 OnCommitAction::DeleteRows => {
                     self.clear_table_rows(slot);
-                    self.tables.get_mut(slot).statistics = TableStatistics::EMPTY;
-                    self.tables.get_mut(slot).statistics_wal_dirty = false;
+                    self.tables[slot].statistics = TableStatistics::EMPTY;
+                    self.tables[slot].statistics_wal_dirty = false;
                     self.set_spill_list(slot, &[]);
                     self.refresh_enforcers(slot)?;
                 }
                 OnCommitAction::Drop => {
-                    let table = self.tables.read(slot).def.name;
+                    let table = self.tables[slot].def.name;
                     self.drop_indexes_for(schema.as_str(), table.as_str(), 0);
                     self.commit_indexes_for(schema.as_str(), table.as_str(), 0);
                     for sequence in 0..self.sequence_count() {
@@ -16028,17 +16027,17 @@ impl Storage {
 
     pub(crate) fn reset_unlogged_relations(&mut self) -> Result<(), SqlError> {
         for slot in 0..self.table_count() {
-            if !self.tables.read(slot).live
-                || self.tables.read(slot).def.persistence != RelationPersistence::Unlogged
+            if !self.tables[slot].live
+                || self.tables[slot].def.persistence != RelationPersistence::Unlogged
             {
                 continue;
             }
             self.clear_table_rows(slot);
             self.install_table_serial_values(slot, [0; MAX_COLUMNS]);
-            self.tables.get_mut(slot).statistics = TableStatistics::EMPTY;
-            self.tables.get_mut(slot).statistics_wal_dirty = false;
+            self.tables[slot].statistics = TableStatistics::EMPTY;
+            self.tables[slot].statistics_wal_dirty = false;
             self.set_spill_list(slot, &[]);
-            self.tables.get_mut(slot).mark_dirty();
+            self.tables[slot].mark_dirty();
             self.refresh_enforcers(slot)?;
             self.mark_value_bindings_dirty(slot);
         }
@@ -17382,8 +17381,7 @@ impl Storage {
             + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
             + 2 * config.collation_scratch_bytes
             + table_slot_capacity(config)
-                * (size_of::<std::sync::RwLock<Table>>()
-                    + FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
+                * (size_of::<Table>() + FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
             + table_slot_capacity(config)
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>())
@@ -17509,7 +17507,7 @@ impl Storage {
         let heap = RowHeap::new(budget, config.memtable_bytes)?;
         let foreign = foreign::ForeignCatalog::new(config, budget)?;
         let table_capacity = table_slot_capacity(config);
-        let mut tables = TableSlots::new(budget, table_capacity)?;
+        let mut tables = FixedVec::new(budget, "tables", table_capacity)?;
         let table_definition_images =
             definition_images::TableDefinitionImagePool::new(config, budget)?;
         budget.draw_array(
@@ -17550,7 +17548,7 @@ impl Storage {
                     ownership: Ownership::BOOTSTRAP,
                     pending_def_tail: None,
                     pending_def_txid: None,
-                    rows: FixedMap::new(
+                    rows: RowMap::new(
                         budget,
                         "table_rows",
                         if slot == config.max_tables {
@@ -17583,7 +17581,7 @@ impl Storage {
         }
         let large_object_page_table = config.max_tables as u32;
         {
-            let table = tables.get_mut(large_object_page_table as usize);
+            let table = &mut tables[large_object_page_table as usize];
             let mut definition = TableDef::empty();
             definition.schema =
                 SqlName::parse(INTERNAL_LARGE_OBJECT_SCHEMA).expect("internal schema name fits");
@@ -19827,23 +19825,21 @@ impl Storage {
             drop(type_catalog);
 
             for source_slot in 0..self.tables.len() {
-                if self.tables.read(source_slot).database != source
-                    || !self.tables.read(source_slot).live
-                {
+                if self.tables[source_slot].database != source || !self.tables[source_slot].live {
                     continue;
                 }
-                if self.tables.read(source_slot).def.persistence == RelationPersistence::Temporary {
+                if self.tables[source_slot].def.persistence == RelationPersistence::Temporary {
                     continue;
                 }
-                if self.tables.read(source_slot).pending_ddl.is_some()
-                    || self.tables.read(source_slot).pending_def_txid.is_some()
+                if self.tables[source_slot].pending_ddl.is_some()
+                    || self.tables[source_slot].pending_def_txid.is_some()
                 {
                     return Err(sql_err!(
                         sqlstate::OBJECT_IN_USE,
                         "template database has uncommitted relation state"
                     ));
                 }
-                let mut definition = self.tables.read(source_slot).def;
+                let mut definition = self.tables[source_slot].def;
                 for column in definition.columns.iter_mut().take(definition.n_columns) {
                     if let Collation::Catalog(source) = column.collation {
                         let target = collation_slots[usize::from(source)];
@@ -19856,11 +19852,11 @@ impl Storage {
                         column.collation = Collation::Catalog(target);
                     }
                 }
-                let created_at = self.tables.read(source_slot).created_at;
-                let ownership = self.tables.read(source_slot).ownership.committed();
-                let statistics = self.tables.read(source_slot).statistics;
+                let created_at = self.tables[source_slot].created_at;
+                let ownership = self.tables[source_slot].ownership.committed();
+                let statistics = self.tables[source_slot].statistics;
                 let serial_values = self.table_serial_values(source_slot);
-                let n_spill_ssts = self.tables.read(source_slot).n_spill_ssts;
+                let n_spill_ssts = self.tables[source_slot].n_spill_ssts;
                 let target_slot = self.alloc_table(
                     definition,
                     Some(PendingDdl {
@@ -19869,7 +19865,7 @@ impl Storage {
                     }),
                 )?;
                 {
-                    let target_table = self.tables.get_mut(target_slot);
+                    let target_table = &mut self.tables[target_slot];
                     target_table.created_at = created_at;
                     target_table.ownership = ownership;
                     target_table.statistics = statistics;
@@ -19883,18 +19879,15 @@ impl Storage {
                     target_table.n_spill_ssts = n_spill_ssts;
                 }
                 for member in 0..n_spill_ssts {
-                    let handle = self.tables.read(source_slot).spill_ssts[member];
-                    self.tables.get_mut(target_slot).spill_ssts[member] = handle;
+                    let handle = self.tables[source_slot].spill_ssts[member];
+                    self.tables[target_slot].spill_ssts[member] = handle;
                 }
-                let row_count = self.tables.read(source_slot).rows.len();
+                let row_count = self.tables[source_slot].rows.len();
                 for position in 0..row_count {
-                    let (rowid, mut state) = self
-                        .tables
-                        .read(source_slot)
+                    let (rowid, mut state) = self.tables[source_slot]
                         .rows
                         .iter()
                         .nth(position)
-                        .map(|(rowid, state)| (*rowid, *state))
                         .expect("row position remains stable while cloning another table");
                     if state.pending.len() != 0 {
                         return Err(sql_err!(
@@ -19907,8 +19900,7 @@ impl Storage {
                     // committed image. Snapshot-retention chains belong only
                     // to transactions reading the source database.
                     state.history = CommittedHistory::empty();
-                    self.tables
-                        .get_mut(target_slot)
+                    self.tables[target_slot]
                         .rows
                         .insert(rowid, state)
                         .map_err(|_| {
@@ -20351,16 +20343,12 @@ impl Storage {
                 let mut definition = self.policy(source_slot);
                 if definition.database != source
                     || definition.ddl_state != CatalogDdlState::Present
-                    || self
-                        .tables
-                        .read(usize::from(definition.table))
-                        .def
-                        .persistence
+                    || self.tables[usize::from(definition.table)].def.persistence
                         == RelationPersistence::Temporary
                 {
                     continue;
                 }
-                let source_table = self.tables.read(usize::from(definition.table)).def;
+                let source_table = self.tables[usize::from(definition.table)].def;
                 definition.table = self
                     .find_visible(
                         source_table.schema.as_str(),
@@ -20415,7 +20403,7 @@ impl Storage {
                 }
                 definition.target = match definition.target {
                     TriggerTarget::Table(source_table) => {
-                        let source_table = self.tables.read(usize::from(source_table)).def;
+                        let source_table = self.tables[usize::from(source_table)].def;
                         TriggerTarget::Table(
                             self.find_visible(
                                 source_table.schema.as_str(),
@@ -20483,16 +20471,12 @@ impl Storage {
                 let mut definition = self.extended_statistics(source_slot);
                 if definition.database != source
                     || definition.ddl_state != CatalogDdlState::Present
-                    || self
-                        .tables
-                        .read(usize::from(definition.table))
-                        .def
-                        .persistence
+                    || self.tables[usize::from(definition.table)].def.persistence
                         == RelationPersistence::Temporary
                 {
                     continue;
                 }
-                let source_table = self.tables.read(usize::from(definition.table)).def;
+                let source_table = self.tables[usize::from(definition.table)].def;
                 definition.table = self
                     .find_visible(
                         source_table.schema.as_str(),
@@ -20840,8 +20824,8 @@ impl Storage {
             // Partition links are runtime table slots. Rebind them only after
             // every target relation exists; names are the durable identity.
             for target_slot in 0..self.tables.len() {
-                if self.tables.read(target_slot).database != target
-                    || self.tables.read(target_slot).pending_ddl
+                if self.tables[target_slot].database != target
+                    || self.tables[target_slot].pending_ddl
                         != Some(PendingDdl {
                             txid,
                             creating: true,
@@ -20849,11 +20833,10 @@ impl Storage {
                 {
                     continue;
                 }
-                let Some(attachment) = self.tables.read(target_slot).def.partition.attachment
-                else {
+                let Some(attachment) = self.tables[target_slot].def.partition.attachment else {
                     continue;
                 };
-                let source_parent = &self.tables.read(usize::from(attachment.parent)).def;
+                let source_parent = &self.tables[usize::from(attachment.parent)].def;
                 let target_parent = self
                     .find_visible(
                         source_parent.schema.as_str(),
@@ -20866,12 +20849,11 @@ impl Storage {
                             "template partition parent was not cloned"
                         )
                     })?;
-                self.tables.get_mut(target_slot).def.partition.attachment =
-                    Some(PartitionAttachment {
-                        parent: target_parent as u16,
-                        bound: attachment.bound,
-                        state: attachment.state,
-                    });
+                self.tables[target_slot].def.partition.attachment = Some(PartitionAttachment {
+                    parent: target_parent as u16,
+                    bound: attachment.bound,
+                    state: attachment.state,
+                });
             }
             self.rebind_domain_base_types_to(txid)?;
             self.rebind_user_type_declarations_to(txid)?;
@@ -20891,7 +20873,7 @@ impl Storage {
                 continue;
             }
             let object_database = match entry.object.class {
-                AccessClass::Table => self.tables.read(usize::from(entry.object.slot)).database,
+                AccessClass::Table => self.tables[usize::from(entry.object.slot)].database,
                 AccessClass::View => self.view(usize::from(entry.object.slot)).database,
                 AccessClass::MaterializedView => {
                     self.matview(usize::from(entry.object.slot)).database
@@ -20950,7 +20932,7 @@ impl Storage {
             }
             let relation = entry.target.relation;
             let object_database = match relation.class {
-                AccessClass::Table => self.tables.read(usize::from(relation.slot)).database,
+                AccessClass::Table => self.tables[usize::from(relation.slot)].database,
                 AccessClass::View => self.view(usize::from(relation.slot)).database,
                 AccessClass::MaterializedView => self.matview(usize::from(relation.slot)).database,
                 _ => continue,
@@ -21022,16 +21004,16 @@ impl Storage {
             }
         }
         for slot in 0..self.tables.len() {
-            if self.tables.read(slot).database != database {
+            if self.tables[slot].database != database {
                 continue;
             }
             self.release_enforcers(slot);
             self.clear_pending_table_defs(slot);
             self.clear_pending_table_statistics(slot);
             self.clear_table_rows(slot);
-            self.tables.get_mut(slot).live = false;
-            self.tables.get_mut(slot).pending_ddl = None;
-            self.tables.get_mut(slot).database = DatabaseOid::POSTGRES;
+            self.tables[slot].live = false;
+            self.tables[slot].pending_ddl = None;
+            self.tables[slot].database = DatabaseOid::POSTGRES;
         }
         for (slot, schema) in self
             .schemas
@@ -21861,7 +21843,7 @@ impl Storage {
     fn ownership(&self, object: AccessObject) -> Ownership {
         let slot = object.slot as usize;
         match object.class {
-            AccessClass::Table => self.tables.read(slot).ownership,
+            AccessClass::Table => self.tables[slot].ownership,
             AccessClass::View => self.view(slot).ownership,
             AccessClass::MaterializedView => self.matview(slot).ownership,
             AccessClass::Sequence => self.sequence(slot).ownership,
@@ -21875,7 +21857,7 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics(slot).ownership,
             AccessClass::Extension => self.extension(slot).ownership,
             AccessClass::Trigger => match self.trigger(slot).target {
-                TriggerTarget::Table(table) => self.tables.read(usize::from(table)).ownership,
+                TriggerTarget::Table(table) => self.tables[usize::from(table)].ownership,
                 TriggerTarget::View(view) => self.view(usize::from(view)).ownership,
             },
             AccessClass::EventTrigger => self.event_trigger(slot).definition.ownership,
@@ -21894,7 +21876,7 @@ impl Storage {
     fn ownership_mut(&mut self, object: AccessObject) -> &mut Ownership {
         let slot = object.slot as usize;
         match object.class {
-            AccessClass::Table => &mut self.tables.get_mut(slot).ownership,
+            AccessClass::Table => &mut self.tables[slot].ownership,
             AccessClass::View => {
                 unreachable!("view ownership is synchronized separately")
             }
@@ -22423,7 +22405,7 @@ impl Storage {
     pub(crate) fn access_object_is_live_in_catalog(&self, object: AccessObject) -> bool {
         let slot = object.slot as usize;
         match object.class {
-            AccessClass::Table => self.tables.read(slot).live,
+            AccessClass::Table => self.tables[slot].live,
             AccessClass::View => self.view(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::MaterializedView => {
                 self.matview(slot).ddl_state == CatalogDdlState::Present
@@ -22466,7 +22448,7 @@ impl Storage {
         }
         let slot = object.slot as usize;
         match object.class {
-            AccessClass::Table => self.tables.read(slot).visible_to(txid),
+            AccessClass::Table => self.tables[slot].visible_to(txid),
             AccessClass::View => self.view(slot).visible_to(txid),
             AccessClass::MaterializedView => self.matview(slot).visible_to(txid),
             AccessClass::Sequence => self.sequence(slot).visible_to(txid),
@@ -22503,7 +22485,7 @@ impl Storage {
     pub(crate) fn access_object_database(&self, object: AccessObject) -> Option<DatabaseOid> {
         let slot = usize::from(object.slot);
         match object.class {
-            AccessClass::Table => Some(self.tables.read(slot).database),
+            AccessClass::Table => Some(self.tables[slot].database),
             AccessClass::View => Some(self.view(slot).database),
             AccessClass::MaterializedView => Some(self.matview(slot).database),
             AccessClass::Sequence => Some(self.sequence(slot).database),
@@ -22547,7 +22529,7 @@ impl Storage {
                 })?
             }
             AccessClass::Table => {
-                let created_at = self.tables.read(source_slot).created_at;
+                let created_at = self.tables[source_slot].created_at;
                 self.tables.iter().position(|candidate| {
                     candidate.database == target_database && candidate.created_at == created_at
                 })?
@@ -27123,7 +27105,7 @@ impl Storage {
             }
         }
         for table_slot in 0..self.tables.len() {
-            let table = self.tables.read(table_slot);
+            let table = &self.tables[table_slot];
             if table.database != current_database() || (!table.live && table.pending_ddl.is_none())
             {
                 continue;
@@ -27176,10 +27158,10 @@ impl Storage {
         drop(schemas);
 
         for table_slot in 0..self.tables.len() {
-            if self.tables.read(table_slot).database != current_database() {
+            if self.tables[table_slot].database != current_database() {
                 continue;
             }
-            let table = self.tables.get_mut(table_slot);
+            let table = &mut self.tables[table_slot];
             if !table.live && table.pending_ddl.is_none() {
                 continue;
             }
@@ -28532,9 +28514,7 @@ impl Storage {
     }
 
     /// Live SQL tables with their slot indices, excluding internal storage.
-    pub fn live_tables(
-        &self,
-    ) -> impl Iterator<Item = (usize, std::sync::RwLockReadGuard<'_, Table>)> {
+    pub fn live_tables(&self) -> impl Iterator<Item = (usize, &Table)> {
         self.tables.iter().enumerate().filter(|(slot, table)| {
             *slot != self.large_object_page_table()
                 && table.database == current_database()
@@ -28548,24 +28528,24 @@ impl Storage {
     /// a value at or below an existing row's would violate the key.
     pub fn reconcile_serials(&mut self) {
         for i in 0..self.tables.len() {
-            if !self.tables.read(i).live {
+            if !self.tables[i].live {
                 continue;
             }
-            let n_columns = self.tables.read(i).def.n_columns;
+            let n_columns = self.tables[i].def.n_columns;
             let mut auto = [false; MAX_COLUMNS];
             let mut any = false;
             for (c, slot) in auto.iter_mut().enumerate().take(n_columns) {
-                *slot = self.tables.read(i).def.columns()[c].auto_increment;
+                *slot = self.tables[i].def.columns()[c].auto_increment;
                 any |= *slot;
             }
             if !any {
                 continue;
             }
             let mut schema = [crate::sql::types::ColType::Bool; MAX_COLUMNS];
-            self.tables.read(i).def.schema(&mut schema);
+            self.tables[i].def.schema(&mut schema);
             let mut max = [0i64; MAX_COLUMNS];
             let mut rowids: Vec<(u64, RowHome)> = Vec::new();
-            for (&rowid, state) in self.tables.read(i).rows.iter() {
+            for (rowid, state) in self.tables[i].rows.iter() {
                 if let Some(home) = self.resident_visible_to(*state, 0) {
                     rowids.push((rowid, home));
                 }
@@ -28726,7 +28706,7 @@ impl Storage {
 
     /// Number of immutable row generations currently backing a table.
     pub(crate) fn spill_generation_count(&self, table_slot: usize) -> usize {
-        self.tables.read(table_slot).n_spill_ssts
+        self.tables[table_slot].n_spill_ssts
     }
 
     pub(crate) fn row_pending_last(&self, state: RowState) -> Option<PendingChange> {
@@ -28775,7 +28755,7 @@ impl Storage {
         slot: usize,
         emit: &mut dyn FnMut(u64, u32, u32, u64) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<(), SqlError> {
-        let table = self.tables.read(slot);
+        let table = &self.tables[slot];
         let n = table.n_spill_ssts;
         if n == 0 {
             return Ok(());
@@ -28866,7 +28846,7 @@ impl Storage {
                 member,
                 commit_lsn,
             }) = verdict
-                && self.tables.read(slot).rows.get(&rowid).is_none()
+                && self.tables[slot].rows.get(&rowid).is_none()
                 && emit(rowid, len, member, commit_lsn)?.is_break()
             {
                 return Ok(());
@@ -28896,7 +28876,7 @@ impl Storage {
             SpilledRowRepresentation<'a>,
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<bool, SqlError> {
-        let table = self.tables.read(slot);
+        let table = &self.tables[slot];
         let n = table.n_spill_ssts;
         if n == 0 {
             return Ok(true);
@@ -29033,14 +29013,12 @@ impl Storage {
                 commit_lsn,
             }) = verdict
                 && match overlay_mode {
-                    SpillOverlayMode::VisibleScan => self
-                        .tables
-                        .read(slot)
+                    SpillOverlayMode::VisibleScan => self.tables[slot]
                         .rows
                         .get(&rowid)
                         .is_none_or(Self::redundant_spilled_row_state),
                     SpillOverlayMode::CommittedCheckpoint => {
-                        self.tables.read(slot).rows.get(&rowid).is_none_or(|state| {
+                        self.tables[slot].rows.get(&rowid).is_none_or(|state| {
                             matches!(
                                 state.committed,
                                 Some(RowHome::Spilled {
@@ -29380,7 +29358,7 @@ impl Storage {
     /// any overlay requires the ordinary row-state seam to preserve MVCC
     /// shadowing and mixed physical ordering.
     pub(crate) fn spill_rows_are_unshadowed(&self, table_slot: usize) -> bool {
-        self.tables.read(table_slot).rows.is_empty()
+        self.tables[table_slot].rows.is_empty()
     }
 
     /// Whether an unshadowed sequential spill walk costs no more durable block
@@ -29595,7 +29573,7 @@ impl Storage {
         rowid: u64,
         snapshot: u64,
     ) -> Result<Option<SpillVersion>, SqlError> {
-        let table = self.tables.read(slot);
+        let table = &self.tables[slot];
         if table.n_spill_ssts == 0 {
             return Ok(None);
         }
@@ -29668,7 +29646,7 @@ impl Storage {
         {
             return Ok(());
         }
-        if self.tables.read(table_slot).n_spill_ssts == 0 {
+        if self.tables[table_slot].n_spill_ssts == 0 {
             return Ok(());
         }
         // Then everything that lives only in the bucket, synthesized.
@@ -29695,7 +29673,7 @@ impl Storage {
         table_slot: usize,
         each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        for (&rowid, state) in self.tables.read(table_slot).rows.iter() {
+        for (rowid, state) in self.tables[table_slot].rows.iter() {
             if each(rowid, *state)?.is_break() {
                 return Ok(core::ops::ControlFlow::Break(()));
             }
@@ -29708,8 +29686,8 @@ impl Storage {
         table_slot: usize,
         each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        for (&rowid, state) in self.tables.read(table_slot).rows.iter() {
-            if Self::redundant_spilled_row_state(state) {
+        for (rowid, state) in self.tables[table_slot].rows.iter() {
+            if Self::redundant_spilled_row_state(&state) {
                 continue;
             }
             if each(rowid, *state)?.is_break() {
@@ -29738,7 +29716,7 @@ impl Storage {
             CheckpointValueEntry<'entry>,
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<bool, SqlError> {
-        let rows = &self.tables.read(table_slot).rows;
+        let rows = self.tables[table_slot].rows.read();
         let mut walked = 0usize;
         while cursor.resident_slot < rows.backing_slot_count() && walked < max_rows {
             let slot = cursor.resident_slot;
@@ -29817,7 +29795,7 @@ impl Storage {
     ) -> Result<bool, SqlError> {
         let mut walked = 0usize;
         if !cursor.resident_done {
-            let rows = &self.tables.read(table_slot).rows;
+            let rows = self.tables[table_slot].rows.read();
             while cursor.resident_slot < rows.backing_slot_count() && walked < max_rows {
                 let slot = cursor.resident_slot;
                 cursor.resident_slot += 1;
@@ -29871,8 +29849,8 @@ impl Storage {
         }
 
         let mut schema = [ColType::Bool; MAX_COLUMNS];
-        let n_columns = self.tables.read(table_slot).def.schema(&mut schema);
-        let dependency_mask = self.tables.read(table_slot).enforcers[binding]
+        let n_columns = self.tables[table_slot].def.schema(&mut schema);
+        let dependency_mask = self.tables[table_slot].enforcers[binding]
             .expect("binding")
             .dependency_mask;
         // PAX source reads need only key, predicate, expression, and INCLUDE
@@ -29944,8 +29922,8 @@ impl Storage {
 
     /// One row's state by id, through the same seam as the enumeration.
     pub fn row_state(&self, table_slot: usize, rowid: u64) -> Result<Option<RowState>, SqlError> {
-        if let Some(state) = self.tables.read(table_slot).rows.get(&rowid) {
-            return Ok(Some(*state));
+        if let Some(state) = self.tables[table_slot].rows.get(&rowid) {
+            return Ok(Some(state));
         }
         Ok(self
             .spill_probe_at(table_slot, rowid, u64::MAX)?
@@ -29969,7 +29947,7 @@ impl Storage {
     /// by later changes without point-reading the immutable table for every
     /// unchanged index entry.
     pub(crate) fn resident_row_state(&self, table_slot: usize, rowid: u64) -> Option<RowState> {
-        self.tables.read(table_slot).rows.get(&rowid).copied()
+        self.tables[table_slot].rows.get(&rowid)
     }
 
     /// The single visibility choke point for heap and object-resident row
@@ -30170,7 +30148,7 @@ impl Storage {
             .checked_div(rows)
             .unwrap_or(0)
             .min(u64::from(u32::MAX)) as u32;
-        statistics.analyzed_generation = self.tables.read(table_slot).generation;
+        statistics.analyzed_generation = self.tables[table_slot].generation;
         for column in 0..n_columns {
             if !selected[column] {
                 continue;
@@ -30204,23 +30182,23 @@ impl Storage {
         // reltuples/relpages remain changed even if the surrounding
         // transaction rolls back. Column pg_statistic rows stay in the
         // transaction-private version written above.
-        let committed = &mut self.tables.get_mut(table_slot).statistics;
+        let committed = &mut self.tables[table_slot].statistics;
         committed.valid = statistics.valid;
         committed.rows = statistics.rows;
         committed.average_row_width = statistics.average_row_width;
         committed.analyzed_generation = statistics.analyzed_generation;
-        self.tables.get_mut(table_slot).statistics_dirty = true;
-        self.tables.get_mut(table_slot).statistics_wal_dirty = true;
+        self.tables[table_slot].statistics_dirty = true;
+        self.tables[table_slot].statistics_wal_dirty = true;
         Ok(statistics)
     }
 
     pub(crate) fn table_statistics(&self, table_slot: usize, txid: u32) -> TableStatistics {
-        if self.tables.read(table_slot).pending_statistics_txid == Some(txid)
-            && let Some(slot) = self.tables.read(table_slot).pending_statistics_tail
+        if self.tables[table_slot].pending_statistics_txid == Some(txid)
+            && let Some(slot) = self.tables[table_slot].pending_statistics_tail
         {
             return self.pending_table_statistics[slot as usize].statistics;
         }
-        self.tables.read(table_slot).statistics
+        self.tables[table_slot].statistics
     }
 
     pub(crate) fn pending_table_statistics(
@@ -30228,8 +30206,8 @@ impl Storage {
         table_slot: usize,
         txid: u32,
     ) -> Option<TableStatistics> {
-        (self.tables.read(table_slot).pending_statistics_txid == Some(txid))
-            .then(|| self.tables.read(table_slot).pending_statistics_tail)
+        (self.tables[table_slot].pending_statistics_txid == Some(txid))
+            .then(|| self.tables[table_slot].pending_statistics_tail)
             .flatten()
             .map(|slot| self.pending_table_statistics[slot as usize].statistics)
     }
@@ -30240,16 +30218,16 @@ impl Storage {
         txid: u32,
         statistics: TableStatistics,
     ) -> Result<(), SqlError> {
-        if let Some(owner) = self.tables.read(table_slot).pending_statistics_txid
+        if let Some(owner) = self.tables[table_slot].pending_statistics_txid
             && owner != txid
         {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "could not serialize ANALYZE of relation \"{}\"",
-                self.tables.read(table_slot).def.name.as_str()
+                self.tables[table_slot].def.name.as_str()
             ));
         }
-        let previous = self.tables.read(table_slot).pending_statistics_tail;
+        let previous = self.tables[table_slot].pending_statistics_tail;
         if previous.is_some_and(|slot| {
             self.pending_table_statistics[slot as usize].depth
                 >= self.max_catalog_versions_per_object
@@ -30257,7 +30235,7 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "relation \"{}\" exceeds max_catalog_versions_per_object ({})",
-                self.tables.read(table_slot).def.name.as_str(),
+                self.tables[table_slot].def.name.as_str(),
                 self.max_catalog_versions_per_object
             ));
         }
@@ -30296,46 +30274,42 @@ impl Storage {
                 slot
             }
         };
-        self.tables.get_mut(table_slot).pending_statistics_tail = Some(slot as u32);
-        self.tables.get_mut(table_slot).pending_statistics_txid = Some(txid);
+        self.tables[table_slot].pending_statistics_tail = Some(slot as u32);
+        self.tables[table_slot].pending_statistics_txid = Some(txid);
         Ok(())
     }
 
     pub(crate) fn rollback_table_statistics(&mut self, table_slot: usize, txid: u32) {
-        if self.tables.read(table_slot).pending_statistics_txid != Some(txid) {
+        if self.tables[table_slot].pending_statistics_txid != Some(txid) {
             return;
         }
-        let Some(slot) = self.tables.read(table_slot).pending_statistics_tail else {
+        let Some(slot) = self.tables[table_slot].pending_statistics_tail else {
             return;
         };
         let previous = self.pending_table_statistics[slot as usize].previous;
         self.pending_table_statistics[slot as usize].used = false;
-        self.tables.get_mut(table_slot).pending_statistics_tail = previous;
+        self.tables[table_slot].pending_statistics_tail = previous;
         if previous.is_none() {
-            self.tables.get_mut(table_slot).pending_statistics_txid = None;
+            self.tables[table_slot].pending_statistics_txid = None;
         }
     }
 
     fn clear_pending_table_statistics(&mut self, table_slot: usize) {
-        let mut tail = self
-            .tables
-            .get_mut(table_slot)
-            .pending_statistics_tail
-            .take();
+        let mut tail = self.tables[table_slot].pending_statistics_tail.take();
         while let Some(slot) = tail {
             let entry = &mut self.pending_table_statistics[slot as usize];
             tail = entry.previous;
             entry.used = false;
         }
-        self.tables.get_mut(table_slot).pending_statistics_txid = None;
+        self.tables[table_slot].pending_statistics_txid = None;
     }
 
     pub(crate) fn commit_table_statistics(&mut self, table_slot: usize, txid: u32) {
         let Some(statistics) = self.pending_table_statistics(table_slot, txid) else {
             return;
         };
-        self.tables.get_mut(table_slot).statistics = statistics;
-        self.tables.get_mut(table_slot).statistics_dirty = true;
+        self.tables[table_slot].statistics = statistics;
+        self.tables[table_slot].statistics_dirty = true;
         self.clear_pending_table_statistics(table_slot);
     }
 
@@ -30344,7 +30318,7 @@ impl Storage {
     /// while a spilled table uses a conservative floor until statistics are
     /// collected.
     pub(crate) fn planning_row_estimate(&self, table_slot: usize) -> u64 {
-        let table = self.tables.read(table_slot);
+        let table = &self.tables[table_slot];
         if table.statistics.valid {
             table.statistics.rows
         } else if table.n_spill_ssts == 0 {
@@ -30361,11 +30335,11 @@ impl Storage {
     }
 
     pub(crate) fn statistics_wal_dirty(&self, table_slot: usize) -> bool {
-        self.tables.read(table_slot).statistics_wal_dirty
+        self.tables[table_slot].statistics_wal_dirty
     }
 
     pub(crate) fn clear_statistics_wal_dirty(&mut self, table_slot: usize) {
-        self.tables.get_mut(table_slot).statistics_wal_dirty = false;
+        self.tables[table_slot].statistics_wal_dirty = false;
     }
 
     pub(crate) fn install_table_statistics(
@@ -30373,9 +30347,9 @@ impl Storage {
         table_slot: usize,
         statistics: TableStatistics,
     ) {
-        self.tables.get_mut(table_slot).statistics = statistics;
-        self.tables.get_mut(table_slot).statistics_dirty = false;
-        self.tables.get_mut(table_slot).statistics_wal_dirty = false;
+        self.tables[table_slot].statistics = statistics;
+        self.tables[table_slot].statistics_dirty = false;
+        self.tables[table_slot].statistics_wal_dirty = false;
         self.clear_pending_table_statistics(table_slot);
     }
 
@@ -30384,9 +30358,9 @@ impl Storage {
         table_slot: usize,
         statistics: TableStatistics,
     ) {
-        self.tables.get_mut(table_slot).statistics = statistics;
-        self.tables.get_mut(table_slot).statistics_dirty = true;
-        self.tables.get_mut(table_slot).statistics_wal_dirty = false;
+        self.tables[table_slot].statistics = statistics;
+        self.tables[table_slot].statistics_dirty = true;
+        self.tables[table_slot].statistics_wal_dirty = false;
         self.clear_pending_table_statistics(table_slot);
     }
 
@@ -30410,7 +30384,7 @@ impl Storage {
                         "row is spilled but no spill reader is attached"
                     ));
                 };
-                let Some(handle) = self.tables.read(table_slot)
+                let Some(handle) = self.tables[table_slot]
                     .spill_ssts
                     .get(sst as usize)
                     .copied()
@@ -30435,7 +30409,7 @@ impl Storage {
                         "spilled-row fetches nested deeper than the reader supports"
                     ));
                 };
-                let mut blocks = spill.relation_blocks(&self.tables.read(table_slot));
+                let mut blocks = spill.relation_blocks(&self.tables[table_slot]);
                 let SpillScratch {
                     index_buf,
                     data_buf,
@@ -30506,7 +30480,7 @@ impl Storage {
                         "row is spilled but no spill reader is attached"
                     ));
                 };
-                let Some(handle) = self.tables.read(table_slot)
+                let Some(handle) = self.tables[table_slot]
                     .spill_ssts
                     .get(sst as usize)
                     .copied()
@@ -30539,7 +30513,7 @@ impl Storage {
                 // through it).
                 let row_buf = &mut assembly_buf[..len as usize];
                 let got = {
-                    let mut blocks = spill.relation_blocks(&self.tables.read(table_slot));
+                    let mut blocks = spill.relation_blocks(&self.tables[table_slot]);
                     let mut reader = crate::store::SstReader::over(
                         index_buf,
                         data_buf,
@@ -30584,7 +30558,7 @@ impl Storage {
     /// installed on the tables; rows with no SST (empty tables) are left.
     pub fn evict_committed(&mut self) {
         for i in 0..self.tables.len() {
-            if self.tables.read(i).def.persistence != RelationPersistence::Temporary {
+            if self.tables[i].def.persistence != RelationPersistence::Temporary {
                 self.evict_committed_table(i);
             }
         }
@@ -30594,10 +30568,10 @@ impl Storage {
     /// residents. Temporary spill uses this narrower form because a durable
     /// table may have changed since its last manifest publication.
     pub(crate) fn evict_committed_table(&mut self, slot: usize) {
-        if !self.tables.read(slot).live || self.tables.read(slot).n_spill_ssts == 0 {
+        if !self.tables[slot].live || self.tables[slot].n_spill_ssts == 0 {
             return;
         }
-        let table = self.tables.get_mut(slot);
+        let table = &mut self.tables[slot];
         let newest = (table.n_spill_ssts - 1) as u32;
         for (_, state) in table.rows.iter_mut() {
             if let Some(RowHome::Heap(loc)) = state.committed {
@@ -30625,7 +30599,7 @@ impl Storage {
         generation: usize,
         through_lsn: u64,
     ) {
-        let table = self.tables.get_mut(slot);
+        let table = &mut self.tables[slot];
         debug_assert!(generation < table.n_spill_ssts);
         table.spill_through_lsn[generation] = through_lsn;
     }
@@ -30636,14 +30610,14 @@ impl Storage {
             &mut self.committed_row_versions,
             &mut self.committed_row_version_free,
         );
-        for (_, state) in tables.get_mut(slot).rows.iter_mut() {
+        for (_, state) in tables[slot].rows.iter_mut() {
             prune_committed_history(versions, free, &mut state.history, None);
         }
     }
 
     pub(crate) fn clear_table_dirty_through(&mut self, slot: usize, generation: u64) {
-        if self.tables.read(slot).generation == generation {
-            let table = self.tables.get_mut(slot);
+        if self.tables[slot].generation == generation {
+            let table = &mut self.tables[slot];
             table.dirty = false;
             for (_, state) in table.rows.iter_mut() {
                 state.checkpoint_change_lsn = 0;
@@ -30654,7 +30628,7 @@ impl Storage {
     /// A full rewrite: the new SST holds every committed row, so the list
     /// collapses to it and every spilled map entry is remapped to slot 0.
     pub(crate) fn collapse_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
-        let table = self.tables.get_mut(slot);
+        let table = &mut self.tables[slot];
         table.spill_ssts.fill(None);
         table.spill_through_lsn.fill(0);
         table.spill_ssts[0] = Some(handle);
@@ -30684,7 +30658,7 @@ impl Storage {
         at: usize,
         handle: Option<crate::store::SstHandle>,
     ) {
-        let table = self.tables.get_mut(slot);
+        let table = &mut self.tables[slot];
         let removed = if handle.is_some() { 1u32 } else { 2u32 };
         let mut n = 0;
         table.spill_ssts.copy_within(0..at, 0);
@@ -30732,7 +30706,7 @@ impl Storage {
     /// existing spilled entries keep their slots. The caller guarantees the
     /// list has room.
     pub(crate) fn append_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
-        let table = self.tables.get_mut(slot);
+        let table = &mut self.tables[slot];
         assert!(
             table.n_spill_ssts < table.spill_ssts.len(),
             "delta flush into a full list"
@@ -30754,7 +30728,7 @@ impl Storage {
         len: usize,
         handles: impl Iterator<Item = crate::store::SstHandle>,
     ) {
-        let table = self.tables.get_mut(slot);
+        let table = &mut self.tables[slot];
         assert!(
             len <= table.spill_ssts.len(),
             "validated spill list fits configured capacity"
@@ -30778,13 +30752,13 @@ impl Storage {
     /// referencing their SST tombstones has published. A failed publication
     /// keeps the markers, so its retry cannot lose a delete.
     pub(crate) fn clear_tombstones(&mut self, slot: usize) {
-        let table = self.tables.get_mut(slot);
+        let table = &mut self.tables[slot];
         // The installed SSTs now carry (or moot) every deletion, so the row
         // overlay markers are done shadowing older generations.
         loop {
             let mut batch = [0u64; 512];
             let mut n = 0usize;
-            for (&rowid, state) in table.rows.iter() {
+            for (rowid, state) in table.rows.iter() {
                 if state.committed.is_none() && state.history.is_empty() && state.pending.is_none()
                 {
                     batch[n] = rowid;
@@ -31211,7 +31185,7 @@ impl Storage {
             if !table.live && table.pending_ddl.is_none() {
                 continue;
             }
-            for (&rowid, state) in table.rows.iter() {
+            for (rowid, state) in table.rows.iter() {
                 let overflow = |e| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -31276,8 +31250,7 @@ impl Storage {
             };
             match image {
                 RowHeapImage::Committed => {
-                    self.tables
-                        .get_mut(table_index as usize)
+                    self.tables[table_index as usize]
                         .rows
                         .get_mut(&rowid)
                         .expect("scratch entries come from the maps")
@@ -31332,9 +31305,7 @@ impl Storage {
         loc: Option<RowLoc>,
         track_statistics: bool,
     ) -> Result<Option<Option<RowLoc>>, SqlError> {
-        if let Some(owner) = self
-            .tables
-            .read(table_index)
+        if let Some(owner) = self.tables[table_index]
             .pending_def_txid
             .filter(|owner| *owner != txid)
         {
@@ -31345,9 +31316,7 @@ impl Storage {
             ));
         }
         let oldest_snapshot = self.oldest_snapshot();
-        let conflicting_owner = self
-            .tables
-            .read(table_index)
+        let conflicting_owner = self.tables[table_index]
             .rows
             .get(&rowid)
             .and_then(|state| self.row_locked_by_other(*state, txid));
@@ -31358,13 +31327,13 @@ impl Storage {
                 "statement is waiting for a concurrent row update"
             ));
         }
-        let existed = match self.tables.read(table_index).rows.get(&rowid) {
+        let existed = match self.tables[table_index].rows.get(&rowid) {
             Some(state) => self.resident_visible_to(*state, txid).is_some(),
             None => self
                 .spill_probe_at(table_index, rowid, u64::MAX)?
                 .is_some_and(|version| version.len.is_some()),
         };
-        if let Some(state) = self.tables.read(table_index).rows.get(&rowid).copied() {
+        if let Some(state) = self.tables[table_index].rows.get(&rowid) {
             let (changed_columns, changes_existence) = self.pending_change_footprint(
                 table_index,
                 rowid,
@@ -31396,19 +31365,15 @@ impl Storage {
                     &mut self.committed_row_versions,
                     &mut self.committed_row_version_free,
                 );
-                let state = tables
-                    .get_mut(table_index)
+                let state = tables[table_index]
                     .rows
                     .get_mut(&rowid)
                     .expect("row state was just observed");
                 prune_committed_history(versions, free, &mut state.history, oldest_snapshot);
             }
-            let state = self
-                .tables
-                .read(table_index)
+            let state = self.tables[table_index]
                 .rows
                 .get(&rowid)
-                .copied()
                 .expect("row state was just observed");
             if oldest_snapshot.is_some()
                 && state.pending.is_none()
@@ -31427,8 +31392,7 @@ impl Storage {
                 &mut self.pending_row_versions,
                 &mut self.pending_row_version_free,
             );
-            let state = tables
-                .get_mut(table_index)
+            let state = tables[table_index]
                 .rows
                 .get_mut(&rowid)
                 .expect("row state was just observed");
@@ -31475,17 +31439,15 @@ impl Storage {
             txid,
             track_statistics,
         )?;
-        let table = self.tables.get_mut(table_index);
+        let table = &mut self.tables[table_index];
         if table.rows.len() == table.rows.capacity() {
             // Entries the spill lists reproduce are droppable on demand.
             self.evict_redundant_entries(table_index);
-            if self.tables.read(table_index).rows.len()
-                == self.tables.read(table_index).rows.capacity()
-            {
+            if self.tables[table_index].rows.len() == self.tables[table_index].rows.capacity() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "table row limit reached ({} rows in memtable)",
-                    self.tables.read(table_index).rows.capacity()
+                    self.tables[table_index].rows.capacity()
                 ));
             }
         }
@@ -31503,8 +31465,7 @@ impl Storage {
                 changes_existence,
             },
         )?;
-        self.tables
-            .get_mut(table_index)
+        self.tables[table_index]
             .rows
             .insert(
                 rowid,
@@ -31536,20 +31497,20 @@ impl Storage {
         txid: u32,
         track_statistics: bool,
     ) -> Result<(ColumnSet, bool), SqlError> {
-        let columns = self.tables.read(table_index).def.n_columns;
+        let columns = self.tables[table_index].def.n_columns;
         let all_columns = ColumnSet::all(columns);
         // Row rewrites and changes under a transaction-private definition can
         // use a different physical schema. Their enforcers are rebuilt at the
         // DDL boundary, so conservative invalidation is both sufficient and
         // avoids comparing unlike encodings.
-        if !track_statistics || self.tables.read(table_index).pending_def_txid == Some(txid) {
+        if !track_statistics || self.tables[table_index].pending_def_txid == Some(txid) {
             return Ok((all_columns, committed.is_some() != pending.is_some()));
         }
         let (Some(committed), Some(pending)) = (committed, pending) else {
             return Ok((all_columns, committed.is_some() != pending.is_some()));
         };
         let mut schema = [ColType::Bool; MAX_COLUMNS];
-        self.tables.read(table_index).def.schema(&mut schema);
+        self.tables[table_index].def.schema(&mut schema);
         let pending_bytes = self.heap.get(pending);
         let mut pending_payloads = [&[][..]; MAX_COLUMNS];
         let mut pending_nulls = [false; MAX_COLUMNS];
@@ -31588,15 +31549,15 @@ impl Storage {
     /// is what unbinds a table's row count from `table_rows`: the map holds
     /// the working set, the bucket holds the rest.
     pub fn evict_redundant_entries(&mut self, slot: usize) {
-        let table = self.tables.get_mut(slot);
+        let table = &mut self.tables[slot];
         if table.n_spill_ssts == 0 {
             return;
         }
         loop {
             let mut batch = [0u64; 512];
             let mut n = 0usize;
-            for (&rowid, state) in table.rows.iter() {
-                if Self::redundant_spilled_row_state(state) {
+            for (rowid, state) in table.rows.iter() {
+                if Self::redundant_spilled_row_state(&state) {
                     batch[n] = rowid;
                     n += 1;
                     if n == batch.len() {
@@ -31667,7 +31628,7 @@ impl Storage {
     /// half full sheds its redundant entries.
     pub fn evict_entries(&mut self) {
         for i in 0..self.tables.len() {
-            let table = self.tables.read(i);
+            let table = &self.tables[i];
             if !table.live
                 || table.n_spill_ssts == 0
                 || table.rows.len() * 100 < table.rows.capacity() * 50
@@ -31689,7 +31650,7 @@ impl Storage {
         txid: u32,
         prior: Option<Option<RowLoc>>,
     ) {
-        let Some(state) = self.tables.read(table_index).rows.get(&rowid).copied() else {
+        let Some(state) = self.tables[table_index].rows.get(&rowid) else {
             return;
         };
         // Only touch a pending change this transaction owns (or an empty slot).
@@ -31705,8 +31666,7 @@ impl Storage {
                     &mut self.pending_row_versions,
                     &mut self.pending_row_version_free,
                 );
-                let state = tables
-                    .get_mut(table_index)
+                let state = tables[table_index]
                     .rows
                     .get_mut(&rowid)
                     .expect("row state was just observed");
@@ -31714,9 +31674,9 @@ impl Storage {
                 if (state.committed.is_none()
                     && state.history.is_empty()
                     && state.pending.is_none())
-                    || Self::redundant_spilled_row_state(state)
+                    || Self::redundant_spilled_row_state(&state)
                 {
-                    tables.get_mut(table_index).rows.remove(&rowid);
+                    tables[table_index].rows.remove(&rowid);
                 }
             }
             Some(loc) => {
@@ -31735,10 +31695,10 @@ impl Storage {
         rowid: u64,
         commit_lsn: u64,
     ) -> Result<(), SqlError> {
-        if self.tables.read(table_index).n_spill_ssts == 0 {
+        if self.tables[table_index].n_spill_ssts == 0 {
             if self.remove_row_state(table_index, rowid).is_some() {
                 self.mark_value_bindings_changed_at(table_index, commit_lsn);
-                self.tables.get_mut(table_index).mark_dirty();
+                self.tables[table_index].mark_dirty();
             }
             return Ok(());
         }
@@ -31746,7 +31706,7 @@ impl Storage {
         // tombstone (for the next flush) and leave a shadowing marker (for
         // reads until then) — same discipline as a committed DELETE.
         self.remove_row_state(table_index, rowid);
-        let table = self.tables.get_mut(table_index);
+        let table = &mut self.tables[table_index];
         table
             .rows
             .insert(
@@ -31767,7 +31727,7 @@ impl Storage {
                 )
             })?;
         self.mark_value_bindings_changed_at(table_index, commit_lsn);
-        let table = self.tables.get_mut(table_index);
+        let table = &mut self.tables[table_index];
         table.mark_dirty();
         Ok(())
     }
@@ -31777,7 +31737,7 @@ impl Storage {
     pub fn commit_row(&mut self, table_index: usize, rowid: u64, txid: u32, commit_lsn: u64) {
         // Read the transition without holding a mutable borrow.
         let (old_committed, old_lsn, pending) = {
-            let Some(state) = self.tables.read(table_index).rows.get(&rowid) else {
+            let Some(state) = self.tables[table_index].rows.get(&rowid) else {
                 return;
             };
             match pending_last(&self.pending_row_versions, state.pending) {
@@ -31790,8 +31750,8 @@ impl Storage {
         // the new one. The row images are still readable (committed not yet
         // repointed, new bytes already in the heap).
         self.maintain_indexes_on_commit(table_index, rowid, new_loc);
-        let n_enforcers = self.tables.read(table_index).n_enforcers;
-        for enforcer in self.tables.get_mut(table_index).enforcers[..n_enforcers]
+        let n_enforcers = self.tables[table_index].n_enforcers;
+        for enforcer in self.tables[table_index].enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
         {
@@ -31812,7 +31772,7 @@ impl Storage {
                 &mut self.pending_row_versions,
                 &mut self.pending_row_version_free,
             );
-            let state = tables.get_mut(table_index)
+            let state = tables[table_index]
                 .rows
                 .get_mut(&rowid)
                 .expect("row present after read");
@@ -31841,11 +31801,10 @@ impl Storage {
             state.checkpoint_change_lsn = commit_lsn;
             clear_pending_versions(pending_versions, pending_free, &mut state.pending);
         }
-        let table = self.tables.get_mut(table_index);
+        let table = &mut self.tables[table_index];
         let state = table
             .rows
             .get(&rowid)
-            .copied()
             .expect("row present after commit");
         if state.committed.is_none() {
             // A rowid that ever reached an SST — even if its latest version was
@@ -31875,7 +31834,7 @@ impl Storage {
         commit_lsn: u64,
     ) {
         let new_loc = {
-            let Some(state) = self.tables.read(table_index).rows.get(&rowid) else {
+            let Some(state) = self.tables[table_index].rows.get(&rowid) else {
                 return;
             };
             match pending_last(&self.pending_row_versions, state.pending) {
@@ -31891,7 +31850,7 @@ impl Storage {
                 &mut self.pending_row_versions,
                 &mut self.pending_row_version_free,
             );
-            let state = tables.get_mut(table_index)
+            let state = tables[table_index]
                 .rows
                 .get_mut(&rowid)
                 .expect("row present after read");
@@ -31903,17 +31862,16 @@ impl Storage {
             state.checkpoint_change_lsn = commit_lsn;
             clear_pending_versions(pending_versions, pending_free, &mut state.pending);
         }
-        let table = self.tables.get_mut(table_index);
+        let table = &mut self.tables[table_index];
         let state = table
             .rows
             .get(&rowid)
-            .copied()
             .expect("row present after rewrite");
         if state.committed.is_none() && table.n_spill_ssts == 0 {
             table.rows.remove(&rowid);
         }
         self.mark_value_bindings_rebuild_at(table_index, commit_lsn);
-        let table = self.tables.get_mut(table_index);
+        let table = &mut self.tables[table_index];
         table.mark_dirty();
     }
 
@@ -31929,7 +31887,7 @@ impl Storage {
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
         let mut schema = [ColType::Bool; MAX_COLUMNS];
-        let n_columns = self.tables.read(table_index).def.schema(&mut schema);
+        let n_columns = self.tables[table_index].def.schema(&mut schema);
         let arena = self
             .index_arena
             .lock()
@@ -31953,7 +31911,7 @@ impl Storage {
         values: &[Datum],
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
-        let n_enforcers = self.tables.read(table_index).n_enforcers;
+        let n_enforcers = self.tables[table_index].n_enforcers;
         let mut n_out = 0;
         for binding in 0..n_enforcers {
             self.with_value_binding_values(
@@ -31992,7 +31950,7 @@ impl Storage {
         home: RowHome,
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = table.def.schema(&mut schema);
         let arena = self
@@ -32025,7 +31983,7 @@ impl Storage {
         values: &[Datum],
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         let enforcer = table.enforcers[binding].expect("binding");
         let mut key = [Datum::Null; MAX_INDEX_COLS];
         let index;
@@ -32093,7 +32051,7 @@ impl Storage {
         rowid: u64,
         new_loc: Option<RowLoc>,
     ) {
-        if self.tables.read(table_index).n_enforcers == 0 {
+        if self.tables[table_index].n_enforcers == 0 {
             return;
         }
         let mut inserts = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
@@ -32107,9 +32065,9 @@ impl Storage {
         for (i, s) in slots
             .iter_mut()
             .enumerate()
-            .take(self.tables.read(table_index).n_enforcers)
+            .take(self.tables[table_index].n_enforcers)
         {
-            *s = self.tables.read(table_index).enforcers[i]
+            *s = self.tables[table_index].enforcers[i]
                 .expect("enforcer")
                 .slot;
         }
@@ -32117,7 +32075,7 @@ impl Storage {
             .value_indexes
             .as_mut()
             .expect("value index pool present");
-        for &slot in &slots[..self.tables.read(table_index).n_enforcers] {
+        for &slot in &slots[..self.tables[table_index].n_enforcers] {
             pool.get_mut(slot).remove_rowid(rowid);
         }
         for &(ei, hash) in &inserts[..n_inserts] {
@@ -32144,7 +32102,7 @@ impl Storage {
         hash: u64,
         visit: impl FnMut(u64, Option<&[u8]>) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         let Some(i) = (0..table.n_enforcers).find(|index| {
             let enforcer = table.enforcers[*index].expect("enforcer present");
             enforcer.index_created_at.is_none() && enforcer.columns() == columns
@@ -32161,7 +32119,7 @@ impl Storage {
         hash: u64,
         mut visit: impl FnMut(u64, Option<&[u8]>) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         if i < table.n_enforcers {
             let e = table.enforcers[i].expect("enforcer present");
             let index = self
@@ -32235,7 +32193,7 @@ impl Storage {
             // committed change remains in the bounded resident overlay
             // until its replacement generation publishes.
             let mut hashes = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
-            for (&rowid, state) in self.tables.read(table_index).rows.iter() {
+            for (rowid, state) in self.tables[table_index].rows.iter() {
                 if state.committed_lsn <= handle.published_lsn {
                     continue;
                 }
@@ -32262,7 +32220,7 @@ impl Storage {
     }
 
     pub fn value_cache_complete(&self, table_index: usize, columns: &[u16]) -> bool {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         (0..table.n_enforcers).any(|index| {
             let enforcer = table.enforcers[index].expect("enforcer present");
             enforcer.index_created_at.is_none()
@@ -32277,7 +32235,7 @@ impl Storage {
     }
 
     pub fn value_probe_complete(&self, table_index: usize, columns: &[u16]) -> bool {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         (0..table.n_enforcers).any(|index| {
             let enforcer = table.enforcers[index].expect("enforcer present");
             enforcer.index_created_at.is_none()
@@ -32295,7 +32253,7 @@ impl Storage {
     }
 
     pub fn value_durable_complete(&self, table_index: usize, columns: &[u16]) -> bool {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         (0..table.n_enforcers).any(|index| {
             let enforcer = table.enforcers[index].expect("enforcer present");
             enforcer.index_created_at.is_none()
@@ -32311,7 +32269,7 @@ impl Storage {
         table_index: usize,
         created_at: u64,
     ) -> Option<usize> {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         (0..table.n_enforcers).find(|binding| {
             table.enforcers[*binding]
                 .is_some_and(|enforcer| enforcer.index_created_at == Some(created_at))
@@ -32590,7 +32548,7 @@ impl Storage {
     }
 
     pub(crate) fn value_binding_cache_complete(&self, table_index: usize, binding: usize) -> bool {
-        self.tables.read(table_index).enforcers[binding].is_some_and(|enforcer| {
+        self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
             self.value_indexes
                 .as_ref()
                 .expect("value index pool present")
@@ -32600,7 +32558,7 @@ impl Storage {
     }
 
     pub(crate) fn value_binding_probe_complete(&self, table_index: usize, binding: usize) -> bool {
-        self.tables.read(table_index).enforcers[binding].is_some_and(|enforcer| {
+        self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
             self.value_indexes
                 .as_ref()
                 .expect("value index pool present")
@@ -32620,7 +32578,7 @@ impl Storage {
         self.spill
             .as_ref()
             .is_some_and(|spill| spill.blocks.is_some())
-            && self.tables.read(table_index).enforcers[binding].is_some_and(|enforcer| {
+            && self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
                 enforcer
                     .durable
                     .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn)
@@ -32632,7 +32590,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> ([ColType; MAX_INDEX_COLS], usize) {
-        let enforcer = self.tables.read(table_index).enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         (enforcer.key_types, enforcer.n_cols)
     }
 
@@ -32643,14 +32601,14 @@ impl Storage {
     ) -> Option<crate::store::NavigationSpec> {
         use crate::sql::types::{GinOperatorClass, GistOperatorClass, SpGistOperatorClass};
         use crate::store::{NavigationKind, NavigationSpec};
-        let enforcer = self.tables.read(table_index).enforcers[binding]?;
+        let enforcer = self.tables[table_index].enforcers[binding]?;
         let created_at = enforcer.index_created_at?;
         let index = self
             .index_catalog()
             .iter()
             .find(|index| {
                 index.created_at == created_at
-                    && index.database == self.tables.read(table_index).database
+                    && index.database == self.tables[table_index].database
                     && index.ddl_state != CatalogDdlState::Absent
             })
             .copied()?;
@@ -32727,7 +32685,7 @@ impl Storage {
                 "posting summaries require an encoded token"
             ));
         }
-        let enforcer = self.tables.read(table_index).enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         if usize::from(navigation.position) >= enforcer.n_cols {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -32770,7 +32728,7 @@ impl Storage {
                     "posting token extraction requires a GIN binding"
                 )
             })?;
-        let enforcer = self.tables.read(table_index).enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         let position = usize::from(navigation.position);
         let mut values = [Datum::Null; MAX_INDEX_COLS];
         rowenc::decode(
@@ -32787,7 +32745,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> ([Collation; MAX_INDEX_COLS], usize) {
-        let enforcer = self.tables.read(table_index).enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         (enforcer.collations, enforcer.n_cols)
     }
 
@@ -32796,7 +32754,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> Option<u64> {
-        self.tables.read(table_index).enforcers[binding]
+        self.tables[table_index].enforcers[binding]
             .expect("binding")
             .index_created_at
     }
@@ -32809,7 +32767,7 @@ impl Storage {
         columns: &[u16],
         mut visit: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         let Some((binding, handle)) = (0..table.n_enforcers).find_map(|binding| {
             let enforcer = table.enforcers[binding].expect("enforcer");
             (enforcer.index_created_at.is_none() && enforcer.columns() == columns)
@@ -32861,7 +32819,7 @@ impl Storage {
         // Overlay entries supersede or extend the published base. Duplicate
         // rowids are harmless because the ordinary WHERE/MVCC path rechecks
         // them; callers sort and deduplicate candidates before execution.
-        for (&rowid, state) in table.rows.iter() {
+        for (rowid, state) in table.rows.iter() {
             if state.committed_lsn <= handle.published_lsn {
                 continue;
             }
@@ -32891,7 +32849,7 @@ impl Storage {
         classify: impl FnMut(&[u8]) -> Result<crate::store::ValueIndexPosition, SqlError>,
         visit: impl FnMut(u64, u64, &[u8], &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         let Some(binding) = (0..table.n_enforcers).find(|binding| {
             let enforcer = table.enforcers[*binding].expect("enforcer");
             enforcer.index_created_at.is_none() && enforcer.columns() == columns
@@ -32926,7 +32884,7 @@ impl Storage {
         mut classify: impl FnMut(&[u8]) -> Result<crate::store::ValueIndexPosition, SqlError>,
         mut visit: impl FnMut(u64, u64, &[u8], &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         let Some(handle) = table.enforcers[binding].and_then(|enforcer| enforcer.durable) else {
             return Ok(false);
         };
@@ -32980,7 +32938,7 @@ impl Storage {
                 return Err(error);
             }
         }
-        for (&rowid, state) in table.rows.iter() {
+        for (rowid, state) in table.rows.iter() {
             if state.committed_lsn <= handle.published_lsn {
                 continue;
             }
@@ -33023,7 +32981,7 @@ impl Storage {
             &[u8],
         ) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         let Some(handle) = table.enforcers[binding].and_then(|enforcer| enforcer.durable) else {
             return Ok(false);
         };
@@ -33048,7 +33006,7 @@ impl Storage {
 
         // New committed keys are not in the immutable generation. Rank them
         // before opening the tree so they participate in the initial cutoff.
-        for (&rowid, state) in table.rows.iter() {
+        for (rowid, state) in table.rows.iter() {
             if state.committed_lsn <= handle.published_lsn {
                 continue;
             }
@@ -33146,7 +33104,7 @@ impl Storage {
                 )
                 .map_err(value_index_read_error);
         }
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         let Some(state) = table.rows.get(&rowid) else {
             return Ok(false);
         };
@@ -33179,7 +33137,7 @@ impl Storage {
         token: crate::sql::index_signature::PostingToken,
         mut visit: impl FnMut(u64, u64) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         let Some(navigation) = self
             .value_binding_navigation(table_index, binding)
             .filter(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
@@ -33281,7 +33239,7 @@ impl Storage {
                 return Err(error);
             }
         }
-        for (&rowid, state) in table.rows.iter() {
+        for (rowid, state) in table.rows.iter() {
             if state.committed_lsn <= handle.published_lsn {
                 continue;
             }
@@ -33309,7 +33267,7 @@ impl Storage {
     }
 
     pub(crate) fn value_binding_count(&self, table_index: usize) -> usize {
-        self.tables.read(table_index).n_enforcers
+        self.tables[table_index].n_enforcers
     }
 
     pub(crate) fn value_binding_columns(
@@ -33317,7 +33275,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> ([u16; MAX_INDEX_COLS], usize) {
-        let enforcer = self.tables.read(table_index).enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         (enforcer.columns, enforcer.n_cols)
     }
 
@@ -33326,7 +33284,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> ColumnSet {
-        self.tables.read(table_index).enforcers[binding]
+        self.tables[table_index].enforcers[binding]
             .expect("binding")
             .include_mask
     }
@@ -33336,13 +33294,13 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> Option<crate::store::ValueIndexHandle> {
-        self.tables.read(table_index).enforcers[binding]
+        self.tables[table_index].enforcers[binding]
             .expect("binding")
             .durable
     }
 
     pub(crate) fn value_binding_needs_publish(&self, table_index: usize, binding: usize) -> bool {
-        self.tables.read(table_index).enforcers[binding]
+        self.tables[table_index].enforcers[binding]
             .expect("binding")
             .durable_dirty
     }
@@ -33352,7 +33310,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> Option<u64> {
-        let enforcer = self.tables.read(table_index).enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         enforcer.durable_dirty.then_some(enforcer.durable_dirty_lsn)
     }
 
@@ -33361,7 +33319,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> bool {
-        self.tables.read(table_index).enforcers[binding]
+        self.tables[table_index].enforcers[binding]
             .expect("binding")
             .durable_rebuild
     }
@@ -33375,8 +33333,8 @@ impl Storage {
     }
 
     pub(crate) fn mark_value_bindings_changed_at(&mut self, table_index: usize, dirty_lsn: u64) {
-        let n_enforcers = self.tables.read(table_index).n_enforcers;
-        for enforcer in self.tables.get_mut(table_index).enforcers[..n_enforcers]
+        let n_enforcers = self.tables[table_index].n_enforcers;
+        for enforcer in self.tables[table_index].enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
         {
@@ -33387,8 +33345,8 @@ impl Storage {
 
     fn mark_value_bindings_rebuild_at(&mut self, table_index: usize, dirty_lsn: u64) {
         self.mark_value_bindings_changed_at(table_index, dirty_lsn);
-        let n_enforcers = self.tables.read(table_index).n_enforcers;
-        for enforcer in self.tables.get_mut(table_index).enforcers[..n_enforcers]
+        let n_enforcers = self.tables[table_index].n_enforcers;
+        for enforcer in self.tables[table_index].enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
         {
@@ -33397,9 +33355,9 @@ impl Storage {
     }
 
     pub(crate) fn value_binding_is_committed(&self, table_index: usize, binding: usize) -> bool {
-        let enforcer = self.tables.read(table_index).enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         if let Some(created_at) = enforcer.index_created_at {
-            let table = self.tables.read(table_index);
+            let table = &self.tables[table_index];
             return self.index_catalog().iter().any(|index| {
                 index.ddl_state == CatalogDdlState::Present
                     && index.database == table.database
@@ -33409,7 +33367,7 @@ impl Storage {
             });
         }
         let columns = enforcer.columns();
-        let table = self.tables.read(table_index);
+        let table = &self.tables[table_index];
         let definition = &table.def;
         definition
             .columns()
@@ -33447,8 +33405,8 @@ impl Storage {
         include_mask: ColumnSet,
         handle: Option<crate::store::ValueIndexHandle>,
     ) -> Result<(), SqlError> {
-        let n_enforcers = self.tables.read(table_index).n_enforcers;
-        let Some(enforcer) = self.tables.get_mut(table_index).enforcers[..n_enforcers]
+        let n_enforcers = self.tables[table_index].n_enforcers;
+        let Some(enforcer) = self.tables[table_index].enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
             .find(|enforcer| {
@@ -33572,7 +33530,7 @@ impl Storage {
         left: &[u8],
         right: &[u8],
     ) -> Result<core::cmp::Ordering, SqlError> {
-        let enforcer = self.tables.read(table_index).enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         if navigation
             .is_some_and(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
         {
@@ -33684,7 +33642,7 @@ impl Storage {
     /// value cache: row visibility ignores them and the committed key remains
     /// installed until their transaction commits.
     pub(crate) fn has_visible_pending_rows(&self, table_index: usize, txid: u32) -> bool {
-        self.tables.read(table_index).rows.iter().any(|(_, state)| {
+        self.tables[table_index].rows.iter().any(|(_, state)| {
             pending_visible_at(
                 &self.pending_row_versions,
                 state.pending,
@@ -33699,13 +33657,13 @@ impl Storage {
     /// enforcer list. Called before a slot is reused and when a table is
     /// dropped.
     fn release_enforcers(&mut self, table_index: usize) {
-        let n = self.tables.read(table_index).n_enforcers;
+        let n = self.tables[table_index].n_enforcers;
         if n == 0 {
             return;
         }
         let mut slots = [u32::MAX; MAX_VALUE_ENFORCERS];
         for (i, s) in slots.iter_mut().enumerate().take(n) {
-            if let Some(e) = self.tables.read(table_index).enforcers[i] {
+            if let Some(e) = self.tables[table_index].enforcers[i] {
                 *s = e.slot;
             }
         }
@@ -33716,8 +33674,8 @@ impl Storage {
                 }
             }
         }
-        self.tables.get_mut(table_index).enforcers = [None; MAX_VALUE_ENFORCERS];
-        self.tables.get_mut(table_index).n_enforcers = 0;
+        self.tables[table_index].enforcers = [None; MAX_VALUE_ENFORCERS];
+        self.tables[table_index].n_enforcers = 0;
     }
 
     /// Rebuilds every live table's value-index enforcers from its committed
@@ -33726,7 +33684,7 @@ impl Storage {
     /// recovered committed state before any query runs.
     pub fn rebuild_all_enforcers(&mut self) -> Result<(), SqlError> {
         for i in 0..self.tables.len() {
-            if self.tables.read(i).live {
+            if self.tables[i].live {
                 self.refresh_enforcers(i)?;
             }
         }
@@ -33762,9 +33720,9 @@ impl Storage {
         // DDL reshapes the cache slots, but an unchanged column tuple keeps
         // its manifest-published object generation.
         let mut published = [None; MAX_VALUE_ENFORCERS];
-        let n_published = self.tables.read(table_index).n_enforcers;
+        let n_published = self.tables[table_index].n_enforcers;
         for (index, entry) in published.iter_mut().enumerate().take(n_published) {
-            let enforcer = self.tables.read(table_index).enforcers[index].expect("enforcer");
+            let enforcer = self.tables[table_index].enforcers[index].expect("enforcer");
             *entry = Some(enforcer);
         }
         self.release_enforcers(table_index);
@@ -33799,7 +33757,7 @@ impl Storage {
             )
         };
         {
-            let def = &self.tables.read(table_index).def;
+            let def = &self.tables[table_index].def;
             for (i, col) in def.columns().iter().enumerate() {
                 if col.unique {
                     if n_want == MAX_VALUE_ENFORCERS {
@@ -33832,10 +33790,10 @@ impl Storage {
         // share one enforcer: PostgreSQL permits redundant indexes, but a
         // second copy cannot improve the equality probe and would waste a
         // startup-reserved pool slot.
-        let table_schema = self.tables.read(table_index).def.schema;
-        let table_name = self.tables.read(table_index).def.name;
-        let table_database = self.tables.read(table_index).database;
-        let table_definition = self.tables.read(table_index).def;
+        let table_schema = self.tables[table_index].def.schema;
+        let table_name = self.tables[table_index].def.name;
+        let table_database = self.tables[table_index].database;
+        let table_definition = self.tables[table_index].def;
         for index in self
             .matching_indexes(|index| {
                 txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
@@ -33987,7 +33945,7 @@ impl Storage {
                         && enforcer.columns[..enforcer.n_cols] == wanted.columns[..wanted.n_columns]
                 })
                 .copied();
-            self.tables.get_mut(table_index).enforcers[w] = Some(Enforcer {
+            self.tables[table_index].enforcers[w] = Some(Enforcer {
                 slot,
                 columns: wanted.columns,
                 n_cols: wanted.n_columns,
@@ -34007,7 +33965,7 @@ impl Storage {
             // Keep the installed prefix visible to `release_enforcers`, so an
             // acquire failure later in this loop returns every slot already
             // taken by this rebuild.
-            self.tables.get_mut(table_index).n_enforcers = w + 1;
+            self.tables[table_index].n_enforcers = w + 1;
         }
         self.populate_enforcers(table_index)?;
         Ok(())
@@ -34017,7 +33975,7 @@ impl Storage {
     /// pool out of `self` so the row walk (which borrows the rest of `self`) and
     /// the index inserts do not overlap.
     fn populate_enforcers(&mut self, table_index: usize) -> Result<(), SqlError> {
-        if self.tables.read(table_index).n_enforcers == 0 {
+        if self.tables[table_index].n_enforcers == 0 {
             return Ok(());
         }
         let mut pool = self.value_indexes.take().expect("pool present");
@@ -34027,10 +33985,10 @@ impl Storage {
     }
 
     fn populate_into(&self, table_index: usize, pool: &mut ValueIndexPool) -> Result<(), SqlError> {
-        let n_enf = self.tables.read(table_index).n_enforcers;
+        let n_enf = self.tables[table_index].n_enforcers;
         let mut slots = [u32::MAX; MAX_VALUE_ENFORCERS];
         for (i, s) in slots.iter_mut().enumerate().take(n_enf) {
-            *s = self.tables.read(table_index).enforcers[i]
+            *s = self.tables[table_index].enforcers[i]
                 .expect("enforcer")
                 .slot;
         }
@@ -34055,8 +34013,8 @@ impl Storage {
         })?;
         if overlay.is_continue() {
             let mut schema = [ColType::Bool; MAX_COLUMNS];
-            let n_columns = self.tables.read(table_index).def.schema(&mut schema);
-            let dependency_mask = self.tables.read(table_index).enforcers[..n_enf]
+            let n_columns = self.tables[table_index].def.schema(&mut schema);
+            let dependency_mask = self.tables[table_index].enforcers[..n_enf]
                 .iter()
                 .flatten()
                 .fold(ColumnSet::EMPTY, |mask, enforcer| {
@@ -34134,22 +34092,20 @@ impl Storage {
             })
     }
 
-    pub fn table(&self, index: usize) -> std::sync::RwLockReadGuard<'_, Table> {
-        self.tables.read(index)
+    pub fn table(&self, index: usize) -> &Table {
+        &self.tables[index]
     }
 
     pub(crate) fn table_slot_visible_to(&self, index: usize, txid: u32) -> bool {
-        self.tables.read(index).database == current_database()
-            && self.tables.read(index).visible_to(txid)
+        self.tables[index].database == current_database() && self.tables[index].visible_to(txid)
     }
 
     pub fn table_mut(&mut self, index: usize) -> &mut Table {
-        self.tables.get_mut(index)
+        &mut self.tables[index]
     }
 
     pub(crate) fn table_serial_value(&self, index: usize, column: usize) -> i64 {
-        self.tables
-            .read(index)
+        self.tables[index]
             .serial
             .lock()
             .expect("table serial state lock poisoned")
@@ -34157,8 +34113,7 @@ impl Storage {
     }
 
     pub(crate) fn table_serial_values(&self, index: usize) -> [i64; MAX_COLUMNS] {
-        self.tables
-            .read(index)
+        self.tables[index]
             .serial
             .lock()
             .expect("table serial state lock poisoned")
@@ -34166,8 +34121,7 @@ impl Storage {
     }
 
     pub(crate) fn set_table_serial_value(&self, index: usize, column: usize, value: i64) {
-        self.tables
-            .read(index)
+        self.tables[index]
             .serial
             .lock()
             .expect("table serial state lock poisoned")
@@ -34192,8 +34146,7 @@ impl Storage {
                 ));
             }
         };
-        let table = self.tables.read(index);
-        let mut serial = table
+        let mut serial = self.tables[index]
             .serial
             .lock()
             .expect("table serial state lock poisoned");
@@ -34212,8 +34165,7 @@ impl Storage {
         index: usize,
         txid: u32,
     ) -> Option<[i64; MAX_COLUMNS]> {
-        let table = self.tables.read(index);
-        let mut serial = table
+        let mut serial = self.tables[index]
             .serial
             .lock()
             .expect("table serial state lock poisoned");
@@ -34225,8 +34177,7 @@ impl Storage {
     }
 
     pub(crate) fn acknowledge_table_serial_values(&self, index: usize, txid: u32) {
-        let table = self.tables.read(index);
-        let mut serial = table
+        let mut serial = self.tables[index]
             .serial
             .lock()
             .expect("table serial state lock poisoned");
@@ -34250,9 +34201,7 @@ impl Storage {
                 column
             ));
         }
-        let serial = self
-            .tables
-            .get_mut(index)
+        let serial = self.tables[index]
             .serial
             .get_mut()
             .expect("table serial state lock poisoned");
@@ -34262,9 +34211,7 @@ impl Storage {
     }
 
     pub(crate) fn install_table_serial_values(&mut self, index: usize, values: [i64; MAX_COLUMNS]) {
-        *self
-            .tables
-            .get_mut(index)
+        *self.tables[index]
             .serial
             .get_mut()
             .expect("table serial state lock poisoned") = TableSerialState {
@@ -34273,13 +34220,11 @@ impl Storage {
         };
     }
 
-    pub fn table_def(&self, index: usize, txid: u32) -> TableDefinitionRead<'_> {
-        let table = self.tables.read(index);
-        let pending = table
-            .pending_def_tail
-            .map(|slot| &self.pending_table_defs[slot as usize].version)
-            .filter(|pending| pending.txid == txid);
-        TableDefinitionRead { table, pending }
+    pub fn table_def(&self, index: usize, txid: u32) -> &TableDef {
+        match self.pending_table_def(index) {
+            Some(pending) if pending.txid == txid => &pending.def,
+            _ => &self.tables[index].def,
+        }
     }
 
     pub(crate) fn table_definition_images(&self) -> TableDefinitionImages {
@@ -34287,23 +34232,23 @@ impl Storage {
     }
 
     pub fn has_pending_table_def(&self, index: usize, txid: u32) -> bool {
-        self.tables.read(index).pending_def_txid == Some(txid)
+        self.tables[index].pending_def_txid == Some(txid)
     }
 
     fn pending_table_def(&self, index: usize) -> Option<&PendingTableDef> {
-        let table = self.tables.read(index);
+        let table = &self.tables[index];
         let slot = table.pending_def_tail? as usize;
         Some(&self.pending_table_defs[slot].version)
     }
 
     fn clear_pending_table_defs(&mut self, index: usize) {
-        let mut tail = self.tables.get_mut(index).pending_def_tail.take();
+        let mut tail = self.tables[index].pending_def_tail.take();
         while let Some(slot) = tail {
             let entry = &mut self.pending_table_defs[slot as usize];
             tail = entry.previous;
             entry.used = false;
         }
-        self.tables.get_mut(index).pending_def_txid = None;
+        self.tables[index].pending_def_txid = None;
     }
 
     /// Installs the next transaction-owned table shape. `column_mapping`
@@ -34317,12 +34262,12 @@ impl Storage {
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
-        if let Some(other) = self.tables.read(index).ddl_locked_by_other(txid) {
+        if let Some(other) = self.tables[index].ddl_locked_by_other(txid) {
             self.wait_for_transaction(txid, other)?;
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on \"{}\"",
-                self.tables.read(index).def.name.as_str()
+                self.tables[index].def.name.as_str()
             ));
         }
         let current = *self.table_def(index, txid);
@@ -34337,11 +34282,11 @@ impl Storage {
         for (committed_column, target) in composed
             .iter_mut()
             .enumerate()
-            .take(self.tables.read(index).def.n_columns)
+            .take(self.tables[index].def.n_columns)
         {
             let current_name = match prior {
                 Some(version) if version.txid == txid => version.column_mapping[committed_column],
-                _ => Some(self.tables.read(index).def.columns()[committed_column].name),
+                _ => Some(self.tables[index].def.columns()[committed_column].name),
             };
             let Some(current_name) = current_name else {
                 continue;
@@ -34358,14 +34303,14 @@ impl Storage {
             rewrites_rows: rewrites_rows
                 || prior.is_some_and(|version| version.txid == txid && version.rewrites_rows),
         };
-        let previous = self.tables.read(index).pending_def_tail;
+        let previous = self.tables[index].pending_def_tail;
         if previous.is_some_and(|slot| {
             self.pending_table_defs[slot as usize].depth >= self.max_catalog_versions_per_object
         }) {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "relation \"{}\" exceeds max_catalog_versions_per_object ({})",
-                self.tables.read(index).def.name.as_str(),
+                self.tables[index].def.name.as_str(),
                 self.max_catalog_versions_per_object
             ));
         }
@@ -34398,31 +34343,31 @@ impl Storage {
                 slot
             }
         };
-        self.tables.get_mut(index).pending_def_tail = Some(slot as u32);
-        self.tables.get_mut(index).pending_def_txid = Some(txid);
+        self.tables[index].pending_def_tail = Some(slot as u32);
+        self.tables[index].pending_def_txid = Some(txid);
         self.refresh_table_comment_identity(index, txid);
         Ok(())
     }
 
     pub fn rollback_table_def(&mut self, index: usize, txid: u32) {
-        if self.tables.read(index).pending_def_txid != Some(txid) {
+        if self.tables[index].pending_def_txid != Some(txid) {
             return;
         }
-        let Some(slot) = self.tables.read(index).pending_def_tail else {
+        let Some(slot) = self.tables[index].pending_def_tail else {
             return;
         };
         let previous = self.pending_table_defs[slot as usize].previous;
         self.pending_table_defs[slot as usize].used = false;
-        self.tables.get_mut(index).pending_def_tail = previous;
+        self.tables[index].pending_def_tail = previous;
         if previous.is_none() {
-            self.tables.get_mut(index).pending_def_txid = None;
+            self.tables[index].pending_def_txid = None;
         }
         self.refresh_table_comment_identity(index, txid);
     }
 
     fn refresh_table_comment_identity(&mut self, index: usize, txid: u32) {
-        let database = Some(self.tables.read(index).database);
-        let committed = self.tables.read(index).def;
+        let database = Some(self.tables[index].database);
+        let committed = self.tables[index].def;
         let visible = *self.table_def(index, txid);
         let changed = committed.schema != visible.schema || committed.name != visible.name;
         for comment in self.comment_catalog().entries.iter_mut() {
@@ -34468,8 +34413,8 @@ impl Storage {
             return false;
         }
         let mut definition = pending.def;
-        definition.has_toast |= self.tables.read(index).def.has_toast;
-        definition.has_rules |= self.tables.read(index).def.has_rules;
+        definition.has_toast |= self.tables[index].def.has_toast;
+        definition.has_rules |= self.tables[index].def.has_rules;
         self.set_table_def(index, definition, &pending.column_mapping);
         self.clear_pending_table_defs(index);
         self.commit_constraint_comment_identities(index, txid);
@@ -34509,7 +34454,7 @@ impl Storage {
         def: TableDef,
         pending: Option<PendingDdl>,
     ) -> Result<usize, SqlError> {
-        let Some(slot) = self.tables.iter().position(|table| table.is_free()) else {
+        let Some(slot) = self.tables.iter().position(Table::is_free) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many tables (limit {})",
@@ -34530,7 +34475,7 @@ impl Storage {
         self.cumulative_statistics().relations[slot] = RelationCumulativeStatistics::EMPTY;
         self.reset_implicit_index_statistics(slot);
         self.clear_table_rows(slot);
-        let table = self.tables.get_mut(slot);
+        let table = &mut self.tables[slot];
         table.database = current_database();
         table.def = def;
         table.ownership = ownership;
@@ -34555,7 +34500,7 @@ impl Storage {
         let name = table.def.name;
         if let Err(error) = self.refresh_enforcers(slot) {
             self.rollback_create(slot);
-            let table = self.tables.get_mut(slot);
+            let table = &mut self.tables[slot];
             table.def = TableDef::empty();
             table.ownership = Ownership::BOOTSTRAP;
             table.created_at = 0;
@@ -34755,17 +34700,17 @@ impl Storage {
             column_mapping[old_column] = Some(target.name);
         }
         let index = rewrite.table;
-        def.has_toast |= self.tables.read(index).def.has_toast
+        def.has_toast |= self.tables[index].def.has_toast
             || def
                 .columns()
                 .iter()
                 .any(|column| column.ctype.typlen() == -1);
-        def.has_rules |= self.tables.read(index).def.has_rules;
+        def.has_rules |= self.tables[index].def.has_rules;
         self.set_table_def(index, def, &column_mapping);
         if !rewrite.preserve_rows {
             self.clear_table_rows(index);
-            self.tables.get_mut(index).statistics = TableStatistics::EMPTY;
-            self.tables.get_mut(index).statistics_wal_dirty = false;
+            self.tables[index].statistics = TableStatistics::EMPTY;
+            self.tables[index].statistics_wal_dirty = false;
             self.set_spill_list(index, &[]);
         }
         self.mark_value_bindings_dirty(index);
@@ -34842,19 +34787,16 @@ impl Storage {
     /// Committed drop (journal replay): rows are retained; the slot is freed at
     /// checkpoint.
     pub fn drop_table(&mut self, index: usize) {
-        let (schema, name) = (
-            self.tables.read(index).def.schema,
-            self.tables.read(index).def.name,
-        );
+        let (schema, name) = (self.tables[index].def.schema, self.tables[index].def.name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
-        self.tables.get_mut(index).live = false;
-        self.tables.get_mut(index).pending_ddl = None;
-        self.tables.get_mut(index).mark_dirty();
+        self.tables[index].live = false;
+        self.tables[index].pending_ddl = None;
+        self.tables[index].mark_dirty();
         self.commit_triggers_for_table(index);
         self.commit_policies_for_table(index);
         self.commit_extended_statistics_for_table(index);
@@ -34863,7 +34805,7 @@ impl Storage {
     /// Transactional drop: the table stays visible to every other transaction
     /// (committed baseline) until `txid` commits.
     pub fn drop_table_in(&mut self, index: usize, txid: u32) {
-        self.tables.get_mut(index).pending_ddl = Some(PendingDdl {
+        self.tables[index].pending_ddl = Some(PendingDdl {
             txid,
             creating: false,
         });
@@ -34874,22 +34816,19 @@ impl Storage {
         }) {
             rule.ddl_state = rule.ddl_state.drop_by(txid);
         }
-        self.tables.get_mut(index).mark_dirty();
+        self.tables[index].mark_dirty();
     }
 
     /// Promotes an uncommitted CREATE to the committed image.
     pub fn commit_create(&mut self, index: usize) {
-        self.tables.get_mut(index).live = true;
-        self.tables.get_mut(index).pending_ddl = None;
+        self.tables[index].live = true;
+        self.tables[index].pending_ddl = None;
     }
 
     /// Applies a committed DROP: the table leaves the image and its rows are
     /// reclaimed.
     pub fn commit_drop(&mut self, index: usize) {
-        let (schema, name) = (
-            self.tables.read(index).def.schema,
-            self.tables.read(index).def.name,
-        );
+        let (schema, name) = (self.tables[index].def.schema, self.tables[index].def.name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
@@ -34898,10 +34837,10 @@ impl Storage {
         self.reset_implicit_index_statistics(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
-        self.tables.get_mut(index).live = false;
-        self.tables.get_mut(index).pending_ddl = None;
+        self.tables[index].live = false;
+        self.tables[index].pending_ddl = None;
         self.clear_table_rows(index);
-        self.tables.get_mut(index).statistics_wal_dirty = false;
+        self.tables[index].statistics_wal_dirty = false;
         self.commit_triggers_for_table(index);
         self.commit_policies_for_table(index);
         self.commit_extended_statistics_for_table(index);
@@ -34913,16 +34852,16 @@ impl Storage {
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
-        self.tables.get_mut(index).live = false;
-        self.tables.get_mut(index).pending_ddl = None;
+        self.tables[index].live = false;
+        self.tables[index].pending_ddl = None;
         self.clear_table_rows(index);
-        self.tables.get_mut(index).statistics_wal_dirty = false;
+        self.tables[index].statistics_wal_dirty = false;
     }
 
     /// Rolls back an uncommitted DROP: the table returns to the committed
     /// image unchanged.
     pub fn rollback_drop(&mut self, index: usize) {
-        self.tables.get_mut(index).pending_ddl = None;
+        self.tables[index].pending_ddl = None;
         for rule in self.view_rule_catalog().rules.iter_mut().filter(|rule| {
             rule.database == current_database()
                 && rule.definition.target == RuleTarget::Table(index as u16)
@@ -37296,10 +37235,7 @@ impl Storage {
     }
 
     pub fn commit_matview_drop(&mut self, slot: usize) {
-        let definition = self
-            .tables
-            .read(usize::from(self.matview(slot).backing_table))
-            .def;
+        let definition = self.tables[usize::from(self.matview(slot).backing_table)].def;
         let (schema, name) = (definition.schema, definition.name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.matview_catalog()[slot] = MatviewDef::EMPTY;
@@ -37439,7 +37375,7 @@ impl Storage {
         let pending = self
             .pending_table_def(table_slot)
             .filter(|pending| pending.txid == txid)?;
-        let committed = self.tables.read(table_slot).def;
+        let committed = self.tables[table_slot].def;
         let committed_column = pending
             .column_mapping
             .iter()
@@ -38844,14 +38780,14 @@ impl Storage {
 
     fn rebind_user_type_declarations_to(&mut self, txid: u32) -> Result<(), SqlError> {
         for table in 0..self.tables.len() {
-            if self.tables.read(table).database != current_database()
-                || !self.tables.read(table).visible_to(txid)
+            if self.tables[table].database != current_database()
+                || !self.tables[table].visible_to(txid)
             {
                 continue;
             }
-            let mut definition = self.tables.read(table).def;
+            let mut definition = self.tables[table].def;
             self.bind_user_type_columns_to(&mut definition, txid)?;
-            self.tables.get_mut(table).def = definition;
+            self.tables[table].def = definition;
         }
         for composite in 0..self.composite_count() {
             let definition = self.composite_for(composite, txid);
@@ -45163,7 +45099,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.require_schema_create(spec.schema.as_str(), txid)?;
         if usize::from(spec.table) >= self.tables.len()
-            || !self.tables.read(usize::from(spec.table)).visible_to(txid)
+            || !self.tables[usize::from(spec.table)].visible_to(txid)
         {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
@@ -45859,7 +45795,7 @@ impl Storage {
             }
         }
         if let Some(table) = self.index_table_slot(slot) {
-            self.tables.get_mut(table).mark_dirty();
+            self.tables[table].mark_dirty();
         }
     }
 
@@ -46447,7 +46383,7 @@ impl Storage {
             catalog[slot].ddl_state = catalog[slot].ddl_state.commit_create();
         }
         if let Some(table) = self.index_table_slot(slot) {
-            self.tables.get_mut(table).mark_dirty();
+            self.tables[table].mark_dirty();
         }
     }
 
@@ -46467,7 +46403,7 @@ impl Storage {
         });
         self.retire_index(slot, false);
         if let Some(table) = table {
-            self.tables.get_mut(table).mark_dirty();
+            self.tables[table].mark_dirty();
         }
     }
 
@@ -46528,12 +46464,9 @@ impl Storage {
         table: &'a str,
         txid: u32,
     ) -> impl Iterator<Item = IndexDef> + 'a {
-        let committed_binding = self.find_visible(schema, table, txid).map(|slot| {
-            (
-                self.tables.read(slot).def.schema,
-                self.tables.read(slot).def.name,
-            )
-        });
+        let committed_binding = self
+            .find_visible(schema, table, txid)
+            .map(|slot| (self.tables[slot].def.schema, self.tables[slot].def.name));
         self.matching_indexes(move |x| {
             x.database == current_database()
                 && x.visible_to(txid)
@@ -47344,12 +47277,12 @@ impl Storage {
     /// and its indexes change schema, and every inbound foreign key follows —
     /// deterministically, so WAL replay reproduces it from the names alone.
     pub fn move_table_schema(&mut self, index: usize, new_schema: SqlName) {
-        let database_oid = self.tables.read(index).database;
+        let database_oid = self.tables[index].database;
         let database = Some(database_oid);
-        let old_schema = self.tables.read(index).def.schema;
-        let name = self.tables.read(index).def.name;
-        self.tables.get_mut(index).def.schema = new_schema;
-        self.tables.get_mut(index).mark_dirty();
+        let old_schema = self.tables[index].def.schema;
+        let name = self.tables[index].def.name;
+        self.tables[index].def.schema = new_schema;
+        self.tables[index].mark_dirty();
         for x in self.index_catalog().iter_mut() {
             if x.database == database_oid
                 && x.ddl_state == CatalogDdlState::Present
@@ -47423,14 +47356,14 @@ impl Storage {
     /// (DROP SCHEMA CASCADE severing an inbound reference), returning it for
     /// transactional undo.
     pub fn drop_fk(&mut self, index: usize, fk_name: &str) -> Option<ForeignKey> {
-        let def = &mut self.tables.get_mut(index).def;
+        let def = &mut self.tables[index].def;
         let at = (0..def.n_fkeys).find(|&f| def.fkeys[f].name.as_str() == fk_name)?;
         let removed = def.fkeys[at];
         for f in at..def.n_fkeys - 1 {
             def.fkeys[f] = def.fkeys[f + 1];
         }
         def.n_fkeys -= 1;
-        self.tables.get_mut(index).mark_dirty();
+        self.tables[index].mark_dirty();
         Some(removed)
     }
 
@@ -47441,13 +47374,13 @@ impl Storage {
         def: TableDef,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
     ) {
-        let old = self.tables.read(index).def;
-        let database_oid = self.tables.read(index).database;
+        let old = self.tables[index].def;
+        let database_oid = self.tables[index].database;
         let database = Some(database_oid);
         if old.schema != def.schema {
             self.move_table_schema(index, def.schema);
         }
-        let current = self.tables.read(index).def;
+        let current = self.tables[index].def;
         if current.name != def.name {
             for index_def in self.index_catalog().iter_mut() {
                 if index_def.database == database_oid
@@ -47535,8 +47468,8 @@ impl Storage {
             index_def.schema = def.schema;
             index_def.table = def.name;
         }
-        self.tables.get_mut(index).def = def;
-        self.tables.get_mut(index).mark_dirty();
+        self.tables[index].def = def;
+        self.tables[index].mark_dirty();
         self.rename_stored_query_dependency(
             DependencyClass::Table,
             index,
@@ -47901,7 +47834,7 @@ impl Storage {
                 loop {
                     let mut batch = [0u64; 512];
                     let mut count = 0usize;
-                    for (&rowid, state) in table.rows.iter() {
+                    for (rowid, state) in table.rows.iter() {
                         if state.committed.is_none()
                             && state.history.is_empty()
                             && state.pending.is_none()
@@ -48263,7 +48196,7 @@ impl Storage {
         output.clear();
         let locks = self.lock_state();
         for lock in locks.table.iter().filter(|lock| lock.owner == txid) {
-            let table = self.tables.read(lock.table as usize);
+            let table = &self.tables[lock.table as usize];
             if !table.live {
                 continue;
             }
@@ -48281,7 +48214,7 @@ impl Storage {
             }
         }
         locks.row.visit_owner(txid, |table_slot, rowid, strength| {
-            let table = self.tables.read(table_slot);
+            let table = &self.tables[table_slot];
             if !table.live {
                 return Ok(());
             }
@@ -48581,7 +48514,7 @@ impl Storage {
 
     pub(crate) fn validate_serializable(&self, txid: u32) -> Result<(), SqlError> {
         for &(owner, table, generation, read) in self.snapshot_state().serializable.iter() {
-            if owner == txid && read && self.tables.read(table as usize).generation != generation {
+            if owner == txid && read && self.tables[table as usize].generation != generation {
                 return Err(sql_err!(
                     sqlstate::SERIALIZATION_FAILURE,
                     "could not serialize access due to read/write dependencies among transactions"
@@ -50624,7 +50557,7 @@ impl Storage {
             catalog.rules[slot].definition.target
         };
         if let RuleTarget::Table(table) = target {
-            let table = self.tables.get_mut(usize::from(table));
+            let table = &mut self.tables[usize::from(table)];
             table.def.has_rules = true;
             table.pending_has_rules_txid = None;
         }
@@ -50632,9 +50565,7 @@ impl Storage {
 
     pub(crate) fn rollback_rule_create(&mut self, slot: usize, prior_table_rule_txid: Option<u32>) {
         if let RuleTarget::Table(table) = self.rule(slot).definition.target {
-            self.tables
-                .get_mut(usize::from(table))
-                .pending_has_rules_txid = prior_table_rule_txid;
+            self.tables[usize::from(table)].pending_has_rules_txid = prior_table_rule_txid;
         }
         let mut catalog = self.view_rule_catalog();
         let _ = catalog.rules[slot].ddl_state.rollback_create();
@@ -50645,15 +50576,13 @@ impl Storage {
         let RuleTarget::Table(table) = target else {
             return None;
         };
-        self.tables
-            .read(usize::from(table))
+        self.tables[usize::from(table)]
             .pending_has_rules_txid
             .replace(txid)
     }
 
     pub(crate) fn table_has_rules(&self, table: usize, txid: u32) -> bool {
-        self.tables.read(table).def.has_rules
-            || self.tables.read(table).pending_has_rules_txid == Some(txid)
+        self.tables[table].def.has_rules || self.tables[table].pending_has_rules_txid == Some(txid)
     }
 
     pub(crate) fn commit_rule_alter(&mut self, slot: usize, txid: u32) {
@@ -50853,7 +50782,7 @@ impl Storage {
         };
         drop(catalog);
         if let RuleTarget::Table(table) = definition.target {
-            self.tables.get_mut(usize::from(table)).def.has_rules = true;
+            self.tables[usize::from(table)].def.has_rules = true;
         }
         self.catalog_sequence.observe(created_at);
         Ok(())
@@ -52888,120 +52817,6 @@ mod tests {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
     }
 
-    #[test]
-    fn table_state_guards_protect_identity_definition_and_rows_together() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<TableSlots>();
-        let config = test_config();
-        let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage
-            .create_table(make_def("guarded_even", &[("id", ColType::Int4, false)]))
-            .unwrap();
-        let names = [SqlName::parse("guarded_even").unwrap(), SqlName::parse("guarded_odd").unwrap()];
-        {
-            let table = storage.tables.get_mut(table);
-            table.created_at = 0;
-            table.generation = 0;
-            table.rows.insert(1, RowState::committed_only_at(RowLoc { offset: 0, len: 4 }, 0)).unwrap();
-        }
-        let slots = &storage.tables;
-        let start = std::sync::Barrier::new(4);
-        std::thread::scope(|scope| {
-            for _ in 0..3 {
-                let start = &start;
-                scope.spawn(move || {
-                    start.wait();
-                    crate::mem::guard::forbid_alloc(|| {
-                        for _ in 0..1000 {
-                            let image = slots.read(table);
-                            assert_eq!(image.created_at, image.generation);
-                            assert_eq!(image.def.name, names[(image.generation & 1) as usize]);
-                            assert_eq!(image.rows.get(&1).unwrap().committed_lsn, image.generation);
-                        }
-                    });
-                });
-            }
-            start.wait();
-            crate::mem::guard::forbid_alloc(|| {
-                for generation in 1..=500 {
-                    let mut image = slots.write(table);
-                    image.created_at = generation;
-                    image.def.name = names[(generation & 1) as usize];
-                    image.rows.get_mut(&1).unwrap().committed_lsn = generation;
-                    image.generation = generation;
-                }
-            });
-        });
-        assert_eq!(storage.table(table).generation, 500);
-    }
-
-    #[test]
-    fn table_state_definition_guards_exclude_writers_only_for_their_slot() {
-        let config = test_config();
-        let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let first = storage.create_table(make_def("guarded_first", &[])).unwrap();
-        let second = storage.create_table(make_def("guarded_second", &[])).unwrap();
-        crate::mem::guard::forbid_alloc(|| {
-            let definition = storage.table_def(first, 0);
-            let same_slot = storage.table(first);
-            assert_eq!(definition.name, same_slot.def.name);
-            assert!(storage.tables.try_write(first).is_none());
-            assert!(storage.tables.try_write(second).is_some());
-            drop(definition);
-            assert!(storage.tables.try_write(first).is_none());
-            drop(same_slot);
-            assert!(storage.tables.try_write(first).is_some());
-        });
-    }
-
-    #[test]
-    fn table_state_pending_definition_guards_preserve_transaction_visibility() {
-        let config = test_config();
-        let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage.create_table(make_def("guarded_original", &[])).unwrap();
-        crate::mem::guard::forbid_alloc(|| {
-            let mut pending = *storage.table_def(table, 17);
-            pending.name = SqlName::parse("guarded_pending").unwrap();
-            storage.write_table_def(table, 17, pending, &[None; MAX_COLUMNS], false).unwrap();
-            {
-                let owner = storage.table_def(table, 17);
-                let other = storage.table_def(table, 19);
-                assert_eq!(owner.name.as_str(), "guarded_pending");
-                assert_eq!(other.name.as_str(), "guarded_original");
-                assert!(storage.tables.try_write(table).is_none());
-            }
-            storage.rollback_table_def(table, 17);
-            assert_eq!(storage.table_def(table, 17).name.as_str(), "guarded_original");
-            storage.write_table_def(table, 17, pending, &[None; MAX_COLUMNS], false).unwrap();
-            storage.commit_table_def(table, 17);
-            assert_eq!(storage.table_def(table, 19).name.as_str(), "guarded_pending");
-        });
-    }
-
-    #[test]
-    fn table_state_slot_lock_storage_is_charged_at_startup() {
-        let config = test_config();
-        let bytes = config.memtable_bytes + Storage::extra_budget_bytes(&config);
-        let mut budget = Budget::new(bytes);
-        let storage = Storage::new(&config, &mut budget).unwrap();
-        assert_eq!(storage.tables.len(), table_slot_capacity(&config));
-        // Collation initialization owns the only remaining startup draw.
-        assert_eq!(budget.remaining(), 2 * config.collation_scratch_bytes);
-        let slot_bytes = 2 * size_of::<std::sync::RwLock<Table>>();
-        let mut exact = Budget::new(slot_bytes);
-        let slots = TableSlots::new(&mut exact, 2).unwrap();
-        assert_eq!(slots.len(), 0);
-        assert_eq!(exact.remaining(), 0);
-        let error = match TableSlots::new(&mut Budget::new(slot_bytes - 1), 2) {
-            Ok(_) => panic!("table state allocation accepted an undersized budget"),
-            Err(error) => error,
-        };
-        assert_eq!(error.what, "tables");
-    }
-
     fn test_view_definition(dependencies: StoredQueryDependencies) -> ViewDefinition {
         ViewDefinition {
             persistence: RelationPersistence::Permanent,
@@ -53162,11 +52977,7 @@ mod tests {
         rejected.columns[0].unique = true;
         rejected.columns[1].unique = true;
         crate::mem::guard::forbid_alloc(|| {
-            let slot = storage
-                .tables
-                .iter()
-                .position(|table| table.is_free())
-                .unwrap();
+            let slot = storage.tables.iter().position(Table::is_free).unwrap();
             for owner in [None, Some(7)] {
                 let result = match owner {
                     None => storage.create_table(rejected),
@@ -53181,7 +52992,7 @@ mod tests {
                         .find_visible("public", "rejected", owner.unwrap_or(0))
                         .is_none()
                 );
-                let rejected = storage.tables.read(slot);
+                let rejected = &storage.tables[slot];
                 assert!(rejected.is_free());
                 assert_eq!(rejected.def.name, SqlName::EMPTY);
                 assert_eq!(rejected.def.n_columns, 0);
@@ -53191,12 +53002,12 @@ mod tests {
                 assert!(rejected.pending_ddl.is_none());
                 assert_eq!(rejected.n_enforcers, 0);
                 assert!(rejected.enforcers.iter().all(Option::is_none));
-                assert_eq!(storage.tables.read(retained_slot).n_enforcers, 1);
+                assert_eq!(storage.tables[retained_slot].n_enforcers, 1);
                 let mut replacement = retained;
                 replacement.name = SqlName::parse("replacement").unwrap();
                 let reused = storage.create_table_in(replacement, 8).unwrap();
                 assert_eq!(reused, slot);
-                assert_eq!(storage.tables.read(reused).n_enforcers, 1);
+                assert_eq!(storage.tables[reused].n_enforcers, 1);
                 storage.rollback_create(reused);
             }
         });
@@ -53211,7 +53022,7 @@ mod tests {
             let foreign = storage
                 .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 7)
                 .unwrap();
-            storage.tables.get_mut(foreign).database = DatabaseOid::TEMPLATE1;
+            storage.tables[foreign].database = DatabaseOid::TEMPLATE1;
             let local = storage
                 .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 8)
                 .unwrap();
@@ -53225,7 +53036,7 @@ mod tests {
                 None
             );
             storage.commit_create(foreign);
-            let mut renamed = storage.tables.read(foreign).def;
+            let mut renamed = storage.tables[foreign].def;
             renamed.name = SqlName::parse("pending_name").unwrap();
             storage
                 .write_table_def(foreign, 7, renamed, &[None; MAX_COLUMNS], false)
@@ -58969,7 +58780,7 @@ mod tests {
             ))
             .unwrap();
         let captured = storage.table(slot).generation;
-        let _ = storage.tables.get_mut(slot).rows.insert(
+        let _ = storage.tables[slot].rows.insert(
             1,
             RowState::committed_only_at(RowLoc { offset: 0, len: 4 }, 42),
         );
@@ -58977,9 +58788,7 @@ mod tests {
         storage.clear_dirty_through(&[captured]);
         assert!(storage.table(slot).dirty);
         assert_eq!(
-            storage
-                .tables
-                .read(slot)
+            storage.tables[slot]
                 .rows
                 .get(&1)
                 .unwrap()
@@ -58990,9 +58799,7 @@ mod tests {
         storage.clear_dirty_through(&[current]);
         assert!(!storage.table(slot).dirty);
         assert_eq!(
-            storage
-                .tables
-                .read(slot)
+            storage.tables[slot]
                 .rows
                 .get(&1)
                 .unwrap()
@@ -59135,7 +58942,7 @@ mod tests {
         storage.compact_heap(&mut scratch).unwrap();
 
         let compacted = storage
-            .row_pending_last(*storage.table(slot).rows.get(&1).unwrap())
+            .row_pending_last(storage.table(slot).rows.get(&1).unwrap())
             .unwrap()
             .loc
             .unwrap();

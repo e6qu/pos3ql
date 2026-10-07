@@ -1074,7 +1074,7 @@ impl<'d> QueryScope<'d> {
             }
             &*arena.alloc(renamed).map_err(|_| arena_full())?
         } else {
-            &stored_def
+            stored_def
         };
         // Two same-named entries coexist only when both are *unaliased base
         // tables of different schemas* (their references then need the

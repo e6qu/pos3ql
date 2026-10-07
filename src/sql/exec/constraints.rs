@@ -566,11 +566,11 @@ fn enforce_expression_index_uniqueness<'a>(
         }
         Ok(ControlFlow::Continue(()))
     })?;
-    for (&rowid, state) in storage.table(table_index).rows.iter() {
+    for (rowid, state) in storage.table(table_index).rows.iter() {
         if Some(rowid) == self_rowid {
             continue;
         }
-        let Some(pending) = storage.row_pending_last(*state) else {
+        let Some(pending) = storage.row_pending_last(state) else {
             continue;
         };
         let Some(location) = pending.loc else {
@@ -756,11 +756,11 @@ fn pending_scan_uniqueness(
     def: &TableDef,
     name: &ConstraintName,
 ) -> Result<(), SqlError> {
-    for (&rowid, state) in storage.table(table_index).rows.iter() {
+    for (rowid, state) in storage.table(table_index).rows.iter() {
         if Some(rowid) == self_rowid {
             continue;
         }
-        let Some(pending) = storage.row_pending_last(*state) else {
+        let Some(pending) = storage.row_pending_last(state) else {
             continue;
         };
         let Some(loc) = pending.loc else {
@@ -837,11 +837,11 @@ pub(crate) fn enforce_partial_index_uniqueness(
         }
         Ok(ControlFlow::Continue(()))
     })?;
-    for (&rowid, state) in storage.table(table_index).rows.iter() {
+    for (rowid, state) in storage.table(table_index).rows.iter() {
         if Some(rowid) == self_rowid {
             continue;
         }
-        let Some(pending) = storage.row_pending_last(*state) else {
+        let Some(pending) = storage.row_pending_last(state) else {
             continue;
         };
         let Some(location) = pending.loc else {
@@ -2207,7 +2207,7 @@ pub(crate) fn resolve_constraint_name(
             if definition.schema.as_str() != schema {
                 continue;
             }
-            if let Some(timing) = named_constraint_timing(&definition, written.name) {
+            if let Some(timing) = named_constraint_timing(definition, written.name) {
                 found = true;
                 if !timing.is_deferrable() && mode == crate::sql::ast::ConstraintMode::Deferred {
                     return Err(sql_err!(

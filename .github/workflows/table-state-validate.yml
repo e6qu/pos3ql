@@ -21,7 +21,12 @@ jobs:
           name: table-state-format
           path: /tmp/table-state-format.patch
       - name: Check all targets
-        run: cargo check --all-targets --locked
+        run: cargo check --all-targets --locked --message-format=json > /tmp/table-state-check.json
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: table-state-check
+          path: /tmp/table-state-check.json
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Table state regressions

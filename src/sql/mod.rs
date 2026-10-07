@@ -1921,7 +1921,7 @@ fn emit_pending_truncates(
             emit_replication_relation(
                 storage,
                 output_slot,
-                &definition,
+                definition,
                 relation_id,
                 column_mask,
                 responder,
@@ -2307,7 +2307,7 @@ fn publication_row_matches(
         let result = (|| {
             let expression = parser::parse_expr(filter, arena)?;
             let row = exec::RowCtx {
-                def: &definition,
+                def: definition,
                 values,
                 alias: None,
             };
@@ -4623,7 +4623,7 @@ impl Engine {
                                     emit_replication_relation(
                                         storage,
                                         output_slot,
-                                        &storage.table_def(output_slot, 0),
+                                        storage.table_def(output_slot, 0),
                                         relation_id,
                                         column_mask,
                                         responder,
@@ -4691,7 +4691,7 @@ impl Engine {
                                     emit_replication_relation(
                                         storage,
                                         output_slot,
-                                        &storage.table_def(output_slot, 0),
+                                        storage.table_def(output_slot, 0),
                                         relation_id,
                                         column_mask,
                                         responder,
@@ -4804,7 +4804,7 @@ impl Engine {
                                 emit_replication_relation(
                                     storage,
                                     output_slot,
-                                    &storage.table_def(output_slot, 0),
+                                    storage.table_def(output_slot, 0),
                                     relation_id,
                                     column_mask,
                                     responder,
@@ -10309,7 +10309,7 @@ impl Engine {
         let definition = self.storage.table_def(table_index, txn.txid);
         exec::describe_returning_items(
             returning,
-            Some(&definition),
+            Some(definition),
             target_alias,
             Some(&self.storage),
             txn.txid,
@@ -10964,7 +10964,7 @@ impl Engine {
         let (columns, transition_types) = match target {
             crate::storage::RuleTarget::Table(slot) => {
                 let definition = storage.table_def(usize::from(slot), txn.txid);
-                rule_defaults = match exec::parse_defaults(&definition, arena) {
+                rule_defaults = match exec::parse_defaults(definition, arena) {
                     Ok(defaults) => defaults,
                     Err(error) => return Ok(Err(error)),
                 };

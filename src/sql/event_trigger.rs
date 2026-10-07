@@ -104,7 +104,7 @@ pub(crate) fn capture_before<'a>(
                         .column_index(name)
                         .is_some_and(|column| foreign_key.parent_cols().contains(&(column as u16))),
                     crate::sql::ast::AlterAction::DropConstraint { name, .. } => {
-                        foreign_key_references_named_key(&parent, name, foreign_key.parent_cols())
+                        foreign_key_references_named_key(parent, name, foreign_key.parent_cols())
                     }
                     _ => false,
                 })
@@ -115,7 +115,7 @@ pub(crate) fn capture_before<'a>(
                 continue;
             }
             let reference = detached_constraint(
-                &child,
+                child,
                 catalog::foreign_key_constraint_oid(child_slot, foreign_key_index),
                 foreign_key.name.as_str(),
             );
@@ -131,7 +131,7 @@ pub(crate) fn capture_before<'a>(
                 .map_err(|_| graph_full())?;
             for ordinal in 0..4 {
                 let reference = foreign_key_trigger_reference(
-                    &child,
+                    child,
                     child_slot,
                     foreign_key_index,
                     foreign_key,
@@ -402,7 +402,7 @@ impl EventObjectRef {
                 index_object(
                     catalog::index_oid(table_slot, usize::from(position)),
                     name.as_str(),
-                    &table,
+                    table,
                 )?
             }
             Self::TableRowType(slot) => {
@@ -454,7 +454,7 @@ impl EventObjectRef {
             Self::TableConstraint { table, oid, name } => constraint_object(
                 oid,
                 name.as_str(),
-                &storage.table_def(usize::from(table), txid),
+                storage.table_def(usize::from(table), txid),
             )?,
             Self::ViewRowType(slot) => {
                 let slot = usize::from(slot);
@@ -3205,10 +3205,10 @@ fn push_alter_table_drops(
                 .iter()
                 .any(|item| item.name.as_str() == name)
             && !new.columns().iter().any(|column| {
-                (column.primary && inline_primary_name(&new).as_str() == name)
-                    || (column.unique && inline_unique_name(&new, column).as_str() == name)
+                (column.primary && inline_primary_name(new).as_str() == name)
+                    || (column.unique && inline_unique_name(new, column).as_str() == name)
                     || (column.not_null.is_required()
-                        && not_null_name(&new, column).as_str() == name)
+                        && not_null_name(new, column).as_str() == name)
             })
     };
 
@@ -3548,9 +3548,9 @@ fn push_table_indexes(
     let mut position = 0usize;
     for column in table.columns() {
         let name = if column.primary {
-            Some(inline_primary_name(&table))
+            Some(inline_primary_name(table))
         } else if column.unique {
-            Some(inline_unique_name(&table, column))
+            Some(inline_unique_name(table, column))
         } else {
             None
         };
@@ -3639,7 +3639,7 @@ fn push_table_drop_dependents(
     }
     for (index, column) in table.columns().iter().enumerate() {
         if column.not_null.is_required() {
-            let name = not_null_name(&table, column);
+            let name = not_null_name(table, column);
             push_drop(
                 output,
                 count,
@@ -3665,7 +3665,7 @@ fn push_table_drop_dependents(
             false,
             true,
         )?;
-        push_foreign_key_trigger_drops(&table, slot, index, foreign_key, output, count)?;
+        push_foreign_key_trigger_drops(table, slot, index, foreign_key, output, count)?;
     }
     if table.has_toast {
         push_drop(
@@ -3687,9 +3687,9 @@ fn push_table_drop_dependents(
     let mut position = 0usize;
     for column in table.columns() {
         let name = if column.primary {
-            Some(inline_primary_name(&table))
+            Some(inline_primary_name(table))
         } else if column.unique {
-            Some(inline_unique_name(&table, column))
+            Some(inline_unique_name(table, column))
         } else {
             None
         };

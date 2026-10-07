@@ -14757,7 +14757,7 @@ pub(crate) fn table_constraint_oid(
         .enumerate()
         .find(|(_, column)| {
             column.not_null.is_required()
-                && not_null_constraint_name(&table, column).as_str() == name
+                && not_null_constraint_name(table, column).as_str() == name
         })
         .map(|(index, _)| not_null_constraint_oid(table_slot, index))
 }
@@ -14799,7 +14799,7 @@ pub(crate) fn table_constraint_identity_by_oid(
         }
         for column in table.columns() {
             if column.not_null.is_required() {
-                let name = not_null_constraint_name(&table, column);
+                let name = not_null_constraint_name(table, column);
                 if let Some(found) = candidate(name.as_str()) {
                     return Some(found);
                 }
@@ -15038,7 +15038,7 @@ pub fn constraint_def_text<'a>(
             && oid == FIRST_DETACHED_PARTITION_CHECK_OID + slot as i32
         {
             return Ok(Some(detached_partition_constraint_def_text(
-                &table, constraint, arena,
+                table, constraint, arena,
             )?));
         }
     }
@@ -15666,7 +15666,7 @@ pub fn index_def_text<'a>(
             if info.is_unique { "UNIQUE " } else { "" }
         );
         write_identifier(&mut s, info.name.as_str());
-        write_index_target(&mut s, &def, info);
+        write_index_target(&mut s, def, info);
         let _ = write!(
             s,
             " USING {} (",
@@ -19881,7 +19881,7 @@ fn pg_constraint<'a>(
                     "pg_constraint result exceeds static capacity"
                 ));
             }
-            let constraint_name = not_null_constraint_name(&table, column);
+            let constraint_name = not_null_constraint_name(table, column);
             out[n] = row(
                 &[
                     Datum::Int4(not_null_constraint_oid(slot, column_index)),
@@ -21266,7 +21266,7 @@ fn index_collations<'a>(
                 .expect("expression index has source");
             let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
             let catalog = super::query::storage_catalog(storage, arena, txid);
-            resolved_expression_collation(expression, &TableColumnTypes(&table), Some(&catalog))?
+            resolved_expression_collation(expression, &TableColumnTypes(table), Some(&catalog))?
         } else {
             table.columns()[info.columns[position] as usize].collation
         };
@@ -21293,7 +21293,7 @@ fn index_operator_classes<'a>(
             let source = index_expression_source(storage, info, position, txid)
                 .expect("expression index has source");
             let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
-            let (oid, _) = super::exec::infer_type_catalog(expression, Some(&table), storage, txid)?;
+            let (oid, _) = super::exec::infer_type_catalog(expression, Some(table), storage, txid)?;
             super::exec::catalog_column_type(storage, txid, oid)
                 .map(|(ctype, _)| ctype)
                 .and_then(crate::sql::types::BtreeOperatorClass::for_type)
@@ -21735,7 +21735,7 @@ fn pg_attribute<'a>(
                 let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
                 let expression = crate::sql::parser::parse_expr(source, arena)?;
                 let (type_oid, type_mod) =
-                    super::exec::infer_type_catalog(expression, Some(&table), storage, txid)?;
+                    super::exec::infer_type_catalog(expression, Some(table), storage, txid)?;
                 let (ctype, user_type) = super::exec::catalog_column_type(storage, txid, type_oid)
                     .ok_or_else(|| {
                         sql_err!(
@@ -29254,7 +29254,7 @@ fn pg_indexes<'a>(
                 if info.is_unique { "UNIQUE " } else { "" },
             );
             write_identifier(&mut indexdef, info.name.as_str());
-            write_index_target(&mut indexdef, &table_def, info);
+            write_index_target(&mut indexdef, table_def, info);
             let _ = write!(
                 indexdef,
                 " USING {} (",
@@ -31861,35 +31861,35 @@ fn info_table_constraints<'a>(
         let table = storage.table_def(slot, txid);
         for column in table.columns() {
             if column.primary {
-                let name = inline_primary_constraint_name(&table);
+                let name = inline_primary_constraint_name(table);
                 append(
                     name.as_str(),
                     "PRIMARY KEY",
                     None,
                     crate::storage::ConstraintTiming::NotDeferrable,
                     crate::storage::ConstraintValidation::EnforcedValidated,
-                    &table,
+                    table,
                 )?;
             } else if column.unique {
-                let name = inline_unique_constraint_name(&table, column);
+                let name = inline_unique_constraint_name(table, column);
                 append(
                     name.as_str(),
                     "UNIQUE",
                     Some("YES"),
                     crate::storage::ConstraintTiming::NotDeferrable,
                     crate::storage::ConstraintValidation::EnforcedValidated,
-                    &table,
+                    table,
                 )?;
             }
             if column.not_null.is_required() {
-                let name = not_null_constraint_name(&table, column);
+                let name = not_null_constraint_name(table, column);
                 append(
                     name.as_str(),
                     "CHECK",
                     None,
                     crate::storage::ConstraintTiming::NotDeferrable,
                     crate::storage::ConstraintValidation::EnforcedValidated,
-                    &table,
+                    table,
                 )?;
             }
         }
@@ -31904,7 +31904,7 @@ fn info_table_constraints<'a>(
                 (!unique.is_primary).then_some("YES"),
                 unique.timing,
                 crate::storage::ConstraintValidation::EnforcedValidated,
-                &table,
+                table,
             )?;
         }
         for check in table.checks() {
@@ -31914,7 +31914,7 @@ fn info_table_constraints<'a>(
                 None,
                 crate::storage::ConstraintTiming::NotDeferrable,
                 check.validation,
-                &table,
+                table,
             )?;
         }
         for foreign_key in table.fkeys() {
@@ -31924,7 +31924,7 @@ fn info_table_constraints<'a>(
                 None,
                 foreign_key.timing,
                 foreign_key.validation,
-                &table,
+                table,
             )?;
         }
     }
@@ -32066,16 +32066,16 @@ fn info_key_column_usage<'a>(
         for (column_index, column) in table.columns().iter().enumerate() {
             if column.primary || column.unique {
                 let name = if column.primary {
-                    inline_primary_constraint_name(&table)
+                    inline_primary_constraint_name(table)
                 } else {
-                    inline_unique_constraint_name(&table, column)
+                    inline_unique_constraint_name(table, column)
                 };
-                append(&table, name.as_str(), column_index as u16, 1, None)?;
+                append(table, name.as_str(), column_index as u16, 1, None)?;
             }
         }
         for key in table.uniques() {
             for (position, &column) in key.columns().iter().enumerate() {
-                append(&table, key.name.as_str(), column, position + 1, None)?;
+                append(table, key.name.as_str(), column, position + 1, None)?;
             }
         }
         for foreign_key in table.fkeys() {
@@ -32098,7 +32098,7 @@ fn info_key_column_usage<'a>(
                         )
                     })?;
                 append(
-                    &table,
+                    table,
                     foreign_key.name.as_str(),
                     column,
                     position + 1,
@@ -32140,7 +32140,7 @@ fn info_constraint_column_usage<'a>(
             .sum::<usize>();
         for check in table.checks() {
             let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
-            total += crate::sql::exec::check_referenced_columns(expression, &table)?.count_ones()
+            total += crate::sql::exec::check_referenced_columns(expression, table)?.count_ones()
                 as usize;
         }
     }
@@ -32181,35 +32181,35 @@ fn info_constraint_column_usage<'a>(
         for (column_index, column) in table.columns().iter().enumerate() {
             if column.primary || column.unique {
                 let name = if column.primary {
-                    inline_primary_constraint_name(&table)
+                    inline_primary_constraint_name(table)
                 } else {
-                    inline_unique_constraint_name(&table, column)
+                    inline_unique_constraint_name(table, column)
                 };
-                append(table, &table, column_index as u16, name.as_str())?;
+                append(table, table, column_index as u16, name.as_str())?;
             }
             if column.not_null.is_required() {
-                let name = not_null_constraint_name(&table, column);
-                append(table, &table, column_index as u16, name.as_str())?;
+                let name = not_null_constraint_name(table, column);
+                append(table, table, column_index as u16, name.as_str())?;
             }
         }
         for key in table.uniques() {
             for &column in key.columns() {
-                append(table, &table, column, key.name.as_str())?;
+                append(table, table, column, key.name.as_str())?;
             }
         }
         for check in table.checks() {
             let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
-            let columns = crate::sql::exec::check_referenced_columns(expression, &table)?;
+            let columns = crate::sql::exec::check_referenced_columns(expression, table)?;
             for (index, _) in table.columns().iter().enumerate() {
                 if columns.contains(index) {
-                    append(table, &table, index as u16, check.name.as_str())?;
+                    append(table, table, index as u16, check.name.as_str())?;
                 }
             }
         }
         for foreign_key in table.fkeys() {
             let (parent, _) = require_parent_key(storage, txid, foreign_key)?;
             for &column in foreign_key.parent_cols() {
-                append(&parent, &table, column, foreign_key.name.as_str())?;
+                append(&parent, table, column, foreign_key.name.as_str())?;
             }
         }
     }
@@ -33149,7 +33149,7 @@ fn info_check_constraints<'a>(
         }
         for column in table.columns() {
             if column.not_null.is_required() {
-                let name = not_null_constraint_name(&table, column);
+                let name = not_null_constraint_name(table, column);
                 let clause = stack_format!(256, "{} IS NOT NULL", column.name.as_str());
                 append(table.schema.as_str(), name.as_str(), clause.as_str())?;
             }

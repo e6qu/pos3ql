@@ -13480,15 +13480,8 @@ impl CatalogSequence {
     }
 
     fn next(&self) -> u64 {
-        let prior = self
-            .0
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |value| value.checked_add(1),
-            )
-            .expect("catalog sequence exhausted");
-        prior.checked_add(1).expect("catalog sequence exhausted")
+        self.next_bounded(u64::MAX, "catalog sequence")
+            .expect("catalog sequence exhausted")
     }
 
     fn next_bounded(&self, maximum: u64, object: &str) -> Result<u64, SqlError> {
@@ -54723,12 +54716,22 @@ mod tests {
         let mut second_budget = test_budget(&config);
         let mut first = Storage::new(&config, &mut first_budget).unwrap();
         let mut second = Storage::new(&config, &mut second_budget).unwrap();
-        let table = first.create_table(make_def("first", &[("id", ColType::Int8, true)])).unwrap();
-        let other = second.create_table(make_def("second", &[("id", ColType::Int8, true)])).unwrap();
+        let table = first
+            .create_table(make_def("first", &[("id", ColType::Int8, true)]))
+            .unwrap();
+        let other = second
+            .create_table(make_def("second", &[("id", ColType::Int8, true)]))
+            .unwrap();
         let definitions = first.table_definition_images();
         crate::mem::guard::forbid_alloc(|| {
             let image = definitions.definition(&first, table, 0).unwrap();
-            assert_eq!(definitions.definition(&second, other, 0).unwrap_err().sqlstate, sqlstate::INTERNAL_ERROR);
+            assert_eq!(
+                definitions
+                    .definition(&second, other, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
             assert_eq!(image.name.as_str(), "first");
         });
     }

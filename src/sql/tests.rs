@@ -14090,7 +14090,10 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let restart_lsn = engine
         .create_replication_slot(
@@ -17227,7 +17230,10 @@ fn parameter_acls_survive_cold_object_store_recovery() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -17244,7 +17250,10 @@ fn parameter_acls_survive_cold_object_store_recovery() {
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut restarted_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut restarted_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let output = run_with(
         &mut restarted,
@@ -29452,7 +29461,10 @@ fn constraint_lifecycle_survives_cold_object_store_recovery() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
         &mut engine,
@@ -29493,7 +29505,10 @@ fn constraint_lifecycle_survives_cold_object_store_recovery() {
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -41707,7 +41722,10 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
-        let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+        let mut budget = Budget::new(test_retained_image_budget_bytes(
+            &config,
+            (1 << 29) + (96 << 20),
+        ));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let created = run_with(
             &mut engine,
@@ -41750,7 +41768,10 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
         assert!(engine.checkpoint().unwrap());
     }
     {
-        let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+        let mut budget = Budget::new(test_retained_image_budget_bytes(
+            &config,
+            (1 << 29) + (96 << 20),
+        ));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let altered = run_with(
             &mut engine,
@@ -41772,7 +41793,10 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
         assert!(engine.checkpoint().unwrap());
     }
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let rows = run_with(
         &mut engine,
@@ -59769,7 +59793,10 @@ fn relation_persistence_survives_object_store_cold_recovery() {
     config.disk_cache_bytes = 1 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_as(
         &mut engine,
@@ -59792,7 +59819,10 @@ fn relation_persistence_survives_object_store_cold_recovery() {
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     let output = run_with(
         &mut recovered,
@@ -59842,7 +59872,10 @@ fn checkpoint_does_not_carry_spilled_rows_across_reused_table_slots() {
     config.wal_upload_buffer_bytes = 256 * 1024;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
         &mut engine,
@@ -59882,7 +59915,10 @@ fn checkpoint_does_not_carry_spilled_rows_across_reused_table_slots() {
 
     // Match the production sequence that exposed this: the old generation is
     // loaded from a manifest, then dropped and replaced before another crash.
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -59952,7 +59988,10 @@ fn checkpoint_does_not_carry_spilled_rows_across_reused_table_slots() {
     );
     drop(engine);
 
-    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -60062,7 +60101,10 @@ fn temporary_rows_spill_locally_without_object_publication() {
     config.table_rows = 512;
     config.temporary_spill_bytes = 64 * crate::store::BLOCK_SIZE;
     let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let ownership_objects = namespace.borrow().object_count();
     assert!(
@@ -61813,7 +61855,10 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     config.wal_upload_buffer_bytes = 256 * 1024;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let template = engine
         .storage
@@ -63197,7 +63242,10 @@ fn alter_subscription_definition_is_transactional_durable_and_visible_to_its_own
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -63265,7 +63313,10 @@ fn alter_subscription_definition_is_transactional_durable_and_visible_to_its_own
     );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
-    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
     assert_eq!(
         replayed
@@ -63299,7 +63350,10 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -63399,7 +63453,10 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
     );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
-    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let replayed = Engine::new(&config, &mut replay_budget).unwrap();
     let runtime = replayed
         .subscription_runtime(0)
@@ -63421,7 +63478,10 @@ fn subscription_uri_conninfo_is_durable_and_resolves_the_protocol_default_once()
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -63460,7 +63520,10 @@ fn subscription_uri_conninfo_is_durable_and_resolves_the_protocol_default_once()
     );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
-    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let replayed = Engine::new(&config, &mut replay_budget).unwrap();
     assert_eq!(
         replayed
@@ -63696,7 +63759,10 @@ fn subscription_relation_refresh_is_atomic_and_checkpointed() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -63758,7 +63824,10 @@ fn subscription_relation_refresh_is_atomic_and_checkpointed() {
     assert!(engine.checkpoint().unwrap());
     drop(engine);
 
-    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -63781,7 +63850,10 @@ fn managed_subscription_drop_retains_cleanup_until_durable_completion() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -63802,7 +63874,10 @@ fn managed_subscription_drop_retains_cleanup_until_durable_completion() {
     assert!(engine.checkpoint().unwrap());
     drop(engine);
 
-    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
     let cleanup = replayed
         .subscription_cleanup_runtime(0)
@@ -63813,7 +63888,10 @@ fn managed_subscription_drop_retains_cleanup_until_durable_completion() {
     assert!(replayed.subscription_cleanup_runtime(0).is_none());
     drop(replayed);
 
-    let mut final_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut final_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
     assert!(final_engine.subscription_cleanup_runtime(0).is_none());
     let created = run_with(
@@ -63839,7 +63917,10 @@ fn subscription_failure_policy_is_durable_and_typed() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -63891,7 +63972,10 @@ fn subscription_failure_policy_is_durable_and_typed() {
     assert!(engine.checkpoint().unwrap());
     drop(engine);
 
-    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut replay_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
     let failure = replayed
         .storage
@@ -67744,7 +67828,10 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     config.wal_upload_buffer_bytes = 256 * 1024;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     stage_without_publication(&mut engine, &mut budget, "CREATE TABLE batched (id int)");
     stage_without_publication(&mut engine, &mut budget, "INSERT INTO batched VALUES (1)");
@@ -67824,7 +67911,10 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
 
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -67853,7 +67943,10 @@ fn configured_commit_chain_capacity_controls_object_cold_recovery() {
     config.checkpoint_delete_objects_per_beat = 1;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     stage_without_publication(
         &mut engine,
@@ -67875,7 +67968,10 @@ fn configured_commit_chain_capacity_controls_object_cold_recovery() {
     let mut undersized = config.clone();
     undersized.checkpoint_commit_batches = 4;
     undersized.data_dir = format!("{}-undersized", config.data_dir);
-    let mut undersized_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut undersized_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let error = match Engine::new(&undersized, &mut undersized_budget) {
         Ok(_) => panic!("an undersized recovery chain must fail"),
         Err(error) => error,
@@ -67887,7 +67983,10 @@ fn configured_commit_chain_capacity_controls_object_cold_recovery() {
         "{error}"
     );
 
-    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -67929,7 +68028,10 @@ fn checkpoint_garbage_is_drained_in_configured_batches_before_success() {
     config.checkpoint_delete_objects_per_beat = 2;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
         &mut engine,
@@ -67983,7 +68085,10 @@ fn checkpoint_garbage_is_drained_in_configured_batches_before_success() {
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -68011,7 +68116,10 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
     config.checkpoint_delete_objects_per_beat = 1;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     stage_without_publication(
         &mut engine,
@@ -68123,7 +68231,10 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
 
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -68218,7 +68329,10 @@ fn checkpoint_reports_publication_before_paced_maintenance() {
     config.wal_buffer_bytes = 1 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let first = run_with(
         &mut engine,
@@ -68283,7 +68397,10 @@ fn checkpoint_publishes_the_final_slice_without_a_dispatch_gap() {
     config.object_store_response_bytes = 1 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
         &mut engine,
@@ -68349,7 +68466,10 @@ fn checkpoint_publishes_the_final_slice_without_a_dispatch_gap() {
 
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -68574,7 +68694,10 @@ fn failed_full_roster_merge_keeps_the_prior_slice_for_retry() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 91);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
         &mut engine,
@@ -68634,7 +68757,10 @@ fn failed_full_roster_merge_keeps_the_prior_slice_for_retry() {
 
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -68663,7 +68789,10 @@ fn packed_row_delta_bounds_publication_objects_and_recovers() {
     config.wal_buffer_bytes = 2 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let seeded = run_with(
         &mut engine,
@@ -68708,7 +68837,10 @@ fn packed_row_delta_bounds_publication_objects_and_recovers() {
 
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     let cold = run_with_arena_bytes(
         &mut recovered,
@@ -68739,7 +68871,10 @@ fn dirty_full_roster_merges_across_bounded_checkpoint_beats() {
     config.wal_buffer_bytes = 2 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
         &mut engine,
@@ -68878,7 +69013,10 @@ fn dirty_full_roster_merges_across_bounded_checkpoint_beats() {
 
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -68913,7 +69051,10 @@ fn row_merge_reuses_unchanged_wide_pax_groups_across_beats() {
     config.disk_cache_bytes = 0;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
         &mut engine,
@@ -69008,7 +69149,10 @@ fn row_merge_reuses_unchanged_wide_pax_groups_across_beats() {
 
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut recovered_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -69033,7 +69177,10 @@ fn checkpoint_live_block_capacity_exhausts_loudly() {
     config.checkpoint_live_blocks = 1;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
         &mut engine,
@@ -69067,7 +69214,10 @@ fn checkpoint_merge_capacity_exhausts_loudly_for_a_pinned_full_list() {
     config.checkpoint_merge_entries = 1;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut writer = TxnState::new(&mut budget, 256).unwrap();
     let mut reader = TxnState::new(&mut budget, 256).unwrap();
@@ -69153,7 +69303,10 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 17);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     stage_without_publication(
         &mut engine,
@@ -69189,7 +69342,10 @@ fn published_checkpoint_maintenance_retries_without_fencing_reads() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 29);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     stage_without_publication(
         &mut engine,
@@ -70180,7 +70336,10 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
     config.wal_upload_buffer_bytes = 256 * 1024;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 7);
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
 
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(&mut engine, &mut budget, "CREATE TABLE rc (id int, v text)");
@@ -70217,7 +70376,10 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
 
     // Startup reconciliation re-uploads the journaled tail the bucket lacks,
     // so row 2 becomes bucket-durable at this restart.
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -70234,7 +70396,10 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
     // row 2 would be gone (its upload failed, and the journal was its only
     // copy). The reconciled segment must carry it.
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -71029,7 +71194,10 @@ fn cold_start_then_commit_then_crash_recovers_every_record_body() {
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
 
     // Generation 1: write rows WITHOUT a checkpoint, so they live only as
     // uploaded WAL segments past a manifest floor of zero — never folded into
@@ -71049,7 +71217,10 @@ fn cold_start_then_commit_then_crash_recovers_every_record_body() {
     // the journal is recreated empty, the manifest floor stays at zero, and
     // the segments hold gen1.
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -71076,7 +71247,10 @@ fn cold_start_then_commit_then_crash_recovers_every_record_body() {
     // Generation 3: recover. The journal covers only gen2, so a segment floor
     // sized by the journal tip would skip the gen1 segments and silently lose
     // gen1. Both generations must survive.
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -71188,7 +71362,10 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     config.work_arena_bytes = 3 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
         &mut engine,
@@ -71307,7 +71484,10 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     // 20000-row fixture (three block fetches per row through a one-block
     // cache, which the warm queries already covered).
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut restarted_budget = Budget::new(test_retained_image_budget_bytes(&config, (1 << 29) + (96 << 20)));
+    let mut restarted_budget = Budget::new(test_retained_image_budget_bytes(
+        &config,
+        (1 << 29) + (96 << 20),
+    ));
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let before_cold = restarted.storage.block_io_stats();
     partitioned(

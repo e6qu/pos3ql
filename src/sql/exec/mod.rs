@@ -55816,7 +55816,7 @@ pub fn merge<'a>(
                 rowenc::decode(bytes, target_schema, &mut values)?;
                 if let Some(plan) = select_security {
                     let context = RowCtx {
-                        def: def,
+                        def,
                         values: &values[..def.n_columns],
                         alias: None,
                     };
@@ -55991,7 +55991,7 @@ pub fn merge<'a>(
             }
             if let Some(plan) = select_security {
                 let context = RowCtx {
-                    def: def,
+                    def,
                     values: &vals[..def.n_columns],
                     alias: None,
                 };
@@ -56100,7 +56100,7 @@ pub fn merge<'a>(
                 continue;
             }
             let lookup = MergeLookup {
-                target_def: def,
+                target_def,
                 target_alias,
                 target: target_vals[j],
                 source_def,
@@ -56144,7 +56144,7 @@ pub fn merge<'a>(
                 };
                 if let Some(plan) = action_security {
                     let policy_row = RowCtx {
-                        def: def,
+                        def,
                         values: target_vals[j],
                         alias: None,
                     };
@@ -56437,7 +56437,7 @@ pub fn merge<'a>(
                         }
                         if let Some(plan) = update_check {
                             let policy_row = RowCtx {
-                                def: def,
+                                def,
                                 values: &new_values[..def.n_columns],
                                 alias: None,
                             };
@@ -59867,7 +59867,7 @@ pub(crate) fn update<'a>(
             }
             let mut physical_new = values;
             let context = RowCtx {
-                def: def,
+                def,
                 values: &values[..def.n_columns],
                 alias: statement.alias,
             };
@@ -60127,7 +60127,7 @@ pub(crate) fn update<'a>(
             }
             if let Some(plan) = row_security_check {
                 let context = RowCtx {
-                    def: def,
+                    def,
                     values: &new_values[..def.n_columns],
                     alias: None,
                 };

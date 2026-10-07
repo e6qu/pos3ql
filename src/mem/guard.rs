@@ -172,9 +172,18 @@ fn credit(size: usize) {
     if TLS_SCOPE.with(|c| c.get()) {
         // Saturating: a non-TLS allocation freed inside a scope must not
         // wrap the counter into a spurious pool-exhaustion abort.
-        let _ = TLS_USED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(size as u64))
-        });
+        let mut current = TLS_USED.load(Ordering::Relaxed);
+        loop {
+            match TLS_USED.compare_exchange_weak(
+                current,
+                current.saturating_sub(size as u64),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 

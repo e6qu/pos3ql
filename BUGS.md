@@ -12,7 +12,9 @@ UPDATE and MERGE readers reuse those images. Exhaustion and stale identity
 reacquisition fail explicitly; error returns release the retained capacity.
 COPY and DDL pre-change readers use the same pool. Nested-trigger exhaustion
 rolls back the outer mutation and frees capacity for retry. These changes
-introduce no deferred defect.
+introduce no deferred defect. Clippy also exposed deprecated atomic update
+calls; the catalog clock now reuses its bounded compare-and-exchange boundary
+and TLS accounting retains its saturating compare-and-exchange behavior.
 
 Table-owned serial advances previously used unchecked signed addition. The
 counter boundary now checks all integer widths before mutation. Dirty-state

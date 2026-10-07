@@ -85,7 +85,9 @@ that query-scope boundary. These changes remain prerequisites for fixed workers.
 Forced-spill and reference differential coverage split their overloaded corpus
 slices into complementary workers within the unchanged 15-minute ceiling.
 The timeout guard verifies complete, disjoint corpus assignment for both
-matrices across mixed partition widths.
+matrices across mixed partition widths. The ordinary PostgreSQL regression
+file slice also has complementary workers; upstream ranges stay together and
+statement progress is streamed so deadline failures retain diagnostics.
 
 Completion evidence:
 

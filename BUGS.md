@@ -17,7 +17,9 @@ The first forced-spill slice and an instrumented reference corpus slice
 exhausted their fixed CI deadlines. Each now has two complementary slices;
 the timeout guard proves all current and future corpus ordinals still have
 exactly one owner in both matrices. No test or limit was
-removed or reduced.
+removed or reduced. The ordinary PostgreSQL regression
+file slice also has complementary workers; upstream ranges stay together and
+statement progress is streamed so deadline failures retain diagnostics.
 
 SQL and wire engine fixtures now charge retained reader capacity through one
 constructor,

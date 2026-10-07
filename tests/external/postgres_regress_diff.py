@@ -259,6 +259,7 @@ def main():
     parser.add_argument("--max-print", type=int, default=30)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--progress", action="store_true")
     args = parser.parse_args()
     if psycopg is None:
         print("psycopg is required", file=sys.stderr)
@@ -288,6 +289,8 @@ def main():
                     upstream_total += 1
                 else:
                     setup_total += 1
+                if args.progress:
+                    print(f"RUN {filename}:{line}", flush=True)
                 pg_result = run_one(pg, sql, copy_data)
                 p3_result = run_one(p3, sql, copy_data)
                 if results_match(pg_result, p3_result, sql):

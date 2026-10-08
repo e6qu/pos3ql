@@ -14,8 +14,8 @@ pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_map::RowMap;
-pub use row_reads::RowRead;
-use row_reads::RowReadView;
+pub(crate) use row_reads::RowRead;
+use row_reads::{RowReadView, RowReadVisitor};
 use row_versions::{
     RowVersionPools, clear_pending_versions,
     pending_last, pop_pending_version, prune_committed_history,
@@ -29394,7 +29394,7 @@ impl Storage {
     pub fn for_each_row_state(
         &self,
         table_slot: usize,
-        each: &mut dyn for<'row> FnMut(u64, RowRead<'row>) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        each: &mut RowReadVisitor<'_>,
     ) -> Result<(), SqlError> {
         // The overlay first: pending changes and hot rows, whose entries
         // shadow anything the spill list holds for the same rowid.
@@ -29433,7 +29433,7 @@ impl Storage {
     pub(crate) fn for_each_resident_row_state(
         &self,
         table_slot: usize,
-        each: &mut dyn for<'row> FnMut(u64, RowRead<'row>) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        each: &mut RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
         let view = RowReadView::new(&self.row_versions, &self.tables[table_slot].rows);
         for (rowid, state) in view.iter() {
@@ -29447,7 +29447,7 @@ impl Storage {
     pub(crate) fn for_each_scan_overlay_row_state(
         &self,
         table_slot: usize,
-        each: &mut dyn for<'row> FnMut(u64, RowRead<'row>) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        each: &mut RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
         let view = RowReadView::new(&self.row_versions, &self.tables[table_slot].rows);
         for (rowid, state) in view.iter() {

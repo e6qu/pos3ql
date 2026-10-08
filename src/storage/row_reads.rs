@@ -13,10 +13,12 @@ use crate::mem::fixed_map::FixedMap;
 
 /// Metadata is copied, but reusable chain slots remain pinned until this read
 /// ends. Only the owning view can construct a read from resident metadata.
-pub struct RowRead<'a> {
+pub(crate) struct RowRead<'a> {
     state: RowState,
     versions: VersionOwner<'a>,
 }
+
+pub(super) type RowReadVisitor<'a> = dyn for<'row> FnMut(u64, RowRead<'row>) -> Result<core::ops::ControlFlow<()>, crate::sql::eval::SqlError> + 'a;
 
 enum VersionOwner<'a> {
     Retained(RwLockReadGuard<'a, RowVersionState>),

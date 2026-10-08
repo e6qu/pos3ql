@@ -297,7 +297,7 @@ fn scope_record_witness<'a>(
         let mut collations = [Collation::None; MAX_PROJ];
         for (index, column) in definition.columns().iter().enumerate() {
             fields[index] = RecordField {
-                name: column.name.as_str(),
+                name: scope.defs.column_name(table, index),
                 type_oid: storage
                     .routine_type_oid(column.ctype, column.user_type, txid)
                     .ok_or_else(|| {

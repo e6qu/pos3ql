@@ -179,6 +179,10 @@ impl<'a> QueryDefinitions<'a> {
         }
     }
 
+    fn retain(&self, storage: &Storage, table: usize) -> Result<&TableDef, SqlError> {
+        self.images.definition(storage, table, self.transaction)
+    }
+
     fn set_arena(&mut self, index: usize, definition: &'a TableDef) {
         self.sources[index] = Some(ScopeDefinition::Arena(definition));
     }
@@ -1059,7 +1063,7 @@ impl<'d> QueryScope<'d> {
         Ok(())
     }
 
-    pub(crate) fn add(
+    fn add(
         &mut self,
         storage: &'d Storage,
         tref: &'d TableRef<'d>,
@@ -1091,7 +1095,7 @@ impl<'d> QueryScope<'d> {
                 ),
             });
         };
-        let stored_def = self.defs.images.definition(storage, slot, txid)?;
+        let stored_def = self.defs.retain(storage, slot)?;
         let exposed = match tref.alias {
             Some(alias) => alias,
             None => arena.alloc_str(stored_def.name.as_str()).map_err(|_| arena_full())?,
@@ -1141,11 +1145,23 @@ impl<'d> QueryScope<'d> {
         let source = match renamed {
             Some(definition) => ScopeDefinition::Arena(definition),
             None => {
-                let names = arena.alloc_slice_with(stored_def.n_columns, |_| "")
-                    .map_err(|_| arena_full())?;
-                for (name, column) in names.iter_mut().zip(stored_def.columns()) {
-                    *name = arena.alloc_str(column.name.as_str()).map_err(|_| arena_full())?;
-                }
+                let reused = self.defs.sources[..self.n].iter().flatten().find_map(|source| {
+                    match source {
+                        ScopeDefinition::Retained { table, names } if *table == slot => Some(*names),
+                        _ => None,
+                    }
+                });
+                let names = match reused {
+                    Some(names) => names,
+                    None => {
+                        let names = arena.alloc_slice_with(stored_def.n_columns, |_| "")
+                            .map_err(|_| arena_full())?;
+                        for (name, column) in names.iter_mut().zip(stored_def.columns()) {
+                            *name = arena.alloc_str(column.name.as_str()).map_err(|_| arena_full())?;
+                        }
+                        &*names
+                    }
+                };
                 ScopeDefinition::Retained { table: slot, names }
             }
         };
@@ -1777,6 +1793,7 @@ mod tests {
             let scope = QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena).unwrap();
             assert!(core::ptr::eq(scope.defs.get(0).unwrap(), scope.defs.get(1).unwrap()));
             assert_eq!(scope.defs.get(0).unwrap().n_columns, MAX_COLUMNS);
+            assert!(core::ptr::eq(scope.defs.column_name(0, 0), scope.defs.column_name(1, 0)));
             let escaped = scope.output_name(ResolvedColumn::Table(0, MAX_COLUMNS - 1));
             assert_eq!(escaped, "c1599");
             drop(scope);

@@ -5603,8 +5603,7 @@ pub(crate) fn lock_result_row(
             let Some(rowid) = rowid else {
                 continue;
             };
-            let slot = if storage
-                .table_def(scope.slots[table], txid)
+            let slot = if scope.defs.get(table).expect("locked source is resolved")
                 .partition
                 .is_partitioned()
             {

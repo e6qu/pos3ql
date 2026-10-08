@@ -40,11 +40,6 @@ JSON. `tools/benchmark-report.py` derives a report from those raw files.
   duplicate matches, residual ON predicates, and LEFT JOIN preservation share
   one execution path. The fixed build-entry ceiling still bounds eligibility;
   larger builds choose a nested-loop plan before execution.
-- Schema-only catalog resolution reads shared definitions without constructing
-  rows or recursively describing catalog-backed views. Resolved view OID
-  lookups do not enumerate unrelated indexes. Reverse relation-OID lookups
-  allocate only the rendered name, not a complete index catalog per cast.
-
 ## Running the suite
 
 The smoke suite needs Rust, Python 3, and `nc`:
@@ -286,14 +281,8 @@ reported rather than required to be linear.
 
 ## Remaining qualification
 
-The [roadmap](../PLAN.md) owns the implementation sequence. Query execution is
-still serialized. Table and row synchronization, engine publication, and fixed
-workers must be completed before claiming one-through-N core scaling.
-
-Run repeated long measurements on pinned hardware and independently operated
-object storage before publishing production latency or throughput claims.
-Retain both vanilla PostgreSQL controls and each system's actual persistence
-settings. Include cache states, checkpoint/compaction interference, large
-catalogs, worker scaling, logical-replica freshness, recovery, and multi-host
-failover with real routing. The packaged monitor supplies promotion policy;
-representative deployment evidence remains outstanding.
+Execution remains serial. The [roadmap](../PLAN.md#remaining-sequence) defines
+the shared-state and worker prerequisites, representative deployment inputs,
+and required scaling, recovery, freshness, and failover evidence. Timing claims
+require repeated long runs on pinned hardware with independent object storage;
+retain both PostgreSQL controls and each system's actual persistence settings.

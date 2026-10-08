@@ -85,14 +85,10 @@ The file contains strict `access_key`, `secret_key`, and optional
 `session_token` entries. Credential discovery through a vendor SDK, instance
 metadata service, or provider control plane is outside the engine.
 
-The server can reload the file after atomic replacement through `SIGHUP` or
-`pg_reload_conf()`. It parses into fixed buffers, rejects unsafe permissions,
-validates the candidate by conditionally renewing the live writer fence, and
-only then installs it in every root, write, and read client. A failed candidate
-leaves the prior credentials installed, marks readiness false, increments the
-failure metric, and logs an error without secret material. Operators must keep
-old and new credentials valid during the validation window and revoke the old
-credential after readiness returns.
+Credential reload validates the candidate through a conditional writer-fence
+renewal before installing it. Failure retains the installed credential and
+marks readiness false. Follow the atomic replacement and overlapping-validity
+procedure in [operations](operations.md#object-store-credential-rotation).
 
 Request slots, signing state, retry state, response headers, XML list/error
 decoding, and page buffers are fixed at startup. Retries are limited to typed
@@ -107,21 +103,12 @@ between statements, while an explicit checkpoint returns only after all listed
 obsolete objects are deleted. Live-set or recovery-chain exhaustion fails with
 the corresponding configuration name and never weakens retention.
 
-Named backups use the same operations and prefix. A retained backup manifest
-adds its reachable block graph to the live set and lowers the commit-pruning
-floor to include prepared transactions and logical slots. `max_backups` bounds
-the startup name roster, while
-`checkpoint_live_blocks` still bounds the union of current, in-progress, and
-backup-reachable blocks. Capacity exhaustion stops cleanup before deletion.
-
-Independent backup export opens the source and destination through the same
-provider-neutral contract. It scans immutable block, commit, and durable
-extension-package objects once in fixed `checkpoint_garbage_batch_objects`
-batches, streams each body through bounded ranged GETs, and copies it only
-through conditional PUT. An `export-pending` destination marker prevents startup from
-observing a partial namespace; live roots publish after the copy and the marker
-is removed after the destination cache reset and a matching `export-complete`
-receipt. The first attempt requires an empty destination prefix.
+Backups and independent-prefix exports use the same protocol and fixed
+capacities. Backup roots extend the live set and commit-retention floor;
+capacity exhaustion stops cleanup before deletion. Export streams immutable
+objects through bounded ranged GETs and conditional PUTs, with pending markers
+that prevent startup from observing an incomplete destination. The full
+retention, retry, and publication contract is in [backup and restore](backup-restore.md).
 
 ## Qualification
 
@@ -159,9 +146,9 @@ Set `POS3QL_OBJECT_STORE_SESSION_TOKEN` for temporary credentials,
 `POS3QL_OBJECT_STORE_ADDRESSING=virtual_hosted` when required, and
 `POS3QL_OBJECT_STORE_TLS_CA_FILE` for a private certificate authority.
 
-CI also contains architecture guards that reject the old custom request path
-and authentication scheme, vendor SDK dependencies, provider-named branches or
-configuration, and any fallback that changes protocol semantics.
+CI architecture guards enforce the profile request and authentication boundary
+and reject vendor SDK dependencies, provider-named branches or configuration,
+and fallbacks that change protocol semantics.
 
 Passing that suite is the admission criterion. Marketing an API as
 "S3-compatible" is not sufficient. A fixture change cannot be used merely to

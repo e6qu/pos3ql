@@ -19,7 +19,6 @@
 - `wal`: durable journal encoding and replay.
 - `checkpoint`: SST publication and cold recovery.
 - `store`: block formats and cache tiers.
-- `entity tag`: an opaque, strong, quoted object generation token used for compare-and-swap.
 - `sim`: deterministic fault simulation.
 
 ## Glossary
@@ -33,6 +32,7 @@
 - **declared type identity**: the schema-qualified type visible in catalog, parameter, and replication metadata; distinct from an executor value type.
 - **commit batch**: immutable journal bytes plus a descriptor; recoverable only after the CAS commit head names it.
 - **durable mode**: `object_store = on`; acknowledgement requires commit-batch publication.
+- **entity tag**: an opaque, strong, quoted object generation token used for compare-and-swap.
 - **manifest**: compare-and-swap root naming the current immutable storage state.
 - **MVCC**: visibility by transaction and commit LSN.
 - **promotion**: transfer of durable write ownership to a fresh process incarnation by compare-and-swap.

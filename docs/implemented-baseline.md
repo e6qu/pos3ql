@@ -1,8 +1,8 @@
 # Implemented baseline
 
-Current implementation summary after PR #599 (2026-10-06). This describes
-capabilities and verification mechanisms, not completion of the production
-roadmap. Outstanding work is in [PLAN.md](../PLAN.md).
+This summarizes current capabilities and verification mechanisms. Completion
+requires the open gates in [PLAN.md](../PLAN.md); implemented mechanisms alone
+do not qualify concurrent execution or representative deployments.
 
 | Boundary | Implemented | Detailed contract |
 |---|---|---|
@@ -14,63 +14,28 @@ roadmap. Outstanding work is in [PLAN.md](../PLAN.md).
 | Specialized SQL | Typed JSON/JSONB/jsonpath and SQL/JSON; XML and the documented XPath subset | [SQL/JSON](sql-json.md), [SQL/XML](sql-xml.md) |
 | Verification | Allocation-forbidden tests, SQLSTATE and wire probes, drivers, PostgreSQL differential/regression corpora, cold recovery, storage VOPR, and performance-smoke gates | [Contributing](../CONTRIBUTING.md), [performance](performance.md) |
 
-## Concurrency preparation
+## Runtime ownership
 
-Statement arenas, DML selection scratch, backend/database context, and dispatcher
-leases are startup-bounded and isolated by execution workspace. Long-lived
-client COPY and subscription state have their own charged buffers.
+| State | Current boundary |
+|---|---|
+| Statement execution | Startup-bounded arenas, DML scratch, backend/database context, and FIFO dispatcher leases; COPY/subscription state has separately charged buffers |
+| Catalogs and metadata | Synchronized publication and owned reader images; guards release before nested resolution |
+| Table definitions | DML, COPY, and DDL pre-change readers retain immutable startup-budgeted images across callbacks and identity reuse; live publication remains exclusive |
+| Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
+| Resident rows | Per-table map guards and one guarded pending/committed version owner; issued readers retain chain ownership, including SQL and checkpoint walks |
+| Heap bytes | Guarded bytes and append position; callback/codec reads retain the guard, while long-lived images copy into the fixed statement arena |
 
-Catalog and metadata publication now has synchronized boundaries for types,
-sequences, authorization, routines, triggers, policies, views, rewrite rules,
-dependencies, indexes, database identities,
-system settings, prepared catalog images, and active cluster defaults. Owned
-reader images release guards before nested resolution. The latest database and
-cluster changes cover pending identity reservation, retirement, duplicate
-recovery records, coherent snapshots, and exact retained capacity.
+Reader capacity, lock controls, and heap controls are charged at startup.
+Exhaustion is explicit; stale definition identity reacquisition fails rather than
+adopting a reused slot. Heap ranges are checked against initialized bytes, and
+compaction validates the full relocation set before changing bytes or handles,
+including aliases and empty locations. Startup rejects heaps beyond the 32-bit
+location range. Retained heap images consume arena capacity, as spilled images do.
 
-Table-owned serial positions have per-table synchronization and consistent WAL
-and checkpoint images. Later changes invalidate staging acknowledgement; range
-errors leave positions unchanged. Generated-value assignment borrows its visible
-definition without copying the full maximum-width image.
-
-INSERT, UPDATE, DELETE, MERGE, and COPY retain immutable definition images from a
-startup-budgeted pool. Physical UPDATE and MERGE rows reuse one image per table
-and transaction within the statement. Returned references borrow their reader
-owner, remain valid across definition changes and slot reuse, and do not borrow
-mutable storage. Pool exhaustion and stale identity reacquisition are explicit
-errors. COPY owns its reader across data messages; DDL event graphs retain
-pre-change images outside the statement arena. Live definition publication
-remains exclusive. Routine lookup filters transaction-visible identity
-and kind under the catalog guard before copying candidate payloads, releasing
-the guard before nested overload and type resolution.
-
-Relation row maps have a per-table read boundary. Point reads return copied
-row-state images; scans and checkpoint batches retain a coherent map guard.
-Mutation and lifecycle cleanup require exclusive access. The startup table
-budget includes the row-map lock controls. Pending and committed row-version
-arrays share one guarded owner; each array owns its free-list control.
-SQL and checkpoint chain reads require an issued row image that retains its
-version owner. Point lookup acquires that owner before copying row metadata;
-resident walks borrow one map/version view and chain helpers reuse its owner.
-Raw copied metadata cannot enter visibility or history lookup. Immutable SST
-images carry no resident handles. Point visibility consumes its owner before
-an immutable history probe; resident walks retain their view across callbacks.
-Mutations and compaction require exclusive access; pool controls are charged at
-startup.
-Heap bytes and append position also share one guarded owner. Direct codec and
-callback reads retain that owner without copying. Long-lived row images copy
-into the fixed statement arena, so heap images consume arena capacity as
-spilled images do; DML reuses the same retained copy. Compaction preflights all
-locations before moving bytes or handles, groups aliases, and preserves empty
-locations. Bounds apply to initialized bytes, and startup rejects heaps beyond
-the 32-bit location range. Heap controls are charged exactly at startup.
-Shared publication, location pinning across concurrent relocation, statistics,
-maintenance, and query-scope definition ownership remain open.
-
-The reactor still executes statements serially. Table definitions and row
-mutation, engine-owned prepared slots and WAL publication, fixed workers, and
-scaling qualification remain open. Catalog metadata synchronization does not
-make engine execution concurrent.
+The reactor still executes statements serially. Query-scope definition ownership,
+shared row publication and maintenance, locator pinning across concurrent
+relocation, engine publication, and fixed workers remain the roadmap's open
+concurrency gates. Immutable SST reads carry no resident version handles.
 
 ## Evidence limits
 

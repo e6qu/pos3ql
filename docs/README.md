@@ -5,7 +5,7 @@
 | Document | Owns |
 |---|---|
 | [Project overview](../README.md) | Architecture, status, and first run |
-| [Roadmap](../PLAN.md) | Remaining sequence, gaps, and completion criteria |
+| [Roadmap](../PLAN.md) | Open gates, implementation sequence, and acceptance criteria |
 | [Implemented baseline](implemented-baseline.md) | Summary of current capabilities |
 | [PostgreSQL 18 compatibility](postgresql-18-compatibility.md) | SQL/wire scope, capacity inventory, and non-goals |
 | [Contributing](../CONTRIBUTING.md) | Development, verification, and PR workflow |
@@ -32,10 +32,11 @@
 ## Evidence and provenance
 
 - [Retained benchmarks](../benchmarks/README.md): dated raw artifacts and reports.
-- [Implementation history](history/README.md): immutable pre-review records.
+- [Implementation history](history/README.md): immutable implementation records and completed investigations.
 - Fixture generation: `tests/data/README.md` in the source repository.
 - Upstream corpora and checksums: `vendor/README.md` and `vendor/SHA256SUMS`.
 
-Keep current behavior in its owning document. Preserve original benchmark
+Keep current behavior in its owning document and unfinished work in PLAN.md.
+Completed investigations belong in PRs and the history index. Preserve original benchmark
 artifacts and upstream provenance; link them rather than rewriting observations
 as current production claims.

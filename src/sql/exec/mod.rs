@@ -60424,7 +60424,8 @@ pub(crate) fn update<'a>(
         }
         if !statement.returning.is_empty() {
             let mut new_values = [Datum::Null; MAX_COLUMNS];
-            if let Err(e) = rowenc::decode(storage.heap.get(new_loc), row_schema, &mut new_values) {
+            let row = match storage.heap.get(new_loc) { Ok(row) => row, Err(error) => return sql_fail(error) };
+            if let Err(e) = rowenc::decode(&row, row_schema, &mut new_values) {
                 return sql_fail(e);
             }
             if let Err(e) = emit_projected(
@@ -66134,18 +66135,18 @@ fn alter_table_relation(
             let (_, _, RowHome::Heap(la)) = scratch[a].local_parts() else {
                 unreachable!()
             };
-            let abytes = storage.heap.get(la);
+            let abytes = match storage.heap.get(la) { Ok(row) => row, Err(error) => return sql_fail(error) };
             let mut avals = [Datum::Null; MAX_COLUMNS];
-            if let Err(e) = rowenc::decode(abytes, new_schema, &mut avals) {
+            if let Err(e) = rowenc::decode(&abytes, new_schema, &mut avals) {
                 return sql_fail(e);
             }
             for b in (a + 1)..scratch.len() {
                 let (_, _, RowHome::Heap(lb)) = scratch[b].local_parts() else {
                     unreachable!()
                 };
-                let bbytes = storage.heap.get(lb);
+                let bbytes = match storage.heap.get(lb) { Ok(row) => row, Err(error) => return sql_fail(error) };
                 let mut bvals = [Datum::Null; MAX_COLUMNS];
-                if let Err(e) = rowenc::decode(bbytes, new_schema, &mut bvals) {
+                if let Err(e) = rowenc::decode(&bbytes, new_schema, &mut bvals) {
                     return sql_fail(e);
                 }
                 if let Some(name) = rewritten_dup_name(
@@ -66239,6 +66240,7 @@ fn alter_table_relation(
                 unreachable!("the rewrite pass re-homes every row to the heap");
             };
             let lsn = storage.bump_lsn();
+            let row = match storage.heap.get(new_loc) { Ok(row) => row, Err(error) => return sql_fail(error) };
             if let Err(e) = wal.stage(
                 txn.txid,
                 lsn,
@@ -66246,7 +66248,7 @@ fn alter_table_relation(
                     schema: new_def.schema.as_str(),
                     table: new_def.name.as_str(),
                     rowid,
-                    row: storage.heap.get(new_loc),
+                    row: &row,
                     is_update: false,
                     old_row: None,
                     command_id: txn.command_id(),

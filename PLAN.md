@@ -1,7 +1,7 @@
 # pos3ql roadmap
 
-Reviewed after PR #604 on 2026-10-08, against
-`9ce3ad0bff9d64074a3314db96e97fa927e9ef71`.
+Reviewed after PR #605 on 2026-10-08, against
+`51a21b6b7393022b92c4f6f86c889e9fa3394b93`.
 
 [Architecture](README.md) · [Current capabilities](docs/implemented-baseline.md) ·
 [Compatibility](docs/postgresql-18-compatibility.md) · [Contributing](CONTRIBUTING.md)
@@ -89,8 +89,16 @@ SST reads carry no resident handles.
 [Focused validation](https://github.com/e6qu/pos3ql/actions/runs/37745829382)
 passed concurrent row/chain slot reuse, allocation-free guard cleanup, SQL
 history/rollback, prepared-transaction cold recovery, compaction, and independent
-startup capacity checks. Heap access, statistics, maintenance, and shared row
-publication still require mutation boundaries; execution remains serial.
+startup capacity checks.
+Heap bytes and append position now share a guarded owner with startup-charged
+controls. Callback and direct codec reads retain that owner; long-lived row
+images copy into the fixed statement arena before owner release. This consumes
+arena capacity for heap images as well as spilled images. Compaction preflights
+all locations before moving bytes or handles; exhaustion and invalid locations
+leave prior state intact. The heap address limit is checked at configuration
+and startup. Shared row publication, statistics, maintenance, query-scope
+ownership, and location pinning across concurrent relocation remain open;
+execution remains serial.
 
 Live definition publication remains exclusive. Query scopes retain definition
 references beyond lookup, so their ownership must change before definitions

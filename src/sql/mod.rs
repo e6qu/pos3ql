@@ -5047,7 +5047,7 @@ impl Engine {
                                     schema: schema.as_str(),
                                     table: name.as_str(),
                                     rowid,
-                                    row: self.storage.heap.get(loc),
+                                    row: &self.storage.heap.get(loc)?,
                                     is_update: true,
                                     old_row: Some(old_row),
                                     command_id: p.cid,
@@ -5062,7 +5062,7 @@ impl Engine {
                         schema: schema.as_str(),
                         table: name.as_str(),
                         rowid,
-                        row: self.storage.heap.get(loc),
+                        row: &self.storage.heap.get(loc)?,
                         is_update: false,
                         old_row: None,
                         command_id: p.cid,
@@ -13239,12 +13239,13 @@ impl Engine {
                 continue;
             };
             let table_definition = self.storage.table_def(table as usize, txn.txid);
+            let pending_row = pending.loc.map(|location| self.storage.heap.get(location)).transpose()?;
             let operation = match pending.loc {
                 Some(location) => WalOp::Upsert {
                     schema: table_definition.schema.as_str(),
                     table: table_definition.name.as_str(),
                     rowid,
-                    row: self.storage.heap.get(location),
+                    row: pending_row.as_deref().expect("pending location has a retained heap image"),
                     is_update: false,
                     old_row: None,
                     command_id: pending.cid,

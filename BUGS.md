@@ -6,6 +6,15 @@ finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet these inclusion criteria.
 
+Heap reads now retain byte ownership or copy retained images into the fixed
+statement arena. Compaction validates its complete relocation set before
+changing bytes or row handles. Heap locations previously used unchecked
+32-bit end arithmetic and could read unused capacity; bounds are now checked
+against initialized bytes, and configuration rejects unaddressable heaps.
+Capacity errors preserve the append frontier. These repairs introduce no
+deferred defect; shared publication and relocation lifetimes remain roadmap
+prerequisites.
+
 Pending and committed row-version arrays now share a guarded owner with their
 free lists. Allocator calls cannot pair an array with another pool's free list.
 Full chain reads retain one view; rollback, pruning, slot reuse,

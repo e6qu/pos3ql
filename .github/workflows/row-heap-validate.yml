@@ -1,0 +1,42 @@
+name: Row heap validation
+on:
+  push:
+    branches: [codex/row-heap-ownership]
+  workflow_dispatch:
+concurrency:
+  group: row-heap-validation
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Format on runner
+        run: |
+          cargo fmt --all
+          git diff > row-heap-format.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: row-heap-format
+          path: row-heap-format.patch
+      - run: cargo check --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Heap ownership and retained query images
+        run: |
+          cargo test --lib --locked row_heap_ownership -- --nocapture
+          cargo test --lib --locked heap_compaction_preserves_rows_of_a_pending_create -- --nocapture
+          cargo test --lib --locked parameterized_join_recycles_candidate_scratch -- --nocapture
+          cargo test --lib --locked ordered_catalog_query_recycles_correlated_subquery_scratch -- --nocapture
+          cargo test --lib --locked postgresql_relation_and_record_definition_capacity_executes_without_allocation -- --nocapture
+          cargo test --lib --locked prepared_transactions_survive_checkpoint_and_object_cold_recovery -- --nocapture
+          cargo test --lib --locked catalog_object_pools_follow_their_independent_startup_capacities -- --nocapture

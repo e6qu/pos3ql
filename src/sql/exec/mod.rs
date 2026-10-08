@@ -4651,9 +4651,7 @@ where
     let mut new_values = [Datum::Null; MAX_COLUMNS];
     {
         let state = storage
-            .table(table_index)
-            .rows
-            .get(&rowid)
+            .resident_row_state(table_index, rowid)
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
         let home = storage
             .visible_row_home(table_index, rowid, state, txn.txid)?
@@ -67497,7 +67495,7 @@ fn collect_matches<'a>(
                 access.map_or(0, |access| access.index_entries()),
             )?;
         }
-        let mut visit = |rowid, state| {
+        let mut visit = |rowid, state: crate::storage::RowRead<'_>| {
             let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
                 return Ok(());
             };

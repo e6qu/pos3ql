@@ -17,8 +17,8 @@ pub(crate) use row_map::RowMap;
 pub use row_reads::RowRead;
 use row_reads::RowReadView;
 use row_versions::{
-    RowVersionPools, clear_pending_versions, committed_history_get, committed_visible_at,
-    pending_last, pending_visible_at, pop_pending_version, prune_committed_history,
+    RowVersionPools, clear_pending_versions,
+    pending_last, pop_pending_version, prune_committed_history,
     push_committed_version, push_pending_version, release_committed_chain, release_pending_chain,
 };
 
@@ -52578,6 +52578,34 @@ mod tests {
 
     fn test_budget(config: &Config) -> Budget {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
+    }
+
+    #[test]
+    fn row_read_ownership_walk_releases_guards_on_break_and_error() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage.tables[0].rows.insert(1, RowState::committed_only_at(RowLoc { offset: 0, len: 4 }, 7)).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.for_each_row_state(0, &mut |_, row| {
+                assert!(storage.row_versions.test_write().is_err());
+                assert!(storage.tables[0].rows.test_write().is_err());
+                assert_eq!(row.committed_lsn, 7);
+                Ok(core::ops::ControlFlow::Break(()))
+            }).unwrap();
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.tables[0].rows.test_write().is_ok());
+            let error = storage.for_each_row_state(0, &mut |_, _| {
+                Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "reader callback exhausted"))
+            }).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.tables[0].rows.test_write().is_ok());
+            let row = storage.row_state(0, 1).unwrap().unwrap();
+            assert!(storage.row_versions.test_write().is_err());
+            assert_eq!(storage.visible_row_home_at(0, 1, row, 7, SNAPSHOT_ALL, 7).unwrap(), Some(RowHome::Heap(RowLoc { offset: 0, len: 4 })));
+            assert!(storage.row_versions.test_write().is_ok());
+        });
     }
 
     #[test]

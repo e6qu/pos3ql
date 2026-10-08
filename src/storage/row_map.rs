@@ -25,6 +25,11 @@ impl RowMap {
         self.state.read().expect("table row state lock poisoned")
     }
 
+    #[cfg(test)]
+    pub(super) fn test_write(&self) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, FixedMap<u64, RowState>>> {
+        self.state.try_write()
+    }
+
     fn exclusive(&mut self) -> &mut FixedMap<u64, RowState> {
         self.state.get_mut().expect("table row state lock poisoned")
     }

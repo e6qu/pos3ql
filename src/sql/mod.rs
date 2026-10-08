@@ -5034,7 +5034,9 @@ impl Engine {
             let name = def.name;
             let schema = def.schema;
             let lsn = self.storage.lsn() + 1;
-            let appended = match (p.loc, state.committed) {
+            let committed = state.committed;
+            drop(state);
+            let appended = match (p.loc, committed) {
                 (Some(loc), Some(old_home)) => {
                     self.storage
                         .with_row_bytes(table as usize, rowid, old_home, |old_row| {

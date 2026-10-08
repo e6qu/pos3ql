@@ -93,6 +93,11 @@ impl RowVersionPools {
         self.state.read().expect("row-version pool lock poisoned")
     }
 
+    #[cfg(test)]
+    pub(super) fn test_write(&self) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, RowVersionState>> {
+        self.state.try_write()
+    }
+
     /// Exclusive storage ownership excludes shared readers without reacquiring
     /// a lock while rollback, compaction, or publication updates both chains.
     pub(super) fn exclusive(&mut self) -> &mut RowVersionState {

@@ -29391,7 +29391,7 @@ impl Storage {
     /// consumer.
     ///
     /// `Break` stops the walk early; the callback's own error aborts it.
-    pub fn for_each_row_state(
+    pub(crate) fn for_each_row_state(
         &self,
         table_slot: usize,
         each: &mut RowReadVisitor<'_>,
@@ -29685,7 +29685,7 @@ impl Storage {
     }
 
     /// One row's state by id, through the same seam as the enumeration.
-    pub fn row_state(&self, table_slot: usize, rowid: u64) -> Result<Option<RowRead<'_>>, SqlError> {
+    pub(crate) fn row_state(&self, table_slot: usize, rowid: u64) -> Result<Option<RowRead<'_>>, SqlError> {
         if let Some(state) = RowReadView::point(&self.row_versions, &self.tables[table_slot].rows, rowid) {
             return Ok(Some(state));
         }
@@ -29718,7 +29718,7 @@ impl Storage {
     /// versions. Pending command visibility wins first; then the resident
     /// committed chain; finally immutable SSTs supply an older admissible
     /// image when the resident chain no longer carries it.
-    pub fn visible_row_home(
+    pub(crate) fn visible_row_home(
         &self,
         table_slot: usize,
         rowid: u64,
@@ -29738,7 +29738,7 @@ impl Storage {
     /// Visibility with explicit command and commit snapshots. DDL validation
     /// uses `SNAPSHOT_ALL` to include every change made earlier in the current
     /// transaction; ordinary scans call `visible_row_home`.
-    pub fn visible_row_home_at(
+    pub(crate) fn visible_row_home_at(
         &self,
         table_slot: usize,
         rowid: u64,

@@ -80,9 +80,12 @@ free lists. Each array owns its free-list control, so allocator calls cannot
 pair it with another pool. Visibility holds one view across both chains and
 releases it before object-store lookup. Rollback, pruning, publication, removal, and compaction
 require exclusive pool ownership; pool controls are charged at startup.
-Heap access, statistics, maintenance, and the combined row-map/version lifecycle
-still require shared mutation boundaries. Detached row-state chain handles do
-not retain pool slots across mutation; execution remains serial.
+SQL and checkpoint chain readers now require an issued row read that retains
+its version owner. Point lookup acquires version ownership before copying map
+metadata; full resident walks borrow one combined map/version view. Raw copied
+row metadata cannot be supplied to visibility or chain lookup APIs. Immutable
+SST reads carry no resident handles. Heap access, statistics, maintenance, and
+shared row publication still require mutation boundaries; execution remains serial.
 
 Live definition publication remains exclusive. Query scopes retain definition
 references beyond lookup, so their ownership must change before definitions

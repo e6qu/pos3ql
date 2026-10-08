@@ -730,8 +730,7 @@ impl TemporarySpiller {
             let resident = matches!(state.committed, Some(RowHome::Heap(_)))
                 || (state.committed.is_none() && state.committed_lsn != 0)
                 || (0..state.history.len()).any(|index| {
-                    storage
-                        .row_history_get(state, index)
+                    state.history_get(index)
                         .is_some_and(|version| {
                             version.home.is_none() || matches!(version.home, Some(RowHome::Heap(_)))
                         })
@@ -743,7 +742,7 @@ impl TemporarySpiller {
                 .committed
                 .or_else(|| {
                     (0..state.history.len())
-                        .find_map(|index| storage.row_history_get(state, index)?.home)
+                        .find_map(|index| state.history_get(index)?.home)
                 })
                 .unwrap_or(RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }));
             sort_scratch.push((rowid, marker)).map_err(|error| {
@@ -805,7 +804,7 @@ impl TemporarySpiller {
                 append_version(state.committed_lsn, state.committed)?;
             }
             for index in 0..state.history.len() {
-                if let Some(version) = storage.row_history_get(state, index) {
+                if let Some(version) = state.history_get(index) {
                     append_version(version.lsn, version.home)?;
                 }
             }
@@ -11394,7 +11393,7 @@ impl Checkpointer {
             // every snapshot-retained committed version. The scratch remains
             // one entry per row even when object capacity holds a long chain.
             sort_scratch.clear();
-            let mut collect = |rowid, state: crate::storage::RowState| {
+            let mut collect = |rowid, state: crate::storage::RowRead<'_>| {
                 use core::ops::ControlFlow;
                 let has_version = state.committed.is_some()
                     || state.committed_lsn != 0
@@ -11409,7 +11408,7 @@ impl Checkpointer {
                     .committed
                     .or_else(|| {
                         (0..state.history.len())
-                            .find_map(|index| storage.row_history_get(state, index)?.home)
+                            .find_map(|index| state.history_get(index)?.home)
                     })
                     .unwrap_or(RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }));
                 sort_scratch.push((rowid, marker)).map_err(|e| {
@@ -11516,7 +11515,7 @@ impl Checkpointer {
                     append_version(state.committed_lsn, state.committed, true)?;
                 }
                 for index in 0..state.history.len() {
-                    if let Some(version) = storage.row_history_get(state, index) {
+                    if let Some(version) = state.history_get(index) {
                         append_version(version.lsn, version.home, false)?;
                     }
                 }

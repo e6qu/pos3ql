@@ -1,0 +1,39 @@
+name: Row lifecycle validation
+on:
+  push:
+    branches: [codex/row-lifecycle-ownership]
+  workflow_dispatch:
+concurrency:
+  group: row-lifecycle-validation
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Format on runner
+        run: |
+          cargo fmt --all
+          git diff > row-lifecycle-format.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: row-lifecycle-format
+          path: row-lifecycle-format.patch
+      - run: cargo check --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Row lifecycle regressions
+        run: cargo test --lib --locked row_read_ownership -- --nocapture
+      - name: Existing pool regressions
+        run: cargo test --lib --locked row_version_ownership -- --nocapture
+      - name: Snapshot visibility
+        run: cargo test --lib --locked committed_image_obeys_an_lsn_snapshot -- --nocapture

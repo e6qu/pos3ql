@@ -566,11 +566,11 @@ fn enforce_expression_index_uniqueness<'a>(
         }
         Ok(ControlFlow::Continue(()))
     })?;
-    for (rowid, state) in storage.table(table_index).rows.iter() {
+    for (rowid, state) in storage.resident_rows(table_index).iter() {
         if Some(rowid) == self_rowid {
             continue;
         }
-        let Some(pending) = storage.row_pending_last(state) else {
+        let Some(pending) = state.pending_last() else {
             continue;
         };
         let Some(location) = pending.loc else {
@@ -756,11 +756,11 @@ fn pending_scan_uniqueness(
     def: &TableDef,
     name: &ConstraintName,
 ) -> Result<(), SqlError> {
-    for (rowid, state) in storage.table(table_index).rows.iter() {
+    for (rowid, state) in storage.resident_rows(table_index).iter() {
         if Some(rowid) == self_rowid {
             continue;
         }
-        let Some(pending) = storage.row_pending_last(state) else {
+        let Some(pending) = state.pending_last() else {
             continue;
         };
         let Some(loc) = pending.loc else {
@@ -837,11 +837,11 @@ pub(crate) fn enforce_partial_index_uniqueness(
         }
         Ok(ControlFlow::Continue(()))
     })?;
-    for (rowid, state) in storage.table(table_index).rows.iter() {
+    for (rowid, state) in storage.resident_rows(table_index).iter() {
         if Some(rowid) == self_rowid {
             continue;
         }
-        let Some(pending) = storage.row_pending_last(state) else {
+        let Some(pending) = state.pending_last() else {
             continue;
         };
         let Some(location) = pending.loc else {

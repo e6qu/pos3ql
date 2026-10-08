@@ -64021,10 +64021,9 @@ fn alter_table_relation(
     // writers. This verifies the row-version invariant at the rewrite
     // boundary as a corruption guard.
     if storage
-        .table(table_index)
-        .rows
+        .resident_rows(table_index)
         .iter()
-        .any(|(_, state)| storage.row_locked_by_other(state, txn.txid).is_some())
+        .any(|(_, state)| state.locked_by_other(txn.txid).is_some())
     {
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE,

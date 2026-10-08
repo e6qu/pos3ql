@@ -5020,7 +5020,7 @@ impl Engine {
             let Some(state) = self.storage.row_state(table as usize, rowid)? else {
                 continue;
             };
-            let Some(p) = self.storage.row_pending_last(state) else {
+            let Some(p) = state.pending_last() else {
                 continue;
             };
             let t = self.storage.table(table as usize);
@@ -13233,7 +13233,7 @@ impl Engine {
             let Some(state) = self.storage.row_state(table as usize, rowid)? else {
                 continue;
             };
-            let Some(pending) = self.storage.row_pending_last(state) else {
+            let Some(pending) = state.pending_last() else {
                 continue;
             };
             let table_definition = self.storage.table_def(table as usize, txn.txid);

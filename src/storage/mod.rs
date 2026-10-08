@@ -17,9 +17,9 @@ pub(crate) use row_map::RowMap;
 pub(crate) use row_reads::RowRead;
 use row_reads::{RowReadView, RowReadVisitor};
 use row_versions::{
-    RowVersionPools, clear_pending_versions,
-    pending_last, pop_pending_version, prune_committed_history,
-    push_committed_version, push_pending_version, release_committed_chain, release_pending_chain,
+    RowVersionPools, clear_pending_versions, pending_last, pop_pending_version,
+    prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
+    release_pending_chain,
 };
 
 use core::cell::Cell;
@@ -29685,24 +29685,32 @@ impl Storage {
     }
 
     /// One row's state by id, through the same seam as the enumeration.
-    pub(crate) fn row_state(&self, table_slot: usize, rowid: u64) -> Result<Option<RowRead<'_>>, SqlError> {
-        if let Some(state) = RowReadView::point(&self.row_versions, &self.tables[table_slot].rows, rowid) {
+    pub(crate) fn row_state(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+    ) -> Result<Option<RowRead<'_>>, SqlError> {
+        if let Some(state) =
+            RowReadView::point(&self.row_versions, &self.tables[table_slot].rows, rowid)
+        {
             return Ok(Some(state));
         }
         Ok(self
             .spill_probe_at(table_slot, rowid, u64::MAX)?
             .and_then(|version| {
-                version.len.map(|len| RowRead::immutable(RowState {
-                    committed: Some(RowHome::Spilled {
-                        len,
-                        sst: version.member,
-                        commit_lsn: version.commit_lsn,
-                    }),
-                    committed_lsn: version.commit_lsn,
-                    checkpoint_change_lsn: 0,
-                    history: CommittedHistory::empty(),
-                    pending: PendingVersions::empty(),
-                }))
+                version.len.map(|len| {
+                    RowRead::immutable(RowState {
+                        committed: Some(RowHome::Spilled {
+                            len,
+                            sst: version.member,
+                            commit_lsn: version.commit_lsn,
+                        }),
+                        committed_lsn: version.commit_lsn,
+                        checkpoint_change_lsn: 0,
+                        history: CommittedHistory::empty(),
+                        pending: PendingVersions::empty(),
+                    })
+                })
             }))
     }
 
@@ -31069,7 +31077,8 @@ impl Storage {
             ));
         }
         let oldest_snapshot = self.oldest_snapshot();
-        let conflicting_owner = self.resident_row_state(table_index, rowid)
+        let conflicting_owner = self
+            .resident_row_state(table_index, rowid)
             .and_then(|state| state.locked_by_other(txid));
         if let Some(owner) = conflicting_owner {
             self.wait_for_transaction(txid, owner)?;
@@ -31079,7 +31088,10 @@ impl Storage {
             ));
         }
         let existed = match self.resident_row_state(table_index, rowid) {
-            Some(state) => state.visible_at(txid, SNAPSHOT_ALL, u64::MAX).flatten().is_some(),
+            Some(state) => state
+                .visible_at(txid, SNAPSHOT_ALL, u64::MAX)
+                .flatten()
+                .is_some(),
             None => self
                 .spill_probe_at(table_index, rowid, u64::MAX)?
                 .is_some_and(|version| version.len.is_some()),
@@ -33380,9 +33392,9 @@ impl Storage {
     /// value cache: row visibility ignores them and the committed key remains
     /// installed until their transaction commits.
     pub(crate) fn has_visible_pending_rows(&self, table_index: usize, txid: u32) -> bool {
-        self.resident_rows(table_index).iter().any(|(_, state)| {
-            state.has_visible_pending(txid, self.read_snapshot())
-        })
+        self.resident_rows(table_index)
+            .iter()
+            .any(|(_, state)| state.has_visible_pending(txid, self.read_snapshot()))
     }
 
     /// Releases a table's enforcer index slots back to the pool and clears its
@@ -52425,19 +52437,40 @@ mod tests {
         storage.tables[0].rows.insert(1, state).unwrap();
         assert_eq!(
             storage
-                .visible_row_home_at(0, 1, storage.resident_row_state(0, 1).unwrap(), 7, SNAPSHOT_ALL, 41)
+                .visible_row_home_at(
+                    0,
+                    1,
+                    storage.resident_row_state(0, 1).unwrap(),
+                    7,
+                    SNAPSHOT_ALL,
+                    41
+                )
                 .unwrap(),
             None
         );
         assert_eq!(
             storage
-                .visible_row_home_at(0, 1, storage.resident_row_state(0, 1).unwrap(), 7, SNAPSHOT_ALL, 42)
+                .visible_row_home_at(
+                    0,
+                    1,
+                    storage.resident_row_state(0, 1).unwrap(),
+                    7,
+                    SNAPSHOT_ALL,
+                    42
+                )
                 .unwrap(),
             Some(RowHome::Heap(location))
         );
         assert_eq!(
             storage
-                .visible_row_home_at(0, 1, storage.resident_row_state(0, 1).unwrap(), 7, SNAPSHOT_ALL, 99)
+                .visible_row_home_at(
+                    0,
+                    1,
+                    storage.resident_row_state(0, 1).unwrap(),
+                    7,
+                    SNAPSHOT_ALL,
+                    99
+                )
                 .unwrap(),
             Some(RowHome::Heap(location))
         );
@@ -52586,25 +52619,43 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        storage.tables[0].rows.insert(1, RowState::committed_only_at(RowLoc { offset: 0, len: 4 }, 7)).unwrap();
+        storage.tables[0]
+            .rows
+            .insert(
+                1,
+                RowState::committed_only_at(RowLoc { offset: 0, len: 4 }, 7),
+            )
+            .unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            storage.for_each_row_state(0, &mut |_, row| {
-                assert!(storage.row_versions.test_write().is_err());
-                assert!(storage.tables[0].rows.test_write().is_err());
-                assert_eq!(row.committed_lsn, 7);
-                Ok(core::ops::ControlFlow::Break(()))
-            }).unwrap();
+            storage
+                .for_each_row_state(0, &mut |_, row| {
+                    assert!(storage.row_versions.test_write().is_err());
+                    assert!(storage.tables[0].rows.test_write().is_err());
+                    assert_eq!(row.committed_lsn, 7);
+                    Ok(core::ops::ControlFlow::Break(()))
+                })
+                .unwrap();
             assert!(storage.row_versions.test_write().is_ok());
             assert!(storage.tables[0].rows.test_write().is_ok());
-            let error = storage.for_each_row_state(0, &mut |_, _| {
-                Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "reader callback exhausted"))
-            }).unwrap_err();
+            let error = storage
+                .for_each_row_state(0, &mut |_, _| {
+                    Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "reader callback exhausted"
+                    ))
+                })
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(storage.row_versions.test_write().is_ok());
             assert!(storage.tables[0].rows.test_write().is_ok());
             let row = storage.row_state(0, 1).unwrap().unwrap();
             assert!(storage.row_versions.test_write().is_err());
-            assert_eq!(storage.visible_row_home_at(0, 1, row, 7, SNAPSHOT_ALL, 7).unwrap(), Some(RowHome::Heap(RowLoc { offset: 0, len: 4 })));
+            assert_eq!(
+                storage
+                    .visible_row_home_at(0, 1, row, 7, SNAPSHOT_ALL, 7)
+                    .unwrap(),
+                Some(RowHome::Heap(RowLoc { offset: 0, len: 4 }))
+            );
             assert!(storage.row_versions.test_write().is_ok());
         });
     }

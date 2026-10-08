@@ -94,7 +94,9 @@ impl RowVersionPools {
     }
 
     #[cfg(test)]
-    pub(super) fn test_write(&self) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, RowVersionState>> {
+    pub(super) fn test_write(
+        &self,
+    ) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, RowVersionState>> {
         self.state.try_write()
     }
 

@@ -26,7 +26,9 @@ impl RowMap {
     }
 
     #[cfg(test)]
-    pub(super) fn test_write(&self) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, FixedMap<u64, RowState>>> {
+    pub(super) fn test_write(
+        &self,
+    ) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, FixedMap<u64, RowState>>> {
         self.state.try_write()
     }
 

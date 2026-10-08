@@ -730,10 +730,9 @@ impl TemporarySpiller {
             let resident = matches!(state.committed, Some(RowHome::Heap(_)))
                 || (state.committed.is_none() && state.committed_lsn != 0)
                 || (0..state.history.len()).any(|index| {
-                    state.history_get(index)
-                        .is_some_and(|version| {
-                            version.home.is_none() || matches!(version.home, Some(RowHome::Heap(_)))
-                        })
+                    state.history_get(index).is_some_and(|version| {
+                        version.home.is_none() || matches!(version.home, Some(RowHome::Heap(_)))
+                    })
                 });
             if delta && !resident {
                 return Ok(ControlFlow::Continue(()));
@@ -741,8 +740,7 @@ impl TemporarySpiller {
             let marker = state
                 .committed
                 .or_else(|| {
-                    (0..state.history.len())
-                        .find_map(|index| state.history_get(index)?.home)
+                    (0..state.history.len()).find_map(|index| state.history_get(index)?.home)
                 })
                 .unwrap_or(RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }));
             sort_scratch.push((rowid, marker)).map_err(|error| {
@@ -11407,8 +11405,7 @@ impl Checkpointer {
                 let marker = state
                     .committed
                     .or_else(|| {
-                        (0..state.history.len())
-                            .find_map(|index| state.history_get(index)?.home)
+                        (0..state.history.len()).find_map(|index| state.history_get(index)?.home)
                     })
                     .unwrap_or(RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }));
                 sort_scratch.push((rowid, marker)).map_err(|e| {

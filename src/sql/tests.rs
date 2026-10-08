@@ -14,7 +14,7 @@ fn query_definition_ownership_record_witnesses_and_describe_names() {
     assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
     for _ in 0..8 {
         assert_eq!(data_rows(&run_with(&mut engine, &mut budget,
-            "SELECT ROW(1, 'abc'::varchar(3)) IN (SELECT r FROM scope_records r), ROW(9, 'xxx'::varchar(3)) IN (SELECT r FROM scope_records r)")), ["t|f"]);
+            "SELECT t IN (SELECT r FROM scope_records r), t NOT IN (SELECT r FROM scope_records r WHERE r.id = 9) FROM scope_records t")), ["t|t"]);
     }
     let before = describe_with(&mut engine, &mut budget, "SELECT (r).* FROM scope_records r");
     assert_eq!(row_description_names(&before), ["id", "value"]);

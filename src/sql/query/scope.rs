@@ -1778,7 +1778,7 @@ mod tests {
         let config = config();
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage.create_table(definition("wide_source", MAX_COLUMNS)).unwrap();
+        let table = storage.create_table(definition("wide_source", crate::storage::MAX_RELATION_COLUMNS)).unwrap();
         let capacity = crate::storage::table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1);
         let mut owners = Vec::with_capacity(capacity - 1);
         let mut arena_budget = Budget::new(1 << 17);
@@ -1792,9 +1792,9 @@ mod tests {
             }
             let scope = QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena).unwrap();
             assert!(core::ptr::eq(scope.defs.get(0).unwrap(), scope.defs.get(1).unwrap()));
-            assert_eq!(scope.defs.get(0).unwrap().n_columns, MAX_COLUMNS);
+            assert_eq!(scope.defs.get(0).unwrap().n_columns, crate::storage::MAX_RELATION_COLUMNS);
             assert!(core::ptr::eq(scope.defs.column_name(0, 0), scope.defs.column_name(1, 0)));
-            let escaped = scope.output_name(ResolvedColumn::Table(0, MAX_COLUMNS - 1));
+            let escaped = scope.output_name(ResolvedColumn::Table(0, crate::storage::MAX_RELATION_COLUMNS - 1));
             assert_eq!(escaped, "c1599");
             drop(scope);
             let reused = storage.table_definition_images();

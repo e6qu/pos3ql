@@ -1,17 +1,23 @@
 //! Table storage: the in-memory write path of the LSM.
 //!
 //! Row bytes live in one fixed heap (the memtable); each table maps rowid →
-//! location. Updates write a new copy and repoint the map — superseded
-//! bytes are reclaimed when the memtable flushes to object storage (later
-//! phase). All capacities are fixed at startup.
+//! location. Updates write a new copy and repoint the map. Compaction reclaims
+//! superseded bytes; object storage retains durable versions. All capacities
+//! are fixed at startup.
 
 mod definition_images;
 pub(crate) mod foreign;
 mod row_map;
+mod row_versions;
 pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_map::RowMap;
+use row_versions::{
+    RowVersionPools, clear_pending_versions, committed_history_get, committed_visible_at,
+    pending_last, pending_visible_at, pop_pending_version, prune_committed_history,
+    push_committed_version, push_pending_version, release_committed_chain, release_pending_chain,
+};
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -2411,238 +2417,6 @@ struct PendingVersionSlot {
     used: bool,
     previous: Option<usize>,
     change: PendingChange,
-}
-
-fn pending_last(
-    pool: &FixedVec<PendingVersionSlot>,
-    versions: PendingVersions,
-) -> Option<PendingChange> {
-    versions.tail.map(|slot| pool[slot].change)
-}
-
-fn pending_visible_at(
-    pool: &FixedVec<PendingVersionSlot>,
-    versions: PendingVersions,
-    txid: u32,
-    snapshot: u32,
-) -> Option<Option<RowLoc>> {
-    let mut slot = versions.tail;
-    while let Some(index) = slot {
-        let entry = &pool[index];
-        if entry.change.txid == txid && entry.change.cid < snapshot {
-            return Some(entry.change.loc);
-        }
-        slot = entry.previous;
-    }
-    None
-}
-
-fn push_pending_version(
-    pool: &mut FixedVec<PendingVersionSlot>,
-    free: &mut Option<usize>,
-    versions: &mut PendingVersions,
-    maximum: usize,
-    change: PendingChange,
-) -> Result<(), SqlError> {
-    if versions.len >= maximum {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "one row exceeds max_row_versions_per_row ({}) pending command versions",
-            maximum
-        ));
-    }
-    let previous = versions.tail;
-    let slot = match free.take() {
-        Some(slot) => {
-            debug_assert!(!pool[slot].used);
-            *free = pool[slot].previous;
-            pool[slot] = PendingVersionSlot {
-                used: true,
-                previous,
-                change,
-            };
-            slot
-        }
-        None => {
-            let slot = pool.len();
-            pool.push(PendingVersionSlot {
-                used: true,
-                previous,
-                change,
-            })
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "pending row-version pool is exhausted"
-                )
-            })?;
-            slot
-        }
-    };
-    versions.tail = Some(slot);
-    versions.len += 1;
-    Ok(())
-}
-
-fn pop_pending_version(
-    pool: &mut FixedVec<PendingVersionSlot>,
-    free: &mut Option<usize>,
-    versions: &mut PendingVersions,
-) -> Option<PendingChange> {
-    let slot = versions.tail?;
-    let entry = pool[slot];
-    debug_assert!(entry.used);
-    pool[slot].used = false;
-    pool[slot].previous = *free;
-    *free = Some(slot);
-    versions.tail = entry.previous;
-    versions.len -= 1;
-    Some(entry.change)
-}
-
-fn clear_pending_versions(
-    pool: &mut FixedVec<PendingVersionSlot>,
-    free: &mut Option<usize>,
-    versions: &mut PendingVersions,
-) {
-    while pop_pending_version(pool, free, versions).is_some() {}
-}
-
-fn release_pending_chain(
-    pool: &mut FixedVec<PendingVersionSlot>,
-    free: &mut Option<usize>,
-    mut slot: Option<usize>,
-) {
-    while let Some(index) = slot {
-        let entry = pool[index];
-        debug_assert!(entry.used);
-        pool[index].used = false;
-        pool[index].previous = *free;
-        *free = Some(index);
-        slot = entry.previous;
-    }
-}
-
-fn committed_history_get(
-    pool: &FixedVec<CommittedVersionSlot>,
-    history: CommittedHistory,
-    index: usize,
-) -> Option<CommittedVersion> {
-    if index >= history.len() {
-        return None;
-    }
-    let mut slot = history.tail;
-    for _ in 0..index {
-        slot = pool[slot?].previous;
-    }
-    slot.map(|slot| pool[slot].version)
-}
-
-fn committed_visible_at(
-    pool: &FixedVec<CommittedVersionSlot>,
-    history: CommittedHistory,
-    commit_snapshot: u64,
-) -> Option<Option<RowHome>> {
-    let mut slot = history.tail;
-    while let Some(index) = slot {
-        let entry = &pool[index];
-        if entry.version.lsn <= commit_snapshot {
-            return Some(entry.version.home);
-        }
-        slot = entry.previous;
-    }
-    None
-}
-
-fn push_committed_version(
-    pool: &mut FixedVec<CommittedVersionSlot>,
-    free: &mut Option<usize>,
-    history: &mut CommittedHistory,
-    maximum: usize,
-    version: CommittedVersion,
-) -> Result<(), SqlError> {
-    if history.len >= maximum {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "one row exceeds max_row_versions_per_row ({}) committed snapshot versions",
-            maximum
-        ));
-    }
-    let previous = history.tail;
-    let slot = match free.take() {
-        Some(slot) => {
-            debug_assert!(!pool[slot].used);
-            *free = pool[slot].previous;
-            pool[slot] = CommittedVersionSlot {
-                used: true,
-                previous,
-                version,
-            };
-            slot
-        }
-        None => {
-            let slot = pool.len();
-            pool.push(CommittedVersionSlot {
-                used: true,
-                previous,
-                version,
-            })
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "committed row-version pool is exhausted"
-                )
-            })?;
-            slot
-        }
-    };
-    history.tail = Some(slot);
-    history.len += 1;
-    Ok(())
-}
-
-fn release_committed_chain(
-    pool: &mut FixedVec<CommittedVersionSlot>,
-    free: &mut Option<usize>,
-    mut slot: Option<usize>,
-) {
-    while let Some(index) = slot {
-        let entry = pool[index];
-        debug_assert!(entry.used);
-        pool[index].used = false;
-        pool[index].previous = *free;
-        *free = Some(index);
-        slot = entry.previous;
-    }
-}
-
-/// Keeps every version newer than the oldest snapshot and the first version
-/// at or before it. That is the minimal chain that can answer every active
-/// snapshot.
-fn prune_committed_history(
-    pool: &mut FixedVec<CommittedVersionSlot>,
-    free: &mut Option<usize>,
-    history: &mut CommittedHistory,
-    oldest_snapshot: Option<u64>,
-) {
-    let Some(oldest) = oldest_snapshot else {
-        release_committed_chain(pool, free, history.tail.take());
-        history.len = 0;
-        return;
-    };
-    let mut slot = history.tail;
-    let mut retained = 0usize;
-    while let Some(index) = slot {
-        retained += 1;
-        let entry = pool[index];
-        if entry.version.lsn <= oldest {
-            pool[index].previous = None;
-            release_committed_chain(pool, free, entry.previous);
-            history.len = retained;
-            return;
-        }
-        slot = entry.previous;
-    }
 }
 
 /// The command-id a read that should see *all* of its own transaction's
@@ -7309,9 +7083,28 @@ struct TextSearchIter<'a> {
     next_slot: usize,
 }
 
+struct RoutineLookup<'a> {
+    database: DatabaseOid,
+    schema: &'a str,
+    name: &'a str,
+    transaction: u32,
+    kind: RoutineCallKind,
+}
+
+impl RoutineLookup<'_> {
+    fn matches(&self, routine: &RoutineDef) -> bool {
+        routine.database == self.database
+            && routine.visible_to(self.transaction)
+            && self.kind.accepts(routine.kind_for(self.transaction))
+            && routine.schema_for(self.transaction).as_str() == self.schema
+            && routine.name_for(self.transaction).as_str() == self.name
+    }
+}
+
 struct RoutineIter<'a> {
     catalog: &'a std::sync::Mutex<FixedVec<RoutineDef>>,
     next_slot: usize,
+    lookup: Option<RoutineLookup<'a>>,
 }
 
 struct CastIter<'a> {
@@ -7586,10 +7379,21 @@ impl Iterator for RoutineIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let catalog = self.catalog.lock().expect("routine catalog lock poisoned");
-        let slot = self.next_slot;
-        let definition = catalog.get(slot).copied()?;
-        self.next_slot += 1;
-        Some((slot, definition))
+        while let Some(definition) = catalog.get(self.next_slot) {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            // Check compact metadata before copying the bounded body and
+            // argument arrays. Release the guard before overload resolution
+            // calls back into other catalogs.
+            if self
+                .lookup
+                .as_ref()
+                .is_none_or(|lookup| lookup.matches(definition))
+            {
+                return Some((slot, *definition));
+            }
+        }
+        None
     }
 }
 
@@ -13675,10 +13479,7 @@ pub struct Storage {
     tables: FixedVec<Table>,
     table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
-    pending_row_versions: FixedVec<PendingVersionSlot>,
-    pending_row_version_free: Option<usize>,
-    committed_row_versions: FixedVec<CommittedVersionSlot>,
-    committed_row_version_free: Option<usize>,
+    row_versions: RowVersionPools,
     large_objects: std::sync::Mutex<LargeObjectCatalog>,
     large_object_page_table: u32,
     max_catalog_versions_per_object: u32,
@@ -14687,32 +14488,24 @@ fn rename_table_sql_identity(
 
 impl Storage {
     fn clear_table_rows(&mut self, slot: usize) {
-        let (tables, pending_versions, pending_free, committed_versions, committed_free) = (
+        let row_versions = self.row_versions.exclusive();
+        let (tables, pending_versions, committed_versions) = (
             &mut self.tables,
-            &mut self.pending_row_versions,
-            &mut self.pending_row_version_free,
-            &mut self.committed_row_versions,
-            &mut self.committed_row_version_free,
+            &mut row_versions.pending_row_versions,
+            &mut row_versions.committed_row_versions,
         );
         for (_, state) in tables[slot].rows.iter() {
-            release_pending_chain(pending_versions, pending_free, state.pending.tail);
-            release_committed_chain(committed_versions, committed_free, state.history.tail);
+            release_pending_chain(pending_versions, state.pending.tail);
+            release_committed_chain(committed_versions, state.history.tail);
         }
         tables[slot].rows.clear();
     }
 
     fn remove_row_state(&mut self, table: usize, rowid: u64) -> Option<RowState> {
         let state = self.tables[table].rows.remove(&rowid)?;
-        release_pending_chain(
-            &mut self.pending_row_versions,
-            &mut self.pending_row_version_free,
-            state.pending.tail,
-        );
-        release_committed_chain(
-            &mut self.committed_row_versions,
-            &mut self.committed_row_version_free,
-            state.history.tail,
-        );
+        let row_versions = self.row_versions.exclusive();
+        release_pending_chain(&mut row_versions.pending_row_versions, state.pending.tail);
+        release_committed_chain(&mut row_versions.committed_row_versions, state.history.tail);
         Some(state)
     }
 
@@ -17385,6 +17178,7 @@ impl Storage {
             + table_slot_capacity(config)
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>())
+            + RowVersionPools::control_bytes()
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
             + Self::table_definition_image_budget_bytes(config)
             + committed_row_version_capacity(config)
@@ -17515,16 +17309,7 @@ impl Storage {
             size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>(),
             "table spill-generation rosters",
         )?;
-        let pending_row_versions = FixedVec::new(
-            budget,
-            "pending_row_versions",
-            pending_row_version_capacity(config),
-        )?;
-        let committed_row_versions = FixedVec::new(
-            budget,
-            "committed_row_versions",
-            committed_row_version_capacity(config),
-        )?;
+        let row_versions = RowVersionPools::new(config, budget)?;
         let pending_table_defs = FixedVec::new(
             budget,
             "pending_table_defs",
@@ -18277,10 +18062,7 @@ impl Storage {
             tables,
             table_definition_images,
             max_row_versions_per_row: config.max_row_versions_per_row,
-            pending_row_versions,
-            pending_row_version_free: None,
-            committed_row_versions,
-            committed_row_version_free: None,
+            row_versions,
             large_objects: std::sync::Mutex::new(LargeObjectCatalog {
                 definitions: large_objects,
                 next_oid: LargeObjectOid::parse(16_384),
@@ -22260,6 +22042,7 @@ impl Storage {
             AccessClass::Routine => RoutineIter {
                 catalog: &self.routines,
                 next_slot: 0,
+                lookup: None,
             }
             .find_map(|(slot, routine)| {
                 (routine.database == current_database()
@@ -22600,6 +22383,7 @@ impl Storage {
                 RoutineIter {
                     catalog: &self.routines,
                     next_slot: 0,
+                    lookup: None,
                 }
                 .find_map(|(slot, candidate)| {
                     (candidate.database == target_database && candidate.created_at == created_at)
@@ -27076,6 +26860,7 @@ impl Storage {
         for (_, definition) in (RoutineIter {
             catalog: &self.routines,
             next_slot: 0,
+            lookup: None,
         })
         .filter(|(_, definition)| {
             definition.database == current_database()
@@ -28710,7 +28495,10 @@ impl Storage {
     }
 
     pub(crate) fn row_pending_last(&self, state: RowState) -> Option<PendingChange> {
-        pending_last(&self.pending_row_versions, state.pending)
+        pending_last(
+            &self.row_versions.read().pending_row_versions,
+            state.pending,
+        )
     }
 
     pub(crate) fn row_history_get(
@@ -28718,7 +28506,11 @@ impl Storage {
         state: RowState,
         index: usize,
     ) -> Option<CommittedVersion> {
-        committed_history_get(&self.committed_row_versions, state.history, index)
+        committed_history_get(
+            &self.row_versions.read().committed_row_versions,
+            state.history,
+            index,
+        )
     }
 
     pub(crate) fn row_locked_by_other(&self, state: RowState, txid: u32) -> Option<u32> {
@@ -28730,7 +28522,7 @@ impl Storage {
 
     fn resident_visible_to(&self, state: RowState, txid: u32) -> Option<RowHome> {
         match pending_visible_at(
-            &self.pending_row_versions,
+            &self.row_versions.read().pending_row_versions,
             state.pending,
             txid,
             SNAPSHOT_ALL,
@@ -29983,8 +29775,9 @@ impl Storage {
         command_snapshot: u32,
         commit_snapshot: u64,
     ) -> Result<Option<RowHome>, SqlError> {
+        let row_versions = self.row_versions.read();
         match pending_visible_at(
-            &self.pending_row_versions,
+            &row_versions.pending_row_versions,
             state.pending,
             txid,
             command_snapshot,
@@ -29993,11 +29786,14 @@ impl Storage {
             None if state.committed_lsn <= commit_snapshot => return Ok(state.committed),
             None => {}
         }
-        if let Some(home) =
-            committed_visible_at(&self.committed_row_versions, state.history, commit_snapshot)
-        {
+        if let Some(home) = committed_visible_at(
+            &row_versions.committed_row_versions,
+            state.history,
+            commit_snapshot,
+        ) {
             return Ok(home);
         }
+        drop(row_versions);
         Ok(self
             .spill_probe_at(table_slot, rowid, commit_snapshot)?
             .and_then(|version| {
@@ -30605,13 +30401,10 @@ impl Storage {
     }
 
     pub(crate) fn release_table_histories(&mut self, slot: usize) {
-        let (tables, versions, free) = (
-            &mut self.tables,
-            &mut self.committed_row_versions,
-            &mut self.committed_row_version_free,
-        );
+        let row_versions = self.row_versions.exclusive();
+        let (tables, versions) = (&mut self.tables, &mut row_versions.committed_row_versions);
         for (_, state) in tables[slot].rows.iter_mut() {
-            prune_committed_history(versions, free, &mut state.history, None);
+            prune_committed_history(versions, &mut state.history, None);
         }
     }
 
@@ -31176,6 +30969,7 @@ impl Storage {
         scratch: &mut FixedVec<(u32, u64, RowHeapImage, RowLoc)>,
     ) -> Result<(), SqlError> {
         scratch.clear();
+        let row_versions = self.row_versions.exclusive();
         for (index, table) in self.tables.iter().enumerate() {
             // A transaction may have inserted rows into its pending CREATE
             // before a concurrent checkpoint. Those bytes are private, not
@@ -31200,7 +30994,7 @@ impl Storage {
                 }
                 let mut history_slot = state.history.tail;
                 while let Some(slot) = history_slot {
-                    let entry = &self.committed_row_versions[slot];
+                    let entry = &row_versions.committed_row_versions[slot];
                     if let Some(RowHome::Heap(loc)) = entry.version.home {
                         scratch
                             .push((index as u32, rowid, RowHeapImage::History(slot), loc))
@@ -31210,7 +31004,7 @@ impl Storage {
                 }
                 let mut pending_slot = state.pending.tail;
                 while let Some(slot) = pending_slot {
-                    let entry = &self.pending_row_versions[slot];
+                    let entry = &row_versions.pending_row_versions[slot];
                     if let Some(loc) = entry.change.loc {
                         scratch
                             .push((index as u32, rowid, RowHeapImage::Pending(slot), loc))
@@ -31257,10 +31051,11 @@ impl Storage {
                         .committed = Some(RowHome::Heap(new_loc));
                 }
                 RowHeapImage::History(slot) => {
-                    self.committed_row_versions[slot].version.home = Some(RowHome::Heap(new_loc));
+                    row_versions.committed_row_versions[slot].version.home =
+                        Some(RowHome::Heap(new_loc));
                 }
                 RowHeapImage::Pending(slot) => {
-                    self.pending_row_versions[slot].change.loc = Some(new_loc);
+                    row_versions.pending_row_versions[slot].change.loc = Some(new_loc);
                 }
             }
         }
@@ -31342,34 +31137,35 @@ impl Storage {
                 txid,
                 track_statistics,
             )?;
-            if let Some(slot) = state.pending.tail
-                && self.pending_row_versions[slot].change.cid == cid
             {
-                let last = &mut self.pending_row_versions[slot].change;
-                let prior = Some(last.loc);
-                last.loc = loc;
-                // Same-command undo retains only the prior location. Keep a
-                // conservative union of every attempted image so restoring a
-                // prior location can over-invalidate but can never lose an
-                // index dependency that the restored image changed.
-                last.changed_columns |= changed_columns;
-                last.changes_existence |= changes_existence;
-                if track_statistics {
-                    self.record_relation_write(txid, table_index, existed, loc.is_some())?;
+                let row_versions = self.row_versions.exclusive();
+                if let Some(slot) = state.pending.tail
+                    && row_versions.pending_row_versions[slot].change.cid == cid
+                {
+                    let last = &mut row_versions.pending_row_versions[slot].change;
+                    let prior = Some(last.loc);
+                    last.loc = loc;
+                    // Same-command undo retains only the prior location. Keep a
+                    // conservative union of every attempted image so restoring a
+                    // prior location can over-invalidate but can never lose an
+                    // index dependency that the restored image changed.
+                    last.changed_columns |= changed_columns;
+                    last.changes_existence |= changes_existence;
+                    if track_statistics {
+                        self.record_relation_write(txid, table_index, existed, loc.is_some())?;
+                    }
+                    return Ok(prior);
                 }
-                return Ok(prior);
             }
             {
-                let (tables, versions, free) = (
-                    &mut self.tables,
-                    &mut self.committed_row_versions,
-                    &mut self.committed_row_version_free,
-                );
+                let row_versions = self.row_versions.exclusive();
+                let (tables, versions) =
+                    (&mut self.tables, &mut row_versions.committed_row_versions);
                 let state = tables[table_index]
                     .rows
                     .get_mut(&rowid)
                     .expect("row state was just observed");
-                prune_committed_history(versions, free, &mut state.history, oldest_snapshot);
+                prune_committed_history(versions, &mut state.history, oldest_snapshot);
             }
             let state = self.tables[table_index]
                 .rows
@@ -31387,18 +31183,14 @@ impl Storage {
                     self.max_row_versions_per_row
                 ));
             }
-            let (tables, versions, free) = (
-                &mut self.tables,
-                &mut self.pending_row_versions,
-                &mut self.pending_row_version_free,
-            );
+            let row_versions = self.row_versions.exclusive();
+            let (tables, versions) = (&mut self.tables, &mut row_versions.pending_row_versions);
             let state = tables[table_index]
                 .rows
                 .get_mut(&rowid)
                 .expect("row state was just observed");
             push_pending_version(
                 versions,
-                free,
                 &mut state.pending,
                 self.max_row_versions_per_row,
                 PendingChange {
@@ -31452,9 +31244,9 @@ impl Storage {
             }
         }
         let mut pending = PendingVersions::empty();
+        let row_versions = self.row_versions.exclusive();
         push_pending_version(
-            &mut self.pending_row_versions,
-            &mut self.pending_row_version_free,
+            &mut row_versions.pending_row_versions,
             &mut pending,
             self.max_row_versions_per_row,
             PendingChange {
@@ -31609,17 +31401,14 @@ impl Storage {
     /// A successful manifest publish made every resident historical image
     /// reachable through the table's installed versioned SST list.
     pub fn release_durable_histories(&mut self) {
-        let (tables, versions, free) = (
-            &mut self.tables,
-            &mut self.committed_row_versions,
-            &mut self.committed_row_version_free,
-        );
+        let row_versions = self.row_versions.exclusive();
+        let (tables, versions) = (&mut self.tables, &mut row_versions.committed_row_versions);
         for table in tables
             .iter_mut()
             .filter(|table| table.live && table.def.persistence != RelationPersistence::Temporary)
         {
             for (_, state) in table.rows.iter_mut() {
-                prune_committed_history(versions, free, &mut state.history, None);
+                prune_committed_history(versions, &mut state.history, None);
             }
         }
     }
@@ -31654,23 +31443,22 @@ impl Storage {
             return;
         };
         // Only touch a pending change this transaction owns (or an empty slot).
-        if let Some(p) = pending_last(&self.pending_row_versions, state.pending)
-            && p.txid != txid
+        if let Some(p) = pending_last(
+            &self.row_versions.read().pending_row_versions,
+            state.pending,
+        ) && p.txid != txid
         {
             return;
         }
         match prior {
             None => {
-                let (tables, versions, free) = (
-                    &mut self.tables,
-                    &mut self.pending_row_versions,
-                    &mut self.pending_row_version_free,
-                );
+                let row_versions = self.row_versions.exclusive();
+                let (tables, versions) = (&mut self.tables, &mut row_versions.pending_row_versions);
                 let state = tables[table_index]
                     .rows
                     .get_mut(&rowid)
                     .expect("row state was just observed");
-                pop_pending_version(versions, free, &mut state.pending);
+                pop_pending_version(versions, &mut state.pending);
                 if (state.committed.is_none()
                     && state.history.is_empty()
                     && state.pending.is_none())
@@ -31681,7 +31469,9 @@ impl Storage {
             }
             Some(loc) => {
                 if let Some(slot) = state.pending.tail {
-                    self.pending_row_versions[slot].change.loc = loc;
+                    self.row_versions.exclusive().pending_row_versions[slot]
+                        .change
+                        .loc = loc;
                 }
             }
         }
@@ -31740,7 +31530,10 @@ impl Storage {
             let Some(state) = self.tables[table_index].rows.get(&rowid) else {
                 return;
             };
-            match pending_last(&self.pending_row_versions, state.pending) {
+            match pending_last(
+                &self.row_versions.read().pending_row_versions,
+                state.pending,
+            ) {
                 Some(p) if p.txid == txid => (state.committed, state.committed_lsn, p),
                 _ => return,
             }
@@ -31765,12 +31558,11 @@ impl Storage {
 
         let retain_history = !self.snapshot_state().active.is_empty();
         {
-            let (tables, committed_versions, committed_free, pending_versions, pending_free) = (
+            let row_versions = self.row_versions.exclusive();
+            let (tables, committed_versions, pending_versions) = (
                 &mut self.tables,
-                &mut self.committed_row_versions,
-                &mut self.committed_row_version_free,
-                &mut self.pending_row_versions,
-                &mut self.pending_row_version_free,
+                &mut row_versions.committed_row_versions,
+                &mut row_versions.pending_row_versions,
             );
             let state = tables[table_index]
                 .rows
@@ -31779,7 +31571,6 @@ impl Storage {
             if retain_history && (old_committed.is_some() || old_lsn != 0) {
                 push_committed_version(
                     committed_versions,
-                    committed_free,
                     &mut state.history,
                     self.max_row_versions_per_row,
                     CommittedVersion {
@@ -31789,17 +31580,12 @@ impl Storage {
                 )
                 .expect("write_pending reserved historical-version capacity");
             } else if !retain_history {
-                prune_committed_history(
-                    committed_versions,
-                    committed_free,
-                    &mut state.history,
-                    None,
-                );
+                prune_committed_history(committed_versions, &mut state.history, None);
             }
             state.committed = new_loc.map(RowHome::Heap);
             state.committed_lsn = commit_lsn;
             state.checkpoint_change_lsn = commit_lsn;
-            clear_pending_versions(pending_versions, pending_free, &mut state.pending);
+            clear_pending_versions(pending_versions, &mut state.pending);
         }
         let table = &mut self.tables[table_index];
         let state = table.rows.get(&rowid).expect("row present after commit");
@@ -31834,18 +31620,20 @@ impl Storage {
             let Some(state) = self.tables[table_index].rows.get(&rowid) else {
                 return;
             };
-            match pending_last(&self.pending_row_versions, state.pending) {
+            match pending_last(
+                &self.row_versions.read().pending_row_versions,
+                state.pending,
+            ) {
                 Some(pending) if pending.txid == txid => pending.loc,
                 _ => return,
             }
         };
         {
-            let (tables, committed_versions, committed_free, pending_versions, pending_free) = (
+            let row_versions = self.row_versions.exclusive();
+            let (tables, committed_versions, pending_versions) = (
                 &mut self.tables,
-                &mut self.committed_row_versions,
-                &mut self.committed_row_version_free,
-                &mut self.pending_row_versions,
-                &mut self.pending_row_version_free,
+                &mut row_versions.committed_row_versions,
+                &mut row_versions.pending_row_versions,
             );
             let state = tables[table_index]
                 .rows
@@ -31853,11 +31641,11 @@ impl Storage {
                 .expect("row present after read");
             // Definition rewrites are rejected while a historical snapshot
             // is active, so no old-schema row image can be retained here.
-            prune_committed_history(committed_versions, committed_free, &mut state.history, None);
+            prune_committed_history(committed_versions, &mut state.history, None);
             state.committed = new_loc.map(RowHome::Heap);
             state.committed_lsn = commit_lsn;
             state.checkpoint_change_lsn = commit_lsn;
-            clear_pending_versions(pending_versions, pending_free, &mut state.pending);
+            clear_pending_versions(pending_versions, &mut state.pending);
         }
         let table = &mut self.tables[table_index];
         let state = table.rows.get(&rowid).expect("row present after rewrite");
@@ -33638,7 +33426,7 @@ impl Storage {
     pub(crate) fn has_visible_pending_rows(&self, table_index: usize, txid: u32) -> bool {
         self.tables[table_index].rows.iter().any(|(_, state)| {
             pending_visible_at(
-                &self.pending_row_versions,
+                &self.row_versions.read().pending_row_versions,
                 state.pending,
                 txid,
                 self.read_snapshot(),
@@ -41568,6 +41356,27 @@ impl Storage {
         RoutineIter {
             catalog: &self.routines,
             next_slot: 0,
+            lookup: None,
+        }
+    }
+
+    fn routine_candidates<'a>(
+        &'a self,
+        schema: &'a str,
+        name: &'a str,
+        transaction: u32,
+        kind: RoutineCallKind,
+    ) -> RoutineIter<'a> {
+        RoutineIter {
+            catalog: &self.routines,
+            next_slot: 0,
+            lookup: Some(RoutineLookup {
+                database: current_database(),
+                schema,
+                name,
+                transaction,
+                kind,
+            }),
         }
     }
 
@@ -41680,46 +41489,48 @@ impl Storage {
         kind: RoutineCallKind,
     ) -> Option<usize> {
         let resolve = |schema: &str, routine_name: &str| {
-            let mut candidates = self.routine_entries().filter_map(|(slot, routine)| {
-                let definition = routine.definition_for(txid);
-                if routine.database != current_database()
-                    || !routine.visible_to(txid)
-                    || !kind.accepts(definition.kind)
-                    || definition.schema_for(txid).as_str() != schema
-                    || definition.name_for(txid).as_str() != routine_name
-                {
-                    return None;
-                }
-                let variadic_index = definition.arguments().len().checked_sub(1)?;
-                let variadic_parameter = definition.parameter_for_input(variadic_index)?;
-                let RoutineParameterMode::Variadic { .. } = variadic_parameter.mode else {
-                    return None;
-                };
-                let ColType::Array(element) = variadic_parameter.ctype else {
-                    return None;
-                };
-                let fixed = &definition.arguments()[..variadic_index];
-                if argument_type_oids.len() < fixed.len() + usize::from(!explicit_variadic)
-                    || explicit_variadic && argument_type_oids.len() != fixed.len() + 1
-                    || !fixed.iter().zip(argument_type_oids).all(|(argument, oid)| {
-                        self.routine_argument_oid(argument, txid)
-                            .is_some_and(|expected| {
-                                self.routine_implicit_cast(*oid, expected, txid)
-                            })
-                    })
-                {
-                    return None;
-                }
-                let expected = if explicit_variadic {
-                    self.routine_argument_oid(&definition.arguments()[variadic_index], txid)?
-                } else {
-                    element.element_oid()
-                };
-                argument_type_oids[variadic_index..]
-                    .iter()
-                    .all(|oid| self.routine_implicit_cast(*oid, expected, txid))
-                    .then_some(slot)
-            });
+            let mut candidates = self
+                .routine_candidates(schema, routine_name, txid, kind)
+                .filter_map(|(slot, routine)| {
+                    let definition = routine.definition_for(txid);
+                    if routine.database != current_database()
+                        || !routine.visible_to(txid)
+                        || !kind.accepts(definition.kind)
+                        || definition.schema_for(txid).as_str() != schema
+                        || definition.name_for(txid).as_str() != routine_name
+                    {
+                        return None;
+                    }
+                    let variadic_index = definition.arguments().len().checked_sub(1)?;
+                    let variadic_parameter = definition.parameter_for_input(variadic_index)?;
+                    let RoutineParameterMode::Variadic { .. } = variadic_parameter.mode else {
+                        return None;
+                    };
+                    let ColType::Array(element) = variadic_parameter.ctype else {
+                        return None;
+                    };
+                    let fixed = &definition.arguments()[..variadic_index];
+                    if argument_type_oids.len() < fixed.len() + usize::from(!explicit_variadic)
+                        || explicit_variadic && argument_type_oids.len() != fixed.len() + 1
+                        || !fixed.iter().zip(argument_type_oids).all(|(argument, oid)| {
+                            self.routine_argument_oid(argument, txid)
+                                .is_some_and(|expected| {
+                                    self.routine_implicit_cast(*oid, expected, txid)
+                                })
+                        })
+                    {
+                        return None;
+                    }
+                    let expected = if explicit_variadic {
+                        self.routine_argument_oid(&definition.arguments()[variadic_index], txid)?
+                    } else {
+                        element.element_oid()
+                    };
+                    argument_type_oids[variadic_index..]
+                        .iter()
+                        .all(|oid| self.routine_implicit_cast(*oid, expected, txid))
+                        .then_some(slot)
+                });
             let first = candidates.next();
             if first.is_some() && candidates.next().is_none() {
                 first
@@ -42511,20 +42322,21 @@ impl Storage {
         txid: u32,
         kind: RoutineCallKind,
     ) -> Option<usize> {
-        self.routine_entries().find_map(|(slot, routine)| {
-            let definition = routine.definition_for(txid);
-            (routine.database == current_database()
-                && routine.visible_to(txid)
-                && kind.accepts(definition.kind)
-                && definition.schema_for(txid).as_str() == schema
-                && definition.name_for(txid).as_str() == name
-                && definition.accepts_input_arity(argument_types.len())
-                && definition.arguments()[..argument_types.len()]
-                    .iter()
-                    .zip(argument_types)
-                    .all(|(parameter, value)| parameter.ctype == *value))
-            .then_some(slot)
-        })
+        self.routine_candidates(schema, name, txid, kind)
+            .find_map(|(slot, routine)| {
+                let definition = routine.definition_for(txid);
+                (routine.database == current_database()
+                    && routine.visible_to(txid)
+                    && kind.accepts(definition.kind)
+                    && definition.schema_for(txid).as_str() == schema
+                    && definition.name_for(txid).as_str() == name
+                    && definition.accepts_input_arity(argument_types.len())
+                    && definition.arguments()[..argument_types.len()]
+                        .iter()
+                        .zip(argument_types)
+                        .all(|(parameter, value)| parameter.ctype == *value))
+                .then_some(slot)
+            })
     }
 
     fn routine_slot_in_oids(
@@ -42536,63 +42348,70 @@ impl Storage {
         kind: RoutineCallKind,
     ) -> Option<usize> {
         let exact =
-            self.routine_entries().find_map(|(slot, routine)| {
+            self.routine_candidates(schema, name, txid, kind)
+                .find_map(|(slot, routine)| {
+                    let definition = routine.definition_for(txid);
+                    (routine.database == current_database()
+                        && routine.visible_to(txid)
+                        && kind.accepts(definition.kind)
+                        && definition.schema_for(txid).as_str() == schema
+                        && definition.name_for(txid).as_str() == name
+                        && definition.argument_count == argument_type_oids.len()
+                        && definition.arguments().iter().zip(argument_type_oids).all(
+                            |(argument, oid)| {
+                                self.routine_argument_oid(argument, txid) == Some(*oid)
+                            },
+                        ))
+                    .then_some(slot)
+                });
+        if exact.is_some() {
+            return exact;
+        }
+        let concrete = self
+            .routine_candidates(schema, name, txid, kind)
+            .filter_map(|(slot, routine)| {
                 let definition = routine.definition_for(txid);
                 (routine.database == current_database()
                     && routine.visible_to(txid)
                     && kind.accepts(definition.kind)
                     && definition.schema_for(txid).as_str() == schema
                     && definition.name_for(txid).as_str() == name
-                    && definition.argument_count == argument_type_oids.len()
-                    && definition.arguments().iter().zip(argument_type_oids).all(
-                        |(argument, oid)| self.routine_argument_oid(argument, txid) == Some(*oid),
-                    ))
+                    && definition.accepts_input_arity(argument_type_oids.len())
+                    && definition.arguments()[..argument_type_oids.len()]
+                        .iter()
+                        .zip(argument_type_oids)
+                        .all(|(argument, oid)| {
+                            self.routine_argument_oid(argument, txid)
+                                .is_some_and(|expected| {
+                                    self.routine_implicit_cast(*oid, expected, txid)
+                                })
+                        }))
                 .then_some(slot)
             });
-        if exact.is_some() {
-            return exact;
-        }
-        let concrete = self.routine_entries().filter_map(|(slot, routine)| {
-            let definition = routine.definition_for(txid);
-            (routine.database == current_database()
-                && routine.visible_to(txid)
-                && kind.accepts(definition.kind)
-                && definition.schema_for(txid).as_str() == schema
-                && definition.name_for(txid).as_str() == name
-                && definition.accepts_input_arity(argument_type_oids.len())
-                && definition.arguments()[..argument_type_oids.len()]
-                    .iter()
-                    .zip(argument_type_oids)
-                    .all(|(argument, oid)| {
-                        self.routine_argument_oid(argument, txid)
-                            .is_some_and(|expected| {
-                                self.routine_implicit_cast(*oid, expected, txid)
-                            })
-                    }))
-            .then_some(slot)
-        });
         let mut concrete = concrete;
         let first = concrete.next();
         if first.is_some() && concrete.next().is_none() {
             return first;
         }
-        let polymorphic = self.routine_entries().filter_map(|(slot, routine)| {
-            let definition = routine.definition_for(txid);
-            (routine.database == current_database()
-                && routine.visible_to(txid)
-                && kind.accepts(definition.kind)
-                && definition.schema_for(txid).as_str() == schema
-                && definition.name_for(txid).as_str() == name
-                && definition.accepts_input_arity(argument_type_oids.len())
-                && self
-                    .polymorphic_call_binding(
-                        &definition.arguments()[..argument_type_oids.len()],
-                        argument_type_oids,
-                        txid,
-                    )
-                    .is_some())
-            .then_some(slot)
-        });
+        let polymorphic = self
+            .routine_candidates(schema, name, txid, kind)
+            .filter_map(|(slot, routine)| {
+                let definition = routine.definition_for(txid);
+                (routine.database == current_database()
+                    && routine.visible_to(txid)
+                    && kind.accepts(definition.kind)
+                    && definition.schema_for(txid).as_str() == schema
+                    && definition.name_for(txid).as_str() == name
+                    && definition.accepts_input_arity(argument_type_oids.len())
+                    && self
+                        .polymorphic_call_binding(
+                            &definition.arguments()[..argument_type_oids.len()],
+                            argument_type_oids,
+                            txid,
+                        )
+                        .is_some())
+                .then_some(slot)
+            });
         let mut polymorphic = polymorphic;
         let first = polymorphic.next();
         if first.is_some() && polymorphic.next().is_none() {
@@ -42649,9 +42468,11 @@ impl Storage {
             polymorphic == saw_polymorphic
         };
         for (implicit, polymorphic) in [(false, false), (true, false), (true, true)] {
-            let mut candidates = self.routine_entries().filter_map(|(slot, routine)| {
-                matches(&routine, implicit, polymorphic).then_some(slot)
-            });
+            let mut candidates = self
+                .routine_candidates(schema, name, txid, call_kind)
+                .filter_map(|(slot, routine)| {
+                    matches(&routine, implicit, polymorphic).then_some(slot)
+                });
             let first = candidates.next();
             if first.is_some() && candidates.next().is_none() {
                 return first;
@@ -47810,14 +47631,11 @@ impl Storage {
         // reader holds no row lock. Wake the shared wait graph when it ends.
         let wait_owner = self.transaction_wait_owner(txid);
         self.lock_state().row.resource_released(wait_owner);
-        let (tables, versions, free) = (
-            &mut self.tables,
-            &mut self.committed_row_versions,
-            &mut self.committed_row_version_free,
-        );
+        let row_versions = self.row_versions.exclusive();
+        let (tables, versions) = (&mut self.tables, &mut row_versions.committed_row_versions);
         for table in tables.iter_mut() {
             for (_, state) in table.rows.iter_mut() {
-                prune_committed_history(versions, free, &mut state.history, oldest);
+                prune_committed_history(versions, &mut state.history, oldest);
             }
         }
         if oldest.is_none() {
@@ -52677,9 +52495,9 @@ mod tests {
         // committed-snapshot filtering applies only when no visible own image
         // overlays it.
         let mut pending = state;
+        let row_versions = storage.row_versions.exclusive();
         push_pending_version(
-            &mut storage.pending_row_versions,
-            &mut storage.pending_row_version_free,
+            &mut row_versions.pending_row_versions,
             &mut pending.pending,
             storage.max_row_versions_per_row,
             PendingChange {
@@ -54969,11 +54787,15 @@ mod tests {
 
         assert_eq!(storage.tables.len(), 3); // two relations plus large-object pages
         assert_eq!(
-            storage.pending_row_versions.capacity(),
+            storage.row_versions.read().pending_row_versions.capacity(),
             pending_row_version_capacity(&config)
         );
         assert_eq!(
-            storage.committed_row_versions.capacity(),
+            storage
+                .row_versions
+                .read()
+                .committed_row_versions
+                .capacity(),
             committed_row_version_capacity(&config)
         );
         assert!(
@@ -55834,6 +55656,76 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn routine_candidate_lookup_preserves_visibility_identity_and_guard_release() {
+        let mut config = test_config();
+        config.max_routines = 4;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        {
+            let mut catalog = storage.routines.lock().unwrap();
+            for slot in 1..4 {
+                catalog[slot].schema = SqlName::parse("public").unwrap();
+                catalog[slot].name = SqlName::parse("probe").unwrap();
+                catalog[slot].ddl_state = CatalogDdlState::Present;
+            }
+            catalog[1].pending_identity = Some(PendingRoutineIdentity {
+                txid: 7,
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("renamed").unwrap(),
+            });
+            catalog[2].database = DatabaseOid::parse(USER_DATABASE_OID_BASE + 1).unwrap();
+            catalog[3].ddl_state = CatalogDdlState::PendingCreate { txid: 7 };
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            let slots = |name, transaction, kind| {
+                let mut candidates = storage.routine_candidates("public", name, transaction, kind);
+                let candidate = candidates.next().map(|(slot, routine)| {
+                    assert!(storage.routines.try_lock().is_ok());
+                    assert!(routine.visible_to(transaction));
+                    slot
+                });
+                assert!(candidates.next().is_none());
+                candidate
+            };
+            assert_eq!(slots("probe", 0, RoutineCallKind::Scalar), Some(1));
+            assert_eq!(slots("probe", 7, RoutineCallKind::Scalar), Some(3));
+            assert_eq!(slots("renamed", 7, RoutineCallKind::Scalar), Some(1));
+            assert_eq!(slots("renamed", 0, RoutineCallKind::Scalar), None);
+            assert_eq!(slots("probe", 0, RoutineCallKind::Procedure), None);
+            assert_eq!(slots("absent", 0, RoutineCallKind::Scalar), None);
+            assert_eq!(
+                storage.routine_slot_in("public", "renamed", &[], 7, RoutineCallKind::Scalar),
+                Some(1)
+            );
+            assert_eq!(
+                storage.routine_slot_in_oids("public", "renamed", &[], 7, RoutineCallKind::Scalar),
+                Some(1)
+            );
+            assert_eq!(
+                storage.routine_slot_in_named_oids(
+                    "public",
+                    "renamed",
+                    &[],
+                    &[],
+                    7,
+                    RoutineCallKind::Scalar
+                ),
+                Some(1)
+            );
+            let retained = storage
+                .routine_candidates("public", "renamed", 7, RoutineCallKind::Scalar)
+                .next()
+                .unwrap()
+                .1;
+            storage.routines.lock().unwrap()[1].ddl_state = CatalogDdlState::Absent;
+            assert!(retained.visible_to(7));
+            assert_eq!(retained.name_for(7).as_str(), "renamed");
+            assert_eq!(slots("renamed", 7, RoutineCallKind::Scalar), None);
+            assert_eq!(storage.routine_entries().count(), 4);
+        });
     }
 
     #[test]
@@ -58939,9 +58831,9 @@ mod tests {
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
         };
+        let row_versions = storage.row_versions.exclusive();
         push_pending_version(
-            &mut storage.pending_row_versions,
-            &mut storage.pending_row_version_free,
+            &mut row_versions.pending_row_versions,
             &mut state.pending,
             storage.max_row_versions_per_row,
             PendingChange {

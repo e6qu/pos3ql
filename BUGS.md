@@ -6,6 +6,18 @@ finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet these inclusion criteria.
 
+Pending and committed row-version arrays now share a guarded owner with their
+free lists. Allocator calls cannot pair an array with another pool's free list.
+Full chain reads retain one view; rollback, pruning, slot reuse,
+and heap relocation require exclusive ownership. Fixed capacities and named
+exhaustion remain unchanged, with exact startup charging for pool controls.
+The combined row-map/version lifecycle remains roadmap work; this change
+introduces no deferred defect. The outer differential harness now also streams
+regression progress instead of hiding it until completion. Runner stack samples
+identified wide routine copies during per-row type resolution. Lookup now
+filters transaction-visible metadata before copying candidate payloads, with
+no routine guard held across nested catalog resolution.
+
 Row maps now return detached row-state images from shared lookups and guarded
 iteration. Recovery, rollback, cloning, and slot reuse use the same map access
 boundary. Locks are charged at startup; capacity failure preserves retained

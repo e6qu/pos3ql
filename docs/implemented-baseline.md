@@ -40,12 +40,19 @@ owner, remain valid across definition changes and slot reuse, and do not borrow
 mutable storage. Pool exhaustion and stale identity reacquisition are explicit
 errors. COPY owns its reader across data messages; DDL event graphs retain
 pre-change images outside the statement arena. Live definition publication
-remains exclusive.
+remains exclusive. Routine lookup filters transaction-visible identity
+and kind under the catalog guard before copying candidate payloads, releasing
+the guard before nested overload and type resolution.
 
 Relation row maps have a per-table read boundary. Point reads return copied
 row-state images; scans and checkpoint batches retain a coherent map guard.
 Mutation and lifecycle cleanup require exclusive access. The startup table
-budget includes the row-map lock controls. Row-version pools, heap access,
+budget includes the row-map lock controls. Pending and committed row-version
+arrays share one guarded owner; each array owns its free-list control.
+Visibility reads retain
+one view across both chains; mutations and compaction require exclusive owner
+access. Pool controls are charged at startup. Detached chain handles do not
+retain version slots across mutation. Heap access, the combined row lifecycle,
 statistics, maintenance, and query-scope definition ownership remain exclusive.
 
 The reactor still executes statements serially. Table definitions and row

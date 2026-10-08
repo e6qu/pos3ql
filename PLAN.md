@@ -1,7 +1,7 @@
 # pos3ql roadmap
 
-Reviewed after PR #602 on 2026-10-07, against
-`44b832030d131ca113528546eaf402ed05e69b42`.
+Reviewed after PR #603 on 2026-10-07, against
+`9c2465cb261755aa375a6fd837ee9dd582fdf04a`.
 
 [Architecture](README.md) · [Current capabilities](docs/implemented-baseline.md) ·
 [Compatibility](docs/postgresql-18-compatibility.md) · [Contributing](CONTRIBUTING.md)
@@ -74,9 +74,15 @@ Relation row maps now use a per-table read boundary. Point reads and iteration
 return detached row-state images; full walks and checkpoint batches retain a
 consistent map view. Row mutation, recovery, rollback, template cloning, and
 slot reuse require exclusive map access. Table startup accounting includes the
-lock controls, and exhaustion preserves existing rows. This protects the map;
-row-version pools, heap access, statistics, and maintenance still need their
-shared mutation boundaries.
+lock controls, and exhaustion preserves existing rows.
+Pending and committed version arrays now share one guarded owner with their
+free lists. Each array owns its free-list control, so allocator calls cannot
+pair it with another pool. Visibility holds one view across both chains and
+releases it before object-store lookup. Rollback, pruning, publication, removal, and compaction
+require exclusive pool ownership; pool controls are charged at startup.
+Heap access, statistics, maintenance, and the combined row-map/version lifecycle
+still require shared mutation boundaries. Detached row-state chain handles do
+not retain pool slots across mutation; execution remains serial.
 
 Live definition publication remains exclusive. Query scopes retain definition
 references beyond lookup, so their ownership must change before definitions
@@ -87,7 +93,15 @@ slices into complementary workers within the unchanged 15-minute ceiling.
 The timeout guard verifies complete, disjoint corpus assignment for both
 matrices across mixed partition widths. The ordinary PostgreSQL regression
 file slice also has complementary workers; upstream ranges stay together and
-statement progress is streamed so deadline failures retain diagnostics.
+statement progress is streamed through the outer harness so deadline failures
+retain diagnostics. Runner stack samples traced the UUID timestamp/window deadline to copying wide
+routine payloads before candidate filtering. Routine lookup now filters compact
+transaction-visible identity and kind under the catalog guard before copying
+candidates, then releases the guard before nested overload/catalog resolution.
+The complete upstream probe remains the PostgreSQL and deadline regression.
+[Stack sampling](https://github.com/e6qu/pos3ql/actions/runs/37693402941)
+identified the copy path; [focused validation](https://github.com/e6qu/pos3ql/actions/runs/37695506990)
+passed the full probe with zero mismatches after filtering candidates.
 
 Completion evidence:
 

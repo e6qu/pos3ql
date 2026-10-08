@@ -37,3 +37,10 @@ jobs:
         run: cargo test --lib --locked row_version_ownership -- --nocapture
       - name: Snapshot visibility
         run: cargo test --lib --locked committed_image_obeys_an_lsn_snapshot -- --nocapture
+      - name: SQL history and rollback ownership
+        run: |
+          cargo test --lib --locked repeatable_read_retains_committed_row_history -- --nocapture
+          cargo test --lib --locked parked_statement_rewinds_partial_rows_before_replay -- --nocapture
+          cargo test --lib --locked prepared_transactions_survive_checkpoint_and_object_cold_recovery -- --nocapture
+          cargo test --lib --locked heap_compaction_preserves_rows_of_a_pending_create -- --nocapture
+          cargo test --lib --locked catalog_object_pools_follow_their_independent_startup_capacities -- --nocapture

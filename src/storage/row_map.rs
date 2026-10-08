@@ -1,4 +1,4 @@
-//! Guarded relation row state. Shared lookups return detached row images.
+//! Guarded relation row metadata. Chain traversal requires an issued row read.
 
 use std::sync::{RwLock, RwLockReadGuard};
 

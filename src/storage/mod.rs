@@ -2294,7 +2294,8 @@ pub(crate) enum RowHeapImage {
 /// uncommitted command versions owned by one transaction. Keeping each
 /// command's image is what lets a statement-level snapshot look past a later
 /// write to the image produced by an earlier command in the same transaction.
-/// A second transaction still fails fast instead of blocking.
+/// Chain handles are metadata, not retained slots; readers traverse them only
+/// through an issued `RowRead`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowState {
     pub committed: Option<RowHome>,

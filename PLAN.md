@@ -77,8 +77,9 @@ slot reuse require exclusive map access. Table startup accounting includes the
 lock controls, and exhaustion preserves existing rows.
 Pending and committed version arrays now share one guarded owner with their
 free lists. Each array owns its free-list control, so allocator calls cannot
-pair it with another pool. Visibility holds one view across both chains and
-releases it before object-store lookup. Rollback, pruning, publication, removal, and compaction
+pair it with another pool. Point visibility holds one view across both chains
+and consumes its owner before an immutable history probe. Resident walks retain
+their combined view across callbacks. Rollback, pruning, publication, removal, and compaction
 require exclusive pool ownership; pool controls are charged at startup.
 SQL and checkpoint chain readers now require an issued row read that retains
 its version owner. Point lookup acquires version ownership before copying map

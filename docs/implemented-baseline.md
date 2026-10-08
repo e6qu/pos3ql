@@ -49,11 +49,15 @@ row-state images; scans and checkpoint batches retain a coherent map guard.
 Mutation and lifecycle cleanup require exclusive access. The startup table
 budget includes the row-map lock controls. Pending and committed row-version
 arrays share one guarded owner; each array owns its free-list control.
-Visibility reads retain
-one view across both chains; mutations and compaction require exclusive owner
-access. Pool controls are charged at startup. Detached chain handles do not
-retain version slots across mutation. Heap access, the combined row lifecycle,
-statistics, maintenance, and query-scope definition ownership remain exclusive.
+SQL and checkpoint chain reads require an issued row image that retains its
+version owner. Point lookup acquires that owner before copying row metadata;
+resident walks borrow one map/version view and chain helpers reuse its owner.
+Raw copied metadata cannot enter visibility or history lookup. Immutable SST
+images carry no resident handles. Point visibility consumes its owner before
+an immutable history probe; resident walks retain their view across callbacks.
+Mutations and compaction require exclusive access; pool controls are charged at
+startup. Shared row publication, heap access, statistics, maintenance, and
+query-scope definition ownership remain open.
 
 The reactor still executes statements serially. Table definitions and row
 mutation, engine-owned prepared slots and WAL publication, fixed workers, and

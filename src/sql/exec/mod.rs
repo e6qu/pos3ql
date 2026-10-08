@@ -4651,9 +4651,7 @@ where
     let mut new_values = [Datum::Null; MAX_COLUMNS];
     {
         let state = storage
-            .table(table_index)
-            .rows
-            .get(&rowid)
+            .resident_row_state(table_index, rowid)
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
         let home = storage
             .visible_row_home(table_index, rowid, state, txn.txid)?
@@ -64021,10 +64019,9 @@ fn alter_table_relation(
     // writers. This verifies the row-version invariant at the rewrite
     // boundary as a corruption guard.
     if storage
-        .table(table_index)
-        .rows
+        .resident_rows(table_index)
         .iter()
-        .any(|(_, state)| storage.row_locked_by_other(state, txn.txid).is_some())
+        .any(|(_, state)| state.locked_by_other(txn.txid).is_some())
     {
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE,
@@ -67498,7 +67495,7 @@ fn collect_matches<'a>(
                 access.map_or(0, |access| access.index_entries()),
             )?;
         }
-        let mut visit = |rowid, state| {
+        let mut visit = |rowid, state: crate::storage::RowRead<'_>| {
             let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
                 return Ok(());
             };

@@ -1,4 +1,4 @@
-//! Guarded relation row state. Shared lookups return detached row images.
+//! Guarded relation row metadata. Chain traversal requires an issued row read.
 
 use std::sync::{RwLock, RwLockReadGuard};
 
@@ -23,6 +23,13 @@ impl RowMap {
 
     pub(super) fn read(&self) -> RwLockReadGuard<'_, FixedMap<u64, RowState>> {
         self.state.read().expect("table row state lock poisoned")
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_write(
+        &self,
+    ) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, FixedMap<u64, RowState>>> {
+        self.state.try_write()
     }
 
     fn exclusive(&mut self) -> &mut FixedMap<u64, RowState> {

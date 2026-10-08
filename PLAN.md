@@ -1,7 +1,7 @@
 # pos3ql roadmap
 
-Reviewed after PR #603 on 2026-10-07, against
-`9c2465cb261755aa375a6fd837ee9dd582fdf04a`.
+Reviewed after PR #604 on 2026-10-08, against
+`9ce3ad0bff9d64074a3314db96e97fa927e9ef71`.
 
 [Architecture](README.md) · [Current capabilities](docs/implemented-baseline.md) ·
 [Compatibility](docs/postgresql-18-compatibility.md) · [Contributing](CONTRIBUTING.md)
@@ -77,12 +77,20 @@ slot reuse require exclusive map access. Table startup accounting includes the
 lock controls, and exhaustion preserves existing rows.
 Pending and committed version arrays now share one guarded owner with their
 free lists. Each array owns its free-list control, so allocator calls cannot
-pair it with another pool. Visibility holds one view across both chains and
-releases it before object-store lookup. Rollback, pruning, publication, removal, and compaction
+pair it with another pool. Point visibility holds one view across both chains
+and consumes its owner before an immutable history probe. Resident walks retain
+their combined view across callbacks. Rollback, pruning, publication, removal, and compaction
 require exclusive pool ownership; pool controls are charged at startup.
-Heap access, statistics, maintenance, and the combined row-map/version lifecycle
-still require shared mutation boundaries. Detached row-state chain handles do
-not retain pool slots across mutation; execution remains serial.
+SQL and checkpoint chain readers now require an issued row read that retains
+its version owner. Point lookup acquires version ownership before copying map
+metadata; full resident walks borrow one combined map/version view. Raw copied
+row metadata cannot be supplied to visibility or chain lookup APIs. Immutable
+SST reads carry no resident handles.
+[Focused validation](https://github.com/e6qu/pos3ql/actions/runs/37745829382)
+passed concurrent row/chain slot reuse, allocation-free guard cleanup, SQL
+history/rollback, prepared-transaction cold recovery, compaction, and independent
+startup capacity checks. Heap access, statistics, maintenance, and shared row
+publication still require mutation boundaries; execution remains serial.
 
 Live definition publication remains exclusive. Query scopes retain definition
 references beyond lookup, so their ownership must change before definitions

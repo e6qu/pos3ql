@@ -11,8 +11,11 @@ free lists. Allocator calls cannot pair an array with another pool's free list.
 Full chain reads retain one view; rollback, pruning, slot reuse,
 and heap relocation require exclusive ownership. Fixed capacities and named
 exhaustion remain unchanged, with exact startup charging for pool controls.
-The combined row-map/version lifecycle remains roadmap work; this change
-introduces no deferred defect. The outer differential harness now also streams
+Issued row reads now retain pool ownership while chain handles are used.
+Visibility and checkpoint history cannot follow a detached raw handle through
+an unrelated later pool lookup. Point reads and full walks acquire version
+ownership before map metadata; shared mutation and heap ownership remain
+roadmap work. This change introduces no deferred defect. The outer differential harness now also streams
 regression progress instead of hiding it until completion. Runner stack samples
 identified wide routine copies during per-row type resolution. Lookup now
 filters transaction-visible metadata before copying candidate payloads, with

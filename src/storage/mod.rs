@@ -8,15 +8,18 @@
 mod definition_images;
 pub(crate) mod foreign;
 mod row_map;
+mod row_reads;
 mod row_versions;
 pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_map::RowMap;
+pub(crate) use row_reads::RowRead;
+use row_reads::{RowReadView, RowReadVisitor};
 use row_versions::{
-    RowVersionPools, clear_pending_versions, committed_history_get, committed_visible_at,
-    pending_last, pending_visible_at, pop_pending_version, prune_committed_history,
-    push_committed_version, push_pending_version, release_committed_chain, release_pending_chain,
+    RowVersionPools, clear_pending_versions, pending_last, pop_pending_version,
+    prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
+    release_pending_chain,
 };
 
 use core::cell::Cell;
@@ -2291,7 +2294,8 @@ pub(crate) enum RowHeapImage {
 /// uncommitted command versions owned by one transaction. Keeping each
 /// command's image is what lets a statement-level snapshot look past a later
 /// write to the image produced by an earlier command in the same transaction.
-/// A second transaction still fails fast instead of blocking.
+/// Chain handles are metadata, not retained slots; readers traverse them only
+/// through an issued `RowRead`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowState {
     pub committed: Option<RowHome>,
@@ -28330,8 +28334,8 @@ impl Storage {
             self.tables[i].def.schema(&mut schema);
             let mut max = [0i64; MAX_COLUMNS];
             let mut rowids: Vec<(u64, RowHome)> = Vec::new();
-            for (rowid, state) in self.tables[i].rows.iter() {
-                if let Some(home) = self.resident_visible_to(state, 0) {
+            for (rowid, state) in self.resident_rows(i).iter() {
+                if let Some(home) = state.visible_at(0, SNAPSHOT_ALL, u64::MAX).flatten() {
                     rowids.push((rowid, home));
                 }
             }
@@ -28492,44 +28496,6 @@ impl Storage {
     /// Number of immutable row generations currently backing a table.
     pub(crate) fn spill_generation_count(&self, table_slot: usize) -> usize {
         self.tables[table_slot].n_spill_ssts
-    }
-
-    pub(crate) fn row_pending_last(&self, state: RowState) -> Option<PendingChange> {
-        pending_last(
-            &self.row_versions.read().pending_row_versions,
-            state.pending,
-        )
-    }
-
-    pub(crate) fn row_history_get(
-        &self,
-        state: RowState,
-        index: usize,
-    ) -> Option<CommittedVersion> {
-        committed_history_get(
-            &self.row_versions.read().committed_row_versions,
-            state.history,
-            index,
-        )
-    }
-
-    pub(crate) fn row_locked_by_other(&self, state: RowState, txid: u32) -> Option<u32> {
-        match self.row_pending_last(state) {
-            Some(change) if change.txid != txid => Some(change.txid),
-            _ => None,
-        }
-    }
-
-    fn resident_visible_to(&self, state: RowState, txid: u32) -> Option<RowHome> {
-        match pending_visible_at(
-            &self.row_versions.read().pending_row_versions,
-            state.pending,
-            txid,
-            SNAPSHOT_ALL,
-        ) {
-            Some(location) => location.map(RowHome::Heap),
-            None => state.committed,
-        }
     }
 
     /// The bytes of a visible row, wherever they live: a heap row borrows the
@@ -29425,10 +29391,10 @@ impl Storage {
     /// consumer.
     ///
     /// `Break` stops the walk early; the callback's own error aborts it.
-    pub fn for_each_row_state(
+    pub(crate) fn for_each_row_state(
         &self,
         table_slot: usize,
-        each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        each: &mut RowReadVisitor<'_>,
     ) -> Result<(), SqlError> {
         // The overlay first: pending changes and hot rows, whose entries
         // shadow anything the spill list holds for the same rowid.
@@ -29445,7 +29411,7 @@ impl Storage {
         self.spill_merged_walk(table_slot, &mut |rowid, len, member, commit_lsn| {
             each(
                 rowid,
-                RowState {
+                RowRead::immutable(RowState {
                     committed: Some(RowHome::Spilled {
                         len,
                         sst: member,
@@ -29455,17 +29421,22 @@ impl Storage {
                     checkpoint_change_lsn: 0,
                     history: CommittedHistory::empty(),
                     pending: PendingVersions::empty(),
-                },
+                }),
             )
         })
+    }
+
+    pub(crate) fn resident_rows(&self, table_slot: usize) -> RowReadView<'_> {
+        RowReadView::new(&self.row_versions, &self.tables[table_slot].rows)
     }
 
     pub(crate) fn for_each_resident_row_state(
         &self,
         table_slot: usize,
-        each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        each: &mut RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        for (rowid, state) in self.tables[table_slot].rows.iter() {
+        let view = RowReadView::new(&self.row_versions, &self.tables[table_slot].rows);
+        for (rowid, state) in view.iter() {
             if each(rowid, state)?.is_break() {
                 return Ok(core::ops::ControlFlow::Break(()));
             }
@@ -29476,9 +29447,10 @@ impl Storage {
     pub(crate) fn for_each_scan_overlay_row_state(
         &self,
         table_slot: usize,
-        each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        each: &mut RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        for (rowid, state) in self.tables[table_slot].rows.iter() {
+        let view = RowReadView::new(&self.row_versions, &self.tables[table_slot].rows);
+        for (rowid, state) in view.iter() {
             if Self::redundant_spilled_row_state(&state) {
                 continue;
             }
@@ -29713,23 +29685,31 @@ impl Storage {
     }
 
     /// One row's state by id, through the same seam as the enumeration.
-    pub fn row_state(&self, table_slot: usize, rowid: u64) -> Result<Option<RowState>, SqlError> {
-        if let Some(state) = self.tables[table_slot].rows.get(&rowid) {
+    pub(crate) fn row_state(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+    ) -> Result<Option<RowRead<'_>>, SqlError> {
+        if let Some(state) =
+            RowReadView::point(&self.row_versions, &self.tables[table_slot].rows, rowid)
+        {
             return Ok(Some(state));
         }
         Ok(self
             .spill_probe_at(table_slot, rowid, u64::MAX)?
             .and_then(|version| {
-                version.len.map(|len| RowState {
-                    committed: Some(RowHome::Spilled {
-                        len,
-                        sst: version.member,
-                        commit_lsn: version.commit_lsn,
-                    }),
-                    committed_lsn: version.commit_lsn,
-                    checkpoint_change_lsn: 0,
-                    history: CommittedHistory::empty(),
-                    pending: PendingVersions::empty(),
+                version.len.map(|len| {
+                    RowRead::immutable(RowState {
+                        committed: Some(RowHome::Spilled {
+                            len,
+                            sst: version.member,
+                            commit_lsn: version.commit_lsn,
+                        }),
+                        committed_lsn: version.commit_lsn,
+                        checkpoint_change_lsn: 0,
+                        history: CommittedHistory::empty(),
+                        pending: PendingVersions::empty(),
+                    })
                 })
             }))
     }
@@ -29738,19 +29718,19 @@ impl Storage {
     /// overlay. Immutable index generations use this to detect keys shadowed
     /// by later changes without point-reading the immutable table for every
     /// unchanged index entry.
-    pub(crate) fn resident_row_state(&self, table_slot: usize, rowid: u64) -> Option<RowState> {
-        self.tables[table_slot].rows.get(&rowid)
+    pub(crate) fn resident_row_state(&self, table_slot: usize, rowid: u64) -> Option<RowRead<'_>> {
+        RowReadView::point(&self.row_versions, &self.tables[table_slot].rows, rowid)
     }
 
     /// The single visibility choke point for heap and object-resident row
     /// versions. Pending command visibility wins first; then the resident
     /// committed chain; finally immutable SSTs supply an older admissible
     /// image when the resident chain no longer carries it.
-    pub fn visible_row_home(
+    pub(crate) fn visible_row_home(
         &self,
         table_slot: usize,
         rowid: u64,
-        state: RowState,
+        state: RowRead<'_>,
         txid: u32,
     ) -> Result<Option<RowHome>, SqlError> {
         self.visible_row_home_at(
@@ -29766,34 +29746,20 @@ impl Storage {
     /// Visibility with explicit command and commit snapshots. DDL validation
     /// uses `SNAPSHOT_ALL` to include every change made earlier in the current
     /// transaction; ordinary scans call `visible_row_home`.
-    pub fn visible_row_home_at(
+    pub(crate) fn visible_row_home_at(
         &self,
         table_slot: usize,
         rowid: u64,
-        state: RowState,
+        state: RowRead<'_>,
         txid: u32,
         command_snapshot: u32,
         commit_snapshot: u64,
     ) -> Result<Option<RowHome>, SqlError> {
-        let row_versions = self.row_versions.read();
-        match pending_visible_at(
-            &row_versions.pending_row_versions,
-            state.pending,
-            txid,
-            command_snapshot,
-        ) {
-            Some(location) => return Ok(location.map(RowHome::Heap)),
-            None if state.committed_lsn <= commit_snapshot => return Ok(state.committed),
-            None => {}
-        }
-        if let Some(home) = committed_visible_at(
-            &row_versions.committed_row_versions,
-            state.history,
-            commit_snapshot,
-        ) {
+        let visible = state.visible_at(txid, command_snapshot, commit_snapshot);
+        drop(state);
+        if let Some(home) = visible {
             return Ok(home);
         }
-        drop(row_versions);
         Ok(self
             .spill_probe_at(table_slot, rowid, commit_snapshot)?
             .and_then(|version| {
@@ -31111,10 +31077,9 @@ impl Storage {
             ));
         }
         let oldest_snapshot = self.oldest_snapshot();
-        let conflicting_owner = self.tables[table_index]
-            .rows
-            .get(&rowid)
-            .and_then(|state| self.row_locked_by_other(state, txid));
+        let conflicting_owner = self
+            .resident_row_state(table_index, rowid)
+            .and_then(|state| state.locked_by_other(txid));
         if let Some(owner) = conflicting_owner {
             self.wait_for_transaction(txid, owner)?;
             return Err(sql_err!(
@@ -31122,8 +31087,11 @@ impl Storage {
                 "statement is waiting for a concurrent row update"
             ));
         }
-        let existed = match self.tables[table_index].rows.get(&rowid) {
-            Some(state) => self.resident_visible_to(state, txid).is_some(),
+        let existed = match self.resident_row_state(table_index, rowid) {
+            Some(state) => state
+                .visible_at(txid, SNAPSHOT_ALL, u64::MAX)
+                .flatten()
+                .is_some(),
             None => self
                 .spill_probe_at(table_index, rowid, u64::MAX)?
                 .is_some_and(|version| version.len.is_some()),
@@ -33424,15 +33392,9 @@ impl Storage {
     /// value cache: row visibility ignores them and the committed key remains
     /// installed until their transaction commits.
     pub(crate) fn has_visible_pending_rows(&self, table_index: usize, txid: u32) -> bool {
-        self.tables[table_index].rows.iter().any(|(_, state)| {
-            pending_visible_at(
-                &self.row_versions.read().pending_row_versions,
-                state.pending,
-                txid,
-                self.read_snapshot(),
-            )
-            .is_some()
-        })
+        self.resident_rows(table_index)
+            .iter()
+            .any(|(_, state)| state.has_visible_pending(txid, self.read_snapshot()))
     }
 
     /// Releases a table's enforcer index slots back to the pool and clears its
@@ -52472,21 +52434,43 @@ mod tests {
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let location = RowLoc { offset: 12, len: 4 };
         let state = RowState::committed_only_at(location, 42);
+        storage.tables[0].rows.insert(1, state).unwrap();
         assert_eq!(
             storage
-                .visible_row_home_at(0, 1, state, 7, SNAPSHOT_ALL, 41)
+                .visible_row_home_at(
+                    0,
+                    1,
+                    storage.resident_row_state(0, 1).unwrap(),
+                    7,
+                    SNAPSHOT_ALL,
+                    41
+                )
                 .unwrap(),
             None
         );
         assert_eq!(
             storage
-                .visible_row_home_at(0, 1, state, 7, SNAPSHOT_ALL, 42)
+                .visible_row_home_at(
+                    0,
+                    1,
+                    storage.resident_row_state(0, 1).unwrap(),
+                    7,
+                    SNAPSHOT_ALL,
+                    42
+                )
                 .unwrap(),
             Some(RowHome::Heap(location))
         );
         assert_eq!(
             storage
-                .visible_row_home_at(0, 1, state, 7, SNAPSHOT_ALL, 99)
+                .visible_row_home_at(
+                    0,
+                    1,
+                    storage.resident_row_state(0, 1).unwrap(),
+                    7,
+                    SNAPSHOT_ALL,
+                    99
+                )
                 .unwrap(),
             Some(RowHome::Heap(location))
         );
@@ -52509,15 +52493,16 @@ mod tests {
             },
         )
         .unwrap();
+        storage.tables[0].rows.insert(1, pending).unwrap();
         assert_eq!(
             storage
-                .visible_row_home_at(0, 1, pending, 7, 4, 41)
+                .visible_row_home_at(0, 1, storage.resident_row_state(0, 1).unwrap(), 7, 4, 41)
                 .unwrap(),
             Some(RowHome::Heap(RowLoc { offset: 20, len: 4 }))
         );
         assert_eq!(
             storage
-                .visible_row_home_at(0, 1, pending, 8, 4, 41)
+                .visible_row_home_at(0, 1, storage.resident_row_state(0, 1).unwrap(), 8, 4, 41)
                 .unwrap(),
             None
         );
@@ -52627,6 +52612,52 @@ mod tests {
 
     fn test_budget(config: &Config) -> Budget {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
+    }
+
+    #[test]
+    fn row_read_ownership_walk_releases_guards_on_break_and_error() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage.tables[0]
+            .rows
+            .insert(
+                1,
+                RowState::committed_only_at(RowLoc { offset: 0, len: 4 }, 7),
+            )
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .for_each_row_state(0, &mut |_, row| {
+                    assert!(storage.row_versions.test_write().is_err());
+                    assert!(storage.tables[0].rows.test_write().is_err());
+                    assert_eq!(row.committed_lsn, 7);
+                    Ok(core::ops::ControlFlow::Break(()))
+                })
+                .unwrap();
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.tables[0].rows.test_write().is_ok());
+            let error = storage
+                .for_each_row_state(0, &mut |_, _| {
+                    Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "reader callback exhausted"
+                    ))
+                })
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.tables[0].rows.test_write().is_ok());
+            let row = storage.row_state(0, 1).unwrap().unwrap();
+            assert!(storage.row_versions.test_write().is_err());
+            assert_eq!(
+                storage
+                    .visible_row_home_at(0, 1, row, 7, SNAPSHOT_ALL, 7)
+                    .unwrap(),
+                Some(RowHome::Heap(RowLoc { offset: 0, len: 4 }))
+            );
+            assert!(storage.row_versions.test_write().is_ok());
+        });
     }
 
     #[test]
@@ -58851,7 +58882,9 @@ mod tests {
         storage.compact_heap(&mut scratch).unwrap();
 
         let compacted = storage
-            .row_pending_last(storage.table(slot).rows.get(&1).unwrap())
+            .resident_row_state(slot, 1)
+            .unwrap()
+            .pending_last()
             .unwrap()
             .loc
             .unwrap();

@@ -6009,20 +6009,16 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
     assert!(
         recovered
             .storage
-            .table(durable_slot)
-            .rows
+            .resident_rows(durable_slot)
             .iter()
-            .any(|(_, state)| recovered
-                .storage
-                .row_pending_last(state)
-                .is_some_and(|pending| {
-                    pending.txid
-                        == recovered
-                            .prepared_transactions
-                            .slot(recovered_slot)
-                            .metadata()
-                            .transaction_id
-                })),
+            .any(|(_, state)| state.pending_last().is_some_and(|pending| {
+                pending.txid
+                    == recovered
+                        .prepared_transactions
+                        .slot(recovered_slot)
+                        .metadata()
+                        .transaction_id
+            })),
         "prepared row overlays recovered"
     );
     assert_eq!(
@@ -50767,12 +50763,11 @@ fn parked_statement_rewinds_partial_rows_before_replay() {
         {
             let storage = &engine.storage;
             storage
-                .table(engine.storage.find_table("public", "replay_rows").unwrap())
-                .rows
+                .resident_rows(engine.storage.find_table("public", "replay_rows").unwrap())
                 .iter()
                 .all(|(_, state)| {
-                    storage
-                        .row_pending_last(state)
+                    state
+                        .pending_last()
                         .is_none_or(|pending| pending.txid != waiter.txid)
                 })
         },

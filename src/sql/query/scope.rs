@@ -1692,3 +1692,178 @@ impl<'d> QueryScope<'d> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::mem::budget::Budget;
+
+    fn config() -> Config {
+        let mut config = Config::default_dev();
+        config.max_tables = 2;
+        config.max_catalog_versions_per_object = 1;
+        config.query_workspace_slots = 1;
+        config.memtable_bytes = 1 << 16;
+        config.table_rows = 16;
+        config.txn_rows = 16;
+        config.value_index_rows = 32;
+        config.max_value_indexes = 2;
+        config.max_extension_scripts = 2;
+        config.extension_script_bytes = 1 << 16;
+        config
+    }
+
+    fn definition(name: &str, width: usize) -> TableDef {
+        let mut definition = TableDef {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse(name).unwrap(),
+            n_columns: width,
+            ..TableDef::empty()
+        };
+        for (index, column) in definition.columns[..width].iter_mut().enumerate() {
+            *column = ColumnMeta {
+                name: SqlName::parse(crate::stack_format!(64, "c{}", index).as_str()).unwrap(),
+                ctype: ColType::Int8,
+                ..ColumnMeta::EMPTY
+            };
+        }
+        definition
+    }
+
+    #[test]
+    fn query_definition_ownership_preserves_images_across_storage_lifecycle() {
+        let config = config();
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(definition("original", 1)).unwrap();
+        let mut sources = [Some(ScopeDefinition::Retained { table, names: &["c0"] })];
+        let images = storage.table_definition_images();
+        images.definition(&storage, table, 0).unwrap();
+        let definitions = QueryDefinitions { sources: &mut sources, images, transaction: 0 };
+        crate::mem::guard::forbid_alloc(|| {
+            storage.write_table_def(table, 7, definition("pending", 1), &[None; MAX_COLUMNS], false).unwrap();
+            let pending = storage.table_definition_images();
+            pending.definition(&storage, table, 7).unwrap();
+            storage.rollback_table_def(table, 7);
+            assert_eq!(pending.retained_definition(table, 7).unwrap().name.as_str(), "pending");
+            storage.write_table_def(table, 7, definition("published", 1), &[None; MAX_COLUMNS], false).unwrap();
+            storage.commit_table_def(table, 7);
+            storage.commit_drop(table);
+            assert_eq!(storage.create_table(definition("replacement", 1)).unwrap(), table);
+            assert_eq!(definitions.get(0).unwrap().name.as_str(), "original");
+            drop(storage);
+            assert_eq!(definitions.get(0).unwrap().columns()[0].name.as_str(), "c0");
+        });
+    }
+
+    #[test]
+    fn query_definition_ownership_wide_aliases_share_one_image_and_keep_names() {
+        let config = config();
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(definition("wide_source", MAX_COLUMNS)).unwrap();
+        let capacity = crate::storage::table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1);
+        let mut owners = Vec::with_capacity(capacity - 1);
+        let mut arena_budget = Budget::new(1 << 17);
+        let arena = Arena::new(&mut arena_budget, "query definition names", 1 << 17).unwrap();
+        let query = crate::sql::parser::parse_query("SELECT a.c0 FROM wide_source a CROSS JOIN wide_source b", &arena).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 1..capacity {
+                let owner = storage.table_definition_images();
+                owner.definition(&storage, table, 0).unwrap();
+                owners.push(owner);
+            }
+            let scope = QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena).unwrap();
+            assert!(core::ptr::eq(scope.defs.get(0).unwrap(), scope.defs.get(1).unwrap()));
+            assert_eq!(scope.defs.get(0).unwrap().n_columns, MAX_COLUMNS);
+            let escaped = scope.output_name(ResolvedColumn::Table(0, MAX_COLUMNS - 1));
+            assert_eq!(escaped, "c1599");
+            drop(scope);
+            let reused = storage.table_definition_images();
+            reused.definition(&storage, table, 0).unwrap();
+            assert_eq!(escaped, "c1599");
+        });
+    }
+
+    #[test]
+    fn query_definition_ownership_keeps_transaction_visible_shapes() {
+        let config = config();
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(definition("source", 1)).unwrap();
+        storage.write_table_def(table, 7, definition("source", 2), &[None; MAX_COLUMNS], false).unwrap();
+        let mut arena_budget = Budget::new(1 << 17);
+        let arena = Arena::new(&mut arena_budget, "visible shapes", 1 << 17).unwrap();
+        let query = crate::sql::parser::parse_query("SELECT * FROM source", &arena).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let pending = QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 7, &arena).unwrap();
+            let committed = QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 8, &arena).unwrap();
+            assert_eq!(pending.star_columns(), 2);
+            assert_eq!(committed.star_columns(), 1);
+            assert_eq!(pending.output_name(ResolvedColumn::Table(0, 1)), "c1");
+            assert!(!core::ptr::eq(pending.defs.get(0).unwrap(), committed.defs.get(0).unwrap()));
+        });
+    }
+
+    #[test]
+    fn query_definition_ownership_failed_resolution_releases_capacity() {
+        let config = config();
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(definition("first", 1)).unwrap();
+        storage.create_table(definition("second", 1)).unwrap();
+        let capacity = crate::storage::table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1);
+        let mut owners = Vec::with_capacity(capacity - 1);
+        let mut arena_budget = Budget::new(1 << 17);
+        let arena = Arena::new(&mut arena_budget, "query resolution", 1 << 17).unwrap();
+        let query = crate::sql::parser::parse_query("SELECT a.c0 FROM first a CROSS JOIN second b", &arena).unwrap();
+        let single = crate::sql::parser::parse_query("SELECT c0 FROM first", &arena).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 1..capacity {
+                let owner = storage.table_definition_images();
+                owner.definition(&storage, table, 0).unwrap();
+                owners.push(owner);
+            }
+            for _ in 0..8 {
+                let error = match QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena) {
+                    Ok(_) => panic!("two images exceed the one free cell"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert!(error.message.as_str().contains("table definition image pool"));
+                let scope = QueryScope::resolve_schema(&storage, single.from.as_ref().unwrap(), 0, &arena).unwrap();
+                assert_eq!(scope.defs.get(0).unwrap().name.as_str(), "first");
+            }
+            drop(owners.pop().unwrap());
+            let scope = QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena).unwrap();
+            assert_eq!(scope.defs.get(1).unwrap().name.as_str(), "second");
+        });
+    }
+
+    #[test]
+    fn query_definition_ownership_rejects_aliases_and_using_without_leaks() {
+        let config = config();
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage.create_table(definition("source", 1)).unwrap();
+        let mut arena_budget = Budget::new(1 << 22);
+        let arena = Arena::new(&mut arena_budget, "query errors", 1 << 22).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (sql, state) in [
+                ("SELECT * FROM source a CROSS JOIN source a", sqlstate::DUPLICATE_ALIAS),
+                ("SELECT * FROM source a JOIN source b USING (missing)", sqlstate::UNDEFINED_COLUMN),
+                ("SELECT * FROM source a(one, two)", sqlstate::INVALID_COLUMN_REFERENCE),
+            ] {
+                let query = crate::sql::parser::parse_query(sql, &arena).unwrap();
+                for _ in 0..8 {
+                    let error = match QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena) {
+                        Ok(_) => panic!("invalid scope must fail"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(error.sqlstate, state);
+                }
+            }
+        });
+    }
+}

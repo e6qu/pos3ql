@@ -20,7 +20,7 @@ do not qualify concurrent execution or representative deployments.
 |---|---|
 | Statement execution | Startup-bounded arenas, DML scratch, backend/database context, and FIFO dispatcher leases; COPY/subscription state has separately charged buffers |
 | Catalogs and metadata | Synchronized publication and owned reader images; guards release before nested resolution |
-| Table definitions | DML, COPY, and DDL pre-change readers retain immutable startup-budgeted images across callbacks and identity reuse; live publication remains exclusive |
+| Table definitions | Query scopes, DML, COPY, and DDL pre-change readers retain immutable startup-budgeted images; definition access borrows its owner, escaped query names use the arena, and live publication remains exclusive |
 | Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
 | Resident rows | Per-table map guards and one guarded pending/committed version owner; issued readers retain chain ownership, including SQL and checkpoint walks |
 | Heap bytes | Guarded bytes and append position; callback/codec reads retain the guard, while long-lived images copy into the fixed statement arena |
@@ -32,8 +32,8 @@ compaction validates the full relocation set before changing bytes or handles,
 including aliases and empty locations. Startup rejects heaps beyond the 32-bit
 location range. Retained heap images consume arena capacity, as spilled images do.
 
-The reactor still executes statements serially. Query-scope definition ownership,
-shared row publication and maintenance, locator pinning across concurrent
+The reactor still executes statements serially. Shared definition publication,
+row publication and maintenance, locator pinning across concurrent
 relocation, engine publication, and fixed workers remain the roadmap's open
 concurrency gates. Immutable SST reads carry no resident version handles.
 

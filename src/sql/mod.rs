@@ -13239,7 +13239,10 @@ impl Engine {
                 continue;
             };
             let table_definition = self.storage.table_def(table as usize, txn.txid);
-            let pending_row = pending.loc.map(|location| self.storage.heap.get(location)).transpose()?;
+            let pending_row = pending
+                .loc
+                .map(|location| self.storage.heap.get(location))
+                .transpose()?;
             let operation = match pending_row.as_deref() {
                 Some(row) => WalOp::Upsert {
                     schema: table_definition.schema.as_str(),

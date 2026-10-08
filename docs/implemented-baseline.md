@@ -56,8 +56,16 @@ Raw copied metadata cannot enter visibility or history lookup. Immutable SST
 images carry no resident handles. Point visibility consumes its owner before
 an immutable history probe; resident walks retain their view across callbacks.
 Mutations and compaction require exclusive access; pool controls are charged at
-startup. Shared row publication, heap access, statistics, maintenance, and
-query-scope definition ownership remain open.
+startup.
+Heap bytes and append position also share one guarded owner. Direct codec and
+callback reads retain that owner without copying. Long-lived row images copy
+into the fixed statement arena, so heap images consume arena capacity as
+spilled images do; DML reuses the same retained copy. Compaction preflights all
+locations before moving bytes or handles, groups aliases, and preserves empty
+locations. Bounds apply to initialized bytes, and startup rejects heaps beyond
+the 32-bit location range. Heap controls are charged exactly at startup.
+Shared publication, location pinning across concurrent relocation, statistics,
+maintenance, and query-scope definition ownership remain open.
 
 The reactor still executes statements serially. Table definitions and row
 mutation, engine-owned prepared slots and WAL publication, fixed workers, and

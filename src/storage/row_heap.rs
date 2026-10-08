@@ -79,7 +79,11 @@ impl RowHeap {
     }
 
     pub(crate) fn capacity(&self) -> usize {
-        self.state.read().expect("row heap lock poisoned").buffer.len()
+        self.state
+            .read()
+            .expect("row heap lock poisoned")
+            .buffer
+            .len()
     }
 
     pub(super) fn exclusive(&mut self) -> &mut RowHeapState {
@@ -87,7 +91,9 @@ impl RowHeap {
     }
 
     #[cfg(test)]
-    pub(super) fn test_write(&self) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, RowHeapState>> {
+    pub(super) fn test_write(
+        &self,
+    ) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, RowHeapState>> {
         self.state.try_write()
     }
 }
@@ -101,7 +107,10 @@ impl RowHeapState {
                 self.buffer.len()
             ));
         }
-        let location = RowLoc { offset: self.used as u32, len: len as u32 };
+        let location = RowLoc {
+            offset: self.used as u32,
+            len: len as u32,
+        };
         let slice = &mut self.buffer[self.used..self.used + len];
         self.used += len;
         Ok((location, slice))
@@ -110,7 +119,10 @@ impl RowHeapState {
     pub(super) fn validate(&self, location: RowLoc) -> Result<(), SqlError> {
         let end = (location.offset as usize).checked_add(location.len as usize);
         if end.is_none_or(|end| end > self.used) {
-            return Err(sql_err!(sqlstate::INTERNAL_ERROR, "row location exceeds initialized heap bytes"));
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "row location exceeds initialized heap bytes"
+            ));
         }
         Ok(())
     }
@@ -131,7 +143,10 @@ impl RowHeapState {
                     continue;
                 }
                 if (location.offset as usize) < previous.offset as usize + previous.len as usize {
-                    return Err(sql_err!(sqlstate::INTERNAL_ERROR, "heap compaction contains overlapping row locations"));
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "heap compaction contains overlapping row locations"
+                    ));
                 }
             }
             prior = Some(location);
@@ -143,7 +158,8 @@ impl RowHeapState {
         let start = source.offset as usize;
         debug_assert!(destination <= start);
         if start != destination {
-            self.buffer.copy_within(start..start + source.len as usize, destination);
+            self.buffer
+                .copy_within(start..start + source.len as usize, destination);
         }
     }
 
@@ -177,7 +193,13 @@ mod tests {
             assert!(read.other(RowLoc { offset: 3, len: 2 }).is_err());
             drop(read);
             assert!(heap.test_write().is_ok());
-            assert!(heap.get(RowLoc { offset: u32::MAX, len: u32::MAX }).is_err());
+            assert!(
+                heap.get(RowLoc {
+                    offset: u32::MAX,
+                    len: u32::MAX
+                })
+                .is_err()
+            );
             assert!(heap.get(RowLoc { offset: 4, len: 1 }).is_err());
             assert!(heap.test_write().is_ok());
             assert_eq!(heap.used(), 4);
@@ -212,18 +234,35 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let state = heap.exclusive();
             let overlapping = [RowLoc { offset: 0, len: 5 }, RowLoc { offset: 4, len: 2 }];
-            assert_eq!(state.validate_relocation(overlapping.into_iter()).unwrap_err().sqlstate, sqlstate::INTERNAL_ERROR);
+            assert_eq!(
+                state
+                    .validate_relocation(overlapping.into_iter())
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
             let outside = [RowLoc { offset: 8, len: 5 }];
             assert!(state.validate_relocation(outside.into_iter()).is_err());
-            assert_eq!(&*heap.get(RowLoc { offset: 0, len: 12 }).unwrap(), b"abcdefghijkl");
+            assert_eq!(
+                &*heap.get(RowLoc { offset: 0, len: 12 }).unwrap(),
+                b"abcdefghijkl"
+            );
             assert_eq!(heap.used(), 12);
             let state = heap.exclusive();
-            let valid = [RowLoc { offset: 4, len: 4 }, RowLoc { offset: 4, len: 4 }, RowLoc { offset: 4, len: 0 }, RowLoc { offset: 8, len: 4 }];
+            let valid = [
+                RowLoc { offset: 4, len: 4 },
+                RowLoc { offset: 4, len: 4 },
+                RowLoc { offset: 4, len: 0 },
+                RowLoc { offset: 8, len: 4 },
+            ];
             state.validate_relocation(valid.into_iter()).unwrap();
             state.relocate(valid[0], 0);
             state.relocate(valid[3], 4);
             state.finish_relocation(8);
-            assert_eq!(&*heap.get(RowLoc { offset: 0, len: 8 }).unwrap(), b"efghijkl");
+            assert_eq!(
+                &*heap.get(RowLoc { offset: 0, len: 8 }).unwrap(),
+                b"efghijkl"
+            );
             assert!(heap.get(RowLoc { offset: 8, len: 1 }).is_err());
         });
     }
@@ -280,6 +319,11 @@ mod tests {
             assert_eq!(error.what, "row heap address range");
             assert_eq!(budget.used(), 0);
         }
-        assert!(crate::config::Config::parse("memtable_bytes = 4GiB").unwrap_err().message.contains("row-location"));
+        assert!(
+            crate::config::Config::parse("memtable_bytes = 4GiB")
+                .unwrap_err()
+                .message
+                .contains("row-location")
+        );
     }
 }

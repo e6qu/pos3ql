@@ -99,6 +99,10 @@ leave prior state intact. The heap address limit is checked at configuration
 and startup. Shared row publication, statistics, maintenance, query-scope
 ownership, and location pinning across concurrent relocation remain open;
 execution remains serial.
+[Heap validation](https://github.com/e6qu/pos3ql/actions/runs/37767694197)
+passed byte-owner retention, arena exhaustion, invalid/aliased relocation,
+concurrent byte observations, SQL scratch recycling, allocation-free definition
+width, prepared-transaction cold recovery, and exact startup accounting.
 
 Live definition publication remains exclusive. Query scopes retain definition
 references beyond lookup, so their ownership must change before definitions

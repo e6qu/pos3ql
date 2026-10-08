@@ -28456,9 +28456,6 @@ impl Storage {
         self.tables[table_slot].n_spill_ssts
     }
 
-    /// The bytes of a visible row, wherever they live: a heap row borrows the
-    /// heap directly; a spilled row is fetched through the cache tiers into
-    /// `arena`. The two lifetimes unify, so call sites keep their shapes.
     /// The merged walk behind the row-state seam: every SST-resident rowid
     /// of `slot`'s spill list that no map entry shadows, in ascending rowid
     /// order — the newest member's verdict wins a rowid, and a tombstone
@@ -30096,10 +30093,16 @@ impl Storage {
         match home {
             RowHome::Heap(loc) => {
                 let row = self.heap.get(loc)?;
-                arena.alloc_slice_copy(&row).map(|bytes| &*bytes).map_err(|_| {
-                    sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "heap row images exceed the statement arena; raise work_arena_bytes")
-                })
-            },
+                arena
+                    .alloc_slice_copy(&row)
+                    .map(|bytes| &*bytes)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "heap row images exceed the statement arena; raise work_arena_bytes"
+                        )
+                    })
+            }
             RowHome::Spilled {
                 len,
                 sst,
@@ -58809,24 +58812,46 @@ mod tests {
         let (location, bytes) = storage.heap.append(4).unwrap();
         bytes.copy_from_slice(b"keep");
         storage.tables[0].live = true;
-        storage.tables[0].rows.insert(1, RowState::committed_only_at(location, 7)).unwrap();
+        storage.tables[0]
+            .rows
+            .insert(1, RowState::committed_only_at(location, 7))
+            .unwrap();
         let arena = Arena::new(&mut budget, "retained heap rows", 4).unwrap();
         let mut scratch = FixedVec::new(&mut budget, "heap relocation", 2).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            storage.with_row_bytes(0, 1, RowHome::Heap(location), |bytes| {
-                assert!(storage.heap.test_write().is_err());
-                assert_eq!(bytes, b"keep");
-                Ok(())
-            }).unwrap();
+            storage
+                .with_row_bytes(0, 1, RowHome::Heap(location), |bytes| {
+                    assert!(storage.heap.test_write().is_err());
+                    assert_eq!(bytes, b"keep");
+                    Ok(())
+                })
+                .unwrap();
             assert!(storage.heap.test_write().is_ok());
-            let retained = storage.row_bytes(0, 1, RowHome::Heap(location), &arena).unwrap();
+            let retained = storage
+                .row_bytes(0, 1, RowHome::Heap(location), &arena)
+                .unwrap();
             assert!(storage.heap.test_write().is_ok());
-            let error = storage.row_bytes(0, 1, RowHome::Heap(location), &arena).unwrap_err();
+            let error = storage
+                .row_bytes(0, 1, RowHome::Heap(location), &arena)
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(error.message.as_str(), "heap row images exceed the statement arena; raise work_arena_bytes");
+            assert_eq!(
+                error.message.as_str(),
+                "heap row images exceed the statement arena; raise work_arena_bytes"
+            );
             assert!(storage.heap.test_write().is_ok());
             storage.compact_heap(&mut scratch).unwrap();
-            assert_eq!(storage.tables[0].rows.get(&1).unwrap().committed.and_then(RowHome::heap_loc).unwrap().offset, 0);
+            assert_eq!(
+                storage.tables[0]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .committed
+                    .and_then(RowHome::heap_loc)
+                    .unwrap()
+                    .offset,
+                0
+            );
             assert_eq!(retained, b"keep");
             let (_, bytes) = storage.heap.append(4).unwrap();
             bytes.copy_from_slice(b"next");
@@ -58845,14 +58870,26 @@ mod tests {
         bytes.copy_from_slice(b"same");
         storage.tables[0].live = true;
         for rowid in 1..=4 {
-            storage.tables[0].rows.insert(rowid, RowState::committed_only_at(if rowid == 2 { empty } else { location }, 7)).unwrap();
+            storage.tables[0]
+                .rows
+                .insert(
+                    rowid,
+                    RowState::committed_only_at(if rowid == 2 { empty } else { location }, 7),
+                )
+                .unwrap();
         }
         let mut scratch = FixedVec::new(&mut budget, "heap aliases", 4).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             storage.compact_heap(&mut scratch).unwrap();
             assert_eq!(storage.heap.used(), 4);
             for rowid in 1..=4 {
-                let location = storage.tables[0].rows.get(&rowid).unwrap().committed.and_then(RowHome::heap_loc).unwrap();
+                let location = storage.tables[0]
+                    .rows
+                    .get(&rowid)
+                    .unwrap()
+                    .committed
+                    .and_then(RowHome::heap_loc)
+                    .unwrap();
                 assert_eq!(location.offset, 0);
                 if rowid == 2 {
                     assert!(storage.heap.get(location).unwrap().is_empty());
@@ -58873,14 +58910,23 @@ mod tests {
         storage.tables[0].live = true;
         let prior = RowState::committed_only_at(RowLoc { offset: 4, len: 4 }, 7);
         storage.tables[0].rows.insert(1, prior).unwrap();
-        storage.tables[0].rows.insert(2, RowState::committed_only_at(RowLoc { offset: 7, len: 2 }, 8)).unwrap();
+        storage.tables[0]
+            .rows
+            .insert(
+                2,
+                RowState::committed_only_at(RowLoc { offset: 7, len: 2 }, 8),
+            )
+            .unwrap();
         let mut scratch = FixedVec::new(&mut budget, "heap preflight", 2).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let error = storage.compact_heap(&mut scratch).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
             assert_eq!(storage.tables[0].rows.get(&1), Some(prior));
             assert_eq!(storage.heap.used(), 8);
-            assert_eq!(&*storage.heap.get(RowLoc { offset: 0, len: 8 }).unwrap(), b"original");
+            assert_eq!(
+                &*storage.heap.get(RowLoc { offset: 0, len: 8 }).unwrap(),
+                b"original"
+            );
         });
     }
 

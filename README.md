@@ -65,15 +65,9 @@ Build and validation guidance is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Documentation
 
-| Task | Document |
-|---|---|
-| Understand current capabilities | [Implemented baseline](docs/implemented-baseline.md), [compatibility matrix](docs/postgresql-18-compatibility.md) |
-| Choose the next engineering task | [Roadmap and gaps](PLAN.md) |
-| Configure and operate a server | [Operations](docs/operations.md), [installation](packaging/README.md) |
-| Back up, export, or recover | [Backup and restore](docs/backup-restore.md) |
-| Understand persistence and indexes | [Object storage](docs/object-storage.md), [durable formats](docs/durable-format.md), [index navigation](docs/index-navigation.md) |
-| Measure against vanilla PostgreSQL | [Performance](docs/performance.md), [retained benchmark evidence](benchmarks/README.md) |
-| Contribute | [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md), [terminology](docs/terminology.md) |
+Use the [implemented baseline](docs/implemented-baseline.md) for current
+capabilities, [PLAN.md](PLAN.md) for open completion gates, and
+[CONTRIBUTING.md](CONTRIBUTING.md) for development and verification.
 
 The [documentation index](docs/README.md) includes specialized SQL boundaries,
 fixture provenance, and historical records. [BUGS.md](BUGS.md) holds only

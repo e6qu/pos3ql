@@ -59,7 +59,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Durable constraint identity | 64 constraints per modeled table kind and 64 domain checks | Manifest v14 and 64-position catalog/trigger OID stride; SQLSTATE 54000 on the next item |
 | Other definition breadth | Documented 64-item constructs, including LIST bounds, inheritance parents, trigger arguments, and routine configuration entries | Shared parse/storage boundary; widening requires review of representation and identity |
 | Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |
-| Statement memory | Lists, joins, programs, volatile/routine retry logs, event graphs, JSON widths, split/table-function rows, and variable-width geometry | Fixed arenas; arena exhaustion is a program-limit error |
+| Statement memory | Retained heap/spilled row images, lists, joins, programs, retry logs, event graphs, JSON widths, table-function rows, and variable-width geometry | Fixed arenas; arena exhaustion is a program-limit error |
 | Value-specific limits | Full-text, XML/XPath, JSON/path nesting, rendered values, GUC bytes, and finite catalog identities | Typed source boundaries and specialized contracts below |
 
 Startup-sized catalogs have independent capacities; table count does not silently
@@ -70,8 +70,9 @@ rosters are separate reservations. Deletion batches limit work per beat, not the
 number of objects cleanup may ultimately process.
 
 Wire and durable identity widths are validated at startup and recovery. Arrays,
-programs, statement lists, multiranges, and mutable-routine results have no
-additional former 64/256/1,024-item staging ceiling. Effective search paths use
+programs, statement lists, multiranges, and mutable-routine results use their
+fixed memory budgets without separate staging-count ceilings. Heap locations
+use 32-bit addresses; `memtable_bytes` must not exceed `u32::MAX`. Effective search paths use
 the accepted GUC byte representation; cursor indexes use `cursor_bytes`.
 JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 [SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;

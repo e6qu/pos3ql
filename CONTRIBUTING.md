@@ -14,7 +14,9 @@ by a stated external blocker or genuine intractability.
 
 Every PR updates PLAN.md and BUGS.md. Keep current behavior in its owning
 [document](docs/README.md); put provenance and observations with their evidence.
-Do not add another progress journal to the README or roadmap.
+Keep PLAN.md focused on open gates and acceptance criteria; BUGS.md contains
+only blocked defects. Preserve completed investigations in PRs and the
+[history index](docs/history/README.md), without appending progress journals.
 
 ## Engineering boundaries
 

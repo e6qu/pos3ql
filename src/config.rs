@@ -1269,6 +1269,12 @@ impl Config {
                 "collation_scratch_bytes must be greater than zero".to_string(),
             ));
         }
+        if config.memtable_bytes > u32::MAX as usize {
+            return Err(ConfigError::at(
+                0,
+                "memtable_bytes must fit the row-location address representation".to_string(),
+            ));
+        }
         if config.cursor_bytes > u32::MAX as usize {
             return Err(ConfigError::at(
                 0,

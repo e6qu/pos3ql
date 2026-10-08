@@ -7,12 +7,14 @@
 
 mod definition_images;
 pub(crate) mod foreign;
+mod row_heap;
 mod row_map;
 mod row_reads;
 mod row_versions;
 pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
+pub(crate) use row_heap::RowHeap;
 pub(crate) use row_map::RowMap;
 pub(crate) use row_reads::RowRead;
 use row_reads::{RowReadView, RowReadVisitor};
@@ -2440,51 +2442,6 @@ impl RowState {
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
         }
-    }
-}
-
-/// Fixed byte heap for encoded rows.
-pub struct RowHeap {
-    buffer: Box<[u8]>,
-    used: usize,
-}
-
-impl RowHeap {
-    fn new(budget: &mut Budget, bytes: usize) -> Result<Self, BudgetError> {
-        budget.draw(bytes, "memtable")?;
-        Ok(Self {
-            buffer: vec![0; bytes].into_boxed_slice(),
-            used: 0,
-        })
-    }
-
-    pub fn append(&mut self, len: usize) -> Result<(RowLoc, &mut [u8]), SqlError> {
-        if self.buffer.len() - self.used < len {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "memtable is full ({} bytes); with object storage on, rows spill at the next checkpoint — retry, raise memtable_bytes, or enable object storage",
-                self.buffer.len()
-            ));
-        }
-        let loc = RowLoc {
-            offset: self.used as u32,
-            len: len as u32,
-        };
-        let slice = &mut self.buffer[self.used..self.used + len];
-        self.used += len;
-        Ok((loc, slice))
-    }
-
-    pub fn get(&self, loc: RowLoc) -> &[u8] {
-        &self.buffer[loc.offset as usize..(loc.offset + loc.len) as usize]
-    }
-
-    pub fn used(&self) -> usize {
-        self.used
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.buffer.len()
     }
 }
 
@@ -13479,7 +13436,7 @@ impl Iterator for MatviewIter<'_> {
 }
 
 pub struct Storage {
-    pub heap: RowHeap,
+    pub(crate) heap: RowHeap,
     tables: FixedVec<Table>,
     table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
@@ -17182,6 +17139,7 @@ impl Storage {
             + table_slot_capacity(config)
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>())
+            + RowHeap::control_bytes()
             + RowVersionPools::control_bytes()
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
             + Self::table_definition_image_budget_bytes(config)
@@ -28498,9 +28456,6 @@ impl Storage {
         self.tables[table_slot].n_spill_ssts
     }
 
-    /// The bytes of a visible row, wherever they live: a heap row borrows the
-    /// heap directly; a spilled row is fetched through the cache tiers into
-    /// `arena`. The two lifetimes unify, so call sites keep their shapes.
     /// The merged walk behind the row-state seam: every SST-resident rowid
     /// of `slot`'s spill list that no map entry shadows, in ascending rowid
     /// order — the newest member's verdict wins a rowid, and a tombstone
@@ -30126,15 +30081,28 @@ impl Storage {
         self.clear_pending_table_statistics(table_slot);
     }
 
+    /// Retained row bytes belong to the fixed statement arena; heap owners end
+    /// before callers retain the image or invoke mutable callbacks.
     pub fn row_bytes<'a>(
-        &'a self,
+        &self,
         table_slot: usize,
         rowid: u64,
         home: RowHome,
         arena: &'a crate::mem::arena::Arena,
     ) -> Result<&'a [u8], SqlError> {
         match home {
-            RowHome::Heap(loc) => Ok(self.heap.get(loc)),
+            RowHome::Heap(loc) => {
+                let row = self.heap.get(loc)?;
+                arena
+                    .alloc_slice_copy(&row)
+                    .map(|bytes| &*bytes)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "heap row images exceed the statement arena; raise work_arena_bytes"
+                        )
+                    })
+            }
             RowHome::Spilled {
                 len,
                 sst,
@@ -30230,7 +30198,7 @@ impl Storage {
         f: impl FnOnce(&[u8]) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         match home {
-            RowHome::Heap(loc) => f(self.heap.get(loc)),
+            RowHome::Heap(loc) => f(&self.heap.get(loc)?),
             RowHome::Spilled {
                 len,
                 sst,
@@ -30984,7 +30952,9 @@ impl Storage {
         // at or below its source — copy_within stays safe.
         scratch
             .as_mut_slice()
-            .sort_unstable_by_key(|(_, _, _, loc)| loc.offset);
+            .sort_unstable_by_key(|(_, _, _, loc)| (loc.offset, loc.len));
+        let heap = self.heap.exclusive();
+        heap.validate_relocation(scratch.iter().map(|(_, _, _, location)| *location))?;
         let mut write_at = 0usize;
         let mut prior_alias: Option<(RowLoc, RowLoc)> = None;
         for i in 0..scratch.len() {
@@ -30997,9 +30967,7 @@ impl Storage {
                 relocated
             } else {
                 debug_assert!(write_at <= src, "targets never overtake sources");
-                if src != write_at {
-                    self.heap.buffer.copy_within(src..src + len, write_at);
-                }
+                heap.relocate(loc, write_at);
                 let relocated = RowLoc {
                     offset: write_at as u32,
                     len: loc.len,
@@ -31025,7 +30993,7 @@ impl Storage {
                 }
             }
         }
-        self.heap.used = write_at;
+        heap.finish_relocation(write_at);
         Ok(())
     }
 
@@ -31271,16 +31239,16 @@ impl Storage {
         };
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         self.tables[table_index].def.schema(&mut schema);
-        let pending_bytes = self.heap.get(pending);
+        let pending_bytes = self.heap.get(pending)?;
         let mut pending_payloads = [&[][..]; MAX_COLUMNS];
         let mut pending_nulls = [false; MAX_COLUMNS];
         rowenc::encoded_columns(
-            pending_bytes,
+            &pending_bytes,
             &schema[..columns],
             &mut pending_payloads,
             &mut pending_nulls,
         )?;
-        self.with_row_bytes(table_index, rowid, committed, |committed_bytes| {
+        let compare = |committed_bytes: &[u8]| {
             let mut committed_payloads = [&[][..]; MAX_COLUMNS];
             let mut committed_nulls = [false; MAX_COLUMNS];
             rowenc::encoded_columns(
@@ -31298,7 +31266,11 @@ impl Storage {
                 }
             }
             Ok((changed, false))
-        })
+        };
+        match committed {
+            RowHome::Heap(location) => compare(pending_bytes.other(location)?),
+            RowHome::Spilled { .. } => self.with_row_bytes(table_index, rowid, committed, compare),
+        }
     }
 
     /// Drops map entries the spill lists reproduce exactly — committed,
@@ -58832,6 +58804,133 @@ mod tests {
     }
 
     #[test]
+    fn row_heap_ownership_retained_images_survive_compaction_and_arena_exhaustion() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let _ = storage.heap.append(4).unwrap();
+        let (location, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"keep");
+        storage.tables[0].live = true;
+        storage.tables[0]
+            .rows
+            .insert(1, RowState::committed_only_at(location, 7))
+            .unwrap();
+        let arena = Arena::new(&mut budget, "retained heap rows", 4).unwrap();
+        let mut scratch = FixedVec::new(&mut budget, "heap relocation", 2).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .with_row_bytes(0, 1, RowHome::Heap(location), |bytes| {
+                    assert!(storage.heap.test_write().is_err());
+                    assert_eq!(bytes, b"keep");
+                    Ok(())
+                })
+                .unwrap();
+            assert!(storage.heap.test_write().is_ok());
+            let retained = storage
+                .row_bytes(0, 1, RowHome::Heap(location), &arena)
+                .unwrap();
+            assert!(storage.heap.test_write().is_ok());
+            let error = storage
+                .row_bytes(0, 1, RowHome::Heap(location), &arena)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                error.message.as_str(),
+                "heap row images exceed the statement arena; raise work_arena_bytes"
+            );
+            assert!(storage.heap.test_write().is_ok());
+            storage.compact_heap(&mut scratch).unwrap();
+            assert_eq!(
+                storage.tables[0]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .committed
+                    .and_then(RowHome::heap_loc)
+                    .unwrap()
+                    .offset,
+                0
+            );
+            assert_eq!(retained, b"keep");
+            let (_, bytes) = storage.heap.append(4).unwrap();
+            bytes.copy_from_slice(b"next");
+            assert_eq!(retained, b"keep");
+        });
+    }
+
+    #[test]
+    fn row_heap_ownership_compaction_groups_aliases_with_empty_locations() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let _ = storage.heap.append(4).unwrap();
+        let (empty, _) = storage.heap.append(0).unwrap();
+        let (location, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"same");
+        storage.tables[0].live = true;
+        for rowid in 1..=4 {
+            storage.tables[0]
+                .rows
+                .insert(
+                    rowid,
+                    RowState::committed_only_at(if rowid == 2 { empty } else { location }, 7),
+                )
+                .unwrap();
+        }
+        let mut scratch = FixedVec::new(&mut budget, "heap aliases", 4).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.compact_heap(&mut scratch).unwrap();
+            assert_eq!(storage.heap.used(), 4);
+            for rowid in 1..=4 {
+                let location = storage.tables[0]
+                    .rows
+                    .get(&rowid)
+                    .unwrap()
+                    .committed
+                    .and_then(RowHome::heap_loc)
+                    .unwrap();
+                assert_eq!(location.offset, 0);
+                if rowid == 2 {
+                    assert!(storage.heap.get(location).unwrap().is_empty());
+                } else {
+                    assert_eq!(&*storage.heap.get(location).unwrap(), b"same");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn row_heap_ownership_compaction_preflight_preserves_bytes_and_handles() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let (_, bytes) = storage.heap.append(8).unwrap();
+        bytes.copy_from_slice(b"original");
+        storage.tables[0].live = true;
+        let prior = RowState::committed_only_at(RowLoc { offset: 4, len: 4 }, 7);
+        storage.tables[0].rows.insert(1, prior).unwrap();
+        storage.tables[0]
+            .rows
+            .insert(
+                2,
+                RowState::committed_only_at(RowLoc { offset: 7, len: 2 }, 8),
+            )
+            .unwrap();
+        let mut scratch = FixedVec::new(&mut budget, "heap preflight", 2).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let error = storage.compact_heap(&mut scratch).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
+            assert_eq!(storage.tables[0].rows.get(&1), Some(prior));
+            assert_eq!(storage.heap.used(), 8);
+            assert_eq!(
+                &*storage.heap.get(RowLoc { offset: 0, len: 8 }).unwrap(),
+                b"original"
+            );
+        });
+    }
+
+    #[test]
     fn heap_append_and_full() {
         let mut config = test_config();
         config.memtable_bytes = 64;
@@ -58839,7 +58938,7 @@ mod tests {
         let mut s = Storage::new(&config, &mut budget).unwrap();
         let (loc, slice) = s.heap.append(10).unwrap();
         slice.copy_from_slice(b"0123456789");
-        assert_eq!(s.heap.get(loc), b"0123456789");
+        assert_eq!(&*s.heap.get(loc).unwrap(), b"0123456789");
         let err = s.heap.append(60).unwrap_err();
         assert_eq!(err.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
     }
@@ -58889,10 +58988,10 @@ mod tests {
             .loc
             .unwrap();
         assert_eq!(compacted.offset, 0);
-        assert_eq!(storage.heap.get(compacted), b"pending");
+        assert_eq!(&*storage.heap.get(compacted).unwrap(), b"pending");
         let (_, replacement) = storage.heap.append(7).unwrap();
         replacement.copy_from_slice(b"replace");
-        assert_eq!(storage.heap.get(compacted), b"pending");
+        assert_eq!(&*storage.heap.get(compacted).unwrap(), b"pending");
     }
 
     #[test]

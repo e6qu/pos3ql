@@ -13240,12 +13240,12 @@ impl Engine {
             };
             let table_definition = self.storage.table_def(table as usize, txn.txid);
             let pending_row = pending.loc.map(|location| self.storage.heap.get(location)).transpose()?;
-            let operation = match pending.loc {
-                Some(location) => WalOp::Upsert {
+            let operation = match pending_row.as_deref() {
+                Some(row) => WalOp::Upsert {
                     schema: table_definition.schema.as_str(),
                     table: table_definition.name.as_str(),
                     rowid,
-                    row: pending_row.as_deref().expect("pending location has a retained heap image"),
+                    row,
                     is_update: false,
                     old_row: None,
                     command_id: pending.cid,

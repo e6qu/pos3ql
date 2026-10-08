@@ -13436,7 +13436,7 @@ impl Iterator for MatviewIter<'_> {
 }
 
 pub struct Storage {
-    pub heap: RowHeap,
+    pub(crate) heap: RowHeap,
     tables: FixedVec<Table>,
     table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
@@ -30949,7 +30949,7 @@ impl Storage {
         // at or below its source — copy_within stays safe.
         scratch
             .as_mut_slice()
-            .sort_unstable_by_key(|(_, _, _, loc)| loc.offset);
+            .sort_unstable_by_key(|(_, _, _, loc)| (loc.offset, loc.len));
         let heap = self.heap.exclusive();
         heap.validate_relocation(scratch.iter().map(|(_, _, _, location)| *location))?;
         let mut write_at = 0usize;
@@ -58831,6 +58831,35 @@ mod tests {
             let (_, bytes) = storage.heap.append(4).unwrap();
             bytes.copy_from_slice(b"next");
             assert_eq!(retained, b"keep");
+        });
+    }
+
+    #[test]
+    fn row_heap_ownership_compaction_groups_aliases_with_empty_locations() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let _ = storage.heap.append(4).unwrap();
+        let (empty, _) = storage.heap.append(0).unwrap();
+        let (location, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"same");
+        storage.tables[0].live = true;
+        for rowid in 1..=4 {
+            storage.tables[0].rows.insert(rowid, RowState::committed_only_at(if rowid == 2 { empty } else { location }, 7)).unwrap();
+        }
+        let mut scratch = FixedVec::new(&mut budget, "heap aliases", 4).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.compact_heap(&mut scratch).unwrap();
+            assert_eq!(storage.heap.used(), 4);
+            for rowid in 1..=4 {
+                let location = storage.tables[0].rows.get(&rowid).unwrap().committed.and_then(RowHome::heap_loc).unwrap();
+                assert_eq!(location.offset, 0);
+                if rowid == 2 {
+                    assert!(storage.heap.get(location).unwrap().is_empty());
+                } else {
+                    assert_eq!(&*storage.heap.get(location).unwrap(), b"same");
+                }
+            }
         });
     }
 

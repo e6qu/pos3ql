@@ -4657,12 +4657,6 @@ where
             .visible_row_home(table_index, rowid, state, txn.txid)?
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
         let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
-        let bytes = arena.alloc_slice_copy(bytes).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "conflict row exceeds the statement arena"
-            )
-        })?;
         rowenc::decode(bytes, schema, &mut existing)?;
         if let Some(plan) = row_security_using {
             let policy_row = RowCtx {
@@ -46068,13 +46062,7 @@ fn rewrite_enum_values(
         def.schema(&mut schema);
         for entry in rows[..n].iter().copied().flatten() {
             let (rowid, home) = entry;
-            let source = storage.row_bytes(table_index, rowid, home, arena)?;
-            let bytes = arena.alloc_slice_copy(source).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "enum alteration exceeds the statement arena"
-                )
-            })?;
+            let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
             let mut changed = false;
@@ -52470,12 +52458,6 @@ pub fn apply_replication_delete(
             )
         })?;
     let bytes = storage.row_bytes(row_table, row.rowid(), home, arena)?;
-    let bytes = arena.alloc_slice_copy(bytes).map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "subscription delete row exceeds the apply arena"
-        )
-    })?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
     let mut old_values = [Datum::Null; MAX_COLUMNS];
@@ -52613,12 +52595,6 @@ pub(crate) fn apply_replication_update(
             )
         })?;
     let bytes = storage.row_bytes(row_table, row.rowid(), home, arena)?;
-    let bytes = arena.alloc_slice_copy(bytes).map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "subscription update row exceeds the apply arena"
-        )
-    })?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
     let mut old_values = [Datum::Null; MAX_COLUMNS];
@@ -55969,12 +55945,7 @@ pub fn merge<'a>(
                 Ok(b) => b,
                 Err(e) => return sql_fail(e),
             };
-            // Copy into the arena so the decoded datums do not borrow storage
-            // (the write path below borrows it mutably).
-            let bytes = match arena.alloc_slice_copy(fetched) {
-                Ok(b) => &*b,
-                Err(_) => return sql_fail(super::query::arena_full_pub()),
-            };
+            let bytes = fetched;
             let row_definition = match definitions.definition(storage, row_table, txn.txid) {
                 Ok(definition) => definition,
                 Err(error) => return sql_fail(error),
@@ -59820,23 +59791,9 @@ pub(crate) fn update<'a>(
                 tuple_id,
             } => (table_index, 0, None, Some(tuple_id)),
         };
-        // Build the new row image in the statement arena so the heap
-        // borrow ends before the heap is appended to.
-        // An arena-owned copy of the old row bytes: the referential-action
-        // pass below needs the old values after storage mutates.
+        // Referential actions retain the arena-owned old values across mutation.
         let row_bytes = match (|| match (home, remote_tuple) {
-            (Some(home), None) => {
-                let fetched = storage.row_bytes(row_table, rowid, home, arena)?;
-                arena
-                    .alloc_slice_copy(fetched)
-                    .map(|bytes| &*bytes)
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "updated rows exceed the statement arena"
-                        )
-                    })
-            }
+            (Some(home), None) => storage.row_bytes(row_table, rowid, home, arena),
             (None, Some(tuple_id)) => {
                 crate::sql::foreign::fetch_row(storage, row_table, txn.txid, tuple_id, arena)?
                     .ok_or_else(|| {
@@ -60884,15 +60841,7 @@ pub(crate) fn delete<'a>(
                 Ok(b) => b,
                 Err(e) => return sql_fail(e),
             };
-            let old_copy = match arena.alloc_slice_copy(fetched) {
-                Ok(c) => c,
-                Err(_) => {
-                    return sql_fail(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "deleted rows exceed the statement arena"
-                    ));
-                }
-            };
+            let old_copy = fetched;
             let mut old_values = [Datum::Null; MAX_COLUMNS];
             if let Err(e) = rowenc::decode(old_copy, schema, &mut old_values) {
                 return sql_fail(e);
@@ -60971,15 +60920,6 @@ pub(crate) fn delete<'a>(
                 let old_bytes = match storage.row_bytes(row_table, rowid, old_home, arena) {
                     Ok(bytes) => bytes,
                     Err(error) => return sql_fail(error),
-                };
-                let old_bytes = match arena.alloc_slice_copy(old_bytes) {
-                    Ok(bytes) => &*bytes,
-                    Err(_) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "deleted row exceeds the statement arena"
-                        ));
-                    }
                 };
                 if let Err(error) = rowenc::decode(old_bytes, schema, &mut old_transition) {
                     return sql_fail(error);
@@ -66144,9 +66084,9 @@ fn alter_table_relation(
                 let (_, _, RowHome::Heap(lb)) = scratch[b].local_parts() else {
                     unreachable!()
                 };
-                let bbytes = match storage.heap.get(lb) { Ok(row) => row, Err(error) => return sql_fail(error) };
+                let bbytes = match abytes.other(lb) { Ok(row) => row, Err(error) => return sql_fail(error) };
                 let mut bvals = [Datum::Null; MAX_COLUMNS];
-                if let Err(e) = rowenc::decode(&bbytes, new_schema, &mut bvals) {
+                if let Err(e) = rowenc::decode(bbytes, new_schema, &mut bvals) {
                     return sql_fail(e);
                 }
                 if let Some(name) = rewritten_dup_name(

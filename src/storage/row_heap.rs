@@ -33,7 +33,7 @@ impl Deref for HeapRowRead<'_> {
 }
 
 impl HeapRowRead<'_> {
-    pub(super) fn other(&self, location: RowLoc) -> Result<&[u8], SqlError> {
+    pub(crate) fn other(&self, location: RowLoc) -> Result<&[u8], SqlError> {
         self.state.validate(location)?;
         let start = location.offset as usize;
         Ok(&self.state.buffer[start..start + location.len as usize])

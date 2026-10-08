@@ -288,7 +288,7 @@ fn scope_record_witness<'a>(
     };
     if let Some(table_name) = table_name {
         let table = scope.table_index(table_name)?;
-        let definition = scope.defs[table].expect("whole-row table has a definition");
+        let definition = scope.defs.get(table).expect("whole-row table has a definition");
         let mut fields = [RecordField {
             name: "",
             type_oid: 0,
@@ -2279,7 +2279,7 @@ impl crate::sql::exec::ColTypeResolver for ScopeAndOuterCols<'_, '_, '_, '_> {
 
     fn table_columns(&self, name: &str) -> Option<&[crate::storage::ColumnMeta]> {
         let table = self.scope.table_index(name).ok()?;
-        Some(self.scope.defs[table]?.columns())
+        Some(self.scope.defs.get(table)?.columns())
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -2289,7 +2289,7 @@ impl crate::sql::exec::ColTypeResolver for ScopeAndOuterCols<'_, '_, '_, '_> {
         }
         match entry {
             crate::sql::query::scope::ResolvedColumn::Table(table, column) => {
-                Some(self.scope.defs[table]?.columns[column].type_mod)
+                Some(self.scope.defs.get(table)?.columns[column].type_mod)
             }
             crate::sql::query::scope::ResolvedColumn::Merged(_) => None,
         }

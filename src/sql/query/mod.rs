@@ -4545,7 +4545,7 @@ fn resolve_position_target<'a>(
                     return match scope.star_entry(remaining) {
                         ResolvedColumn::Table(t, c) => column_ref(
                             Some(scope.names[t]),
-                            scope.defs[t].expect("resolved").columns[c].name.as_str(),
+                            scope.defs.column_name(t, c),
                         ),
                         // Unqualified: resolves back to the merged column.
                         ResolvedColumn::Merged(m) => column_ref(None, scope.merged[m].name),
@@ -7749,7 +7749,7 @@ pub fn describe_scope_items<'q>(
                     out[n] = ColDesc::of_type(scope.output_name(entry), scope.output_type(entry))
                         .with_type_mod(match entry {
                             ResolvedColumn::Table(table, column) => {
-                                scope.defs[table].expect("resolved").columns[column].type_mod
+                                scope.defs.get(table).expect("resolved").columns[column].type_mod
                             }
                             ResolvedColumn::Merged(_) => -1,
                         });
@@ -7769,7 +7769,7 @@ pub fn describe_scope_items<'q>(
                     out[n] = ColDesc::of_type(scope.output_name(entry), scope.output_type(entry))
                         .with_type_mod(match entry {
                             ResolvedColumn::Table(t, c) => {
-                                scope.defs[t].expect("resolved").columns[c].type_mod
+                                scope.defs.get(t).expect("resolved").columns[c].type_mod
                             }
                             ResolvedColumn::Merged(_) => -1,
                         });
@@ -7962,7 +7962,7 @@ pub fn describe_select_items<'q>(
                 if let Some(scope) = scope
                     && let Ok(table) = scope.table_index(table)
                 {
-                    column += scope.defs[table].expect("resolved").n_columns;
+                    column += scope.defs.get(table).expect("resolved").n_columns;
                 }
             }
             SelectItem::RecordStar(base) => {
@@ -8003,7 +8003,7 @@ fn patch_array_subquery_field_types<'q>(
                 if let Some(scope) = outer_scope
                     && let Ok(table) = scope.table_index(table)
                 {
-                    column += scope.defs[table].expect("resolved").n_columns;
+                    column += scope.defs.get(table).expect("resolved").n_columns;
                 }
             }
             SelectItem::RecordStar(base) => {
@@ -8637,11 +8637,9 @@ fn describe_scope_record_star<'q>(
             name: table,
         } if scope.table_index(table).is_ok() => {
             let t = scope.table_index(table)?;
-            for c in &scope.defs[t].expect("resolved").columns()
-                [..scope.defs[t].expect("resolved").n_columns]
-            {
+            for (column, c) in scope.defs.get(t).expect("resolved").columns().iter().enumerate() {
                 push(
-                    ColDesc::of_type(c.name.as_str(), c.ctype)
+                    ColDesc::of_type(scope.defs.column_name(t, column), c.ctype)
                         .with_type_mod(c.type_mod)
                         .with_collation(c.collation),
                     &mut n,
@@ -8810,7 +8808,7 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         let ctype = self.0.output_type(entry);
         let type_mod = match entry {
             scope::ResolvedColumn::Table(table, column) => {
-                self.0.defs[table]?.columns.get(column)?.type_mod
+                self.0.defs.get(table)?.columns.get(column)?.type_mod
             }
             scope::ResolvedColumn::Merged(_) => -1,
         };
@@ -8832,7 +8830,7 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
         let t = self.0.table_index(name).ok()?;
-        let def = self.0.defs[t]?;
+        let def = self.0.defs.get(t)?;
         Some(&def.columns()[..def.n_columns])
     }
 
@@ -8855,7 +8853,7 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
             return None;
         }
         match entry {
-            scope::ResolvedColumn::Table(t, c) => Some(self.0.defs[t]?.columns[c].type_mod),
+            scope::ResolvedColumn::Table(t, c) => Some(self.0.defs.get(t)?.columns[c].type_mod),
             _ => None,
         }
     }
@@ -8901,7 +8899,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         let ctype = scope.output_type(entry);
         let (type_oid, type_mod) = match entry {
             scope::ResolvedColumn::Table(table, column) => {
-                let column = scope.defs[table]?.columns.get(column)?;
+                let column = scope.defs.get(table)?.columns.get(column)?;
                 (
                     self.storage
                         .routine_type_oid(column.ctype, column.user_type, self.txid)?,
@@ -9172,11 +9170,11 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
         if let Ok(table) = self.scope.table_index(name) {
-            return Some(self.scope.defs[table]?.columns());
+            return Some(self.scope.defs.get(table)?.columns());
         }
         let scope = self.outer_scope?;
         let table = scope.table_index(name).ok()?;
-        Some(scope.defs[table]?.columns())
+        Some(scope.defs.get(table)?.columns())
     }
 
     fn whole_row_field(
@@ -9196,7 +9194,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         let ctype = scope.output_type(entry);
         let (type_oid, type_mod) = match entry {
             scope::ResolvedColumn::Table(table, column) => {
-                let column = scope.defs[table]?.columns.get(column)?;
+                let column = scope.defs.get(table)?.columns.get(column)?;
                 (
                     self.storage
                         .routine_type_oid(column.ctype, column.user_type, self.txid)?,
@@ -9235,7 +9233,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         }
         match entry {
             scope::ResolvedColumn::Table(table, column) => {
-                Some(scope.defs[table]?.columns[column].type_mod)
+                Some(scope.defs.get(table)?.columns[column].type_mod)
             }
             _ => None,
         }
@@ -9267,7 +9265,7 @@ fn scope_column_type_mod<'a>(
     };
     match found {
         Some((scope, ResolvedColumn::Table(table, column))) => {
-            scope.defs[table].expect("resolved").columns[column].type_mod
+            scope.defs.get(table).expect("resolved").columns[column].type_mod
         }
         _ => -1,
     }

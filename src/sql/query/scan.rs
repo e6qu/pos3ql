@@ -760,7 +760,7 @@ pub(super) fn pax_column_demand(
 ) -> PaxReadDemand {
     if scope.n == 0
         || scope.n > MAX_OPTIMIZED_JOIN_TABLES
-        || scope.defs[..scope.n].iter().any(Option::is_none)
+        || (0..scope.n).any(|table| scope.defs.get(table).is_none())
     {
         return PaxReadDemand::full_row(PaxFullRowReason::IncompleteScope);
     }
@@ -2225,7 +2225,7 @@ pub(crate) fn index_access_plan<'a>(
         scope.slots[0],
         txid,
         &[Some(predicate)],
-        scope.defs[0].expect("physical table has definition"),
+        scope.defs.get(0).expect("physical table has definition"),
         &mut resolve_column,
         &operand_is_invariant,
         false,
@@ -2346,7 +2346,7 @@ pub(crate) fn parameterized_index_access_plan<'a>(
         scope.slots[table],
         txid,
         &[where_clause, on],
-        scope.defs[table].expect("resolved"),
+        scope.defs.get(table).expect("resolved"),
         &mut resolve_column,
         &operand_is_bound,
         false,
@@ -2409,7 +2409,7 @@ pub(crate) fn parameterized_index_access_plan<'a>(
         }
     }
     let slot = scope.slots[table];
-    let definition = scope.defs[table].expect("resolved");
+    let definition = scope.defs.get(table).expect("resolved");
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
     let resident_exact = !matches!(
         plan.method,
@@ -2559,7 +2559,7 @@ pub(crate) fn ordered_index_access_plan<'a>(
             selected = Some((score, plan));
         }
     }
-    let definition = scope.defs[0].expect("physical table has definition");
+    let definition = scope.defs.get(0).expect("physical table has definition");
     if let Some(access) = special_index_access_plan(
         storage,
         slot,
@@ -2771,7 +2771,7 @@ fn indexed_candidates<'a>(
         return Ok(None);
     };
     let slot = scope.slots[0];
-    let definition = scope.defs[0].expect("physical table has definition");
+    let definition = scope.defs.get(0).expect("physical table has definition");
     indexed_candidates_for_plan(
         storage, 0, slot, definition, txid, plan, None, None, arena, params, &NoColumns, hooks,
     )
@@ -2789,7 +2789,7 @@ pub(super) fn ordered_indexed_candidates<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
     let slot = scope.slots[0];
-    let definition = scope.defs[0].expect("physical table has definition");
+    let definition = scope.defs.get(0).expect("physical table has definition");
     let rank_window = rank_window.filter(|_| {
         storage.current_role_slot(txid).is_some_and(|current_role| {
             let role = scope.authorization_roles[0].map_or(current_role, usize::from);
@@ -3901,7 +3901,7 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
                         let width = if self.scope.derived[table].is_some() {
                             crate::sql::exec::projected_row_width(bytes)
                         } else {
-                            self.scope.defs[table].expect("resolved").n_columns
+                            self.scope.defs.get(table).expect("resolved").n_columns
                         };
                         Some(&buffers[position][..width])
                     }
@@ -3911,7 +3911,7 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
             }
             JoinRowValues::Flat { values, offsets } => {
                 let start = *offsets.get(table)?;
-                let width = self.scope.defs[table].expect("resolved").n_columns;
+                let width = self.scope.defs.get(table).expect("resolved").n_columns;
                 Some(&values[start..start + width])
             }
         }
@@ -3948,7 +3948,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
 
     fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'v>, SqlError> {
         let table = self.scope.table_index(qualifier)?;
-        let visible = self.scope.defs[table].expect("resolved").n_columns;
+        let visible = self.scope.defs.get(table).expect("resolved").n_columns;
         self.table_values(table)
             .and_then(|values| values.get(visible + index))
             .copied()
@@ -3968,14 +3968,14 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         match self.scope.find_column(qualifier, name).ok() {
-            Some(ResolvedColumn::Table(table, column)) => self.scope.defs[table]
+            Some(ResolvedColumn::Table(table, column)) => self.scope.defs.get(table)
                 .and_then(|definition| definition.columns.get(column))
                 .map(|column| column.collation)
                 .unwrap_or(crate::sql::ast::Collation::None),
             Some(ResolvedColumn::Merged(merged)) => self.scope.merged[merged]
                 .parts
                 .first()
-                .and_then(|&(table, column)| self.scope.defs[table]?.columns.get(column))
+                .and_then(|&(table, column)| self.scope.defs.get(table)?.columns.get(column))
                 .map(|column| column.collation)
                 .unwrap_or(crate::sql::ast::Collation::None),
             None => crate::sql::ast::Collation::None,
@@ -3994,7 +3994,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     ) -> Option<crate::storage::UserTypeName> {
         match self.scope.find_column(qualifier, name).ok()? {
             ResolvedColumn::Table(t, c) => {
-                self.scope.defs[t].and_then(|def| def.columns.get(c).and_then(|col| col.user_type))
+                self.scope.defs.get(t).and_then(|def| def.columns.get(c).and_then(|col| col.user_type))
             }
             // A USING/NATURAL-merged column carries no single domain identity.
             ResolvedColumn::Merged(_) => None,
@@ -4045,7 +4045,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 .map_err(|_| arena_full());
         }
         let t = self.scope.table_index(table)?;
-        let def = self.scope.defs[t].expect("resolved");
+        let def = self.scope.defs.get(t).expect("resolved");
         let vals = match self.table_values(t) {
             Some([]) => return Ok(None), // outer-join null row
             Some(vals) => vals,
@@ -4088,7 +4088,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             return Ok(fields);
         }
         let table = self.scope.table_index(table)?;
-        let definition = self.scope.defs[table].expect("resolved");
+        let definition = self.scope.defs.get(table).expect("resolved");
         let columns = definition.columns();
         let fields = arena
             .alloc_slice_with(definition.n_columns, |index| {
@@ -4860,10 +4860,10 @@ fn hash_join_keys<'a>(
         } else {
             continue;
         };
-        let pt = scope.defs[probe_t].expect("resolved").columns[probe_col].ctype;
-        let bt = scope.defs[build_t].expect("resolved").columns[build_col].ctype;
-        let probe_collation = scope.defs[probe_t].expect("resolved").columns[probe_col].collation;
-        let build_collation = scope.defs[build_t].expect("resolved").columns[build_col].collation;
+        let pt = scope.defs.get(probe_t).expect("resolved").columns[probe_col].ctype;
+        let bt = scope.defs.get(build_t).expect("resolved").columns[build_col].ctype;
+        let probe_collation = scope.defs.get(probe_t).expect("resolved").columns[probe_col].collation;
+        let build_collation = scope.defs.get(build_t).expect("resolved").columns[build_col].collation;
         if probe_collation != build_collation {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::COLLATION_MISMATCH,
@@ -4990,7 +4990,7 @@ pub(crate) fn select_hash_join_plan<'a>(
     let mut key_collations = [Collation::None; 8];
     for (index, &(probe_column, _)) in keys.iter().take(key_count).enumerate() {
         key_collations[index] =
-            scope.defs[probe_table].expect("resolved").columns[probe_column].collation;
+            scope.defs.get(probe_table).expect("resolved").columns[probe_column].collation;
     }
     Ok(Some(HashJoinPlan {
         probe_table,
@@ -5040,7 +5040,7 @@ fn scan_source_mode<'a>(
                 crate::storage::PrivilegeSet::SELECT,
                 txid,
             ) {
-                let definition = scope.defs[table].ok_or_else(|| {
+                let definition = scope.defs.get(table).ok_or_else(|| {
                     sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "expanded view source has no output definition"
@@ -5411,7 +5411,7 @@ fn scan_source_mode<'a>(
         for &t in order.iter().take(count) {
             let (buffer, tail) = rest.split_first_mut().expect("enough buffers");
             rest = tail;
-            let def = scope.defs[t].expect("resolved");
+            let def = scope.defs.get(t).expect("resolved");
             match bound[t] {
                 Some(BoundRow::Encoded(bytes)) => {
                     if scope.derived[t].is_some() {
@@ -5502,7 +5502,7 @@ fn scan_source_mode<'a>(
         let key_collations = plan.key_collations;
         let on = plan.on;
         let build_slot = scope.slots[build_t];
-        let build_def = scope.defs[build_t].expect("resolved");
+        let build_def = scope.defs.get(build_t).expect("resolved");
         let build_derived_rows = scope.derived[build_t];
         let build_external_run = scope.external_runs[build_t];
         let build_count = plan.build_capacity;
@@ -5665,7 +5665,7 @@ fn scan_source_mode<'a>(
             // output matches byte-for-byte. Per-row decode and leaf-eval scratch
             // recycle; the build table (allocated above the mark) survives.
             let probe_slot = scope.slots[probe_t];
-            let probe_def = scope.defs[probe_t].expect("resolved");
+            let probe_def = scope.defs.get(probe_t).expect("resolved");
             let mut probe_schema = [ColType::Bool; MAX_COLUMNS];
             for (ctype, column) in probe_schema
                 .iter_mut()
@@ -6135,7 +6135,7 @@ fn scan_source_mode<'a>(
                 arena,
             )?;
             let context = crate::sql::exec::RowCtx {
-                def: scope.defs[source].expect("row-security source is resolved"),
+                def: scope.defs.get(source).expect("row-security source is resolved"),
                 values: assembled
                     .table_values(source)
                     .expect("row-security row is bound"),
@@ -6396,7 +6396,7 @@ fn scan_source_mode<'a>(
                 storage,
                 txid,
                 tref,
-                scope.defs[t].expect("resolved").n_columns,
+                scope.defs.get(t).expect("resolved").n_columns,
                 arena,
                 params,
                 &chained,
@@ -6487,7 +6487,7 @@ fn scan_source_mode<'a>(
                     storage,
                     order[depth],
                     slot,
-                    scope.defs[order[depth]].expect("resolved"),
+                    scope.defs.get(order[depth]).expect("resolved"),
                     txid,
                     plan,
                     None,
@@ -6589,7 +6589,7 @@ fn scan_source_mode<'a>(
                                 physical.schema(&mut schema);
                                 rowenc::decode(bytes, &schema[..physical.n_columns], values)?;
                                 refresh_catalog_object_names(storage, txid, values, arena)?;
-                                let logical_width = scope.defs[order[depth]]
+                                let logical_width = scope.defs.get(order[depth])
                                     .expect("resolved logical relation")
                                     .n_columns;
                                 visit_candidate!(
@@ -6636,7 +6636,7 @@ fn scan_source_mode<'a>(
                         .selected_mask(order[depth])
                         .is_some_and(|demanded| access.covers(demanded))
             }) {
-                let definition = scope.defs[order[depth]].expect("resolved");
+                let definition = scope.defs.get(order[depth]).expect("resolved");
                 let keys = access.keys.expect("covering access retains keys");
                 debug_assert_eq!(keys.len(), access.rowids.len());
                 let key_types = access.key_types;
@@ -7117,7 +7117,7 @@ fn scan_source_mode<'a>(
                         arena,
                     )?;
                     let context = crate::sql::exec::RowCtx {
-                        def: scope.defs[d].expect("row-security source is resolved"),
+                        def: scope.defs.get(d).expect("row-security source is resolved"),
                         values: row.table_values(d).expect("row-security row is bound"),
                         alias: None,
                     };

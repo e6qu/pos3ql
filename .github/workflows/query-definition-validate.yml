@@ -1,0 +1,41 @@
+name: Query definition validation
+on:
+  push:
+    branches: [codex/query-definition-ownership]
+  workflow_dispatch:
+concurrency:
+  group: query-definition-validation
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Format on runner
+        run: |
+          cargo fmt --all
+          git diff > query-definition-format.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: query-definition-format
+          path: query-definition-format.patch
+      - run: cargo check --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Definition ownership and query scratch
+        run: |
+          cargo test --lib --locked query_definition_ownership -- --nocapture
+          cargo test --lib --locked table_definition_images -- --nocapture
+          cargo test --lib --locked parameterized_join_recycles_candidate_scratch -- --nocapture
+          cargo test --lib --locked ordered_catalog_query_recycles_correlated_subquery_scratch -- --nocapture
+          cargo test --lib --locked postgresql_relation_and_record_definition_capacity_executes_without_allocation -- --nocapture
+          cargo test --lib --locked prepared_transactions_survive_checkpoint_and_object_cold_recovery -- --nocapture

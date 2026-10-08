@@ -1450,7 +1450,7 @@ pub(crate) fn project_window_rows<'a>(
     let mut total = 0usize;
     for t in 0..scope.n {
         offs[t] = total;
-        total += scope.defs[t].expect("resolved").n_columns;
+        total += scope.defs.get(t).expect("resolved").n_columns;
     }
 
     // Pass 1: count source rows.
@@ -1521,7 +1521,7 @@ pub(crate) fn project_window_rows<'a>(
                 .alloc_slice_with(total.max(1), |_| Datum::Null)
                 .map_err(|_| arena_full())?;
             for (t, offset) in offs.iter().enumerate().take(scope.n) {
-                let def = scope.defs[t].expect("resolved");
+                let def = scope.defs.get(t).expect("resolved");
                 let vals = row.table_values(t).expect("bound");
                 for c in 0..def.n_columns {
                     flat[offset + c] = if vals.is_empty() {
@@ -1761,7 +1761,7 @@ pub(crate) fn external_window_into<'a>(
     let mut total = 0usize;
     for (t, offset) in offs.iter_mut().enumerate().take(scope.n) {
         *offset = total;
-        total += scope.defs[t].expect("resolved").n_columns;
+        total += scope.defs.get(t).expect("resolved").n_columns;
     }
     // Resolve ORDER BY (ordinals → select items).
     let n_order = statement.order_by.len();
@@ -1892,7 +1892,7 @@ pub(crate) fn external_window_into<'a>(
                                 } else if index < n_keys + total {
                                     let flat = index - n_keys;
                                     for (t, offset) in offs.iter().enumerate().take(scope.n) {
-                                        let nc = scope.defs[t].expect("resolved").n_columns;
+                                        let nc = scope.defs.get(t).expect("resolved").n_columns;
                                         if flat < offset + nc {
                                             let vals = row.table_values(t).expect("bound");
                                             return if vals.is_empty() {

@@ -97,6 +97,19 @@ impl TableDefinitionImages {
         }
     }
 
+    pub(crate) fn retained_definition(&self, table: usize, transaction: u32) -> Option<&TableDef> {
+        let mut slot = self.head.get();
+        while let Some(index) = slot {
+            // SAFETY: this owner's immutable chain remains occupied until Drop.
+            let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
+            if image.table == table && image.transaction == transaction {
+                return Some(&image.definition);
+            }
+            slot = image.next;
+        }
+        None
+    }
+
     pub(crate) fn definition<'a>(
         &'a self,
         storage: &Storage,

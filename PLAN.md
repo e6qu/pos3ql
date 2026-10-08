@@ -42,8 +42,9 @@ and its linked documents; completed investigations belong in [history](docs/hist
 
 Complete shared ownership before enabling overlapping execution:
 
-- Give query scopes retained transaction-visible definition ownership beyond
-  lookup; live definition publication is currently exclusive.
+- Query scopes retain transaction-visible definitions in the startup image pool;
+  escaped column names use the statement arena. Live definition publication
+  remains exclusive and must move behind shared ownership.
 - Synchronize row publication, statistics, and physical maintenance through a
   coherent table lifecycle, including rollback, retirement, cloning, and recovery.
 - Pin heap locations across visibility lookup and concurrent relocation. Byte

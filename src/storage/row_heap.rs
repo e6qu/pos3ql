@@ -16,6 +16,7 @@ pub(crate) struct RowHeap {
 pub(super) struct RowHeapState {
     buffer: Box<[u8]>,
     used: usize,
+    generation: u64,
 }
 
 pub(crate) struct HeapRowRead<'a> {
@@ -60,6 +61,7 @@ impl RowHeap {
             state: RwLock::new(RowHeapState {
                 buffer: vec![0; bytes].into_boxed_slice(),
                 used: 0,
+                generation: 1,
             }),
         })
     }
@@ -110,6 +112,7 @@ impl RowHeapState {
         let location = RowLoc {
             offset: self.used as u32,
             len: len as u32,
+            generation: self.generation,
         };
         let slice = &mut self.buffer[self.used..self.used + len];
         self.used += len;
@@ -117,6 +120,12 @@ impl RowHeapState {
     }
 
     pub(super) fn validate(&self, location: RowLoc) -> Result<(), SqlError> {
+        if location.generation != self.generation {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "row heap location was invalidated by relocation"
+            ));
+        }
         let end = (location.offset as usize).checked_add(location.len as usize);
         if end.is_none_or(|end| end > self.used) {
             return Err(sql_err!(
@@ -163,9 +172,20 @@ impl RowHeapState {
         }
     }
 
-    pub(super) fn finish_relocation(&mut self, used: usize) {
+    pub(super) fn next_relocation_generation(&self) -> Result<u64, SqlError> {
+        self.generation.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "row heap relocation generation is exhausted"
+            )
+        })
+    }
+
+    pub(super) fn finish_relocation(&mut self, used: usize, generation: u64) {
         debug_assert!(used <= self.used);
+        debug_assert_eq!(self.generation.checked_add(1), Some(generation));
         self.used = used;
+        self.generation = generation;
     }
 }
 
@@ -190,17 +210,11 @@ mod tests {
             assert!(heap.test_write().is_err());
             assert_eq!(&*read, b"abcd");
             assert_eq!(read.other(location).unwrap(), b"abcd");
-            assert!(read.other(RowLoc { offset: 3, len: 2 }).is_err());
+            assert!(read.other(RowLoc::test(3, 2)).is_err());
             drop(read);
             assert!(heap.test_write().is_ok());
-            assert!(
-                heap.get(RowLoc {
-                    offset: u32::MAX,
-                    len: u32::MAX
-                })
-                .is_err()
-            );
-            assert!(heap.get(RowLoc { offset: 4, len: 1 }).is_err());
+            assert!(heap.get(RowLoc::test(u32::MAX, u32::MAX)).is_err());
+            assert!(heap.get(RowLoc::test(4, 1)).is_err());
             assert!(heap.test_write().is_ok());
             assert_eq!(heap.used(), 4);
             assert_eq!(heap.capacity(), 8);
@@ -221,7 +235,7 @@ mod tests {
             }
             let (empty, bytes) = heap.append(0).unwrap();
             assert!(bytes.is_empty());
-            assert_eq!(empty, RowLoc { offset: 4, len: 0 });
+            assert_eq!(empty, RowLoc::test(4, 0));
             assert!(heap.get(empty).unwrap().is_empty());
         });
     }
@@ -233,7 +247,7 @@ mod tests {
         bytes.copy_from_slice(b"abcdefghijkl");
         crate::mem::guard::forbid_alloc(|| {
             let state = heap.exclusive();
-            let overlapping = [RowLoc { offset: 0, len: 5 }, RowLoc { offset: 4, len: 2 }];
+            let overlapping = [RowLoc::test(0, 5), RowLoc::test(4, 2)];
             assert_eq!(
                 state
                     .validate_relocation(overlapping.into_iter())
@@ -241,30 +255,143 @@ mod tests {
                     .sqlstate,
                 sqlstate::INTERNAL_ERROR
             );
-            let outside = [RowLoc { offset: 8, len: 5 }];
+            let outside = [RowLoc::test(8, 5)];
             assert!(state.validate_relocation(outside.into_iter()).is_err());
-            assert_eq!(
-                &*heap.get(RowLoc { offset: 0, len: 12 }).unwrap(),
-                b"abcdefghijkl"
-            );
+            assert_eq!(&*heap.get(RowLoc::test(0, 12)).unwrap(), b"abcdefghijkl");
             assert_eq!(heap.used(), 12);
             let state = heap.exclusive();
             let valid = [
-                RowLoc { offset: 4, len: 4 },
-                RowLoc { offset: 4, len: 4 },
-                RowLoc { offset: 4, len: 0 },
-                RowLoc { offset: 8, len: 4 },
+                RowLoc::test(4, 4),
+                RowLoc::test(4, 4),
+                RowLoc::test(4, 0),
+                RowLoc::test(8, 4),
             ];
             state.validate_relocation(valid.into_iter()).unwrap();
             state.relocate(valid[0], 0);
             state.relocate(valid[3], 4);
-            state.finish_relocation(8);
+            let generation = state.next_relocation_generation().unwrap();
+            state.finish_relocation(8, generation);
             assert_eq!(
-                &*heap.get(RowLoc { offset: 0, len: 8 }).unwrap(),
+                &*heap
+                    .get(RowLoc {
+                        offset: 0,
+                        len: 8,
+                        generation
+                    })
+                    .unwrap(),
                 b"efghijkl"
             );
-            assert!(heap.get(RowLoc { offset: 8, len: 1 }).is_err());
+            assert!(heap.get(RowLoc::test(8, 1)).is_err());
         });
+    }
+
+    #[test]
+    fn row_heap_generation_rejects_reused_ranges_and_preserves_current_appends() {
+        let mut heap = heap(12);
+        let (_, bytes) = heap.append(4).unwrap();
+        bytes.copy_from_slice(b"dead");
+        let (old, bytes) = heap.append(4).unwrap();
+        bytes.copy_from_slice(b"keep");
+        crate::mem::guard::forbid_alloc(|| {
+            let state = heap.exclusive();
+            state.validate_relocation(core::iter::once(old)).unwrap();
+            let generation = state.next_relocation_generation().unwrap();
+            state.relocate(old, 0);
+            state.finish_relocation(4, generation);
+            let current = RowLoc {
+                offset: 0,
+                len: 4,
+                generation,
+            };
+            let (new, bytes) = heap.append(4).unwrap();
+            bytes.copy_from_slice(b"next");
+            assert_eq!(old.offset, new.offset);
+            let error = match heap.get(old) {
+                Ok(_) => panic!("a reused range must reject its stale locator"),
+                Err(error) => error,
+            };
+            assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(
+                error.message.as_str(),
+                "row heap location was invalidated by relocation"
+            );
+            let read = heap.get(current).unwrap();
+            assert_eq!(&*read, b"keep");
+            assert_eq!(read.other(new).unwrap(), b"next");
+            assert_eq!(
+                read.other(old).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert_eq!(
+                read.other(RowLoc::EMPTY).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            drop(read);
+            assert!(heap.test_write().is_ok());
+        });
+    }
+
+    #[test]
+    fn row_heap_generation_exhaustion_preserves_bytes_and_current_locations() {
+        let mut heap = heap(4);
+        heap.exclusive().generation = u64::MAX;
+        let (location, bytes) = heap.append(4).unwrap();
+        bytes.copy_from_slice(b"last");
+        crate::mem::guard::forbid_alloc(|| {
+            let state = heap.exclusive();
+            state
+                .validate_relocation(core::iter::once(location))
+                .unwrap();
+            let error = state.next_relocation_generation().unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                error.message.as_str(),
+                "row heap relocation generation is exhausted"
+            );
+            assert_eq!(&*heap.get(location).unwrap(), b"last");
+            assert_eq!(heap.used(), 4);
+        });
+    }
+
+    #[test]
+    fn row_heap_generation_readers_reject_detached_locations_during_relocation() {
+        let mut heap = heap(8);
+        let (_, bytes) = heap.append(4).unwrap();
+        bytes.copy_from_slice(b"dead");
+        let (old, bytes) = heap.append(4).unwrap();
+        bytes.copy_from_slice(b"keep");
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let heap = &heap;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        for _ in 0..500 {
+                            match heap.get(old) {
+                                Ok(read) => assert_eq!(&*read, b"keep"),
+                                Err(error) => {
+                                    assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE)
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+            start.wait();
+            crate::mem::guard::forbid_alloc(|| {
+                let mut state = heap.state.write().unwrap();
+                state.validate_relocation(core::iter::once(old)).unwrap();
+                let generation = state.next_relocation_generation().unwrap();
+                state.relocate(old, 0);
+                state.finish_relocation(4, generation);
+                let (_, bytes) = state.append(4).unwrap();
+                bytes.copy_from_slice(b"next");
+            });
+        });
+        assert!(heap.get(old).is_err());
+        assert!(heap.test_write().is_ok());
     }
 
     #[test]

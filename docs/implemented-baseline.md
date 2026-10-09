@@ -23,14 +23,16 @@ do not qualify concurrent execution or representative deployments.
 | Table definitions | Query scopes, DML, COPY, and DDL pre-change readers retain immutable startup-budgeted images; definition access borrows its owner, escaped query names use the arena, and live publication remains exclusive |
 | Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
 | Resident rows | Per-table map guards and one guarded pending/committed version owner; issued readers retain chain ownership, including SQL and checkpoint walks |
-| Heap bytes | Guarded bytes and append position; callback/codec reads retain the guard, while long-lived images copy into the fixed statement arena |
+| Heap bytes | Guarded bytes, append position, and relocation generation; callback/codec reads retain the guard, while long-lived images copy into the fixed statement arena |
 
 Reader capacity, lock controls, and heap controls are charged at startup.
 Exhaustion is explicit; stale definition identity reacquisition fails rather than
-adopting a reused slot. Heap ranges are checked against initialized bytes, and
-compaction validates the full relocation set before changing bytes or handles,
+adopting a reused slot. Heap reads reject locations from an earlier relocation
+generation, even when the old range remains initialized. Compaction validates
+the full relocation set and generation capacity before changing bytes or handles,
 including aliases and empty locations. Startup rejects heaps beyond the 32-bit
-location range. Retained heap images consume arena capacity, as spilled images do.
+location range. Relocation generations are cache metadata; durable formats encode
+logical rows rather than heap locations. Retained heap images consume arena capacity, as spilled images do.
 
 The reactor still executes statements serially. Shared definition publication,
 row publication and maintenance, locator pinning across concurrent

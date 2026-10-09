@@ -742,7 +742,7 @@ impl TemporarySpiller {
                 .or_else(|| {
                     (0..state.history.len()).find_map(|index| state.history_get(index)?.home)
                 })
-                .unwrap_or(RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }));
+                .unwrap_or(RowHome::Heap(crate::storage::RowLoc::EMPTY));
             sort_scratch.push((rowid, marker)).map_err(|error| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -11407,7 +11407,7 @@ impl Checkpointer {
                     .or_else(|| {
                         (0..state.history.len()).find_map(|index| state.history_get(index)?.home)
                     })
-                    .unwrap_or(RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }));
+                    .unwrap_or(RowHome::Heap(crate::storage::RowLoc::EMPTY));
                 sort_scratch.push((rowid, marker)).map_err(|e| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,

@@ -107,7 +107,7 @@ mod tests {
     use crate::storage::RowLoc;
 
     fn image(lsn: u64) -> RowState {
-        RowState::committed_only_at(RowLoc { offset: 0, len: 4 }, lsn)
+        RowState::committed_only_at(RowLoc::test(0, 4), lsn)
     }
 
     fn map(capacity: usize) -> RowMap {

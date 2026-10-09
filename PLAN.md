@@ -46,8 +46,9 @@ Complete shared ownership before enabling overlapping execution:
   readers retain transaction-visible images; publication remains exclusive.
 - Synchronize row publication, statistics, and physical maintenance through a
   coherent table lifecycle, including rollback, retirement, cloning, and recovery.
-- Pin heap locations across visibility lookup and concurrent relocation. Byte
-  guards protect reads; they do not keep a previously issued locator valid.
+- Pin heap locations across visibility lookup and concurrent relocation. Heap
+  generations reject detached locations after relocation, including reused ranges;
+  byte guards and rejection do not preserve a locator across visibility lookup.
 - Establish lock ordering and release guards before nested catalog resolution.
   Reuse retained images and compact metadata instead of copying wide definitions
   per row. Long-lived heap images consume the fixed statement arena.

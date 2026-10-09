@@ -3828,11 +3828,7 @@ impl Table {
     /// any — or of a pending definition version. That transaction has the
     /// catalog identity locked.
     pub fn ddl_locked_by_other(&self, txid: u32) -> Option<u32> {
-        let state = self.definition.read();
-        match state.identity.existence.pending_txid() {
-            Some(owner) if owner != txid => Some(owner),
-            _ => state.pending.map(|head| head.transaction).filter(|&owner| owner != txid),
-        }
+        self.definition().locked_by_other(txid)
     }
 
     /// Whether the slot is free for a fresh CREATE: no committed table, no
@@ -19638,7 +19634,8 @@ impl Storage {
             drop(type_catalog);
 
             for source_slot in 0..self.tables.len() {
-                if self.tables[source_slot].database() != source || !self.tables[source_slot].live() {
+                if self.tables[source_slot].database() != source || !self.tables[source_slot].live()
+                {
                     continue;
                 }
                 if {
@@ -22367,7 +22364,7 @@ impl Storage {
             AccessClass::Table => {
                 let created_at = self.tables[source_slot].created_at();
                 self.tables.iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
+                    candidate.database() == target_database && candidate.created_at() == created_at
                 })?
             }
             AccessClass::View => {
@@ -22376,20 +22373,20 @@ impl Storage {
                     .views
                     .iter()
                     .position(|candidate| {
-                        candidate.database == target_database && candidate.created_at == created_at
+                        candidate.database() == target_database && candidate.created_at() == created_at
                     })?
             }
             AccessClass::MaterializedView => {
                 let created_at = self.matview(source_slot).created_at;
                 self.matview_catalog().iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
+                    candidate.database() == target_database && candidate.created_at() == created_at
                 })?
             }
             AccessClass::Sequence => {
                 let catalog = self.sequence_catalog();
                 let created_at = catalog.definitions[source_slot].created_at;
                 catalog.definitions.iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
+                    candidate.database() == target_database && candidate.created_at() == created_at
                 })?
             }
             AccessClass::Domain => {
@@ -22428,7 +22425,7 @@ impl Storage {
             AccessClass::Index => {
                 let created_at = self.index(source_slot).created_at;
                 self.index_catalog().iter().position(|candidate| {
-                    candidate.database == target_database && candidate.created_at == created_at
+                    candidate.database() == target_database && candidate.created_at() == created_at
                 })?
             }
             AccessClass::Routine => {
@@ -26953,7 +26950,8 @@ impl Storage {
         }
         for table_slot in 0..self.tables.len() {
             let table = &self.tables[table_slot];
-            if table.database() != current_database() || (!table.live() && table.pending_ddl().is_none())
+            if table.database() != current_database()
+                || (!table.live() && table.pending_ddl().is_none())
             {
                 continue;
             }
@@ -31441,7 +31439,7 @@ impl Storage {
     pub fn map_pressure(&self) -> bool {
         self.tables
             .iter()
-            .any(|t| t.live && t.n_spill_ssts > 0 && t.rows.len() * 100 >= t.rows.capacity() * 50)
+            .any(|t| t.live() && t.n_spill_ssts > 0 && t.rows.len() * 100 >= t.rows.capacity() * 50)
     }
 
     pub(crate) fn temporary_map_pressure(&self) -> bool {
@@ -33931,20 +33929,12 @@ impl Storage {
     /// replay and any context that operates on the durable image.
     pub fn find_table(&self, schema: &str, name: &str) -> Option<usize> {
         self.tables.iter().take(self.table_count()).position(|t| {
-            t.database == current_database()
-                && t.live
-                && {
-                    let definition = t.definition();
-                    definition.schema
-                }
-                .as_str()
-                    == schema
-                && {
-                    let definition = t.definition();
-                    definition.name
-                }
-                .as_str()
-                    == name
+            let definition = t.definition();
+            let identity = definition.identity();
+            identity.database == current_database()
+                && identity.live()
+                && definition.schema.as_str() == schema
+                && definition.name.as_str() == name
         })
     }
 
@@ -33956,11 +33946,13 @@ impl Storage {
             .iter()
             .take(self.table_count())
             .enumerate()
-            .position(|(index, table)| {
-                table.database() == current_database()
-                    && table.visible_to(txid)
-                    && self.table_def(index, txid).schema.as_str() == schema
-                    && self.table_def(index, txid).name.as_str() == name
+            .position(|(index, _)| {
+                let definition = self.table_def(index, txid);
+                let identity = definition.identity();
+                identity.database == current_database()
+                    && identity.existence.visible_to(txid)
+                    && definition.schema.as_str() == schema
+                    && definition.name.as_str() == name
             })
     }
 
@@ -33969,7 +33961,8 @@ impl Storage {
     }
 
     pub(crate) fn table_slot_visible_to(&self, index: usize, txid: u32) -> bool {
-        self.tables[index].database() == current_database() && self.tables[index].visible_to(txid)
+        let identity = self.tables[index].identity();
+        identity.database == current_database() && identity.existence.visible_to(txid)
     }
 
     pub fn table_mut(&mut self, index: usize) -> &mut Table {
@@ -34689,28 +34682,16 @@ impl Storage {
 
     /// The txid of another transaction holding uncommitted DDL for `name`.
     fn ddl_name_locked_by_other(&self, schema: &str, name: &str, txid: u32) -> Option<u32> {
-        self.tables
-            .iter()
-            .enumerate()
-            .filter(|(_, table)| table.database() == current_database())
-            .filter(|(index, table)| {
-                ({
-                    let definition = table.definition();
-                    definition.schema
-                }
-                .as_str()
-                    == schema
-                    && {
-                        let definition = table.definition();
-                        definition.name
-                    }
-                    .as_str()
-                        == name)
-                    || self.pending_table_def(*index).is_some_and(|pending| {
-                        pending.def.schema.as_str() == schema && pending.def.name.as_str() == name
-                    })
-            })
-            .find_map(|(_, table)| table.ddl_locked_by_other(txid))
+        self.tables.iter().find_map(|table| {
+            let definition = TableDefinitionRead::current(&table.definition, &self.pending_table_defs);
+            if definition.identity().database != current_database() {
+                return None;
+            }
+            let committed = definition.committed_definition();
+            let matches = (committed.schema.as_str() == schema && committed.name.as_str() == name)
+                || (definition.schema.as_str() == schema && definition.name.as_str() == name);
+            matches.then(|| definition.locked_by_other(txid)).flatten()
+        })
     }
 
     /// Committed drop (journal replay): rows are retained; the slot is freed at
@@ -34782,7 +34763,10 @@ impl Storage {
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
         let identity = self.tables[index].identity_mut();
-        assert!(matches!(identity.existence, CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. }));
+        assert!(matches!(
+            identity.existence,
+            CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. }
+        ));
         identity.existence = CatalogDdlState::Absent;
         self.clear_table_rows(index);
         self.tables[index].statistics_wal_dirty = false;
@@ -34798,7 +34782,10 @@ impl Storage {
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
         let identity = self.tables[index].identity_mut();
-        assert!(matches!(identity.existence, CatalogDdlState::Present | CatalogDdlState::PendingCreate { .. }));
+        assert!(matches!(
+            identity.existence,
+            CatalogDdlState::Present | CatalogDdlState::PendingCreate { .. }
+        ));
         identity.existence = CatalogDdlState::Absent;
         self.clear_table_rows(index);
         self.tables[index].statistics_wal_dirty = false;
@@ -34808,7 +34795,10 @@ impl Storage {
     /// image unchanged.
     pub fn rollback_drop(&mut self, index: usize) {
         let identity = self.tables[index].identity_mut();
-        let txid = identity.existence.pending_txid().expect("table DROP owns catalog state");
+        let txid = identity
+            .existence
+            .pending_txid()
+            .expect("table DROP owns catalog state");
         identity.existence = identity.existence.rollback_drop(txid);
         for rule in self.view_rule_catalog().rules.iter_mut().filter(|rule| {
             rule.database == current_database()
@@ -38288,7 +38278,7 @@ impl Storage {
         for table in self
             .tables
             .iter()
-            .filter(|t| t.database == current_database() && t.live)
+            .filter(|t| t.database() == current_database() && t.live())
         {
             let definition = table.definition();
             for col in definition.columns() {
@@ -39367,7 +39357,7 @@ impl Storage {
         for table in self
             .tables
             .iter()
-            .filter(|t| t.database == current_database() && t.live)
+            .filter(|t| t.database() == current_database() && t.live())
         {
             let definition = table.definition();
             for col in definition.columns() {
@@ -47328,7 +47318,7 @@ impl Storage {
         }
         drop(sequence_catalog);
         for t in self.tables.iter_mut() {
-            if t.database != database_oid || !t.live {
+            if t.database() != database_oid || !t.live() {
                 continue;
             }
             let mut changed = false;
@@ -53075,6 +53065,52 @@ mod tests {
     }
 
     #[test]
+    fn table_catalog_lifecycle_capacity_rollback_and_reuse_preserve_retained_identity() {
+        let mut config = test_config();
+        config.max_tables = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let definition = make_def("lifecycle_original", &[("id", ColType::Int4, true)]);
+            let slot = storage.create_table_in(definition, 7).unwrap();
+            let images = storage.table_definition_images();
+            images.definition(&storage, slot, 7).unwrap();
+            let original = images.retained_identity(slot, 7).unwrap();
+            assert_eq!(original.existence, CatalogDdlState::PendingCreate { txid: 7 });
+            assert!(storage.table(slot).visible_to(7));
+            assert!(!storage.table(slot).visible_to(8));
+            storage.drop_table_in(slot, 7);
+            assert!(!storage.table(slot).visible_to(7));
+            assert!(!storage.table(slot).visible_to(8));
+            assert!(!storage.table(slot).is_free());
+            let replacement = make_def("lifecycle_replacement", &[("id", ColType::Int4, true)]);
+            let error = storage.create_table_in(replacement, 8).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            storage.rollback_drop(slot);
+            assert_eq!(storage.table(slot).identity().existence, original.existence);
+            assert!(storage.table(slot).visible_to(7));
+            assert!(!storage.table(slot).visible_to(8));
+            storage.commit_create(slot);
+            assert!(storage.table(slot).visible_to(8));
+            storage.drop_table_in(slot, 9);
+            assert!(!storage.table(slot).visible_to(9));
+            assert!(storage.table(slot).visible_to(8));
+            storage.rollback_drop(slot);
+            assert!(storage.table(slot).visible_to(9));
+            storage.drop_table_in(slot, 9);
+            storage.commit_drop(slot);
+            let reused = storage.create_table_in(replacement, 8).unwrap();
+            assert_eq!(reused, slot);
+            assert_ne!(storage.table(slot).created_at(), original.created_at);
+            assert_eq!(images.definition(&storage, slot, 7).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(images.retained_definition(slot, 7).unwrap().name.as_str(), "lifecycle_original");
+            assert_eq!(images.retained_identity(slot, 7).unwrap().created_at, original.created_at);
+            storage.rollback_create(slot);
+            assert!(storage.table(slot).is_free());
+        });
+    }
+
+    #[test]
     fn cluster_metadata_failed_table_creation_releases_identity_and_value_bindings() {
         let mut config = test_config();
         config.max_value_indexes = 2;
@@ -53109,10 +53145,10 @@ mod tests {
                 assert!(rejected.is_free());
                 assert_eq!(rejected.definition().name, SqlName::EMPTY);
                 assert_eq!(rejected.definition().n_columns, 0);
-                assert_eq!(rejected.created_at, 0);
-                assert_eq!(rejected.ownership.owner, Ownership::BOOTSTRAP.owner);
-                assert!(rejected.ownership.pending.is_none());
-                assert!(rejected.pending_ddl.is_none());
+                assert_eq!(rejected.created_at(), 0);
+                assert_eq!(rejected.ownership().owner, Ownership::BOOTSTRAP.owner);
+                assert!(rejected.ownership().pending.is_none());
+                assert!(rejected.pending_ddl().is_none());
                 assert_eq!(rejected.n_enforcers, 0);
                 assert!(rejected.enforcers.iter().all(Option::is_none));
                 assert_eq!(storage.tables[retained_slot].n_enforcers, 1);

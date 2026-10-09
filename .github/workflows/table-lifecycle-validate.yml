@@ -6,6 +6,39 @@ concurrency:
   group: table-lifecycle-validation
   cancel-in-progress: true
 jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Reproduce pending-create rollback against merged baseline
+        run: |
+          baseline=4298884956dcd7d635e17dac8ea38f3b0534fd7b
+          git fetch origin "$baseline"
+          git diff "$baseline" HEAD -- src/sql/tests.rs > "$RUNNER_TEMP/regression.patch"
+          git checkout "$baseline" -- .
+          git apply "$RUNNER_TEMP/regression.patch"
+          set +e
+          cargo test --lib --locked table_catalog_lifecycle_savepoint_drop_restores_pending_create -- --nocapture > "$RUNNER_TEMP/lifecycle-baseline.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/lifecycle-baseline.log"
+          test "$result" -ne 0
+          rg 'test result: FAILED.*1 failed' "$RUNNER_TEMP/lifecycle-baseline.log"
+          rg 'relation.*lifecycle_created.*does not exist' "$RUNNER_TEMP/lifecycle-baseline.log"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: table-lifecycle-baseline
+          path: ${{ runner.temp }}/lifecycle-baseline.log
   validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -40,4 +73,8 @@ jobs:
           cargo test --lib --locked table_catalog_lifecycle -- --nocapture
           cargo test --lib --locked live_definition_ownership -- --nocapture
           cargo test --lib --locked table_slot -- --nocapture
+          cargo test --lib --locked cluster_metadata_failed_table_creation -- --nocapture
+          cargo test --lib --locked cluster_metadata_table_names -- --nocapture
+          cargo test --lib --locked table_definition_images -- --nocapture
+          cargo test --lib --locked query_definition_ownership -- --nocapture
           cargo test --lib --locked prepared_transactions_survive_checkpoint_and_object_cold_recovery -- --nocapture

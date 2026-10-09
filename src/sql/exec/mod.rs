@@ -11797,7 +11797,7 @@ pub fn drop_schema(
                 let def = storage.table_def(*t, txn.txid);
                 (
                     schema_rank(storage, def.schema.as_str()),
-                    table.created_at,
+                    table.created_at(),
                     0,
                 )
             }
@@ -11849,7 +11849,7 @@ pub fn drop_schema(
                 let def = storage.table_def(*table, txn.txid);
                 (
                     schema_rank(storage, def.schema.as_str()),
-                    table_state.created_at,
+                    table_state.created_at(),
                     0,
                 )
             }
@@ -11933,7 +11933,7 @@ pub fn drop_schema(
                 let def = storage.table_def(*table, txn.txid);
                 (
                     schema_rank(storage, def.fkeys[*fk_index].parent_schema.as_str()),
-                    child.created_at,
+                    child.created_at(),
                     1,
                 )
             }

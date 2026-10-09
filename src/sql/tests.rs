@@ -150,6 +150,97 @@ fn live_definition_ownership_catalog_tracks_rename_schema_and_rollback() {
 }
 
 #[test]
+fn table_catalog_lifecycle_savepoint_drop_restores_pending_create() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; CREATE TABLE lifecycle_created(id integer PRIMARY KEY); \
+         INSERT INTO lifecycle_created VALUES (7); SAVEPOINT before_drop; \
+         DROP TABLE lifecycle_created; ROLLBACK TO before_drop; \
+         SELECT id FROM lifecycle_created; INSERT INTO lifecycle_created VALUES (8); \
+         COMMIT; SELECT id FROM lifecycle_created ORDER BY id; \
+         BEGIN; SAVEPOINT before_existing_drop; DROP TABLE lifecycle_created; \
+         ROLLBACK TO before_existing_drop; SELECT id FROM lifecycle_created ORDER BY id; \
+         COMMIT; DROP TABLE lifecycle_created",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}", String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["7", "7", "8", "7", "8"]);
+}
+
+#[test]
+fn table_catalog_lifecycle_create_drop_commit_and_reuse_do_not_publish_old_rows() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; CREATE TABLE lifecycle_retired(id integer PRIMARY KEY); \
+         INSERT INTO lifecycle_retired VALUES (7); DROP TABLE lifecycle_retired; COMMIT; \
+         SELECT count(*) FROM pg_class WHERE relname = 'lifecycle_retired'; \
+         CREATE TABLE lifecycle_retired(id integer PRIMARY KEY); \
+         SELECT count(*) FROM lifecycle_retired; INSERT INTO lifecycle_retired VALUES (9); \
+         BEGIN; DROP TABLE lifecycle_retired; ROLLBACK; SELECT id FROM lifecycle_retired; \
+         DROP TABLE lifecycle_retired",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}", String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["0", "0", "9"]);
+}
+
+#[test]
+fn table_catalog_lifecycle_savepoint_creation_and_retirement_survive_cold_recovery() {
+    let mut config = test_config("table-lifecycle-cold-recovery");
+    config.max_tables = 2;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("table-lifecycle-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; CREATE TABLE lifecycle_durable(id integer PRIMARY KEY); \
+         INSERT INTO lifecycle_durable VALUES (7); SAVEPOINT before_drop; \
+         DROP TABLE lifecycle_durable; ROLLBACK TO before_drop; COMMIT; \
+         BEGIN; CREATE TABLE lifecycle_absent(id integer PRIMARY KEY); \
+         INSERT INTO lifecycle_absent VALUES (8); DROP TABLE lifecycle_absent; COMMIT",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}", String::from_utf8_lossy(&output)
+    );
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT id FROM lifecycle_durable; \
+         SELECT count(*) FROM pg_class WHERE relname = 'lifecycle_absent'; \
+         CREATE TABLE lifecycle_absent(id integer PRIMARY KEY); \
+         SELECT count(*) FROM lifecycle_absent",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}", String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["7", "0", "0"]);
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn query_definition_ownership_record_witnesses_and_describe_names() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(

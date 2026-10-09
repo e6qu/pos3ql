@@ -14502,7 +14502,11 @@ impl Engine {
                 | Stmt::Show(_)
                 | Stmt::ShowAll
         );
-        if let Err(error) = self.begin_command_snapshot(txn, takes_snapshot, !matches!(statement, Stmt::Commit | Stmt::Rollback)) {
+        if let Err(error) = self.begin_command_snapshot(
+            txn,
+            takes_snapshot,
+            !matches!(statement, Stmt::Commit | Stmt::Rollback),
+        ) {
             return Ok(Err(error));
         }
         if statement_writes(statement) {

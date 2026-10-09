@@ -29,7 +29,12 @@ jobs:
         with:
           name: live-definition-format
           path: live-definition-format.patch
-      - run: cargo check --all-targets --locked
+      - run: cargo check --all-targets --locked --message-format=json > live-definition-check.json
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: live-definition-check
+          path: live-definition-check.json
       - run: cargo clippy --all-targets --locked -- -D warnings
       - name: Definition ownership and recovery
         run: |

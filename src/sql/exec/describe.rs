@@ -16,7 +16,6 @@ use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_ROUTINE_ARGUMENTS, RoutineArgumentDef, TableDef};
 use core::cell::Cell;
 
-/// Result-column names borrow statement aliases or arena-owned catalog names.
 /// The atttypmod RowDescription reports for an output expression: a bare table
 /// column carries its declared modifier, a cast its target's, and every other
 /// expression `-1` — matching what PostgreSQL sends (`upper(v)` has none even
@@ -30,6 +29,7 @@ fn output_type_mod(expression: &Expr<'_>, column_mod: impl Fn(&str) -> i32) -> i
     }
 }
 
+/// Catalog names escape into the statement arena before their reader is released.
 fn describe_column<'a>(
     column: &ColumnMeta,
     arena: &'a crate::mem::arena::Arena,

@@ -7,6 +7,48 @@
 use super::*;
 
 #[test]
+fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
+    let mut config = test_config("definition-checkpoint-exhaustion");
+    config.max_tables = 1;
+    config.max_catalog_versions_per_object = 1;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("definition-checkpoint-exhaustion-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(&mut engine, &mut budget,
+        "CREATE TABLE definition_checkpoint (id integer); INSERT INTO definition_checkpoint VALUES (7)");
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let table = engine.storage.find_table("public", "definition_checkpoint").unwrap();
+    let capacity = crate::storage::table_slot_capacity(&config)
+        * (config.max_catalog_versions_per_object + 1) * config.query_workspace_slots;
+    let mut owners = Vec::with_capacity(capacity);
+    for _ in 0..capacity {
+        let definitions = engine.storage.table_definition_images();
+        definitions.definition(&engine.storage, table, 0).unwrap();
+        owners.push(definitions);
+    }
+    let error = engine.checkpoint().unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    assert!(error.message.as_str().contains("table definition image pool is exhausted"));
+    drop(owners.pop().unwrap());
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(owners);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(data_rows(&run_with(&mut recovered, &mut recovered_budget,
+        "SELECT id FROM definition_checkpoint")), ["7"]);
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn live_definition_ownership_returning_descriptions_keep_names_and_modifiers() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(&mut engine, &mut budget,

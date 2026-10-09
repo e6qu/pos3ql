@@ -5,7 +5,7 @@ or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 Reviewed for visible row ownership, immutable pending versions, compact scan
-metadata, and PostgreSQL oracle image availability on 2026-10-10: no defects
+metadata, and oracle/qualification image availability on 2026-10-10: no defects
 meet these inclusion criteria.
 Resolved investigations are indexed in [history](docs/history/README.md).
 

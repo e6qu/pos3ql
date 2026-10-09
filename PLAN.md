@@ -127,6 +127,7 @@ The roadmap is complete when all of these hold:
   boundaries without truncation or post-startup allocation.
 - PostgreSQL oracle gates use the same verified, immutable service/client image;
   registry failures must fail the gate rather than skipping comparisons.
+  Object-store qualification likewise preserves verified release image identities.
 - Formats, monitoring, credentials, packages, backup/restore, and replacement
   remain qualified end to end.
 - Concurrent execution scales through the supported worker range while

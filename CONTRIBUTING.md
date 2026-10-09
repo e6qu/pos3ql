@@ -93,6 +93,8 @@ PostgreSQL service and client containers use Docker's official image from
 digest. Keep service images, container selectors, and client adapters on the
 same digest. Verify updated manifests against Docker Hub's official image and
 retain that comparison in the PR; do not switch registries silently on failure.
+SeaweedFS qualification uses the upstream GHCR release image at the same digest
+as its Docker Hub publication. Registry changes preserve image provenance.
 
 For benchmarks, follow [performance.md](docs/performance.md). Keep raw artifacts,
 revision/binary hashes, tool and service provenance, hardware, storage, network,

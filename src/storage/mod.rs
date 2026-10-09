@@ -19636,7 +19636,10 @@ impl Storage {
                 {
                     continue;
                 }
-                if self.tables[source_slot].existence().pending_txid().is_some()
+                if self.tables[source_slot]
+                    .existence()
+                    .pending_txid()
+                    .is_some()
                     || self.tables[source_slot]
                         .pending_definition_transaction()
                         .is_some()
@@ -19664,10 +19667,7 @@ impl Storage {
                 let statistics = self.tables[source_slot].statistics;
                 let serial_values = self.table_serial_values(source_slot);
                 let n_spill_ssts = self.tables[source_slot].n_spill_ssts;
-                let target_slot = self.alloc_table(
-                    definition,
-                    Some(txid),
-                )?;
+                let target_slot = self.alloc_table(definition, Some(txid))?;
                 {
                     let target_table = &mut self.tables[target_slot];
                     target_table.identity_mut().created_at = created_at;
@@ -20642,7 +20642,8 @@ impl Storage {
             // every target relation exists; names are the durable identity.
             for target_slot in 0..self.tables.len() {
                 if self.tables[target_slot].database() != target
-                    || self.tables[target_slot].existence() != (CatalogDdlState::PendingCreate { txid })
+                    || self.tables[target_slot].existence()
+                        != (CatalogDdlState::PendingCreate { txid })
                 {
                     continue;
                 }
@@ -22353,8 +22354,7 @@ impl Storage {
                     .views
                     .iter()
                     .position(|candidate| {
-                        candidate.database == target_database
-                            && candidate.created_at == created_at
+                        candidate.database == target_database && candidate.created_at == created_at
                     })?
             }
             AccessClass::MaterializedView => {
@@ -34323,11 +34323,7 @@ impl Storage {
     /// Allocates a slot for a fresh table. Shared by replay (committed) and
     /// the executor (pending); `transaction` selects the uncommitted-CREATE
     /// state so the table is invisible to other transactions until commit.
-    fn alloc_table(
-        &mut self,
-        def: TableDef,
-        transaction: Option<u32>,
-    ) -> Result<usize, SqlError> {
+    fn alloc_table(&mut self, def: TableDef, transaction: Option<u32>) -> Result<usize, SqlError> {
         let Some(slot) = self
             .tables
             .iter()
@@ -34362,7 +34358,9 @@ impl Storage {
                 database: current_database(),
                 ownership,
                 created_at: stamp,
-                existence: transaction.map_or(CatalogDdlState::Present, |txid| CatalogDdlState::PendingCreate { txid }),
+                existence: transaction.map_or(CatalogDdlState::Present, |txid| {
+                    CatalogDdlState::PendingCreate { txid }
+                }),
             };
         }
         table.pending_has_rules_txid = None;

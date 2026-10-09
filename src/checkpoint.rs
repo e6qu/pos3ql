@@ -7835,11 +7835,12 @@ impl Checkpointer {
         let mut wrote_slice = false;
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
-            if {
+            let skip_table = {
                 let definition = table.definition();
                 !definition.identity().live()
                     || definition.persistence == crate::storage::RelationPersistence::Temporary
-            } {
+            };
+            if skip_table {
                 continue;
             }
             if self.start_value_index_job(storage, slot)? {
@@ -8511,11 +8512,12 @@ impl Checkpointer {
         }
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
-            if {
+            let skip_table = {
                 let definition = table.definition();
                 !definition.identity().live()
                     || definition.persistence == crate::storage::RelationPersistence::Temporary
-            } {
+            };
+            if skip_table {
                 // A dropped table's recorded list must not linger into the
                 // GC keep-set the swap below publishes.
                 if slot < self.prev_scratch.len() {

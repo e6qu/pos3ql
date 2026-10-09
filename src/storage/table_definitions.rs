@@ -5,8 +5,7 @@ use core::ops::Deref;
 use std::sync::{RwLock, RwLockReadGuard};
 
 use super::{
-    CatalogDdlState, DatabaseOid, Ownership, PendingTableDef, PendingTableDefSlot,
-    TableDef,
+    CatalogDdlState, DatabaseOid, Ownership, PendingTableDef, PendingTableDefSlot, TableDef,
 };
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
@@ -41,7 +40,6 @@ impl TableIdentity {
             CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. }
         )
     }
-
 }
 
 #[derive(Clone, Copy)]
@@ -285,6 +283,12 @@ mod tests {
                                 usize::from(identity.ownership.owner),
                                 image.committed_definition().n_columns % 4
                             );
+                            let expected_database = if identity.ownership.owner == 1 {
+                                DatabaseOid::POSTGRES
+                            } else {
+                                DatabaseOid::TEMPLATE1
+                            };
+                            assert_eq!(identity.database, expected_database);
                             assert!(table.state.try_write().is_err());
                             if let Some((slots, slot)) = &image.pending {
                                 assert_eq!(slots[*slot].version.txid, 7);
@@ -327,6 +331,11 @@ mod tests {
                     state.committed = definition(stamp);
                     state.identity.created_at = stamp as u64;
                     state.identity.ownership.owner = (stamp % 4) as u16;
+                    state.identity.database = if stamp % 4 == 1 {
+                        DatabaseOid::POSTGRES
+                    } else {
+                        DatabaseOid::TEMPLATE1
+                    };
                     state.identity.existence = match epoch % 5 {
                         0 => CatalogDdlState::Present,
                         1 => CatalogDdlState::PendingCreate { txid: 7 },

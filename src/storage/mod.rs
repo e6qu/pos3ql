@@ -13404,6 +13404,22 @@ struct ViewRuleCatalog {
     rules: FixedVec<RuleDef>,
 }
 
+impl ViewRuleCatalog {
+    fn rollback_target_rules(&mut self, target: RuleTarget, txid: u32) {
+        for rule in self.rules.iter_mut().filter(|rule| {
+            rule.database == current_database()
+                && rule.definition_for(txid).target == target
+                && rule.ddl_state.pending_txid() == Some(txid)
+                && matches!(
+                    rule.ddl_state,
+                    CatalogDdlState::PendingDrop { .. } | CatalogDdlState::PendingCreateDrop { .. }
+                )
+        }) {
+            rule.ddl_state = rule.ddl_state.rollback_drop(txid);
+        }
+    }
+}
+
 struct ViewRuleIter<'a, T> {
     catalog: &'a std::sync::Mutex<ViewRuleCatalog>,
     entries: fn(&ViewRuleCatalog) -> &FixedVec<T>,
@@ -34776,17 +34792,7 @@ impl Storage {
             .pending_txid()
             .expect("table DROP owns catalog state");
         identity.existence = identity.existence.rollback_drop(txid);
-        for rule in self.view_rule_catalog().rules.iter_mut().filter(|rule| {
-            rule.database == current_database()
-                && rule.definition.target == RuleTarget::Table(index as u16)
-                && rule.ddl_state.pending_txid() == Some(txid)
-                && matches!(
-                    rule.ddl_state,
-                    CatalogDdlState::PendingDrop { .. } | CatalogDdlState::PendingCreateDrop { .. }
-                )
-        }) {
-            rule.ddl_state = rule.ddl_state.rollback_drop(txid);
-        }
+        self.view_rule_catalog().rollback_target_rules(RuleTarget::Table(index as u16), txid);
     }
 
     /// Whether any live view exists (lets the executor skip view expansion).
@@ -41475,13 +41481,7 @@ impl Storage {
     /// the drop rolled back to a savepoint) reverts to pending-create.
     pub fn rollback_view_drop(&mut self, slot: usize, txid: u32) {
         let mut catalog = self.view_rule_catalog();
-        for rule in catalog.rules.iter_mut().filter(|rule| {
-            rule.database == current_database()
-                && rule.definition.target == RuleTarget::View(slot as u16)
-                && matches!(rule.ddl_state, CatalogDdlState::PendingDrop { txid: owner } if owner == txid)
-        }) {
-            rule.ddl_state = rule.ddl_state.rollback_drop(txid);
-        }
+        catalog.rollback_target_rules(RuleTarget::View(slot as u16), txid);
         let view = &mut catalog.views[slot];
         view.ddl_state = view.ddl_state.rollback_drop(txid);
     }

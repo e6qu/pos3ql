@@ -8880,7 +8880,7 @@ pub(crate) fn object_acl_by_address<'a>(
     };
     let table = synthesize(storage, Some("pg_catalog"), catalog, txid, arena)?;
     let column = |name: &str| {
-        table.def.columns()[..table.def.n_columns]
+        table.definition().columns()[..table.definition().n_columns]
             .iter()
             .position(|candidate| candidate.name.as_str() == name)
     };
@@ -13594,7 +13594,7 @@ pub fn view_def_text<'a>(
             continue;
         }
         let Some(view) =
-            storage.find_matview(table.def.schema.as_str(), table.def.name.as_str(), txid)
+            storage.find_matview(table.definition().schema.as_str(), table.definition().name.as_str(), txid)
         else {
             return Ok(None);
         };
@@ -28948,10 +28948,10 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         out[n] = row(
             &[
                 Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
-                text(table.def.name.as_str(), arena)?,
+                text(table.definition().name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, table.def.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, table.definition().schema.as_str())),
                 text("c", arena)?,
                 text("C", arena)?,
                 Datum::Int4(0),
@@ -28967,7 +28967,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(
                     storage
-                        .matview_slot(table.def.schema.as_str(), table.def.name.as_str(), txid)
+                        .matview_slot(table.definition().schema.as_str(), table.definition().name.as_str(), txid)
                         .map_or(
                             owner_oid(storage, crate::storage::AccessClass::Table, slot, txid),
                             |matview| {
@@ -28996,14 +28996,14 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_type"));
         }
-        let array_name = stack_format!(128, "_{}", table.def.name.as_str());
+        let array_name = stack_format!(128, "_{}", table.definition().name.as_str());
         out[n] = row(
             &[
                 Datum::Int4(FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32),
                 text(array_name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, table.def.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, table.definition().schema.as_str())),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),

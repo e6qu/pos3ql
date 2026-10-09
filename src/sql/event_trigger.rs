@@ -1669,7 +1669,7 @@ fn primary_object(
             let trigger = storage.trigger(slot);
             let (schema, table) = match trigger.target {
                 crate::storage::TriggerTarget::Table(table) => {
-                    let table = &storage.table(usize::from(table)).def;
+                    let table = &*storage.table(usize::from(table)).definition();
                     (table.schema, table.name)
                 }
                 crate::storage::TriggerTarget::View(view) => {

@@ -1,0 +1,39 @@
+name: Live definition validation
+on:
+  push:
+    branches: [codex/live-definition-ownership]
+  workflow_dispatch:
+concurrency:
+  group: live-definition-validation
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Format on runner
+        run: |
+          cargo fmt --all
+          git diff > live-definition-format.patch
+      - uses: actions/upload-artifact@v6
+        with:
+          name: live-definition-format
+          path: live-definition-format.patch
+      - run: cargo check --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Definition ownership and recovery
+        run: |
+          cargo test --lib --locked live_definition_ownership -- --nocapture
+          cargo test --lib --locked query_definition_ownership -- --nocapture
+          cargo test --lib --locked table_definition_images -- --nocapture
+          cargo test --lib --locked prepared_transactions_survive_checkpoint_and_object_cold_recovery -- --nocapture

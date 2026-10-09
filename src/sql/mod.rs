@@ -5980,8 +5980,8 @@ impl Engine {
                     );
                 }
                 DdlUndo::Dropped(slot) => {
-                    let name = self.storage.table(*slot as usize).def.name;
-                    let schema = self.storage.table(*slot as usize).def.schema;
+                    let name = self.storage.table(*slot as usize).definition().name;
+                    let schema = self.storage.table(*slot as usize).definition().schema;
                     self.storage.commit_drop(*slot as usize);
                     // The table's indexes were pending-dropped with it.
                     self.storage
@@ -6914,8 +6914,8 @@ impl Engine {
             DdlUndo::Created(slot) => self.storage.rollback_create(slot as usize),
             DdlUndo::Dropped(slot) => {
                 self.storage.rollback_drop(slot as usize);
-                let name = self.storage.table(slot as usize).def.name;
-                let schema = self.storage.table(slot as usize).def.schema;
+                let name = self.storage.table(slot as usize).definition().name;
+                let schema = self.storage.table(slot as usize).definition().schema;
                 self.storage
                     .rollback_indexes_for(schema.as_str(), name.as_str(), txid);
             }

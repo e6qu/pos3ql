@@ -41166,7 +41166,7 @@ fn validate_domain_rows(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     for (table_index, table) in storage.live_tables() {
-        let def = table.def;
+        let def = *table.definition();
         let mut affected = [false; MAX_COLUMNS];
         let mut any = false;
         for (column_index, column) in def.columns().iter().enumerate() {

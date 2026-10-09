@@ -410,14 +410,15 @@ fn collect_statement(
             let result = (|| {
                 record_routine_target(insert.table, storage, txid, path, dependencies)?;
                 let scope = dml_dependency_scope(storage, insert.table, None, None, txid, arena)?;
-                let excluded = storage
-                    .resolve_relation_under(path, insert.table.schema, insert.table.name, txid)
-                    .and_then(|relation| match relation {
-                        ResolvedRelation::Table(slot) => {
-                            Some((slot, storage.table_def(slot, txid)))
-                        }
-                        _ => None,
-                    });
+                let definitions = storage.table_definition_images();
+                let excluded = match storage.resolve_relation_under(
+                    path, insert.table.schema, insert.table.name, txid,
+                ) {
+                    Some(ResolvedRelation::Table(slot)) => Some((
+                        slot, definitions.definition(storage, slot, txid)?,
+                    )),
+                    _ => None,
+                };
                 for row in insert.rows {
                     for expression in *row {
                         collect_expr!(expression, None, no_excluded)?;
@@ -1991,7 +1992,10 @@ fn record_relation_column_references<'a>(
                     source.columns[column] = table
                         .col_alias
                         .and_then(|aliases| aliases.get(column).copied())
-                        .unwrap_or(definition.columns[column].name.as_str());
+                        .map_or_else(
+                            || arena.alloc_str(definition.columns[column].name.as_str()).map_err(|_| arena_full()),
+                            Ok,
+                        )?;
                 }
             }
             ResolvedRelation::View(slot) => {

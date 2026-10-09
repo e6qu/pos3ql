@@ -1921,7 +1921,7 @@ fn emit_pending_truncates(
             emit_replication_relation(
                 storage,
                 output_slot,
-                definition,
+                &definition,
                 relation_id,
                 column_mask,
                 responder,
@@ -2307,7 +2307,7 @@ fn publication_row_matches(
         let result = (|| {
             let expression = parser::parse_expr(filter, arena)?;
             let row = exec::RowCtx {
-                def: definition,
+                def: &definition,
                 values,
                 alias: None,
             };
@@ -4623,7 +4623,7 @@ impl Engine {
                                     emit_replication_relation(
                                         storage,
                                         output_slot,
-                                        storage.table_def(output_slot, 0),
+                                        &storage.table_def(output_slot, 0),
                                         relation_id,
                                         column_mask,
                                         responder,
@@ -4691,7 +4691,7 @@ impl Engine {
                                     emit_replication_relation(
                                         storage,
                                         output_slot,
-                                        storage.table_def(output_slot, 0),
+                                        &storage.table_def(output_slot, 0),
                                         relation_id,
                                         column_mask,
                                         responder,
@@ -4804,7 +4804,7 @@ impl Engine {
                                 emit_replication_relation(
                                     storage,
                                     output_slot,
-                                    storage.table_def(output_slot, 0),
+                                    &storage.table_def(output_slot, 0),
                                     relation_id,
                                     column_mask,
                                     responder,
@@ -5033,6 +5033,7 @@ impl Engine {
             }
             let name = def.name;
             let schema = def.schema;
+            drop(def);
             let lsn = self.storage.lsn() + 1;
             let committed = state.committed;
             drop(state);
@@ -5113,6 +5114,7 @@ impl Engine {
             let name = def.name;
             let schema = def.schema;
             let n_columns = def.n_columns;
+            drop(def);
             for (c, &last) in serial_values.iter().enumerate().take(n_columns) {
                 if !self.storage.table_def(i, txn.txid).columns()[c].auto_increment {
                     continue;
@@ -7755,6 +7757,7 @@ impl Engine {
                         .expect("maintenance targets were validated");
                     selected_count += 1;
                 }
+                drop(definition);
                 txn.record_statistics(slot as u32)?;
                 let started = datetime::now_micros();
                 let statistics = self.storage.analyze_table(
@@ -10062,7 +10065,7 @@ impl Engine {
                 let def = slot.map(|s| self.storage.table_def(s, txid));
                 for row in ins.rows {
                     for (i, value) in row.iter().enumerate() {
-                        let ty = def.and_then(|d| {
+                        let ty = def.as_ref().and_then(|d| {
                             let ci = if ins.columns.is_empty() {
                                 (i < d.n_columns).then_some(i)
                             } else {
@@ -10311,7 +10314,7 @@ impl Engine {
         let definition = self.storage.table_def(table_index, txn.txid);
         exec::describe_returning_items(
             returning,
-            Some(definition),
+            Some(&definition),
             target_alias,
             Some(&self.storage),
             txn.txid,
@@ -10966,7 +10969,7 @@ impl Engine {
         let (columns, transition_types) = match target {
             crate::storage::RuleTarget::Table(slot) => {
                 let definition = storage.table_def(usize::from(slot), txn.txid);
-                rule_defaults = match exec::parse_defaults(definition, arena) {
+                rule_defaults = match exec::parse_defaults(&definition, arena) {
                     Ok(defaults) => defaults,
                     Err(error) => return Ok(Err(error)),
                 };

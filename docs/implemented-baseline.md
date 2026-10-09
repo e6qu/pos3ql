@@ -34,8 +34,8 @@ including aliases and empty locations. Startup rejects heaps beyond the 32-bit
 location range. Relocation generations are cache metadata; durable formats encode
 logical rows rather than heap locations. Retained heap images consume arena capacity, as spilled images do.
 
-The reactor still executes statements serially. Definition publication coordinated
-with table identity and existence, row publication and maintenance, locator pinning across concurrent
+The reactor still executes statements serially. Table identity and existence
+coordination, row publication and maintenance, locator pinning across concurrent
 relocation, engine publication, and fixed workers remain the roadmap's open
 concurrency gates. Immutable SST reads carry no resident version handles.
 

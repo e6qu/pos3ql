@@ -710,7 +710,10 @@ impl TemporarySpiller {
         let Some(slot) = (0..storage.physical_table_count()).find(|&slot| {
             let table = storage.table(slot);
             table.live
-                && { let definition = table.definition(); definition.persistence } == crate::storage::RelationPersistence::Temporary
+                && {
+                    let definition = table.definition();
+                    definition.persistence
+                } == crate::storage::RelationPersistence::Temporary
                 && table.dirty
         }) else {
             return Ok(None);
@@ -846,8 +849,10 @@ impl TemporarySpiller {
         self.handles.clear();
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
-            if !table.live
-                || { let definition = table.definition(); definition.persistence } != crate::storage::RelationPersistence::Temporary
+            if !table.live || {
+                let definition = table.definition();
+                definition.persistence
+            } != crate::storage::RelationPersistence::Temporary
             {
                 continue;
             }
@@ -1139,7 +1144,13 @@ impl Checkpointer {
                     .set_pax_schema(&schema[..columns])
                     .map_err(sst_to_sql)?;
                 self.merge_writer
-                    .set_packed_fillfactor(storage.table(job.slot).definition().storage_options.fillfactor)
+                    .set_packed_fillfactor(
+                        storage
+                            .table(job.slot)
+                            .definition()
+                            .storage_options
+                            .fillfactor,
+                    )
                     .map_err(sst_to_sql)?;
                 self.merge_source_cursors = [
                     Some(SstVersionCursor::new(job.old0.handle)),
@@ -7824,8 +7835,10 @@ impl Checkpointer {
         let mut wrote_slice = false;
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
-            if !table.live
-                || { let definition = table.definition(); definition.persistence } == crate::storage::RelationPersistence::Temporary
+            if !table.live || {
+                let definition = table.definition();
+                definition.persistence
+            } == crate::storage::RelationPersistence::Temporary
             {
                 continue;
             }
@@ -7905,7 +7918,10 @@ impl Checkpointer {
             }
             let table = storage.table(slot);
             let matches_storage = table.live
-                && { let definition = table.definition(); definition.persistence } != crate::storage::RelationPersistence::Temporary
+                && {
+                    let definition = table.definition();
+                    definition.persistence
+                } != crate::storage::RelationPersistence::Temporary
                 && table.n_spill_ssts == published.n
                 && (0..published.n).all(|index| {
                     table.spill_ssts[index] == published.ssts[index].map(|prior| prior.handle)
@@ -7940,7 +7956,10 @@ impl Checkpointer {
     fn needs_slice(&self, storage: &Storage, slot: usize) -> bool {
         let table = storage.table(slot);
         table.live
-            && { let definition = table.definition(); definition.persistence } != crate::storage::RelationPersistence::Temporary
+            && {
+                let definition = table.definition();
+                definition.persistence
+            } != crate::storage::RelationPersistence::Temporary
             && table.dirty
             && self.sliced_generation[slot] != table.generation
     }
@@ -8492,8 +8511,10 @@ impl Checkpointer {
         }
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
-            if !table.live
-                || { let definition = table.definition(); definition.persistence } == crate::storage::RelationPersistence::Temporary
+            if !table.live || {
+                let definition = table.definition();
+                definition.persistence
+            } == crate::storage::RelationPersistence::Temporary
             {
                 // A dropped table's recorded list must not linger into the
                 // GC keep-set the swap below publishes.
@@ -11641,7 +11662,10 @@ impl Checkpointer {
         (0..storage.physical_table_count()).any(|slot| {
             let table = storage.table(slot);
             table.live
-                && { let definition = table.definition(); definition.persistence } != crate::storage::RelationPersistence::Temporary
+                && {
+                    let definition = table.definition();
+                    definition.persistence
+                } != crate::storage::RelationPersistence::Temporary
                 && (0..storage.value_binding_count(slot)).any(|binding| {
                     storage.value_binding_is_committed(slot, binding)
                         && storage.value_binding_needs_publish(slot, binding)

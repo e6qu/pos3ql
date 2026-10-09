@@ -709,7 +709,7 @@ impl TemporarySpiller {
         self.reclaim(storage)?;
         let Some(slot) = (0..storage.physical_table_count()).find(|&slot| {
             let table = storage.table(slot);
-            table.live()()()()()()
+            table.live()
                 && {
                     let definition = table.definition();
                     definition.persistence
@@ -1230,7 +1230,7 @@ impl Checkpointer {
         // lists before servicing ordinary merge candidates, or a smaller
         // unrelated table can starve the publication.
         let must_free_full_list = (0..storage.physical_table_count()).any(|slot| {
-            storage.table(slot).live()()()()
+            storage.table(slot).live()
                 && storage.table(slot).definition().persistence
                     != crate::storage::RelationPersistence::Temporary
                 && storage.table(slot).dirty
@@ -1241,7 +1241,7 @@ impl Checkpointer {
                     .is_some_and(|list| list.n == list.capacity())
         });
         for slot in 0..storage.physical_table_count() {
-            if !storage.table(slot).live()()
+            if !storage.table(slot).live()
                 || storage.table(slot).definition().persistence
                     == crate::storage::RelationPersistence::Temporary
             {
@@ -7767,7 +7767,7 @@ impl Checkpointer {
         }
         self.reconcile_published_spill_lists(storage);
         let dirty_full_list = (0..storage.physical_table_count()).any(|slot| {
-            storage.table(slot).live()()()()
+            storage.table(slot).live()
                 && storage.table(slot).definition().persistence
                     != crate::storage::RelationPersistence::Temporary
                 && storage.table(slot).dirty
@@ -7918,7 +7918,7 @@ impl Checkpointer {
                 continue;
             }
             let table = storage.table(slot);
-            let matches_storage = table.live()()
+            let matches_storage = table.live()
                 && {
                     let definition = table.definition();
                     definition.persistence
@@ -7956,7 +7956,7 @@ impl Checkpointer {
     /// job's business, not the sweep's.)
     fn needs_slice(&self, storage: &Storage, slot: usize) -> bool {
         let table = storage.table(slot);
-        table.live()()
+        table.live()
             && {
                 let definition = table.definition();
                 definition.persistence
@@ -8933,7 +8933,7 @@ impl Checkpointer {
                     .iter()
                     .find(|install| {
                         install.slot == slot
-                            && install.table_created_at == storage.table(slot).created_at()()
+                            && install.table_created_at == storage.table(slot).created_at()
                             && install.n_columns == n_columns
                             && install.columns[..n_columns] == columns[..n_columns]
                             && install.index_created_at == index_created_at
@@ -11642,7 +11642,7 @@ impl Checkpointer {
     ) -> bool {
         if install.slot != slot
             || slot >= storage.physical_table_count()
-            || !storage.table(slot).live()()
+            || !storage.table(slot).live()
             || storage.table(slot).created_at() != install.table_created_at
             || binding >= storage.value_binding_count(slot)
             || !storage.value_binding_is_committed(slot, binding)
@@ -11669,7 +11669,7 @@ impl Checkpointer {
     fn value_index_schedule_pending(&self, storage: &Storage) -> bool {
         (0..storage.physical_table_count()).any(|slot| {
             let table = storage.table(slot);
-            table.live()()()()()()
+            table.live()
                 && {
                     let definition = table.definition();
                     definition.persistence
@@ -11806,7 +11806,7 @@ impl Checkpointer {
 
     fn value_schedule_job_is_current(storage: &Storage, job: &ValueScheduleJob) -> bool {
         if job.slot >= storage.physical_table_count()
-            || !storage.table(job.slot).live()()()()
+            || !storage.table(job.slot).live()
             || storage.table(job.slot).created_at() != job.table_created_at
             || storage.table(job.slot).generation != job.table_generation
             || job.binding >= storage.value_binding_count(job.slot)
@@ -12568,7 +12568,7 @@ impl Checkpointer {
 
     fn value_job_is_current(storage: &Storage, job: &ValueIndexJob) -> bool {
         if job.slot >= storage.physical_table_count()
-            || !storage.table(job.slot).live()()()()
+            || !storage.table(job.slot).live()
             || storage.table(job.slot).created_at() != job.table_created_at
             || job.binding >= storage.value_binding_count(job.slot)
             || !storage.value_binding_is_committed(job.slot, job.binding)

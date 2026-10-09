@@ -31397,8 +31397,11 @@ impl Storage {
                     changes_existence,
                 },
             )?;
-            if track_statistics {
-                self.record_relation_write(txid, table_index, existed, loc.is_some())?;
+            if track_statistics
+                && let Err(error) = self.record_relation_write(txid, table_index, existed, loc.is_some())
+            {
+                self.restore_pending(table_index, rowid, txid, undo);
+                return Err(error);
             }
             return Ok(undo);
         }
@@ -31466,8 +31469,11 @@ impl Storage {
                 },
             )
             .expect("capacity checked above");
-        if track_statistics {
-            self.record_relation_write(txid, table_index, existed, loc.is_some())?;
+        if track_statistics
+            && let Err(error) = self.record_relation_write(txid, table_index, existed, loc.is_some())
+        {
+            self.restore_pending(table_index, rowid, txid, undo);
+            return Err(error);
         }
         Ok(undo)
     }
@@ -52682,6 +52688,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn visible_row_heap_ownership_statistics_exhaustion_reverts_pending_append() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("write_statistics", &[("id", ColType::Int4, false)])).unwrap();
+        let values = [Datum::Int4(1)];
+        let (location, bytes) = storage.heap.append(rowenc::encoded_len(&values)).unwrap();
+        rowenc::encode(&values, bytes);
+        {
+            let mut statistics = storage.cumulative_statistics();
+            while statistics.relation_transactions.len() < statistics.relation_transactions.capacity() {
+                statistics.relation_transactions.push(RelationTransactionStatistics::new(8, table, 1)).unwrap();
+            }
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            let error = storage.write_pending(table, 1, 7, 1, Some(location)).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(storage.resident_row_state(table, 1).is_none());
+            storage.tables[table].rows.insert(1, RowState::committed_only_at(location, 7)).unwrap();
+            let error = storage.write_pending(table, 1, 7, 1, None).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            let row = storage.resident_row_state(table, 1).unwrap();
+            assert!(row.pending.is_none());
+            assert_eq!(row.committed, Some(RowHome::Heap(location)));
+            drop(row);
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.heap.test_write().is_ok());
+        });
+    }
+
+    #[test]
     fn visible_row_heap_ownership_pins_before_metadata_owner_releases() {
         let config = test_config();
         let mut budget = test_budget(&config);
@@ -52741,6 +52778,40 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(storage.heap.test_write().is_ok());
+        });
+    }
+
+    #[test]
+    fn visible_row_heap_ownership_committed_snapshot_freezes_selected_lsn() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("committed_snapshot", &[("id", ColType::Int4, false)])).unwrap();
+        storage.heap.append(4).unwrap();
+        let (original, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"old!");
+        let mut state = RowState::committed_only_at(original, 7);
+        storage.tables[table].rows.insert(1, state).unwrap();
+        let image = storage.visible_row_home_at(table, 1, storage.resident_row_state(table, 1).unwrap(), 7, SNAPSHOT_ALL, u64::MAX).unwrap().unwrap();
+        let retained = image.snapshot();
+        drop(image);
+        let arena = Arena::new(&mut budget, "committed snapshot images", 16).unwrap();
+        let mut scratch = FixedVec::new(&mut budget, "committed snapshot compaction", 8).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let (later, bytes) = storage.heap.append(4).unwrap();
+            bytes.copy_from_slice(b"new!");
+            push_committed_version(&mut storage.row_versions.exclusive().committed_row_versions, &mut state.history, storage.max_row_versions_per_row, CommittedVersion { home: state.committed, lsn: 7 }).unwrap();
+            state.committed = Some(RowHome::Heap(later));
+            state.committed_lsn = 8;
+            storage.tables[table].rows.insert(1, state).unwrap();
+            storage.compact_heap(&mut scratch).unwrap();
+            assert_eq!(storage.row_bytes(table, 1, retained, &arena).unwrap(), b"old!");
+            let image = storage.visible_row_home_at(table, 1, storage.resident_row_state(table, 1).unwrap(), 7, SNAPSHOT_ALL, u64::MAX).unwrap().unwrap();
+            assert_eq!(storage.row_bytes(table, 1, image, &arena).unwrap(), b"new!");
+            let versions = storage.row_versions.exclusive();
+            let state = storage.tables[table].rows.get_mut(&1).unwrap();
+            prune_committed_history(&mut versions.committed_row_versions, &mut state.history, None);
+            assert_eq!(storage.row_bytes(table, 1, retained, &arena).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
         });
     }
 

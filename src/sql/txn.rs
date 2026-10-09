@@ -2193,6 +2193,7 @@ impl TxnState {
 
     pub fn clear(&mut self) {
         self.mode = TxnMode::Idle;
+        self.command_id = 0;
         self.failed = false;
         self.isolation = TransactionIsolation::ReadCommitted;
         self.read_only = false;
@@ -2248,6 +2249,10 @@ mod tests {
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
                 assert_eq!(txn.command_id(), crate::storage::SNAPSHOT_ALL - 1);
             }
+            txn.clear();
+            assert_eq!(txn.command_id(), 0);
+            txn.begin_command().unwrap();
+            assert_eq!(txn.command_id(), 1);
         });
     }
 }

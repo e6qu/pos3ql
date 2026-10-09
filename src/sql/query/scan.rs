@@ -6005,8 +6005,9 @@ fn scan_source_mode<'a>(
                     }
                     Ok(ControlFlow::Continue(()))
                 })?;
-                probe_ordered[..probe_fill]
-                    .sort_unstable_by_key(|row| row.expect("row snapshots are initialized").sort_key());
+                probe_ordered[..probe_fill].sort_unstable_by_key(|row| {
+                    row.expect("row snapshots are initialized").sort_key()
+                });
 
                 for row in probe_ordered[..probe_fill].iter().copied().flatten() {
                     let rowid = row.rowid();
@@ -6734,9 +6735,7 @@ fn scan_source_mode<'a>(
             };
             let table_snapshot = storage.table_row_snapshot(slot);
             let ordered = arena
-                .alloc_slice_with(count, |_| {
-                    None::<crate::storage::OrderedRowSnapshot>
-                })
+                .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
                 .map_err(|_| arena_full())?;
             let mut fill = 0usize;
             if let Some(rowids) = candidates {
@@ -6763,8 +6762,9 @@ fn scan_source_mode<'a>(
             // they were written in); heap rows keep heap-offset order after
             // them, matching insertion order within each group.
             if access.is_none_or(|access| !access.preserves_order) {
-                ordered[..fill]
-                    .sort_unstable_by_key(|row| row.expect("row snapshots are initialized").sort_key());
+                ordered[..fill].sort_unstable_by_key(|row| {
+                    row.expect("row snapshots are initialized").sort_key()
+                });
             }
             for (this, row) in ordered[..fill].iter().copied().flatten().enumerate() {
                 let rowid = row.rowid();

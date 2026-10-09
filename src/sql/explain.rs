@@ -1591,7 +1591,13 @@ pub(super) fn plan_modification<'a>(
                 .then(|| {
                     let definition = storage.table_def(slot, txid);
                     query::dml_index_access_plan(
-                        storage, slot, &definition, alias, txid, predicate, arena,
+                        storage,
+                        slot,
+                        &definition,
+                        alias,
+                        txid,
+                        predicate,
+                        arena,
                     )
                 })
                 .transpose()?

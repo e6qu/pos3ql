@@ -410,12 +410,11 @@ fn collect_statement(
             let result = (|| {
                 record_routine_target(insert.table, storage, txid, path, dependencies)?;
                 let scope = dml_dependency_scope(storage, insert.table, None, None, txid, arena)?;
-                let definitions = storage.table_definition_images();
                 let excluded = match storage.resolve_relation_under(
                     path, insert.table.schema, insert.table.name, txid,
                 ) {
                     Some(ResolvedRelation::Table(slot)) => Some((
-                        slot, definitions.definition(storage, slot, txid)?,
+                        slot, scope.defs.get(0).expect("target resolved"),
                     )),
                     _ => None,
                 };

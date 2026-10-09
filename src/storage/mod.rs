@@ -20666,11 +20666,7 @@ impl Storage {
                     (source_parent.schema, source_parent.name)
                 };
                 let target_parent = self
-                    .find_visible(
-                        parent_schema.as_str(),
-                        parent_name.as_str(),
-                        txid,
-                    )
+                    .find_visible(parent_schema.as_str(), parent_name.as_str(), txid)
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::INTERNAL_ERROR,
@@ -50594,8 +50590,7 @@ impl Storage {
         ({
             let definition = self.tables[table].definition();
             definition.has_rules
-        })
-        || self.tables[table].pending_has_rules_txid == Some(txid)
+        }) || self.tables[table].pending_has_rules_txid == Some(txid)
     }
 
     pub(crate) fn commit_rule_alter(&mut self, slot: usize, txid: u32) {

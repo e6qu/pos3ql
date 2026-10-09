@@ -64,26 +64,34 @@ pub(crate) fn capture_before<'a>(
     }
 
     let table_is_explicitly_dropped = |slot: usize| {
-        let table = storage.table_def(slot, txid);
+        let (table_schema, table_name) = {
+            let table = storage.table_def(slot, txid);
+            (table.schema, table.name)
+        };
         match statement {
             Stmt::DropTable(drop) => drop.names.iter().any(|name| {
-                name.name == table.name.as_str()
+                name.name == table_name.as_str()
                     && name
                         .schema
-                        .is_none_or(|schema| schema == table.schema.as_str())
+                        .is_none_or(|schema| schema == table_schema.as_str())
             }),
             Stmt::DropSchema { names, .. } => {
-                names.iter().any(|schema| *schema == table.schema.as_str())
+                names.iter().any(|schema| *schema == table_schema.as_str())
             }
             _ => false,
         }
     };
 
     for child_slot in 0..storage.table_count() {
-        let child = storage.table_def(child_slot, txid);
         if table_is_explicitly_dropped(child_slot) {
             continue;
         }
+        let definitions = storage.table_definition_images();
+        let child = match before.altered_table.as_ref() {
+            Some((slot, retained)) if *slot == child_slot =>
+                retained.definition(storage, child_slot, txid)?,
+            _ => definitions.definition(storage, child_slot, txid)?,
+        };
         for (foreign_key_index, foreign_key) in child.fkeys().iter().enumerate() {
             let Some(parent_slot) = storage.find_visible(
                 foreign_key.parent_schema.as_str(),
@@ -115,7 +123,7 @@ pub(crate) fn capture_before<'a>(
                 continue;
             }
             let reference = detached_constraint(
-                &child,
+                child,
                 catalog::foreign_key_constraint_oid(child_slot, foreign_key_index),
                 foreign_key.name.as_str(),
             );
@@ -131,7 +139,7 @@ pub(crate) fn capture_before<'a>(
                 .map_err(|_| graph_full())?;
             for ordinal in 0..4 {
                 let reference = foreign_key_trigger_reference(
-                    &child,
+                    child,
                     child_slot,
                     foreign_key_index,
                     foreign_key,

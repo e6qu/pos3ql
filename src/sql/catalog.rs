@@ -19629,9 +19629,9 @@ fn pg_constraint<'a>(
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_constraint"));
         }
-        let fk = &storage.table_def(info.child_slot, txid).fkeys()[info.fk_index];
+        let fk = storage.table_def(info.child_slot, txid).fkeys()[info.fk_index];
         let constraint_parent_oid =
-            inherited_foreign_key_parent_oid(storage, txid, info.child_slot, fk);
+            inherited_foreign_key_parent_oid(storage, txid, info.child_slot, &fk);
         // conindid points at the parent's unique/PK index backing the referenced
         // columns, which JDBC joins to for foreign-key metadata.
         let conindid = indexes
@@ -21294,7 +21294,8 @@ fn index_operator_classes<'a>(
             let source = index_expression_source(storage, info, position, txid)
                 .expect("expression index has source");
             let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
-            let (oid, _) = super::exec::infer_type_catalog(expression, Some(&table), storage, txid)?;
+            let (oid, _) =
+                super::exec::infer_type_catalog(expression, Some(&table), storage, txid)?;
             super::exec::catalog_column_type(storage, txid, oid)
                 .map(|(ctype, _)| ctype)
                 .and_then(crate::sql::types::BtreeOperatorClass::for_type)

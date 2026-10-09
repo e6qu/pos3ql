@@ -7,6 +7,35 @@
 use super::*;
 
 #[test]
+fn live_definition_ownership_returning_descriptions_keep_names_and_modifiers() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(&mut engine, &mut budget,
+        "CREATE TABLE definition_returning (id integer, label varchar(3))");
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let mut before = Vec::new();
+    for statement in [
+        "INSERT INTO definition_returning VALUES (1, 'abc') RETURNING *",
+        "INSERT INTO definition_returning VALUES (1, 'abc') RETURNING new.*",
+        "INSERT INTO definition_returning VALUES (1, 'abc') RETURNING (new).*",
+    ] {
+        let described = describe_with(&mut engine, &mut budget, statement);
+        assert_eq!(row_description_names(&described), ["id", "label"]);
+        assert_eq!(row_description_type_modifiers(&described), [-1, 7]);
+        before.push(described);
+    }
+    let renamed = run_with(&mut engine, &mut budget,
+        "ALTER TABLE definition_returning RENAME COLUMN label TO value");
+    assert!(!String::from_utf8_lossy(&renamed).contains("ERROR"));
+    let after = describe_with(&mut engine, &mut budget,
+        "INSERT INTO definition_returning VALUES (1, 'abc') RETURNING *");
+    assert_eq!(row_description_names(&after), ["id", "value"]);
+    assert_eq!(row_description_type_modifiers(&after), [-1, 7]);
+    for described in before {
+        assert_eq!(row_description_names(&described), ["id", "label"]);
+    }
+}
+
+#[test]
 fn live_definition_ownership_catalog_tracks_rename_schema_and_rollback() {
     let (mut engine, mut budget) = test_engine();
     let query = "SELECT t.typname, n.nspname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname IN ('definition_owner_before', '_definition_owner_before', 'definition_owner_after', '_definition_owner_after') ORDER BY t.typname";

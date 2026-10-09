@@ -36410,7 +36410,9 @@ fn stored_rule_definition(
             let definition = definitions.definition(storage, usize::from(slot), txn.txid)?;
             condition_columns.count = definition.n_columns;
             for (index, column) in definition.columns().iter().enumerate() {
-                condition_columns.names[index] = arena.alloc_str(column.name.as_str()).map_err(|_| arena_full())?;
+                condition_columns.names[index] = arena
+                    .alloc_str(column.name.as_str())
+                    .map_err(|_| arena_full())?;
                 condition_columns.metadata[index] = StaticTypeMeta {
                     ctype: column.ctype,
                     type_oid: storage

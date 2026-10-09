@@ -7,6 +7,27 @@
 use super::*;
 
 #[test]
+fn visible_row_heap_ownership_command_exhaustion_allows_rollback() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 16).unwrap();
+    let mut guc = GucState::new();
+    let setup = run_session_transaction(&mut engine, &mut budget, &mut txn, &mut guc,
+        "BEGIN; CREATE TABLE exhausted_command (id integer); INSERT INTO exhausted_command VALUES (1)");
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    txn.test_set_command_id(crate::storage::SNAPSHOT_ALL - 1);
+    let output = run_session_transaction(&mut engine, &mut budget, &mut txn, &mut guc,
+        "UPDATE exhausted_command SET id = 2");
+    assert!(String::from_utf8_lossy(&output).contains("54000"));
+    let output = run_session_transaction(&mut engine, &mut budget, &mut txn, &mut guc, "ROLLBACK");
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    assert_eq!(txn.command_id(), 0);
+    assert!(!txn.is_active());
+    assert!(engine.storage.find_table("public", "exhausted_command").is_none());
+    let output = run_session_transaction(&mut engine, &mut budget, &mut txn, &mut guc, "SELECT 1");
+    assert_eq!(data_rows(&output), ["1"]);
+}
+
+#[test]
 fn visible_row_heap_ownership_transaction_exhaustion_rejects_wire_statement() {
     let (mut engine, mut budget) = test_engine();
     engine.next_txid = u32::MAX;

@@ -67832,9 +67832,18 @@ fn store_row_with_identity(
         storage.restore_pending(table_index, rowid, txn.txid, prior);
         return Err(e);
     }
-    let state = storage.resident_row_state(table_index, rowid)
+    let state = storage
+        .resident_row_state(table_index, rowid)
         .expect("a successful pending append publishes its row state");
-    let image = storage.visible_row_home_at(table_index, rowid, state, txn.txid, crate::storage::SNAPSHOT_ALL, u64::MAX)?
+    let image = storage
+        .visible_row_home_at(
+            table_index,
+            rowid,
+            state,
+            txn.txid,
+            crate::storage::SNAPSHOT_ALL,
+            u64::MAX,
+        )?
         .expect("a successful row insert has a visible image");
     Ok(PhysicalRow::local(table_index, rowid, image.snapshot()))
 }

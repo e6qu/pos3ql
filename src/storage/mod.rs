@@ -29825,18 +29825,35 @@ impl Storage {
         // Acquire bytes before releasing the owner of the selected location.
         let resident = visible
             .and_then(|(version, home)| home.map(|home| (version, home)))
-            .map(|(version, home)| self.pin_visible_home(RowSnapshot { created_at, version }, home))
+            .map(|(version, home)| {
+                self.pin_visible_home(
+                    RowSnapshot {
+                        created_at,
+                        version,
+                    },
+                    home,
+                )
+            })
             .transpose()?;
         drop(state);
         if visible.is_some() {
             return Ok(resident);
         }
-        Ok(self.spill_probe_at(table_slot, rowid, commit_snapshot)?.and_then(|version| {
-            version.len.map(|len| VisibleRowHome::spilled(
-                RowSnapshot { created_at, version: RowVersionIdentity::Committed(version.commit_lsn) },
-                len, version.member, version.commit_lsn,
-            ))
-        }))
+        Ok(self
+            .spill_probe_at(table_slot, rowid, commit_snapshot)?
+            .and_then(|version| {
+                version.len.map(|len| {
+                    VisibleRowHome::spilled(
+                        RowSnapshot {
+                            created_at,
+                            version: RowVersionIdentity::Committed(version.commit_lsn),
+                        },
+                        len,
+                        version.member,
+                        version.commit_lsn,
+                    )
+                })
+            }))
     }
 
     fn pin_visible_home(
@@ -29867,20 +29884,38 @@ impl Storage {
             ));
         }
         let state = self.row_state(table_slot, rowid)?.ok_or_else(|| {
-            sql_err!(sqlstate::SERIALIZATION_FAILURE, "retained row version is no longer available")
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "retained row version is no longer available"
+            )
         })?;
         match snapshot.version {
             RowVersionIdentity::Pending(identity) => {
-                let home = state.retained_pending_home(identity).flatten().ok_or_else(|| {
-                    sql_err!(sqlstate::SERIALIZATION_FAILURE, "retained pending row version is no longer available")
-                })?;
+                let home = state
+                    .retained_pending_home(identity)
+                    .flatten()
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::SERIALIZATION_FAILURE,
+                            "retained pending row version is no longer available"
+                        )
+                    })?;
                 self.pin_visible_home(snapshot, RowHome::Heap(home))
             }
             RowVersionIdentity::Committed(commit_lsn) => {
-                let image = self.visible_row_home_at(table_slot, rowid, state, 0, SNAPSHOT_ALL, commit_lsn)?
-                    .ok_or_else(|| sql_err!(sqlstate::SERIALIZATION_FAILURE, "retained committed row version is no longer available"))?;
+                let image = self
+                    .visible_row_home_at(table_slot, rowid, state, 0, SNAPSHOT_ALL, commit_lsn)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::SERIALIZATION_FAILURE,
+                            "retained committed row version is no longer available"
+                        )
+                    })?;
                 if image.snapshot().version != snapshot.version {
-                    return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "retained committed row version was retired"));
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "retained committed row version was retired"
+                    ));
                 }
                 Ok(image)
             }
@@ -31398,7 +31433,8 @@ impl Storage {
                 },
             )?;
             if track_statistics
-                && let Err(error) = self.record_relation_write(txid, table_index, existed, loc.is_some())
+                && let Err(error) =
+                    self.record_relation_write(txid, table_index, existed, loc.is_some())
             {
                 self.restore_pending(table_index, rowid, txid, undo);
                 return Err(error);
@@ -31470,7 +31506,8 @@ impl Storage {
             )
             .expect("capacity checked above");
         if track_statistics
-            && let Err(error) = self.record_relation_write(txid, table_index, existed, loc.is_some())
+            && let Err(error) =
+                self.record_relation_write(txid, table_index, existed, loc.is_some())
         {
             self.restore_pending(table_index, rowid, txid, undo);
             return Err(error);
@@ -31655,7 +31692,9 @@ impl Storage {
         let Some(state) = self.tables[table_index].rows.get(&rowid) else {
             return;
         };
-        let Some(slot) = state.pending.tail else { return; };
+        let Some(slot) = state.pending.tail else {
+            return;
+        };
         {
             let versions = self.row_versions.read();
             let head = versions.pending_row_versions[slot];
@@ -31664,7 +31703,10 @@ impl Storage {
             }
         }
         let versions = self.row_versions.exclusive();
-        let state = self.tables[table_index].rows.get_mut(&rowid).expect("row was observed");
+        let state = self.tables[table_index]
+            .rows
+            .get_mut(&rowid)
+            .expect("row was observed");
         pop_pending_version(&mut versions.pending_row_versions, &mut state.pending);
         if (state.committed.is_none() && state.history.is_empty() && state.pending.is_none())
             || Self::redundant_spilled_row_state(state)
@@ -52670,8 +52712,6 @@ impl Storage {
         replace_execution_visibility(visibility);
     }
 
-
-
     /// Recovery: pins the LSN to a replayed record's.
     pub fn set_lsn(&mut self, lsn: u64) {
         self.lsn = lsn;
@@ -52692,21 +52732,36 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage.create_table(make_def("write_statistics", &[("id", ColType::Int4, false)])).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "write_statistics",
+                &[("id", ColType::Int4, false)],
+            ))
+            .unwrap();
         let values = [Datum::Int4(1)];
         let (location, bytes) = storage.heap.append(rowenc::encoded_len(&values)).unwrap();
         rowenc::encode(&values, bytes);
         {
             let mut statistics = storage.cumulative_statistics();
-            while statistics.relation_transactions.len() < statistics.relation_transactions.capacity() {
-                statistics.relation_transactions.push(RelationTransactionStatistics::new(8, table, 1)).unwrap();
+            while statistics.relation_transactions.len()
+                < statistics.relation_transactions.capacity()
+            {
+                statistics
+                    .relation_transactions
+                    .push(RelationTransactionStatistics::new(8, table, 1))
+                    .unwrap();
             }
         }
         crate::mem::guard::forbid_alloc(|| {
-            let error = storage.write_pending(table, 1, 7, 1, Some(location)).unwrap_err();
+            let error = storage
+                .write_pending(table, 1, 7, 1, Some(location))
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(storage.resident_row_state(table, 1).is_none());
-            storage.tables[table].rows.insert(1, RowState::committed_only_at(location, 7)).unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, RowState::committed_only_at(location, 7))
+                .unwrap();
             let error = storage.write_pending(table, 1, 7, 1, None).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             let row = storage.resident_row_state(table, 1).unwrap();
@@ -52786,13 +52841,28 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage.create_table(make_def("committed_snapshot", &[("id", ColType::Int4, false)])).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "committed_snapshot",
+                &[("id", ColType::Int4, false)],
+            ))
+            .unwrap();
         storage.heap.append(4).unwrap();
         let (original, bytes) = storage.heap.append(4).unwrap();
         bytes.copy_from_slice(b"old!");
         let mut state = RowState::committed_only_at(original, 7);
         storage.tables[table].rows.insert(1, state).unwrap();
-        let image = storage.visible_row_home_at(table, 1, storage.resident_row_state(table, 1).unwrap(), 7, SNAPSHOT_ALL, u64::MAX).unwrap().unwrap();
+        let image = storage
+            .visible_row_home_at(
+                table,
+                1,
+                storage.resident_row_state(table, 1).unwrap(),
+                7,
+                SNAPSHOT_ALL,
+                u64::MAX,
+            )
+            .unwrap()
+            .unwrap();
         let retained = image.snapshot();
         drop(image);
         let arena = Arena::new(&mut budget, "committed snapshot images", 16).unwrap();
@@ -52800,18 +52870,50 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let (later, bytes) = storage.heap.append(4).unwrap();
             bytes.copy_from_slice(b"new!");
-            push_committed_version(&mut storage.row_versions.exclusive().committed_row_versions, &mut state.history, storage.max_row_versions_per_row, CommittedVersion { home: state.committed, lsn: 7 }).unwrap();
+            push_committed_version(
+                &mut storage.row_versions.exclusive().committed_row_versions,
+                &mut state.history,
+                storage.max_row_versions_per_row,
+                CommittedVersion {
+                    home: state.committed,
+                    lsn: 7,
+                },
+            )
+            .unwrap();
             state.committed = Some(RowHome::Heap(later));
             state.committed_lsn = 8;
             storage.tables[table].rows.insert(1, state).unwrap();
             storage.compact_heap(&mut scratch).unwrap();
-            assert_eq!(storage.row_bytes(table, 1, retained, &arena).unwrap(), b"old!");
-            let image = storage.visible_row_home_at(table, 1, storage.resident_row_state(table, 1).unwrap(), 7, SNAPSHOT_ALL, u64::MAX).unwrap().unwrap();
+            assert_eq!(
+                storage.row_bytes(table, 1, retained, &arena).unwrap(),
+                b"old!"
+            );
+            let image = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.resident_row_state(table, 1).unwrap(),
+                    7,
+                    SNAPSHOT_ALL,
+                    u64::MAX,
+                )
+                .unwrap()
+                .unwrap();
             assert_eq!(storage.row_bytes(table, 1, image, &arena).unwrap(), b"new!");
             let versions = storage.row_versions.exclusive();
             let state = storage.tables[table].rows.get_mut(&1).unwrap();
-            prune_committed_history(&mut versions.committed_row_versions, &mut state.history, None);
-            assert_eq!(storage.row_bytes(table, 1, retained, &arena).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            prune_committed_history(
+                &mut versions.committed_row_versions,
+                &mut state.history,
+                None,
+            );
+            assert_eq!(
+                storage
+                    .row_bytes(table, 1, retained, &arena)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
         });
     }
 
@@ -52820,12 +52922,26 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage.create_table(make_def("same_command", &[("id", ColType::Int4, false)])).unwrap();
+        let table = storage
+            .create_table(make_def("same_command", &[("id", ColType::Int4, false)]))
+            .unwrap();
         storage.heap.append(4).unwrap();
         let (original, bytes) = storage.heap.append(4).unwrap();
         bytes.copy_from_slice(b"old!");
-        let first = storage.write_pending_untracked(table, 1, 7, 2, Some(original)).unwrap();
-        let image = storage.visible_row_home_at(table, 1, storage.resident_row_state(table, 1).unwrap(), 7, SNAPSHOT_ALL, 7).unwrap().unwrap();
+        let first = storage
+            .write_pending_untracked(table, 1, 7, 2, Some(original))
+            .unwrap();
+        let image = storage
+            .visible_row_home_at(
+                table,
+                1,
+                storage.resident_row_state(table, 1).unwrap(),
+                7,
+                SNAPSHOT_ALL,
+                7,
+            )
+            .unwrap()
+            .unwrap();
         let retained = image.snapshot();
         drop(image);
         let mut scratch = FixedVec::new(&mut budget, "same command compaction", 8).unwrap();
@@ -52833,24 +52949,65 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let (later, bytes) = storage.heap.append(4).unwrap();
             bytes.copy_from_slice(b"new!");
-            let second = storage.write_pending_untracked(table, 1, 7, 2, Some(later)).unwrap();
-            let image = storage.visible_row_home_at(table, 1, storage.resident_row_state(table, 1).unwrap(), 7, SNAPSHOT_ALL, 7).unwrap().unwrap();
+            let second = storage
+                .write_pending_untracked(table, 1, 7, 2, Some(later))
+                .unwrap();
+            let image = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.resident_row_state(table, 1).unwrap(),
+                    7,
+                    SNAPSHOT_ALL,
+                    7,
+                )
+                .unwrap()
+                .unwrap();
             let removed = image.snapshot();
             drop(image);
             storage.compact_heap(&mut scratch).unwrap();
-            assert_eq!(storage.row_bytes(table, 1, retained, &arena).unwrap(), b"old!");
-            assert_eq!(storage.row_bytes(table, 1, removed, &arena).unwrap(), b"new!");
+            assert_eq!(
+                storage.row_bytes(table, 1, retained, &arena).unwrap(),
+                b"old!"
+            );
+            assert_eq!(
+                storage.row_bytes(table, 1, removed, &arena).unwrap(),
+                b"new!"
+            );
             storage.restore_pending(table, 1, 7, second);
-            assert_eq!(storage.row_bytes(table, 1, removed, &arena).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(
+                storage
+                    .row_bytes(table, 1, removed, &arena)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
             let (replacement, bytes) = storage.heap.append(4).unwrap();
             bytes.copy_from_slice(b"next");
-            let third = storage.write_pending_untracked(table, 1, 7, 2, Some(replacement)).unwrap();
-            assert_eq!(storage.row_bytes(table, 1, removed, &arena).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            let third = storage
+                .write_pending_untracked(table, 1, 7, 2, Some(replacement))
+                .unwrap();
+            assert_eq!(
+                storage
+                    .row_bytes(table, 1, removed, &arena)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
             storage.restore_pending(table, 1, 7, second);
-            assert_eq!(storage.resident_row_state(table, 1).unwrap().pending.len(), 2);
-            assert_eq!(storage.row_bytes(table, 1, retained, &arena).unwrap(), b"old!");
+            assert_eq!(
+                storage.resident_row_state(table, 1).unwrap().pending.len(),
+                2
+            );
+            assert_eq!(
+                storage.row_bytes(table, 1, retained, &arena).unwrap(),
+                b"old!"
+            );
             storage.restore_pending(table, 1, 7, third);
-            assert_eq!(storage.row_bytes(table, 1, retained, &arena).unwrap(), b"old!");
+            assert_eq!(
+                storage.row_bytes(table, 1, retained, &arena).unwrap(),
+                b"old!"
+            );
             storage.restore_pending(table, 1, 7, first);
             assert!(storage.resident_row_state(table, 1).is_none());
             assert!(storage.heap.test_write().is_ok());

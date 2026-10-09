@@ -8,7 +8,8 @@ use std::sync::{RwLock, RwLockReadGuard};
 
 use super::{
     CommittedHistory, CommittedVersion, CommittedVersionSlot, PendingChange, PendingVersionSlot,
-    PendingVersions, PendingWriteUndo, RowHome, RowLoc, committed_row_version_capacity, pending_row_version_capacity,
+    PendingVersions, PendingWriteUndo, RowLoc, committed_row_version_capacity,
+    pending_row_version_capacity,
 };
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
@@ -167,7 +168,10 @@ pub(super) fn push_pending_version(
     change: PendingChange,
 ) -> Result<PendingWriteUndo, SqlError> {
     let identity = pool.next_identity.checked_add(1).ok_or_else(|| {
-        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "pending row-version identity space is exhausted")
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "pending row-version identity space is exhausted"
+        )
     })?;
     let (pool, free, next_identity) = (&mut pool.slots, &mut pool.free, &mut pool.next_identity);
     if versions.len >= maximum {
@@ -375,7 +379,7 @@ pub(super) fn prune_committed_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::ColumnSet;
+    use crate::storage::{ColumnSet, RowHome};
 
     fn pools(capacity: usize) -> RowVersionPools {
         let mut budget = Budget::new(
@@ -413,12 +417,24 @@ mod tests {
         let mut owner = pools(1);
         let state = owner.exclusive();
         let mut versions = PendingVersions::empty();
-        push_pending_version(&mut state.pending_row_versions, &mut versions, 1, pending(1)).unwrap();
+        push_pending_version(
+            &mut state.pending_row_versions,
+            &mut versions,
+            1,
+            pending(1),
+        )
+        .unwrap();
         pop_pending_version(&mut state.pending_row_versions, &mut versions).unwrap();
         let free = state.pending_row_versions.free;
         state.pending_row_versions.next_identity = u64::MAX;
         crate::mem::guard::forbid_alloc(|| {
-            let error = push_pending_version(&mut state.pending_row_versions, &mut versions, 1, pending(1)).unwrap_err();
+            let error = push_pending_version(
+                &mut state.pending_row_versions,
+                &mut versions,
+                1,
+                pending(1),
+            )
+            .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(state.pending_row_versions.free, free);
             assert_eq!(state.pending_row_versions.len(), 1);
@@ -458,7 +474,8 @@ mod tests {
                 Some(retained_pending.loc)
             );
             assert_eq!(
-                committed_version_at(&reader.committed_row_versions, history, 3).map(|version| version.home),
+                committed_version_at(&reader.committed_row_versions, history, 3)
+                    .map(|version| version.home),
                 Some(retained_history.home)
             );
             drop(reader);

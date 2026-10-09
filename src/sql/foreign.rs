@@ -19,7 +19,7 @@ const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 /// the transport boundary prevents a remote row locator from being confused
 /// with user SQL or an arbitrary parameter string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RemoteTupleId {
+pub(crate) struct RemoteTupleId {
     block: u32,
     offset: u16,
 }
@@ -74,7 +74,7 @@ impl RemoteTupleId {
         Ok(Self { block, offset })
     }
 
-    pub fn write_text<const N: usize>(self, output: &mut StackStr<N>) {
+    pub(crate) fn write_text<const N: usize>(self, output: &mut StackStr<N>) {
         let _ = write!(output, "({},{})", self.block, self.offset);
     }
 

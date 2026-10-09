@@ -508,7 +508,7 @@ impl<'a> SubscriptionCopyWorkspace<'a> {
 }
 
 impl<'a, 'response> CopyRowContext<'a, 'response> {
-    pub fn new(
+    pub(crate) fn new(
         txn: &'a mut TxnState,
         seq_session: &'a guc::SeqSession,
         arena: &'a Arena,
@@ -4921,13 +4921,16 @@ impl Engine {
         &mut self,
         txn: &mut TxnState,
         takes_snapshot: bool,
+        advance_command: bool,
     ) -> Result<(), SqlError> {
         self.storage.set_foreign_statement_context(
             txn.txid,
             txn.isolation == TransactionIsolation::Serializable,
             txn.savepoint_names(),
         )?;
-        txn.begin_command()?;
+        if advance_command {
+            txn.begin_command()?;
+        }
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
         let snapshot = if takes_snapshot {
             let snapshot = txn.statement_snapshot(self.storage.lsn());
@@ -8870,7 +8873,7 @@ impl Engine {
     /// Ends a successful COPY FROM: an implicit transaction commits here
     /// (this was the statement's end); an explicit one stays open, exactly
     /// as INSERT inside BEGIN would.
-    pub fn copy_finish(
+    pub(crate) fn copy_finish(
         &mut self,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
@@ -9644,7 +9647,7 @@ impl Engine {
             responder.ready_for_query(txn.status_byte())?;
             return Ok(false);
         }
-        if let Err(error) = self.begin_command_snapshot(txn, true) {
+        if let Err(error) = self.begin_command_snapshot(txn, true, true) {
             if txn.is_explicit() {
                 txn.failed = true;
             } else {
@@ -14185,7 +14188,7 @@ impl Engine {
                 "statement is waiting for a schema lock"
             )));
         }
-        if let Err(error) = self.begin_command_snapshot(txn, true) {
+        if let Err(error) = self.begin_command_snapshot(txn, true, true) {
             return Ok(Err(error));
         }
         let event_tag = event_trigger_tag(statement);
@@ -14499,7 +14502,7 @@ impl Engine {
                 | Stmt::Show(_)
                 | Stmt::ShowAll
         );
-        if let Err(error) = self.begin_command_snapshot(txn, takes_snapshot) {
+        if let Err(error) = self.begin_command_snapshot(txn, takes_snapshot, !matches!(statement, Stmt::Commit | Stmt::Rollback)) {
             return Ok(Err(error));
         }
         if statement_writes(statement) {

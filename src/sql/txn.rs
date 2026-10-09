@@ -1063,6 +1063,11 @@ impl TxnState {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn test_set_command_id(&mut self, command: u32) {
+        self.command_id = command;
+    }
+
     pub fn enter_trigger_sql(&mut self) -> Result<(), SqlError> {
         if self.trigger_depth == MAX_TRIGGER_NESTING {
             return Err(sql_err!(

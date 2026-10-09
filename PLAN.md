@@ -55,7 +55,8 @@ Complete shared ownership before enabling overlapping execution:
 - Establish lock ordering and release guards before nested catalog resolution.
   Reuse retained images and compact metadata instead of copying wide definitions
   per row. Retained byte images consume the fixed statement arena; deferred row
-  snapshots consume bounded metadata rather than detached heap locations.
+  snapshots consume bounded metadata rather than detached heap locations;
+  single-table scans share their incarnation instead of repeating it per row.
 
 Acceptance: concurrent readers/writers retain valid images; exhaustion,
 rollback, identity reuse, and failed creation preserve prior state; all controls

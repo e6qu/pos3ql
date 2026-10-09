@@ -16,6 +16,48 @@ pub(super) enum RowVersionIdentity {
     Committed(u64),
 }
 
+/// One incarnation shared by all retained rows in a single-table scan.
+#[derive(Clone, Copy)]
+pub(crate) struct TableRowSnapshot {
+    pub(super) created_at: u64,
+}
+
+/// Compact scan metadata keeps physical ordering separate from byte identity.
+#[derive(Clone, Copy)]
+pub(crate) struct OrderedRowSnapshot {
+    rowid: u64,
+    version: RowVersionIdentity,
+    heap_offset: Option<u32>,
+}
+
+impl TableRowSnapshot {
+    pub(crate) fn retain(&self, rowid: u64, image: &VisibleRowHome<'_>) -> Result<OrderedRowSnapshot, crate::sql::eval::SqlError> {
+        if self.created_at != image.snapshot.created_at {
+            return Err(crate::sql_err!(crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "scan row belongs to a different table incarnation"));
+        }
+        Ok(OrderedRowSnapshot {
+            rowid,
+            version: image.snapshot.version,
+            heap_offset: image.heap_loc().map(|location| location.offset),
+        })
+    }
+
+    pub(crate) fn row_snapshot(&self, row: OrderedRowSnapshot) -> RowSnapshot {
+        RowSnapshot { created_at: self.created_at, version: row.version }
+    }
+}
+
+impl OrderedRowSnapshot {
+    pub(crate) fn rowid(self) -> u64 {
+        self.rowid
+    }
+
+    pub(crate) fn sort_key(self) -> (u8, u64, u32) {
+        self.heap_offset.map_or((0, self.rowid, 0), |offset| (1, 0, offset))
+    }
+}
+
 /// Deferred executor reads distinguish an MVCC snapshot from staged write bytes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RowReadSource {
@@ -133,5 +175,32 @@ impl From<RowReadSource> for RowByteRead<'_> {
 impl From<RowHome> for RowByteRead<'_> {
     fn from(home: RowHome) -> Self {
         Self(RowByteSource::Physical(home))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::budget::Budget;
+
+    #[test]
+    fn visible_row_heap_ownership_scan_metadata_preserves_budget_and_order() {
+        assert!(core::mem::size_of::<Option<OrderedRowSnapshot>>() <= 32);
+        let mut budget = Budget::new(1024);
+        let mut heap = super::super::RowHeap::new(&mut budget, 32).unwrap();
+        let (location, bytes) = heap.append(4).unwrap();
+        bytes.copy_from_slice(b"row!");
+        let table = TableRowSnapshot { created_at: 7 };
+        let other = TableRowSnapshot { created_at: 8 };
+        let image = VisibleRowHome::heap(RowSnapshot { created_at: 7, version: RowVersionIdentity::Pending(1) }, heap.get(location).unwrap());
+        let spilled = VisibleRowHome::spilled(RowSnapshot { created_at: 7, version: RowVersionIdentity::Committed(4) }, 4, 0, 4);
+        crate::mem::guard::forbid_alloc(|| {
+            let resident = table.retain(1, &image).unwrap();
+            let object = table.retain(u64::MAX, &spilled).unwrap();
+            assert!(object.sort_key() < resident.sort_key());
+            assert_eq!(object.rowid(), u64::MAX);
+            assert_eq!(table.row_snapshot(resident).version, RowVersionIdentity::Pending(1));
+            assert_eq!(other.retain(1, &image).err().unwrap().sqlstate, crate::sql::eval::sqlstate::SERIALIZATION_FAILURE);
+        });
     }
 }

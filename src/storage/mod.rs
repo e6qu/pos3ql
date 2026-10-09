@@ -21,7 +21,7 @@ pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;
-pub(crate) use row_images::{RowByteRead, RowReadSource, RowSnapshot, VisibleRowHome};
+pub(crate) use row_images::{OrderedRowSnapshot, RowByteRead, RowReadSource, RowSnapshot, TableRowSnapshot, VisibleRowHome};
 use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::RowMap;
 pub(crate) use row_reads::RowRead;
@@ -29785,6 +29785,10 @@ impl Storage {
     /// unchanged index entry.
     pub(crate) fn resident_row_state(&self, table_slot: usize, rowid: u64) -> Option<RowRead<'_>> {
         RowReadView::point(&self.row_versions, &self.tables[table_slot].rows, rowid)
+    }
+
+    pub(crate) fn table_row_snapshot(&self, table_slot: usize) -> TableRowSnapshot {
+        TableRowSnapshot { created_at: self.tables[table_slot].created_at() }
     }
 
     /// The single visibility choke point for heap and object-resident row

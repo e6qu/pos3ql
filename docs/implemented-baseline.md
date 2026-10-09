@@ -34,7 +34,8 @@ the full relocation set and generation capacity before changing bytes or handles
 including aliases and empty locations. Startup rejects heaps beyond the 32-bit
 location range. Relocation generations are cache metadata; durable formats encode
 logical rows rather than heap locations. Retained heap and spilled byte images
-consume arena capacity; deferred snapshots consume bounded metadata.
+consume arena capacity; deferred snapshots consume bounded metadata. Sorted
+single-table scans share one incarnation and retain compact version/order keys.
 
 The reactor still executes statements serially. Shared table lifecycle mutation
 and retirement, row publication and maintenance, engine publication, and fixed

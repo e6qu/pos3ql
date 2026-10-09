@@ -21,7 +21,7 @@ use crate::storage::{
     MAX_ROUTINE_OUTPUT_COLUMNS, PartitionBound as StoredPartitionBound, PartitionBoundValue,
     PartitionDef, PartitionStrategy as StoredPartitionStrategy, PolicyCommandKind, ROUTINE_SQL_MAX,
     RoutineArgumentDef, RoutineIdentity, RoutineParameterDef, RoutineParameterMode, RoutineSpec,
-    RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef,
+    SeqSpec, SeqType, SqlName, Storage, TableDef,
 };
 use crate::util::StackStr;
 use crate::wal::{Wal, WalOp};
@@ -43,11 +43,11 @@ use super::types::{ArrElem, ColDesc, ColType, Datum, RecordField, TypeMod};
 /// remote PostgreSQL tuple identity are distinct closed states: callers cannot
 /// accidentally turn a foreign row into a local shadow row.
 #[derive(Clone, Copy)]
-pub enum PhysicalRow {
+pub(crate) enum PhysicalRow {
     Local {
         table_index: usize,
         rowid: u64,
-        home: RowHome,
+        home: crate::storage::RowReadSource,
     },
     Foreign {
         table_index: usize,
@@ -56,15 +56,23 @@ pub enum PhysicalRow {
 }
 
 impl PhysicalRow {
-    fn local(table_index: usize, rowid: u64, home: RowHome) -> Self {
+    fn local(table_index: usize, rowid: u64, snapshot: crate::storage::RowSnapshot) -> Self {
         Self::Local {
             table_index,
             rowid,
-            home,
+            home: crate::storage::RowReadSource::Snapshot(snapshot),
         }
     }
 
-    fn local_parts(self) -> (usize, u64, RowHome) {
+    fn staged(table_index: usize, rowid: u64, location: crate::storage::RowLoc) -> Self {
+        Self::Local {
+            table_index,
+            rowid,
+            home: crate::storage::RowReadSource::StagedHeap(location),
+        }
+    }
+
+    fn local_parts(self) -> (usize, u64, crate::storage::RowReadSource) {
         match self {
             Self::Local {
                 table_index,
@@ -123,14 +131,14 @@ pub const QUERY_STACK_BYTES: usize = 128 << 20;
 /// Fixed resources needed when logical apply invokes the ordinary trigger
 /// executor. The worker owns all three at startup, so a remote row cannot
 /// create an unbounded execution path.
-pub struct ReplicationTriggerContext<'a, 'response> {
+pub(crate) struct ReplicationTriggerContext<'a, 'response> {
     seq_session: &'a crate::sql::guc::SeqSession,
     responder: &'a mut Responder<'response>,
     scratch: &'a mut DmlScratch,
 }
 
 impl<'a, 'response> ReplicationTriggerContext<'a, 'response> {
-    pub fn new(
+    pub(crate) fn new(
         seq_session: &'a crate::sql::guc::SeqSession,
         responder: &'a mut Responder<'response>,
         scratch: &'a mut DmlScratch,
@@ -5914,7 +5922,7 @@ pub fn alter_materialized_view_extension_dependency(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn alter_materialized_view(
+pub(crate) fn alter_materialized_view(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -8829,7 +8837,7 @@ fn drop_owned_privileges(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_owned(
+pub(crate) fn drop_owned(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -11236,7 +11244,7 @@ enum SchemaObject {
 /// CASCADE drops every contained catalog object and severs inbound foreign
 /// keys from surviving tables.
 #[allow(clippy::too_many_arguments)]
-pub fn drop_schema(
+pub(crate) fn drop_schema(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -20036,7 +20044,7 @@ impl PlpgsqlExecHost<'_> {
                 next
             }
         };
-        engine.ensure_txn(txn, TxnMode::Implicit, guc);
+        engine.ensure_txn(txn, TxnMode::Implicit, guc)?;
         if next == PlpgsqlNextTransaction::Chained {
             txn.restore_configuration(prior_configuration);
         }
@@ -30016,7 +30024,7 @@ pub fn alter_conversion(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_collation(
+pub(crate) fn drop_collation(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -40468,7 +40476,7 @@ fn drop_type_dependent_routines(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_domain(
+pub(crate) fn drop_domain(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -41612,7 +41620,7 @@ pub fn create_composite(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_type(
+pub(crate) fn drop_type(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -46049,7 +46057,7 @@ fn rewrite_enum_values(
         }
         let count = storage.visible_row_count(table_index, txn.txid)?;
         let rows = arena
-            .alloc_slice_with(count, |_| None::<(u64, RowHome)>)
+            .alloc_slice_with(count, |_| None::<(u64, crate::storage::RowSnapshot)>)
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -46059,7 +46067,7 @@ fn rewrite_enum_values(
         let mut n = 0;
         storage.for_each_row_state(table_index, &mut |rowid, state| {
             if let Some(home) = storage.visible_row_home(table_index, rowid, state, txn.txid)? {
-                rows[n] = Some((rowid, home));
+                rows[n] = Some((rowid, home.snapshot()));
                 n += 1;
             }
             Ok(core::ops::ControlFlow::Continue(()))
@@ -51512,7 +51520,7 @@ pub(crate) fn subscription_copy_setup(
     })
 }
 
-pub fn copy_statement_begin(
+pub(crate) fn copy_statement_begin(
     storage: &mut Storage,
     txn: &mut TxnState,
     setup: &CopySetup,
@@ -51559,7 +51567,7 @@ pub fn copy_statement_begin(
     clippy::too_many_arguments,
     reason = "COPY completion owns its statement trigger boundary"
 )]
-pub fn copy_statement_end(
+pub(crate) fn copy_statement_end(
     storage: &mut Storage,
     txn: &mut TxnState,
     setup: &CopySetup,
@@ -51703,7 +51711,7 @@ pub fn copy_ignorable_error(error: &SqlError) -> bool {
     clippy::too_many_arguments,
     reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
 )]
-pub fn copy_row(
+pub(crate) fn copy_row(
     storage: &mut Storage,
     txn: &mut TxnState,
     seq_session: &crate::sql::guc::SeqSession,
@@ -51834,7 +51842,7 @@ pub fn copy_row(
     clippy::too_many_arguments,
     reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
 )]
-pub fn copy_row_binary(
+pub(crate) fn copy_row_binary(
     storage: &mut Storage,
     txn: &mut TxnState,
     seq_session: &crate::sql::guc::SeqSession,
@@ -52071,7 +52079,7 @@ fn finish_copy_row<'a>(
 
 /// Applies one pgoutput INSERT tuple through the ordinary row core. Omitted
 /// published columns take local defaults; unchanged TOAST is invalid here.
-pub fn apply_replication_insert(
+pub(crate) fn apply_replication_insert(
     storage: &mut Storage,
     txn: &mut TxnState,
     binding: RelationBinding,
@@ -52422,7 +52430,7 @@ fn locate_replication_row_by_values(
 /// pending-version path.  The caller supplies the publisher old tuple; the
 /// exact-row proof prevents a replica identity from turning into a broad
 /// local delete.
-pub fn apply_replication_delete(
+pub(crate) fn apply_replication_delete(
     storage: &mut Storage,
     txn: &mut TxnState,
     binding: RelationBinding,
@@ -54001,13 +54009,10 @@ pub fn copy_out(
         })?;
     }
     let tokens = arena
-        .alloc_slice_with(visible, |_| {
-            (
-                usize::MAX,
-                0u64,
-                crate::storage::RowHome::Heap(crate::storage::RowLoc::EMPTY),
-            )
-        })
+        .alloc_slice_with(
+            visible,
+            |_| None::<(usize, u64, crate::storage::RowSnapshot)>,
+        )
         .map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -54018,15 +54023,15 @@ pub fn copy_out(
     for &leaf in &leaves[..n_leaves] {
         storage.for_each_row_state(leaf, &mut |rowid, state| {
             if let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? {
-                tokens[fill] = (leaf, rowid, home);
+                tokens[fill] = Some((leaf, rowid, home.snapshot()));
                 fill += 1;
             }
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
     }
-    tokens.sort_unstable_by_key(|(_, rowid, _)| *rowid);
+    tokens.sort_unstable_by_key(|token| token.as_ref().expect("COPY tokens are initialized").1);
     let mut count = 0u64;
-    for &(leaf, rowid, home) in tokens.iter() {
+    for (leaf, rowid, home) in tokens.iter().copied().flatten() {
         storage.record_relation_tuple_read(txid, leaf, None)?;
         let emitted = storage.with_row_bytes(leaf, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
@@ -55232,7 +55237,7 @@ pub fn describe_merge_returning<'a>(
 /// source/target join plus unmatched rows from either side requested by the
 /// `WHEN` clauses. A target row affected twice is a cardinality error (21000).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn merge<'a>(
+pub(crate) fn merge<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
@@ -55910,17 +55915,11 @@ pub fn merge<'a>(
         }
     } else {
         use core::ops::ControlFlow;
-        // Snapshot rowid + home first (the closure cannot borrow the arena while
-        // `storage` is borrowed), then decode.
-        let placeholder = crate::storage::RowHome::Spilled {
-            len: 0,
-            sst: 0,
-            commit_lsn: 0,
-        };
+        // Retain logical rows at their original MVCC boundaries, then decode.
         let ids: &mut [u64] = target_ids;
         let tables: &mut [usize] = target_tables;
-        let hms: &mut [crate::storage::RowHome] =
-            match arena.alloc_slice_with(n_target, |_| placeholder) {
+        let hms: &mut [Option<crate::storage::RowSnapshot>] =
+            match arena.alloc_slice_with(n_target, |_| None) {
                 Ok(s) => s,
                 Err(_) => return sql_fail(super::query::arena_full_pub()),
             };
@@ -55936,7 +55935,7 @@ pub fn merge<'a>(
                     storage.record_relation_tuple_read(txn.txid, leaf, None)?;
                     ids[k] = rowid;
                     tables[k] = leaf;
-                    hms[k] = home;
+                    hms[k] = Some(home.snapshot());
                     k += 1;
                 }
                 Ok(ControlFlow::Continue(()))
@@ -55948,7 +55947,12 @@ pub fn merge<'a>(
         for j in 0..k {
             let row_table = tables[j];
             let row_id = ids[j];
-            let fetched = match storage.row_bytes(row_table, row_id, hms[j], arena) {
+            let fetched = match storage.row_bytes(
+                row_table,
+                row_id,
+                hms[j].expect("MERGE snapshots are initialized"),
+                arena,
+            ) {
                 Ok(b) => b,
                 Err(e) => return sql_fail(e),
             };
@@ -61002,7 +61006,7 @@ pub(crate) fn delete<'a>(
     clippy::too_many_arguments,
     reason = "statement-trigger dispatch needs the normal bounded DML execution context"
 )]
-pub fn truncate(
+pub(crate) fn truncate(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
@@ -62171,7 +62175,7 @@ enum ColSource<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn alter_table(
+pub(crate) fn alter_table(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -63213,7 +63217,10 @@ fn alter_partition_attachment(
                 else {
                     return Ok(ControlFlow::Continue(()));
                 };
-                if scratch.push(PhysicalRow::local(leaf, rowid, home)).is_err() {
+                if scratch
+                    .push(PhysicalRow::local(leaf, rowid, home.snapshot()))
+                    .is_err()
+                {
                     overflow = true;
                     return Ok(ControlFlow::Break(()));
                 }
@@ -64671,7 +64678,7 @@ fn alter_table_relation(
                 return Ok(ControlFlow::Continue(()));
             };
             if scratch
-                .push(PhysicalRow::local(table_index, rowid, loc))
+                .push(PhysicalRow::local(table_index, rowid, loc.snapshot()))
                 .is_err()
             {
                 overflow = true;
@@ -66047,13 +66054,20 @@ fn alter_table_relation(
             slice.copy_from_slice(new_bytes);
             loc
         } else {
-            match old_home {
-                RowHome::Heap(loc) => loc,
-                RowHome::Spilled { .. } => {
+            let crate::storage::RowReadSource::Snapshot(snapshot) = old_home else {
+                unreachable!("rewrite input retains an MVCC snapshot");
+            };
+            let image = match storage.read_row_snapshot(table_index, rowid, snapshot) {
+                Ok(image) => image,
+                Err(error) => return sql_fail(error),
+            };
+            match image.heap_loc() {
+                Some(loc) => loc,
+                None => {
                     // The ALTER journals a full re-upsert of every row, so a
                     // spilled row's bytes come back into the heap here; the
                     // next checkpoint spills them again.
-                    let bytes = match storage.row_bytes(table_index, rowid, old_home, arena) {
+                    let bytes = match storage.row_bytes(table_index, rowid, image, arena) {
                         Ok(b) => b,
                         Err(e) => return sql_fail(e),
                     };
@@ -66075,14 +66089,15 @@ fn alter_table_relation(
                 }
             }
         };
-        scratch[i] = PhysicalRow::local(table_index, rowid, RowHome::Heap(new_loc));
+        scratch[i] = PhysicalRow::staged(table_index, rowid, new_loc);
     }
 
     // Cross-row constraints must see the transformed image set rather than the
     // old rows still installed in storage.
     if has_rewrite {
         for a in 0..scratch.len() {
-            let (_, _, RowHome::Heap(la)) = scratch[a].local_parts() else {
+            let (_, _, crate::storage::RowReadSource::StagedHeap(la)) = scratch[a].local_parts()
+            else {
                 unreachable!()
             };
             let abytes = match storage.heap.get(la) {
@@ -66094,7 +66109,9 @@ fn alter_table_relation(
                 return sql_fail(e);
             }
             for b in (a + 1)..scratch.len() {
-                let (_, _, RowHome::Heap(lb)) = scratch[b].local_parts() else {
+                let (_, _, crate::storage::RowReadSource::StagedHeap(lb)) =
+                    scratch[b].local_parts()
+                else {
                     unreachable!()
                 };
                 let bbytes = match abytes.other(lb) {
@@ -66192,7 +66209,7 @@ fn alter_table_relation(
         }
         for i in 0..scratch.len() {
             let (_, rowid, new_home) = scratch[i].local_parts();
-            let RowHome::Heap(new_loc) = new_home else {
+            let crate::storage::RowReadSource::StagedHeap(new_loc) = new_home else {
                 unreachable!("the rewrite pass re-homes every row to the heap");
             };
             let lsn = storage.bump_lsn();
@@ -66778,7 +66795,7 @@ fn alter_table_relation(
     }
     for i in 0..scratch.len() {
         let (_, rowid, new_home) = scratch[i].local_parts();
-        let RowHome::Heap(new_loc) = new_home else {
+        let crate::storage::RowReadSource::StagedHeap(new_loc) = new_home else {
             unreachable!("the rewrite pass re-homes every row to the heap");
         };
         match storage.write_pending_untracked(
@@ -67206,7 +67223,7 @@ fn row_matches<'a>(
     def: &TableDef,
     alias: Option<&str>,
     _schema: &[ColType],
-    home: RowHome,
+    home: crate::storage::VisibleRowHome<'_>,
     where_clause: Option<&Expr<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -67465,6 +67482,7 @@ fn collect_matches<'a>(
                 leaf,
                 access.map(|access| access.index_oid()),
             )?;
+            let snapshot = loc.snapshot();
             if row_matches(
                 storage,
                 leaf,
@@ -67482,7 +67500,7 @@ fn collect_matches<'a>(
                 transition,
             )? {
                 scratch
-                    .push(PhysicalRow::local(leaf, rowid, loc))
+                    .push(PhysicalRow::local(leaf, rowid, snapshot))
                     .map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -67601,6 +67619,7 @@ fn collect_join_matches<'a>(
             storage.record_relation_tuple_read(txid, leaf, None)?;
             // Consume-in-place, as in row_matches: the joined-row probe reads
             // this row's values only while it runs.
+            let snapshot = loc.snapshot();
             let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
                 let mut tv = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, schema, &mut tv)?;
@@ -67630,7 +67649,7 @@ fn collect_join_matches<'a>(
             })?;
             if found {
                 scratch
-                    .push(PhysicalRow::local(leaf, rowid, loc))
+                    .push(PhysicalRow::local(leaf, rowid, snapshot))
                     .map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -67736,6 +67755,7 @@ fn collect_join_matches_with_transition<'a>(
                 return Ok(ControlFlow::Continue(()));
             };
             storage.record_relation_tuple_read(txid, leaf, None)?;
+            let snapshot = loc.snapshot();
             let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, schema, &mut values)?;
@@ -67769,7 +67789,7 @@ fn collect_join_matches_with_transition<'a>(
             })?;
             if found {
                 scratch
-                    .push(PhysicalRow::local(leaf, rowid, loc))
+                    .push(PhysicalRow::local(leaf, rowid, snapshot))
                     .map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -67812,7 +67832,20 @@ fn store_row_with_identity(
         storage.restore_pending(table_index, rowid, txn.txid, prior);
         return Err(e);
     }
-    Ok(PhysicalRow::local(table_index, rowid, RowHome::Heap(loc)))
+    let state = storage
+        .resident_row_state(table_index, rowid)
+        .expect("a successful pending append publishes its row state");
+    let image = storage
+        .visible_row_home_at(
+            table_index,
+            rowid,
+            state,
+            txn.txid,
+            crate::storage::SNAPSHOT_ALL,
+            u64::MAX,
+        )?
+        .expect("a successful row insert has a visible image");
+    Ok(PhysicalRow::local(table_index, rowid, image.snapshot()))
 }
 
 pub(crate) fn coerce<'a>(

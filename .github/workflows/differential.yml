@@ -435,7 +435,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:18
+        image: public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           # Match pos3ql: C/byte collation so ordering/min/max agree, and UTF8
@@ -456,7 +456,7 @@ jobs:
       - name: Enable PostgreSQL prepared transactions
         if: matrix.run_fast == '1'
         run: |
-          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          postgres_container=$(docker ps --filter ancestor=public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 --format '{{.ID}}' | head -n 1)
           test -n "$postgres_container"
           docker exec "$postgres_container" psql -U postgres -X -v ON_ERROR_STOP=1 \
             -c "ALTER SYSTEM SET max_prepared_transactions = 8"
@@ -470,7 +470,7 @@ jobs:
       - name: Install SQL extension oracle fixtures
         if: matrix.run_fast == '1'
         run: |
-          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          postgres_container=$(docker ps --filter ancestor=public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 --format '{{.ID}}' | head -n 1)
           test -n "$postgres_container"
           docker exec "$postgres_container" mkdir -p /tmp/pos3ql-extensions
           docker cp tests/external/extensions/. "$postgres_container":/tmp/pos3ql-extensions/
@@ -479,7 +479,7 @@ jobs:
         run: |
           mkdir -p .ci-bin
           for client in pg_dump pg_restore; do
-            printf '%s\n' '#!/bin/sh' "exec docker run --rm --network host -v \"\$PWD:\$PWD\" -w \"\$PWD\" -v /tmp:/tmp postgres:18 $client \"\$@\"" > ".ci-bin/$client"
+            printf '%s\n' '#!/bin/sh' "exec docker run --rm --network host -v \"\$PWD:\$PWD\" -w \"\$PWD\" -v /tmp:/tmp public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 $client \"\$@\"" > ".ci-bin/$client"
           done
           chmod +x .ci-bin/pg_dump .ci-bin/pg_restore
           echo "${{ github.workspace }}/.ci-bin" >> "$GITHUB_PATH"

@@ -13742,10 +13742,7 @@ fn table_size(storage: &Storage, txid: u32, slot: usize) -> Result<i64, SqlError
     let mut bytes = 0i64;
     storage.for_each_row_state(slot, &mut |rowid, state| {
         if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
-            let len = match home {
-                crate::storage::RowHome::Heap(location) => location.len,
-                crate::storage::RowHome::Spilled { len, .. } => len,
-            };
+            let len = home.byte_len();
             bytes = bytes.checked_add(i64::from(len)).ok_or_else(|| {
                 sql_err!(
                     sqlstate::NUMERIC_OUT_OF_RANGE,

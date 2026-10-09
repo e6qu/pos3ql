@@ -8,7 +8,8 @@ use std::sync::{RwLock, RwLockReadGuard};
 
 use super::{
     CommittedHistory, CommittedVersion, CommittedVersionSlot, PendingChange, PendingVersionSlot,
-    PendingVersions, RowHome, RowLoc, committed_row_version_capacity, pending_row_version_capacity,
+    PendingVersions, PendingWriteUndo, RowLoc, committed_row_version_capacity,
+    pending_row_version_capacity,
 };
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
@@ -18,6 +19,7 @@ use crate::mem::fixed_vec::FixedVec;
 pub(super) struct RowVersionPool<T> {
     slots: FixedVec<T>,
     free: Option<usize>,
+    next_identity: u64,
 }
 
 impl<T> RowVersionPool<T> {
@@ -25,6 +27,7 @@ impl<T> RowVersionPool<T> {
         Ok(Self {
             slots: FixedVec::new(budget, name, capacity)?,
             free: None,
+            next_identity: 0,
         })
     }
 
@@ -116,16 +119,41 @@ pub(super) fn pending_last(
     versions.tail.map(|slot| pool[slot].change)
 }
 
+pub(super) fn pending_version_at(
+    pool: &RowVersionPool<PendingVersionSlot>,
+    versions: PendingVersions,
+    txid: u32,
+    snapshot: u32,
+) -> Option<(u64, Option<RowLoc>)> {
+    let mut slot = versions.tail;
+    while let Some(index) = slot {
+        let entry = &pool[index];
+        if entry.change.txid == txid && entry.change.cid < snapshot {
+            return Some((entry.identity, entry.change.loc));
+        }
+        slot = entry.previous;
+    }
+    None
+}
+
 pub(super) fn pending_visible_at(
     pool: &RowVersionPool<PendingVersionSlot>,
     versions: PendingVersions,
     txid: u32,
     snapshot: u32,
 ) -> Option<Option<RowLoc>> {
+    pending_version_at(pool, versions, txid, snapshot).map(|(_, home)| home)
+}
+
+pub(super) fn retained_pending_home(
+    pool: &RowVersionPool<PendingVersionSlot>,
+    versions: PendingVersions,
+    identity: u64,
+) -> Option<Option<RowLoc>> {
     let mut slot = versions.tail;
     while let Some(index) = slot {
         let entry = &pool[index];
-        if entry.change.txid == txid && entry.change.cid < snapshot {
+        if entry.identity == identity {
             return Some(entry.change.loc);
         }
         slot = entry.previous;
@@ -138,12 +166,18 @@ pub(super) fn push_pending_version(
     versions: &mut PendingVersions,
     maximum: usize,
     change: PendingChange,
-) -> Result<(), SqlError> {
-    let (pool, free) = (&mut pool.slots, &mut pool.free);
+) -> Result<PendingWriteUndo, SqlError> {
+    let identity = pool.next_identity.checked_add(1).ok_or_else(|| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "pending row-version identity space is exhausted"
+        )
+    })?;
+    let (pool, free, next_identity) = (&mut pool.slots, &mut pool.free, &mut pool.next_identity);
     if versions.len >= maximum {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "one row exceeds max_row_versions_per_row ({}) pending command versions",
+            "one row exceeds max_row_versions_per_row ({}) pending write versions",
             maximum
         ));
     }
@@ -153,6 +187,7 @@ pub(super) fn push_pending_version(
             debug_assert!(!pool[slot].used);
             *free = pool[slot].previous;
             pool[slot] = PendingVersionSlot {
+                identity,
                 used: true,
                 previous,
                 change,
@@ -162,6 +197,7 @@ pub(super) fn push_pending_version(
         None => {
             let slot = pool.len();
             pool.push(PendingVersionSlot {
+                identity,
                 used: true,
                 previous,
                 change,
@@ -177,7 +213,8 @@ pub(super) fn push_pending_version(
     };
     versions.tail = Some(slot);
     versions.len += 1;
-    Ok(())
+    *next_identity = identity;
+    Ok(PendingWriteUndo { identity })
 }
 
 pub(super) fn pop_pending_version(
@@ -233,16 +270,16 @@ pub(super) fn committed_history_get(
     slot.map(|slot| pool[slot].version)
 }
 
-pub(super) fn committed_visible_at(
+pub(super) fn committed_version_at(
     pool: &RowVersionPool<CommittedVersionSlot>,
     history: CommittedHistory,
     commit_snapshot: u64,
-) -> Option<Option<RowHome>> {
+) -> Option<CommittedVersion> {
     let mut slot = history.tail;
     while let Some(index) = slot {
         let entry = &pool[index];
         if entry.version.lsn <= commit_snapshot {
-            return Some(entry.version.home);
+            return Some(entry.version);
         }
         slot = entry.previous;
     }
@@ -342,7 +379,7 @@ pub(super) fn prune_committed_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::ColumnSet;
+    use crate::storage::{ColumnSet, RowHome};
 
     fn pools(capacity: usize) -> RowVersionPools {
         let mut budget = Budget::new(
@@ -376,6 +413,37 @@ mod tests {
     }
 
     #[test]
+    fn visible_row_heap_ownership_pending_identity_exhaustion_preserves_pool() {
+        let mut owner = pools(1);
+        let state = owner.exclusive();
+        let mut versions = PendingVersions::empty();
+        push_pending_version(
+            &mut state.pending_row_versions,
+            &mut versions,
+            1,
+            pending(1),
+        )
+        .unwrap();
+        pop_pending_version(&mut state.pending_row_versions, &mut versions).unwrap();
+        let free = state.pending_row_versions.free;
+        state.pending_row_versions.next_identity = u64::MAX;
+        crate::mem::guard::forbid_alloc(|| {
+            let error = push_pending_version(
+                &mut state.pending_row_versions,
+                &mut versions,
+                1,
+                pending(1),
+            )
+            .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(state.pending_row_versions.free, free);
+            assert_eq!(state.pending_row_versions.len(), 1);
+            assert_eq!(state.pending_row_versions.next_identity, u64::MAX);
+            assert!(versions.is_none());
+        });
+    }
+
+    #[test]
     fn row_version_ownership_guard_retains_chains_and_detached_results() {
         let mut pools = pools(2);
         let mut commands = PendingVersions::empty();
@@ -406,7 +474,8 @@ mod tests {
                 Some(retained_pending.loc)
             );
             assert_eq!(
-                committed_visible_at(&reader.committed_row_versions, history, 3),
+                committed_version_at(&reader.committed_row_versions, history, 3)
+                    .map(|version| version.home),
                 Some(retained_history.home)
             );
             drop(reader);

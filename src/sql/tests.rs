@@ -7,6 +7,97 @@
 use super::*;
 
 #[test]
+fn visible_row_heap_ownership_command_exhaustion_allows_rollback() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 16).unwrap();
+    let mut guc = GucState::new();
+    let setup = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        &mut guc,
+        "BEGIN; CREATE TABLE exhausted_command (id integer); INSERT INTO exhausted_command VALUES (1)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    txn.test_set_command_id(crate::storage::SNAPSHOT_ALL - 1);
+    let output = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        &mut guc,
+        "UPDATE exhausted_command SET id = 2",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("54000"));
+    let output = run_session_transaction(&mut engine, &mut budget, &mut txn, &mut guc, "ROLLBACK");
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    assert_eq!(txn.command_id(), 0);
+    assert!(!txn.is_active());
+    assert!(
+        engine
+            .storage
+            .find_table("public", "exhausted_command")
+            .is_none()
+    );
+    let output = run_session_transaction(&mut engine, &mut budget, &mut txn, &mut guc, "SELECT 1");
+    assert_eq!(data_rows(&output), ["1"]);
+}
+
+#[test]
+fn visible_row_heap_ownership_transaction_exhaustion_rejects_wire_statement() {
+    let (mut engine, mut budget) = test_engine();
+    engine.next_txid = u32::MAX;
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE exhausted_identity (id integer)",
+        1 << 20,
+    );
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("54000"));
+    assert!(output.contains("transaction identity space is exhausted"));
+    assert!(
+        engine
+            .storage
+            .find_table("public", "exhausted_identity")
+            .is_none()
+    );
+    assert_eq!(engine.next_txid, u32::MAX);
+}
+
+#[test]
+fn visible_row_heap_ownership_transaction_exhaustion_preserves_active_owners() {
+    let (mut engine, mut budget) = test_engine();
+    let mut first = TxnState::new(&mut budget, 8).unwrap();
+    let mut second = TxnState::new(&mut budget, 8).unwrap();
+    let guc = GucState::new();
+    engine
+        .ensure_txn(&mut first, TxnMode::Explicit, &guc)
+        .unwrap();
+    let active = first.txid;
+    engine.next_txid = u32::MAX;
+    crate::mem::guard::forbid_alloc(|| {
+        let error = engine
+            .ensure_txn(&mut second, TxnMode::Implicit, &guc)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(second.txid, 0);
+        assert!(!second.is_active());
+        assert_eq!(first.txid, active);
+        assert!(first.is_active());
+        assert_eq!(engine.next_txid, u32::MAX);
+        engine
+            .ensure_txn(&mut first, TxnMode::Explicit, &guc)
+            .unwrap();
+        assert_eq!(first.txid, active);
+        assert_eq!(
+            engine.allocate_transaction_id().unwrap_err().sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+    });
+    engine.rollback_txn(&mut first, &guc);
+}
+
+#[test]
 fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
     let mut config = test_config("definition-checkpoint-exhaustion");
     config.max_tables = 1;
@@ -642,11 +733,7 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
         .push(exec::PhysicalRow::Local {
             table_index: 1,
             rowid: 11,
-            home: RowHome::Spilled {
-                len: 1,
-                sst: 1,
-                commit_lsn: 1,
-            },
+            home: crate::storage::RowReadSource::StagedHeap(crate::storage::RowLoc::EMPTY),
         })
         .unwrap();
     assert_eq!(dml_workspaces.len(), 1);

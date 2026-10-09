@@ -50,9 +50,10 @@ jobs:
           mkdir -p .ci-bin
           sed 's/^          //' > .ci-bin/psql <<'SH'
           #!/bin/sh
-          exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 psql "$@"
+          exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 psql "$@"
           SH
           chmod +x .ci-bin/psql
+          .ci-bin/psql --version
       # psycopg2-binary serves the sqllogictest replay; psycopg (v3) serves
       # the crash-torture and fuzz harnesses, which use its API directly.
       - name: Python venv for the differential harnesses
@@ -91,7 +92,7 @@ jobs:
           - { name: b, seed: 20260725 }
     services:
       postgres:
-        image: postgres:18
+        image: public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
@@ -128,7 +129,7 @@ jobs:
       - name: Expose PostgreSQL 18 publisher and client adapters
         run: |
           docker run --rm --detach --name pos3ql-subscription-publisher \
-            -e POSTGRES_HOST_AUTH_METHOD=trust -p 15496:5432 postgres:18 \
+            -e POSTGRES_HOST_AUTH_METHOD=trust -p 15496:5432 public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 \
             -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4
           # The subscriber's apply worker must reach the pos3ql publisher on
           # the runner loopback address. Host networking gives the PostgreSQL
@@ -136,16 +137,16 @@ jobs:
           # only makes inbound connections work and leaves 127.0.0.1 inside
           # the container pointing back at PostgreSQL itself.
           docker run --rm --detach --name pos3ql-subscription-subscriber \
-            --network host -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18 \
+            --network host -e POSTGRES_HOST_AUTH_METHOD=trust public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 \
             -c port=15564
           mkdir -p .ci-bin
           sed 's/^          //' > .ci-bin/psql <<'SH'
           #!/bin/sh
-          exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 psql "$@"
+          exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 psql "$@"
           SH
           sed 's/^          //' > .ci-bin/pg_recvlogical <<'SH'
           #!/bin/sh
-          exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 pg_recvlogical "$@"
+          exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 pg_recvlogical "$@"
           SH
           printf '%s\n' '#!/bin/sh' 'exit 0' > .ci-bin/postgres
           printf '%s\n' '#!/bin/sh' 'exit 0' > .ci-bin/initdb
@@ -199,7 +200,7 @@ jobs:
           - { name: slt-h, corpus_shard: "none", auxiliary: slt, slt_query_shard: "7", slt_query_shards: "8" }
     services:
       postgres:
-        image: postgres:18
+        image: public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
@@ -214,7 +215,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Enable PostgreSQL prepared transactions
         run: |
-          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          postgres_container=$(docker ps --filter ancestor=public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 --format '{{.ID}}' | head -n 1)
           test -n "$postgres_container"
           docker exec "$postgres_container" psql -U postgres -X -v ON_ERROR_STOP=1 \
             -c "ALTER SYSTEM SET max_prepared_transactions = 8"
@@ -226,7 +227,7 @@ jobs:
           exit 1
       - name: Install SQL extension oracle fixtures
         run: |
-          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          postgres_container=$(docker ps --filter ancestor=public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 --format '{{.ID}}' | head -n 1)
           test -n "$postgres_container"
           docker exec "$postgres_container" mkdir -p /tmp/pos3ql-extensions
           docker cp tests/external/extensions/. "$postgres_container":/tmp/pos3ql-extensions/
@@ -287,7 +288,7 @@ jobs:
           - { name: auxiliary-slt-h, corpus_shard: "none", auxiliary: slt, slt_query_shard: "7", slt_query_shards: "8" }
     services:
       postgres:
-        image: postgres:18
+        image: public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
@@ -302,7 +303,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Enable PostgreSQL prepared transactions
         run: |
-          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          postgres_container=$(docker ps --filter ancestor=public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 --format '{{.ID}}' | head -n 1)
           test -n "$postgres_container"
           docker exec "$postgres_container" psql -U postgres -X -v ON_ERROR_STOP=1 \
             -c "ALTER SYSTEM SET max_prepared_transactions = 8"
@@ -314,7 +315,7 @@ jobs:
           exit 1
       - name: Install SQL extension oracle fixtures
         run: |
-          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          postgres_container=$(docker ps --filter ancestor=public.ecr.aws/docker/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 --format '{{.ID}}' | head -n 1)
           test -n "$postgres_container"
           docker exec "$postgres_container" mkdir -p /tmp/pos3ql-extensions
           docker cp tests/external/extensions/. "$postgres_container":/tmp/pos3ql-extensions/

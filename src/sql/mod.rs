@@ -508,7 +508,7 @@ impl<'a> SubscriptionCopyWorkspace<'a> {
 }
 
 impl<'a, 'response> CopyRowContext<'a, 'response> {
-    pub fn new(
+    pub(crate) fn new(
         txn: &'a mut TxnState,
         seq_session: &'a guc::SeqSession,
         arena: &'a Arena,
@@ -2348,6 +2348,15 @@ fn cursor_result_too_large() -> SqlError {
     )
 }
 
+fn next_transaction_identity(current: u32) -> Result<u32, SqlError> {
+    current.checked_add(1).ok_or_else(|| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "transaction identity space is exhausted"
+        )
+    })
+}
+
 impl Engine {
     /// Selects one exclusively leased startup-reserved query workspace.
     pub(crate) fn select_query_workspace(&mut self, workspace: QueryWorkspaceId) {
@@ -2397,8 +2406,7 @@ impl Engine {
         created_at: u64,
         name: SqlName,
     ) -> Result<(), SqlError> {
-        self.next_txid = self.next_txid.wrapping_add(1).max(1);
-        let transaction_id = self.next_txid;
+        let transaction_id = self.allocate_transaction_id()?;
         let lsn =
             self.storage.lsn().checked_add(1).ok_or_else(|| {
                 sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
@@ -2433,8 +2441,7 @@ impl Engine {
         stream: crate::storage::SubscriptionStream,
         failure: crate::storage::SubscriptionFailure,
     ) -> Result<(), SqlError> {
-        self.next_txid = self.next_txid.wrapping_add(1).max(1);
-        let transaction_id = self.next_txid;
+        let transaction_id = self.allocate_transaction_id()?;
         let lsn =
             self.storage.lsn().checked_add(1).ok_or_else(|| {
                 sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
@@ -2583,9 +2590,9 @@ impl Engine {
         // local transaction instead of inheriting a reactor thread's context.
         self.select_database(database)?;
         self.work.bind_connection(0);
-        self.ensure_txn(txn, TxnMode::Implicit, guc);
+        self.ensure_txn(txn, TxnMode::Implicit, guc)?;
         txn.replication_apply = true;
-        txn.begin_command();
+        txn.begin_command()?;
         // pgoutput messages form one remote transaction, not independent SQL
         // statements.  Each later row operation must therefore see every
         // earlier local change from that same remote commit.
@@ -3374,9 +3381,12 @@ impl Engine {
         storage.ensure_no_pending_replay_table_rewrite()?;
         let mut recovered_transaction_id = recovered_transaction_id;
         if clean_shutdown_lsn != Some(storage.lsn()) && storage.has_unlogged_relations() {
+            let transaction_id = next_transaction_identity(recovered_transaction_id)?;
+            let provisional_lsn = storage.lsn().checked_add(1).ok_or_else(|| {
+                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
+            })?;
             storage.reset_unlogged_relations()?;
-            recovered_transaction_id = recovered_transaction_id.wrapping_add(1).max(1);
-            let provisional_lsn = storage.lsn().saturating_add(1);
+            recovered_transaction_id = transaction_id;
             wal.stage(
                 recovered_transaction_id,
                 provisional_lsn,
@@ -3649,8 +3659,7 @@ impl Engine {
                 "too many replication slots"
             ));
         }
-        self.next_txid = self.next_txid.wrapping_add(1).max(1);
-        let transaction_id = self.next_txid;
+        let transaction_id = self.allocate_transaction_id()?;
         let restart_lsn =
             self.storage.lsn().checked_add(1).ok_or_else(|| {
                 sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
@@ -3731,8 +3740,7 @@ impl Engine {
             return Ok(message_lsn);
         }
 
-        self.next_txid = self.next_txid.wrapping_add(1).max(1);
-        let transaction_id = self.next_txid;
+        let transaction_id = self.allocate_transaction_id()?;
         if let Err(error) = self.wal.stage(
             transaction_id,
             message_lsn,
@@ -3807,8 +3815,7 @@ impl Engine {
             ));
         }
 
-        self.next_txid = self.next_txid.wrapping_add(1).max(1);
-        let transaction_id = self.next_txid;
+        let transaction_id = self.allocate_transaction_id()?;
         let lsn =
             self.storage.lsn().checked_add(1).ok_or_else(|| {
                 sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
@@ -3874,8 +3881,7 @@ impl Engine {
                 name.as_str()
             ));
         }
-        self.next_txid = self.next_txid.wrapping_add(1).max(1);
-        let transaction_id = self.next_txid;
+        let transaction_id = self.allocate_transaction_id()?;
         let lsn =
             self.storage.lsn().checked_add(1).ok_or_else(|| {
                 sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
@@ -3925,8 +3931,7 @@ impl Engine {
                 name.as_str()
             ));
         }
-        self.next_txid = self.next_txid.wrapping_add(1).max(1);
-        let transaction_id = self.next_txid;
+        let transaction_id = self.allocate_transaction_id()?;
         let lsn =
             self.storage.lsn().checked_add(1).ok_or_else(|| {
                 sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
@@ -4085,8 +4090,7 @@ impl Engine {
         {
             return Ok(confirmed_flush_lsn);
         }
-        self.next_txid = self.next_txid.wrapping_add(1).max(1);
-        let transaction_id = self.next_txid;
+        let transaction_id = self.allocate_transaction_id()?;
         let lsn =
             self.storage.lsn().checked_add(1).ok_or_else(|| {
                 sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
@@ -4884,15 +4888,19 @@ impl Engine {
     }
 
     /// Starts a transaction if none is active.
-    fn ensure_txn(&mut self, txn: &mut TxnState, mode: TxnMode, guc: &GucState) {
+    fn ensure_txn(
+        &mut self,
+        txn: &mut TxnState,
+        mode: TxnMode,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
         if txn.is_active() {
             if mode == TxnMode::Explicit {
                 txn.mode = TxnMode::Explicit;
             }
-            return;
+            return Ok(());
         }
-        self.next_txid = self.next_txid.wrapping_add(1).max(1);
-        txn.txid = self.next_txid;
+        txn.txid = self.allocate_transaction_id()?;
         txn.mode = mode;
         self.storage.begin_transaction_identity(txn.txid);
         datetime::begin_transaction();
@@ -4900,19 +4908,29 @@ impl Engine {
         let (isolation, read_only, deferrable) = guc.transaction_defaults();
         txn.set_characteristics(isolation, read_only, deferrable);
         txn.failed = false;
+        Ok(())
+    }
+
+    fn allocate_transaction_id(&mut self) -> Result<u32, SqlError> {
+        let transaction_id = next_transaction_identity(self.next_txid)?;
+        self.next_txid = transaction_id;
+        Ok(transaction_id)
     }
 
     fn begin_command_snapshot(
         &mut self,
         txn: &mut TxnState,
         takes_snapshot: bool,
+        advance_command: bool,
     ) -> Result<(), SqlError> {
         self.storage.set_foreign_statement_context(
             txn.txid,
             txn.isolation == TransactionIsolation::Serializable,
             txn.savepoint_names(),
         )?;
-        txn.begin_command();
+        if advance_command {
+            txn.begin_command()?;
+        }
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
         let snapshot = if takes_snapshot {
             let snapshot = txn.statement_snapshot(self.storage.lsn());
@@ -8855,7 +8873,7 @@ impl Engine {
     /// Ends a successful COPY FROM: an implicit transaction commits here
     /// (this was the statement's end); an explicit one stays open, exactly
     /// as INSERT inside BEGIN would.
-    pub fn copy_finish(
+    pub(crate) fn copy_finish(
         &mut self,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
@@ -9193,7 +9211,10 @@ impl Engine {
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
         datetime::begin_statement();
-        self.ensure_txn(txn, TxnMode::Implicit, guc);
+        if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExecutionStatus::Complete);
+        }
         let application_name = guc.get_owned("application_name").unwrap_or_default();
         let backend_xid = self
             .storage
@@ -9480,7 +9501,10 @@ impl Engine {
         } else {
             exec::PlpgsqlTransactionContext::NonAtomic
         };
-        self.ensure_txn(txn, TxnMode::Implicit, guc);
+        if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExtendedExecutionStatus::Complete(false));
+        }
         let application_name = guc.get_owned("application_name").unwrap_or_default();
         let backend_xid = self
             .storage
@@ -9610,7 +9634,11 @@ impl Engine {
     ) -> Result<bool, WireFull> {
         self.work.bind_connection(conn_id);
         datetime::begin_statement();
-        self.ensure_txn(txn, TxnMode::Implicit, guc);
+        if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            responder.ready_for_query(txn.status_byte())?;
+            return Ok(false);
+        }
         if txn.failed {
             responder.error(
                 sqlstate::IN_FAILED_SQL_TRANSACTION,
@@ -9619,7 +9647,7 @@ impl Engine {
             responder.ready_for_query(txn.status_byte())?;
             return Ok(false);
         }
-        if let Err(error) = self.begin_command_snapshot(txn, true) {
+        if let Err(error) = self.begin_command_snapshot(txn, true, true) {
             if txn.is_explicit() {
                 txn.failed = true;
             } else {
@@ -13891,7 +13919,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
-        self.ensure_txn(txn, TxnMode::Implicit, guc);
+        self.ensure_txn(txn, TxnMode::Implicit, guc)?;
         let result = (|| {
             let _guc_scope = guc::enter_eval_scope(guc, txn);
             let database = self
@@ -14160,7 +14188,7 @@ impl Engine {
                 "statement is waiting for a schema lock"
             )));
         }
-        if let Err(error) = self.begin_command_snapshot(txn, true) {
+        if let Err(error) = self.begin_command_snapshot(txn, true, true) {
             return Ok(Err(error));
         }
         let event_tag = event_trigger_tag(statement);
@@ -14474,7 +14502,11 @@ impl Engine {
                 | Stmt::Show(_)
                 | Stmt::ShowAll
         );
-        if let Err(error) = self.begin_command_snapshot(txn, takes_snapshot) {
+        if let Err(error) = self.begin_command_snapshot(
+            txn,
+            takes_snapshot,
+            !matches!(statement, Stmt::Commit | Stmt::Rollback),
+        ) {
             return Ok(Err(error));
         }
         if statement_writes(statement) {
@@ -16363,7 +16395,9 @@ impl Engine {
                     responder.command_complete("BEGIN")?;
                     return Ok(Ok(()));
                 }
-                self.ensure_txn(txn, TxnMode::Explicit, guc);
+                if let Err(error) = self.ensure_txn(txn, TxnMode::Explicit, guc) {
+                    return Ok(Err(error));
+                }
                 txn.apply_begin_characteristics(*characteristics);
                 responder.command_complete("BEGIN")?;
                 Ok(Ok(()))
@@ -16387,7 +16421,9 @@ impl Engine {
                 // Freeze this statement's clock before anything anchors a
                 // transaction to it.
                 datetime::begin_statement();
-                self.ensure_txn(txn, TxnMode::Implicit, guc);
+                if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+                    return Ok(Err(error));
+                }
                 Ok(Ok(()))
             }
             Stmt::PrepareTransaction(gid) => {
@@ -16398,7 +16434,9 @@ impl Engine {
                 }
                 responder.command_complete("PREPARE TRANSACTION")?;
                 datetime::begin_statement();
-                self.ensure_txn(txn, TxnMode::Implicit, guc);
+                if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+                    return Ok(Err(error));
+                }
                 Ok(Ok(()))
             }
             Stmt::CommitPrepared(gid) => {
@@ -16407,7 +16445,9 @@ impl Engine {
                 }
                 responder.command_complete("COMMIT PREPARED")?;
                 datetime::begin_statement();
-                self.ensure_txn(txn, TxnMode::Implicit, guc);
+                if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+                    return Ok(Err(error));
+                }
                 Ok(Ok(()))
             }
             Stmt::RollbackPrepared(gid) => {
@@ -16416,7 +16456,9 @@ impl Engine {
                 }
                 responder.command_complete("ROLLBACK PREPARED")?;
                 datetime::begin_statement();
-                self.ensure_txn(txn, TxnMode::Implicit, guc);
+                if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+                    return Ok(Err(error));
+                }
                 Ok(Ok(()))
             }
             Stmt::Rollback => {
@@ -16429,7 +16471,9 @@ impl Engine {
                 // Freeze this statement's clock before anything anchors a
                 // transaction to it.
                 datetime::begin_statement();
-                self.ensure_txn(txn, TxnMode::Implicit, guc);
+                if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+                    return Ok(Err(error));
+                }
                 Ok(Ok(()))
             }
             Stmt::LockTable {
@@ -16632,7 +16676,9 @@ impl Engine {
                     // the connection takes over, streaming CopyData into
                     // copy_row_line under this same (implicit or explicit)
                     // transaction, and the command tag waits for CopyDone.
-                    self.ensure_txn(txn, txn.mode, guc);
+                    if let Err(error) = self.ensure_txn(txn, txn.mode, guc) {
+                        return Ok(Err(error));
+                    }
                     if let Err(error) =
                         self.copy_start(&setup, txn, guc.seq_session(), arena, responder)
                     {

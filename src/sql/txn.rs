@@ -13,15 +13,14 @@ use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
-use crate::storage::{ColumnSet, RowLoc};
+use crate::storage::ColumnSet;
 use crate::util::StackStr;
 
 use super::ast::TransactionIsolation;
 use super::eval::SqlError;
 
-/// A row's pending image before a write, as returned by `write_pending`:
-/// `None` = no pending existed; `Some(loc)` = a pending change with that loc.
-pub type PriorPending = Option<Option<RowLoc>>;
+/// The immutable pending append returned by `write_pending`.
+pub type PriorPending = crate::storage::PendingWriteUndo;
 
 /// A named savepoint: the transaction's undo marks when it was established.
 #[derive(Clone)]
@@ -1049,8 +1048,24 @@ impl TxnState {
     /// Advances to the next command. Called once at the start of each statement,
     /// so all of a statement's sub-parts (a WITH clause's data-modifying CTEs
     /// and its main query) share one command-id and therefore one snapshot.
-    pub fn begin_command(&mut self) {
-        self.command_id = self.command_id.saturating_add(1);
+    pub fn begin_command(&mut self) -> Result<(), SqlError> {
+        let command_id = self
+            .command_id
+            .checked_add(1)
+            .filter(|command| *command < crate::storage::SNAPSHOT_ALL)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "transaction command identity space is exhausted"
+                )
+            })?;
+        self.command_id = command_id;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_set_command_id(&mut self, command: u32) {
+        self.command_id = command;
     }
 
     pub fn enter_trigger_sql(&mut self) -> Result<(), SqlError> {
@@ -2183,6 +2198,7 @@ impl TxnState {
 
     pub fn clear(&mut self) {
         self.mode = TxnMode::Idle;
+        self.command_id = 0;
         self.failed = false;
         self.isolation = TransactionIsolation::ReadCommitted;
         self.read_only = false;
@@ -2218,5 +2234,30 @@ impl TxnState {
         for descriptor in self.large_object_descriptors.iter_mut() {
             descriptor.active = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_row_heap_ownership_command_exhaustion_preserves_snapshot_boundary() {
+        let mut budget = Budget::new(TxnState::budget_bytes(8));
+        let mut txn = TxnState::new(&mut budget, 8).unwrap();
+        txn.command_id = crate::storage::SNAPSHOT_ALL - 2;
+        crate::mem::guard::forbid_alloc(|| {
+            txn.begin_command().unwrap();
+            assert_eq!(txn.command_id(), crate::storage::SNAPSHOT_ALL - 1);
+            for _ in 0..2 {
+                let error = txn.begin_command().unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(txn.command_id(), crate::storage::SNAPSHOT_ALL - 1);
+            }
+            txn.clear();
+            assert_eq!(txn.command_id(), 0);
+            txn.begin_command().unwrap();
+            assert_eq!(txn.command_id(), 1);
+        });
     }
 }

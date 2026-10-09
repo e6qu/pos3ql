@@ -4,8 +4,9 @@ This file records only defects whose repair is prevented by an external blocker
 or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
-Reviewed for coordinated table identity and existence on 2026-10-09: no defects meet
-these inclusion criteria.
+Reviewed for visible row ownership, immutable pending versions, compact scan
+metadata, and oracle/qualification image availability on 2026-10-10: no defects
+meet these inclusion criteria.
 Resolved investigations are indexed in [history](docs/history/README.md).
 
 For a new entry, include a reproducer, affected boundary, observed behavior,

@@ -48,12 +48,15 @@ Complete shared ownership before enabling overlapping execution:
   lifecycle mutation and retirement; publication still requires exclusive storage.
 - Synchronize row publication, statistics, and physical maintenance through a
   coherent table lifecycle, including rollback, retirement, cloning, and recovery.
-- Pin heap locations across visibility lookup and concurrent relocation. Heap
-  generations reject detached locations after relocation, including reused ranges;
-  byte guards and rejection do not preserve a locator across visibility lookup.
+- Visible heap reads acquire byte ownership while version ownership is held.
+  Deferred executor reads retain logical row identities and exact MVCC version tokens,
+  then reacquire the selected version after relocation. Complete shared row
+  publication and retirement without invalidating these retained snapshots.
 - Establish lock ordering and release guards before nested catalog resolution.
   Reuse retained images and compact metadata instead of copying wide definitions
-  per row. Long-lived heap images consume the fixed statement arena.
+  per row. Retained byte images consume the fixed statement arena; deferred row
+  snapshots consume bounded metadata rather than detached heap locations;
+  single-table scans share their incarnation instead of repeating it per row.
 
 Acceptance: concurrent readers/writers retain valid images; exhaustion,
 rollback, identity reuse, and failed creation preserve prior state; all controls
@@ -122,6 +125,9 @@ The roadmap is complete when all of these hold:
 
 - Advertised SQL/wire shapes and accepted configurations have verified, explicit
   boundaries without truncation or post-startup allocation.
+- PostgreSQL oracle gates use the same verified, immutable service/client image;
+  registry failures must fail the gate rather than skipping comparisons.
+  Object-store qualification likewise preserves verified release image identities.
 - Formats, monitoring, credentials, packages, backup/restore, and replacement
   remain qualified end to end.
 - Concurrent execution scales through the supported worker range while

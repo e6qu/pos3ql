@@ -59,12 +59,16 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Durable constraint identity | 64 constraints per modeled table kind and 64 domain checks | Manifest v14 and 64-position catalog/trigger OID stride; SQLSTATE 54000 on the next item |
 | Other definition breadth | Documented 64-item constructs, including LIST bounds, inheritance parents, trigger arguments, and routine configuration entries | Shared parse/storage boundary; widening requires review of representation and identity |
 | Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |
+| Internal transaction identities | Checked 32-bit transaction identities and per-transaction command counters; exhaustion returns SQLSTATE 54000 before identity reuse or command advancement |
 | Statement memory | Retained heap/spilled row images, escaped query metadata, lists, joins, programs, retry logs, event graphs, JSON widths, table-function rows, and variable-width geometry | Fixed arenas; arena exhaustion is a program-limit error |
 | Value-specific limits | Full-text, XML/XPath, JSON/path nesting, rendered values, GUC bytes, and finite catalog identities | Typed source boundaries and specialized contracts below |
 
 Startup-sized catalogs have independent capacities; table count does not silently
 size unrelated classes. Transaction bounds also cover prepared and subscription
 slots. `max_catalog_versions_per_object` bounds retained definition/undo versions.
+`max_row_versions_per_row` bounds pending writes and committed snapshot versions;
+each write retains an immutable image, including writes in the same command.
+Pending version identity exhaustion is a named program-limit error.
 `checkpoint_manifest_bytes`, live-block, replay, merge, garbage-batch, and backup
 rosters are separate reservations. Deletion batches limit work per beat, not the
 number of objects cleanup may ultimately process.

@@ -11793,13 +11793,11 @@ pub fn drop_schema(
     let sort_key = |storage: &Storage, o: &SchemaObject| -> (usize, u64, u8) {
         match o {
             SchemaObject::Table(t) => {
-                let table = storage.table(*t);
-                let def = storage.table_def(*t, txn.txid);
-                (
-                    schema_rank(storage, def.schema.as_str()),
-                    table.created_at,
-                    0,
-                )
+                let (schema, created_at) = {
+                    let def = storage.table_def(*t, txn.txid);
+                    (def.schema, def.identity().created_at)
+                };
+                (schema_rank(storage, schema.as_str()), created_at, 0)
             }
             SchemaObject::View(v) => {
                 let view = storage.view(*v);
@@ -11845,13 +11843,11 @@ pub fn drop_schema(
                 )
             }
             SchemaObject::Matview { table, .. } => {
-                let table_state = storage.table(*table);
-                let def = storage.table_def(*table, txn.txid);
-                (
-                    schema_rank(storage, def.schema.as_str()),
-                    table_state.created_at,
-                    0,
-                )
+                let (schema, created_at) = {
+                    let def = storage.table_def(*table, txn.txid);
+                    (def.schema, def.identity().created_at)
+                };
+                (schema_rank(storage, schema.as_str()), created_at, 0)
             }
             SchemaObject::Sequence(sequence) => {
                 let sequence = storage.sequence_for(*sequence, txn.txid);
@@ -11929,13 +11925,14 @@ pub fn drop_schema(
                 )
             }
             SchemaObject::InboundFk { table, fk_index } => {
-                let child = storage.table(*table);
-                let def = storage.table_def(*table, txn.txid);
-                (
-                    schema_rank(storage, def.fkeys[*fk_index].parent_schema.as_str()),
-                    child.created_at,
-                    1,
-                )
+                let (schema, created_at) = {
+                    let def = storage.table_def(*table, txn.txid);
+                    (
+                        def.fkeys[*fk_index].parent_schema,
+                        def.identity().created_at,
+                    )
+                };
+                (schema_rank(storage, schema.as_str()), created_at, 1)
             }
         }
     };

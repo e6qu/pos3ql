@@ -6438,7 +6438,7 @@ impl Engine {
         let mut index_result = Ok(());
         for &(table, rewrote_rows) in self.commit_altered_tables.iter() {
             self.storage.finish_table_def_commit(table, rewrote_rows);
-            if self.storage.table(table).live
+            if self.storage.table(table).live()
                 && let Err(error) = self.storage.refresh_enforcers(table)
             {
                 index_result = Err(error);

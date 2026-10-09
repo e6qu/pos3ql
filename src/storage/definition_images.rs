@@ -5,7 +5,8 @@ use core::mem::{MaybeUninit, size_of};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{DatabaseOid, Storage, TableDef, table_slot_capacity};
+use super::table_definitions::TableIdentity;
+use super::{Storage, TableDef, table_slot_capacity};
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::sql::eval::{SqlError, sqlstate};
@@ -15,8 +16,7 @@ struct Image {
     next: Option<usize>,
     table: usize,
     transaction: u32,
-    database: DatabaseOid,
-    created_at: u64,
+    identity: TableIdentity,
     definition: TableDef,
 }
 
@@ -111,6 +111,23 @@ impl TableDefinitionImages {
         None
     }
 
+    pub(crate) fn retained_identity(
+        &self,
+        table: usize,
+        transaction: u32,
+    ) -> Option<TableIdentity> {
+        let mut slot = self.head.get();
+        while let Some(index) = slot {
+            // SAFETY: the owner retains this immutable image until Drop.
+            let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
+            if image.table == table && image.transaction == transaction {
+                return Some(image.identity);
+            }
+            slot = image.next;
+        }
+        None
+    }
+
     pub(crate) fn definition<'a>(
         &'a self,
         storage: &Storage,
@@ -123,14 +140,16 @@ impl TableDefinitionImages {
                 "table definition reader belongs to different storage"
             ));
         }
-        let source = storage.table(table);
+        let source = storage.table(table).identity();
         let mut slot = self.head.get();
         while let Some(index) = slot {
             // SAFETY: this owner retains every cell in its immutable chain.
             // Adding a new head never modifies a previously captured image.
             let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
             if image.table == table && image.transaction == transaction {
-                if image.database != source.database || image.created_at != source.created_at {
+                if image.identity.database != source.database
+                    || image.identity.created_at != source.created_at
+                {
                     return Err(sql_err!(
                         sqlstate::SERIALIZATION_FAILURE,
                         "table identity changed while its definition image was retained"
@@ -160,6 +179,7 @@ impl TableDefinitionImages {
         let cell = &self.pool.cells[index];
         let target = cell.image.get().cast::<Image>();
         let definition = storage.table_def(table, transaction);
+        let identity = definition.identity();
         // SAFETY: the allocation lock gives this writer exclusive ownership
         // of the free cell. Acquire observes the previous owner's release.
         // Copy directly into the reserved slot instead of a wide stack image.
@@ -167,8 +187,7 @@ impl TableDefinitionImages {
             core::ptr::addr_of_mut!((*target).next).write(self.head.get());
             core::ptr::addr_of_mut!((*target).table).write(table);
             core::ptr::addr_of_mut!((*target).transaction).write(transaction);
-            core::ptr::addr_of_mut!((*target).database).write(source.database);
-            core::ptr::addr_of_mut!((*target).created_at).write(source.created_at);
+            core::ptr::addr_of_mut!((*target).identity).write(identity);
             core::ptr::copy_nonoverlapping(
                 &*definition,
                 core::ptr::addr_of_mut!((*target).definition),

@@ -4,13 +4,42 @@ use core::mem::size_of;
 use core::ops::Deref;
 use std::sync::{RwLock, RwLockReadGuard};
 
-use super::{PendingTableDef, PendingTableDefSlot, TableDef};
+use super::{
+    CatalogDdlState, DatabaseOid, Ownership, PendingTableDef, PendingTableDefSlot, TableDef,
+};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
 
 pub(super) struct DefinitionState {
+    pub(super) identity: TableIdentity,
     pub(super) committed: TableDef,
     pub(super) pending: Option<PendingDefinitionHead>,
+}
+
+/// Identity and existence share publication ownership with the definition.
+#[derive(Clone, Copy)]
+pub(crate) struct TableIdentity {
+    pub(crate) database: DatabaseOid,
+    pub(crate) ownership: Ownership,
+    /// Monotonic catalog stamp orders dependencies and detects slot reuse.
+    pub(crate) created_at: u64,
+    pub(crate) existence: CatalogDdlState,
+}
+
+impl TableIdentity {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        ownership: Ownership::BOOTSTRAP,
+        created_at: 0,
+        existence: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn live(self) -> bool {
+        matches!(
+            self.existence,
+            CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. }
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -27,6 +56,7 @@ impl TableDefinition {
     pub(super) fn new(committed: TableDef) -> Self {
         Self {
             state: RwLock::new(DefinitionState {
+                identity: TableIdentity::EMPTY,
                 committed,
                 pending: None,
             }),
@@ -95,6 +125,38 @@ impl Deref for TableDefinitionRead<'_> {
 }
 
 impl<'a> TableDefinitionRead<'a> {
+    pub(crate) fn identity(&self) -> TableIdentity {
+        self.state.identity
+    }
+
+    pub(super) fn current(
+        definition: &'a TableDefinition,
+        versions: &'a DefinitionVersions,
+    ) -> Self {
+        let versions = versions.read();
+        let state = definition.read();
+        let pending = state.pending.map(|head| (versions, head.tail as usize));
+        Self { state, pending }
+    }
+
+    pub(super) fn committed_definition(&self) -> &TableDef {
+        &self.state.committed
+    }
+
+    pub(super) fn locked_by_other(&self, transaction: u32) -> Option<u32> {
+        self.state
+            .identity
+            .existence
+            .pending_txid()
+            .filter(|&owner| owner != transaction)
+            .or_else(|| {
+                self.state
+                    .pending
+                    .map(|head| head.transaction)
+                    .filter(|&owner| owner != transaction)
+            })
+    }
+
     pub(super) fn committed(definition: &'a TableDefinition) -> Self {
         Self {
             state: definition.read(),
@@ -188,6 +250,111 @@ mod tests {
                 rewrites_rows: false,
             },
         }
+    }
+
+    #[test]
+    fn table_catalog_lifecycle_concurrent_readers_retain_one_identity_and_definition() {
+        let mut versions = versions(1);
+        versions.exclusive().push(pending(2, 7)).unwrap();
+        let mut table = TableDefinition::new(definition(1));
+        {
+            let state = table.exclusive();
+            state.identity.created_at = 1;
+            state.identity.ownership.owner = 1;
+            state.identity.existence = CatalogDdlState::Present;
+        }
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let table = &table;
+                let versions = &versions;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        for _ in 0..500 {
+                            let image = TableDefinitionRead::current(table, versions);
+                            let identity = image.identity();
+                            assert_eq!(
+                                identity.created_at as usize,
+                                image.committed_definition().n_columns
+                            );
+                            assert_eq!(
+                                usize::from(identity.ownership.owner),
+                                image.committed_definition().n_columns % 4
+                            );
+                            let expected_database = if identity.ownership.owner == 1 {
+                                DatabaseOid::POSTGRES
+                            } else {
+                                DatabaseOid::TEMPLATE1
+                            };
+                            assert_eq!(identity.database, expected_database);
+                            assert!(table.state.try_write().is_err());
+                            if let Some((slots, slot)) = &image.pending {
+                                assert_eq!(slots[*slot].version.txid, 7);
+                                assert_eq!(image.n_columns as u64, identity.created_at + 1);
+                                assert!(versions.state.try_write().is_err());
+                            }
+                            match identity.existence {
+                                CatalogDdlState::PendingCreate { txid } => {
+                                    assert!(identity.existence.visible_to(txid));
+                                    assert!(!identity.existence.visible_to(8));
+                                    assert!(!identity.live());
+                                }
+                                CatalogDdlState::PendingDrop { txid } => {
+                                    assert!(!identity.existence.visible_to(txid));
+                                    assert!(identity.existence.visible_to(8));
+                                    assert!(identity.live());
+                                }
+                                CatalogDdlState::PendingCreateDrop { .. }
+                                | CatalogDdlState::Absent => {
+                                    assert!(!identity.existence.visible_to(7));
+                                    assert!(!identity.existence.visible_to(8));
+                                    assert!(!identity.live());
+                                }
+                                CatalogDdlState::Present => {
+                                    assert!(identity.existence.visible_to(7));
+                                    assert!(identity.existence.visible_to(8));
+                                    assert!(identity.live());
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+            start.wait();
+            crate::mem::guard::forbid_alloc(|| {
+                for epoch in 1..=250 {
+                    let mut versions = versions.state.write().unwrap();
+                    let mut state = table.state.write().unwrap();
+                    let stamp = epoch * 2 + 1;
+                    state.committed = definition(stamp);
+                    state.identity.created_at = stamp as u64;
+                    state.identity.ownership.owner = (stamp % 4) as u16;
+                    state.identity.database = if stamp % 4 == 1 {
+                        DatabaseOid::POSTGRES
+                    } else {
+                        DatabaseOid::TEMPLATE1
+                    };
+                    state.identity.existence = match epoch % 5 {
+                        0 => CatalogDdlState::Present,
+                        1 => CatalogDdlState::PendingCreate { txid: 7 },
+                        2 => CatalogDdlState::PendingDrop { txid: 7 },
+                        3 => CatalogDdlState::PendingCreateDrop { txid: 7 },
+                        _ => CatalogDdlState::Absent,
+                    };
+                    versions[0] = pending(stamp + 1, 7);
+                    state.pending = (epoch % 5 != 4).then_some(PendingDefinitionHead {
+                        tail: 0,
+                        transaction: 7,
+                    });
+                }
+            });
+        });
+        let final_image = TableDefinitionRead::current(&table, &versions);
+        assert_eq!(final_image.identity().created_at, 501);
+        assert_eq!(final_image.n_columns, 502);
+        assert_eq!(final_image.identity().existence, CatalogDdlState::Present);
     }
 
     #[test]

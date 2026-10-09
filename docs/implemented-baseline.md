@@ -20,7 +20,7 @@ do not qualify concurrent execution or representative deployments.
 |---|---|
 | Statement execution | Startup-bounded arenas, DML scratch, backend/database context, and FIFO dispatcher leases; COPY/subscription state has separately charged buffers |
 | Catalogs and metadata | Synchronized publication and owned reader images; guards release before nested resolution |
-| Table definitions | Committed definitions, pending heads, and version slots retain guarded ownership; query/DML readers retain immutable startup-budgeted images, escaped names use the arena, and lifecycle coordination remains exclusive |
+| Table metadata | Database/creation/owner identity, typed CREATE/DROP existence, definitions, and pending heads share guarded ownership; version slots are guarded, retained images capture identity with the definition, and publication remains exclusive |
 | Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
 | Resident rows | Per-table map guards and one guarded pending/committed version owner; issued readers retain chain ownership, including SQL and checkpoint walks |
 | Heap bytes | Guarded bytes, append position, and relocation generation; callback/codec reads retain the guard, while long-lived images copy into the fixed statement arena |
@@ -34,8 +34,8 @@ including aliases and empty locations. Startup rejects heaps beyond the 32-bit
 location range. Relocation generations are cache metadata; durable formats encode
 logical rows rather than heap locations. Retained heap images consume arena capacity, as spilled images do.
 
-The reactor still executes statements serially. Table identity and existence
-coordination, row publication and maintenance, locator pinning across concurrent
+The reactor still executes statements serially. Shared table lifecycle mutation
+and retirement, row publication and maintenance, locator pinning across concurrent
 relocation, engine publication, and fixed workers remain the roadmap's open
 concurrency gates. Immutable SST reads carry no resident version handles.
 

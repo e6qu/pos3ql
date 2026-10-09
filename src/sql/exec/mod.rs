@@ -3319,7 +3319,7 @@ fn like_source<'s>(
     storage: &'s Storage,
     like: &LikeClause,
     txid: u32,
-) -> Result<&'s TableDef, SqlError> {
+) -> Result<crate::storage::TableDefinitionRead<'s>, SqlError> {
     match resolve_dml_table(storage, &like.source, txid) {
         Ok(i) => Ok(storage.table_def(i, txid)),
         Err(e) => Err(e),
@@ -3437,7 +3437,7 @@ fn copy_like_constraints(
         }
         if like.indexes {
             for key in &source.uniques[..source.n_uniques] {
-                let columns = remap_columns(def, source, &key.columns[..key.n_cols])?;
+                let columns = remap_columns(def, &source, &key.columns[..key.n_cols])?;
                 add_unique_key(
                     def,
                     None,
@@ -3470,7 +3470,7 @@ fn copy_like_constraints(
                         crate::storage::MAX_EXCLUSIONS
                     ));
                 }
-                let columns = remap_columns(def, source, source_exclusion.columns())?;
+                let columns = remap_columns(def, &source, source_exclusion.columns())?;
                 let mut exclusion = *source_exclusion;
                 exclusion.columns[..source_exclusion.n_cols]
                     .copy_from_slice(&columns[..source_exclusion.n_cols]);

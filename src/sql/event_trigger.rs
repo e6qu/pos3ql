@@ -88,8 +88,9 @@ pub(crate) fn capture_before<'a>(
         }
         let definitions = storage.table_definition_images();
         let child = match before.altered_table.as_ref() {
-            Some((slot, retained)) if *slot == child_slot =>
-                retained.definition(storage, child_slot, txid)?,
+            Some((slot, retained)) if *slot == child_slot => {
+                retained.definition(storage, child_slot, txid)?
+            }
             _ => definitions.definition(storage, child_slot, txid)?,
         };
         for (foreign_key_index, foreign_key) in child.fkeys().iter().enumerate() {

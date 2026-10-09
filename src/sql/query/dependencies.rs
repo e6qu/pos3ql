@@ -411,11 +411,14 @@ fn collect_statement(
                 record_routine_target(insert.table, storage, txid, path, dependencies)?;
                 let scope = dml_dependency_scope(storage, insert.table, None, None, txid, arena)?;
                 let excluded = match storage.resolve_relation_under(
-                    path, insert.table.schema, insert.table.name, txid,
+                    path,
+                    insert.table.schema,
+                    insert.table.name,
+                    txid,
                 ) {
-                    Some(ResolvedRelation::Table(slot)) => Some((
-                        slot, scope.defs.get(0).expect("target resolved"),
-                    )),
+                    Some(ResolvedRelation::Table(slot)) => {
+                        Some((slot, scope.defs.get(0).expect("target resolved")))
+                    }
                     _ => None,
                 };
                 for row in insert.rows {
@@ -1992,7 +1995,11 @@ fn record_relation_column_references<'a>(
                         .col_alias
                         .and_then(|aliases| aliases.get(column).copied())
                         .map_or_else(
-                            || arena.alloc_str(definition.columns[column].name.as_str()).map_err(|_| arena_full()),
+                            || {
+                                arena
+                                    .alloc_str(definition.columns[column].name.as_str())
+                                    .map_err(|_| arena_full())
+                            },
                             Ok,
                         )?;
                 }

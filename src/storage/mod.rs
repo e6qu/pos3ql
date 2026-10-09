@@ -7,7 +7,7 @@
 
 mod definition_images;
 mod table_definitions;
-pub use table_definitions::TableDefinitionRead;
+pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{
     DefinitionVersions, PendingDefinitionHead, PendingDefinitionRead, TableDefinition,
 };
@@ -31856,7 +31856,7 @@ impl Storage {
                 if !crate::sql::exec::constraints::index_predicate_matches(
                     self,
                     enforcer.evaluation_txid,
-                    &*table.definition(),
+                    &table.definition(),
                     values,
                     predicate,
                     arena,
@@ -31874,7 +31874,7 @@ impl Storage {
             key = crate::sql::exec::constraints::index_key_values(
                 self,
                 enforcer.evaluation_txid,
-                &*table.definition(),
+                &table.definition(),
                 values,
                 &index.columns[..index.n_cols],
                 &expressions[..index.n_cols],

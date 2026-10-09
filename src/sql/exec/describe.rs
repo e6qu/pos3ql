@@ -35,7 +35,10 @@ fn describe_column<'a>(
     arena: &'a crate::mem::arena::Arena,
 ) -> Result<ColDesc<'a>, SqlError> {
     let name = arena.alloc_str(column.name.as_str()).map_err(|_| {
-        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "column description exceeds the statement arena")
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "column description exceeds the statement arena"
+        )
     })?;
     Ok(ColDesc::of_type(name, column.ctype)
         .with_type_mod(column.type_mod)

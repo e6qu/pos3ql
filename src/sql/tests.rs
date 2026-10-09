@@ -19,12 +19,19 @@ fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let output = run_with(&mut engine, &mut budget,
-        "CREATE TABLE definition_checkpoint (id integer); INSERT INTO definition_checkpoint VALUES (7)");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE definition_checkpoint (id integer); INSERT INTO definition_checkpoint VALUES (7)",
+    );
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
-    let table = engine.storage.find_table("public", "definition_checkpoint").unwrap();
+    let table = engine
+        .storage
+        .find_table("public", "definition_checkpoint")
+        .unwrap();
     let capacity = crate::storage::table_slot_capacity(&config)
-        * (config.max_catalog_versions_per_object + 1) * config.query_workspace_slots;
+        * (config.max_catalog_versions_per_object + 1)
+        * config.query_workspace_slots;
     let mut owners = Vec::with_capacity(capacity);
     for _ in 0..capacity {
         let definitions = engine.storage.table_definition_images();
@@ -33,7 +40,12 @@ fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
     }
     let error = engine.checkpoint().unwrap_err();
     assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-    assert!(error.message.as_str().contains("table definition image pool is exhausted"));
+    assert!(
+        error
+            .message
+            .as_str()
+            .contains("table definition image pool is exhausted")
+    );
     drop(owners.pop().unwrap());
     assert!(engine.checkpoint().unwrap());
     engine.commit_wal().unwrap();
@@ -42,8 +54,14 @@ fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
-    assert_eq!(data_rows(&run_with(&mut recovered, &mut recovered_budget,
-        "SELECT id FROM definition_checkpoint")), ["7"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id FROM definition_checkpoint"
+        )),
+        ["7"]
+    );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
@@ -51,8 +69,11 @@ fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
 #[test]
 fn live_definition_ownership_returning_descriptions_keep_names_and_modifiers() {
     let (mut engine, mut budget) = test_engine();
-    let setup = run_with(&mut engine, &mut budget,
-        "CREATE TABLE definition_returning (id integer, label varchar(3))");
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE definition_returning (id integer, label varchar(3))",
+    );
     assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
     let mut before = Vec::new();
     for statement in [
@@ -65,11 +86,17 @@ fn live_definition_ownership_returning_descriptions_keep_names_and_modifiers() {
         assert_eq!(row_description_type_modifiers(&described), [-1, 7]);
         before.push(described);
     }
-    let renamed = run_with(&mut engine, &mut budget,
-        "ALTER TABLE definition_returning RENAME COLUMN label TO value");
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE definition_returning RENAME COLUMN label TO value",
+    );
     assert!(!String::from_utf8_lossy(&renamed).contains("ERROR"));
-    let after = describe_with(&mut engine, &mut budget,
-        "INSERT INTO definition_returning VALUES (1, 'abc') RETURNING *");
+    let after = describe_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO definition_returning VALUES (1, 'abc') RETURNING *",
+    );
     assert_eq!(row_description_names(&after), ["id", "value"]);
     assert_eq!(row_description_type_modifiers(&after), [-1, 7]);
     for described in before {

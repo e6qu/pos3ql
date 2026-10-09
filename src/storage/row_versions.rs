@@ -362,10 +362,7 @@ mod tests {
         PendingChange {
             txid: 7,
             cid: command,
-            loc: Some(RowLoc {
-                offset: command,
-                len: 4,
-            }),
+            loc: Some(RowLoc::test(command, 4)),
             changed_columns: ColumnSet::EMPTY,
             changes_existence: false,
         }
@@ -373,10 +370,7 @@ mod tests {
 
     fn committed(lsn: u64) -> CommittedVersion {
         CommittedVersion {
-            home: Some(RowHome::Heap(RowLoc {
-                offset: lsn as u32,
-                len: 4,
-            })),
+            home: Some(RowHome::Heap(RowLoc::test(lsn as u32, 4))),
             lsn,
         }
     }

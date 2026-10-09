@@ -2278,11 +2278,23 @@ fn postgres_hash_uint32_extended(value: u32) -> u64 {
     (u64::from(b) << 32) | u64::from(c)
 }
 
-/// Where a row's bytes live in the heap.
+/// A heap-issued location. Relocation invalidates detached locations even
+/// when their old range is still initialized. This is not a durable identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowLoc {
     pub offset: u32,
     pub len: u32,
+    generation: u64,
+}
+
+impl RowLoc {
+    /// Metadata-only placeholder; a heap never issues generation zero.
+    pub(crate) const EMPTY: Self = Self { offset: 0, len: 0, generation: 0 };
+
+    #[cfg(test)]
+    pub(crate) const fn test(offset: u32, len: u32) -> Self {
+        Self { offset, len, generation: 1 }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30955,6 +30967,7 @@ impl Storage {
             .sort_unstable_by_key(|(_, _, _, loc)| (loc.offset, loc.len));
         let heap = self.heap.exclusive();
         heap.validate_relocation(scratch.iter().map(|(_, _, _, location)| *location))?;
+        let generation = heap.next_relocation_generation()?;
         let mut write_at = 0usize;
         let mut prior_alias: Option<(RowLoc, RowLoc)> = None;
         for i in 0..scratch.len() {
@@ -30971,6 +30984,7 @@ impl Storage {
                 let relocated = RowLoc {
                     offset: write_at as u32,
                     len: loc.len,
+                    generation,
                 };
                 write_at += len;
                 prior_alias = Some((loc, relocated));
@@ -30993,7 +31007,7 @@ impl Storage {
                 }
             }
         }
-        heap.finish_relocation(write_at);
+        heap.finish_relocation(write_at, generation);
         Ok(())
     }
 
@@ -52404,7 +52418,7 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let location = RowLoc { offset: 12, len: 4 };
+        let location = RowLoc::test(12, 4);
         let state = RowState::committed_only_at(location, 42);
         storage.tables[0].rows.insert(1, state).unwrap();
         assert_eq!(
@@ -52459,7 +52473,7 @@ mod tests {
             PendingChange {
                 txid: 7,
                 cid: 3,
-                loc: Some(RowLoc { offset: 20, len: 4 }),
+                loc: Some(RowLoc::test(20, 4)),
                 changed_columns: ColumnSet::all(MAX_COLUMNS),
                 changes_existence: false,
             },
@@ -52470,7 +52484,7 @@ mod tests {
             storage
                 .visible_row_home_at(0, 1, storage.resident_row_state(0, 1).unwrap(), 7, 4, 41)
                 .unwrap(),
-            Some(RowHome::Heap(RowLoc { offset: 20, len: 4 }))
+            Some(RowHome::Heap(RowLoc::test(20, 4)))
         );
         assert_eq!(
             storage
@@ -52595,7 +52609,7 @@ mod tests {
             .rows
             .insert(
                 1,
-                RowState::committed_only_at(RowLoc { offset: 0, len: 4 }, 7),
+                RowState::committed_only_at(RowLoc::test(0, 4), 7),
             )
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
@@ -52626,7 +52640,7 @@ mod tests {
                 storage
                     .visible_row_home_at(0, 1, row, 7, SNAPSHOT_ALL, 7)
                     .unwrap(),
-                Some(RowHome::Heap(RowLoc { offset: 0, len: 4 }))
+                Some(RowHome::Heap(RowLoc::test(0, 4)))
             );
             assert!(storage.row_versions.test_write().is_ok());
         });
@@ -58694,7 +58708,7 @@ mod tests {
         let captured = storage.table(slot).generation;
         let _ = storage.tables[slot].rows.insert(
             1,
-            RowState::committed_only_at(RowLoc { offset: 0, len: 4 }, 42),
+            RowState::committed_only_at(RowLoc::test(0, 4), 42),
         );
         storage.table_mut(slot).mark_dirty();
         storage.clear_dirty_through(&[captured]);
@@ -58908,13 +58922,13 @@ mod tests {
         let (_, bytes) = storage.heap.append(8).unwrap();
         bytes.copy_from_slice(b"original");
         storage.tables[0].live = true;
-        let prior = RowState::committed_only_at(RowLoc { offset: 4, len: 4 }, 7);
+        let prior = RowState::committed_only_at(RowLoc::test(4, 4), 7);
         storage.tables[0].rows.insert(1, prior).unwrap();
         storage.tables[0]
             .rows
             .insert(
                 2,
-                RowState::committed_only_at(RowLoc { offset: 7, len: 2 }, 8),
+                RowState::committed_only_at(RowLoc::test(7, 2), 8),
             )
             .unwrap();
         let mut scratch = FixedVec::new(&mut budget, "heap preflight", 2).unwrap();
@@ -58924,9 +58938,75 @@ mod tests {
             assert_eq!(storage.tables[0].rows.get(&1), Some(prior));
             assert_eq!(storage.heap.used(), 8);
             assert_eq!(
-                &*storage.heap.get(RowLoc { offset: 0, len: 8 }).unwrap(),
+                &*storage.heap.get(RowLoc::test(0, 8)).unwrap(),
                 b"original"
             );
+        });
+    }
+
+    #[test]
+    fn row_heap_generation_compaction_updates_every_visibility_chain_and_rejects_stale_reads() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let (_, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"dead");
+        let (history, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"old!");
+        let (committed, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"live");
+        let (pending, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"edit");
+        let mut state = RowState::committed_only_at(committed, 7);
+        let versions = storage.row_versions.exclusive();
+        push_committed_version(
+            &mut versions.committed_row_versions,
+            &mut state.history,
+            storage.max_row_versions_per_row,
+            CommittedVersion { lsn: 5, home: Some(RowHome::Heap(history)) },
+        ).unwrap();
+        push_pending_version(
+            &mut versions.pending_row_versions,
+            &mut state.pending,
+            storage.max_row_versions_per_row,
+            PendingChange {
+                txid: 9, cid: 1, loc: Some(pending),
+                changed_columns: ColumnSet::EMPTY, changes_existence: false,
+            },
+        ).unwrap();
+        storage.tables[0].live = true;
+        storage.tables[0].rows.insert(1, state).unwrap();
+        let mut scratch = FixedVec::new(&mut budget, "generation compaction", 3).unwrap();
+        let arena = Arena::new(&mut budget, "generation images", 32).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.compact_heap(&mut scratch).unwrap();
+            let (replacement, bytes) = storage.heap.append(4).unwrap();
+            bytes.copy_from_slice(b"next");
+            assert_eq!(replacement.offset, pending.offset);
+            for stale in [history, committed, pending] {
+                assert_eq!(storage.row_bytes(0, 1, RowHome::Heap(stale), &arena).unwrap_err().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE);
+                let error = storage.with_row_bytes(0, 1, RowHome::Heap(stale), |_| -> Result<(), SqlError> {
+                    panic!("stale locations must never reach the consumer")
+                }).unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            }
+            for (txid, lsn, expected) in [(8, 6, b"old!"), (8, 7, b"live"), (9, 7, b"edit")] {
+                let row = storage.resident_row_state(0, 1).unwrap();
+                let home = storage.visible_row_home_at(0, 1, row, txid, SNAPSHOT_ALL, lsn).unwrap().unwrap();
+                assert_eq!(storage.row_bytes(0, 1, home, &arena).unwrap(), expected);
+            }
+            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.row_versions.test_write().is_ok());
+            // A second relocation changes the generation even when offsets
+            // are unchanged. Historical and pending images remain readable.
+            let previous = storage.resident_row_state(0, 1).unwrap().committed.unwrap();
+            storage.compact_heap(&mut scratch).unwrap();
+            assert_eq!(storage.row_bytes(0, 1, previous, &arena).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE);
+            let row = storage.resident_row_state(0, 1).unwrap();
+            let home = storage.visible_row_home_at(0, 1, row, 9, SNAPSHOT_ALL, 7).unwrap().unwrap();
+            assert_eq!(storage.row_bytes(0, 1, home, &arena).unwrap(), b"edit");
         });
     }
 

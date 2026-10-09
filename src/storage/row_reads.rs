@@ -190,10 +190,7 @@ mod tests {
             release_committed_chain(&mut versions.committed_row_versions, state.history.tail);
         }
         rows.clear();
-        let location = RowLoc {
-            offset: epoch,
-            len: 4,
-        };
+        let location = RowLoc::test(epoch, 4);
         let mut state = RowState::committed_only_at(location, u64::from(epoch));
         state.pending = PendingVersions::empty();
         state.history = CommittedHistory::empty();
@@ -345,7 +342,7 @@ mod tests {
             assert!(RowReadView::point(&versions, &rows, 1).is_none());
             assert!(versions.test_write().is_ok());
             let row =
-                RowRead::immutable(RowState::committed_only_at(RowLoc { offset: 8, len: 4 }, 9));
+                RowRead::immutable(RowState::committed_only_at(RowLoc::test(8, 4), 9));
             assert!(row.pending_last().is_none());
             assert!(row.history_get(0).is_none());
             assert_eq!(row.visible_at(7, 1, 8), None);

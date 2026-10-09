@@ -5995,10 +5995,7 @@ fn scan_source_mode<'a>(
                     .alloc_slice_with(probe_count.max(1), |_| {
                         (
                             0u64,
-                            crate::storage::RowHome::Heap(crate::storage::RowLoc {
-                                offset: 0,
-                                len: 0,
-                            }),
+                            crate::storage::RowHome::Heap(crate::storage::RowLoc::EMPTY),
                         )
                     })
                     .map_err(|_| arena_full())?;
@@ -6741,7 +6738,7 @@ fn scan_source_mode<'a>(
                 .alloc_slice_with(count, |_| {
                     (
                         0u64,
-                        crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }),
+                        crate::storage::RowHome::Heap(crate::storage::RowLoc::EMPTY),
                     )
                 })
                 .map_err(|_| arena_full())?;

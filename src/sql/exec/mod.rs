@@ -53998,7 +53998,7 @@ pub fn copy_out(
             (
                 usize::MAX,
                 0u64,
-                crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }),
+                crate::storage::RowHome::Heap(crate::storage::RowLoc::EMPTY),
             )
         })
         .map_err(|_| {

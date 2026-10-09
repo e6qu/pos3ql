@@ -387,7 +387,7 @@ impl SliceLayout {
     };
 
     fn from_storage(storage: &Storage, slot: usize) -> Self {
-        let definition = &storage.table(slot).def;
+        let definition = &*storage.table(slot).definition();
         let mut layout = Self::EMPTY;
         layout.n_columns = definition.n_columns as u16;
         layout.fillfactor = definition.storage_options.fillfactor.unwrap_or(0);
@@ -710,7 +710,10 @@ impl TemporarySpiller {
         let Some(slot) = (0..storage.physical_table_count()).find(|&slot| {
             let table = storage.table(slot);
             table.live
-                && table.def.persistence == crate::storage::RelationPersistence::Temporary
+                && {
+                    let definition = table.definition();
+                    definition.persistence
+                } == crate::storage::RelationPersistence::Temporary
                 && table.dirty
         }) else {
             return Ok(None);
@@ -759,12 +762,12 @@ impl TemporarySpiller {
         self.sst_arena.reset();
         self.writer.reset();
         let mut schema = [ColType::Bool; MAX_COLUMNS];
-        let columns = storage.table(slot).def.schema(&mut schema);
+        let columns = storage.table(slot).definition().schema(&mut schema);
         self.writer
             .set_pax_schema(&schema[..columns])
             .map_err(temporary_sst_to_sql)?;
         self.writer
-            .set_packed_fillfactor(storage.table(slot).def.storage_options.fillfactor)
+            .set_packed_fillfactor(storage.table(slot).definition().storage_options.fillfactor)
             .map_err(temporary_sst_to_sql)?;
         let writer = &mut self.writer;
         let blocks = &self.blocks;
@@ -846,8 +849,10 @@ impl TemporarySpiller {
         self.handles.clear();
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
-            if !table.live
-                || table.def.persistence != crate::storage::RelationPersistence::Temporary
+            if !table.live || {
+                let definition = table.definition();
+                definition.persistence
+            } != crate::storage::RelationPersistence::Temporary
             {
                 continue;
             }
@@ -1134,12 +1139,18 @@ impl Checkpointer {
                 self.merge_scratch.clear();
                 self.merge_writer.reset();
                 let mut schema = [ColType::Bool; MAX_COLUMNS];
-                let columns = storage.table(job.slot).def.schema(&mut schema);
+                let columns = storage.table(job.slot).definition().schema(&mut schema);
                 self.merge_writer
                     .set_pax_schema(&schema[..columns])
                     .map_err(sst_to_sql)?;
                 self.merge_writer
-                    .set_packed_fillfactor(storage.table(job.slot).def.storage_options.fillfactor)
+                    .set_packed_fillfactor(
+                        storage
+                            .table(job.slot)
+                            .definition()
+                            .storage_options
+                            .fillfactor,
+                    )
                     .map_err(sst_to_sql)?;
                 self.merge_source_cursors = [
                     Some(SstVersionCursor::new(job.old0.handle)),
@@ -1220,7 +1231,7 @@ impl Checkpointer {
         // unrelated table can starve the publication.
         let must_free_full_list = (0..storage.physical_table_count()).any(|slot| {
             storage.table(slot).live
-                && storage.table(slot).def.persistence
+                && storage.table(slot).definition().persistence
                     != crate::storage::RelationPersistence::Temporary
                 && storage.table(slot).dirty
                 && self.merge_done[slot].is_none()
@@ -1231,7 +1242,7 @@ impl Checkpointer {
         });
         for slot in 0..storage.physical_table_count() {
             if !storage.table(slot).live
-                || storage.table(slot).def.persistence
+                || storage.table(slot).definition().persistence
                     == crate::storage::RelationPersistence::Temporary
             {
                 continue;
@@ -7516,7 +7527,7 @@ impl Checkpointer {
                     "statistics row count exceeds addressable memory",
                 ));
             }
-            let n_columns = storage.table(slot).def.n_columns;
+            let n_columns = storage.table(slot).definition().n_columns;
             if statistics.columns[n_columns..]
                 .iter()
                 .any(|column| column.valid)
@@ -7542,7 +7553,7 @@ impl Checkpointer {
                 .iter()
                 .any(|key| {
                     matches!(key, crate::storage::ExtendedStatisticsKey::Column(column)
-                    if storage.table(table).def.column_index(column.as_str()).is_none())
+                    if storage.table(table).definition().column_index(column.as_str()).is_none())
                 })
             {
                 return Err(CheckpointSetupError::Corrupt(
@@ -7757,7 +7768,7 @@ impl Checkpointer {
         self.reconcile_published_spill_lists(storage);
         let dirty_full_list = (0..storage.physical_table_count()).any(|slot| {
             storage.table(slot).live
-                && storage.table(slot).def.persistence
+                && storage.table(slot).definition().persistence
                     != crate::storage::RelationPersistence::Temporary
                 && storage.table(slot).dirty
                 && self.merge_done[slot].is_none()
@@ -7824,8 +7835,10 @@ impl Checkpointer {
         let mut wrote_slice = false;
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
-            if !table.live
-                || table.def.persistence == crate::storage::RelationPersistence::Temporary
+            if !table.live || {
+                let definition = table.definition();
+                definition.persistence
+            } == crate::storage::RelationPersistence::Temporary
             {
                 continue;
             }
@@ -7905,7 +7918,10 @@ impl Checkpointer {
             }
             let table = storage.table(slot);
             let matches_storage = table.live
-                && table.def.persistence != crate::storage::RelationPersistence::Temporary
+                && {
+                    let definition = table.definition();
+                    definition.persistence
+                } != crate::storage::RelationPersistence::Temporary
                 && table.n_spill_ssts == published.n
                 && (0..published.n).all(|index| {
                     table.spill_ssts[index] == published.ssts[index].map(|prior| prior.handle)
@@ -7940,7 +7956,10 @@ impl Checkpointer {
     fn needs_slice(&self, storage: &Storage, slot: usize) -> bool {
         let table = storage.table(slot);
         table.live
-            && table.def.persistence != crate::storage::RelationPersistence::Temporary
+            && {
+                let definition = table.definition();
+                definition.persistence
+            } != crate::storage::RelationPersistence::Temporary
             && table.dirty
             && self.sliced_generation[slot] != table.generation
     }
@@ -8492,8 +8511,10 @@ impl Checkpointer {
         }
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
-            if !table.live
-                || table.def.persistence == crate::storage::RelationPersistence::Temporary
+            if !table.live || {
+                let definition = table.definition();
+                definition.persistence
+            } == crate::storage::RelationPersistence::Temporary
             {
                 // A dropped table's recorded list must not linger into the
                 // GC keep-set the swap below publishes.
@@ -8502,6 +8523,8 @@ impl Checkpointer {
                 }
                 continue;
             }
+            let definitions = storage.table_definition_images();
+            let definition = definitions.definition(storage, slot, 0)?;
             write_database_context(
                 &mut self.manifest_buf,
                 &mut database_context,
@@ -8513,19 +8536,19 @@ impl Checkpointer {
             write!(
                 table_line,
                 "table {slot} {} {} {} {} {} {} {}",
-                table.def.n_columns,
-                u8::from(table.def.has_toast),
-                u8::from(table.def.has_rules),
-                match table.def.kind {
+                definition.n_columns,
+                u8::from(definition.has_toast),
+                u8::from(definition.has_rules),
+                match definition.kind {
                     crate::storage::TableKind::Local => 0,
                     crate::storage::TableKind::Foreign => 1,
                 },
-                table.def.tablespace,
-                match table.def.access_method {
+                definition.tablespace,
+                match definition.access_method {
                     crate::storage::TableAccessMethod::Heap => 2,
                     crate::storage::TableAccessMethod::Catalog(oid) => oid.get(),
                 },
-                table.def.inheritance.parents_ref().len(),
+                definition.inheritance.parents_ref().len(),
             )
             .map_err(|_| {
                 sql_err!(
@@ -8533,7 +8556,7 @@ impl Checkpointer {
                     "table manifest line exceeds fixed capacity"
                 )
             })?;
-            for parent in table.def.inheritance.parents_ref() {
+            for parent in definition.inheritance.parents_ref() {
                 write!(table_line, " {parent}").map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -8541,8 +8564,7 @@ impl Checkpointer {
                     )
                 })?;
             }
-            let membership = table
-                .def
+            let membership = definition
                 .type_membership
                 .composite_slot()
                 .map_or(-1, |slot| slot as i32);
@@ -8555,7 +8577,7 @@ impl Checkpointer {
             write!(
                 table_line,
                 " {}",
-                table.def.storage_options.fillfactor.unwrap_or(0)
+                definition.storage_options.fillfactor.unwrap_or(0)
             )
             .map_err(|_| {
                 sql_err!(
@@ -8563,7 +8585,7 @@ impl Checkpointer {
                     "table manifest line exceeds fixed capacity"
                 )
             })?;
-            write!(table_line, " {}", table.def.name.as_str()).map_err(|_| {
+            write!(table_line, " {}", definition.name.as_str()).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "table manifest line exceeds fixed capacity"
@@ -8572,12 +8594,12 @@ impl Checkpointer {
             write_manifest(&mut self.manifest_buf, table_line.as_str())?;
             write_manifest(
                 &mut self.manifest_buf,
-                format_args!("persist {}", table.def.persistence.code() as char),
+                format_args!("persist {}", definition.persistence.code() as char),
             )?;
-            if table.def.schema.as_str() != "public" {
+            if definition.schema.as_str() != "public" {
                 use core::fmt::Write;
                 let mut hex = StackStr::<130>::new();
-                for b in table.def.schema.as_str().as_bytes() {
+                for b in definition.schema.as_str().as_bytes() {
                     let _ = write!(hex, "{b:02x}");
                 }
                 write_manifest(
@@ -8585,17 +8607,17 @@ impl Checkpointer {
                     format_args!("tsch {}", hex.as_str()),
                 )?;
             }
-            write_partition_manifest(&mut self.manifest_buf, table.def.partition)?;
+            write_partition_manifest(&mut self.manifest_buf, definition.partition)?;
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
                     "rls {} {} {}",
-                    u8::from(table.def.row_level_security.enabled),
-                    u8::from(table.def.row_level_security.forced),
-                    table.def.replica_identity.code(),
+                    u8::from(definition.row_level_security.enabled),
+                    u8::from(definition.row_level_security.forced),
+                    definition.replica_identity.code(),
                 ),
             )?;
-            for c in table.def.columns() {
+            for c in definition.columns() {
                 use core::fmt::Write as _;
                 let default_value = c.default.constant().copied();
                 let default_hex = default_to_hex(&default_value);
@@ -8678,7 +8700,7 @@ impl Checkpointer {
                         table.statistics.analyzed_generation
                     ),
                 )?;
-                for (column, statistics) in table.statistics.columns[..table.def.n_columns]
+                for (column, statistics) in table.statistics.columns[..definition.n_columns]
                     .iter()
                     .enumerate()
                 {
@@ -8698,7 +8720,7 @@ impl Checkpointer {
                 }
             }
             let serial_values = storage.table_serial_values(slot);
-            for (ci, c) in table.def.columns().iter().enumerate() {
+            for (ci, c) in definition.columns().iter().enumerate() {
                 if c.auto_increment {
                     write_manifest(
                         &mut self.manifest_buf,
@@ -8708,7 +8730,7 @@ impl Checkpointer {
             }
             // Constraint lines (hex-encoded names/text tolerate spaces):
             // `ukey <is_primary> <timing> <ncols> <c0..cN> <hex-name>`
-            for uk in table.def.uniques() {
+            for uk in definition.uniques() {
                 use core::fmt::Write;
                 let mut columns = StackStr::<64>::new();
                 for c in uk.columns() {
@@ -8731,7 +8753,7 @@ impl Checkpointer {
                 )?;
             }
             // `chk <validation> <hex-name> <hex-predicate>`
-            for check in table.def.checks() {
+            for check in definition.checks() {
                 use core::fmt::Write;
                 let mut hex_name = StackStr::<130>::new();
                 for b in check.name.as_str().as_bytes() {
@@ -8752,7 +8774,7 @@ impl Checkpointer {
                 )?;
             }
             // `fkey <ncols> <c..> <nparent> <p..> <actions> <timing> <validation> <names>`
-            for fk in table.def.fkeys() {
+            for fk in definition.fkeys() {
                 use core::fmt::Write;
                 let mut columns = StackStr::<64>::new();
                 for c in fk.columns() {
@@ -8792,7 +8814,7 @@ impl Checkpointer {
                     ),
                 )?;
             }
-            for exclusion in table.def.exclusions() {
+            for exclusion in definition.exclusions() {
                 use core::fmt::Write;
                 let mut elements = StackStr::<128>::new();
                 for position in 0..exclusion.n_cols {
@@ -11374,7 +11396,7 @@ impl Checkpointer {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "historical snapshot pins a full SST generation list for table \"{}\"",
-                storage.table(slot).def.name.as_str()
+                storage.table(slot).definition().name.as_str()
             ));
         }
 
@@ -11437,7 +11459,7 @@ impl Checkpointer {
             self.sst_arena.reset();
             self.slice_writer.reset();
             let mut schema = [ColType::Bool; MAX_COLUMNS];
-            let columns = storage.table(slot).def.schema(&mut schema);
+            let columns = storage.table(slot).definition().schema(&mut schema);
             if delta {
                 self.slice_writer.set_packed_rows().map_err(sst_to_sql)?;
             } else {
@@ -11446,7 +11468,7 @@ impl Checkpointer {
                     .map_err(sst_to_sql)?;
             }
             self.slice_writer
-                .set_packed_fillfactor(storage.table(slot).def.storage_options.fillfactor)
+                .set_packed_fillfactor(storage.table(slot).definition().storage_options.fillfactor)
                 .map_err(sst_to_sql)?;
             let writer = &mut self.slice_writer;
             let blocks = &self.blocks;
@@ -11640,7 +11662,10 @@ impl Checkpointer {
         (0..storage.physical_table_count()).any(|slot| {
             let table = storage.table(slot);
             table.live
-                && table.def.persistence != crate::storage::RelationPersistence::Temporary
+                && {
+                    let definition = table.definition();
+                    definition.persistence
+                } != crate::storage::RelationPersistence::Temporary
                 && (0..storage.value_binding_count(slot)).any(|binding| {
                     storage.value_binding_is_committed(slot, binding)
                         && storage.value_binding_needs_publish(slot, binding)
@@ -15389,7 +15414,7 @@ fn finish_pending(
                 .is_large_object_page_relation(definition.schema.as_str(), definition.name.as_str())
             {
                 let slot = storage.large_object_page_table();
-                let expected = &storage.table(slot).def;
+                let expected = &*storage.table(slot).definition();
                 if manifest_index != slot
                     || definition.schema != expected.schema
                     || definition.name != expected.name

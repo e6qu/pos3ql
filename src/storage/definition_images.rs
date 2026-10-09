@@ -170,7 +170,7 @@ impl TableDefinitionImages {
             core::ptr::addr_of_mut!((*target).database).write(source.database);
             core::ptr::addr_of_mut!((*target).created_at).write(source.created_at);
             core::ptr::copy_nonoverlapping(
-                definition,
+                &*definition,
                 core::ptr::addr_of_mut!((*target).definition),
                 1,
             );

@@ -16,9 +16,6 @@ use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_ROUTINE_ARGUMENTS, RoutineArgumentDef, TableDef};
 use core::cell::Cell;
 
-/// Result-column names and types, statically inferred. Names borrow the
-/// statement (aliases) or the catalog (wildcard columns); `'q` is whichever
-/// is shorter at the call site.
 /// The atttypmod RowDescription reports for an output expression: a bare table
 /// column carries its declared modifier, a cast its target's, and every other
 /// expression `-1` — matching what PostgreSQL sends (`upper(v)` has none even
@@ -32,9 +29,25 @@ fn output_type_mod(expression: &Expr<'_>, column_mod: impl Fn(&str) -> i32) -> i
     }
 }
 
+/// Catalog names escape into the statement arena before their reader is released.
+fn describe_column<'a>(
+    column: &ColumnMeta,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<ColDesc<'a>, SqlError> {
+    let name = arena.alloc_str(column.name.as_str()).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "column description exceeds the statement arena"
+        )
+    })?;
+    Ok(ColDesc::of_type(name, column.ctype)
+        .with_type_mod(column.type_mod)
+        .with_collation(column.collation))
+}
+
 pub fn describe_items<'q>(
     items: &[SelectItem<'q>],
-    def: Option<&'q TableDef>,
+    def: Option<&TableDef>,
     table_alias: Option<&str>,
     storage: Option<&'q crate::storage::Storage>,
     txid: u32,
@@ -57,7 +70,7 @@ pub fn describe_items<'q>(
 
 #[derive(Clone, Copy)]
 struct DescribeContext<'q, 'scope> {
-    def: Option<&'q TableDef>,
+    def: Option<&'scope TableDef>,
     table_alias: Option<&'scope str>,
     output_aliases: &'scope [&'scope str],
     storage: Option<&'q crate::storage::Storage>,
@@ -188,11 +201,7 @@ fn describe_items_with_output_aliases<'q>(
                     ));
                 };
                 for c in def.columns() {
-                    push(
-                        ColDesc::of_type(c.name.as_str(), c.ctype)
-                            .with_type_mod(c.type_mod)
-                            .with_collation(c.collation),
-                    )?;
+                    push(describe_column(c, context.arena)?)?;
                 }
             }
             SelectItem::TableWildcard(q) => {
@@ -208,11 +217,7 @@ fn describe_items_with_output_aliases<'q>(
                     ));
                 }
                 for c in def.expect("matched").columns() {
-                    push(
-                        ColDesc::of_type(c.name.as_str(), c.ctype)
-                            .with_type_mod(c.type_mod)
-                            .with_collation(c.collation),
-                    )?;
+                    push(describe_column(c, context.arena)?)?;
                 }
             }
             SelectItem::RecordStar(base) => {
@@ -309,7 +314,7 @@ fn describe_items_with_output_aliases<'q>(
 /// PostgreSQL adds only to the output scope.
 pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     returning: crate::sql::ast::Returning<'q>,
-    definition: Option<&'storage TableDef>,
+    definition: Option<&TableDef>,
     target_alias: Option<&'q str>,
     storage: Option<&'storage crate::storage::Storage>,
     txid: u32,
@@ -810,11 +815,7 @@ fn describe_record_star<'q>(
             }) =>
         {
             for c in def.expect("matched").columns() {
-                push(
-                    ColDesc::of_type(c.name.as_str(), c.ctype)
-                        .with_type_mod(c.type_mod)
-                        .with_collation(c.collation),
-                )?;
+                push(describe_column(c, arena)?)?;
             }
             Ok(())
         }

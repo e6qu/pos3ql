@@ -42,8 +42,9 @@ and its linked documents; completed investigations belong in [history](docs/hist
 
 Complete shared ownership before enabling overlapping execution:
 
-- Synchronize live table-definition publication and lifecycle. Query and DML
-  readers retain transaction-visible images; publication remains exclusive.
+- Coordinate definition publication with table identity and existence. Committed
+  definitions, pending heads, and version slots have guarded ownership; query and
+  DML readers retain immutable images. Lifecycle coordination remains exclusive.
 - Synchronize row publication, statistics, and physical maintenance through a
   coherent table lifecycle, including rollback, retirement, cloning, and recovery.
 - Pin heap locations across visibility lookup and concurrent relocation. Heap

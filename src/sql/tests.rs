@@ -7,6 +7,149 @@
 use super::*;
 
 #[test]
+fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
+    let mut config = test_config("definition-checkpoint-exhaustion");
+    config.max_tables = 1;
+    config.max_catalog_versions_per_object = 1;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("definition-checkpoint-exhaustion-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE definition_checkpoint (id integer); INSERT INTO definition_checkpoint VALUES (7)",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let table = engine
+        .storage
+        .find_table("public", "definition_checkpoint")
+        .unwrap();
+    let capacity = crate::storage::table_slot_capacity(&config)
+        * (config.max_catalog_versions_per_object + 1)
+        * config.query_workspace_slots;
+    let mut owners = Vec::with_capacity(capacity);
+    for _ in 0..capacity {
+        let definitions = engine.storage.table_definition_images();
+        definitions.definition(&engine.storage, table, 0).unwrap();
+        owners.push(definitions);
+    }
+    let error = engine.checkpoint().unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    assert!(
+        error
+            .message
+            .as_str()
+            .contains("table definition image pool is exhausted")
+    );
+    drop(owners.pop().unwrap());
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(owners);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id FROM definition_checkpoint"
+        )),
+        ["7"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn live_definition_ownership_returning_descriptions_keep_names_and_modifiers() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE definition_returning (id integer, label varchar(3))",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let mut before = Vec::new();
+    for statement in [
+        "INSERT INTO definition_returning VALUES (1, 'abc') RETURNING *",
+        "INSERT INTO definition_returning VALUES (1, 'abc') RETURNING new.*",
+        "INSERT INTO definition_returning VALUES (1, 'abc') RETURNING (new).*",
+    ] {
+        let described = describe_with(&mut engine, &mut budget, statement);
+        assert_eq!(row_description_names(&described), ["id", "label"]);
+        assert_eq!(row_description_type_modifiers(&described), [-1, 7]);
+        before.push(described);
+    }
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE definition_returning RENAME COLUMN label TO value",
+    );
+    assert!(!String::from_utf8_lossy(&renamed).contains("ERROR"));
+    let after = describe_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO definition_returning VALUES (1, 'abc') RETURNING *",
+    );
+    assert_eq!(row_description_names(&after), ["id", "value"]);
+    assert_eq!(row_description_type_modifiers(&after), [-1, 7]);
+    for described in before {
+        assert_eq!(row_description_names(&described), ["id", "label"]);
+    }
+}
+
+#[test]
+fn live_definition_ownership_catalog_tracks_rename_schema_and_rollback() {
+    let (mut engine, mut budget) = test_engine();
+    let query = "SELECT t.typname, n.nspname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname IN ('definition_owner_before', '_definition_owner_before', 'definition_owner_after', '_definition_owner_after') ORDER BY t.typname";
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA definition_owner_schema; CREATE TABLE definition_owner_before (id integer)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let statement = format!(
+        "{query}; \
+         BEGIN; ALTER TABLE definition_owner_before RENAME TO definition_owner_after; {query}; \
+         ALTER TABLE definition_owner_after SET SCHEMA definition_owner_schema; {query}; \
+         ROLLBACK; {query}; \
+         BEGIN; ALTER TABLE definition_owner_before RENAME TO definition_owner_after; \
+         ALTER TABLE definition_owner_after SET SCHEMA definition_owner_schema; COMMIT; {query}"
+    );
+    let output = run_with(&mut engine, &mut budget, &statement);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "_definition_owner_before|public",
+            "definition_owner_before|public",
+            "_definition_owner_after|public",
+            "definition_owner_after|public",
+            "_definition_owner_after|definition_owner_schema",
+            "definition_owner_after|definition_owner_schema",
+            "_definition_owner_before|public",
+            "definition_owner_before|public",
+            "_definition_owner_after|definition_owner_schema",
+            "definition_owner_after|definition_owner_schema",
+        ]
+    );
+}
+
+#[test]
 fn query_definition_ownership_record_witnesses_and_describe_names() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(

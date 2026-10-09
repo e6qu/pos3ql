@@ -34791,7 +34791,8 @@ impl Storage {
             .pending_txid()
             .expect("table DROP owns catalog state");
         identity.existence = identity.existence.rollback_drop(txid);
-        self.view_rule_catalog().rollback_target_rules(RuleTarget::Table(index as u16), txid);
+        self.view_rule_catalog()
+            .rollback_target_rules(RuleTarget::Table(index as u16), txid);
     }
 
     /// Whether any live view exists (lets the executor skip view expansion).

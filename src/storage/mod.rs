@@ -34768,7 +34768,7 @@ impl Storage {
         self.commit_rules_for_table(index);
     }
 
-    /// Rolls back an uncommitted CREATE, freeing the slot.
+    /// Retires a rolled-back CREATE or a failed replay allocation.
     pub fn rollback_create(&mut self, index: usize) {
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
@@ -34783,8 +34783,7 @@ impl Storage {
         self.tables[index].statistics_wal_dirty = false;
     }
 
-    /// Rolls back an uncommitted DROP: the table returns to the committed
-    /// image unchanged.
+    /// Restores the prior existence and attached rules after an uncommitted DROP.
     pub fn rollback_drop(&mut self, index: usize) {
         let identity = self.tables[index].identity_mut();
         let txid = identity

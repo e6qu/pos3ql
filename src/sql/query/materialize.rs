@@ -39,7 +39,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         let flat_of = |t: usize, c: usize| -> usize {
             (0..t)
-                .map(|i| self.scope.defs[i].expect("resolved").n_columns)
+                .map(|i| self.scope.defs.get(i).expect("resolved").n_columns)
                 .sum::<usize>()
                 + c
         };
@@ -92,7 +92,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     ) -> Option<crate::storage::UserTypeName> {
         match self.scope.find_column(qualifier, name).ok()? {
             ResolvedColumn::Table(table, column) => {
-                self.scope.defs[table]?.columns.get(column)?.user_type
+                self.scope.defs.get(table)?.columns.get(column)?.user_type
             }
             ResolvedColumn::Merged(_) => None,
         }
@@ -259,7 +259,7 @@ fn materialized_value_at<'a>(
     }
     let mut raw_index = index - width - n_keys;
     for table in 0..scope.n {
-        let column_count = scope.defs[table].expect("resolved").n_columns;
+        let column_count = scope.defs.get(table).expect("resolved").n_columns;
         if raw_index < column_count {
             let values = row.table_values(table).expect("bound");
             return if values.is_empty() {
@@ -310,7 +310,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     ) -> Option<crate::storage::UserTypeName> {
         match self.0.find_column(qualifier, name).ok()? {
             super::scope::ResolvedColumn::Table(table, column) => {
-                self.0.defs[table]?.columns.get(column)?.user_type
+                self.0.defs.get(table)?.columns.get(column)?.user_type
             }
             super::scope::ResolvedColumn::Merged(_) => None,
         }
@@ -1545,7 +1545,7 @@ pub(crate) fn external_materialized_into<'a>(
                                 let mut raw_index = index - plan.width - plan.n_keys;
                                 for table in 0..scope.n {
                                     let column_count =
-                                        scope.defs[table].expect("resolved").n_columns;
+                                        scope.defs.get(table).expect("resolved").n_columns;
                                     if raw_index < column_count {
                                         let values = row.table_values(table).expect("bound");
                                         return if values.is_empty() {

@@ -452,7 +452,7 @@ fn collect_statement(
                         collect_returning_expression(
                             expression,
                             insert.returning,
-                            scope.defs[0].expect("target resolved"),
+                            scope.defs.get(0).expect("target resolved"),
                             insert.table.name,
                             storage,
                             txid,
@@ -518,7 +518,7 @@ fn collect_statement(
                         collect_returning_expression(
                             expression,
                             update.returning,
-                            scope.defs[0].expect("target resolved"),
+                            scope.defs.get(0).expect("target resolved"),
                             update.alias.unwrap_or(update.table.name),
                             storage,
                             txid,
@@ -581,7 +581,7 @@ fn collect_statement(
                         collect_returning_expression(
                             expression,
                             delete.returning,
-                            scope.defs[0].expect("target resolved"),
+                            scope.defs.get(0).expect("target resolved"),
                             delete.alias.unwrap_or(delete.table.name),
                             storage,
                             txid,
@@ -651,7 +651,7 @@ fn collect_statement(
                         collect_returning_expression(
                             expression,
                             merge.returning,
-                            scope.defs[0].expect("target resolved"),
+                            scope.defs.get(0).expect("target resolved"),
                             merge.target_alias.unwrap_or(merge.target.name),
                             storage,
                             txid,
@@ -1068,7 +1068,7 @@ fn collect_select<'a>(
                     }
                     SelectItem::Wildcard => {
                         for table in 0..scope.n {
-                            for column in 0..scope.defs[table].expect("resolved").n_columns {
+                            for column in 0..scope.defs.get(table).expect("resolved").n_columns {
                                 dependencies.mark_referenced_column(
                                     DependencyClass::Table,
                                     scope.slots[table],
@@ -1334,7 +1334,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         }
         let scope = self.scope?;
         let table = scope.table_index(name).ok()?;
-        Some(scope.defs[table]?.columns())
+        Some(scope.defs.get(table)?.columns())
     }
 
     fn whole_row_field(
@@ -1361,7 +1361,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         }
         match entry {
             super::scope::ResolvedColumn::Table(table, column) => {
-                Some(scope.defs[table]?.columns[column].type_mod)
+                Some(scope.defs.get(table)?.columns[column].type_mod)
             }
             _ => None,
         }

@@ -27,7 +27,7 @@ current single-writer protocol.
 | Compatibility | Broad PostgreSQL 18 SQL, catalogs, types, procedures, wire, drivers, dump/restore, and explicit command disposition | Preserve accepted shapes and explicit limits through the remaining changes |
 | Persistence | Durable response barriers, checkpoints, indexes, caches, paced maintenance, and cold recovery | Preserve these guarantees under concurrent execution and representative load |
 | Operations | Writer fencing, backups, independent-prefix export, point-in-time recovery, probes, credential rotation, packages, and passive promotion | Qualify multi-host recovery and failover with real routing and independent storage |
-| Concurrency | Private statement workspaces; synchronized catalogs, serial positions, row maps/version readers, retained DML definitions, and heap byte ownership | Shared table/row mutation, engine publication, and fixed execution workers |
+| Concurrency | Private statement workspaces; synchronized catalogs, serial positions, row maps/version readers, retained query/DML definitions, and heap byte ownership | Shared table/row mutation, engine publication, and fixed execution workers |
 | Performance | Fixture, MinIO, and SeaweedFS harness with host-available and CPU/memory-matched vanilla PostgreSQL 18 controls | Repeated representative runs and published raw evidence |
 
 Execution remains serial. Guarded reads and retained images are prerequisites;
@@ -42,8 +42,8 @@ and its linked documents; completed investigations belong in [history](docs/hist
 
 Complete shared ownership before enabling overlapping execution:
 
-- Give query scopes retained transaction-visible definition ownership beyond
-  lookup; live definition publication is currently exclusive.
+- Synchronize live table-definition publication and lifecycle. Query and DML
+  readers retain transaction-visible images; publication remains exclusive.
 - Synchronize row publication, statistics, and physical maintenance through a
   coherent table lifecycle, including rollback, retirement, cloning, and recovery.
 - Pin heap locations across visibility lookup and concurrent relocation. Byte

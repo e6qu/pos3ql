@@ -7,6 +7,47 @@
 use super::*;
 
 #[test]
+fn query_definition_ownership_record_witnesses_and_describe_names() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE scope_records (id integer, value varchar(3)); INSERT INTO scope_records VALUES (1, 'abc')",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    for _ in 0..8 {
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT t IN (SELECT r FROM scope_records r), t NOT IN (SELECT r FROM scope_records r WHERE r.id = 9) FROM scope_records t"
+            )),
+            ["t|t"]
+        );
+    }
+    let before = describe_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (r).* FROM scope_records r",
+    );
+    assert_eq!(row_description_names(&before), ["id", "value"]);
+    assert_eq!(row_description_type_modifiers(&before), [-1, 7]);
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE scope_records RENAME COLUMN value TO label",
+    );
+    assert!(!String::from_utf8_lossy(&renamed).contains("ERROR"));
+    let after = describe_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (r).* FROM scope_records r",
+    );
+    assert_eq!(row_description_names(&after), ["id", "label"]);
+    assert_eq!(row_description_names(&before), ["id", "value"]);
+}
+
+#[test]
 fn table_definition_images_nested_trigger_exhaustion_rolls_back_and_retries() {
     let mut config = test_config("definition-image-exhaustion");
     config.max_tables = 2;

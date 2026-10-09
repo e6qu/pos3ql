@@ -71234,6 +71234,8 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     config.wal_bytes = 16 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    // Reserve row maps and version capacity for the two fixture relations.
+    config.max_tables = 2;
     config.table_rows = 24576;
     config.memtable_bytes = 4 << 20;
     // The 20000-row fixture is ~160 KiB of rows, so the memtable holds it;

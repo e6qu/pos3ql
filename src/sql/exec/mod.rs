@@ -43,7 +43,7 @@ use super::types::{ArrElem, ColDesc, ColType, Datum, RecordField, TypeMod};
 /// remote PostgreSQL tuple identity are distinct closed states: callers cannot
 /// accidentally turn a foreign row into a local shadow row.
 #[derive(Clone, Copy)]
-pub enum PhysicalRow {
+pub(crate) enum PhysicalRow {
     Local {
         table_index: usize,
         rowid: u64,
@@ -131,14 +131,14 @@ pub const QUERY_STACK_BYTES: usize = 128 << 20;
 /// Fixed resources needed when logical apply invokes the ordinary trigger
 /// executor. The worker owns all three at startup, so a remote row cannot
 /// create an unbounded execution path.
-pub struct ReplicationTriggerContext<'a, 'response> {
+pub(crate) struct ReplicationTriggerContext<'a, 'response> {
     seq_session: &'a crate::sql::guc::SeqSession,
     responder: &'a mut Responder<'response>,
     scratch: &'a mut DmlScratch,
 }
 
 impl<'a, 'response> ReplicationTriggerContext<'a, 'response> {
-    pub fn new(
+    pub(crate) fn new(
         seq_session: &'a crate::sql::guc::SeqSession,
         responder: &'a mut Responder<'response>,
         scratch: &'a mut DmlScratch,
@@ -5922,7 +5922,7 @@ pub fn alter_materialized_view_extension_dependency(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn alter_materialized_view(
+pub(crate) fn alter_materialized_view(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -8837,7 +8837,7 @@ fn drop_owned_privileges(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_owned(
+pub(crate) fn drop_owned(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -11244,7 +11244,7 @@ enum SchemaObject {
 /// CASCADE drops every contained catalog object and severs inbound foreign
 /// keys from surviving tables.
 #[allow(clippy::too_many_arguments)]
-pub fn drop_schema(
+pub(crate) fn drop_schema(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -30024,7 +30024,7 @@ pub fn alter_conversion(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_collation(
+pub(crate) fn drop_collation(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -40476,7 +40476,7 @@ fn drop_type_dependent_routines(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_domain(
+pub(crate) fn drop_domain(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -41620,7 +41620,7 @@ pub fn create_composite(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_type(
+pub(crate) fn drop_type(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -51520,7 +51520,7 @@ pub(crate) fn subscription_copy_setup(
     })
 }
 
-pub fn copy_statement_begin(
+pub(crate) fn copy_statement_begin(
     storage: &mut Storage,
     txn: &mut TxnState,
     setup: &CopySetup,
@@ -51567,7 +51567,7 @@ pub fn copy_statement_begin(
     clippy::too_many_arguments,
     reason = "COPY completion owns its statement trigger boundary"
 )]
-pub fn copy_statement_end(
+pub(crate) fn copy_statement_end(
     storage: &mut Storage,
     txn: &mut TxnState,
     setup: &CopySetup,
@@ -51711,7 +51711,7 @@ pub fn copy_ignorable_error(error: &SqlError) -> bool {
     clippy::too_many_arguments,
     reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
 )]
-pub fn copy_row(
+pub(crate) fn copy_row(
     storage: &mut Storage,
     txn: &mut TxnState,
     seq_session: &crate::sql::guc::SeqSession,
@@ -51842,7 +51842,7 @@ pub fn copy_row(
     clippy::too_many_arguments,
     reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
 )]
-pub fn copy_row_binary(
+pub(crate) fn copy_row_binary(
     storage: &mut Storage,
     txn: &mut TxnState,
     seq_session: &crate::sql::guc::SeqSession,
@@ -52079,7 +52079,7 @@ fn finish_copy_row<'a>(
 
 /// Applies one pgoutput INSERT tuple through the ordinary row core. Omitted
 /// published columns take local defaults; unchanged TOAST is invalid here.
-pub fn apply_replication_insert(
+pub(crate) fn apply_replication_insert(
     storage: &mut Storage,
     txn: &mut TxnState,
     binding: RelationBinding,
@@ -52430,7 +52430,7 @@ fn locate_replication_row_by_values(
 /// pending-version path.  The caller supplies the publisher old tuple; the
 /// exact-row proof prevents a replica identity from turning into a broad
 /// local delete.
-pub fn apply_replication_delete(
+pub(crate) fn apply_replication_delete(
     storage: &mut Storage,
     txn: &mut TxnState,
     binding: RelationBinding,
@@ -55237,7 +55237,7 @@ pub fn describe_merge_returning<'a>(
 /// source/target join plus unmatched rows from either side requested by the
 /// `WHEN` clauses. A target row affected twice is a cardinality error (21000).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn merge<'a>(
+pub(crate) fn merge<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
@@ -61006,7 +61006,7 @@ pub(crate) fn delete<'a>(
     clippy::too_many_arguments,
     reason = "statement-trigger dispatch needs the normal bounded DML execution context"
 )]
-pub fn truncate(
+pub(crate) fn truncate(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
@@ -62175,7 +62175,7 @@ enum ColSource<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn alter_table(
+pub(crate) fn alter_table(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,

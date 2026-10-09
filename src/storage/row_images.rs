@@ -3,16 +3,20 @@
 use super::row_heap::HeapRowRead;
 use super::{RowHome, RowLoc};
 
-/// A table incarnation and the MVCC boundaries used to select a logical row.
+/// A table incarnation and the exact row version selected by MVCC.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowSnapshot {
     pub(super) created_at: u64,
-    pub(super) txid: u32,
-    pub(super) command: u32,
-    pub(super) commit: u64,
+    pub(super) version: RowVersionIdentity,
 }
 
-/// Deferred executor reads distinguish an MVCC snapshot from unpublished bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RowVersionIdentity {
+    Pending(u64),
+    Committed(u64),
+}
+
+/// Deferred executor reads distinguish an MVCC snapshot from staged write bytes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RowReadSource {
     Snapshot(RowSnapshot),

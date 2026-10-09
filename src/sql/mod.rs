@@ -2593,7 +2593,6 @@ impl Engine {
         self.ensure_txn(txn, TxnMode::Implicit, guc)?;
         txn.replication_apply = true;
         txn.begin_command()?;
-        self.storage.set_command_snapshot(txn.command_id())?;
         // pgoutput messages form one remote transaction, not independent SQL
         // statements.  Each later row operation must therefore see every
         // earlier local change from that same remote commit.
@@ -4929,7 +4928,6 @@ impl Engine {
             txn.savepoint_names(),
         )?;
         txn.begin_command()?;
-        self.storage.set_command_snapshot(txn.command_id())?;
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
         let snapshot = if takes_snapshot {
             let snapshot = txn.statement_snapshot(self.storage.lsn());

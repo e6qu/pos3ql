@@ -66,6 +66,9 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 Startup-sized catalogs have independent capacities; table count does not silently
 size unrelated classes. Transaction bounds also cover prepared and subscription
 slots. `max_catalog_versions_per_object` bounds retained definition/undo versions.
+`max_row_versions_per_row` bounds pending writes and committed snapshot versions;
+each write retains an immutable image, including writes in the same command.
+Pending version identity exhaustion is a named program-limit error.
 `checkpoint_manifest_bytes`, live-block, replay, merge, garbage-batch, and backup
 rosters are separate reservations. Deletion batches limit work per beat, not the
 number of objects cleanup may ultimately process.

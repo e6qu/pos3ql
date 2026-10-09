@@ -5,10 +5,11 @@ use std::sync::RwLockReadGuard;
 
 use super::row_map::RowMap;
 use super::row_versions::{
-    RowVersionPools, RowVersionState, committed_history_get, committed_visible_at, pending_last,
-    pending_visible_at,
+    RowVersionPools, RowVersionState, committed_history_get, committed_version_at, pending_last,
+    pending_visible_at, pending_version_at, retained_pending_home,
 };
-use super::{CommittedVersion, PendingChange, RowHome, RowState};
+use super::{CommittedVersion, PendingChange, RowHome, RowLoc, RowState};
+use super::row_images::RowVersionIdentity;
 use crate::mem::fixed_map::FixedMap;
 
 /// Metadata is copied, but reusable chain slots remain pinned until this read
@@ -86,6 +87,32 @@ impl RowRead<'_> {
         })
     }
 
+    pub(super) fn retained_pending_home(&self, identity: u64) -> Option<Option<RowLoc>> {
+        retained_pending_home(&self.versions()?.pending_row_versions, self.state.pending, identity)
+    }
+
+    pub(super) fn visible_version_at(
+        &self,
+        txid: u32,
+        command_snapshot: u32,
+        commit_snapshot: u64,
+    ) -> Option<(RowVersionIdentity, Option<RowHome>)> {
+        if let Some(versions) = self.versions()
+            && let Some((identity, location)) = pending_version_at(
+                &versions.pending_row_versions, self.state.pending, txid, command_snapshot,
+            )
+        {
+            return Some((RowVersionIdentity::Pending(identity), location.map(RowHome::Heap)));
+        }
+        if self.state.committed_lsn <= commit_snapshot {
+            return Some((RowVersionIdentity::Committed(self.state.committed_lsn), self.state.committed));
+        }
+        let version = committed_version_at(
+            &self.versions()?.committed_row_versions, self.state.history, commit_snapshot,
+        )?;
+        Some((RowVersionIdentity::Committed(version.lsn), version.home))
+    }
+
     /// `None` requests immutable history; `Some(None)` is a visible deletion.
     pub(super) fn visible_at(
         &self,
@@ -93,27 +120,9 @@ impl RowRead<'_> {
         command_snapshot: u32,
         commit_snapshot: u64,
     ) -> Option<Option<RowHome>> {
-        if let Some(versions) = self.versions()
-            && let Some(location) = pending_visible_at(
-                &versions.pending_row_versions,
-                self.state.pending,
-                txid,
-                command_snapshot,
-            )
-        {
-            return Some(location.map(RowHome::Heap));
-        }
-        if self.state.committed_lsn <= commit_snapshot {
-            return Some(self.state.committed);
-        }
-        self.versions().and_then(|versions| {
-            committed_visible_at(
-                &versions.committed_row_versions,
-                self.state.history,
-                commit_snapshot,
-            )
-        })
+        self.visible_version_at(txid, command_snapshot, commit_snapshot).map(|(_, home)| home)
     }
+
 }
 
 /// Acquire version ownership before map ownership. A complete walk borrows

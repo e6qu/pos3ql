@@ -33,6 +33,7 @@ jobs:
           cargo test --lib --locked visible_row_heap_ownership -- --nocapture 2>&1 | tee "$RUNNER_TEMP/tests.log"
           cargo test --lib --locked row_heap_generation
           cargo test --lib --locked row_read_ownership
+          cargo test --lib --locked large_object
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v6

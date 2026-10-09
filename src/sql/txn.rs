@@ -13,15 +13,14 @@ use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
-use crate::storage::{ColumnSet, RowLoc};
+use crate::storage::ColumnSet;
 use crate::util::StackStr;
 
 use super::ast::TransactionIsolation;
 use super::eval::SqlError;
 
-/// A row's pending image before a write, as returned by `write_pending`:
-/// `None` = no pending existed; `Some(loc)` = a pending change with that loc.
-pub type PriorPending = Option<Option<RowLoc>>;
+/// The immutable pending append returned by `write_pending`.
+pub type PriorPending = crate::storage::PendingWriteUndo;
 
 /// A named savepoint: the transaction's undo marks when it was established.
 #[derive(Clone)]

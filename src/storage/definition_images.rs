@@ -97,6 +97,7 @@ impl TableDefinitionImages {
         }
     }
 
+    /// Read a captured image without reacquiring the live table identity.
     pub(crate) fn retained_definition(&self, table: usize, transaction: u32) -> Option<&TableDef> {
         let mut slot = self.head.get();
         while let Some(index) = slot {

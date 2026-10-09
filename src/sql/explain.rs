@@ -744,7 +744,12 @@ fn scan_node<'a>(
         .or(parameterized)
         .or(fallback_index);
     let index_rows = index_plan.map_or(predicate_rows, |plan| {
-        plan.expected_rows(storage, slot, scope.defs.get(table).expect("base table"), txid)
+        plan.expected_rows(
+            storage,
+            slot,
+            scope.defs.get(table).expect("base table"),
+            txid,
+        )
     });
     // Predicate statistics remain authoritative for rows emitted by the scan:
     // unlike the access path, they can use joint statistics and non-index

@@ -3968,7 +3968,10 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         match self.scope.find_column(qualifier, name).ok() {
-            Some(ResolvedColumn::Table(table, column)) => self.scope.defs.get(table)
+            Some(ResolvedColumn::Table(table, column)) => self
+                .scope
+                .defs
+                .get(table)
                 .and_then(|definition| definition.columns.get(column))
                 .map(|column| column.collation)
                 .unwrap_or(crate::sql::ast::Collation::None),
@@ -3993,9 +3996,11 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
         match self.scope.find_column(qualifier, name).ok()? {
-            ResolvedColumn::Table(t, c) => {
-                self.scope.defs.get(t).and_then(|def| def.columns.get(c).and_then(|col| col.user_type))
-            }
+            ResolvedColumn::Table(t, c) => self
+                .scope
+                .defs
+                .get(t)
+                .and_then(|def| def.columns.get(c).and_then(|col| col.user_type)),
             // A USING/NATURAL-merged column carries no single domain identity.
             ResolvedColumn::Merged(_) => None,
         }
@@ -4862,8 +4867,10 @@ fn hash_join_keys<'a>(
         };
         let pt = scope.defs.get(probe_t).expect("resolved").columns[probe_col].ctype;
         let bt = scope.defs.get(build_t).expect("resolved").columns[build_col].ctype;
-        let probe_collation = scope.defs.get(probe_t).expect("resolved").columns[probe_col].collation;
-        let build_collation = scope.defs.get(build_t).expect("resolved").columns[build_col].collation;
+        let probe_collation =
+            scope.defs.get(probe_t).expect("resolved").columns[probe_col].collation;
+        let build_collation =
+            scope.defs.get(build_t).expect("resolved").columns[build_col].collation;
         if probe_collation != build_collation {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::COLLATION_MISMATCH,
@@ -6135,7 +6142,10 @@ fn scan_source_mode<'a>(
                 arena,
             )?;
             let context = crate::sql::exec::RowCtx {
-                def: scope.defs.get(source).expect("row-security source is resolved"),
+                def: scope
+                    .defs
+                    .get(source)
+                    .expect("row-security source is resolved"),
                 values: assembled
                     .table_values(source)
                     .expect("row-security row is bound"),
@@ -6589,7 +6599,9 @@ fn scan_source_mode<'a>(
                                 physical.schema(&mut schema);
                                 rowenc::decode(bytes, &schema[..physical.n_columns], values)?;
                                 refresh_catalog_object_names(storage, txid, values, arena)?;
-                                let logical_width = scope.defs.get(order[depth])
+                                let logical_width = scope
+                                    .defs
+                                    .get(order[depth])
                                     .expect("resolved logical relation")
                                     .n_columns;
                                 visit_candidate!(

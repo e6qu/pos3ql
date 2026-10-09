@@ -4543,10 +4543,9 @@ fn resolve_position_target<'a>(
                 let width = scope.star_columns();
                 if remaining < width {
                     return match scope.star_entry(remaining) {
-                        ResolvedColumn::Table(t, c) => column_ref(
-                            Some(scope.names[t]),
-                            scope.defs.column_name(t, c),
-                        ),
+                        ResolvedColumn::Table(t, c) => {
+                            column_ref(Some(scope.names[t]), scope.defs.column_name(t, c))
+                        }
                         // Unqualified: resolves back to the merged column.
                         ResolvedColumn::Merged(m) => column_ref(None, scope.merged[m].name),
                     };
@@ -5603,7 +5602,10 @@ pub(crate) fn lock_result_row(
             let Some(rowid) = rowid else {
                 continue;
             };
-            let slot = if scope.defs.get(table).expect("locked source is resolved")
+            let slot = if scope
+                .defs
+                .get(table)
+                .expect("locked source is resolved")
                 .partition
                 .is_partitioned()
             {
@@ -8636,7 +8638,14 @@ fn describe_scope_record_star<'q>(
             name: table,
         } if scope.table_index(table).is_ok() => {
             let t = scope.table_index(table)?;
-            for (column, c) in scope.defs.get(t).expect("resolved").columns().iter().enumerate() {
+            for (column, c) in scope
+                .defs
+                .get(t)
+                .expect("resolved")
+                .columns()
+                .iter()
+                .enumerate()
+            {
                 push(
                     ColDesc::of_type(scope.defs.column_name(t, column), c.ctype)
                         .with_type_mod(c.type_mod)

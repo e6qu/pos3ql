@@ -13,7 +13,9 @@ use crate::sql::ast::{BinaryOp, Expr, FromClause, MaterializedCte, TableRef};
 use crate::sql::eval::{ColumnLookup, SequenceAccess, SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef, TableDefinitionImages, UserTypeName};
+use crate::storage::{
+    ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef, TableDefinitionImages, UserTypeName,
+};
 use crate::util::StackStr;
 
 use super::{
@@ -162,6 +164,7 @@ enum ScopeDefinition<'a> {
     Retained { table: usize, names: &'a [&'a str] },
 }
 
+// Definition references borrow this owner; escaped names borrow the arena.
 pub(crate) struct QueryDefinitions<'a> {
     sources: &'a mut [Option<ScopeDefinition<'a>>],
     images: TableDefinitionImages,
@@ -173,7 +176,8 @@ impl<'a> QueryDefinitions<'a> {
         match self.sources.get(index).copied().flatten()? {
             ScopeDefinition::Arena(definition) => Some(definition),
             ScopeDefinition::Retained { table, .. } => Some(
-                self.images.retained_definition(table, self.transaction)
+                self.images
+                    .retained_definition(table, self.transaction)
                     .expect("scope retains its registered definition"),
             ),
         }
@@ -374,7 +378,11 @@ impl<'d> QueryScope<'d> {
             txid,
             arena,
             names,
-            defs: QueryDefinitions { sources: defs, images: storage.table_definition_images(), transaction: txid },
+            defs: QueryDefinitions {
+                sources: defs,
+                images: storage.table_definition_images(),
+                transaction: txid,
+            },
             slots,
             hidden_columns,
             authorization_roles,
@@ -1098,7 +1106,9 @@ impl<'d> QueryScope<'d> {
         let stored_def = self.defs.retain(storage, slot)?;
         let exposed = match tref.alias {
             Some(alias) => alias,
-            None => arena.alloc_str(stored_def.name.as_str()).map_err(|_| arena_full())?,
+            None => arena
+                .alloc_str(stored_def.name.as_str())
+                .map_err(|_| arena_full())?,
         };
         let renamed = if let Some(aliases) = tref.col_alias {
             if aliases.len() > stored_def.n_columns {
@@ -1145,19 +1155,25 @@ impl<'d> QueryScope<'d> {
         let source = match renamed {
             Some(definition) => ScopeDefinition::Arena(definition),
             None => {
-                let reused = self.defs.sources[..self.n].iter().flatten().find_map(|source| {
-                    match source {
-                        ScopeDefinition::Retained { table, names } if *table == slot => Some(*names),
+                let reused = self.defs.sources[..self.n]
+                    .iter()
+                    .flatten()
+                    .find_map(|source| match source {
+                        ScopeDefinition::Retained { table, names } if *table == slot => {
+                            Some(*names)
+                        }
                         _ => None,
-                    }
-                });
+                    });
                 let names = match reused {
                     Some(names) => names,
                     None => {
-                        let names = arena.alloc_slice_with(stored_def.n_columns, |_| "")
+                        let names = arena
+                            .alloc_slice_with(stored_def.n_columns, |_| "")
                             .map_err(|_| arena_full())?;
                         for (name, column) in names.iter_mut().zip(stored_def.columns()) {
-                            *name = arena.alloc_str(column.name.as_str()).map_err(|_| arena_full())?;
+                            *name = arena
+                                .alloc_str(column.name.as_str())
+                                .map_err(|_| arena_full())?;
                         }
                         &*names
                     }
@@ -1753,20 +1769,49 @@ mod tests {
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let table = storage.create_table(definition("original", 1)).unwrap();
-        let mut sources = [Some(ScopeDefinition::Retained { table, names: &["c0"] })];
+        let mut sources = [Some(ScopeDefinition::Retained {
+            table,
+            names: &["c0"],
+        })];
         let images = storage.table_definition_images();
         images.definition(&storage, table, 0).unwrap();
-        let definitions = QueryDefinitions { sources: &mut sources, images, transaction: 0 };
+        let definitions = QueryDefinitions {
+            sources: &mut sources,
+            images,
+            transaction: 0,
+        };
         crate::mem::guard::forbid_alloc(|| {
-            storage.write_table_def(table, 7, definition("pending", 1), &[None; MAX_COLUMNS], false).unwrap();
+            storage
+                .write_table_def(
+                    table,
+                    7,
+                    definition("pending", 1),
+                    &[None; MAX_COLUMNS],
+                    false,
+                )
+                .unwrap();
             let pending = storage.table_definition_images();
             pending.definition(&storage, table, 7).unwrap();
             storage.rollback_table_def(table, 7);
-            assert_eq!(pending.retained_definition(table, 7).unwrap().name.as_str(), "pending");
-            storage.write_table_def(table, 7, definition("published", 1), &[None; MAX_COLUMNS], false).unwrap();
+            assert_eq!(
+                pending.retained_definition(table, 7).unwrap().name.as_str(),
+                "pending"
+            );
+            storage
+                .write_table_def(
+                    table,
+                    7,
+                    definition("published", 1),
+                    &[None; MAX_COLUMNS],
+                    false,
+                )
+                .unwrap();
             storage.commit_table_def(table, 7);
             storage.commit_drop(table);
-            assert_eq!(storage.create_table(definition("replacement", 1)).unwrap(), table);
+            assert_eq!(
+                storage.create_table(definition("replacement", 1)).unwrap(),
+                table
+            );
             assert_eq!(definitions.get(0).unwrap().name.as_str(), "original");
             drop(storage);
             assert_eq!(definitions.get(0).unwrap().columns()[0].name.as_str(), "c0");
@@ -1778,23 +1823,47 @@ mod tests {
         let config = config();
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
-        let table = storage.create_table(definition("wide_source", crate::storage::MAX_RELATION_COLUMNS)).unwrap();
-        let capacity = crate::storage::table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1);
+        let table = storage
+            .create_table(definition(
+                "wide_source",
+                crate::storage::MAX_RELATION_COLUMNS,
+            ))
+            .unwrap();
+        let capacity = crate::storage::table_slot_capacity(&config)
+            * (config.max_catalog_versions_per_object + 1);
         let mut owners = Vec::with_capacity(capacity - 1);
         let mut arena_budget = Budget::new(1 << 17);
         let arena = Arena::new(&mut arena_budget, "query definition names", 1 << 17).unwrap();
-        let query = crate::sql::parser::parse_query("SELECT a.c0 FROM wide_source a CROSS JOIN wide_source b", &arena).unwrap();
+        let query = crate::sql::parser::parse_query(
+            "SELECT a.c0 FROM wide_source a CROSS JOIN wide_source b",
+            &arena,
+        )
+        .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             for _ in 1..capacity {
                 let owner = storage.table_definition_images();
                 owner.definition(&storage, table, 0).unwrap();
                 owners.push(owner);
             }
-            let scope = QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena).unwrap();
-            assert!(core::ptr::eq(scope.defs.get(0).unwrap(), scope.defs.get(1).unwrap()));
-            assert_eq!(scope.defs.get(0).unwrap().n_columns, crate::storage::MAX_RELATION_COLUMNS);
-            assert!(core::ptr::eq(scope.defs.column_name(0, 0), scope.defs.column_name(1, 0)));
-            let escaped = scope.output_name(ResolvedColumn::Table(0, crate::storage::MAX_RELATION_COLUMNS - 1));
+            let scope =
+                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena)
+                    .unwrap();
+            assert!(core::ptr::eq(
+                scope.defs.get(0).unwrap(),
+                scope.defs.get(1).unwrap()
+            ));
+            assert_eq!(
+                scope.defs.get(0).unwrap().n_columns,
+                crate::storage::MAX_RELATION_COLUMNS
+            );
+            assert!(core::ptr::eq(
+                scope.defs.column_name(0, 0),
+                scope.defs.column_name(1, 0)
+            ));
+            let escaped = scope.output_name(ResolvedColumn::Table(
+                0,
+                crate::storage::MAX_RELATION_COLUMNS - 1,
+            ));
             assert_eq!(escaped, "c1599");
             drop(scope);
             let reused = storage.table_definition_images();
@@ -1809,17 +1878,32 @@ mod tests {
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let table = storage.create_table(definition("source", 1)).unwrap();
-        storage.write_table_def(table, 7, definition("source", 2), &[None; MAX_COLUMNS], false).unwrap();
+        storage
+            .write_table_def(
+                table,
+                7,
+                definition("source", 2),
+                &[None; MAX_COLUMNS],
+                false,
+            )
+            .unwrap();
         let mut arena_budget = Budget::new(1 << 17);
         let arena = Arena::new(&mut arena_budget, "visible shapes", 1 << 17).unwrap();
         let query = crate::sql::parser::parse_query("SELECT * FROM source", &arena).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let pending = QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 7, &arena).unwrap();
-            let committed = QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 8, &arena).unwrap();
+            let pending =
+                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 7, &arena)
+                    .unwrap();
+            let committed =
+                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 8, &arena)
+                    .unwrap();
             assert_eq!(pending.star_columns(), 2);
             assert_eq!(committed.star_columns(), 1);
             assert_eq!(pending.output_name(ResolvedColumn::Table(0, 1)), "c1");
-            assert!(!core::ptr::eq(pending.defs.get(0).unwrap(), committed.defs.get(0).unwrap()));
+            assert!(!core::ptr::eq(
+                pending.defs.get(0).unwrap(),
+                committed.defs.get(0).unwrap()
+            ));
         });
     }
 
@@ -1830,11 +1914,14 @@ mod tests {
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let table = storage.create_table(definition("first", 1)).unwrap();
         storage.create_table(definition("second", 1)).unwrap();
-        let capacity = crate::storage::table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1);
+        let capacity = crate::storage::table_slot_capacity(&config)
+            * (config.max_catalog_versions_per_object + 1);
         let mut owners = Vec::with_capacity(capacity - 1);
         let mut arena_budget = Budget::new(1 << 17);
         let arena = Arena::new(&mut arena_budget, "query resolution", 1 << 17).unwrap();
-        let query = crate::sql::parser::parse_query("SELECT a.c0 FROM first a CROSS JOIN second b", &arena).unwrap();
+        let query =
+            crate::sql::parser::parse_query("SELECT a.c0 FROM first a CROSS JOIN second b", &arena)
+                .unwrap();
         let single = crate::sql::parser::parse_query("SELECT c0 FROM first", &arena).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             for _ in 1..capacity {
@@ -1843,17 +1930,31 @@ mod tests {
                 owners.push(owner);
             }
             for _ in 0..8 {
-                let error = match QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena) {
+                let error = match QueryScope::resolve_schema(
+                    &storage,
+                    query.from.as_ref().unwrap(),
+                    0,
+                    &arena,
+                ) {
                     Ok(_) => panic!("two images exceed the one free cell"),
                     Err(error) => error,
                 };
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-                assert!(error.message.as_str().contains("table definition image pool"));
-                let scope = QueryScope::resolve_schema(&storage, single.from.as_ref().unwrap(), 0, &arena).unwrap();
+                assert!(
+                    error
+                        .message
+                        .as_str()
+                        .contains("table definition image pool")
+                );
+                let scope =
+                    QueryScope::resolve_schema(&storage, single.from.as_ref().unwrap(), 0, &arena)
+                        .unwrap();
                 assert_eq!(scope.defs.get(0).unwrap().name.as_str(), "first");
             }
             drop(owners.pop().unwrap());
-            let scope = QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena).unwrap();
+            let scope =
+                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena)
+                    .unwrap();
             assert_eq!(scope.defs.get(1).unwrap().name.as_str(), "second");
         });
     }
@@ -1868,13 +1969,27 @@ mod tests {
         let arena = Arena::new(&mut arena_budget, "query errors", 1 << 22).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             for (sql, state) in [
-                ("SELECT * FROM source a CROSS JOIN source a", sqlstate::DUPLICATE_ALIAS),
-                ("SELECT * FROM source a JOIN source b USING (missing)", sqlstate::UNDEFINED_COLUMN),
-                ("SELECT * FROM source a(one, two)", sqlstate::INVALID_COLUMN_REFERENCE),
+                (
+                    "SELECT * FROM source a CROSS JOIN source a",
+                    sqlstate::DUPLICATE_ALIAS,
+                ),
+                (
+                    "SELECT * FROM source a JOIN source b USING (missing)",
+                    sqlstate::UNDEFINED_COLUMN,
+                ),
+                (
+                    "SELECT * FROM source a(one, two)",
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                ),
             ] {
                 let query = crate::sql::parser::parse_query(sql, &arena).unwrap();
                 for _ in 0..8 {
-                    let error = match QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena) {
+                    let error = match QueryScope::resolve_schema(
+                        &storage,
+                        query.from.as_ref().unwrap(),
+                        0,
+                        &arena,
+                    ) {
                         Ok(_) => panic!("invalid scope must fail"),
                         Err(error) => error,
                     };

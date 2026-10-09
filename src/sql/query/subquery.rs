@@ -288,7 +288,10 @@ fn scope_record_witness<'a>(
     };
     if let Some(table_name) = table_name {
         let table = scope.table_index(table_name)?;
-        let definition = scope.defs.get(table).expect("whole-row table has a definition");
+        let definition = scope
+            .defs
+            .get(table)
+            .expect("whole-row table has a definition");
         let mut fields = [RecordField {
             name: "",
             type_oid: 0,

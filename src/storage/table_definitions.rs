@@ -5,7 +5,7 @@ use core::ops::Deref;
 use std::sync::{RwLock, RwLockReadGuard};
 
 use super::{
-    CatalogDdlState, DatabaseOid, Ownership, PendingDdl, PendingTableDef, PendingTableDefSlot,
+    CatalogDdlState, DatabaseOid, Ownership, PendingTableDef, PendingTableDefSlot,
     TableDef,
 };
 use crate::mem::budget::{Budget, BudgetError};
@@ -22,6 +22,7 @@ pub(super) struct DefinitionState {
 pub(crate) struct TableIdentity {
     pub(crate) database: DatabaseOid,
     pub(crate) ownership: Ownership,
+    /// Monotonic catalog stamp orders dependencies and detects slot reuse.
     pub(crate) created_at: u64,
     pub(crate) existence: CatalogDdlState,
 }
@@ -41,21 +42,6 @@ impl TableIdentity {
         )
     }
 
-    pub(super) fn pending_ddl(self) -> Option<PendingDdl> {
-        match self.existence {
-            CatalogDdlState::PendingCreate { txid } => Some(PendingDdl {
-                txid,
-                creating: true,
-            }),
-            CatalogDdlState::PendingDrop { txid } | CatalogDdlState::PendingCreateDrop { txid } => {
-                Some(PendingDdl {
-                    txid,
-                    creating: false,
-                })
-            }
-            CatalogDdlState::Absent | CatalogDdlState::Present => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -160,9 +146,17 @@ impl<'a> TableDefinitionRead<'a> {
     }
 
     pub(super) fn locked_by_other(&self, transaction: u32) -> Option<u32> {
-        self.state.identity.existence.pending_txid()
+        self.state
+            .identity
+            .existence
+            .pending_txid()
             .filter(|&owner| owner != transaction)
-            .or_else(|| self.state.pending.map(|head| head.transaction).filter(|&owner| owner != transaction))
+            .or_else(|| {
+                self.state
+                    .pending
+                    .map(|head| head.transaction)
+                    .filter(|&owner| owner != transaction)
+            })
     }
 
     pub(super) fn committed(definition: &'a TableDefinition) -> Self {
@@ -283,8 +277,14 @@ mod tests {
                         for _ in 0..500 {
                             let image = TableDefinitionRead::current(table, versions);
                             let identity = image.identity();
-                            assert_eq!(identity.created_at as usize, image.committed_definition().n_columns);
-                            assert_eq!(usize::from(identity.ownership.owner), image.committed_definition().n_columns % 4);
+                            assert_eq!(
+                                identity.created_at as usize,
+                                image.committed_definition().n_columns
+                            );
+                            assert_eq!(
+                                usize::from(identity.ownership.owner),
+                                image.committed_definition().n_columns % 4
+                            );
                             assert!(table.state.try_write().is_err());
                             if let Some((slots, slot)) = &image.pending {
                                 assert_eq!(slots[*slot].version.txid, 7);
@@ -302,7 +302,8 @@ mod tests {
                                     assert!(identity.existence.visible_to(8));
                                     assert!(identity.live());
                                 }
-                                CatalogDdlState::PendingCreateDrop { .. } | CatalogDdlState::Absent => {
+                                CatalogDdlState::PendingCreateDrop { .. }
+                                | CatalogDdlState::Absent => {
                                     assert!(!identity.existence.visible_to(7));
                                     assert!(!identity.existence.visible_to(8));
                                     assert!(!identity.live());

@@ -5,8 +5,8 @@ use core::mem::{MaybeUninit, size_of};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{Storage, TableDef, table_slot_capacity};
 use super::table_definitions::TableIdentity;
+use super::{Storage, TableDef, table_slot_capacity};
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::sql::eval::{SqlError, sqlstate};
@@ -111,7 +111,11 @@ impl TableDefinitionImages {
         None
     }
 
-    pub(crate) fn retained_identity(&self, table: usize, transaction: u32) -> Option<TableIdentity> {
+    pub(crate) fn retained_identity(
+        &self,
+        table: usize,
+        transaction: u32,
+    ) -> Option<TableIdentity> {
         let mut slot = self.head.get();
         while let Some(index) = slot {
             // SAFETY: the owner retains this immutable image until Drop.
@@ -143,7 +147,9 @@ impl TableDefinitionImages {
             // Adding a new head never modifies a previously captured image.
             let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
             if image.table == table && image.transaction == transaction {
-                if image.identity.database != source.database || image.identity.created_at != source.created_at {
+                if image.identity.database != source.database
+                    || image.identity.created_at != source.created_at
+                {
                     return Err(sql_err!(
                         sqlstate::SERIALIZATION_FAILURE,
                         "table identity changed while its definition image was retained"

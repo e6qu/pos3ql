@@ -7839,8 +7839,7 @@ impl Checkpointer {
                 let definition = table.definition();
                 !definition.identity().live()
                     || definition.persistence == crate::storage::RelationPersistence::Temporary
-            }
-            {
+            } {
                 continue;
             }
             if self.start_value_index_job(storage, slot)? {
@@ -8516,8 +8515,7 @@ impl Checkpointer {
                 let definition = table.definition();
                 !definition.identity().live()
                     || definition.persistence == crate::storage::RelationPersistence::Temporary
-            }
-            {
+            } {
                 // A dropped table's recorded list must not linger into the
                 // GC keep-set the swap below publishes.
                 if slot < self.prev_scratch.len() {
@@ -8527,8 +8525,12 @@ impl Checkpointer {
             }
             let definitions = storage.table_definition_images();
             let definition = definitions.definition(storage, slot, 0)?;
-            let identity = definitions.retained_identity(slot, 0).expect("captured table identity");
-            if !identity.live() || definition.persistence == crate::storage::RelationPersistence::Temporary {
+            let identity = definitions
+                .retained_identity(slot, 0)
+                .expect("captured table identity");
+            if !identity.live()
+                || definition.persistence == crate::storage::RelationPersistence::Temporary
+            {
                 if slot < self.prev_scratch.len() {
                     self.prev_scratch[slot].clear();
                 }

@@ -32,8 +32,8 @@ jobs:
           set -e
           cat "$RUNNER_TEMP/lifecycle-baseline.log"
           test "$result" -ne 0
-          rg --text 'test result: FAILED.*1 failed' "$RUNNER_TEMP/lifecycle-baseline.log"
-          rg --text 'relation.*lifecycle_created.*does not exist' "$RUNNER_TEMP/lifecycle-baseline.log"
+          grep -aE 'test result: FAILED.*1 failed' "$RUNNER_TEMP/lifecycle-baseline.log"
+          grep -aE 'relation.*lifecycle_created.*does not exist' "$RUNNER_TEMP/lifecycle-baseline.log"
       - uses: actions/upload-artifact@v6
         if: always()
         with:

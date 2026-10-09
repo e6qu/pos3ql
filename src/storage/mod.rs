@@ -3555,15 +3555,6 @@ impl Enforcer {
     }
 }
 
-/// An uncommitted catalog change to one table, owned by one transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PendingDdl {
-    pub txid: u32,
-    /// `true` = pending CREATE (committed baseline: absent), `false` = pending
-    /// DROP (committed baseline: present).
-    pub creating: bool,
-}
-
 /// A catalog object's committed existence and transaction-local DDL. The
 /// variants include a create followed by drop, which savepoint rollback must
 /// restore as a pending create.
@@ -3788,8 +3779,8 @@ impl Table {
         self.identity().live()
     }
 
-    pub fn pending_ddl(&self) -> Option<PendingDdl> {
-        self.identity().pending_ddl()
+    pub fn existence(&self) -> CatalogDdlState {
+        self.identity().existence
     }
 
     /// Committed metadata retains table ownership until this guard drops.
@@ -19645,7 +19636,7 @@ impl Storage {
                 {
                     continue;
                 }
-                if self.tables[source_slot].pending_ddl().is_some()
+                if self.tables[source_slot].existence().pending_txid().is_some()
                     || self.tables[source_slot]
                         .pending_definition_transaction()
                         .is_some()
@@ -19675,10 +19666,7 @@ impl Storage {
                 let n_spill_ssts = self.tables[source_slot].n_spill_ssts;
                 let target_slot = self.alloc_table(
                     definition,
-                    Some(PendingDdl {
-                        txid,
-                        creating: true,
-                    }),
+                    Some(txid),
                 )?;
                 {
                     let target_table = &mut self.tables[target_slot];
@@ -20654,11 +20642,7 @@ impl Storage {
             // every target relation exists; names are the durable identity.
             for target_slot in 0..self.tables.len() {
                 if self.tables[target_slot].database() != target
-                    || self.tables[target_slot].pending_ddl()
-                        != Some(PendingDdl {
-                            txid,
-                            creating: true,
-                        })
+                    || self.tables[target_slot].existence() != (CatalogDdlState::PendingCreate { txid })
                 {
                     continue;
                 }
@@ -21186,11 +21170,7 @@ impl Storage {
         }
         for table in self.tables.iter_mut() {
             if table.database() == database
-                && table.pending_ddl()
-                    == Some(PendingDdl {
-                        txid,
-                        creating: true,
-                    })
+                && table.existence() == (CatalogDdlState::PendingCreate { txid })
             {
                 let identity = table.identity_mut();
                 identity.existence = identity.existence.commit_create();
@@ -22373,20 +22353,21 @@ impl Storage {
                     .views
                     .iter()
                     .position(|candidate| {
-                        candidate.database() == target_database && candidate.created_at() == created_at
+                        candidate.database == target_database
+                            && candidate.created_at == created_at
                     })?
             }
             AccessClass::MaterializedView => {
                 let created_at = self.matview(source_slot).created_at;
                 self.matview_catalog().iter().position(|candidate| {
-                    candidate.database() == target_database && candidate.created_at() == created_at
+                    candidate.database == target_database && candidate.created_at == created_at
                 })?
             }
             AccessClass::Sequence => {
                 let catalog = self.sequence_catalog();
                 let created_at = catalog.definitions[source_slot].created_at;
                 catalog.definitions.iter().position(|candidate| {
-                    candidate.database() == target_database && candidate.created_at() == created_at
+                    candidate.database == target_database && candidate.created_at == created_at
                 })?
             }
             AccessClass::Domain => {
@@ -22425,7 +22406,7 @@ impl Storage {
             AccessClass::Index => {
                 let created_at = self.index(source_slot).created_at;
                 self.index_catalog().iter().position(|candidate| {
-                    candidate.database() == target_database && candidate.created_at() == created_at
+                    candidate.database == target_database && candidate.created_at == created_at
                 })?
             }
             AccessClass::Routine => {
@@ -26951,7 +26932,7 @@ impl Storage {
         for table_slot in 0..self.tables.len() {
             let table = &self.tables[table_slot];
             if table.database() != current_database()
-                || (!table.live() && table.pending_ddl().is_none())
+                || (table.existence() == CatalogDdlState::Absent)
             {
                 continue;
             }
@@ -27008,7 +26989,7 @@ impl Storage {
                 continue;
             }
             let table = &mut self.tables[table_slot];
-            if !table.live() && table.pending_ddl().is_none() {
+            if table.existence() == CatalogDdlState::Absent {
                 continue;
             }
             rename_schema_name(&mut table.definition_mut().schema, prior, name);
@@ -31025,7 +31006,7 @@ impl Storage {
             // garbage: preserve them even though the committed table image is
             // not live yet. A genuinely dead slot has neither committed nor
             // pending existence.
-            if !table.live() && table.pending_ddl().is_none() {
+            if table.existence() == CatalogDdlState::Absent {
                 continue;
             }
             for (rowid, state) in table.rows.iter() {
@@ -34340,14 +34321,19 @@ impl Storage {
     }
 
     /// Allocates a slot for a fresh table. Shared by replay (committed) and
-    /// the executor (pending); `pending` overlays the uncommitted-CREATE
+    /// the executor (pending); `transaction` selects the uncommitted-CREATE
     /// state so the table is invisible to other transactions until commit.
     fn alloc_table(
         &mut self,
         def: TableDef,
-        pending: Option<PendingDdl>,
+        transaction: Option<u32>,
     ) -> Result<usize, SqlError> {
-        let Some(slot) = self.tables.iter().take(self.table_count()).position(Table::is_free) else {
+        let Some(slot) = self
+            .tables
+            .iter()
+            .take(self.table_count())
+            .position(Table::is_free)
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many tables (limit {})",
@@ -34362,7 +34348,7 @@ impl Storage {
             class: AccessClass::Table,
             slot: slot as u16,
         });
-        let ownership = self.initial_ownership(pending.map_or(0, |pending| pending.txid));
+        let ownership = self.initial_ownership(transaction.unwrap_or(0));
         let created_at = self.catalog_sequence.next();
         let stamp = created_at;
         self.cumulative_statistics().relations[slot] = RelationCumulativeStatistics::EMPTY;
@@ -34376,10 +34362,7 @@ impl Storage {
                 database: current_database(),
                 ownership,
                 created_at: stamp,
-                existence: pending.map_or(CatalogDdlState::Present, |pending| {
-                    assert!(pending.creating);
-                    CatalogDdlState::PendingCreate { txid: pending.txid }
-                }),
+                existence: transaction.map_or(CatalogDdlState::Present, |txid| CatalogDdlState::PendingCreate { txid }),
             };
         }
         table.pending_has_rules_txid = None;
@@ -34667,13 +34650,7 @@ impl Storage {
                 def.name.as_str()
             ));
         }
-        let slot = self.alloc_table(
-            def,
-            Some(PendingDdl {
-                txid,
-                creating: true,
-            }),
-        )?;
+        let slot = self.alloc_table(def, Some(txid))?;
         if def.persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
         }
@@ -34683,7 +34660,8 @@ impl Storage {
     /// The txid of another transaction holding uncommitted DDL for `name`.
     fn ddl_name_locked_by_other(&self, schema: &str, name: &str, txid: u32) -> Option<u32> {
         self.tables.iter().find_map(|table| {
-            let definition = TableDefinitionRead::current(&table.definition, &self.pending_table_defs);
+            let definition =
+                TableDefinitionRead::current(&table.definition, &self.pending_table_defs);
             if definition.identity().database != current_database() {
                 return None;
             }
@@ -39048,7 +39026,7 @@ impl Storage {
         for table in self
             .tables
             .iter_mut()
-            .filter(|table| table.live() || table.pending_ddl().is_some())
+            .filter(|table| table.existence() != CatalogDdlState::Absent)
         {
             let mut changed = false;
             let definition = table.definition_mut();
@@ -39856,7 +39834,7 @@ impl Storage {
         for table in self
             .tables
             .iter_mut()
-            .filter(|table| table.live() || table.pending_ddl().is_some())
+            .filter(|table| table.existence() != CatalogDdlState::Absent)
         {
             let mut changed = false;
             let definition = table.definition_mut();
@@ -40322,7 +40300,7 @@ impl Storage {
         for table in self
             .tables
             .iter_mut()
-            .filter(|table| table.live() || table.pending_ddl().is_some())
+            .filter(|table| table.existence() != CatalogDdlState::Absent)
         {
             let mut changed = false;
             let definition = table.definition_mut();
@@ -53076,7 +53054,10 @@ mod tests {
             let images = storage.table_definition_images();
             images.definition(&storage, slot, 7).unwrap();
             let original = images.retained_identity(slot, 7).unwrap();
-            assert_eq!(original.existence, CatalogDdlState::PendingCreate { txid: 7 });
+            assert_eq!(
+                original.existence,
+                CatalogDdlState::PendingCreate { txid: 7 }
+            );
             assert!(storage.table(slot).visible_to(7));
             assert!(!storage.table(slot).visible_to(8));
             storage.drop_table_in(slot, 7);
@@ -53103,9 +53084,18 @@ mod tests {
             let reused = storage.create_table_in(replacement, 8).unwrap();
             assert_eq!(reused, slot);
             assert_ne!(storage.table(slot).created_at(), original.created_at);
-            assert_eq!(images.definition(&storage, slot, 7).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
-            assert_eq!(images.retained_definition(slot, 7).unwrap().name.as_str(), "lifecycle_original");
-            assert_eq!(images.retained_identity(slot, 7).unwrap().created_at, original.created_at);
+            assert_eq!(
+                images.definition(&storage, slot, 7).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert_eq!(
+                images.retained_definition(slot, 7).unwrap().name.as_str(),
+                "lifecycle_original"
+            );
+            assert_eq!(
+                images.retained_identity(slot, 7).unwrap().created_at,
+                original.created_at
+            );
             storage.rollback_create(slot);
             assert!(storage.table(slot).is_free());
         });
@@ -53149,7 +53139,7 @@ mod tests {
                 assert_eq!(rejected.created_at(), 0);
                 assert_eq!(rejected.ownership().owner, Ownership::BOOTSTRAP.owner);
                 assert!(rejected.ownership().pending.is_none());
-                assert!(rejected.pending_ddl().is_none());
+                assert_eq!(rejected.existence(), CatalogDdlState::Absent);
                 assert_eq!(rejected.n_enforcers, 0);
                 assert!(rejected.enforcers.iter().all(Option::is_none));
                 assert_eq!(storage.tables[retained_slot].n_enforcers, 1);

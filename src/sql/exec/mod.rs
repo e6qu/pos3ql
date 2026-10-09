@@ -11927,7 +11927,10 @@ pub fn drop_schema(
             SchemaObject::InboundFk { table, fk_index } => {
                 let (schema, created_at) = {
                     let def = storage.table_def(*table, txn.txid);
-                    (def.fkeys[*fk_index].parent_schema, def.identity().created_at)
+                    (
+                        def.fkeys[*fk_index].parent_schema,
+                        def.identity().created_at,
+                    )
                 };
                 (schema_rank(storage, schema.as_str()), created_at, 1)
             }

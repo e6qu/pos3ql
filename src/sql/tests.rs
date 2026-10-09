@@ -166,7 +166,8 @@ fn table_catalog_lifecycle_savepoint_drop_restores_pending_create() {
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
-        "{}", String::from_utf8_lossy(&output)
+        "{}",
+        String::from_utf8_lossy(&output)
     );
     assert_eq!(data_rows(&output), ["7", "7", "8", "7", "8"]);
 }
@@ -187,7 +188,8 @@ fn table_catalog_lifecycle_create_drop_commit_and_reuse_do_not_publish_old_rows(
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
-        "{}", String::from_utf8_lossy(&output)
+        "{}",
+        String::from_utf8_lossy(&output)
     );
     assert_eq!(data_rows(&output), ["0", "0", "9"]);
 }
@@ -215,7 +217,8 @@ fn table_catalog_lifecycle_savepoint_creation_and_retirement_survive_cold_recove
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
-        "{}", String::from_utf8_lossy(&output)
+        "{}",
+        String::from_utf8_lossy(&output)
     );
     assert!(engine.checkpoint().unwrap());
     engine.commit_wal().unwrap();
@@ -233,7 +236,8 @@ fn table_catalog_lifecycle_savepoint_creation_and_retirement_survive_cold_recove
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
-        "{}", String::from_utf8_lossy(&output)
+        "{}",
+        String::from_utf8_lossy(&output)
     );
     assert_eq!(data_rows(&output), ["7", "0", "0"]);
     drop(recovered);

@@ -8880,7 +8880,7 @@ pub(crate) fn object_acl_by_address<'a>(
     };
     let table = synthesize(storage, Some("pg_catalog"), catalog, txid, arena)?;
     let column = |name: &str| {
-        table.definition().columns()[..table.definition().n_columns]
+        table.def.columns()[..table.def.n_columns]
             .iter()
             .position(|candidate| candidate.name.as_str() == name)
     };
@@ -13586,15 +13586,18 @@ pub fn view_def_text<'a>(
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     for slot in 0..storage.table_count() {
-        let table = storage.table(slot);
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
         if table_oid(storage, slot) != oid {
             continue;
         }
+        let (schema, name) = {
+            let definition = storage.table_def(slot, txid);
+            (definition.schema, definition.name)
+        };
         let Some(view) =
-            storage.find_matview(table.definition().schema.as_str(), table.definition().name.as_str(), txid)
+            storage.find_matview(schema.as_str(), name.as_str(), txid)
         else {
             return Ok(None);
         };
@@ -28938,20 +28941,23 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     }
     // Every table, materialized view and plain view owns a composite row type.
     for slot in 0..storage.table_count() {
-        let table = storage.table(slot);
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
+        let (name, schema) = {
+            let definition = storage.table_def(slot, txid);
+            (definition.name, definition.schema)
+        };
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_type"));
         }
         out[n] = row(
             &[
                 Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
-                text(table.definition().name.as_str(), arena)?,
+                text(name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, table.definition().schema.as_str())),
+                Datum::Int4(namespace_oid(storage, schema.as_str())),
                 text("c", arena)?,
                 text("C", arena)?,
                 Datum::Int4(0),
@@ -28967,7 +28973,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(
                     storage
-                        .matview_slot(table.definition().schema.as_str(), table.definition().name.as_str(), txid)
+                        .matview_slot(schema.as_str(), name.as_str(), txid)
                         .map_or(
                             owner_oid(storage, crate::storage::AccessClass::Table, slot, txid),
                             |matview| {
@@ -28989,21 +28995,24 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         n += 1;
     }
     for slot in 0..storage.table_count() {
-        let table = storage.table(slot);
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
+        let (name, schema) = {
+            let definition = storage.table_def(slot, txid);
+            (definition.name, definition.schema)
+        };
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_type"));
         }
-        let array_name = stack_format!(128, "_{}", table.definition().name.as_str());
+        let array_name = stack_format!(128, "_{}", name.as_str());
         out[n] = row(
             &[
                 Datum::Int4(FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32),
                 text(array_name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, table.definition().schema.as_str())),
+                Datum::Int4(namespace_oid(storage, schema.as_str())),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),

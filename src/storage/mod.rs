@@ -14132,7 +14132,7 @@ impl SpillReader {
     }
 
     fn relation_blocks<'a>(&'a self, table: &Table) -> RelationBlockStore<'a> {
-        if table.definition().persistence == RelationPersistence::Temporary {
+        if { let definition = table.definition(); definition.persistence } == RelationPersistence::Temporary {
             RelationBlockStore::Temporary(
                 self.temporary_blocks
                     .as_ref()
@@ -15741,12 +15741,12 @@ impl Storage {
         for slot in 0..self.table_count() {
             if self.tables[slot].database != current_database()
                 || !self.tables[slot].live
-                || self.tables[slot].definition().persistence != RelationPersistence::Temporary
-                || self.tables[slot].definition().schema != schema
+                || { let definition = self.tables[slot].definition(); definition.persistence } != RelationPersistence::Temporary
+                || { let definition = self.tables[slot].definition(); definition.schema } != schema
             {
                 continue;
             }
-            let name = self.tables[slot].definition().name;
+            let name = { let definition = self.tables[slot].definition(); definition.name };
             self.drop_indexes_for(schema.as_str(), name.as_str(), 0);
             self.commit_indexes_for(schema.as_str(), name.as_str(), 0);
             self.commit_drop(slot);
@@ -15774,8 +15774,8 @@ impl Storage {
         for slot in 0..self.table_count() {
             if self.tables[slot].database != current_database()
                 || !self.tables[slot].live
-                || self.tables[slot].definition().persistence != RelationPersistence::Temporary
-                || self.tables[slot].definition().schema != schema
+                || { let definition = self.tables[slot].definition(); definition.persistence } != RelationPersistence::Temporary
+                || { let definition = self.tables[slot].definition(); definition.schema } != schema
             {
                 continue;
             }
@@ -15789,7 +15789,7 @@ impl Storage {
                     self.refresh_enforcers(slot)?;
                 }
                 OnCommitAction::Drop => {
-                    let table = self.tables[slot].definition().name;
+                    let table = { let definition = self.tables[slot].definition(); definition.name };
                     self.drop_indexes_for(schema.as_str(), table.as_str(), 0);
                     self.commit_indexes_for(schema.as_str(), table.as_str(), 0);
                     for sequence in 0..self.sequence_count() {
@@ -15816,7 +15816,7 @@ impl Storage {
     pub(crate) fn reset_unlogged_relations(&mut self) -> Result<(), SqlError> {
         for slot in 0..self.table_count() {
             if !self.tables[slot].live
-                || self.tables[slot].definition().persistence != RelationPersistence::Unlogged
+                || { let definition = self.tables[slot].definition(); definition.persistence } != RelationPersistence::Unlogged
             {
                 continue;
             }
@@ -15844,7 +15844,7 @@ impl Storage {
     pub(crate) fn has_unlogged_relations(&self) -> bool {
         self.tables
             .iter()
-            .any(|table| table.live && table.definition().persistence == RelationPersistence::Unlogged)
+            .any(|table| table.live && { let definition = table.definition(); definition.persistence } == RelationPersistence::Unlogged)
             || self.sequence_catalog().definitions.iter().any(|sequence| {
                 sequence.ddl_state == CatalogDdlState::Present
                     && sequence.persistence == RelationPersistence::Unlogged
@@ -19601,7 +19601,7 @@ impl Storage {
                 if self.tables[source_slot].database != source || !self.tables[source_slot].live {
                     continue;
                 }
-                if self.tables[source_slot].definition().persistence == RelationPersistence::Temporary {
+                if { let definition = self.tables[source_slot].definition(); definition.persistence } == RelationPersistence::Temporary {
                     continue;
                 }
                 if self.tables[source_slot].pending_ddl.is_some()
@@ -20045,9 +20045,9 @@ impl Storage {
                     || self.tables.iter().any(|table| {
                         table.database == source
                             && table.live
-                            && table.definition().schema == definition.schema
-                            && table.definition().name == definition.table
-                            && table.definition().persistence == RelationPersistence::Temporary
+                            && { let definition = table.definition(); definition.schema } == definition.schema
+                            && { let definition = table.definition(); definition.name } == definition.table
+                            && { let definition = table.definition(); definition.persistence } == RelationPersistence::Temporary
                     })
                 {
                     continue;
@@ -20116,7 +20116,7 @@ impl Storage {
                 let mut definition = self.policy(source_slot);
                 if definition.database != source
                     || definition.ddl_state != CatalogDdlState::Present
-                    || self.tables[usize::from(definition.table)].definition().persistence
+                    || { let definition = self.tables[usize::from(definition.table)].definition(); definition.persistence }
                         == RelationPersistence::Temporary
                 {
                     continue;
@@ -20244,7 +20244,7 @@ impl Storage {
                 let mut definition = self.extended_statistics(source_slot);
                 if definition.database != source
                     || definition.ddl_state != CatalogDdlState::Present
-                    || self.tables[usize::from(definition.table)].definition().persistence
+                    || { let definition = self.tables[usize::from(definition.table)].definition(); definition.persistence }
                         == RelationPersistence::Temporary
                 {
                     continue;
@@ -22748,9 +22748,9 @@ impl Storage {
                 && !self.tables.iter().any(|table| {
                     table.database == value.database
                         && table.live
-                        && table.definition().schema == value.schema
-                        && table.definition().name == value.table
-                        && table.definition().persistence == RelationPersistence::Temporary
+                        && { let definition = table.definition(); definition.schema } == value.schema
+                        && { let definition = table.definition(); definition.name } == value.table
+                        && { let definition = table.definition(); definition.persistence } == RelationPersistence::Temporary
                 })
         })
     }
@@ -28309,7 +28309,7 @@ impl Storage {
             if !self.tables[i].live {
                 continue;
             }
-            let n_columns = self.tables[i].definition().n_columns;
+            let n_columns = { let definition = self.tables[i].definition(); definition.n_columns };
             let mut auto = [false; MAX_COLUMNS];
             let mut any = false;
             for (c, slot) in auto.iter_mut().enumerate().take(n_columns) {
@@ -29972,7 +29972,7 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "could not serialize ANALYZE of relation \"{}\"",
-                self.tables[table_slot].definition().name.as_str()
+                { let definition = self.tables[table_slot].definition(); definition.name }.as_str()
             ));
         }
         let previous = self.tables[table_slot].pending_statistics_tail;
@@ -29983,7 +29983,7 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "relation \"{}\" exceeds max_catalog_versions_per_object ({})",
-                self.tables[table_slot].definition().name.as_str(),
+                { let definition = self.tables[table_slot].definition(); definition.name }.as_str(),
                 self.max_catalog_versions_per_object
             ));
         }
@@ -30319,7 +30319,7 @@ impl Storage {
     /// installed on the tables; rows with no SST (empty tables) are left.
     pub fn evict_committed(&mut self) {
         for i in 0..self.tables.len() {
-            if self.tables[i].definition().persistence != RelationPersistence::Temporary {
+            if { let definition = self.tables[i].definition(); definition.persistence } != RelationPersistence::Temporary {
                 self.evict_committed_table(i);
             }
         }
@@ -31263,7 +31263,7 @@ impl Storage {
         txid: u32,
         track_statistics: bool,
     ) -> Result<(ColumnSet, bool), SqlError> {
-        let columns = self.tables[table_index].definition().n_columns;
+        let columns = { let definition = self.tables[table_index].definition(); definition.n_columns };
         let all_columns = ColumnSet::all(columns);
         // Row rewrites and changes under a transaction-private definition can
         // use a different physical schema. Their enforcers are rebuilt at the
@@ -31356,7 +31356,7 @@ impl Storage {
     pub(crate) fn temporary_map_pressure(&self) -> bool {
         self.tables.iter().any(|table| {
             table.live
-                && table.definition().persistence == RelationPersistence::Temporary
+                && { let definition = table.definition(); definition.persistence } == RelationPersistence::Temporary
                 && table.dirty
                 && table.rows.len() * 100 >= table.rows.capacity() * 50
         })
@@ -31383,7 +31383,7 @@ impl Storage {
         let (tables, versions) = (&mut self.tables, &mut row_versions.committed_row_versions);
         for table in tables
             .iter_mut()
-            .filter(|table| table.live && table.definition().persistence != RelationPersistence::Temporary)
+            .filter(|table| table.live && { let definition = table.definition(); definition.persistence } != RelationPersistence::Temporary)
         {
             for (_, state) in table.rows.iter_mut() {
                 prune_committed_history(versions, &mut state.history, None);
@@ -33121,8 +33121,8 @@ impl Storage {
             return self.index_catalog().iter().any(|index| {
                 index.ddl_state == CatalogDdlState::Present
                     && index.database == table.database
-                    && index.schema == table.definition().schema
-                    && index.table == table.definition().name
+                    && index.schema == { let definition = table.definition(); definition.schema }
+                    && index.table == { let definition = table.definition(); definition.name }
                     && index.created_at == created_at
             });
         }
@@ -33544,8 +33544,8 @@ impl Storage {
         // share one enforcer: PostgreSQL permits redundant indexes, but a
         // second copy cannot improve the equality probe and would waste a
         // startup-reserved pool slot.
-        let table_schema = self.tables[table_index].definition().schema;
-        let table_name = self.tables[table_index].definition().name;
+        let table_schema = { let definition = self.tables[table_index].definition(); definition.schema };
+        let table_name = { let definition = self.tables[table_index].definition(); definition.name };
         let table_database = self.tables[table_index].database;
         let table_definition = *self.tables[table_index].definition();
         for index in self
@@ -33825,8 +33825,8 @@ impl Storage {
         self.tables.iter().take(self.table_count()).position(|t| {
             t.database == current_database()
                 && t.live
-                && t.definition().schema.as_str() == schema
-                && t.definition().name.as_str() == name
+                && { let definition = t.definition(); definition.schema }.as_str() == schema
+                && { let definition = t.definition(); definition.name }.as_str() == name
         })
     }
 
@@ -34015,7 +34015,7 @@ impl Storage {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on \"{}\"",
-                self.tables[index].definition().name.as_str()
+                { let definition = self.tables[index].definition(); definition.name }.as_str()
             ));
         }
         let current = *self.table_def(index, txid);
@@ -34030,7 +34030,7 @@ impl Storage {
         for (committed_column, target) in composed
             .iter_mut()
             .enumerate()
-            .take(self.tables[index].definition().n_columns)
+            .take({ let definition = self.tables[index].definition(); definition.n_columns })
         {
             let current_name = match prior {
                 Some(version) if version.txid == txid => version.column_mapping[committed_column],
@@ -34058,7 +34058,7 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "relation \"{}\" exceeds max_catalog_versions_per_object ({})",
-                self.tables[index].definition().name.as_str(),
+                { let definition = self.tables[index].definition(); definition.name }.as_str(),
                 self.max_catalog_versions_per_object
             ));
         }
@@ -34157,8 +34157,8 @@ impl Storage {
             return false;
         }
         let mut definition = pending.def;
-        definition.has_toast |= self.tables[index].definition().has_toast;
-        definition.has_rules |= self.tables[index].definition().has_rules;
+        definition.has_toast |= { let definition = self.tables[index].definition(); definition.has_toast };
+        definition.has_rules |= { let definition = self.tables[index].definition(); definition.has_rules };
         self.set_table_def(index, definition, &pending.column_mapping);
         self.clear_pending_table_defs(index);
         self.commit_constraint_comment_identities(index, txid);
@@ -34240,8 +34240,8 @@ impl Storage {
         table.spill_ssts.fill(None);
         table.spill_through_lsn.fill(0);
         table.n_spill_ssts = 0;
-        let schema = table.definition().schema;
-        let name = table.definition().name;
+        let schema = { let definition = table.definition(); definition.schema };
+        let name = { let definition = table.definition(); definition.name };
         if let Err(error) = self.refresh_enforcers(slot) {
             self.rollback_create(slot);
             let table = &mut self.tables[slot];
@@ -34444,12 +34444,12 @@ impl Storage {
             column_mapping[old_column] = Some(target.name);
         }
         let index = rewrite.table;
-        def.has_toast |= self.tables[index].definition().has_toast
+        def.has_toast |= { let definition = self.tables[index].definition(); definition.has_toast }
             || def
                 .columns()
                 .iter()
                 .any(|column| column.ctype.typlen() == -1);
-        def.has_rules |= self.tables[index].definition().has_rules;
+        def.has_rules |= { let definition = self.tables[index].definition(); definition.has_rules };
         self.set_table_def(index, def, &column_mapping);
         if !rewrite.preserve_rows {
             self.clear_table_rows(index);
@@ -34520,7 +34520,7 @@ impl Storage {
             .enumerate()
             .filter(|(_, table)| table.database == current_database())
             .filter(|(index, table)| {
-                (table.definition().schema.as_str() == schema && table.definition().name.as_str() == name)
+                ({ let definition = table.definition(); definition.schema }.as_str() == schema && { let definition = table.definition(); definition.name }.as_str() == name)
                     || self.pending_table_def(*index).is_some_and(|pending| {
                         pending.def.schema.as_str() == schema && pending.def.name.as_str() == name
                     })
@@ -34531,7 +34531,7 @@ impl Storage {
     /// Committed drop (journal replay): rows are retained; the slot is freed at
     /// checkpoint.
     pub fn drop_table(&mut self, index: usize) {
-        let (schema, name) = (self.tables[index].definition().schema, self.tables[index].definition().name);
+        let (schema, name) = ({ let definition = self.tables[index].definition(); definition.schema }, { let definition = self.tables[index].definition(); definition.name });
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
@@ -34572,7 +34572,7 @@ impl Storage {
     /// Applies a committed DROP: the table leaves the image and its rows are
     /// reclaimed.
     pub fn commit_drop(&mut self, index: usize) {
-        let (schema, name) = (self.tables[index].definition().schema, self.tables[index].definition().name);
+        let (schema, name) = ({ let definition = self.tables[index].definition(); definition.schema }, { let definition = self.tables[index].definition(); definition.name });
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
@@ -38086,11 +38086,12 @@ impl Storage {
             .iter()
             .filter(|t| t.database == current_database() && t.live)
         {
-            for col in table.definition().columns() {
+            let definition = table.definition();
+            for col in definition.columns() {
                 if col.user_type.is_some_and(|identity| {
                     identity.name.as_str() == name && identity.schema.as_str() == schema
                 }) {
-                    return Some((table.definition().name, col.name));
+                    return Some((definition.name, col.name));
                 }
             }
         }
@@ -39164,14 +39165,15 @@ impl Storage {
             .iter()
             .filter(|t| t.database == current_database() && t.live)
         {
-            for col in table.definition().columns() {
+            let definition = table.definition();
+            for col in definition.columns() {
                 if matches!(col.ctype, ColType::Enum(s) if s as usize == slot)
                     || matches!(
                         col.ctype,
                         ColType::Array(ArrElem::Enum(s)) if s as usize == slot
                     )
                 {
-                    return Some((table.definition().name, col.name));
+                    return Some((definition.name, col.name));
                 }
             }
         }
@@ -46246,7 +46248,7 @@ impl Storage {
     ) -> impl Iterator<Item = IndexDef> + 'a {
         let committed_binding = self
             .find_visible(schema, table, txid)
-            .map(|slot| (self.tables[slot].definition().schema, self.tables[slot].definition().name));
+            .map(|slot| ({ let definition = self.tables[slot].definition(); definition.schema }, { let definition = self.tables[slot].definition(); definition.name }));
         self.matching_indexes(move |x| {
             x.database == current_database()
                 && x.visible_to(txid)
@@ -46325,8 +46327,8 @@ impl Storage {
         }
         let Some(table_slot) = self.tables.iter().position(|table| {
             table.database == index.database
-                && table.definition().schema == index.schema
-                && table.definition().name == index.table
+                && { let definition = table.definition(); definition.schema } == index.schema
+                && { let definition = table.definition(); definition.name } == index.table
         }) else {
             return index;
         };
@@ -47059,8 +47061,8 @@ impl Storage {
     pub fn move_table_schema(&mut self, index: usize, new_schema: SqlName) {
         let database_oid = self.tables[index].database;
         let database = Some(database_oid);
-        let old_schema = self.tables[index].definition().schema;
-        let name = self.tables[index].definition().name;
+        let old_schema = { let definition = self.tables[index].definition(); definition.schema };
+        let name = { let definition = self.tables[index].definition(); definition.name };
         self.tables[index].definition_mut().schema = new_schema;
         self.tables[index].mark_dirty();
         for x in self.index_catalog().iter_mut() {
@@ -47985,8 +47987,8 @@ impl Storage {
                         0,
                         mode as u8,
                         0,
-                        table.definition().schema.as_str(),
-                        table.definition().name.as_str(),
+                        { let definition = table.definition(); definition.schema }.as_str(),
+                        { let definition = table.definition(); definition.name }.as_str(),
                     )?;
                 }
             }
@@ -48001,8 +48003,8 @@ impl Storage {
                 1,
                 strength as u8,
                 rowid,
-                table.definition().schema.as_str(),
-                table.definition().name.as_str(),
+                { let definition = table.definition(); definition.schema }.as_str(),
+                { let definition = table.definition(); definition.name }.as_str(),
             )
         })?;
         let mut advisory_result = Ok(());
@@ -50360,7 +50362,7 @@ impl Storage {
     }
 
     pub(crate) fn table_has_rules(&self, table: usize, txid: u32) -> bool {
-        self.tables[table].definition().has_rules || self.tables[table].pending_has_rules_txid == Some(txid)
+        { let definition = self.tables[table].definition(); definition.has_rules } || self.tables[table].pending_has_rules_txid == Some(txid)
     }
 
     pub(crate) fn commit_rule_alter(&mut self, slot: usize, txid: u32) {

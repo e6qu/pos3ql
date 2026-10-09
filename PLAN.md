@@ -125,6 +125,8 @@ The roadmap is complete when all of these hold:
 
 - Advertised SQL/wire shapes and accepted configurations have verified, explicit
   boundaries without truncation or post-startup allocation.
+- PostgreSQL oracle gates use the same verified, immutable service/client image;
+  registry failures must fail the gate rather than skipping comparisons.
 - Formats, monitoring, credentials, packages, backup/restore, and replacement
   remain qualified end to end.
 - Concurrent execution scales through the supported worker range while

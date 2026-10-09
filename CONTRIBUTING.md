@@ -88,6 +88,12 @@ temporary validation workflows before the final PR head. Fix failures on the
 same PR branch and rerun the affected gates; merge only when every required
 check passes on that head.
 
+PostgreSQL service and client containers use Docker's official image from
+[ECR Public](https://gallery.ecr.aws/docker/library/postgres), pinned by manifest
+digest. Keep service images, container selectors, and client adapters on the
+same digest. Verify updated manifests against Docker Hub's official image and
+retain that comparison in the PR; do not switch registries silently on failure.
+
 For benchmarks, follow [performance.md](docs/performance.md). Keep raw artifacts,
 revision/binary hashes, tool and service provenance, hardware, storage, network,
 and workload settings. Compare against stock PostgreSQL with its ordinary local

@@ -9,7 +9,7 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/cache@v5
@@ -20,6 +20,8 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+      - run: python3 tools/check-docs.py
+      - run: bash tools/check-ci-timeouts.sh
       - run: cargo clean -p pos3ql
       - name: Format on runner
         run: |

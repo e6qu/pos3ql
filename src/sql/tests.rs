@@ -108,8 +108,18 @@ fn live_definition_ownership_returning_descriptions_keep_names_and_modifiers() {
 fn live_definition_ownership_catalog_tracks_rename_schema_and_rollback() {
     let (mut engine, mut budget) = test_engine();
     let query = "SELECT t.typname, n.nspname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname IN ('definition_owner_before', '_definition_owner_before', 'definition_owner_after', '_definition_owner_after') ORDER BY t.typname";
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA definition_owner_schema; CREATE TABLE definition_owner_before (id integer)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
     let statement = format!(
-        "CREATE SCHEMA definition_owner_schema; CREATE TABLE definition_owner_before (id integer); {query}; \
+        "{query}; \
          BEGIN; ALTER TABLE definition_owner_before RENAME TO definition_owner_after; {query}; \
          ALTER TABLE definition_owner_after SET SCHEMA definition_owner_schema; {query}; \
          ROLLBACK; {query}; \

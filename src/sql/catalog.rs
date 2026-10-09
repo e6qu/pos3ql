@@ -29203,7 +29203,7 @@ fn pg_namespace<'a>(
         {
             continue;
         }
-        temporary[temporary_count] = (table.schema, storage.table(slot).ownership().owner_to(txid));
+        temporary[temporary_count] = (table.schema, table.identity().ownership.owner_to(txid));
         temporary_count += 1;
     }
     for slot in 0..storage.sequence_count() {

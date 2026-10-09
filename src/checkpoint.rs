@@ -8512,10 +8512,11 @@ impl Checkpointer {
         }
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
-            if !table.live() || {
+            if {
                 let definition = table.definition();
-                definition.persistence
-            } == crate::storage::RelationPersistence::Temporary
+                !definition.identity().live()
+                    || definition.persistence == crate::storage::RelationPersistence::Temporary
+            }
             {
                 // A dropped table's recorded list must not linger into the
                 // GC keep-set the swap below publishes.

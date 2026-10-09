@@ -34347,11 +34347,11 @@ impl Storage {
         def: TableDef,
         pending: Option<PendingDdl>,
     ) -> Result<usize, SqlError> {
-        let Some(slot) = self.tables.iter().position(Table::is_free) else {
+        let Some(slot) = self.tables.iter().take(self.table_count()).position(Table::is_free) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many tables (limit {})",
-                self.tables.len()
+                self.table_count()
             ));
         };
         // A reused slot must not keep the dropped table's value indexes.
@@ -53086,6 +53086,7 @@ mod tests {
             let replacement = make_def("lifecycle_replacement", &[("id", ColType::Int4, true)]);
             let error = storage.create_table_in(replacement, 8).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(error.message.as_str(), "too many tables (limit 1)");
             storage.rollback_drop(slot);
             assert_eq!(storage.table(slot).identity().existence, original.existence);
             assert!(storage.table(slot).visible_to(7));

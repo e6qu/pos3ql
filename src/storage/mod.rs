@@ -31048,6 +31048,11 @@ impl Storage {
         loc: Option<RowLoc>,
         track_statistics: bool,
     ) -> Result<Option<Option<RowLoc>>, SqlError> {
+        // Exclusive storage ownership keeps this validation valid through
+        // publication, including rewrite paths that skip physical comparison.
+        if let Some(location) = loc {
+            self.heap.get(location)?;
+        }
         if let Some(owner) = self.tables[table_index]
             .pending_def_txid
             .filter(|owner| *owner != txid)
@@ -59007,6 +59012,46 @@ mod tests {
             let row = storage.resident_row_state(0, 1).unwrap();
             let home = storage.visible_row_home_at(0, 1, row, 9, SNAPSHOT_ALL, 7).unwrap().unwrap();
             assert_eq!(storage.row_bytes(0, 1, home, &arena).unwrap(), b"edit");
+        });
+    }
+
+    #[test]
+    fn row_heap_generation_stale_publication_and_preflight_preserve_all_state() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let (_, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"dead");
+        let (old, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"keep");
+        storage.tables[0].live = true;
+        storage.tables[0].rows.insert(1, RowState::committed_only_at(old, 7)).unwrap();
+        let mut scratch = FixedVec::new(&mut budget, "stale preflight", 2).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.compact_heap(&mut scratch).unwrap();
+            let current = storage.tables[0].rows.get(&1).unwrap();
+            let (replacement, bytes) = storage.heap.append(4).unwrap();
+            bytes.copy_from_slice(b"next");
+            for rowid in [1, 2] {
+                for tracked in [true, false] {
+                    let error = storage.write_pending_inner(0, rowid, 9, 1, Some(old), tracked).unwrap_err();
+                    assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+                    assert_eq!(storage.tables[0].rows.get(&1), Some(current));
+                    assert!(storage.tables[0].rows.get(&2).is_none());
+                }
+            }
+            // Even a stale range that remains in bounds must fail the whole
+            // preflight before any current image or row handle moves.
+            storage.tables[0].rows.insert(2, RowState::committed_only_at(old, 8)).unwrap();
+            let error = storage.compact_heap(&mut scratch).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(storage.tables[0].rows.get(&1), Some(current));
+            assert_eq!(storage.tables[0].rows.get(&2).unwrap().committed, Some(RowHome::Heap(old)));
+            assert_eq!(storage.heap.used(), 8);
+            assert_eq!(&*storage.heap.get(current.committed.unwrap().heap_loc().unwrap()).unwrap(), b"keep");
+            assert_eq!(&*storage.heap.get(replacement).unwrap(), b"next");
+            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.row_versions.test_write().is_ok());
         });
     }
 

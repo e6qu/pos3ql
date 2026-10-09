@@ -31,7 +31,8 @@ adopting a reused slot. Heap reads reject locations from an earlier relocation
 generation, even when the old range remains initialized. Compaction validates
 the full relocation set and generation capacity before changing bytes or handles,
 including aliases and empty locations. Startup rejects heaps beyond the 32-bit
-location range. Retained heap images consume arena capacity, as spilled images do.
+location range. Relocation generations are cache metadata; durable formats encode
+logical rows rather than heap locations. Retained heap images consume arena capacity, as spilled images do.
 
 The reactor still executes statements serially. Shared definition publication,
 row publication and maintenance, locator pinning across concurrent

@@ -48,12 +48,14 @@ Complete shared ownership before enabling overlapping execution:
   lifecycle mutation and retirement; publication still requires exclusive storage.
 - Synchronize row publication, statistics, and physical maintenance through a
   coherent table lifecycle, including rollback, retirement, cloning, and recovery.
-- Pin heap locations across visibility lookup and concurrent relocation. Heap
-  generations reject detached locations after relocation, including reused ranges;
-  byte guards and rejection do not preserve a locator across visibility lookup.
+- Visible heap reads acquire byte ownership while version ownership is held.
+  Deferred executor reads retain logical row identities and frozen MVCC boundaries,
+  then reacquire the selected version after relocation. Complete shared row
+  publication and retirement without invalidating these retained snapshots.
 - Establish lock ordering and release guards before nested catalog resolution.
   Reuse retained images and compact metadata instead of copying wide definitions
-  per row. Long-lived heap images consume the fixed statement arena.
+  per row. Retained byte images consume the fixed statement arena; deferred row snapshots
+  consume bounded metadata rather than retaining detached heap locations.
 
 Acceptance: concurrent readers/writers retain valid images; exhaustion,
 rollback, identity reuse, and failed creation preserve prior state; all controls

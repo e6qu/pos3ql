@@ -7,6 +7,30 @@
 use super::*;
 
 #[test]
+fn visible_row_heap_ownership_transaction_exhaustion_preserves_active_owners() {
+    let (mut engine, mut budget) = test_engine();
+    let mut first = TxnState::new(&mut budget, 8).unwrap();
+    let mut second = TxnState::new(&mut budget, 8).unwrap();
+    let guc = GucState::new();
+    engine.ensure_txn(&mut first, TxnMode::Explicit, &guc).unwrap();
+    let active = first.txid;
+    engine.next_txid = u32::MAX;
+    crate::mem::guard::forbid_alloc(|| {
+        let error = engine.ensure_txn(&mut second, TxnMode::Implicit, &guc).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(second.txid, 0);
+        assert!(!second.is_active());
+        assert_eq!(first.txid, active);
+        assert!(first.is_active());
+        assert_eq!(engine.next_txid, u32::MAX);
+        engine.ensure_txn(&mut first, TxnMode::Explicit, &guc).unwrap();
+        assert_eq!(first.txid, active);
+        assert_eq!(engine.allocate_transaction_id().unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    });
+    engine.rollback_txn(&mut first, &guc);
+}
+
+#[test]
 fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
     let mut config = test_config("definition-checkpoint-exhaustion");
     config.max_tables = 1;
@@ -642,11 +666,7 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
         .push(exec::PhysicalRow::Local {
             table_index: 1,
             rowid: 11,
-            home: RowHome::Spilled {
-                len: 1,
-                sst: 1,
-                commit_lsn: 1,
-            },
+            home: crate::storage::RowReadSource::StagedHeap(crate::storage::RowLoc::EMPTY),
         })
         .unwrap();
     assert_eq!(dml_workspaces.len(), 1);

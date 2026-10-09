@@ -5993,26 +5993,20 @@ fn scan_source_mode<'a>(
                 let probe_count = storage.visible_row_count(probe_slot, txid)?;
                 let probe_ordered = arena
                     .alloc_slice_with(probe_count.max(1), |_| {
-                        (
-                            0u64,
-                            crate::storage::RowHome::Heap(crate::storage::RowLoc::EMPTY),
-                        )
+                        None::<(u64, crate::storage::RowSnapshot, (u8, u64, u32))>
                     })
                     .map_err(|_| arena_full())?;
                 let mut probe_fill = 0usize;
                 storage.for_each_row_state(probe_slot, &mut |rowid, state| {
                     if let Some(home) = storage.visible_row_home(probe_slot, rowid, state, txid)? {
-                        probe_ordered[probe_fill] = (rowid, home);
+                        probe_ordered[probe_fill] = Some((rowid, home.snapshot(), home.heap_loc().map_or((0u8, rowid, 0u32), |loc| (1u8, 0, loc.offset))));
                         probe_fill += 1;
                     }
                     Ok(ControlFlow::Continue(()))
                 })?;
-                probe_ordered[..probe_fill].sort_unstable_by_key(|(rowid, home)| match home {
-                    crate::storage::RowHome::Spilled { .. } => (0u8, *rowid, 0u32),
-                    crate::storage::RowHome::Heap(loc) => (1u8, 0, loc.offset),
-                });
+                probe_ordered[..probe_fill].sort_unstable_by_key(|row| row.expect("row snapshots are initialized").2);
 
-                for &(rowid, home) in &probe_ordered[..probe_fill] {
+                for (rowid, home, _) in probe_ordered[..probe_fill].iter().copied().flatten() {
                     storage.record_relation_tuple_read(txid, probe_slot, None)?;
                     if !recycled(arena, recycle_rows, None, || {
                         let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
@@ -6736,10 +6730,7 @@ fn scan_source_mode<'a>(
             };
             let ordered = arena
                 .alloc_slice_with(count, |_| {
-                    (
-                        0u64,
-                        crate::storage::RowHome::Heap(crate::storage::RowLoc::EMPTY),
-                    )
+                    None::<(u64, crate::storage::RowSnapshot, (u8, u64, u32))>
                 })
                 .map_err(|_| arena_full())?;
             let mut fill = 0usize;
@@ -6749,14 +6740,14 @@ fn scan_source_mode<'a>(
                         continue;
                     };
                     if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
-                        ordered[fill] = (rowid, home);
+                        ordered[fill] = Some((rowid, home.snapshot(), home.heap_loc().map_or((0u8, rowid, 0u32), |loc| (1u8, 0, loc.offset))));
                         fill += 1;
                     }
                 }
             } else {
                 storage.for_each_row_state(slot, &mut |rowid, state| {
                     if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
-                        ordered[fill] = (rowid, home);
+                        ordered[fill] = Some((rowid, home.snapshot(), home.heap_loc().map_or((0u8, rowid, 0u32), |loc| (1u8, 0, loc.offset))));
                         fill += 1;
                     }
                     Ok(core::ops::ControlFlow::Continue(()))
@@ -6767,12 +6758,9 @@ fn scan_source_mode<'a>(
             // they were written in); heap rows keep heap-offset order after
             // them, matching insertion order within each group.
             if access.is_none_or(|access| !access.preserves_order) {
-                ordered[..fill].sort_unstable_by_key(|(rowid, home)| match home {
-                    crate::storage::RowHome::Spilled { .. } => (0u8, *rowid, 0u32),
-                    crate::storage::RowHome::Heap(loc) => (1u8, 0, loc.offset),
-                });
+                ordered[..fill].sort_unstable_by_key(|row| row.expect("row snapshots are initialized").2);
             }
-            for (this, &(rowid, home)) in ordered[..fill].iter().enumerate() {
+            for (this, (rowid, home, _)) in ordered[..fill].iter().copied().flatten().enumerate() {
                 check_timeout()?;
                 storage.record_relation_tuple_read(
                     txid,

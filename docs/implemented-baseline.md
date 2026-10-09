@@ -23,7 +23,8 @@ do not qualify concurrent execution or representative deployments.
 | Table metadata | Database/creation/owner identity, typed CREATE/DROP existence, definitions, and pending heads share guarded ownership; version slots are guarded, retained images capture identity with the definition, and publication remains exclusive |
 | Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
 | Resident rows | Per-table map guards and one guarded pending/committed version owner; issued readers retain chain ownership, including SQL and checkpoint walks |
-| Heap bytes | Guarded bytes, append position, and relocation generation; callback/codec reads retain the guard, while long-lived images copy into the fixed statement arena |
+| Heap bytes | Visible reads acquire byte guards before releasing version ownership; callback/codec reads retain them, while retained byte images copy into the fixed statement arena |
+| Deferred rows | Logical row identity, table incarnation, and frozen command/commit snapshots; later reads reacquire the selected version rather than retaining heap locations |
 
 Reader capacity, lock controls, and heap controls are charged at startup.
 Exhaustion is explicit; stale definition identity reacquisition fails rather than
@@ -35,8 +36,7 @@ location range. Relocation generations are cache metadata; durable formats encod
 logical rows rather than heap locations. Retained heap images consume arena capacity, as spilled images do.
 
 The reactor still executes statements serially. Shared table lifecycle mutation
-and retirement, row publication and maintenance, locator pinning across concurrent
-relocation, engine publication, and fixed workers remain the roadmap's open
+and retirement, row publication and maintenance, engine publication, and fixed workers remain the roadmap's open
 concurrency gates. Immutable SST reads carry no resident version handles.
 
 ## Evidence limits

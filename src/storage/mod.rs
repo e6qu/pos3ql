@@ -13,6 +13,7 @@ use table_definitions::{
 };
 pub(crate) mod foreign;
 mod row_heap;
+mod row_images;
 mod row_map;
 mod row_reads;
 mod row_versions;
@@ -20,6 +21,8 @@ pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;
+pub use row_images::{RowByteRead, RowReadSource, RowSnapshot, VisibleRowHome};
+use row_images::{RowByteSource, VisibleRowBytes};
 pub(crate) use row_map::RowMap;
 pub(crate) use row_reads::RowRead;
 use row_reads::{RowReadView, RowReadVisitor};
@@ -12692,6 +12695,8 @@ struct VisibilityContext {
     /// A row's own-transaction pending change is visible only when its command
     /// identifier precedes this value. `SNAPSHOT_ALL` sees every own write.
     read_snapshot: u32,
+    /// Finite boundary for retaining a statement's current own-write image.
+    command_ceiling: u32,
     /// Greatest durable commit LSN visible to the running statement.
     commit_snapshot: u64,
 }
@@ -12700,6 +12705,7 @@ impl VisibilityContext {
     const fn all() -> Self {
         Self {
             read_snapshot: SNAPSHOT_ALL,
+            command_ceiling: SNAPSHOT_ALL,
             commit_snapshot: u64::MAX,
         }
     }
@@ -29787,7 +29793,7 @@ impl Storage {
         rowid: u64,
         state: RowRead<'_>,
         txid: u32,
-    ) -> Result<Option<RowHome>, SqlError> {
+    ) -> Result<Option<VisibleRowHome<'_>>, SqlError> {
         self.visible_row_home_at(
             table_slot,
             rowid,
@@ -29809,21 +29815,49 @@ impl Storage {
         txid: u32,
         command_snapshot: u32,
         commit_snapshot: u64,
-    ) -> Result<Option<RowHome>, SqlError> {
+    ) -> Result<Option<VisibleRowHome<'_>>, SqlError> {
+        let snapshot = RowSnapshot {
+            created_at: self.tables[table_slot].created_at(),
+            txid,
+            command: command_snapshot.min(execution_visibility().command_ceiling),
+            commit: commit_snapshot,
+        };
         let visible = state.visible_at(txid, command_snapshot, commit_snapshot);
+        // Version ownership excludes relocation until the heap guard is held.
+        // Acquire bytes before releasing the owner of the selected location.
+        let resident = visible
+            .flatten()
+            .map(|home| self.pin_visible_home(snapshot, home))
+            .transpose()?;
         drop(state);
-        if let Some(home) = visible {
-            return Ok(home);
+        if visible.is_some() {
+            return Ok(resident);
         }
         Ok(self
             .spill_probe_at(table_slot, rowid, commit_snapshot)?
             .and_then(|version| {
-                version.len.map(|len| RowHome::Spilled {
-                    len,
-                    sst: version.member,
-                    commit_lsn: version.commit_lsn,
-                })
+                version.len.map(|len| VisibleRowHome::spilled(
+                    snapshot, len, version.member, version.commit_lsn,
+                ))
             }))
+    }
+
+    fn pin_visible_home(&self, snapshot: RowSnapshot, home: RowHome) -> Result<VisibleRowHome<'_>, SqlError> {
+        match home {
+            RowHome::Heap(location) => Ok(VisibleRowHome::heap(snapshot, self.heap.get(location)?)),
+            RowHome::Spilled { len, sst, commit_lsn } => Ok(VisibleRowHome::spilled(snapshot, len, sst, commit_lsn)),
+        }
+    }
+
+    pub(crate) fn read_row_snapshot(&self, table_slot: usize, rowid: u64, snapshot: RowSnapshot) -> Result<VisibleRowHome<'_>, SqlError> {
+        if self.tables[table_slot].created_at() != snapshot.created_at {
+            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "retained row belongs to a retired table incarnation"));
+        }
+        let state = self.row_state(table_slot, rowid)?.ok_or_else(|| {
+            sql_err!(sqlstate::SERIALIZATION_FAILURE, "retained row version is no longer available")
+        })?;
+        self.visible_row_home_at(table_slot, rowid, state, snapshot.txid, snapshot.command, snapshot.commit)?
+            .ok_or_else(|| sql_err!(sqlstate::SERIALIZATION_FAILURE, "retained row version is no longer visible at its captured snapshot"))
     }
 
     /// How many rows `txid` sees, through the same seam — under the current
@@ -30191,7 +30225,45 @@ impl Storage {
 
     /// Retained row bytes belong to the fixed statement arena; heap owners end
     /// before callers retain the image or invoke mutable callbacks.
-    pub fn row_bytes<'a>(
+    pub fn row_bytes<'a, 'image>(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+        home: impl Into<RowByteRead<'image>>,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<&'a [u8], SqlError> {
+        match home.into().0 {
+            RowByteSource::Visible(image) => self.visible_row_bytes(table_slot, rowid, image, arena),
+            RowByteSource::Snapshot(snapshot) => {
+                let image = self.read_row_snapshot(table_slot, rowid, snapshot)?;
+                self.visible_row_bytes(table_slot, rowid, image, arena)
+            }
+            RowByteSource::Physical(home) => self.physical_row_bytes(table_slot, rowid, home, arena),
+        }
+    }
+
+    fn visible_row_bytes<'a>(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+        image: VisibleRowHome<'_>,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<&'a [u8], SqlError> {
+        match image.bytes {
+            VisibleRowBytes::Heap(row) => Self::copy_heap_row(row, arena),
+            VisibleRowBytes::Spilled { len, sst, commit_lsn } => {
+                self.physical_row_bytes(table_slot, rowid, RowHome::Spilled { len, sst, commit_lsn }, arena)
+            }
+        }
+    }
+
+    fn copy_heap_row<'a>(row: row_heap::HeapRowRead<'_>, arena: &'a Arena) -> Result<&'a [u8], SqlError> {
+        arena.alloc_slice_copy(&row).map(|bytes| &*bytes).map_err(|_| {
+            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "heap row images exceed the statement arena; raise work_arena_bytes")
+        })
+    }
+
+    fn physical_row_bytes<'a>(
         &self,
         table_slot: usize,
         rowid: u64,
@@ -30201,15 +30273,7 @@ impl Storage {
         match home {
             RowHome::Heap(loc) => {
                 let row = self.heap.get(loc)?;
-                arena
-                    .alloc_slice_copy(&row)
-                    .map(|bytes| &*bytes)
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "heap row images exceed the statement arena; raise work_arena_bytes"
-                        )
-                    })
+                Self::copy_heap_row(row, arena)
             }
             RowHome::Spilled {
                 len,
@@ -30298,7 +30362,39 @@ impl Storage {
     /// scratch for the duration of the call. For consume-in-place readers
     /// (constraint scans) whose decoded values do not outlive the closure.
     /// `f` must not fetch another spilled row (the scratch is singular).
-    pub fn with_row_bytes<R>(
+    pub fn with_row_bytes<'image, R>(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+        home: impl Into<RowByteRead<'image>>,
+        f: impl FnOnce(&[u8]) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        match home.into().0 {
+            RowByteSource::Visible(image) => self.with_visible_row_bytes(table_slot, rowid, image, f),
+            RowByteSource::Snapshot(snapshot) => {
+                let image = self.read_row_snapshot(table_slot, rowid, snapshot)?;
+                self.with_visible_row_bytes(table_slot, rowid, image, f)
+            }
+            RowByteSource::Physical(home) => self.with_physical_row_bytes(table_slot, rowid, home, f),
+        }
+    }
+
+    fn with_visible_row_bytes<R>(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+        image: VisibleRowHome<'_>,
+        f: impl FnOnce(&[u8]) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        match image.bytes {
+            VisibleRowBytes::Heap(row) => f(&row),
+            VisibleRowBytes::Spilled { len, sst, commit_lsn } => {
+                self.with_physical_row_bytes(table_slot, rowid, RowHome::Spilled { len, sst, commit_lsn }, f)
+            }
+        }
+    }
+
+    fn with_physical_row_bytes<R>(
         &self,
         table_slot: usize,
         rowid: u64,
@@ -52543,6 +52639,16 @@ impl Storage {
         replace_execution_visibility(visibility);
     }
 
+    pub(crate) fn set_command_snapshot(&self, command: u32) -> Result<(), SqlError> {
+        let ceiling = command.checked_add(1).ok_or_else(|| {
+            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "transaction command identity space is exhausted")
+        })?;
+        let mut visibility = execution_visibility();
+        visibility.command_ceiling = ceiling;
+        replace_execution_visibility(visibility);
+        Ok(())
+    }
+
     /// Recovery: pins the LSN to a replayed record's.
     pub fn set_lsn(&mut self, lsn: u64) {
         self.lsn = lsn;
@@ -52557,6 +52663,90 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_row_heap_ownership_pins_before_metadata_owner_releases() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("pinned", &[("id", ColType::Int4, false)])).unwrap();
+        storage.heap.append(4).unwrap();
+        let (location, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"row!");
+        storage.tables[table].rows.insert(1, RowState::committed_only_at(location, 7)).unwrap();
+        let arena = Arena::new(&mut budget, "visible row image", 4).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let row = storage.resident_row_state(table, 1).unwrap();
+            let image = storage.visible_row_home_at(table, 1, row, 8, SNAPSHOT_ALL, 7).unwrap().unwrap();
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.tables[table].rows.test_write().is_ok());
+            assert!(storage.heap.test_write().is_err(), "visible heap locations retain byte ownership");
+            assert_eq!(storage.row_bytes(table, 1, image, &arena).unwrap(), b"row!");
+            assert!(storage.heap.test_write().is_ok());
+            let row = storage.resident_row_state(table, 1).unwrap();
+            let image = storage.visible_row_home_at(table, 1, row, 8, SNAPSHOT_ALL, 7).unwrap().unwrap();
+            assert_eq!(storage.row_bytes(table, 1, image, &arena).unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(storage.heap.test_write().is_ok());
+            let row = storage.resident_row_state(table, 1).unwrap();
+            let image = storage.visible_row_home_at(table, 1, row, 8, SNAPSHOT_ALL, 7).unwrap().unwrap();
+            let error = storage.with_row_bytes(table, 1, image, |bytes| -> Result<(), SqlError> {
+                assert_eq!(bytes, b"row!");
+                assert!(storage.heap.test_write().is_err());
+                Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "callback exhausted"))
+            }).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(storage.heap.test_write().is_ok());
+        });
+    }
+
+    #[test]
+    fn visible_row_heap_ownership_deferred_snapshot_survives_relocation_and_rejects_reuse() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("snapshot", &[("id", ColType::Int4, false)])).unwrap();
+        storage.heap.append(4).unwrap();
+        let (committed, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"base");
+        let (original, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"old!");
+        let mut state = RowState::committed_only_at(committed, 7);
+        push_pending_version(&mut storage.row_versions.exclusive().pending_row_versions, &mut state.pending, storage.max_row_versions_per_row, PendingChange {
+            txid: 7, cid: 2, loc: Some(original), changed_columns: ColumnSet::EMPTY, changes_existence: false,
+        }).unwrap();
+        storage.tables[table].rows.insert(1, state).unwrap();
+        storage.set_command_snapshot(2).unwrap();
+        let mut scratch = FixedVec::new(&mut budget, "snapshot compaction", 8).unwrap();
+        let arena = Arena::new(&mut budget, "deferred row images", 32).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let row = storage.resident_row_state(table, 1).unwrap();
+            let image = storage.visible_row_home_at(table, 1, row, 7, SNAPSHOT_ALL, 7).unwrap().unwrap();
+            let snapshot = image.snapshot();
+            drop(image);
+            assert!(storage.heap.test_write().is_ok());
+            let (later, bytes) = storage.heap.append(4).unwrap();
+            bytes.copy_from_slice(b"new!");
+            push_pending_version(&mut storage.row_versions.exclusive().pending_row_versions, &mut state.pending, storage.max_row_versions_per_row, PendingChange {
+                txid: 7, cid: 4, loc: Some(later), changed_columns: ColumnSet::EMPTY, changes_existence: false,
+            }).unwrap();
+            storage.tables[table].rows.insert(1, state).unwrap();
+            storage.set_command_snapshot(4).unwrap();
+            storage.set_commit_snapshot(u64::MAX);
+            storage.compact_heap(&mut scratch).unwrap();
+            assert_eq!(storage.heap.get(original).err().unwrap().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(storage.row_bytes(table, 1, snapshot, &arena).unwrap(), b"old!");
+            assert!(storage.heap.test_write().is_ok());
+            let row = storage.resident_row_state(table, 1).unwrap();
+            let current = storage.visible_row_home_at(table, 1, row, 7, SNAPSHOT_ALL, 7).unwrap().unwrap();
+            assert_eq!(storage.row_bytes(table, 1, current, &arena).unwrap(), b"new!");
+            storage.commit_drop(table);
+            let replacement = storage.create_table(make_def("replacement", &[("id", ColType::Int4, false)])).unwrap();
+            assert_eq!(replacement, table);
+            assert_eq!(storage.row_bytes(table, 1, snapshot, &arena).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.heap.test_write().is_ok());
+        });
+    }
 
     #[test]
     fn execution_path_is_thread_private() {
@@ -52576,6 +52766,7 @@ mod tests {
     fn visibility_snapshots_are_thread_private() {
         let prior = replace_execution_visibility(VisibilityContext {
             read_snapshot: 7,
+            command_ceiling: 8,
             commit_snapshot: 13,
         });
         let child = std::thread::spawn(|| {
@@ -52584,6 +52775,7 @@ mod tests {
             assert_eq!(initial.commit_snapshot, u64::MAX);
             replace_execution_visibility(VisibilityContext {
                 read_snapshot: 11,
+                command_ceiling: 12,
                 commit_snapshot: 17,
             });
             let changed = execution_visibility();
@@ -52652,6 +52844,7 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage.heap.append(24).unwrap();
         let location = RowLoc::test(12, 4);
         let state = RowState::committed_only_at(location, 42);
         storage.tables[0].rows.insert(1, state).unwrap();
@@ -52665,7 +52858,7 @@ mod tests {
                     SNAPSHOT_ALL,
                     41
                 )
-                .unwrap(),
+                .unwrap().map(|image| image.metadata()),
             None
         );
         assert_eq!(
@@ -52678,7 +52871,7 @@ mod tests {
                     SNAPSHOT_ALL,
                     42
                 )
-                .unwrap(),
+                .unwrap().map(|image| image.metadata()),
             Some(RowHome::Heap(location))
         );
         assert_eq!(
@@ -52691,7 +52884,7 @@ mod tests {
                     SNAPSHOT_ALL,
                     99
                 )
-                .unwrap(),
+                .unwrap().map(|image| image.metadata()),
             Some(RowHome::Heap(location))
         );
 
@@ -52717,13 +52910,13 @@ mod tests {
         assert_eq!(
             storage
                 .visible_row_home_at(0, 1, storage.resident_row_state(0, 1).unwrap(), 7, 4, 41)
-                .unwrap(),
+                .unwrap().map(|image| image.metadata()),
             Some(RowHome::Heap(RowLoc::test(20, 4)))
         );
         assert_eq!(
             storage
                 .visible_row_home_at(0, 1, storage.resident_row_state(0, 1).unwrap(), 8, 4, 41)
-                .unwrap(),
+                .unwrap().map(|image| image.metadata()),
             None
         );
     }
@@ -52839,6 +53032,7 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage.heap.append(4).unwrap();
         storage.tables[0]
             .rows
             .insert(1, RowState::committed_only_at(RowLoc::test(0, 4), 7))
@@ -52870,7 +53064,7 @@ mod tests {
             assert_eq!(
                 storage
                     .visible_row_home_at(0, 1, row, 7, SNAPSHOT_ALL, 7)
-                    .unwrap(),
+                    .unwrap().map(|image| image.metadata()),
                 Some(RowHome::Heap(RowLoc::test(0, 4)))
             );
             assert!(storage.row_versions.test_write().is_ok());

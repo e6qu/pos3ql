@@ -1,0 +1,43 @@
+name: Table lifecycle validation
+on:
+  push:
+    branches: [codex/table-catalog-lifecycle]
+concurrency:
+  group: table-lifecycle-validation
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Format on runner
+        run: |
+          cargo fmt --all
+          git diff > table-lifecycle-format.patch
+      - uses: actions/upload-artifact@v6
+        with:
+          name: table-lifecycle-format
+          path: table-lifecycle-format.patch
+      - run: cargo check --all-targets --locked --message-format=json > table-lifecycle-check.json
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: table-lifecycle-check
+          path: table-lifecycle-check.json
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Lifecycle ownership and recovery
+        run: |
+          cargo test --lib --locked table_catalog_lifecycle -- --nocapture
+          cargo test --lib --locked live_definition_ownership -- --nocapture
+          cargo test --lib --locked table_slot -- --nocapture
+          cargo test --lib --locked prepared_transactions_survive_checkpoint_and_object_cold_recovery -- --nocapture

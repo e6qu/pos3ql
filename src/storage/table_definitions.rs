@@ -4,13 +4,44 @@ use core::mem::size_of;
 use core::ops::Deref;
 use std::sync::{RwLock, RwLockReadGuard};
 
-use super::{PendingTableDef, PendingTableDefSlot, TableDef};
+use super::{CatalogDdlState, DatabaseOid, Ownership, PendingDdl, PendingTableDef, PendingTableDefSlot, TableDef};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
 
 pub(super) struct DefinitionState {
+    pub(super) identity: TableIdentity,
     pub(super) committed: TableDef,
     pub(super) pending: Option<PendingDefinitionHead>,
+}
+
+/// Identity and existence share publication ownership with the definition.
+#[derive(Clone, Copy)]
+pub(crate) struct TableIdentity {
+    pub(crate) database: DatabaseOid,
+    pub(crate) ownership: Ownership,
+    pub(crate) created_at: u64,
+    pub(crate) existence: CatalogDdlState,
+}
+
+impl TableIdentity {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        ownership: Ownership::BOOTSTRAP,
+        created_at: 0,
+        existence: CatalogDdlState::Absent,
+    };
+
+    pub(super) fn live(self) -> bool {
+        matches!(self.existence, CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. })
+    }
+
+    pub(super) fn pending_ddl(self) -> Option<PendingDdl> {
+        match self.existence {
+            CatalogDdlState::PendingCreate { txid } => Some(PendingDdl { txid, creating: true }),
+            CatalogDdlState::PendingDrop { txid } | CatalogDdlState::PendingCreateDrop { txid } => Some(PendingDdl { txid, creating: false }),
+            CatalogDdlState::Absent | CatalogDdlState::Present => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -27,6 +58,7 @@ impl TableDefinition {
     pub(super) fn new(committed: TableDef) -> Self {
         Self {
             state: RwLock::new(DefinitionState {
+                identity: TableIdentity::EMPTY,
                 committed,
                 pending: None,
             }),
@@ -95,6 +127,10 @@ impl Deref for TableDefinitionRead<'_> {
 }
 
 impl<'a> TableDefinitionRead<'a> {
+    pub(crate) fn identity(&self) -> TableIdentity {
+        self.state.identity
+    }
+
     pub(super) fn committed(definition: &'a TableDefinition) -> Self {
         Self {
             state: definition.read(),

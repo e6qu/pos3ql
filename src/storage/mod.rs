@@ -2493,23 +2493,8 @@ impl TableSerialState {
 }
 
 pub struct Table {
-    /// Database catalog owning this relation. Slots are process-global while
-    /// relation names are database-local, so the database identity is part of
-    /// the stored relation identity rather than an execution-time filter.
-    pub(crate) database: DatabaseOid,
     definition: TableDefinition,
-    pub ownership: Ownership,
-    /// Monotonic creation stamp (catalog sequence), giving dependency
-    /// reports PostgreSQL's OID ordering.
-    pub created_at: u64,
     pub rows: RowMap,
-    /// Committed existence: whether the table is part of the last-committed
-    /// catalog image. `pending_ddl` overlays an uncommitted CREATE/DROP.
-    pub live: bool,
-    /// An uncommitted CREATE or DROP owned by a single transaction. Mirrors
-    /// `RowState`: other transactions see `live`; the owner sees the pending
-    /// existence. `None` once committed or rolled back.
-    pub pending_ddl: Option<PendingDdl>,
     /// Transaction-local `relhasrules` history. The committed bit never
     /// clears, but an aborted CREATE RULE must not publish it.
     pending_has_rules_txid: Option<u32>,
@@ -3775,6 +3760,38 @@ struct PendingTableDefSlot {
 }
 
 impl Table {
+    pub(crate) fn identity(&self) -> table_definitions::TableIdentity {
+        self.definition.read().identity
+    }
+
+    fn identity_mut(&mut self) -> &mut table_definitions::TableIdentity {
+        &mut self.definition.exclusive().identity
+    }
+
+    pub(crate) fn database(&self) -> DatabaseOid {
+        self.identity().database
+    }
+
+    pub fn ownership(&self) -> Ownership {
+        self.identity().ownership
+    }
+
+    fn ownership_mut(&mut self) -> &mut Ownership {
+        &mut self.identity_mut().ownership
+    }
+
+    pub fn created_at(&self) -> u64 {
+        self.identity().created_at
+    }
+
+    pub fn live(&self) -> bool {
+        self.identity().live()
+    }
+
+    pub fn pending_ddl(&self) -> Option<PendingDdl> {
+        self.identity().pending_ddl()
+    }
+
     /// Committed metadata retains table ownership until this guard drops.
     pub fn definition(&self) -> TableDefinitionRead<'_> {
         TableDefinitionRead::committed(&self.definition)
@@ -3804,30 +3821,26 @@ impl Table {
     /// else the committed `live` baseline (another transaction's uncommitted
     /// DDL is invisible).
     pub fn visible_to(&self, txid: u32) -> bool {
-        match self.pending_ddl {
-            Some(p) if p.txid == txid => p.creating,
-            _ => self.live,
-        }
+        self.identity().existence.visible_to(txid)
     }
 
     /// The txid of an uncommitted CREATE/DROP held by another transaction, if
     /// any — or of a pending definition version. That transaction has the
     /// catalog identity locked.
     pub fn ddl_locked_by_other(&self, txid: u32) -> Option<u32> {
-        match self.pending_ddl {
-            Some(p) if p.txid != txid => Some(p.txid),
-            _ => self
-                .pending_definition_transaction()
-                .filter(|&owner| owner != txid),
+        let state = self.definition.read();
+        match state.identity.existence.pending_txid() {
+            Some(owner) if owner != txid => Some(owner),
+            _ => state.pending.map(|head| head.transaction).filter(|&owner| owner != txid),
         }
     }
 
     /// Whether the slot is free for a fresh CREATE: no committed table, no
     /// pending DDL, and no retained rows.
     fn is_free(&self) -> bool {
-        !self.live
-            && self.pending_ddl.is_none()
-            && self.pending_definition_tail().is_none()
+        let state = self.definition.read();
+        state.identity.existence == CatalogDdlState::Absent
+            && state.pending.is_none()
             && self.rows.is_empty()
     }
 }
@@ -14597,7 +14610,7 @@ impl Storage {
                 indexes
                     .push(IndexCumulativeStatistics {
                         oid,
-                        database: self.tables[table].database,
+                        database: self.tables[table].database(),
                         ..IndexCumulativeStatistics::EMPTY
                     })
                     .map_err(|_| {
@@ -14749,7 +14762,7 @@ impl Storage {
                     .database_catalog()
                     .definitions
                     .iter()
-                    .position(|database| database.oid == self.tables[table].database)
+                    .position(|database| database.oid == self.tables[table].database())
                 {
                     let database = &mut databases[database_slot];
                     database.tup_returned = database
@@ -14829,7 +14842,7 @@ impl Storage {
                         .database_catalog()
                         .definitions
                         .iter()
-                        .position(|database| database.oid == self.tables[table].database)
+                        .position(|database| database.oid == self.tables[table].database())
                     {
                         let database = &mut databases[database_slot];
                         database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
@@ -14927,7 +14940,7 @@ impl Storage {
                 .database_catalog()
                 .definitions
                 .iter()
-                .position(|database| database.oid == self.tables[table].database)
+                .position(|database| database.oid == self.tables[table].database())
             {
                 let database = &mut databases[database_slot];
                 database.tup_returned = database
@@ -15220,7 +15233,7 @@ impl Storage {
             cumulative.databases[slot] = reset;
         }
         for (slot, table) in self.tables.iter().enumerate() {
-            if table.database == database {
+            if table.database() == database {
                 cumulative.relations[slot] = RelationCumulativeStatistics::EMPTY;
             }
         }
@@ -15747,8 +15760,8 @@ impl Storage {
             }
         }
         for slot in 0..self.table_count() {
-            if self.tables[slot].database != current_database()
-                || !self.tables[slot].live
+            if self.tables[slot].database() != current_database()
+                || !self.tables[slot].live()
                 || {
                     let definition = self.tables[slot].definition();
                     definition.persistence
@@ -15789,8 +15802,8 @@ impl Storage {
             return Ok(());
         };
         for slot in 0..self.table_count() {
-            if self.tables[slot].database != current_database()
-                || !self.tables[slot].live
+            if self.tables[slot].database() != current_database()
+                || !self.tables[slot].live()
                 || {
                     let definition = self.tables[slot].definition();
                     definition.persistence
@@ -15842,7 +15855,7 @@ impl Storage {
 
     pub(crate) fn reset_unlogged_relations(&mut self) -> Result<(), SqlError> {
         for slot in 0..self.table_count() {
-            if !self.tables[slot].live || {
+            if !self.tables[slot].live() || {
                 let definition = self.tables[slot].definition();
                 definition.persistence
             } != RelationPersistence::Unlogged
@@ -15872,7 +15885,7 @@ impl Storage {
 
     pub(crate) fn has_unlogged_relations(&self) -> bool {
         self.tables.iter().any(|table| {
-            table.live && {
+            table.live() && {
                 let definition = table.definition();
                 definition.persistence
             } == RelationPersistence::Unlogged
@@ -15932,7 +15945,7 @@ impl Storage {
                 index
                     .and_then(|index| {
                         self.tables.iter().enumerate().find_map(|(slot, table)| {
-                            (table.database == index.database
+                            (table.database() == index.database
                                 && table.visible_to(txid)
                                 && self.table_def(slot, txid).schema == index.schema
                                 && self.table_def(slot, txid).name == index.table)
@@ -17348,14 +17361,12 @@ impl Storage {
         for slot in 0..table_capacity {
             tables
                 .push(Table {
-                    database: DatabaseOid::POSTGRES,
                     definition: TableDefinition::new(TableDef {
                         name: SqlName::parse("").expect("empty name fits"),
                         columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
                         n_columns: 0,
                         ..TableDef::empty()
                     }),
-                    ownership: Ownership::BOOTSTRAP,
                     rows: RowMap::new(
                         budget,
                         "table_rows",
@@ -17365,9 +17376,6 @@ impl Storage {
                             config.table_rows
                         },
                     )?,
-                    created_at: 0,
-                    live: false,
-                    pending_ddl: None,
                     pending_has_rules_txid: None,
                     dirty: false,
                     generation: 1,
@@ -17411,7 +17419,7 @@ impl Storage {
             definition.n_columns = 4;
             definition.has_toast = true;
             *table.definition_mut() = definition;
-            table.live = true;
+            table.identity_mut().existence = CatalogDdlState::Present;
         }
         let mut large_objects = FixedVec::new(budget, "large_objects", config.max_large_objects)?;
         for _ in 0..config.max_large_objects {
@@ -19630,7 +19638,7 @@ impl Storage {
             drop(type_catalog);
 
             for source_slot in 0..self.tables.len() {
-                if self.tables[source_slot].database != source || !self.tables[source_slot].live {
+                if self.tables[source_slot].database() != source || !self.tables[source_slot].live() {
                     continue;
                 }
                 if {
@@ -19640,7 +19648,7 @@ impl Storage {
                 {
                     continue;
                 }
-                if self.tables[source_slot].pending_ddl.is_some()
+                if self.tables[source_slot].pending_ddl().is_some()
                     || self.tables[source_slot]
                         .pending_definition_transaction()
                         .is_some()
@@ -19663,8 +19671,8 @@ impl Storage {
                         column.collation = Collation::Catalog(target);
                     }
                 }
-                let created_at = self.tables[source_slot].created_at;
-                let ownership = self.tables[source_slot].ownership.committed();
+                let created_at = self.tables[source_slot].created_at();
+                let ownership = self.tables[source_slot].ownership().committed();
                 let statistics = self.tables[source_slot].statistics;
                 let serial_values = self.table_serial_values(source_slot);
                 let n_spill_ssts = self.tables[source_slot].n_spill_ssts;
@@ -19677,8 +19685,8 @@ impl Storage {
                 )?;
                 {
                     let target_table = &mut self.tables[target_slot];
-                    target_table.created_at = created_at;
-                    target_table.ownership = ownership;
+                    target_table.identity_mut().created_at = created_at;
+                    target_table.identity_mut().ownership = ownership;
                     target_table.statistics = statistics;
                     *target_table
                         .serial
@@ -20081,8 +20089,8 @@ impl Storage {
                 if definition.database != source
                     || definition.ddl_state != CatalogDdlState::Present
                     || self.tables.iter().any(|table| {
-                        table.database == source
-                            && table.live
+                        table.database() == source
+                            && table.live()
                             && {
                                 let definition = table.definition();
                                 definition.schema
@@ -20648,8 +20656,8 @@ impl Storage {
             // Partition links are runtime table slots. Rebind them only after
             // every target relation exists; names are the durable identity.
             for target_slot in 0..self.tables.len() {
-                if self.tables[target_slot].database != target
-                    || self.tables[target_slot].pending_ddl
+                if self.tables[target_slot].database() != target
+                    || self.tables[target_slot].pending_ddl()
                         != Some(PendingDdl {
                             txid,
                             creating: true,
@@ -20700,7 +20708,7 @@ impl Storage {
                 continue;
             }
             let object_database = match entry.object.class {
-                AccessClass::Table => self.tables[usize::from(entry.object.slot)].database,
+                AccessClass::Table => self.tables[usize::from(entry.object.slot)].database(),
                 AccessClass::View => self.view(usize::from(entry.object.slot)).database,
                 AccessClass::MaterializedView => {
                     self.matview(usize::from(entry.object.slot)).database
@@ -20759,7 +20767,7 @@ impl Storage {
             }
             let relation = entry.target.relation;
             let object_database = match relation.class {
-                AccessClass::Table => self.tables[usize::from(relation.slot)].database,
+                AccessClass::Table => self.tables[usize::from(relation.slot)].database(),
                 AccessClass::View => self.view(usize::from(relation.slot)).database,
                 AccessClass::MaterializedView => self.matview(usize::from(relation.slot)).database,
                 _ => continue,
@@ -20831,16 +20839,16 @@ impl Storage {
             }
         }
         for slot in 0..self.tables.len() {
-            if self.tables[slot].database != database {
+            if self.tables[slot].database() != database {
                 continue;
             }
             self.release_enforcers(slot);
             self.clear_pending_table_defs(slot);
             self.clear_pending_table_statistics(slot);
             self.clear_table_rows(slot);
-            self.tables[slot].live = false;
-            self.tables[slot].pending_ddl = None;
-            self.tables[slot].database = DatabaseOid::POSTGRES;
+            let identity = self.tables[slot].identity_mut();
+            identity.existence = CatalogDdlState::Absent;
+            identity.database = DatabaseOid::POSTGRES;
         }
         for (slot, schema) in self
             .schemas
@@ -21180,15 +21188,15 @@ impl Storage {
             }
         }
         for table in self.tables.iter_mut() {
-            if table.database == database
-                && table.pending_ddl
+            if table.database() == database
+                && table.pending_ddl()
                     == Some(PendingDdl {
                         txid,
                         creating: true,
                     })
             {
-                table.live = true;
-                table.pending_ddl = None;
+                let identity = table.identity_mut();
+                identity.existence = identity.existence.commit_create();
             }
         }
         {
@@ -21670,7 +21678,7 @@ impl Storage {
     fn ownership(&self, object: AccessObject) -> Ownership {
         let slot = object.slot as usize;
         match object.class {
-            AccessClass::Table => self.tables[slot].ownership,
+            AccessClass::Table => self.tables[slot].ownership(),
             AccessClass::View => self.view(slot).ownership,
             AccessClass::MaterializedView => self.matview(slot).ownership,
             AccessClass::Sequence => self.sequence(slot).ownership,
@@ -21684,7 +21692,7 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics(slot).ownership,
             AccessClass::Extension => self.extension(slot).ownership,
             AccessClass::Trigger => match self.trigger(slot).target {
-                TriggerTarget::Table(table) => self.tables[usize::from(table)].ownership,
+                TriggerTarget::Table(table) => self.tables[usize::from(table)].ownership(),
                 TriggerTarget::View(view) => self.view(usize::from(view)).ownership,
             },
             AccessClass::EventTrigger => self.event_trigger(slot).definition.ownership,
@@ -21703,7 +21711,7 @@ impl Storage {
     fn ownership_mut(&mut self, object: AccessObject) -> &mut Ownership {
         let slot = object.slot as usize;
         match object.class {
-            AccessClass::Table => &mut self.tables[slot].ownership,
+            AccessClass::Table => self.tables[slot].ownership_mut(),
             AccessClass::View => {
                 unreachable!("view ownership is synchronized separately")
             }
@@ -22233,7 +22241,7 @@ impl Storage {
     pub(crate) fn access_object_is_live_in_catalog(&self, object: AccessObject) -> bool {
         let slot = object.slot as usize;
         match object.class {
-            AccessClass::Table => self.tables[slot].live,
+            AccessClass::Table => self.tables[slot].live(),
             AccessClass::View => self.view(slot).ddl_state == CatalogDdlState::Present,
             AccessClass::MaterializedView => {
                 self.matview(slot).ddl_state == CatalogDdlState::Present
@@ -22313,7 +22321,7 @@ impl Storage {
     pub(crate) fn access_object_database(&self, object: AccessObject) -> Option<DatabaseOid> {
         let slot = usize::from(object.slot);
         match object.class {
-            AccessClass::Table => Some(self.tables[slot].database),
+            AccessClass::Table => Some(self.tables[slot].database()),
             AccessClass::View => Some(self.view(slot).database),
             AccessClass::MaterializedView => Some(self.matview(slot).database),
             AccessClass::Sequence => Some(self.sequence(slot).database),
@@ -22357,7 +22365,7 @@ impl Storage {
                 })?
             }
             AccessClass::Table => {
-                let created_at = self.tables[source_slot].created_at;
+                let created_at = self.tables[source_slot].created_at();
                 self.tables.iter().position(|candidate| {
                     candidate.database == target_database && candidate.created_at == created_at
                 })?
@@ -22800,8 +22808,8 @@ impl Storage {
         self.matching_indexes(|value| {
             value.ddl_state == CatalogDdlState::Present
                 && !self.tables.iter().any(|table| {
-                    table.database == value.database
-                        && table.live
+                    table.database() == value.database
+                        && table.live()
                         && {
                             let definition = table.definition();
                             definition.schema
@@ -26945,7 +26953,7 @@ impl Storage {
         }
         for table_slot in 0..self.tables.len() {
             let table = &self.tables[table_slot];
-            if table.database != current_database() || (!table.live && table.pending_ddl.is_none())
+            if table.database() != current_database() || (!table.live() && table.pending_ddl().is_none())
             {
                 continue;
             }
@@ -26998,11 +27006,11 @@ impl Storage {
         drop(schemas);
 
         for table_slot in 0..self.tables.len() {
-            if self.tables[table_slot].database != current_database() {
+            if self.tables[table_slot].database() != current_database() {
                 continue;
             }
             let table = &mut self.tables[table_slot];
-            if !table.live && table.pending_ddl.is_none() {
+            if !table.live() && table.pending_ddl().is_none() {
                 continue;
             }
             rename_schema_name(&mut table.definition_mut().schema, prior, name);
@@ -28358,8 +28366,8 @@ impl Storage {
     pub fn live_tables(&self) -> impl Iterator<Item = (usize, &Table)> {
         self.tables.iter().enumerate().filter(|(slot, table)| {
             *slot != self.large_object_page_table()
-                && table.database == current_database()
-                && table.live
+                && table.database() == current_database()
+                && table.live()
         })
     }
 
@@ -28369,7 +28377,7 @@ impl Storage {
     /// a value at or below an existing row's would violate the key.
     pub fn reconcile_serials(&mut self) {
         for i in 0..self.tables.len() {
-            if !self.tables[i].live {
+            if !self.tables[i].live() {
                 continue;
             }
             let n_columns = {
@@ -30153,7 +30161,7 @@ impl Storage {
     pub(crate) fn statistics_dirty(&self) -> bool {
         self.tables
             .iter()
-            .any(|table| table.live && table.statistics_dirty)
+            .any(|table| table.live() && table.statistics_dirty)
     }
 
     pub(crate) fn statistics_wal_dirty(&self, table_slot: usize) -> bool {
@@ -30407,7 +30415,7 @@ impl Storage {
     /// residents. Temporary spill uses this narrower form because a durable
     /// table may have changed since its last manifest publication.
     pub(crate) fn evict_committed_table(&mut self, slot: usize) {
-        if !self.tables[slot].live || self.tables[slot].n_spill_ssts == 0 {
+        if !self.tables[slot].live() || self.tables[slot].n_spill_ssts == 0 {
             return;
         }
         let table = &mut self.tables[slot];
@@ -31019,7 +31027,7 @@ impl Storage {
             // garbage: preserve them even though the committed table image is
             // not live yet. A genuinely dead slot has neither committed nor
             // pending existence.
-            if !table.live && table.pending_ddl.is_none() {
+            if !table.live() && table.pending_ddl().is_none() {
                 continue;
             }
             for (rowid, state) in table.rows.iter() {
@@ -31438,7 +31446,7 @@ impl Storage {
 
     pub(crate) fn temporary_map_pressure(&self) -> bool {
         self.tables.iter().any(|table| {
-            table.live
+            table.live()
                 && {
                     let definition = table.definition();
                     definition.persistence
@@ -31454,7 +31462,7 @@ impl Storage {
     pub fn history_pressure(&self) -> bool {
         let maximum = self.max_row_versions_per_row;
         self.tables.iter().any(|table| {
-            table.live
+            table.live()
                 && table
                     .rows
                     .iter()
@@ -31468,7 +31476,7 @@ impl Storage {
         let row_versions = self.row_versions.exclusive();
         let (tables, versions) = (&mut self.tables, &mut row_versions.committed_row_versions);
         for table in tables.iter_mut().filter(|table| {
-            table.live && {
+            table.live() && {
                 let definition = table.definition();
                 definition.persistence
             } != RelationPersistence::Temporary
@@ -31484,7 +31492,7 @@ impl Storage {
     pub fn evict_entries(&mut self) {
         for i in 0..self.tables.len() {
             let table = &self.tables[i];
-            if !table.live
+            if !table.live()
                 || table.n_spill_ssts == 0
                 || table.rows.len() * 100 < table.rows.capacity() * 50
             {
@@ -31842,7 +31850,7 @@ impl Storage {
                 .find(|index| {
                     index.ddl_state != CatalogDdlState::Absent
                         && index.created_at == created_at
-                        && index.database == table.database
+                        && index.database == table.database()
                 })
                 .copied()
                 .ok_or_else(|| {
@@ -32456,7 +32464,7 @@ impl Storage {
             .iter()
             .find(|index| {
                 index.created_at == created_at
-                    && index.database == self.tables[table_index].database
+                    && index.database == self.tables[table_index].database()
                     && index.ddl_state != CatalogDdlState::Absent
             })
             .copied()?;
@@ -33208,7 +33216,7 @@ impl Storage {
             let table = &self.tables[table_index];
             return self.index_catalog().iter().any(|index| {
                 index.ddl_state == CatalogDdlState::Present
-                    && index.database == table.database
+                    && index.database == table.database()
                     && index.schema == {
                         let definition = table.definition();
                         definition.schema
@@ -33234,7 +33242,7 @@ impl Storage {
                 .any(|unique| unique.columns() == columns)
             || self.index_catalog().iter().any(|index| {
                 index.ddl_state == CatalogDdlState::Present
-                    && index.database == table.database
+                    && index.database == table.database()
                     && index.schema == definition.schema
                     && index.table == definition.name
                     && &index.columns[..index.n_cols] == columns
@@ -33532,7 +33540,7 @@ impl Storage {
     /// recovered committed state before any query runs.
     pub fn rebuild_all_enforcers(&mut self) -> Result<(), SqlError> {
         for i in 0..self.tables.len() {
-            if self.tables[i].live {
+            if self.tables[i].live() {
                 self.refresh_enforcers(i)?;
             }
         }
@@ -33646,7 +33654,7 @@ impl Storage {
             let definition = self.tables[table_index].definition();
             definition.name
         };
-        let table_database = self.tables[table_index].database;
+        let table_database = self.tables[table_index].database();
         let table_definition = *self.tables[table_index].definition();
         for index in self
             .matching_indexes(|index| {
@@ -33949,7 +33957,7 @@ impl Storage {
             .take(self.table_count())
             .enumerate()
             .position(|(index, table)| {
-                table.database == current_database()
+                table.database() == current_database()
                     && table.visible_to(txid)
                     && self.table_def(index, txid).schema.as_str() == schema
                     && self.table_def(index, txid).name.as_str() == name
@@ -33961,7 +33969,7 @@ impl Storage {
     }
 
     pub(crate) fn table_slot_visible_to(&self, index: usize, txid: u32) -> bool {
-        self.tables[index].database == current_database() && self.tables[index].visible_to(txid)
+        self.tables[index].database() == current_database() && self.tables[index].visible_to(txid)
     }
 
     pub fn table_mut(&mut self, index: usize) -> &mut Table {
@@ -34252,7 +34260,7 @@ impl Storage {
     }
 
     fn refresh_table_comment_identity(&mut self, index: usize, txid: u32) {
-        let database = Some(self.tables[index].database);
+        let database = Some(self.tables[index].database());
         let committed = *self.tables[index].definition();
         let visible = *self.table_def(index, txid);
         let changed = committed.schema != visible.schema || committed.name != visible.name;
@@ -34368,12 +34376,19 @@ impl Storage {
         self.reset_implicit_index_statistics(slot);
         self.clear_table_rows(slot);
         let table = &mut self.tables[slot];
-        table.database = current_database();
-        *table.definition_mut() = def;
-        table.ownership = ownership;
-        table.created_at = stamp;
-        table.live = pending.is_none();
-        table.pending_ddl = pending;
+        {
+            let state = table.definition.exclusive();
+            state.committed = def;
+            state.identity = table_definitions::TableIdentity {
+                database: current_database(),
+                ownership,
+                created_at: stamp,
+                existence: pending.map_or(CatalogDdlState::Present, |pending| {
+                    assert!(pending.creating);
+                    CatalogDdlState::PendingCreate { txid: pending.txid }
+                }),
+            };
+        }
         table.pending_has_rules_txid = None;
         table.mark_dirty();
         table.statistics = TableStatistics::EMPTY;
@@ -34400,8 +34415,8 @@ impl Storage {
             self.rollback_create(slot);
             let table = &mut self.tables[slot];
             *table.definition_mut() = TableDef::empty();
-            table.ownership = Ownership::BOOTSTRAP;
-            table.created_at = 0;
+            table.identity_mut().ownership = Ownership::BOOTSTRAP;
+            table.identity_mut().created_at = 0;
             return Err(error);
         }
         self.rename_stored_query_dependency(DependencyClass::Table, slot, None, schema, name);
@@ -34677,7 +34692,7 @@ impl Storage {
         self.tables
             .iter()
             .enumerate()
-            .filter(|(_, table)| table.database == current_database())
+            .filter(|(_, table)| table.database() == current_database())
             .filter(|(index, table)| {
                 ({
                     let definition = table.definition();
@@ -34717,8 +34732,7 @@ impl Storage {
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
-        self.tables[index].live = false;
-        self.tables[index].pending_ddl = None;
+        self.tables[index].identity_mut().existence = CatalogDdlState::Absent;
         self.tables[index].mark_dirty();
         self.commit_triggers_for_table(index);
         self.commit_policies_for_table(index);
@@ -34728,10 +34742,8 @@ impl Storage {
     /// Transactional drop: the table stays visible to every other transaction
     /// (committed baseline) until `txid` commits.
     pub fn drop_table_in(&mut self, index: usize, txid: u32) {
-        self.tables[index].pending_ddl = Some(PendingDdl {
-            txid,
-            creating: false,
-        });
+        let identity = self.tables[index].identity_mut();
+        identity.existence = identity.existence.drop_by(txid);
         for rule in self.view_rule_catalog().rules.iter_mut().filter(|rule| {
             rule.database == current_database()
                 && rule.visible_to(txid)
@@ -34744,8 +34756,8 @@ impl Storage {
 
     /// Promotes an uncommitted CREATE to the committed image.
     pub fn commit_create(&mut self, index: usize) {
-        self.tables[index].live = true;
-        self.tables[index].pending_ddl = None;
+        let identity = self.tables[index].identity_mut();
+        identity.existence = identity.existence.commit_create();
     }
 
     /// Applies a committed DROP: the table leaves the image and its rows are
@@ -34769,8 +34781,9 @@ impl Storage {
         self.reset_implicit_index_statistics(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
-        self.tables[index].live = false;
-        self.tables[index].pending_ddl = None;
+        let identity = self.tables[index].identity_mut();
+        assert!(matches!(identity.existence, CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. }));
+        identity.existence = CatalogDdlState::Absent;
         self.clear_table_rows(index);
         self.tables[index].statistics_wal_dirty = false;
         self.commit_triggers_for_table(index);
@@ -34784,8 +34797,9 @@ impl Storage {
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
-        self.tables[index].live = false;
-        self.tables[index].pending_ddl = None;
+        let identity = self.tables[index].identity_mut();
+        assert!(matches!(identity.existence, CatalogDdlState::Present | CatalogDdlState::PendingCreate { .. }));
+        identity.existence = CatalogDdlState::Absent;
         self.clear_table_rows(index);
         self.tables[index].statistics_wal_dirty = false;
     }
@@ -34793,7 +34807,9 @@ impl Storage {
     /// Rolls back an uncommitted DROP: the table returns to the committed
     /// image unchanged.
     pub fn rollback_drop(&mut self, index: usize) {
-        self.tables[index].pending_ddl = None;
+        let identity = self.tables[index].identity_mut();
+        let txid = identity.existence.pending_txid().expect("table DROP owns catalog state");
+        identity.existence = identity.existence.rollback_drop(txid);
         for rule in self.view_rule_catalog().rules.iter_mut().filter(|rule| {
             rule.database == current_database()
                 && rule.definition.target == RuleTarget::Table(index as u16)
@@ -38713,7 +38729,7 @@ impl Storage {
 
     fn rebind_user_type_declarations_to(&mut self, txid: u32) -> Result<(), SqlError> {
         for table in 0..self.tables.len() {
-            if self.tables[table].database != current_database()
+            if self.tables[table].database() != current_database()
                 || !self.tables[table].visible_to(txid)
             {
                 continue;
@@ -39042,7 +39058,7 @@ impl Storage {
         for table in self
             .tables
             .iter_mut()
-            .filter(|table| table.live || table.pending_ddl.is_some())
+            .filter(|table| table.live() || table.pending_ddl().is_some())
         {
             let mut changed = false;
             let definition = table.definition_mut();
@@ -39850,7 +39866,7 @@ impl Storage {
         for table in self
             .tables
             .iter_mut()
-            .filter(|table| table.live || table.pending_ddl.is_some())
+            .filter(|table| table.live() || table.pending_ddl().is_some())
         {
             let mut changed = false;
             let definition = table.definition_mut();
@@ -40316,7 +40332,7 @@ impl Storage {
         for table in self
             .tables
             .iter_mut()
-            .filter(|table| table.live || table.pending_ddl.is_some())
+            .filter(|table| table.live() || table.pending_ddl().is_some())
         {
             let mut changed = false;
             let definition = table.definition_mut();
@@ -46523,7 +46539,7 @@ impl Storage {
             return index;
         }
         let Some(table_slot) = self.tables.iter().position(|table| {
-            table.database == index.database
+            table.database() == index.database
                 && {
                     let definition = table.definition();
                     definition.schema
@@ -47262,7 +47278,7 @@ impl Storage {
     /// and its indexes change schema, and every inbound foreign key follows —
     /// deterministically, so WAL replay reproduces it from the names alone.
     pub fn move_table_schema(&mut self, index: usize, new_schema: SqlName) {
-        let database_oid = self.tables[index].database;
+        let database_oid = self.tables[index].database();
         let database = Some(database_oid);
         let old_schema = {
             let definition = self.tables[index].definition();
@@ -47366,7 +47382,7 @@ impl Storage {
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
     ) {
         let old = *self.tables[index].definition();
-        let database_oid = self.tables[index].database;
+        let database_oid = self.tables[index].database();
         let database = Some(database_oid);
         if old.schema != def.schema {
             self.move_table_schema(index, def.schema);
@@ -47382,7 +47398,7 @@ impl Storage {
                 }
             }
             for table in self.tables.iter_mut() {
-                if table.database != database_oid {
+                if table.database() != database_oid {
                     continue;
                 }
                 let mut changed = false;
@@ -48186,7 +48202,7 @@ impl Storage {
         let locks = self.lock_state();
         for lock in locks.table.iter().filter(|lock| lock.owner == txid) {
             let table = &self.tables[lock.table as usize];
-            if !table.live {
+            if !table.live() {
                 continue;
             }
             for (mode, acquired_at) in lock.modes.iter().enumerate() {
@@ -48212,7 +48228,7 @@ impl Storage {
         }
         locks.row.visit_owner(txid, |table_slot, rowid, strength| {
             let table = &self.tables[table_slot];
-            if !table.live {
+            if !table.live() {
                 return Ok(());
             }
             append_lock(
@@ -53119,7 +53135,7 @@ mod tests {
             let foreign = storage
                 .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 7)
                 .unwrap();
-            storage.tables[foreign].database = DatabaseOid::TEMPLATE1;
+            storage.tables[foreign].identity_mut().database = DatabaseOid::TEMPLATE1;
             let local = storage
                 .create_table_in(make_def("reserved", &[("id", ColType::Int4, true)]), 8)
                 .unwrap();
@@ -59069,7 +59085,7 @@ mod tests {
         let _ = storage.heap.append(4).unwrap();
         let (location, bytes) = storage.heap.append(4).unwrap();
         bytes.copy_from_slice(b"keep");
-        storage.tables[0].live = true;
+        storage.tables[0].identity_mut().existence = CatalogDdlState::Present;
         storage.tables[0]
             .rows
             .insert(1, RowState::committed_only_at(location, 7))
@@ -59126,7 +59142,7 @@ mod tests {
         let (empty, _) = storage.heap.append(0).unwrap();
         let (location, bytes) = storage.heap.append(4).unwrap();
         bytes.copy_from_slice(b"same");
-        storage.tables[0].live = true;
+        storage.tables[0].identity_mut().existence = CatalogDdlState::Present;
         for rowid in 1..=4 {
             storage.tables[0]
                 .rows
@@ -59165,7 +59181,7 @@ mod tests {
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let (_, bytes) = storage.heap.append(8).unwrap();
         bytes.copy_from_slice(b"original");
-        storage.tables[0].live = true;
+        storage.tables[0].identity_mut().existence = CatalogDdlState::Present;
         let prior = RowState::committed_only_at(RowLoc::test(4, 4), 7);
         storage.tables[0].rows.insert(1, prior).unwrap();
         storage.tables[0]
@@ -59220,7 +59236,7 @@ mod tests {
             },
         )
         .unwrap();
-        storage.tables[0].live = true;
+        storage.tables[0].identity_mut().existence = CatalogDdlState::Present;
         storage.tables[0].rows.insert(1, state).unwrap();
         let mut scratch = FixedVec::new(&mut budget, "generation compaction", 3).unwrap();
         let arena = Arena::new(&mut budget, "generation images", 32).unwrap();
@@ -59283,7 +59299,7 @@ mod tests {
         bytes.copy_from_slice(b"dead");
         let (old, bytes) = storage.heap.append(4).unwrap();
         bytes.copy_from_slice(b"keep");
-        storage.tables[0].live = true;
+        storage.tables[0].identity_mut().existence = CatalogDdlState::Present;
         storage.tables[0]
             .rows
             .insert(1, RowState::committed_only_at(old, 7))

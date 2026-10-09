@@ -34779,9 +34779,13 @@ impl Storage {
         for rule in self.view_rule_catalog().rules.iter_mut().filter(|rule| {
             rule.database == current_database()
                 && rule.definition.target == RuleTarget::Table(index as u16)
-                && matches!(rule.ddl_state, CatalogDdlState::PendingDrop { .. })
+                && rule.ddl_state.pending_txid() == Some(txid)
+                && matches!(
+                    rule.ddl_state,
+                    CatalogDdlState::PendingDrop { .. } | CatalogDdlState::PendingCreateDrop { .. }
+                )
         }) {
-            rule.ddl_state = CatalogDdlState::Present;
+            rule.ddl_state = rule.ddl_state.rollback_drop(txid);
         }
     }
 

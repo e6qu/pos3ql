@@ -195,6 +195,46 @@ fn table_catalog_lifecycle_create_drop_commit_and_reuse_do_not_publish_old_rows(
 }
 
 #[test]
+fn table_catalog_lifecycle_drop_rollback_restores_pending_and_committed_rules() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE lifecycle_rules(id integer PRIMARY KEY); \
+         INSERT INTO lifecycle_rules VALUES (7)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let pending = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; CREATE RULE lifecycle_discard AS ON INSERT TO lifecycle_rules DO INSTEAD NOTHING; \
+         SAVEPOINT before_drop; DROP TABLE lifecycle_rules; ROLLBACK TO before_drop; \
+         SELECT count(*) FROM pg_rewrite WHERE rulename = 'lifecycle_discard'; \
+         INSERT INTO lifecycle_rules VALUES (8); SELECT id FROM lifecycle_rules ORDER BY id; COMMIT",
+    );
+    assert!(
+        !String::from_utf8_lossy(&pending).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&pending)
+    );
+    assert_eq!(data_rows(&pending), ["1", "7"]);
+    let committed = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; SAVEPOINT before_drop; DROP TABLE lifecycle_rules; ROLLBACK TO before_drop; \
+         SELECT count(*) FROM pg_rewrite WHERE rulename = 'lifecycle_discard'; \
+         INSERT INTO lifecycle_rules VALUES (9); SELECT id FROM lifecycle_rules ORDER BY id; \
+         COMMIT; DROP TABLE lifecycle_rules",
+    );
+    assert!(
+        !String::from_utf8_lossy(&committed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
+    assert_eq!(data_rows(&committed), ["1", "7"]);
+}
+
+#[test]
 fn table_catalog_lifecycle_savepoint_creation_and_retirement_survive_cold_recovery() {
     let mut config = test_config("table-lifecycle-cold-recovery");
     config.max_tables = 2;
@@ -210,7 +250,9 @@ fn table_catalog_lifecycle_savepoint_creation_and_retirement_survive_cold_recove
         &mut engine,
         &mut budget,
         "BEGIN; CREATE TABLE lifecycle_durable(id integer PRIMARY KEY); \
-         INSERT INTO lifecycle_durable VALUES (7); SAVEPOINT before_drop; \
+         INSERT INTO lifecycle_durable VALUES (7); \
+         CREATE RULE lifecycle_cold_discard AS ON INSERT TO lifecycle_durable DO INSTEAD NOTHING; \
+         SAVEPOINT before_drop; \
          DROP TABLE lifecycle_durable; ROLLBACK TO before_drop; COMMIT; \
          BEGIN; CREATE TABLE lifecycle_absent(id integer PRIMARY KEY); \
          INSERT INTO lifecycle_absent VALUES (8); DROP TABLE lifecycle_absent; COMMIT",
@@ -230,6 +272,8 @@ fn table_catalog_lifecycle_savepoint_creation_and_retirement_survive_cold_recove
         &mut recovered,
         &mut recovered_budget,
         "SELECT id FROM lifecycle_durable; \
+         SELECT count(*) FROM pg_rewrite WHERE rulename = 'lifecycle_cold_discard'; \
+         INSERT INTO lifecycle_durable VALUES (9); SELECT id FROM lifecycle_durable; \
          SELECT count(*) FROM pg_class WHERE relname = 'lifecycle_absent'; \
          CREATE TABLE lifecycle_absent(id integer PRIMARY KEY); \
          SELECT count(*) FROM lifecycle_absent",
@@ -239,7 +283,7 @@ fn table_catalog_lifecycle_savepoint_creation_and_retirement_survive_cold_recove
         "{}",
         String::from_utf8_lossy(&output)
     );
-    assert_eq!(data_rows(&output), ["7", "0", "0"]);
+    assert_eq!(data_rows(&output), ["7", "1", "7", "0", "0"]);
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }

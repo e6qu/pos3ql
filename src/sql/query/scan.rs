@@ -5999,12 +5999,18 @@ fn scan_source_mode<'a>(
                 let mut probe_fill = 0usize;
                 storage.for_each_row_state(probe_slot, &mut |rowid, state| {
                     if let Some(home) = storage.visible_row_home(probe_slot, rowid, state, txid)? {
-                        probe_ordered[probe_fill] = Some((rowid, home.snapshot(), home.heap_loc().map_or((0u8, rowid, 0u32), |loc| (1u8, 0, loc.offset))));
+                        probe_ordered[probe_fill] = Some((
+                            rowid,
+                            home.snapshot(),
+                            home.heap_loc()
+                                .map_or((0u8, rowid, 0u32), |loc| (1u8, 0, loc.offset)),
+                        ));
                         probe_fill += 1;
                     }
                     Ok(ControlFlow::Continue(()))
                 })?;
-                probe_ordered[..probe_fill].sort_unstable_by_key(|row| row.expect("row snapshots are initialized").2);
+                probe_ordered[..probe_fill]
+                    .sort_unstable_by_key(|row| row.expect("row snapshots are initialized").2);
 
                 for (rowid, home, _) in probe_ordered[..probe_fill].iter().copied().flatten() {
                     storage.record_relation_tuple_read(txid, probe_slot, None)?;
@@ -6740,14 +6746,24 @@ fn scan_source_mode<'a>(
                         continue;
                     };
                     if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
-                        ordered[fill] = Some((rowid, home.snapshot(), home.heap_loc().map_or((0u8, rowid, 0u32), |loc| (1u8, 0, loc.offset))));
+                        ordered[fill] = Some((
+                            rowid,
+                            home.snapshot(),
+                            home.heap_loc()
+                                .map_or((0u8, rowid, 0u32), |loc| (1u8, 0, loc.offset)),
+                        ));
                         fill += 1;
                     }
                 }
             } else {
                 storage.for_each_row_state(slot, &mut |rowid, state| {
                     if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
-                        ordered[fill] = Some((rowid, home.snapshot(), home.heap_loc().map_or((0u8, rowid, 0u32), |loc| (1u8, 0, loc.offset))));
+                        ordered[fill] = Some((
+                            rowid,
+                            home.snapshot(),
+                            home.heap_loc()
+                                .map_or((0u8, rowid, 0u32), |loc| (1u8, 0, loc.offset)),
+                        ));
                         fill += 1;
                     }
                     Ok(core::ops::ControlFlow::Continue(()))
@@ -6758,7 +6774,8 @@ fn scan_source_mode<'a>(
             // they were written in); heap rows keep heap-offset order after
             // them, matching insertion order within each group.
             if access.is_none_or(|access| !access.preserves_order) {
-                ordered[..fill].sort_unstable_by_key(|row| row.expect("row snapshots are initialized").2);
+                ordered[..fill]
+                    .sort_unstable_by_key(|row| row.expect("row snapshots are initialized").2);
             }
             for (this, (rowid, home, _)) in ordered[..fill].iter().copied().flatten().enumerate() {
                 check_timeout()?;

@@ -2350,7 +2350,10 @@ fn cursor_result_too_large() -> SqlError {
 
 fn next_transaction_identity(current: u32) -> Result<u32, SqlError> {
     current.checked_add(1).ok_or_else(|| {
-        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "transaction identity space is exhausted")
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "transaction identity space is exhausted"
+        )
     })
 }
 
@@ -4886,7 +4889,12 @@ impl Engine {
     }
 
     /// Starts a transaction if none is active.
-    fn ensure_txn(&mut self, txn: &mut TxnState, mode: TxnMode, guc: &GucState) -> Result<(), SqlError> {
+    fn ensure_txn(
+        &mut self,
+        txn: &mut TxnState,
+        mode: TxnMode,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
         if txn.is_active() {
             if mode == TxnMode::Explicit {
                 txn.mode = TxnMode::Explicit;
@@ -16664,8 +16672,8 @@ impl Engine {
                     // copy_row_line under this same (implicit or explicit)
                     // transaction, and the command tag waits for CopyDone.
                     if let Err(error) = self.ensure_txn(txn, txn.mode, guc) {
-                    return Ok(Err(error));
-                }
+                        return Ok(Err(error));
+                    }
                     if let Err(error) =
                         self.copy_start(&setup, txn, guc.seq_session(), arena, responder)
                     {

@@ -35,7 +35,8 @@ pub struct VisibleRowHome<'a> {
 
 impl core::fmt::Debug for VisibleRowHome<'_> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.debug_struct("VisibleRowHome")
+        formatter
+            .debug_struct("VisibleRowHome")
             .field("snapshot", &self.snapshot)
             .field("heap_location", &self.heap_loc())
             .finish_non_exhaustive()
@@ -49,15 +50,32 @@ pub(super) enum VisibleRowBytes<'a> {
 
 impl<'a> VisibleRowHome<'a> {
     pub(super) fn heap(snapshot: RowSnapshot, bytes: HeapRowRead<'a>) -> Self {
-        Self { snapshot, bytes: VisibleRowBytes::Heap(bytes) }
+        Self {
+            snapshot,
+            bytes: VisibleRowBytes::Heap(bytes),
+        }
     }
 
     pub(super) fn spilled(snapshot: RowSnapshot, len: u32, sst: u32, commit_lsn: u64) -> Self {
-        Self { snapshot, bytes: VisibleRowBytes::Spilled { len, sst, commit_lsn } }
+        Self {
+            snapshot,
+            bytes: VisibleRowBytes::Spilled {
+                len,
+                sst,
+                commit_lsn,
+            },
+        }
     }
 
     pub fn snapshot(&self) -> RowSnapshot {
         self.snapshot
+    }
+
+    pub fn byte_len(&self) -> u32 {
+        match &self.bytes {
+            VisibleRowBytes::Heap(bytes) => bytes.location().len,
+            VisibleRowBytes::Spilled { len, .. } => *len,
+        }
     }
 
     pub fn heap_loc(&self) -> Option<RowLoc> {
@@ -71,8 +89,14 @@ impl<'a> VisibleRowHome<'a> {
     pub(super) fn metadata(&self) -> RowHome {
         match &self.bytes {
             VisibleRowBytes::Heap(bytes) => RowHome::Heap(bytes.location()),
-            VisibleRowBytes::Spilled { len, sst, commit_lsn } => RowHome::Spilled {
-                len: *len, sst: *sst, commit_lsn: *commit_lsn,
+            VisibleRowBytes::Spilled {
+                len,
+                sst,
+                commit_lsn,
+            } => RowHome::Spilled {
+                len: *len,
+                sst: *sst,
+                commit_lsn: *commit_lsn,
             },
         }
     }
@@ -104,7 +128,9 @@ impl From<RowReadSource> for RowByteRead<'_> {
     fn from(source: RowReadSource) -> Self {
         match source {
             RowReadSource::Snapshot(snapshot) => Self(RowByteSource::Snapshot(snapshot)),
-            RowReadSource::StagedHeap(location) => Self(RowByteSource::Physical(RowHome::Heap(location))),
+            RowReadSource::StagedHeap(location) => {
+                Self(RowByteSource::Physical(RowHome::Heap(location)))
+            }
         }
     }
 }

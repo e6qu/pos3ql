@@ -7,25 +7,46 @@
 use super::*;
 
 #[test]
+fn visible_row_heap_ownership_transaction_exhaustion_rejects_wire_statement() {
+    let (mut engine, mut budget) = test_engine();
+    engine.next_txid = u32::MAX;
+    let output = run_with_fixed_memory(&mut engine, &mut budget, "CREATE TABLE exhausted_identity (id integer)");
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("54000"));
+    assert!(output.contains("transaction identity space is exhausted"));
+    assert!(engine.storage.find_table("public", "exhausted_identity").is_none());
+    assert_eq!(engine.next_txid, u32::MAX);
+}
+
+#[test]
 fn visible_row_heap_ownership_transaction_exhaustion_preserves_active_owners() {
     let (mut engine, mut budget) = test_engine();
     let mut first = TxnState::new(&mut budget, 8).unwrap();
     let mut second = TxnState::new(&mut budget, 8).unwrap();
     let guc = GucState::new();
-    engine.ensure_txn(&mut first, TxnMode::Explicit, &guc).unwrap();
+    engine
+        .ensure_txn(&mut first, TxnMode::Explicit, &guc)
+        .unwrap();
     let active = first.txid;
     engine.next_txid = u32::MAX;
     crate::mem::guard::forbid_alloc(|| {
-        let error = engine.ensure_txn(&mut second, TxnMode::Implicit, &guc).unwrap_err();
+        let error = engine
+            .ensure_txn(&mut second, TxnMode::Implicit, &guc)
+            .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(second.txid, 0);
         assert!(!second.is_active());
         assert_eq!(first.txid, active);
         assert!(first.is_active());
         assert_eq!(engine.next_txid, u32::MAX);
-        engine.ensure_txn(&mut first, TxnMode::Explicit, &guc).unwrap();
+        engine
+            .ensure_txn(&mut first, TxnMode::Explicit, &guc)
+            .unwrap();
         assert_eq!(first.txid, active);
-        assert_eq!(engine.allocate_transaction_id().unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(
+            engine.allocate_transaction_id().unwrap_err().sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
     });
     engine.rollback_txn(&mut first, &guc);
 }

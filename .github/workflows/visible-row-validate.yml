@@ -31,6 +31,8 @@ jobs:
         run: |
           cargo clippy --lib --bins --locked -- -D warnings
           cargo test --lib --locked visible_row_heap_ownership -- --nocapture 2>&1 | tee "$RUNNER_TEMP/tests.log"
+          cargo test --lib --locked row_heap_generation
+          cargo test --lib --locked row_read_ownership
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v6
@@ -40,3 +42,44 @@ jobs:
             ${{ runner.temp }}/format.patch
             ${{ runner.temp }}/check.json
             ${{ runner.temp }}/tests.log
+  baseline-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@v5
+      - name: Preserve ownership regression
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          source = Path('src/storage/mod.rs').read_text()
+          start = source.index('    #[test]\n    fn visible_row_heap_ownership_pins_before_metadata_owner_releases()')
+          end = source.index('    #[test]', start + 12)
+          Path('/tmp/ownership-test.rs').write_text(source[start:end])
+          PYCODE
+          git fetch origin 0abc5bdef8d4142e62ec2fc339ef51633d71ca5c
+          git checkout --detach FETCH_HEAD
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          path = Path('src/storage/mod.rs')
+          source = path.read_text()
+          marker = 'mod tests {\n    use super::*;'
+          assert marker in source
+          path.write_text(source.replace(marker, marker + '\n' + Path('/tmp/ownership-test.rs').read_text(), 1))
+          PYCODE
+      - name: Confirm the baseline lacks visibility byte ownership
+        run: |
+          set +e
+          cargo test --lib --locked visible_row_heap_ownership_pins_before_metadata_owner_releases -- --nocapture > "$RUNNER_TEMP/baseline.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/baseline.log"
+          test "$status" -ne 0
+          grep -aF 'visible heap locations retain byte ownership' "$RUNNER_TEMP/baseline.log"
+          grep -aF '1 failed' "$RUNNER_TEMP/baseline.log"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: visible-row-baseline-proof
+          path: ${{ runner.temp }}/baseline.log

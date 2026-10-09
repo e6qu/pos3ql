@@ -20044,7 +20044,7 @@ impl PlpgsqlExecHost<'_> {
                 next
             }
         };
-        engine.ensure_txn(txn, TxnMode::Implicit, guc);
+        engine.ensure_txn(txn, TxnMode::Implicit, guc)?;
         if next == PlpgsqlNextTransaction::Chained {
             txn.restore_configuration(prior_configuration);
         }
@@ -54009,7 +54009,10 @@ pub fn copy_out(
         })?;
     }
     let tokens = arena
-        .alloc_slice_with(visible, |_| None::<(usize, u64, crate::storage::RowSnapshot)>)
+        .alloc_slice_with(
+            visible,
+            |_| None::<(usize, u64, crate::storage::RowSnapshot)>,
+        )
         .map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -55944,7 +55947,12 @@ pub fn merge<'a>(
         for j in 0..k {
             let row_table = tables[j];
             let row_id = ids[j];
-            let fetched = match storage.row_bytes(row_table, row_id, hms[j].expect("MERGE snapshots are initialized"), arena) {
+            let fetched = match storage.row_bytes(
+                row_table,
+                row_id,
+                hms[j].expect("MERGE snapshots are initialized"),
+                arena,
+            ) {
                 Ok(b) => b,
                 Err(e) => return sql_fail(e),
             };
@@ -63209,7 +63217,10 @@ fn alter_partition_attachment(
                 else {
                     return Ok(ControlFlow::Continue(()));
                 };
-                if scratch.push(PhysicalRow::local(leaf, rowid, home.snapshot())).is_err() {
+                if scratch
+                    .push(PhysicalRow::local(leaf, rowid, home.snapshot()))
+                    .is_err()
+                {
                     overflow = true;
                     return Ok(ControlFlow::Break(()));
                 }
@@ -66085,7 +66096,8 @@ fn alter_table_relation(
     // old rows still installed in storage.
     if has_rewrite {
         for a in 0..scratch.len() {
-            let (_, _, crate::storage::RowReadSource::StagedHeap(la)) = scratch[a].local_parts() else {
+            let (_, _, crate::storage::RowReadSource::StagedHeap(la)) = scratch[a].local_parts()
+            else {
                 unreachable!()
             };
             let abytes = match storage.heap.get(la) {
@@ -66097,7 +66109,9 @@ fn alter_table_relation(
                 return sql_fail(e);
             }
             for b in (a + 1)..scratch.len() {
-                let (_, _, crate::storage::RowReadSource::StagedHeap(lb)) = scratch[b].local_parts() else {
+                let (_, _, crate::storage::RowReadSource::StagedHeap(lb)) =
+                    scratch[b].local_parts()
+                else {
                     unreachable!()
                 };
                 let bbytes = match abytes.other(lb) {

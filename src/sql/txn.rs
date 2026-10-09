@@ -1050,9 +1050,16 @@ impl TxnState {
     /// so all of a statement's sub-parts (a WITH clause's data-modifying CTEs
     /// and its main query) share one command-id and therefore one snapshot.
     pub fn begin_command(&mut self) -> Result<(), SqlError> {
-        let command_id = self.command_id.checked_add(1)
+        let command_id = self
+            .command_id
+            .checked_add(1)
             .filter(|command| *command < crate::storage::SNAPSHOT_ALL)
-            .ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "transaction command identity space is exhausted"))?;
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "transaction command identity space is exhausted"
+                )
+            })?;
         self.command_id = command_id;
         Ok(())
     }
@@ -2235,13 +2242,13 @@ mod tests {
         let mut txn = TxnState::new(&mut budget, 8).unwrap();
         txn.command_id = crate::storage::SNAPSHOT_ALL - 2;
         crate::mem::guard::forbid_alloc(|| {
-        txn.begin_command().unwrap();
-        assert_eq!(txn.command_id(), crate::storage::SNAPSHOT_ALL - 1);
-        for _ in 0..2 {
-            let error = txn.begin_command().unwrap_err();
-            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            txn.begin_command().unwrap();
             assert_eq!(txn.command_id(), crate::storage::SNAPSHOT_ALL - 1);
-        }
+            for _ in 0..2 {
+                let error = txn.begin_command().unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(txn.command_id(), crate::storage::SNAPSHOT_ALL - 1);
+            }
         });
     }
 }

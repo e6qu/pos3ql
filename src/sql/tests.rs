@@ -117,14 +117,26 @@ fn live_definition_ownership_catalog_tracks_rename_schema_and_rollback() {
          ALTER TABLE definition_owner_after SET SCHEMA definition_owner_schema; COMMIT; {query}"
     );
     let output = run_with(&mut engine, &mut budget, &statement);
-    assert!(!String::from_utf8_lossy(&output).contains("ERROR"), "{}", String::from_utf8_lossy(&output));
-    assert_eq!(data_rows(&output), [
-        "_definition_owner_before|public", "definition_owner_before|public",
-        "_definition_owner_after|public", "definition_owner_after|public",
-        "_definition_owner_after|definition_owner_schema", "definition_owner_after|definition_owner_schema",
-        "_definition_owner_before|public", "definition_owner_before|public",
-        "_definition_owner_after|definition_owner_schema", "definition_owner_after|definition_owner_schema",
-    ]);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "_definition_owner_before|public",
+            "definition_owner_before|public",
+            "_definition_owner_after|public",
+            "definition_owner_after|public",
+            "_definition_owner_after|definition_owner_schema",
+            "definition_owner_after|definition_owner_schema",
+            "_definition_owner_before|public",
+            "definition_owner_before|public",
+            "_definition_owner_after|definition_owner_schema",
+            "definition_owner_after|definition_owner_schema",
+        ]
+    );
 }
 
 #[test]

@@ -341,8 +341,7 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             assert!(RowReadView::point(&versions, &rows, 1).is_none());
             assert!(versions.test_write().is_ok());
-            let row =
-                RowRead::immutable(RowState::committed_only_at(RowLoc::test(8, 4), 9));
+            let row = RowRead::immutable(RowState::committed_only_at(RowLoc::test(8, 4), 9));
             assert!(row.pending_last().is_none());
             assert!(row.history_get(0).is_none());
             assert_eq!(row.visible_at(7, 1, 8), None);

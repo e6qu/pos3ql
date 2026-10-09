@@ -2289,11 +2289,19 @@ pub struct RowLoc {
 
 impl RowLoc {
     /// Metadata-only placeholder; a heap never issues generation zero.
-    pub(crate) const EMPTY: Self = Self { offset: 0, len: 0, generation: 0 };
+    pub(crate) const EMPTY: Self = Self {
+        offset: 0,
+        len: 0,
+        generation: 0,
+    };
 
     #[cfg(test)]
     pub(crate) const fn test(offset: u32, len: u32) -> Self {
-        Self { offset, len, generation: 1 }
+        Self {
+            offset,
+            len,
+            generation: 1,
+        }
     }
 }
 
@@ -52612,10 +52620,7 @@ mod tests {
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         storage.tables[0]
             .rows
-            .insert(
-                1,
-                RowState::committed_only_at(RowLoc::test(0, 4), 7),
-            )
+            .insert(1, RowState::committed_only_at(RowLoc::test(0, 4), 7))
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             storage
@@ -58711,10 +58716,9 @@ mod tests {
             ))
             .unwrap();
         let captured = storage.table(slot).generation;
-        let _ = storage.tables[slot].rows.insert(
-            1,
-            RowState::committed_only_at(RowLoc::test(0, 4), 42),
-        );
+        let _ = storage.tables[slot]
+            .rows
+            .insert(1, RowState::committed_only_at(RowLoc::test(0, 4), 42));
         storage.table_mut(slot).mark_dirty();
         storage.clear_dirty_through(&[captured]);
         assert!(storage.table(slot).dirty);
@@ -58931,10 +58935,7 @@ mod tests {
         storage.tables[0].rows.insert(1, prior).unwrap();
         storage.tables[0]
             .rows
-            .insert(
-                2,
-                RowState::committed_only_at(RowLoc::test(7, 2), 8),
-            )
+            .insert(2, RowState::committed_only_at(RowLoc::test(7, 2), 8))
             .unwrap();
         let mut scratch = FixedVec::new(&mut budget, "heap preflight", 2).unwrap();
         crate::mem::guard::forbid_alloc(|| {
@@ -58942,10 +58943,7 @@ mod tests {
             assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
             assert_eq!(storage.tables[0].rows.get(&1), Some(prior));
             assert_eq!(storage.heap.used(), 8);
-            assert_eq!(
-                &*storage.heap.get(RowLoc::test(0, 8)).unwrap(),
-                b"original"
-            );
+            assert_eq!(&*storage.heap.get(RowLoc::test(0, 8)).unwrap(), b"original");
         });
     }
 
@@ -58968,17 +58966,25 @@ mod tests {
             &mut versions.committed_row_versions,
             &mut state.history,
             storage.max_row_versions_per_row,
-            CommittedVersion { lsn: 5, home: Some(RowHome::Heap(history)) },
-        ).unwrap();
+            CommittedVersion {
+                lsn: 5,
+                home: Some(RowHome::Heap(history)),
+            },
+        )
+        .unwrap();
         push_pending_version(
             &mut versions.pending_row_versions,
             &mut state.pending,
             storage.max_row_versions_per_row,
             PendingChange {
-                txid: 9, cid: 1, loc: Some(pending),
-                changed_columns: ColumnSet::EMPTY, changes_existence: false,
+                txid: 9,
+                cid: 1,
+                loc: Some(pending),
+                changed_columns: ColumnSet::EMPTY,
+                changes_existence: false,
             },
-        ).unwrap();
+        )
+        .unwrap();
         storage.tables[0].live = true;
         storage.tables[0].rows.insert(1, state).unwrap();
         let mut scratch = FixedVec::new(&mut budget, "generation compaction", 3).unwrap();
@@ -58989,16 +58995,26 @@ mod tests {
             bytes.copy_from_slice(b"next");
             assert_eq!(replacement.offset, pending.offset);
             for stale in [history, committed, pending] {
-                assert_eq!(storage.row_bytes(0, 1, RowHome::Heap(stale), &arena).unwrap_err().sqlstate,
-                    sqlstate::SERIALIZATION_FAILURE);
-                let error = storage.with_row_bytes(0, 1, RowHome::Heap(stale), |_| -> Result<(), SqlError> {
-                    panic!("stale locations must never reach the consumer")
-                }).unwrap_err();
+                assert_eq!(
+                    storage
+                        .row_bytes(0, 1, RowHome::Heap(stale), &arena)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                let error = storage
+                    .with_row_bytes(0, 1, RowHome::Heap(stale), |_| -> Result<(), SqlError> {
+                        panic!("stale locations must never reach the consumer")
+                    })
+                    .unwrap_err();
                 assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
             }
             for (txid, lsn, expected) in [(8, 6, b"old!"), (8, 7, b"live"), (9, 7, b"edit")] {
                 let row = storage.resident_row_state(0, 1).unwrap();
-                let home = storage.visible_row_home_at(0, 1, row, txid, SNAPSHOT_ALL, lsn).unwrap().unwrap();
+                let home = storage
+                    .visible_row_home_at(0, 1, row, txid, SNAPSHOT_ALL, lsn)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(storage.row_bytes(0, 1, home, &arena).unwrap(), expected);
             }
             assert!(storage.heap.test_write().is_ok());
@@ -59007,10 +59023,18 @@ mod tests {
             // are unchanged. Historical and pending images remain readable.
             let previous = storage.resident_row_state(0, 1).unwrap().committed.unwrap();
             storage.compact_heap(&mut scratch).unwrap();
-            assert_eq!(storage.row_bytes(0, 1, previous, &arena).unwrap_err().sqlstate,
-                sqlstate::SERIALIZATION_FAILURE);
+            assert_eq!(
+                storage
+                    .row_bytes(0, 1, previous, &arena)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
             let row = storage.resident_row_state(0, 1).unwrap();
-            let home = storage.visible_row_home_at(0, 1, row, 9, SNAPSHOT_ALL, 7).unwrap().unwrap();
+            let home = storage
+                .visible_row_home_at(0, 1, row, 9, SNAPSHOT_ALL, 7)
+                .unwrap()
+                .unwrap();
             assert_eq!(storage.row_bytes(0, 1, home, &arena).unwrap(), b"edit");
         });
     }
@@ -59025,7 +59049,10 @@ mod tests {
         let (old, bytes) = storage.heap.append(4).unwrap();
         bytes.copy_from_slice(b"keep");
         storage.tables[0].live = true;
-        storage.tables[0].rows.insert(1, RowState::committed_only_at(old, 7)).unwrap();
+        storage.tables[0]
+            .rows
+            .insert(1, RowState::committed_only_at(old, 7))
+            .unwrap();
         let mut scratch = FixedVec::new(&mut budget, "stale preflight", 2).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             storage.compact_heap(&mut scratch).unwrap();
@@ -59034,7 +59061,9 @@ mod tests {
             bytes.copy_from_slice(b"next");
             for rowid in [1, 2] {
                 for tracked in [true, false] {
-                    let error = storage.write_pending_inner(0, rowid, 9, 1, Some(old), tracked).unwrap_err();
+                    let error = storage
+                        .write_pending_inner(0, rowid, 9, 1, Some(old), tracked)
+                        .unwrap_err();
                     assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
                     assert_eq!(storage.tables[0].rows.get(&1), Some(current));
                     assert!(storage.tables[0].rows.get(&2).is_none());
@@ -59042,13 +59071,25 @@ mod tests {
             }
             // Even a stale range that remains in bounds must fail the whole
             // preflight before any current image or row handle moves.
-            storage.tables[0].rows.insert(2, RowState::committed_only_at(old, 8)).unwrap();
+            storage.tables[0]
+                .rows
+                .insert(2, RowState::committed_only_at(old, 8))
+                .unwrap();
             let error = storage.compact_heap(&mut scratch).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
             assert_eq!(storage.tables[0].rows.get(&1), Some(current));
-            assert_eq!(storage.tables[0].rows.get(&2).unwrap().committed, Some(RowHome::Heap(old)));
+            assert_eq!(
+                storage.tables[0].rows.get(&2).unwrap().committed,
+                Some(RowHome::Heap(old))
+            );
             assert_eq!(storage.heap.used(), 8);
-            assert_eq!(&*storage.heap.get(current.committed.unwrap().heap_loc().unwrap()).unwrap(), b"keep");
+            assert_eq!(
+                &*storage
+                    .heap
+                    .get(current.committed.unwrap().heap_loc().unwrap())
+                    .unwrap(),
+                b"keep"
+            );
             assert_eq!(&*storage.heap.get(replacement).unwrap(), b"next");
             assert!(storage.heap.test_write().is_ok());
             assert!(storage.row_versions.test_write().is_ok());

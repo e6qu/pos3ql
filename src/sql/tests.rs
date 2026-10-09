@@ -10,11 +10,21 @@ use super::*;
 fn visible_row_heap_ownership_transaction_exhaustion_rejects_wire_statement() {
     let (mut engine, mut budget) = test_engine();
     engine.next_txid = u32::MAX;
-    let output = run_with_fixed_memory(&mut engine, &mut budget, "CREATE TABLE exhausted_identity (id integer)");
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE exhausted_identity (id integer)",
+        1 << 20,
+    );
     let output = String::from_utf8_lossy(&output);
     assert!(output.contains("54000"));
     assert!(output.contains("transaction identity space is exhausted"));
-    assert!(engine.storage.find_table("public", "exhausted_identity").is_none());
+    assert!(
+        engine
+            .storage
+            .find_table("public", "exhausted_identity")
+            .is_none()
+    );
     assert_eq!(engine.next_txid, u32::MAX);
 }
 

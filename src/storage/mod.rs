@@ -21,7 +21,7 @@ pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;
-pub use row_images::{RowByteRead, RowReadSource, RowSnapshot, VisibleRowHome};
+pub(crate) use row_images::{RowByteRead, RowReadSource, RowSnapshot, VisibleRowHome};
 use row_images::{RowByteSource, VisibleRowBytes};
 pub(crate) use row_map::RowMap;
 pub(crate) use row_reads::RowRead;

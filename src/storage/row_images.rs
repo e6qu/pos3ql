@@ -5,7 +5,7 @@ use super::{RowHome, RowLoc};
 
 /// A table incarnation and the MVCC boundaries used to select a logical row.
 #[derive(Clone, Copy, Debug)]
-pub struct RowSnapshot {
+pub(crate) struct RowSnapshot {
     pub(super) created_at: u64,
     pub(super) txid: u32,
     pub(super) command: u32,
@@ -14,21 +14,12 @@ pub struct RowSnapshot {
 
 /// Deferred executor reads distinguish an MVCC snapshot from unpublished bytes.
 #[derive(Clone, Copy, Debug)]
-pub enum RowReadSource {
+pub(crate) enum RowReadSource {
     Snapshot(RowSnapshot),
     StagedHeap(RowLoc),
 }
 
-impl RowReadSource {
-    pub fn heap_loc(self) -> Option<RowLoc> {
-        match self {
-            Self::Snapshot(_) => None,
-            Self::StagedHeap(location) => Some(location),
-        }
-    }
-}
-
-pub struct VisibleRowHome<'a> {
+pub(crate) struct VisibleRowHome<'a> {
     snapshot: RowSnapshot,
     pub(super) bytes: VisibleRowBytes<'a>,
 }
@@ -67,18 +58,18 @@ impl<'a> VisibleRowHome<'a> {
         }
     }
 
-    pub fn snapshot(&self) -> RowSnapshot {
+    pub(crate) fn snapshot(&self) -> RowSnapshot {
         self.snapshot
     }
 
-    pub fn byte_len(&self) -> u32 {
+    pub(crate) fn byte_len(&self) -> u32 {
         match &self.bytes {
             VisibleRowBytes::Heap(bytes) => bytes.location().len,
             VisibleRowBytes::Spilled { len, .. } => *len,
         }
     }
 
-    pub fn heap_loc(&self) -> Option<RowLoc> {
+    pub(crate) fn heap_loc(&self) -> Option<RowLoc> {
         match &self.bytes {
             VisibleRowBytes::Heap(bytes) => Some(bytes.location()),
             VisibleRowBytes::Spilled { .. } => None,
@@ -104,7 +95,7 @@ impl<'a> VisibleRowHome<'a> {
 
 /// The source is explicit: a pinned visible image, a frozen snapshot, or
 /// physical metadata used by exclusive publication and maintenance paths.
-pub struct RowByteRead<'a>(pub(super) RowByteSource<'a>);
+pub(crate) struct RowByteRead<'a>(pub(super) RowByteSource<'a>);
 
 pub(super) enum RowByteSource<'a> {
     Visible(VisibleRowHome<'a>),

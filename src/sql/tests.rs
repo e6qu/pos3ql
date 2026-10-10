@@ -31,6 +31,7 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
     rowids.sort_unstable();
     assert!(engine.checkpoint().unwrap());
     assert_eq!(engine.storage.table(table).n_spill_ssts, 1);
+    engine.storage.set_commit_snapshot(engine.storage.lsn());
     engine.storage.evict_redundant_entries(table);
     assert!(
         engine

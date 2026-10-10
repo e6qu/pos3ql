@@ -17227,6 +17227,10 @@ impl Storage {
         definition_images::TableDefinitionImagePool::budget_bytes(config)
     }
 
+    pub(crate) fn retained_row_walk_budget_bytes(config: &Config) -> usize {
+        RowWalkPool::budget_bytes(config)
+    }
+
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
             + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
@@ -17238,7 +17242,7 @@ impl Storage {
                 .saturating_mul(size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>())
             + RowHeap::control_bytes()
             + RowVersionPools::control_bytes()
-            + RowWalkPool::budget_bytes(config)
+            + Self::retained_row_walk_budget_bytes(config)
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
             + Self::table_definition_image_budget_bytes(config)
             + committed_row_version_capacity(config)

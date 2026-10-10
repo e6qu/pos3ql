@@ -880,6 +880,8 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
             + foreign_statement_workspace_bytes)
             + Storage::table_definition_image_budget_bytes(&config)
             - Storage::table_definition_image_budget_bytes(&one)
+            + Storage::retained_row_walk_budget_bytes(&config)
+            - Storage::retained_row_walk_budget_bytes(&one)
     );
     let bytes = config.query_workspace_slots
         * (config.work_arena_bytes + core::mem::size_of::<QueryWorkspace>());

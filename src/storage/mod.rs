@@ -29877,6 +29877,26 @@ impl Storage {
             }))
     }
 
+    /// Uniqueness validation checks the latest committed image regardless of
+    /// the transaction's snapshot, without observing a pending replacement.
+    pub(crate) fn committed_row_home(
+        &self,
+        table_slot: usize,
+        state: RowRead<'_>,
+    ) -> Result<Option<VisibleRowHome<'_>>, SqlError> {
+        let image = state.committed.map(|home| {
+            self.pin_visible_home(
+                RowSnapshot {
+                    created_at: self.tables[table_slot].created_at(),
+                    version: RowVersionIdentity::Committed(state.committed_lsn),
+                },
+                home,
+            )
+        }).transpose()?;
+        drop(state);
+        Ok(image)
+    }
+
     fn pin_visible_home(
         &self,
         snapshot: RowSnapshot,

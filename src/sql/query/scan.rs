@@ -5652,7 +5652,7 @@ fn scan_source_mode<'a>(
                     insert_derived!(bytes);
                 }
             } else if let Some(demand) = pax_demand.selected_mask(build_t)
-                && let Some(scan) = storage.immutable_row_scan(build_slot)?
+                && let Some(scan) = storage.immutable_row_scan_in(build_slot, arena)?
             {
                 storage.record_relation_scan(txid, build_slot, None, 0)?;
                 scan.for_each_spilled_row_batch(arena, false, Some(demand), &mut |rows| {
@@ -5730,7 +5730,7 @@ fn scan_source_mode<'a>(
             let probe_schema = &probe_schema[..scope.row_width(probe_t)];
             if scope.derived[probe_t].is_none()
                 && let Some(demand) = pax_demand.selected_mask(probe_t)
-                && let Some(scan) = storage.immutable_row_scan(probe_slot)?
+                && let Some(scan) = storage.immutable_row_scan_in(probe_slot, arena)?
             {
                 storage.record_relation_scan(txid, probe_slot, None, 0)?;
                 let mut stopped = false;
@@ -6387,7 +6387,7 @@ fn scan_source_mode<'a>(
         macro_rules! visit_sequential_physical_rows {
             ($slot:expr) => {{
                 storage.record_relation_scan(txid, $slot, None, 0)?;
-                let scan = storage.row_scan($slot)?;
+                let scan = storage.row_scan_in($slot, arena)?;
                 let mut index = 0usize;
                 let mut aborted = false;
                 let _ = scan.for_each_overlay(&mut |rowid, state| {
@@ -7333,7 +7333,7 @@ fn scan_source_mode<'a>(
                     }
                 }
             } else if let Some(demand) = pax_demand.selected_mask(d)
-                && let Some(scan) = storage.immutable_row_scan(scope.slots[d])?
+                && let Some(scan) = storage.immutable_row_scan_in(scope.slots[d], arena)?
             {
                 let mut index = 0usize;
                 let mut done = false;

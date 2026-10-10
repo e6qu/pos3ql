@@ -35,7 +35,7 @@ use row_versions::{
     prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
     release_pending_chain,
 };
-use row_walks::{RetainedRowIds, RowWalkPool};
+use row_walks::{RetainedRowIds, RowScanIds, RowWalkPool};
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -13963,7 +13963,7 @@ struct SpillVersion {
 
 #[derive(Clone, Copy)]
 enum SpillOverlayMode<'scan> {
-    VisibleScan(&'scan RetainedRowIds<'scan>),
+    VisibleScan(&'scan RowScanIds<'scan>),
     /// A checkpoint spans statements, so pending versions may appear without
     /// changing the committed generation. Partition only by committed home.
     CommittedCheckpoint,
@@ -29117,7 +29117,7 @@ impl Storage {
     fn for_each_spilled_row_batch<'a, 'callback>(
         &self,
         table_slot: usize,
-        rowids: &RetainedRowIds<'_>,
+        rowids: &RowScanIds<'_>,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
         decoded_columns: Option<u64>,

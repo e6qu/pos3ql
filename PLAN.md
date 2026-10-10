@@ -49,7 +49,8 @@ match tracking uses row identities across scan orders. Committed publication,
 table lifecycle, resumable checkpoint walks, and in-place compaction still
 require further concurrency work. Optimized overlay/PAX byte scans share one
 startup-bounded partition through both phases; callbacks release row metadata
-before consuming bytes. Their Storage borrow retains the immutable SST list;
+before consuming bytes. SQL scans retain identities in the fixed statement arena
+so accepted wide joins do not exhaust per-workspace metadata-walk slots. Their Storage borrow retains the immutable SST list;
 it does not yet permit concurrent generation replacement or retirement.
 
 - Complete concurrent table lifecycle, committed row publication, snapshot

@@ -48239,7 +48239,7 @@ pub fn create_index(
         }
         Ok(())
     };
-    let validation = storage.row_scan(table_index).and_then(|scan| {
+    let validation = storage.row_scan_in(table_index, arena).and_then(|scan| {
         let overlay = scan.for_each_overlay(&mut |rowid, state| {
             let Some(home) = storage.committed_row_home(table_index, state)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));

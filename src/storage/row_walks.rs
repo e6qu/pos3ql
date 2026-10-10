@@ -27,6 +27,28 @@ impl RetainedRowIds<'_> {
     pub(super) fn contains(&self, rowid: u64) -> bool {
         self.rowids.binary_search(&rowid).is_ok()
     }
+
+    fn as_slice(&self) -> &[u64] {
+        &self.rowids
+    }
+}
+
+pub(super) enum RowScanIds<'scan> {
+    Reserved(RetainedRowIds<'scan>),
+    Statement(&'scan [u64]),
+}
+
+impl RowScanIds<'_> {
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            Self::Reserved(rowids) => rowids.as_slice(),
+            Self::Statement(rowids) => rowids,
+        }
+    }
+
+    pub(super) fn contains(&self, rowid: u64) -> bool {
+        self.as_slice().binary_search(&rowid).is_ok()
+    }
 }
 
 /// One overlay partition shared by the metadata and payload phases. Borrowing
@@ -35,7 +57,7 @@ impl RetainedRowIds<'_> {
 pub(crate) struct RowScan<'storage> {
     storage: &'storage Storage,
     table_slot: usize,
-    pub(super) rowids: RetainedRowIds<'storage>,
+    pub(super) rowids: RowScanIds<'storage>,
     immutable_only: bool,
 }
 
@@ -45,15 +67,50 @@ impl Storage {
         Ok(RowScan {
             storage: self,
             table_slot,
-            rowids,
+            rowids: RowScanIds::Reserved(rowids),
             immutable_only,
         })
     }
 
-    pub(crate) fn immutable_row_scan(
-        &self,
+    pub(crate) fn row_scan_in<'scan>(
+        &'scan self,
         table_slot: usize,
-    ) -> Result<Option<RowScan<'_>>, SqlError> {
+        arena: &'scan crate::mem::arena::Arena,
+    ) -> Result<RowScan<'scan>, SqlError> {
+        let rows = self.tables[table_slot].rows.read();
+        let immutable_only = rows.is_empty();
+        let count = rows.iter().filter(|(_, state)| !Self::redundant_spilled_row_state(state)).count();
+        let rowids = arena.alloc_slice_with(count, |_| 0u64).map_err(|_| {
+            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "retained byte scan identities exceed the statement arena")
+        })?;
+        let mut index = 0;
+        for (&rowid, state) in rows.iter() {
+            if !Self::redundant_spilled_row_state(state) {
+                rowids[index] = rowid;
+                index += 1;
+            }
+        }
+        drop(rows);
+        rowids.sort_unstable();
+        Ok(RowScan {
+            storage: self,
+            table_slot,
+            rowids: RowScanIds::Statement(rowids),
+            immutable_only,
+        })
+    }
+
+    pub(crate) fn immutable_row_scan_in<'scan>(
+        &'scan self,
+        table_slot: usize,
+        arena: &'scan crate::mem::arena::Arena,
+    ) -> Result<Option<RowScan<'scan>>, SqlError> {
+        let scan = self.row_scan_in(table_slot, arena)?;
+        Ok(scan.immutable_only.then_some(scan))
+    }
+
+    #[cfg(test)]
+    fn immutable_row_scan(&self, table_slot: usize) -> Result<Option<RowScan<'_>>, SqlError> {
         let scan = self.row_scan(table_slot)?;
         Ok(scan.immutable_only.then_some(scan))
     }
@@ -64,8 +121,14 @@ impl RowScan<'_> {
         &self,
         each: &mut super::RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        self.storage
-            .for_each_retained_row_state(self.table_slot, &self.rowids, each)
+        for &rowid in self.rowids.as_slice() {
+            if let Some(state) = self.storage.row_state(self.table_slot, rowid)?
+                && each(rowid, state)?.is_break()
+            {
+                return Ok(core::ops::ControlFlow::Break(()));
+            }
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
     }
 
     pub(crate) fn for_each_spilled_row_batch<'arena, 'callback>(
@@ -522,6 +585,36 @@ mod tests {
             assert!(overlay.is_continue());
             assert_eq!(count, 0, "later overlays cannot alter an admitted scan");
             storage.restore_pending(table, 2, 7, undo);
+        });
+    }
+
+    #[test]
+    fn retained_byte_scan_statement_arena_preserves_join_depth_and_exhaustion() {
+        let (storage, table) = fixture();
+        let count = MAX_ROW_WALK_NESTING + 1;
+        let mut budget = Budget::new(count * size_of::<u64>());
+        let arena = crate::mem::arena::Arena::new(
+            &mut budget, "retained scan identities", count * size_of::<u64>(),
+        ).unwrap();
+        let mut scans = Vec::with_capacity(count);
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..count {
+                scans.push(storage.row_scan_in(table, &arena).unwrap());
+            }
+            assert!(storage.row_scan(table).is_ok(), "SQL scans do not consume metadata walk leases");
+            assert_eq!(
+                storage.row_scan_in(table, &arena).err().unwrap().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            for scan in &scans {
+                assert!(scan.rowids.contains(1));
+                assert!(scan.for_each_overlay(&mut |rowid, state| {
+                    assert_eq!(rowid, 1);
+                    drop(state);
+                    assert!(storage.tables[table].rows.test_write().is_ok());
+                    Ok(core::ops::ControlFlow::Continue(()))
+                }).unwrap().is_continue());
+            }
         });
     }
 

@@ -27,9 +27,11 @@ do not qualify concurrent execution or representative deployments.
 | Deferred rows | Logical row identity, table incarnation, and exact pending/committed version tokens; later reads reacquire the selected version rather than retaining heap locations |
 
 Reader capacity, lock controls, and heap controls are charged at startup. Row-state
-and byte scans share 64 retention slots per query workspace, each sized for the larger
+walks and internal byte scans share 64 retention slots per query workspace, each sized for the larger
 of the table and large-object page overlays; exhaustion reports SQLSTATE 54000.
-A scan's Storage borrow retains its table incarnation and immutable SST list;
+SQL byte scans retain identities in the fixed statement arena, so accepted wide
+joins do not consume one metadata-walk slot per join edge. Arena exhaustion is
+SQLSTATE 54000. A scan's Storage borrow retains its table incarnation and immutable SST list;
 concurrent generation replacement and retirement remain unsupported.
 Exhaustion is explicit; readers reject reused table identities and stale heap
 locations. Appends release byte ownership before publishing row metadata;

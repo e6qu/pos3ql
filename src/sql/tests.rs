@@ -25899,7 +25899,12 @@ fn right_and_full_outer_joins() {
         "SELECT coalesce(a.x,'-'), coalesce(bt.y,'-') FROM a FULL JOIN bt ON a.id=bt.id ORDER BY a.id NULLS LAST, bt.id",
     ));
     assert_eq!(full, ["a1|-", "a2|b2", "a3|b3", "-|b4"], "full: {full:?}");
-    run_txn(&mut e, &mut b, &mut t, "UPDATE bt SET y='b2-new' WHERE id=2");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE bt SET y='b2-new' WHERE id=2",
+    );
     let full = data_rows(&run_with_txn_bytes(
         &mut e,
         &mut b,

@@ -4516,19 +4516,32 @@ struct JoinMatchFlags<'a> {
 }
 
 impl JoinMatchFlags<'_> {
-    fn flag(&self, ordinal: usize, rowid: Option<u64>) -> Result<&core::cell::Cell<bool>, SqlError> {
+    fn flag(
+        &self,
+        ordinal: usize,
+        rowid: Option<u64>,
+    ) -> Result<&core::cell::Cell<bool>, SqlError> {
         let index = match self.rowids {
             Some(rowids) => rowids
                 .binary_search(&rowid.ok_or_else(|| {
-                    sql_err!(sqlstate::INTERNAL_ERROR, "physical join row has no identity")
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "physical join row has no identity"
+                    )
                 })?)
                 .map_err(|_| {
-                    sql_err!(sqlstate::INTERNAL_ERROR, "physical join row identity changed")
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "physical join row identity changed"
+                    )
                 })?,
             None => ordinal,
         };
         self.flags.get(index).ok_or_else(|| {
-            sql_err!(sqlstate::INTERNAL_ERROR, "join match ordinal is out of bounds")
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "join match ordinal is out of bounds"
+            )
         })
     }
 }
@@ -7268,16 +7281,14 @@ fn scan_source_mode<'a>(
                         recycled(arena, recycle_rows, retain_match, || {
                             let already_matched = if external_match_map {
                                 match external_match_reader.as_deref_mut() {
-                                    Some(reader) => {
-                                        external_match_contains(
-                                            storage,
-                                            reader,
-                                            match_run.expect("external match reader has a run"),
-                                            &mut previous_external_match,
-                                            d,
-                                            join_match_key(this, None),
-                                        )?
-                                    }
+                                    Some(reader) => external_match_contains(
+                                        storage,
+                                        reader,
+                                        match_run.expect("external match reader has a run"),
+                                        &mut previous_external_match,
+                                        d,
+                                        join_match_key(this, None),
+                                    )?,
                                     None => false,
                                 }
                             } else {
@@ -7351,16 +7362,14 @@ fn scan_source_mode<'a>(
                                 recycled(arena, recycle_rows, retain_match, || {
                                     let already_matched = if external_match_map {
                                         match external_match_reader.as_deref_mut() {
-                                            Some(reader) => {
-                                                external_match_contains(
-                                                    storage,
-                                                    reader,
-                                                    match_run.expect("external match reader has a run"),
-                                                    &mut previous_external_match,
-                                                    d,
-                                                    join_match_key(this, Some(spilled.rowid)),
-                                                )?
-                                            }
+                                            Some(reader) => external_match_contains(
+                                                storage,
+                                                reader,
+                                                match_run.expect("external match reader has a run"),
+                                                &mut previous_external_match,
+                                                d,
+                                                join_match_key(this, Some(spilled.rowid)),
+                                            )?,
                                             None => false,
                                         }
                                     } else {

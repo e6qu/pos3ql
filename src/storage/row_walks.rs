@@ -324,29 +324,30 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 let mut count = 0;
                 let scan = storage.row_scan(table).unwrap();
-                let overlay = scan.for_each_overlay(&mut |rowid, state| {
-                    assert_eq!(rowid, 1);
-                    let image = storage
-                        .visible_row_home_at(table, rowid, state, 8, SNAPSHOT_ALL, 7)?
-                        .unwrap();
-                    assert!(storage.tables[table].rows.test_write().is_ok());
-                    assert!(storage.row_versions.test_write().is_ok());
-                    start.store(true, Ordering::Release);
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
-                        std::thread::yield_now();
-                    }
-                    progressed = completed.load(Ordering::Acquire);
-                    storage.with_row_bytes(table, rowid, image, |bytes| {
-                        let mut values = [Datum::Null];
-                        super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
-                        assert_eq!(values[0], Datum::Int4(1));
-                        Ok(())
-                    })?;
-                    count += 1;
-                    Ok(core::ops::ControlFlow::Continue(()))
-                })
-                .unwrap();
+                let overlay = scan
+                    .for_each_overlay(&mut |rowid, state| {
+                        assert_eq!(rowid, 1);
+                        let image = storage
+                            .visible_row_home_at(table, rowid, state, 8, SNAPSHOT_ALL, 7)?
+                            .unwrap();
+                        assert!(storage.tables[table].rows.test_write().is_ok());
+                        assert!(storage.row_versions.test_write().is_ok());
+                        start.store(true, Ordering::Release);
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
+                            std::thread::yield_now();
+                        }
+                        progressed = completed.load(Ordering::Acquire);
+                        storage.with_row_bytes(table, rowid, image, |bytes| {
+                            let mut values = [Datum::Null];
+                            super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                            assert_eq!(values[0], Datum::Int4(1));
+                            Ok(())
+                        })?;
+                        count += 1;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })
+                    .unwrap();
                 assert!(overlay.is_continue());
                 assert_eq!(
                     count, 1,
@@ -512,11 +513,12 @@ mod tests {
                 .unwrap();
             assert!(storage.immutable_row_scan(table).unwrap().is_none());
             let mut count = 0;
-            let overlay = scan.for_each_overlay(&mut |_, _| {
-                count += 1;
-                Ok(core::ops::ControlFlow::Continue(()))
-            })
-            .unwrap();
+            let overlay = scan
+                .for_each_overlay(&mut |_, _| {
+                    count += 1;
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
             assert!(overlay.is_continue());
             assert_eq!(count, 0, "later overlays cannot alter an admitted scan");
             storage.restore_pending(table, 2, 7, undo);

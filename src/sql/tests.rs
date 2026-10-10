@@ -130,42 +130,43 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
     let mut seen = [0u64; 2];
     let mut values = [0i32; 2];
     let mut replacement = None;
-    let overlay = scan.for_each_overlay(&mut |rowid, state| {
-        let image = engine
-            .storage
-            .visible_row_home_at(
+    let overlay = scan
+        .for_each_overlay(&mut |rowid, state| {
+            let image = engine
+                .storage
+                .visible_row_home_at(
+                    table,
+                    rowid,
+                    state,
+                    888,
+                    crate::storage::SNAPSHOT_ALL,
+                    u64::MAX,
+                )?
+                .unwrap();
+            engine
+                .storage
+                .with_row_bytes(table, rowid, image, |bytes| {
+                    let mut decoded = [Datum::Null];
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)?;
+                    let Datum::Int4(value) = decoded[0] else {
+                        panic!("integer fixture")
+                    };
+                    seen[count] = rowid;
+                    values[count] = value;
+                    count += 1;
+                    Ok(())
+                })?;
+            engine.storage.restore_pending(table, rowid, 777, original);
+            replacement = Some(engine.storage.write_pending_untracked(
                 table,
-                rowid,
-                state,
-                888,
-                crate::storage::SNAPSHOT_ALL,
-                u64::MAX,
-            )?
-            .unwrap();
-        engine
-            .storage
-            .with_row_bytes(table, rowid, image, |bytes| {
-                let mut decoded = [Datum::Null];
-                crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)?;
-                let Datum::Int4(value) = decoded[0] else {
-                    panic!("integer fixture")
-                };
-                seen[count] = rowid;
-                values[count] = value;
-                count += 1;
-                Ok(())
-            })?;
-        engine.storage.restore_pending(table, rowid, 777, original);
-        replacement = Some(engine.storage.write_pending_untracked(
-            table,
-            rowids[1],
-            777,
-            1,
-            Some(location),
-        )?);
-        Ok(core::ops::ControlFlow::Continue(()))
-    })
-    .unwrap();
+                rowids[1],
+                777,
+                1,
+                Some(location),
+            )?);
+            Ok(core::ops::ControlFlow::Continue(()))
+        })
+        .unwrap();
     assert!(overlay.is_continue());
     scan.for_each_spilled_row_batch(&arena, true, None, &mut |rows| {
         for row in rows {

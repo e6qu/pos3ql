@@ -41,12 +41,17 @@ and its linked documents; completed investigations belong in [history](docs/hist
 Allow readers to retain immutable selected images while unrelated writes progress.
 Heap appends and pending row publication progress while existing byte readers
 retain their images. Preparation precedes short, validated version/map updates;
-rollback uses the same ownership. Committed publication, table lifecycle, full
-metadata walks, and in-place compaction still require further concurrency work.
+rollback uses the same ownership. Authoritative row-state walks retain bounded
+row identities and release broad metadata ownership before callbacks; their
+frozen overlay coverage survives eviction during SST merging. Pending uniqueness
+walks release chain ownership before byte reads and waits. Physical outer-join
+match tracking uses row identities across scan orders. Committed publication,
+table lifecycle, optimized byte/checkpoint walks, and in-place compaction still
+require further concurrency work.
 
 - Complete concurrent table lifecycle, committed row publication, snapshot
   registration, and statistics ownership with explicit lock ordering. Replace
-  full-walk metadata ownership with bounded retained scan state.
+  optimized byte/checkpoint walk ownership with bounded retained scan generations.
 - Preserve active snapshots and retained table/SST generations through retirement.
   Stale-token detection does not replace retention of a live reader's state.
 - Separate reclamation from active readers. Evaluate startup-sized segments and

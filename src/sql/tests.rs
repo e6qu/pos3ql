@@ -7,6 +7,152 @@
 use super::*;
 
 #[test]
+fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
+    let mut config = test_config("retained-row-walk-sst");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("retained-row-walk-sst-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE retained_walk(id integer PRIMARY KEY); INSERT INTO retained_walk VALUES (1), (2)", true);
+    let table = engine
+        .storage
+        .find_table("public", "retained_walk")
+        .unwrap();
+    let mut rowids = [0u64; 2];
+    for (index, (rowid, _)) in engine.storage.resident_rows(table).iter().enumerate() {
+        rowids[index] = rowid;
+    }
+    rowids.sort_unstable();
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(engine.storage.table(table).n_spill_ssts, 1);
+    // Checkpoint publication can keep hot heap images. Reopen without either
+    // cache so this fixture begins with immutable rows only.
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let table = engine
+        .storage
+        .find_table("public", "retained_walk")
+        .unwrap();
+    assert_eq!(engine.storage.table(table).n_spill_ssts, 1);
+    engine.storage.set_commit_snapshot(engine.storage.lsn());
+    engine.storage.evict_redundant_entries(table);
+    assert!(
+        engine
+            .storage
+            .resident_row_state(table, rowids[0])
+            .is_none()
+    );
+    assert!(
+        engine
+            .storage
+            .resident_row_state(table, rowids[1])
+            .is_none()
+    );
+    let location = engine.storage.heap.append_row(&[Datum::Int4(99)]).unwrap();
+    let original = engine
+        .storage
+        .write_pending_untracked(table, rowids[0], 777, 1, Some(location))
+        .unwrap();
+    let mut replacement = None;
+    let mut seen = [0u64; 2];
+    let mut values = [0i32; 2];
+    let mut count = 0;
+    engine
+        .storage
+        .for_each_row_state(table, &mut |rowid, state| {
+            let image = engine
+                .storage
+                .visible_row_home_at(
+                    table,
+                    rowid,
+                    state,
+                    888,
+                    crate::storage::SNAPSHOT_ALL,
+                    u64::MAX,
+                )?
+                .unwrap();
+            engine
+                .storage
+                .with_row_bytes(table, rowid, image, |bytes| {
+                    let mut row = [Datum::Null];
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut row)?;
+                    let Datum::Int4(value) = row[0] else {
+                        panic!("integer fixture")
+                    };
+                    seen[count] = rowid;
+                    values[count] = value;
+                    count += 1;
+                    Ok(())
+                })?;
+            if rowid == rowids[0] {
+                engine.storage.restore_pending(table, rowid, 777, original);
+                assert!(engine.storage.resident_row_state(table, rowid).is_none());
+                replacement = Some(engine.storage.write_pending_untracked(
+                    table,
+                    rowids[1],
+                    777,
+                    1,
+                    Some(location),
+                )?);
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })
+        .unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(seen, rowids);
+    assert_eq!(
+        values,
+        [1, 2],
+        "eviction cannot duplicate a row or hide an uncaptured SST row"
+    );
+    engine
+        .storage
+        .restore_pending(table, rowids[1], 777, replacement.unwrap());
+    session.success(&mut engine, "INSERT INTO retained_walk VALUES (3)", false);
+    let join = "SELECT l.id, r.id FROM \
+                (SELECT id FROM retained_walk WHERE id <= 2) l \
+                FULL JOIN retained_walk r ON l.id = r.id \
+                ORDER BY r.id";
+    assert_eq!(
+        data_rows(&session.success(&mut engine, join, false)),
+        ["1|1", "2|2", "NULL|3"],
+        "outer-join identities survive an overlay-to-SST scan boundary"
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT id FROM retained_walk ORDER BY id"
+        )),
+        ["1", "2", "3"]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut cold, &mut cold_budget, join)),
+        ["1|1", "2|2", "NULL|3"],
+        "outer-join identities survive empty-cache recovery"
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn shared_row_publication_rollback_keeps_sst_deletions_through_cold_recovery() {
     let mut config = test_config("shared-row-deletion-retention");
     config.object_store_on = true;
@@ -748,6 +894,8 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
             + foreign_statement_workspace_bytes)
             + Storage::table_definition_image_budget_bytes(&config)
             - Storage::table_definition_image_budget_bytes(&one)
+            + Storage::retained_row_walk_budget_bytes(&config)
+            - Storage::retained_row_walk_budget_bytes(&one)
     );
     let bytes = config.query_workspace_slots
         * (config.work_arena_bytes + core::mem::size_of::<QueryWorkspace>());
@@ -25751,6 +25899,19 @@ fn right_and_full_outer_joins() {
         "SELECT coalesce(a.x,'-'), coalesce(bt.y,'-') FROM a FULL JOIN bt ON a.id=bt.id ORDER BY a.id NULLS LAST, bt.id",
     ));
     assert_eq!(full, ["a1|-", "a2|b2", "a3|b3", "-|b4"], "full: {full:?}");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut t,
+        "UPDATE bt SET y='b2-new' WHERE id=2",
+    );
+    let full = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT coalesce(a.x,'-'), coalesce(bt.y,'-') FROM a FULL JOIN bt ON a.id=bt.id ORDER BY a.id NULLS LAST, bt.id",
+    ));
+    assert_eq!(full, ["a1|-", "a2|b2-new", "a3|b3", "-|b4"]);
 }
 
 #[test]

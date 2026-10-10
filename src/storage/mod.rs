@@ -15,8 +15,8 @@ pub(crate) mod foreign;
 mod row_heap;
 mod row_images;
 mod row_map;
-mod row_reads;
 mod row_publication;
+mod row_reads;
 mod row_versions;
 pub(crate) mod rowenc;
 

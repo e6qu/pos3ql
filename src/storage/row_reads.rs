@@ -63,7 +63,10 @@ impl RowRead<'_> {
 
     pub(super) fn pending_head_identity(&self) -> Option<u64> {
         self.state.pending.tail.map(|slot| {
-            self.versions().expect("resident pending chain").pending_row_versions[slot].identity
+            self.versions()
+                .expect("resident pending chain")
+                .pending_row_versions[slot]
+                .identity
         })
     }
 

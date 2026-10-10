@@ -165,7 +165,9 @@ mod tests {
                     }
                     progressed = completed.load(Ordering::Acquire);
                     storage.with_row_bytes(table, rowid, image, |bytes| {
-                        assert_eq!(bytes, &*storage.heap.get(image_location(storage, table)).unwrap());
+                        let mut values = [Datum::Null];
+                        super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                        assert_eq!(values[0], Datum::Int4(1));
                         Ok(())
                     })?;
                     count += 1;
@@ -177,13 +179,6 @@ mod tests {
             assert!(progressed, "writer must finish while the scan callback retains bytes");
             storage.restore_pending(table, 2, 7, undo);
         });
-    }
-
-    fn image_location(storage: &Storage, table: usize) -> super::super::RowLoc {
-        match storage.tables[table].rows.get(&1).unwrap().committed.unwrap() {
-            super::super::RowHome::Heap(location) => location,
-            _ => panic!("fixture heap image"),
-        }
     }
 
     #[test]

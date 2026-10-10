@@ -31,6 +31,19 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
     rowids.sort_unstable();
     assert!(engine.checkpoint().unwrap());
     assert_eq!(engine.storage.table(table).n_spill_ssts, 1);
+    // Checkpoint publication can keep hot heap images. Reopen without either
+    // cache so this fixture begins with immutable rows only.
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let table = engine
+        .storage
+        .find_table("public", "retained_walk")
+        .unwrap();
+    assert_eq!(engine.storage.table(table).n_spill_ssts, 1);
     engine.storage.set_commit_snapshot(engine.storage.lsn());
     engine.storage.evict_redundant_entries(table);
     assert!(

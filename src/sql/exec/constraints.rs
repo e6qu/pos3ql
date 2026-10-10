@@ -2652,8 +2652,7 @@ pub(crate) fn apply_fk_parent_actions(
                     )
                 })?;
                 rowenc::encode(new_child, out);
-                let (new_loc, slice) = storage.heap.append(out.len())?;
-                slice.copy_from_slice(out);
+                let new_loc = storage.heap.append_bytes(out)?;
                 let prior = storage.write_pending(
                     child_index,
                     rowid,

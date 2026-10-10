@@ -6,7 +6,7 @@
 ## Destination
 
 Deliver a PostgreSQL-compatible, object-native database with fixed startup
-memory, useful concurrent execution, recoverable durable publication, and
+memory, overlapping reads and writes, recoverable durable publication, and
 published performance evidence for representative deployments.
 
 SQL, wire, catalog, tool, and logical-replication behavior are compatibility
@@ -38,42 +38,51 @@ and its linked documents; completed investigations belong in [history](docs/hist
 
 ## Remaining sequence
 
-### 1. Table definitions and row mutation
+### 1. Row publication, reader retention, and reclamation
 
-Complete shared ownership before enabling overlapping execution:
+Allow readers to retain immutable selected images while unrelated writes progress.
+Heap appends publish complete disjoint tails without excluding existing byte
+readers. Table/row mutation and in-place compaction still require exclusive storage.
 
-- Table identity, typed CREATE/DROP existence, definitions, pending heads, and
-  version slots share guarded publication ownership. Query, DML, and checkpoint
-  readers retain immutable images with their captured identity. Complete shared
-  lifecycle mutation and retirement; publication still requires exclusive storage.
-- Synchronize row publication, statistics, and physical maintenance through a
-  coherent table lifecycle, including rollback, retirement, cloning, and recovery.
-- Visible heap reads acquire byte ownership while version ownership is held.
-  Deferred executor reads retain logical row identities and exact MVCC version tokens,
-  then reacquire the selected version after relocation. Complete shared row
-  publication and retirement without invalidating these retained snapshots.
-- Establish lock ordering and release guards before nested catalog resolution.
-  Reuse retained images and compact metadata instead of copying wide definitions
-  per row. Retained byte images consume the fixed statement arena; deferred row
-  snapshots consume bounded metadata rather than detached heap locations;
-  single-table scans share their incarnation instead of repeating it per row.
+- Complete concurrent table lifecycle, row-version publication, rollback, and
+  statistics ownership with explicit lock ordering.
+- Preserve active snapshots and retained table/SST generations through retirement.
+  Stale-token detection does not replace retention of a live reader's state.
+- Separate reclamation from active readers. Evaluate startup-sized segments and
+  bounded pins or reader epochs before enabling concurrent physical maintenance.
 
-Acceptance: concurrent readers/writers retain valid images; exhaustion,
-rollback, identity reuse, and failed creation preserve prior state; all controls
-and retained capacity are charged at startup; allocation, cold-recovery,
-PostgreSQL differential, access-path, and request-shape gates pass.
+Acceptance: a retained reader permits an unrelated write to complete; failed
+publication preserves prior state; maintenance retains active images; bounded
+exhaustion, identity reuse, rollback, and cold recovery remain allocation-free.
 
-### 2. Engine publication and transaction ownership
+### 2. Concurrent object reads and maintenance
 
-Synchronize engine-owned prepared slots, WAL staging, transaction/row/LSN
-allocation, group publication, and response barriers. Prepared catalog metadata
-has synchronized ownership; engine execution still requires exclusive access.
+Give queries and maintenance independent, startup-budgeted scratch and request
+ownership. Audit the shared cache/object-store stack so slow I/O does not hold
+broad ownership that excludes unrelated requests.
 
-Acceptance: coherent MVCC and lock ordering, durable acknowledgement, correct
+- Keep cache lookup/fill ownership brief; coordinate duplicate misses and bounded
+  parallel reads, prefetch, and cancellation.
+- Build checkpoint and compaction replacements independently of foreground reads
+  and writes; publish a coherent generation through a short root transition.
+- Budget foreground reads, durable publication, and maintenance fairly. Preserve
+  object retention until every active reader and backup releases its generation.
+
+Acceptance: unrelated warm reads and writes progress during a cold miss and
+maintenance; concurrent misses use bounded slots; request/byte amplification,
+reclamation, and cold recovery remain qualified through the shared S3 contract.
+
+### 3. Transaction ownership and durable publication
+
+Synchronize prepared slots, WAL staging, transaction/row/LSN allocation, commit
+ordering, and response barriers. Concurrent statement execution must not hold
+whole-engine ownership while waiting for durable publication.
+
+Acceptance: coherent MVCC and lock ordering, grouped durable acknowledgement,
 unknown-outcome errors, cancellation, retries, savepoints, and two-phase recovery
 under concurrent fault injection without runtime allocation.
 
-### 3. Fixed execution workers
+### 4. Fixed execution workers
 
 Replace the reactor's local queue drain with a startup-sized worker set.
 Preserve dispatcher leases, FIFO backpressure, connection/database identity,
@@ -84,7 +93,7 @@ workloads with bounded saturation, fixed memory, unchanged MVCC, and durable
 response barriers. Serializing the whole engine behind a global lock does not
 satisfy this gate.
 
-### 4. Representative performance and operations
+### 5. Representative performance and operations
 
 Run the [measurement suite](docs/performance.md) on pinned hardware with an
 independently operated S3-compatible service. Required deployment inputs are
@@ -103,7 +112,9 @@ warm disk, empty caches, writes, checkpoint/compaction interference, parameteriz
 joins, large catalogs, one-through-N workers and logical replicas, freshness,
 recovery, and multi-host failover with actual routing. Include latency
 distributions, throughput, CPU, memory occupancy, physical access paths, and
-object requests. Set timing thresholds only after repeatable measurements.
+object requests. Evaluate physical ordering, packing, projection, pruning, and
+compaction through request, byte, and rewrite amplification alongside latency.
+Set timing thresholds only after repeatable measurements.
 
 ## Continuing compatibility and capacity work
 
@@ -125,13 +136,11 @@ The roadmap is complete when all of these hold:
 
 - Advertised SQL/wire shapes and accepted configurations have verified, explicit
   boundaries without truncation or post-startup allocation.
-- PostgreSQL oracle gates use the same verified, immutable service/client image;
-  registry failures must fail the gate rather than skipping comparisons.
-  Object-store qualification likewise preserves verified release image identities.
 - Formats, monitoring, credentials, packages, backup/restore, and replacement
   remain qualified end to end.
-- Concurrent execution scales through the supported worker range while
-  preserving MVCC, durability, fixed memory, and backpressure.
+- Concurrent execution scales through the supported worker range; reads, writes,
+  cold misses, and maintenance overlap while preserving MVCC, durability, fixed
+  memory, and backpressure.
 - Published representative results substantiate performance, recovery,
   replica freshness, memory, and object-request claims.
 

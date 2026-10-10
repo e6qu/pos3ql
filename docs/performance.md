@@ -6,7 +6,7 @@ pos3ql and PostgreSQL 18; every run records database identity, workload shape,
 latency and throughput summaries, and resource evidence as schema-versioned
 JSON. `tools/benchmark-report.py` derives a report from those raw files.
 
-## Current topology
+## Current execution and evidence limits
 
 - One server process owns one writable database state and
   serializes query execution. Startup-sized pools bound memory and make
@@ -19,6 +19,9 @@ JSON. `tools/benchmark-report.py` derives a report from those raw files.
   and DML scratch instead of a client workspace.
   Long-lived COPY streams keep transition rows in their connection's fixed
   startup buffer, so interleaved clients do not share statement state.
+- Heap append/read overlap is an ownership capability, not concurrent query
+  execution. The [roadmap](../PLAN.md) requires reader/writer progress during
+  cold misses and maintenance before claiming worker scaling.
 - Object storage is durable; memory and local disk are disposable caches.
   Immutable journal batches and a compare-and-swap commit head are published
   before success reaches a client.

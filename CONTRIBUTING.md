@@ -87,6 +87,8 @@ runner validates iteration; it does not replace complete PR gates. Remove
 temporary validation workflows before the final PR head. Fix failures on the
 same PR branch and rerun the affected gates; merge only when every required
 check passes on that head.
+CI also exercises shared heap publication with Miri to check the disjoint-range
+memory invariant alongside allocation-forbidden concurrent regressions.
 
 PostgreSQL service and client containers use Docker's official image from
 [ECR Public](https://gallery.ecr.aws/docker/library/postgres), pinned by manifest

@@ -705,9 +705,7 @@ fn write_page(
         Datum::Int4(page as i32),
         Datum::Bytea(data),
     ];
-    let len = rowenc::encoded_len(&values);
-    let (loc, bytes) = storage.heap.append(len)?;
-    rowenc::encode(&values, bytes);
+    let loc = storage.heap.append_row(&values)?;
     let rowid = rowid.unwrap_or_else(|| storage.next_rowid());
     let table = storage.large_object_page_table();
     let prior = storage.write_pending(table, rowid, txn.txid, txn.command_id(), Some(loc))?;

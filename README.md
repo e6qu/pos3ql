@@ -14,8 +14,8 @@ actual PostgreSQL; unsupported behavior must fail explicitly. The
 forms, capacity limits, and architecture boundaries.
 
 Query execution still runs serially in one process. Independent statement
-workspaces and synchronized catalogs prepare for fixed workers, but do not yet
-provide concurrent execution. Representative production performance remains
+workspaces and retained immutable images prepare for overlapping reads and
+writes with fixed workers. Representative production performance remains
 unqualified. [PLAN.md](PLAN.md) records the remaining work and completion gates.
 
 ## Architecture

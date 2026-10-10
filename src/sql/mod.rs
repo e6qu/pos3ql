@@ -19268,8 +19268,7 @@ fn replay_transaction_batches(
                             else {
                                 continue;
                             };
-                            let (location, bytes) = storage.heap.append(row.len())?;
-                            bytes.copy_from_slice(row);
+                            let location = storage.heap.append_bytes(row)?;
                             storage.observe_rowid(rowid);
                             let prior = storage.write_pending_untracked(
                                 table_slot,
@@ -20183,8 +20182,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     message: stack_format!(192, "journal writes to unknown table \"{}\"", table),
                 });
             };
-            let (loc, slice) = storage.heap.append(row.len())?;
-            slice.copy_from_slice(row);
+            let loc = storage.heap.append_bytes(row)?;
             storage.observe_rowid(rowid);
             storage
                 .table_mut(index)

@@ -574,12 +574,11 @@ fn enforce_expression_index_uniqueness<'a>(
         let Some(image) = image else {
             return Ok(ControlFlow::Continue(()));
         };
-        let matched =
-            storage.with_row_bytes(table_index, rowid, image, |bytes| {
-                let mut other = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut other)?;
-                matches(&other)
-            })?;
+        let matched = storage.with_row_bytes(table_index, rowid, image, |bytes| {
+            let mut other = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut other)?;
+            matches(&other)
+        })?;
         if !matched {
             return Ok(ControlFlow::Continue(()));
         }
@@ -842,12 +841,11 @@ pub(crate) fn enforce_partial_index_uniqueness(
         let Some(image) = image else {
             return Ok(ControlFlow::Continue(()));
         };
-        let matched =
-            storage.with_row_bytes(table_index, rowid, image, |bytes| {
-                let mut other = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut other)?;
-                matches(&other)
-            })?;
+        let matched = storage.with_row_bytes(table_index, rowid, image, |bytes| {
+            let mut other = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut other)?;
+            matches(&other)
+        })?;
         if !matched {
             return Ok(ControlFlow::Continue(()));
         }

@@ -3,8 +3,11 @@
 use core::mem::size_of;
 use std::sync::{Mutex, MutexGuard};
 
-use super::{MAX_ROW_WALK_NESTING, PendingChange, RowHome, RowMap, RowSnapshot, Storage, VisibleRowHome, try_mutex_pool};
 use super::row_images::RowVersionIdentity;
+use super::{
+    MAX_ROW_WALK_NESTING, PendingChange, RowHome, RowMap, RowSnapshot, Storage, VisibleRowHome,
+    try_mutex_pool,
+};
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
@@ -26,6 +29,13 @@ impl RetainedRowIds<'_> {
     }
 }
 
+type PendingRowVisitor<'a> = dyn for<'row> FnMut(
+        u64,
+        PendingChange,
+        Option<VisibleRowHome<'row>>,
+    ) -> Result<core::ops::ControlFlow<()>, SqlError>
+    + 'a;
+
 pub(super) struct RowWalkPool {
     slots: FixedVec<Mutex<FixedVec<u64>>>,
 }
@@ -34,7 +44,7 @@ impl Storage {
     pub(crate) fn for_each_pending_row_change(
         &self,
         table: usize,
-        each: &mut dyn for<'row> FnMut(u64, PendingChange, Option<VisibleRowHome<'row>>) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        each: &mut PendingRowVisitor<'_>,
     ) -> Result<(), SqlError> {
         let rowids = self.row_walks.retain(&self.tables[table].rows)?;
         for rowid in rowids.iter() {
@@ -44,15 +54,20 @@ impl Storage {
             let Some(change) = state.pending_last() else {
                 continue;
             };
-            let image = change.loc.map(|location| {
-                self.pin_visible_home(
-                    RowSnapshot {
-                        created_at: self.tables[table].created_at(),
-                        version: RowVersionIdentity::Pending(state.pending_head_identity().expect("pending head")),
-                    },
-                    RowHome::Heap(location),
-                )
-            }).transpose()?;
+            let image = change
+                .loc
+                .map(|location| {
+                    self.pin_visible_home(
+                        RowSnapshot {
+                            created_at: self.tables[table].created_at(),
+                            version: RowVersionIdentity::Pending(
+                                state.pending_head_identity().expect("pending head"),
+                            ),
+                        },
+                        RowHome::Heap(location),
+                    )
+                })
+                .transpose()?;
             drop(state);
             if each(rowid, change, image)?.is_break() {
                 return Ok(());
@@ -60,13 +75,14 @@ impl Storage {
         }
         Ok(())
     }
-
 }
 
 impl RowWalkPool {
     pub(super) fn budget_bytes(config: &Config) -> usize {
-        size_of::<Self>() + Self::slot_count(config)
-            * (size_of::<Mutex<FixedVec<u64>>>() + Self::row_capacity(config) * size_of::<u64>())
+        size_of::<Self>()
+            + Self::slot_count(config)
+                * (size_of::<Mutex<FixedVec<u64>>>()
+                    + Self::row_capacity(config) * size_of::<u64>())
     }
 
     fn slot_count(config: &Config) -> usize {
@@ -105,9 +121,9 @@ impl RowWalkPool {
         {
             let rows = rows.read();
             for (&rowid, _) in rows.iter() {
-                rowids.push(rowid).map_err(|error| {
-                    sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error)
-                })?;
+                rowids
+                    .push(rowid)
+                    .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
             }
         }
         // A sorted frozen set also owns SST suppression. Current map
@@ -164,32 +180,40 @@ mod tests {
             });
             crate::mem::guard::forbid_alloc(|| {
                 let mut count = 0;
-                storage.for_each_row_state(table, &mut |rowid, state| {
-                    assert_eq!(rowid, 1);
-                    let image = storage
-                        .visible_row_home_at(table, rowid, state, 8, SNAPSHOT_ALL, 7)?
-                        .unwrap();
-                    assert!(storage.tables[table].rows.test_write().is_ok());
-                    assert!(storage.row_versions.test_write().is_ok());
-                    start.store(true, Ordering::Release);
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
-                        std::thread::yield_now();
-                    }
-                    progressed = completed.load(Ordering::Acquire);
-                    storage.with_row_bytes(table, rowid, image, |bytes| {
-                        let mut values = [Datum::Null];
-                        super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
-                        assert_eq!(values[0], Datum::Int4(1));
-                        Ok(())
-                    })?;
-                    count += 1;
-                    Ok(core::ops::ControlFlow::Continue(()))
-                }).unwrap();
-                assert_eq!(count, 1, "a later insertion is outside the retained row set");
+                storage
+                    .for_each_row_state(table, &mut |rowid, state| {
+                        assert_eq!(rowid, 1);
+                        let image = storage
+                            .visible_row_home_at(table, rowid, state, 8, SNAPSHOT_ALL, 7)?
+                            .unwrap();
+                        assert!(storage.tables[table].rows.test_write().is_ok());
+                        assert!(storage.row_versions.test_write().is_ok());
+                        start.store(true, Ordering::Release);
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
+                            std::thread::yield_now();
+                        }
+                        progressed = completed.load(Ordering::Acquire);
+                        storage.with_row_bytes(table, rowid, image, |bytes| {
+                            let mut values = [Datum::Null];
+                            super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                            assert_eq!(values[0], Datum::Int4(1));
+                            Ok(())
+                        })?;
+                        count += 1;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })
+                    .unwrap();
+                assert_eq!(
+                    count, 1,
+                    "a later insertion is outside the retained row set"
+                );
             });
             let undo = writer.join().unwrap();
-            assert!(progressed, "writer must finish while the scan callback retains bytes");
+            assert!(
+                progressed,
+                "writer must finish while the scan callback retains bytes"
+            );
             storage.restore_pending(table, 2, 7, undo);
         });
     }
@@ -198,30 +222,34 @@ mod tests {
     fn retained_row_walk_survives_removal_reuse_and_nested_walks() {
         let (storage, table) = fixture();
         let location = storage.heap.append_row(&[Datum::Int4(2)]).unwrap();
-        let undo = storage.write_pending(table, 2, 7, 1, Some(location)).unwrap();
+        let undo = storage
+            .write_pending(table, 2, 7, 1, Some(location))
+            .unwrap();
         let mut seen = [0u64; 2];
         crate::mem::guard::forbid_alloc(|| {
             let mut count = 0;
-            storage.for_each_row_state(table, &mut |rowid, state| {
-                drop(state);
-                seen[count] = rowid;
-                count += 1;
-                if rowid == 1 {
-                    storage.restore_pending(table, 2, 7, undo);
-                    let replacement = storage.write_pending(table, 3, 7, 1, Some(location))?;
-                    let mut nested = [0u64; 2];
-                    let mut n = 0;
-                    storage.for_each_row_state(table, &mut |nested_rowid, state| {
-                        drop(state);
-                        nested[n] = nested_rowid;
-                        n += 1;
-                        Ok(core::ops::ControlFlow::Continue(()))
-                    })?;
-                    assert_eq!(nested, [1, 3]);
-                    storage.restore_pending(table, 3, 7, replacement);
-                }
-                Ok(core::ops::ControlFlow::Continue(()))
-            }).unwrap();
+            storage
+                .for_each_row_state(table, &mut |rowid, state| {
+                    drop(state);
+                    seen[count] = rowid;
+                    count += 1;
+                    if rowid == 1 {
+                        storage.restore_pending(table, 2, 7, undo);
+                        let replacement = storage.write_pending(table, 3, 7, 1, Some(location))?;
+                        let mut nested = [0u64; 2];
+                        let mut n = 0;
+                        storage.for_each_row_state(table, &mut |nested_rowid, state| {
+                            drop(state);
+                            nested[n] = nested_rowid;
+                            n += 1;
+                            Ok(core::ops::ControlFlow::Continue(()))
+                        })?;
+                        assert_eq!(nested, [1, 3]);
+                        storage.restore_pending(table, 3, 7, replacement);
+                    }
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
             assert_eq!(count, 1);
             assert_eq!(seen[0], 1);
             assert!(storage.tables[table].rows.test_write().is_ok());
@@ -233,28 +261,32 @@ mod tests {
     fn retained_row_walk_pending_callbacks_release_chain_ownership() {
         let (storage, table) = fixture();
         let location = storage.heap.append_row(&[Datum::Int4(2)]).unwrap();
-        let undo = storage.write_pending(table, 2, 7, 1, Some(location)).unwrap();
+        let undo = storage
+            .write_pending(table, 2, 7, 1, Some(location))
+            .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let mut count = 0;
-            storage.for_each_pending_row_change(table, &mut |rowid, change, image| {
-                assert_eq!(rowid, 2);
-                assert_eq!(change.txid, 7);
-                assert!(storage.tables[table].rows.test_write().is_ok());
-                assert!(storage.row_versions.test_write().is_ok());
-                storage.restore_pending(table, rowid, 7, undo);
-                assert_eq!(change.loc, Some(location));
-                assert!(storage.resident_row_state(table, rowid).is_none());
-                assert!(storage.heap.test_write().is_err());
-                storage.with_row_bytes(table, rowid, image.unwrap(), |bytes| {
-                    let mut values = [Datum::Null];
-                    super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
-                    assert_eq!(values[0], Datum::Int4(2));
-                    Ok(())
-                })?;
-                assert!(storage.heap.test_write().is_ok());
-                count += 1;
-                Ok(core::ops::ControlFlow::Continue(()))
-            }).unwrap();
+            storage
+                .for_each_pending_row_change(table, &mut |rowid, change, image| {
+                    assert_eq!(rowid, 2);
+                    assert_eq!(change.txid, 7);
+                    assert!(storage.tables[table].rows.test_write().is_ok());
+                    assert!(storage.row_versions.test_write().is_ok());
+                    storage.restore_pending(table, rowid, 7, undo);
+                    assert_eq!(change.loc, Some(location));
+                    assert!(storage.resident_row_state(table, rowid).is_none());
+                    assert!(storage.heap.test_write().is_err());
+                    storage.with_row_bytes(table, rowid, image.unwrap(), |bytes| {
+                        let mut values = [Datum::Null];
+                        super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                        assert_eq!(values[0], Datum::Int4(2));
+                        Ok(())
+                    })?;
+                    assert!(storage.heap.test_write().is_ok());
+                    count += 1;
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
             assert_eq!(count, 1);
         });
     }
@@ -263,7 +295,9 @@ mod tests {
     fn retained_row_walk_committed_validation_pins_before_metadata_release() {
         let (storage, table) = fixture();
         let location = storage.heap.append_row(&[Datum::Int4(2)]).unwrap();
-        let undo = storage.write_pending(table, 1, 7, 1, Some(location)).unwrap();
+        let undo = storage
+            .write_pending(table, 1, 7, 1, Some(location))
+            .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let state = storage.resident_row_state(table, 1).unwrap();
             let image = storage.committed_row_home(table, state).unwrap().unwrap();
@@ -271,12 +305,14 @@ mod tests {
             assert!(storage.tables[table].rows.test_write().is_ok());
             assert!(storage.heap.test_write().is_err());
             storage.restore_pending(table, 1, 7, undo);
-            storage.with_row_bytes(table, 1, image, |bytes| {
-                let mut values = [Datum::Null];
-                super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
-                assert_eq!(values[0], Datum::Int4(1), "ignore the pending replacement");
-                Ok(())
-            }).unwrap();
+            storage
+                .with_row_bytes(table, 1, image, |bytes| {
+                    let mut values = [Datum::Null];
+                    super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                    assert_eq!(values[0], Datum::Int4(1), "ignore the pending replacement");
+                    Ok(())
+                })
+                .unwrap();
             assert!(storage.heap.test_write().is_ok());
         });
     }
@@ -299,7 +335,10 @@ mod tests {
             for _ in 0..count {
                 leases.push(pool.retain(&rows).unwrap());
             }
-            assert_eq!(pool.retain(&rows).unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                pool.retain(&rows).unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
             drop(leases.pop());
             assert!(pool.retain(&rows).is_ok());
             leases.clear();
@@ -316,8 +355,16 @@ mod tests {
         let pool = RowWalkPool::new(&config, &mut budget).unwrap();
         let mut row_budget = Budget::new(4096);
         let mut rows = RowMap::new(&mut row_budget, "oversized fixture", 2).unwrap();
-        rows.insert(1, RowState::committed_only_at(super::super::RowLoc::test(0, 4), 7)).unwrap();
-        rows.insert(2, RowState::committed_only_at(super::super::RowLoc::test(0, 4), 7)).unwrap();
+        rows.insert(
+            1,
+            RowState::committed_only_at(super::super::RowLoc::test(0, 4), 7),
+        )
+        .unwrap();
+        rows.insert(
+            2,
+            RowState::committed_only_at(super::super::RowLoc::test(0, 4), 7),
+        )
+        .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let error = pool.retain(&rows).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);

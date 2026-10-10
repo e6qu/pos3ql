@@ -29904,15 +29904,18 @@ impl Storage {
         table_slot: usize,
         state: RowRead<'_>,
     ) -> Result<Option<VisibleRowHome<'_>>, SqlError> {
-        let image = state.committed.map(|home| {
-            self.pin_visible_home(
-                RowSnapshot {
-                    created_at: self.tables[table_slot].created_at(),
-                    version: RowVersionIdentity::Committed(state.committed_lsn),
-                },
-                home,
-            )
-        }).transpose()?;
+        let image = state
+            .committed
+            .map(|home| {
+                self.pin_visible_home(
+                    RowSnapshot {
+                        created_at: self.tables[table_slot].created_at(),
+                        version: RowVersionIdentity::Committed(state.committed_lsn),
+                    },
+                    home,
+                )
+            })
+            .transpose()?;
         drop(state);
         Ok(image)
     }

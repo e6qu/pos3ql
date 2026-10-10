@@ -44,7 +44,8 @@ retain their images. Preparation precedes short, validated version/map updates;
 rollback uses the same ownership. Authoritative row-state walks retain bounded
 row identities and release broad metadata ownership before callbacks; their
 frozen overlay coverage survives eviction during SST merging. Pending uniqueness
-walks release chain ownership before byte reads and waits. Committed publication,
+walks release chain ownership before byte reads and waits. Physical outer-join
+match tracking uses row identities across scan orders. Committed publication,
 table lifecycle, optimized byte/checkpoint walks, and in-place compaction still
 require further concurrency work.
 

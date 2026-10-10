@@ -119,6 +119,15 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
         .storage
         .restore_pending(table, rowids[1], 777, replacement.unwrap());
     session.success(&mut engine, "INSERT INTO retained_walk VALUES (3)", false);
+    let join = "SELECT l.id, r.id FROM \
+                (SELECT id FROM retained_walk WHERE id <= 2) l \
+                FULL JOIN retained_walk r ON l.id = r.id \
+                ORDER BY r.id";
+    assert_eq!(
+        data_rows(&session.success(&mut engine, join, false)),
+        ["1|1", "2|2", "NULL|3"],
+        "outer-join identities survive an overlay-to-SST scan boundary"
+    );
     assert!(engine.checkpoint().unwrap());
     drop(session);
     drop(engine);
@@ -132,6 +141,11 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
             "SELECT id FROM retained_walk ORDER BY id"
         )),
         ["1", "2", "3"]
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut cold, &mut cold_budget, join)),
+        ["1|1", "2|2", "NULL|3"],
+        "outer-join identities survive empty-cache recovery"
     );
     drop(cold);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -25885,6 +25899,14 @@ fn right_and_full_outer_joins() {
         "SELECT coalesce(a.x,'-'), coalesce(bt.y,'-') FROM a FULL JOIN bt ON a.id=bt.id ORDER BY a.id NULLS LAST, bt.id",
     ));
     assert_eq!(full, ["a1|-", "a2|b2", "a3|b3", "-|b4"], "full: {full:?}");
+    run_txn(&mut e, &mut b, &mut t, "UPDATE bt SET y='b2-new' WHERE id=2");
+    let full = data_rows(&run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT coalesce(a.x,'-'), coalesce(bt.y,'-') FROM a FULL JOIN bt ON a.id=bt.id ORDER BY a.id NULLS LAST, bt.id",
+    ));
+    assert_eq!(full, ["a1|-", "a2|b2-new", "a3|b3", "-|b4"]);
 }
 
 #[test]

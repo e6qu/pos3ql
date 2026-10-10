@@ -4507,11 +4507,41 @@ fn consume_external_lateral_run<'a>(
     Ok(true)
 }
 
+// Physical rows retain their identity across differently ordered scan passes.
+// Derived sources have no row identity and use their stable source ordinal.
+#[derive(Clone, Copy)]
+struct JoinMatchFlags<'a> {
+    flags: &'a [core::cell::Cell<bool>],
+    rowids: Option<&'a [u64]>,
+}
+
+impl JoinMatchFlags<'_> {
+    fn flag(&self, ordinal: usize, rowid: Option<u64>) -> Result<&core::cell::Cell<bool>, SqlError> {
+        let index = match self.rowids {
+            Some(rowids) => rowids
+                .binary_search(&rowid.ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "physical join row has no identity")
+                })?)
+                .map_err(|_| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "physical join row identity changed")
+                })?,
+            None => ordinal,
+        };
+        self.flags.get(index).ok_or_else(|| {
+            sql_err!(sqlstate::INTERNAL_ERROR, "join match ordinal is out of bounds")
+        })
+    }
+}
+
+fn join_match_key(ordinal: usize, rowid: Option<u64>) -> u64 {
+    rowid.unwrap_or(ordinal as u64)
+}
+
 fn record_external_match(
     storage: &Storage,
     writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
     depth: usize,
-    index: usize,
+    index: u64,
 ) -> Result<(), SqlError> {
     let Some(mut writer) = writer else {
         return Ok(());
@@ -4529,7 +4559,7 @@ fn record_external_match(
                     if column == 0 {
                         Datum::Int4(depth as i32)
                     } else {
-                        Datum::Int8(index as i64)
+                        Datum::Int8((index ^ (1u64 << 63)) as i64)
                     }
                 },
                 &mut compare,
@@ -4541,9 +4571,19 @@ fn record_external_match(
 fn external_match_contains(
     storage: &Storage,
     reader: &mut crate::sql::external::ExternalRunReader,
+    run: crate::sql::external::ExternalRun,
+    previous: &mut Option<(usize, u64)>,
     depth: usize,
-    index: usize,
+    index: u64,
 ) -> Result<bool, SqlError> {
+    // Overlay and immutable rows are independently ordered streams. Restart
+    // at their boundary if the next identity precedes the previous lookup.
+    if previous.is_some_and(|key| key > (depth, index)) {
+        storage
+            .with_block_store(|blocks| reader.start(blocks, run))
+            .expect("external match map has a block store")?;
+    }
+    *previous = Some((depth, index));
     while let Some(row) = reader.row() {
         let row_depth = match crate::sql::exec::decode_projected_pub(row, 0) {
             Datum::Int4(value) => value as usize,
@@ -4555,7 +4595,7 @@ fn external_match_contains(
             }
         };
         let row_index = match crate::sql::exec::decode_projected_pub(row, 1) {
-            Datum::Int8(value) => value as usize,
+            Datum::Int8(value) => (value as u64) ^ (1u64 << 63),
             _ => {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -6111,7 +6151,7 @@ fn scan_source_mode<'a>(
         rowid: Option<u64>,
         bound: &mut [Option<BoundRow<'a>>],
         bound_rowids: &mut [Option<u64>],
-        matched: &[Option<&[core::cell::Cell<bool>]>],
+        matched: &[Option<JoinMatchFlags<'_>>],
         external_match_writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
         security_plans: &[Option<RowSecurityPlan<'a>>],
         pushdown: &[&[&'a Expr<'a>]],
@@ -6170,9 +6210,14 @@ fn scan_source_mode<'a>(
             return Ok(false);
         }
         if let Some(matched_rows) = matched[depth] {
-            matched_rows[index].set(true);
+            matched_rows.flag(index, rowid)?.set(true);
         }
-        record_external_match(storage, external_match_writer, depth, index)?;
+        record_external_match(
+            storage,
+            external_match_writer,
+            depth,
+            join_match_key(index, rowid),
+        )?;
         Ok(true)
     }
 
@@ -6194,7 +6239,7 @@ fn scan_source_mode<'a>(
         bound_rowids: &mut [Option<u64>],
         // For each RIGHT/FULL join level, one flag per scanned row of that
         // level's table, marking those that found a left partner.
-        matched: &[Option<&[core::cell::Cell<bool>]>],
+        matched: &[Option<JoinMatchFlags<'_>>],
         external_match_writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
         security_plans: &[Option<RowSecurityPlan<'a>>],
         // Error-safe WHERE conjuncts to check at each depth (predicate pushdown).
@@ -6858,7 +6903,36 @@ fn scan_source_mode<'a>(
         let flags = arena
             .alloc_slice_with(n_rows, |_| false)
             .map_err(|_| arena_full())?;
-        matched[t] = Some(core::cell::Cell::from_mut(flags).as_slice_of_cells());
+        let rowids = if scope.external_runs[t].is_none() && scope.derived[t].is_none() {
+            let rowids = arena
+                .alloc_slice_with(n_rows, |_| 0u64)
+                .map_err(|_| arena_full())?;
+            let mut fill = 0usize;
+            storage.for_each_row_state(scope.slots[t], &mut |rowid, state| {
+                if storage
+                    .visible_row_home(scope.slots[t], rowid, state, txid)?
+                    .is_some()
+                {
+                    let cell = rowids.get_mut(fill).ok_or_else(|| {
+                        sql_err!(sqlstate::INTERNAL_ERROR, "join row count changed")
+                    })?;
+                    *cell = rowid;
+                    fill += 1;
+                }
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
+            if fill != n_rows {
+                return Err(sql_err!(sqlstate::INTERNAL_ERROR, "join row count changed"));
+            }
+            rowids.sort_unstable();
+            Some(&*rowids)
+        } else {
+            None
+        };
+        matched[t] = Some(JoinMatchFlags {
+            flags: core::cell::Cell::from_mut(flags).as_slice_of_cells(),
+            rowids,
+        });
     }
 
     // Predicate pushdown (inner/cross joins only): assign each error-safe WHERE
@@ -7099,6 +7173,7 @@ fn scan_source_mode<'a>(
             } else {
                 None
             };
+            let mut previous_external_match = None;
             let mut emit_unmatched = |candidate: BoundRow<'a>,
                                       rowid: Option<u64>,
                                       f: &mut dyn FnMut(
@@ -7194,12 +7269,22 @@ fn scan_source_mode<'a>(
                             let already_matched = if external_match_map {
                                 match external_match_reader.as_deref_mut() {
                                     Some(reader) => {
-                                        external_match_contains(storage, reader, d, this)?
+                                        external_match_contains(
+                                            storage,
+                                            reader,
+                                            match_run.expect("external match reader has a run"),
+                                            &mut previous_external_match,
+                                            d,
+                                            join_match_key(this, None),
+                                        )?
                                     }
                                     None => false,
                                 }
                             } else {
-                                local_matches.expect("local match map")[this].get()
+                                local_matches
+                                    .expect("local match map")
+                                    .flag(this, None)?
+                                    .get()
                             };
                             if !sample_includes(sample_plans[d], None)? || already_matched {
                                 Ok(true)
@@ -7222,11 +7307,21 @@ fn scan_source_mode<'a>(
                     let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                         let already_matched = if external_match_map {
                             match external_match_reader.as_deref_mut() {
-                                Some(reader) => external_match_contains(storage, reader, d, index)?,
+                                Some(reader) => external_match_contains(
+                                    storage,
+                                    reader,
+                                    match_run.expect("external match reader has a run"),
+                                    &mut previous_external_match,
+                                    d,
+                                    join_match_key(index, None),
+                                )?,
                                 None => false,
                             }
                         } else {
-                            local_matches.expect("local match map")[index].get()
+                            local_matches
+                                .expect("local match map")
+                                .flag(index, None)?
+                                .get()
                         };
                         if !sample_includes(sample_plans[d], None)? || already_matched {
                             Ok(true)
@@ -7257,12 +7352,22 @@ fn scan_source_mode<'a>(
                                     let already_matched = if external_match_map {
                                         match external_match_reader.as_deref_mut() {
                                             Some(reader) => {
-                                                external_match_contains(storage, reader, d, this)?
+                                                external_match_contains(
+                                                    storage,
+                                                    reader,
+                                                    match_run.expect("external match reader has a run"),
+                                                    &mut previous_external_match,
+                                                    d,
+                                                    join_match_key(this, Some(spilled.rowid)),
+                                                )?
                                             }
                                             None => false,
                                         }
                                     } else {
-                                        local_matches.expect("local match map")[this].get()
+                                        local_matches
+                                            .expect("local match map")
+                                            .flag(this, Some(spilled.rowid))?
+                                            .get()
                                     };
                                     if !sample_includes(sample_plans[d], Some(spilled.rowid))?
                                         || already_matched
@@ -7309,11 +7414,21 @@ fn scan_source_mode<'a>(
                     let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                         let already_matched = if external_match_map {
                             match external_match_reader.as_deref_mut() {
-                                Some(reader) => external_match_contains(storage, reader, d, this)?,
+                                Some(reader) => external_match_contains(
+                                    storage,
+                                    reader,
+                                    match_run.expect("external match reader has a run"),
+                                    &mut previous_external_match,
+                                    d,
+                                    join_match_key(this, Some(rowid)),
+                                )?,
                                 None => false,
                             }
                         } else {
-                            local_matches.expect("local match map")[this].get()
+                            local_matches
+                                .expect("local match map")
+                                .flag(this, Some(rowid))?
+                                .get()
                         };
                         if !sample_includes(sample_plans[d], Some(rowid))? || already_matched {
                             Ok(true)

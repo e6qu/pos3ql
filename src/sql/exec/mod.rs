@@ -48240,7 +48240,7 @@ pub fn create_index(
         Ok(())
     };
     let validation = storage.row_scan(table_index).and_then(|scan| {
-        scan.for_each_overlay(&mut |rowid, state| {
+        let overlay = scan.for_each_overlay(&mut |rowid, state| {
             let Some(home) = storage.committed_row_home(table_index, state)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
@@ -48251,6 +48251,12 @@ pub fn create_index(
             })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
+        if overlay.is_break() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "index validation stopped before completing the scan"
+            ));
+        }
         scan.for_each_spilled_row_batch(arena, true, None, &mut |rows| {
             for spilled in rows {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];

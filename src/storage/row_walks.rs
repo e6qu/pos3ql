@@ -42,10 +42,18 @@ pub(crate) struct RowScan<'storage> {
 impl Storage {
     pub(crate) fn row_scan(&self, table_slot: usize) -> Result<RowScan<'_>, SqlError> {
         let (rowids, immutable_only) = self.row_walks.retain_scan(&self.tables[table_slot].rows)?;
-        Ok(RowScan { storage: self, table_slot, rowids, immutable_only })
+        Ok(RowScan {
+            storage: self,
+            table_slot,
+            rowids,
+            immutable_only,
+        })
     }
 
-    pub(crate) fn immutable_row_scan(&self, table_slot: usize) -> Result<Option<RowScan<'_>>, SqlError> {
+    pub(crate) fn immutable_row_scan(
+        &self,
+        table_slot: usize,
+    ) -> Result<Option<RowScan<'_>>, SqlError> {
         let scan = self.row_scan(table_slot)?;
         Ok(scan.immutable_only.then_some(scan))
     }
@@ -56,7 +64,8 @@ impl RowScan<'_> {
         &self,
         each: &mut super::RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        self.storage.for_each_retained_row_state(self.table_slot, &self.rowids, each)
+        self.storage
+            .for_each_retained_row_state(self.table_slot, &self.rowids, each)
     }
 
     pub(crate) fn for_each_spilled_row_batch<'arena, 'callback>(
@@ -67,7 +76,12 @@ impl RowScan<'_> {
         each: &mut super::SpilledRowBatchVisitor<'arena, 'callback>,
     ) -> Result<(), SqlError> {
         self.storage.for_each_spilled_row_batch(
-            self.table_slot, &self.rowids, arena, recycle_rows, decoded_columns, each,
+            self.table_slot,
+            &self.rowids,
+            arena,
+            recycle_rows,
+            decoded_columns,
+            each,
         )
     }
 }
@@ -154,7 +168,11 @@ impl RowWalkPool {
 
     fn retain_scan(&self, rows: &RowMap) -> Result<(RetainedRowIds<'_>, bool), SqlError> {
         let mut rowids = try_mutex_pool(&self.slots, "row walk slots").ok_or_else(|| {
-            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "row walk retention slots are exhausted ({})", self.slots.len())
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "row walk retention slots are exhausted ({})",
+                self.slots.len()
+            )
         })?;
         rowids.clear();
         let immutable_only;
@@ -163,9 +181,9 @@ impl RowWalkPool {
             immutable_only = rows.is_empty();
             for (&rowid, state) in rows.iter() {
                 if !Storage::redundant_spilled_row_state(state) {
-                    rowids.push(rowid).map_err(|error| {
-                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error)
-                    })?;
+                    rowids
+                        .push(rowid)
+                        .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
                 }
             }
         }
@@ -306,30 +324,30 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 let mut count = 0;
                 let scan = storage.row_scan(table).unwrap();
-                scan
-                    .for_each_overlay( &mut |rowid, state| {
-                        assert_eq!(rowid, 1);
-                        let image = storage
-                            .visible_row_home_at(table, rowid, state, 8, SNAPSHOT_ALL, 7)?
-                            .unwrap();
-                        assert!(storage.tables[table].rows.test_write().is_ok());
-                        assert!(storage.row_versions.test_write().is_ok());
-                        start.store(true, Ordering::Release);
-                        let deadline = Instant::now() + Duration::from_secs(5);
-                        while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
-                            std::thread::yield_now();
-                        }
-                        progressed = completed.load(Ordering::Acquire);
-                        storage.with_row_bytes(table, rowid, image, |bytes| {
-                            let mut values = [Datum::Null];
-                            super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
-                            assert_eq!(values[0], Datum::Int4(1));
-                            Ok(())
-                        })?;
-                        count += 1;
-                        Ok(core::ops::ControlFlow::Continue(()))
-                    })
-                    .unwrap();
+                let overlay = scan.for_each_overlay(&mut |rowid, state| {
+                    assert_eq!(rowid, 1);
+                    let image = storage
+                        .visible_row_home_at(table, rowid, state, 8, SNAPSHOT_ALL, 7)?
+                        .unwrap();
+                    assert!(storage.tables[table].rows.test_write().is_ok());
+                    assert!(storage.row_versions.test_write().is_ok());
+                    start.store(true, Ordering::Release);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    progressed = completed.load(Ordering::Acquire);
+                    storage.with_row_bytes(table, rowid, image, |bytes| {
+                        let mut values = [Datum::Null];
+                        super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                        assert_eq!(values[0], Datum::Int4(1));
+                        Ok(())
+                    })?;
+                    count += 1;
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
+                assert!(overlay.is_continue());
                 assert_eq!(
                     count, 1,
                     "a later insertion is outside the retained row set"
@@ -447,7 +465,11 @@ mod tests {
     fn retained_byte_scan_filters_redundant_entries_and_releases_on_error() {
         let (mut storage, table) = fixture();
         let mut redundant = *storage.resident_row_state(table, 1).unwrap();
-        redundant.committed = Some(RowHome::Spilled { len: 4, sst: 0, commit_lsn: 7 });
+        redundant.committed = Some(RowHome::Spilled {
+            len: 4,
+            sst: 0,
+            commit_lsn: 7,
+        });
         redundant.checkpoint_change_lsn = 0;
         storage.tables[table].rows.insert(2, redundant).unwrap();
         crate::mem::guard::forbid_alloc(|| {
@@ -465,10 +487,14 @@ mod tests {
                 Err(sql_err!(sqlstate::INTERNAL_ERROR, "scan callback failure"))
             });
             assert_eq!(failure.unwrap_err().sqlstate, sqlstate::INTERNAL_ERROR);
-            assert!(scan.for_each_overlay(&mut |_, state| {
-                drop(state);
-                Ok(core::ops::ControlFlow::Break(()))
-            }).unwrap().is_break());
+            assert!(
+                scan.for_each_overlay(&mut |_, state| {
+                    drop(state);
+                    Ok(core::ops::ControlFlow::Break(()))
+                })
+                .unwrap()
+                .is_break()
+            );
             drop(scan);
             assert!(storage.row_scan(table).is_ok());
         });
@@ -481,13 +507,17 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let scan = storage.immutable_row_scan(table).unwrap().unwrap();
             let location = storage.heap.append_row(&[Datum::Int4(2)]).unwrap();
-            let undo = storage.write_pending(table, 2, 7, 1, Some(location)).unwrap();
+            let undo = storage
+                .write_pending(table, 2, 7, 1, Some(location))
+                .unwrap();
             assert!(storage.immutable_row_scan(table).unwrap().is_none());
             let mut count = 0;
-            scan.for_each_overlay(&mut |_, _| {
+            let overlay = scan.for_each_overlay(&mut |_, _| {
                 count += 1;
                 Ok(core::ops::ControlFlow::Continue(()))
-            }).unwrap();
+            })
+            .unwrap();
+            assert!(overlay.is_continue());
             assert_eq!(count, 0, "later overlays cannot alter an admitted scan");
             storage.restore_pending(table, 2, 7, undo);
         });

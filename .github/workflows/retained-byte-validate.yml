@@ -1,0 +1,41 @@
+name: Retained byte scan validation
+on:
+  push:
+    branches: [codex/retained-byte-scans]
+concurrency:
+  group: retained-byte-scan-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_INCREMENTAL: 0
+      RUST_MIN_STACK: 134217728
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Runner formatting patch
+        run: |
+          cargo fmt
+          git diff -- src > "$RUNNER_TEMP/format.patch"
+      - name: Compile and lint
+        run: |
+          cargo check --all-targets --locked
+          cargo clippy --lib --bins --locked -- -D warnings
+      - name: Retained ownership and SST recovery
+        run: |
+          cargo test --lib --locked retained_byte_scan -- --test-threads=1
+          cargo test --lib --locked retained_row_walk -- --test-threads=1
+          cargo test --lib --locked right_and_full_outer_joins -- --test-threads=1
+      - name: Documentation and architecture guards
+        run: |
+          bash tools/check-bugs.sh
+          bash tools/check-noops.sh
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: retained-byte-scan-format
+          path: ${{ runner.temp }}/format.patch

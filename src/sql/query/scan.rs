@@ -5652,11 +5652,10 @@ fn scan_source_mode<'a>(
                     insert_derived!(bytes);
                 }
             } else if let Some(demand) = pax_demand.selected_mask(build_t)
-                && storage.spill_rows_are_unshadowed(build_slot)
+                && let Some(scan) = storage.immutable_row_scan(build_slot)?
             {
                 storage.record_relation_scan(txid, build_slot, None, 0)?;
-                storage.for_each_spilled_row_batch(
-                    build_slot,
+                scan.for_each_spilled_row_batch(
                     arena,
                     false,
                     Some(demand),
@@ -5736,12 +5735,11 @@ fn scan_source_mode<'a>(
             let probe_schema = &probe_schema[..scope.row_width(probe_t)];
             if scope.derived[probe_t].is_none()
                 && let Some(demand) = pax_demand.selected_mask(probe_t)
-                && storage.spill_rows_are_unshadowed(probe_slot)
+                && let Some(scan) = storage.immutable_row_scan(probe_slot)?
             {
                 storage.record_relation_scan(txid, probe_slot, None, 0)?;
                 let mut stopped = false;
-                storage.for_each_spilled_row_batch(
-                    probe_slot,
+                scan.for_each_spilled_row_batch(
                     arena,
                     recycle_rows,
                     Some(demand),
@@ -6360,9 +6358,8 @@ fn scan_source_mode<'a>(
             }};
         }
         macro_rules! visit_spilled_rows {
-            ($slot:expr, $index:ident, $aborted:ident) => {{
-                storage.for_each_spilled_row_batch(
-                    $slot,
+            ($slot:expr, $scan:ident, $index:ident, $aborted:ident) => {{
+                $scan.for_each_spilled_row_batch(
                     arena,
                     recycle_rows,
                     pax_demand.selected_mask(order[depth]),
@@ -6400,9 +6397,10 @@ fn scan_source_mode<'a>(
         macro_rules! visit_sequential_physical_rows {
             ($slot:expr) => {{
                 storage.record_relation_scan(txid, $slot, None, 0)?;
+                let scan = storage.row_scan($slot)?;
                 let mut index = 0usize;
                 let mut aborted = false;
-                let _ = storage.for_each_scan_overlay_row_state($slot, &mut |rowid, state| {
+                let _ = scan.for_each_overlay(&mut |rowid, state| {
                     use core::ops::ControlFlow;
                     check_timeout()?;
                     let Some(home) = storage.visible_row_home($slot, rowid, state, txid)? else {
@@ -6424,7 +6422,7 @@ fn scan_source_mode<'a>(
                 if !aborted {
                     // Spill entries shadowed by the overlay are omitted by
                     // the merged cursor; their resident versions ran first.
-                    visit_spilled_rows!($slot, index, aborted);
+                    visit_spilled_rows!($slot, scan, index, aborted);
                 }
                 if aborted {
                     return Ok(false);
@@ -7345,12 +7343,11 @@ fn scan_source_mode<'a>(
                     }
                 }
             } else if let Some(demand) = pax_demand.selected_mask(d)
-                && storage.spill_rows_are_unshadowed(scope.slots[d])
+                && let Some(scan) = storage.immutable_row_scan(scope.slots[d])?
             {
                 let mut index = 0usize;
                 let mut done = false;
-                storage.for_each_spilled_row_batch(
-                    scope.slots[d],
+                scan.for_each_spilled_row_batch(
                     arena,
                     recycle_rows,
                     Some(demand),

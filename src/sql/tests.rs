@@ -118,6 +118,58 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
     engine
         .storage
         .restore_pending(table, rowids[1], 777, replacement.unwrap());
+    // The optimized overlay and payload phases must keep the same partition
+    // even when the first callback removes its overlay and installs another.
+    let arena = Arena::new(&mut budget, "retained byte scan fixture", 1 << 20).unwrap();
+    let original = engine.storage.write_pending_untracked(
+        table, rowids[0], 777, 1, Some(location),
+    ).unwrap();
+    let scan = engine.storage.row_scan(table).unwrap();
+    let mut count = 0;
+    let mut seen = [0u64; 2];
+    let mut values = [0i32; 2];
+    let mut replacement = None;
+    scan.for_each_overlay(&mut |rowid, state| {
+        let image = engine.storage.visible_row_home_at(
+            table, rowid, state, 888, crate::storage::SNAPSHOT_ALL, u64::MAX,
+        )?.unwrap();
+        engine.storage.with_row_bytes(table, rowid, image, |bytes| {
+            let mut decoded = [Datum::Null];
+            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)?;
+            let Datum::Int4(value) = decoded[0] else { panic!("integer fixture") };
+            seen[count] = rowid;
+            values[count] = value;
+            count += 1;
+            Ok(())
+        })?;
+        engine.storage.restore_pending(table, rowid, 777, original);
+        replacement = Some(engine.storage.write_pending_untracked(
+            table, rowids[1], 777, 1, Some(location),
+        )?);
+        Ok(core::ops::ControlFlow::Continue(()))
+    }).unwrap();
+    scan.for_each_spilled_row_batch(&arena, true, None, &mut |rows| {
+        for row in rows {
+            let mut decoded = [Datum::Null];
+            let decoded = match row.representation {
+                crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)?;
+                    &decoded[..]
+                }
+                crate::storage::SpilledRowRepresentation::Values(values) => values,
+            };
+            let Datum::Int4(value) = decoded[0] else { panic!("integer fixture") };
+            seen[count] = row.rowid;
+            values[count] = value;
+            count += 1;
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    }).unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(seen, rowids);
+    assert_eq!(values, [1, 2], "optimized scan coverage is frozen across phases");
+    drop(scan);
+    engine.storage.restore_pending(table, rowids[1], 777, replacement.unwrap());
     session.success(&mut engine, "INSERT INTO retained_walk VALUES (3)", false);
     let join = "SELECT l.id, r.id FROM \
                 (SELECT id FROM retained_walk WHERE id <= 2) l \

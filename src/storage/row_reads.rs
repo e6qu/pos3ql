@@ -61,6 +61,12 @@ impl RowRead<'_> {
         pending_last(&self.versions()?.pending_row_versions, self.state.pending)
     }
 
+    pub(super) fn pending_head_identity(&self) -> Option<u64> {
+        self.state.pending.tail.map(|slot| {
+            self.versions().expect("resident pending chain").pending_row_versions[slot].identity
+        })
+    }
+
     pub(crate) fn history_get(&self, index: usize) -> Option<CommittedVersion> {
         committed_history_get(
             &self.versions()?.committed_row_versions,

@@ -4,7 +4,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use core::mem::size_of;
 use core::ops::{Index, IndexMut};
-use std::sync::{RwLock, RwLockReadGuard};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{
     CommittedHistory, CommittedVersion, CommittedVersionSlot, PendingChange, PendingVersionSlot,
@@ -94,6 +94,10 @@ impl RowVersionPools {
 
     pub(super) fn read(&self) -> RwLockReadGuard<'_, RowVersionState> {
         self.state.read().expect("row-version pool lock poisoned")
+    }
+
+    pub(super) fn write(&self) -> RwLockWriteGuard<'_, RowVersionState> {
+        self.state.write().expect("row-version pool lock poisoned")
     }
 
     #[cfg(test)]

@@ -16,6 +16,7 @@ mod row_heap;
 mod row_images;
 mod row_map;
 mod row_reads;
+mod row_publication;
 mod row_versions;
 pub(crate) mod rowenc;
 
@@ -31316,213 +31317,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Appends one immutable uncommitted row version and its rollback token.
-    /// A conflicting transaction becomes a wait-graph edge; the protocol parks
-    /// and retries after the owner ends.
-    pub fn write_pending(
-        &mut self,
-        table_index: usize,
-        rowid: u64,
-        txid: u32,
-        cid: u32,
-        loc: Option<RowLoc>,
-    ) -> Result<PendingWriteUndo, SqlError> {
-        self.write_pending_inner(table_index, rowid, txid, cid, loc, true)
-    }
-
-    /// Row rewrites and WAL reconstruction use the same MVCC transition but
-    /// are not executor INSERT/UPDATE/DELETE operations.
-    pub(crate) fn write_pending_untracked(
-        &mut self,
-        table_index: usize,
-        rowid: u64,
-        txid: u32,
-        cid: u32,
-        loc: Option<RowLoc>,
-    ) -> Result<PendingWriteUndo, SqlError> {
-        self.write_pending_inner(table_index, rowid, txid, cid, loc, false)
-    }
-
-    fn write_pending_inner(
-        &mut self,
-        table_index: usize,
-        rowid: u64,
-        txid: u32,
-        cid: u32,
-        loc: Option<RowLoc>,
-        track_statistics: bool,
-    ) -> Result<PendingWriteUndo, SqlError> {
-        // Exclusive storage ownership keeps this validation valid through
-        // publication, including rewrite paths that skip physical comparison.
-        if let Some(location) = loc {
-            self.heap.get(location)?;
-        }
-        if let Some(owner) = self.tables[table_index]
-            .pending_definition_transaction()
-            .filter(|owner| *owner != txid)
-        {
-            self.wait_for_transaction(txid, owner)?;
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
-                "statement is waiting for a concurrent table definition change"
-            ));
-        }
-        let oldest_snapshot = self.oldest_snapshot();
-        let conflicting_owner = self
-            .resident_row_state(table_index, rowid)
-            .and_then(|state| state.locked_by_other(txid));
-        if let Some(owner) = conflicting_owner {
-            self.wait_for_transaction(txid, owner)?;
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
-                "statement is waiting for a concurrent row update"
-            ));
-        }
-        let existed = match self.resident_row_state(table_index, rowid) {
-            Some(state) => state
-                .visible_at(txid, SNAPSHOT_ALL, u64::MAX)
-                .flatten()
-                .is_some(),
-            None => self
-                .spill_probe_at(table_index, rowid, u64::MAX)?
-                .is_some_and(|version| version.len.is_some()),
-        };
-        if let Some(state) = self.tables[table_index].rows.get(&rowid) {
-            let (changed_columns, changes_existence) = self.pending_change_footprint(
-                table_index,
-                rowid,
-                state.committed,
-                loc,
-                txid,
-                track_statistics,
-            )?;
-            {
-                let row_versions = self.row_versions.exclusive();
-                let (tables, versions) =
-                    (&mut self.tables, &mut row_versions.committed_row_versions);
-                let state = tables[table_index]
-                    .rows
-                    .get_mut(&rowid)
-                    .expect("row state was just observed");
-                prune_committed_history(versions, &mut state.history, oldest_snapshot);
-            }
-            let state = self.tables[table_index]
-                .rows
-                .get(&rowid)
-                .expect("row state was just observed");
-            if oldest_snapshot.is_some()
-                && state.pending.is_none()
-                && (state.committed.is_some() || state.committed_lsn != 0)
-                && state.history.len() == self.max_row_versions_per_row
-            {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "active snapshot history for row {} reached max_row_versions_per_row ({})",
-                    rowid,
-                    self.max_row_versions_per_row
-                ));
-            }
-            let row_versions = self.row_versions.exclusive();
-            let (tables, versions) = (&mut self.tables, &mut row_versions.pending_row_versions);
-            let state = tables[table_index]
-                .rows
-                .get_mut(&rowid)
-                .expect("row state was just observed");
-            let undo = push_pending_version(
-                versions,
-                &mut state.pending,
-                self.max_row_versions_per_row,
-                PendingChange {
-                    txid,
-                    cid,
-                    loc,
-                    changed_columns,
-                    changes_existence,
-                },
-            )?;
-            if track_statistics
-                && let Err(error) =
-                    self.record_relation_write(txid, table_index, existed, loc.is_some())
-            {
-                self.restore_pending(table_index, rowid, txid, undo);
-                return Err(error);
-            }
-            return Ok(undo);
-        }
-        // An absent entry no longer means an absent row: the spill list may
-        // hold its committed image, and that image must ride into the entry
-        // — a pending change with `committed: None` would hide the old
-        // value from uniqueness scans and resurrect wrongly on rollback.
-        let committed = self
-            .spill_probe_at(table_index, rowid, u64::MAX)?
-            .and_then(|version| {
-                version.len.map(|len| RowHome::Spilled {
-                    len,
-                    sst: version.member,
-                    commit_lsn: version.commit_lsn,
-                })
-            });
-        let committed_lsn = committed.map_or(0, |home| match home {
-            RowHome::Heap(_) => 0,
-            RowHome::Spilled { commit_lsn, .. } => commit_lsn,
-        });
-        let (changed_columns, changes_existence) = self.pending_change_footprint(
-            table_index,
-            rowid,
-            committed,
-            loc,
-            txid,
-            track_statistics,
-        )?;
-        let table = &mut self.tables[table_index];
-        if table.rows.len() == table.rows.capacity() {
-            // Entries the spill lists reproduce are droppable on demand.
-            self.evict_redundant_entries(table_index);
-            if self.tables[table_index].rows.len() == self.tables[table_index].rows.capacity() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table row limit reached ({} rows in memtable)",
-                    self.tables[table_index].rows.capacity()
-                ));
-            }
-        }
-        let mut pending = PendingVersions::empty();
-        let row_versions = self.row_versions.exclusive();
-        let undo = push_pending_version(
-            &mut row_versions.pending_row_versions,
-            &mut pending,
-            self.max_row_versions_per_row,
-            PendingChange {
-                txid,
-                cid,
-                loc,
-                changed_columns,
-                changes_existence,
-            },
-        )?;
-        self.tables[table_index]
-            .rows
-            .insert(
-                rowid,
-                RowState {
-                    committed,
-                    committed_lsn,
-                    checkpoint_change_lsn: 0,
-                    history: CommittedHistory::empty(),
-                    pending,
-                },
-            )
-            .expect("capacity checked above");
-        if track_statistics
-            && let Err(error) =
-                self.record_relation_write(txid, table_index, existed, loc.is_some())
-        {
-            self.restore_pending(table_index, rowid, txid, undo);
-            return Err(error);
-        }
-        Ok(undo)
-    }
-
     /// Compares canonical physical column payloads without allocating or
     /// decoding variable-width values. The comparison happens on the
     /// fallible, pre-commit write path: commit itself must never discover that
@@ -31596,29 +31390,9 @@ impl Storage {
     /// probe synthesize the identical state after the entry is gone. This
     /// is what unbinds a table's row count from `table_rows`: the map holds
     /// the working set, the bucket holds the rest.
-    pub fn evict_redundant_entries(&mut self, slot: usize) {
-        let table = &mut self.tables[slot];
-        if table.n_spill_ssts == 0 {
-            return;
-        }
-        loop {
-            let mut batch = [0u64; 512];
-            let mut n = 0usize;
-            for (rowid, state) in table.rows.iter() {
-                if Self::redundant_spilled_row_state(&state) {
-                    batch[n] = rowid;
-                    n += 1;
-                    if n == batch.len() {
-                        break;
-                    }
-                }
-            }
-            if n == 0 {
-                return;
-            }
-            for &rowid in &batch[..n] {
-                table.rows.remove(&rowid);
-            }
+    pub fn evict_redundant_entries(&self, slot: usize) {
+        if self.tables[slot].n_spill_ssts != 0 {
+            Self::evict_redundant_rows(&mut self.tables[slot].rows.write());
         }
     }
 
@@ -31686,40 +31460,6 @@ impl Storage {
                 continue;
             }
             self.evict_redundant_entries(i);
-        }
-    }
-
-    /// Undo one immutable pending append without adopting a reused head.
-    pub fn restore_pending(
-        &mut self,
-        table_index: usize,
-        rowid: u64,
-        txid: u32,
-        undo: PendingWriteUndo,
-    ) {
-        let Some(state) = self.tables[table_index].rows.get(&rowid) else {
-            return;
-        };
-        let Some(slot) = state.pending.tail else {
-            return;
-        };
-        {
-            let versions = self.row_versions.read();
-            let head = versions.pending_row_versions[slot];
-            if head.identity != undo.identity || head.change.txid != txid {
-                return;
-            }
-        }
-        let versions = self.row_versions.exclusive();
-        let state = self.tables[table_index]
-            .rows
-            .get_mut(&rowid)
-            .expect("row was observed");
-        pop_pending_version(&mut versions.pending_row_versions, &mut state.pending);
-        if (state.committed.is_none() && state.history.is_empty() && state.pending.is_none())
-            || Self::redundant_spilled_row_state(state)
-        {
-            self.tables[table_index].rows.remove(&rowid);
         }
     }
 
@@ -53380,7 +53120,7 @@ mod tests {
         assert_eq!(AccessClass::from_u8(u8::MAX), None);
     }
 
-    fn test_config() -> Config {
+    pub(super) fn test_config() -> Config {
         let mut c = Config::default_dev();
         c.memtable_bytes = 1 << 16;
         c.max_connections = 2;
@@ -53394,7 +53134,7 @@ mod tests {
         c
     }
 
-    fn test_budget(config: &Config) -> Budget {
+    pub(super) fn test_budget(config: &Config) -> Budget {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
     }
 
@@ -55529,7 +55269,7 @@ mod tests {
         assert_eq!(image.name.as_str(), "shared");
     }
 
-    fn make_def(name: &str, columns: &[(&str, ColType, bool)]) -> TableDef {
+    pub(super) fn make_def(name: &str, columns: &[(&str, ColType, bool)]) -> TableDef {
         let mut def = TableDef {
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse(name).unwrap(),

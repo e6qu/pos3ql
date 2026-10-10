@@ -79,9 +79,15 @@ impl Storage {
     ) -> Result<RowScan<'scan>, SqlError> {
         let rows = self.tables[table_slot].rows.read();
         let immutable_only = rows.is_empty();
-        let count = rows.iter().filter(|(_, state)| !Self::redundant_spilled_row_state(state)).count();
+        let count = rows
+            .iter()
+            .filter(|(_, state)| !Self::redundant_spilled_row_state(state))
+            .count();
         let rowids = arena.alloc_slice_with(count, |_| 0u64).map_err(|_| {
-            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "retained byte scan identities exceed the statement arena")
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "retained byte scan identities exceed the statement arena"
+            )
         })?;
         let mut index = 0;
         for (&rowid, state) in rows.iter() {
@@ -594,26 +600,36 @@ mod tests {
         let count = MAX_ROW_WALK_NESTING + 1;
         let mut budget = Budget::new(count * size_of::<u64>());
         let arena = crate::mem::arena::Arena::new(
-            &mut budget, "retained scan identities", count * size_of::<u64>(),
-        ).unwrap();
+            &mut budget,
+            "retained scan identities",
+            count * size_of::<u64>(),
+        )
+        .unwrap();
         let mut scans = Vec::with_capacity(count);
         crate::mem::guard::forbid_alloc(|| {
             for _ in 0..count {
                 scans.push(storage.row_scan_in(table, &arena).unwrap());
             }
-            assert!(storage.row_scan(table).is_ok(), "SQL scans do not consume metadata walk leases");
+            assert!(
+                storage.row_scan(table).is_ok(),
+                "SQL scans do not consume metadata walk leases"
+            );
             assert_eq!(
                 storage.row_scan_in(table, &arena).err().unwrap().sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
             for scan in &scans {
                 assert!(scan.rowids.contains(1));
-                assert!(scan.for_each_overlay(&mut |rowid, state| {
-                    assert_eq!(rowid, 1);
-                    drop(state);
-                    assert!(storage.tables[table].rows.test_write().is_ok());
-                    Ok(core::ops::ControlFlow::Continue(()))
-                }).unwrap().is_continue());
+                assert!(
+                    scan.for_each_overlay(&mut |rowid, state| {
+                        assert_eq!(rowid, 1);
+                        drop(state);
+                        assert!(storage.tables[table].rows.test_write().is_ok());
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })
+                    .unwrap()
+                    .is_continue()
+                );
             }
         });
     }

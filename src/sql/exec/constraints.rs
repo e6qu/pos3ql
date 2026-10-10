@@ -16,7 +16,7 @@ use crate::sql::eval::{
 use crate::sql::txn::TxnState;
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{MAX_COLUMNS, RowHome, Storage, TableDef, rowenc};
+use crate::storage::{MAX_COLUMNS, Storage, TableDef, rowenc};
 
 use super::{RowCtx, check_not_null};
 

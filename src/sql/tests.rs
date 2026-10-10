@@ -20,7 +20,10 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     session.success(&mut engine,
         "CREATE TABLE retained_walk(id integer PRIMARY KEY); INSERT INTO retained_walk VALUES (1), (2)", true);
-    let table = engine.storage.find_table("public", "retained_walk").unwrap();
+    let table = engine
+        .storage
+        .find_table("public", "retained_walk")
+        .unwrap();
     let mut rowids = [0u64; 2];
     for (index, (rowid, _)) in engine.storage.resident_rows(table).iter().enumerate() {
         rowids[index] = rowid;
@@ -29,37 +32,78 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
     assert!(engine.checkpoint().unwrap());
     assert_eq!(engine.storage.table(table).n_spill_ssts, 1);
     engine.storage.evict_redundant_entries(table);
-    assert!(engine.storage.resident_row_state(table, rowids[0]).is_none());
-    assert!(engine.storage.resident_row_state(table, rowids[1]).is_none());
+    assert!(
+        engine
+            .storage
+            .resident_row_state(table, rowids[0])
+            .is_none()
+    );
+    assert!(
+        engine
+            .storage
+            .resident_row_state(table, rowids[1])
+            .is_none()
+    );
     let location = engine.storage.heap.append_row(&[Datum::Int4(99)]).unwrap();
-    let original = engine.storage.write_pending_untracked(table, rowids[0], 777, 1, Some(location)).unwrap();
+    let original = engine
+        .storage
+        .write_pending_untracked(table, rowids[0], 777, 1, Some(location))
+        .unwrap();
     let mut replacement = None;
     let mut seen = [0u64; 2];
     let mut values = [0i32; 2];
     let mut count = 0;
-    engine.storage.for_each_row_state(table, &mut |rowid, state| {
-        let image = engine.storage.visible_row_home_at(table, rowid, state, 888,
-            crate::storage::SNAPSHOT_ALL, u64::MAX)?.unwrap();
-        engine.storage.with_row_bytes(table, rowid, image, |bytes| {
-            let mut row = [Datum::Null];
-            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut row)?;
-            let Datum::Int4(value) = row[0] else { panic!("integer fixture") };
-            seen[count] = rowid;
-            values[count] = value;
-            count += 1;
-            Ok(())
-        })?;
-        if rowid == rowids[0] {
-            engine.storage.restore_pending(table, rowid, 777, original);
-            assert!(engine.storage.resident_row_state(table, rowid).is_none());
-            replacement = Some(engine.storage.write_pending_untracked(table, rowids[1], 777, 1, Some(location))?);
-        }
-        Ok(core::ops::ControlFlow::Continue(()))
-    }).unwrap();
+    engine
+        .storage
+        .for_each_row_state(table, &mut |rowid, state| {
+            let image = engine
+                .storage
+                .visible_row_home_at(
+                    table,
+                    rowid,
+                    state,
+                    888,
+                    crate::storage::SNAPSHOT_ALL,
+                    u64::MAX,
+                )?
+                .unwrap();
+            engine
+                .storage
+                .with_row_bytes(table, rowid, image, |bytes| {
+                    let mut row = [Datum::Null];
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut row)?;
+                    let Datum::Int4(value) = row[0] else {
+                        panic!("integer fixture")
+                    };
+                    seen[count] = rowid;
+                    values[count] = value;
+                    count += 1;
+                    Ok(())
+                })?;
+            if rowid == rowids[0] {
+                engine.storage.restore_pending(table, rowid, 777, original);
+                assert!(engine.storage.resident_row_state(table, rowid).is_none());
+                replacement = Some(engine.storage.write_pending_untracked(
+                    table,
+                    rowids[1],
+                    777,
+                    1,
+                    Some(location),
+                )?);
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })
+        .unwrap();
     assert_eq!(count, 2);
     assert_eq!(seen, rowids);
-    assert_eq!(values, [1, 2], "eviction cannot duplicate a row or hide an uncaptured SST row");
-    engine.storage.restore_pending(table, rowids[1], 777, replacement.unwrap());
+    assert_eq!(
+        values,
+        [1, 2],
+        "eviction cannot duplicate a row or hide an uncaptured SST row"
+    );
+    engine
+        .storage
+        .restore_pending(table, rowids[1], 777, replacement.unwrap());
     session.success(&mut engine, "INSERT INTO retained_walk VALUES (3)", false);
     assert!(engine.checkpoint().unwrap());
     drop(session);
@@ -67,8 +111,14 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
-    assert_eq!(data_rows(&run_with(&mut cold, &mut cold_budget,
-        "SELECT id FROM retained_walk ORDER BY id")), ["1", "2", "3"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT id FROM retained_walk ORDER BY id"
+        )),
+        ["1", "2", "3"]
+    );
     drop(cold);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

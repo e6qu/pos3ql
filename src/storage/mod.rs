@@ -30,12 +30,12 @@ use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::RowMap;
 pub(crate) use row_reads::RowRead;
 use row_reads::{RowReadView, RowReadVisitor};
-use row_walks::{RetainedRowIds, RowWalkPool};
 use row_versions::{
     RowVersionPools, clear_pending_versions, pending_last, pop_pending_version,
     prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
     release_pending_chain,
 };
+use row_walks::{RetainedRowIds, RowWalkPool};
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -29483,26 +29483,46 @@ impl Storage {
             return Ok(());
         }
         // Then everything that lives only in the bucket, synthesized.
-        self.spill_merged_walk(table_slot, &rowids, &mut |rowid, len, member, commit_lsn| {
-            each(
-                rowid,
-                RowRead::immutable(RowState {
-                    committed: Some(RowHome::Spilled {
-                        len,
-                        sst: member,
-                        commit_lsn,
+        self.spill_merged_walk(
+            table_slot,
+            &rowids,
+            &mut |rowid, len, member, commit_lsn| {
+                each(
+                    rowid,
+                    RowRead::immutable(RowState {
+                        committed: Some(RowHome::Spilled {
+                            len,
+                            sst: member,
+                            commit_lsn,
+                        }),
+                        committed_lsn: commit_lsn,
+                        checkpoint_change_lsn: 0,
+                        history: CommittedHistory::empty(),
+                        pending: PendingVersions::empty(),
                     }),
-                    committed_lsn: commit_lsn,
-                    checkpoint_change_lsn: 0,
-                    history: CommittedHistory::empty(),
-                    pending: PendingVersions::empty(),
-                }),
-            )
-        })
+                )
+            },
+        )
     }
 
     pub(crate) fn resident_rows(&self, table_slot: usize) -> RowReadView<'_> {
         RowReadView::new(&self.row_versions, &self.tables[table_slot].rows)
+    }
+
+    pub(crate) fn for_each_resident_row_state(
+        &self,
+        table_slot: usize,
+        each: &mut RowReadVisitor<'_>,
+    ) -> Result<core::ops::ControlFlow<()>, SqlError> {
+        let rowids = self.row_walks.retain(&self.tables[table_slot].rows)?;
+        for rowid in rowids.iter() {
+            if let Some(state) = self.resident_row_state(table_slot, rowid)
+                && each(rowid, state)?.is_break()
+            {
+                return Ok(core::ops::ControlFlow::Break(()));
+            }
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
     }
 
     fn for_each_retained_row_state(

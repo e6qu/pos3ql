@@ -338,28 +338,32 @@ mod tests {
         config.max_connections = 1;
         config.max_prepared_transactions = 0;
         config.txn_rows = 1;
-        config.table_rows = 2;
+        let capacity = pending_row_version_capacity(&config) as u64;
+        config.table_rows = capacity as usize + 1;
         let (storage, table) = fixture(&config);
         let location = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let undo = storage
                 .write_pending(table, 1, 7, 1, Some(location))
                 .unwrap();
+            for rowid in 2..=capacity {
+                storage.write_pending(table, rowid, 7, 1, Some(location)).unwrap();
+            }
             assert_eq!(
                 storage
-                    .write_pending(table, 2, 7, 1, Some(location))
+                    .write_pending(table, capacity + 1, 7, 1, Some(location))
                     .unwrap_err()
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
-            assert!(storage.resident_row_state(table, 2).is_none());
+            assert!(storage.resident_row_state(table, capacity + 1).is_none());
             assert_eq!(
                 storage.cumulative_statistics().relation_transactions[0].n_tup_ins,
-                1
+                capacity
             );
             storage.restore_pending(table, 1, 7, undo);
             storage
-                .write_pending(table, 2, 7, 1, Some(location))
+                .write_pending(table, capacity + 1, 7, 1, Some(location))
                 .unwrap();
             assert!(storage.resident_row_state(table, 1).is_none());
         });

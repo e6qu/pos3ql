@@ -18,6 +18,7 @@ mod row_map;
 mod row_publication;
 mod row_reads;
 mod row_versions;
+mod row_walks;
 pub(crate) mod rowenc;
 
 pub(crate) use definition_images::TableDefinitionImages;
@@ -29,6 +30,7 @@ use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::RowMap;
 pub(crate) use row_reads::RowRead;
 use row_reads::{RowReadView, RowReadVisitor};
+use row_walks::{RetainedRowIds, RowWalkPool};
 use row_versions::{
     RowVersionPools, clear_pending_versions, pending_last, pop_pending_version,
     prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
@@ -13508,6 +13510,7 @@ pub struct Storage {
     table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
     row_versions: RowVersionPools,
+    row_walks: RowWalkPool,
     large_objects: std::sync::Mutex<LargeObjectCatalog>,
     large_object_page_table: u32,
     max_catalog_versions_per_object: u32,
@@ -17235,6 +17238,7 @@ impl Storage {
                 .saturating_mul(size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>())
             + RowHeap::control_bytes()
             + RowVersionPools::control_bytes()
+            + RowWalkPool::budget_bytes(config)
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
             + Self::table_definition_image_budget_bytes(config)
             + committed_row_version_capacity(config)
@@ -17367,6 +17371,7 @@ impl Storage {
             "table spill-generation rosters",
         )?;
         let row_versions = RowVersionPools::new(config, budget)?;
+        let row_walks = RowWalkPool::new(config, budget)?;
         let pending_table_defs =
             DefinitionVersions::new(budget, pending_table_definition_capacity(config))?;
         let pending_table_statistics = FixedVec::new(
@@ -18110,6 +18115,7 @@ impl Storage {
             table_definition_images,
             max_row_versions_per_row: config.max_row_versions_per_row,
             row_versions,
+            row_walks,
             large_objects: std::sync::Mutex::new(LargeObjectCatalog {
                 definitions: large_objects,
                 next_oid: LargeObjectOid::parse(16_384),
@@ -28570,8 +28576,8 @@ impl Storage {
     }
 
     /// The merged walk behind the row-state seam: every SST-resident rowid
-    /// of `slot`'s spill list that no map entry shadows, in ascending rowid
-    /// order — the newest member's verdict wins a rowid, and a tombstone
+    /// of `slot`'s spill list not covered by the retained overlay, in ascending
+    /// rowid order. The newest member's verdict wins a rowid, and a tombstone
     /// verdict suppresses it. Cursors keep one resident data block per
     /// member (leased from the spill reader's context pool), advancing
     /// through the sparse index; only keys are parsed here — row bytes are
@@ -28579,6 +28585,7 @@ impl Storage {
     fn spill_merged_walk(
         &self,
         slot: usize,
+        overlay_rowids: &RetainedRowIds<'_>,
         emit: &mut dyn FnMut(u64, u32, u32, u64) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<(), SqlError> {
         let table = &self.tables[slot];
@@ -28672,7 +28679,7 @@ impl Storage {
                 member,
                 commit_lsn,
             }) = verdict
-                && self.tables[slot].rows.get(&rowid).is_none()
+                && !overlay_rowids.contains(rowid)
                 && emit(rowid, len, member, commit_lsn)?.is_break()
             {
                 return Ok(());
@@ -29454,9 +29461,10 @@ impl Storage {
     /// The one place a table's row states are enumerated. The bounded map is
     /// an overlay of pending changes and hot/resident rows; the merged SST
     /// walk synthesizes every remaining snapshot-visible state directly from
-    /// the provider-neutral object store through the cache tiers. The callback
-    /// therefore takes state by value, and errors stay visible to every SQL
-    /// consumer.
+    /// the provider-neutral object store through the cache tiers. The walk
+    /// retains overlay row identities before callbacks. Each resident image
+    /// owns its chain only until selected bytes are pinned; errors stay visible
+    /// to every SQL consumer.
     ///
     /// `Break` stops the walk early; the callback's own error aborts it.
     pub(crate) fn for_each_row_state(
@@ -29464,10 +29472,9 @@ impl Storage {
         table_slot: usize,
         each: &mut RowReadVisitor<'_>,
     ) -> Result<(), SqlError> {
-        // The overlay first: pending changes and hot rows, whose entries
-        // shadow anything the spill list holds for the same rowid.
+        let rowids = self.row_walks.retain(&self.tables[table_slot].rows)?;
         if self
-            .for_each_resident_row_state(table_slot, each)?
+            .for_each_retained_row_state(table_slot, &rowids, each)?
             .is_break()
         {
             return Ok(());
@@ -29476,7 +29483,7 @@ impl Storage {
             return Ok(());
         }
         // Then everything that lives only in the bucket, synthesized.
-        self.spill_merged_walk(table_slot, &mut |rowid, len, member, commit_lsn| {
+        self.spill_merged_walk(table_slot, &rowids, &mut |rowid, len, member, commit_lsn| {
             each(
                 rowid,
                 RowRead::immutable(RowState {
@@ -29498,14 +29505,19 @@ impl Storage {
         RowReadView::new(&self.row_versions, &self.tables[table_slot].rows)
     }
 
-    pub(crate) fn for_each_resident_row_state(
+    fn for_each_retained_row_state(
         &self,
         table_slot: usize,
+        rowids: &RetainedRowIds<'_>,
         each: &mut RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        let view = RowReadView::new(&self.row_versions, &self.tables[table_slot].rows);
-        for (rowid, state) in view.iter() {
-            if each(rowid, state)?.is_break() {
+        for rowid in rowids.iter() {
+            // Only reproducible spill entries and rolled-back inserts can
+            // disappear under shared ownership. Resolve an evicted entry from
+            // its immutable generation; an undone insert contributes no row.
+            if let Some(state) = self.row_state(table_slot, rowid)?
+                && each(rowid, state)?.is_break()
+            {
                 return Ok(core::ops::ControlFlow::Break(()));
             }
         }
@@ -53152,7 +53164,7 @@ mod tests {
             storage
                 .for_each_row_state(0, &mut |_, row| {
                     assert!(storage.row_versions.test_write().is_err());
-                    assert!(storage.tables[0].rows.test_write().is_err());
+                    assert!(storage.tables[0].rows.test_write().is_ok());
                     assert_eq!(row.committed_lsn, 7);
                     Ok(core::ops::ControlFlow::Break(()))
                 })

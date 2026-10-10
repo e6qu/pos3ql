@@ -57,6 +57,13 @@ impl RowRead<'_> {
         }
     }
 
+    /// Copy committed metadata and release reusable chain ownership before
+    /// fetching or decoding bytes. Shared writers cannot relocate the heap or
+    /// retire immutable generations while Storage remains shared.
+    pub(crate) fn committed_home(self) -> Option<RowHome> {
+        self.state.committed
+    }
+
     pub(crate) fn pending_last(&self) -> Option<PendingChange> {
         pending_last(&self.versions()?.pending_row_versions, self.state.pending)
     }

@@ -244,7 +244,7 @@ fn committed_key_matches(
     let Some(state) = storage.row_state(table_index, rowid)? else {
         return Ok(false);
     };
-    let Some(home) = state.committed else {
+    let Some(home) = state.committed_home() else {
         return Ok(false);
     };
     storage.with_row_bytes(table_index, rowid, home, |bytes| {
@@ -553,7 +553,7 @@ fn enforce_expression_index_uniqueness<'a>(
         if Some(rowid) == self_rowid {
             return Ok(ControlFlow::Continue(()));
         }
-        let Some(home) = state.committed else {
+        let Some(home) = state.committed_home() else {
             return Ok(ControlFlow::Continue(()));
         };
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
@@ -566,15 +566,13 @@ fn enforce_expression_index_uniqueness<'a>(
         }
         Ok(ControlFlow::Continue(()))
     })?;
-    for (rowid, state) in storage.resident_rows(table_index).iter() {
+    storage.for_each_pending_row_change(table_index, &mut |rowid, pending| {
+        use core::ops::ControlFlow;
         if Some(rowid) == self_rowid {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         }
-        let Some(pending) = state.pending_last() else {
-            continue;
-        };
         let Some(location) = pending.loc else {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         };
         let matched =
             storage.with_row_bytes(table_index, rowid, RowHome::Heap(location), |bytes| {
@@ -583,7 +581,7 @@ fn enforce_expression_index_uniqueness<'a>(
                 matches(&other)
             })?;
         if !matched {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         }
         if pending.txid != txid {
             storage.wait_for_transaction(txid, pending.txid)?;
@@ -592,8 +590,8 @@ fn enforce_expression_index_uniqueness<'a>(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        return Err(unique_violation(def, name));
-    }
+        Err(unique_violation(def, name))
+    })?;
     Ok(())
 }
 
@@ -722,7 +720,7 @@ fn committed_scan_uniqueness(
         if Some(rowid) == self_rowid {
             return Ok(ControlFlow::Continue(()));
         }
-        let Some(home) = state.committed else {
+        let Some(home) = state.committed_home() else {
             return Ok(ControlFlow::Continue(()));
         };
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
@@ -756,15 +754,13 @@ fn pending_scan_uniqueness(
     def: &TableDef,
     name: &ConstraintName,
 ) -> Result<(), SqlError> {
-    for (rowid, state) in storage.resident_rows(table_index).iter() {
+    storage.for_each_pending_row_change(table_index, &mut |rowid, pending| {
+        use core::ops::ControlFlow;
         if Some(rowid) == self_rowid {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         }
-        let Some(pending) = state.pending_last() else {
-            continue;
-        };
         let Some(loc) = pending.loc else {
-            continue; // a pending delete has no key
+            return Ok(ControlFlow::Continue(())); // a pending delete has no key
         };
         let matched = storage.with_row_bytes(table_index, rowid, RowHome::Heap(loc), |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
@@ -781,7 +777,8 @@ fn pending_scan_uniqueness(
             }
             return Err(unique_violation(def, name));
         }
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(())
 }
 
@@ -824,7 +821,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
         if Some(rowid) == self_rowid {
             return Ok(ControlFlow::Continue(()));
         }
-        let Some(home) = state.committed else {
+        let Some(home) = state.committed_home() else {
             return Ok(ControlFlow::Continue(()));
         };
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
@@ -837,15 +834,13 @@ pub(crate) fn enforce_partial_index_uniqueness(
         }
         Ok(ControlFlow::Continue(()))
     })?;
-    for (rowid, state) in storage.resident_rows(table_index).iter() {
+    storage.for_each_pending_row_change(table_index, &mut |rowid, pending| {
+        use core::ops::ControlFlow;
         if Some(rowid) == self_rowid {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         }
-        let Some(pending) = state.pending_last() else {
-            continue;
-        };
         let Some(location) = pending.loc else {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         };
         let matched =
             storage.with_row_bytes(table_index, rowid, RowHome::Heap(location), |bytes| {
@@ -854,7 +849,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 matches(&other)
             })?;
         if !matched {
-            continue;
+            return Ok(ControlFlow::Continue(()));
         }
         if pending.txid != txid {
             storage.wait_for_transaction(txid, pending.txid)?;
@@ -863,8 +858,8 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        return Err(unique_violation(def, name));
-    }
+        Err(unique_violation(def, name))
+    })?;
     Ok(())
 }
 

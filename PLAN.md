@@ -39,11 +39,14 @@ and its linked documents; completed investigations belong in [history](docs/hist
 ### 1. Row publication, reader retention, and reclamation
 
 Allow readers to retain immutable selected images while unrelated writes progress.
-Heap appends publish complete disjoint tails without excluding existing byte
-readers. Table/row mutation and in-place compaction still require exclusive storage.
+Heap appends and pending row publication progress while existing byte readers
+retain their images. Preparation precedes short, validated version/map updates;
+rollback uses the same ownership. Committed publication, table lifecycle, full
+metadata walks, and in-place compaction still require further concurrency work.
 
-- Complete concurrent table lifecycle, row-version publication, rollback, and
-  statistics ownership with explicit lock ordering.
+- Complete concurrent table lifecycle, committed row publication, snapshot
+  registration, and statistics ownership with explicit lock ordering. Replace
+  full-walk metadata ownership with bounded retained scan state.
 - Preserve active snapshots and retained table/SST generations through retirement.
   Stale-token detection does not replace retention of a live reader's state.
 - Separate reclamation from active readers. Evaluate startup-sized segments and

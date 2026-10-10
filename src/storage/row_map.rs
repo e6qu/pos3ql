@@ -1,6 +1,6 @@
 //! Guarded relation row metadata. Chain traversal requires an issued row read.
 
-use std::sync::{RwLock, RwLockReadGuard};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::RowState;
 use crate::mem::budget::{Budget, BudgetError};
@@ -23,6 +23,10 @@ impl RowMap {
 
     pub(super) fn read(&self) -> RwLockReadGuard<'_, FixedMap<u64, RowState>> {
         self.state.read().expect("table row state lock poisoned")
+    }
+
+    pub(super) fn write(&self) -> RwLockWriteGuard<'_, FixedMap<u64, RowState>> {
+        self.state.write().expect("table row state lock poisoned")
     }
 
     #[cfg(test)]

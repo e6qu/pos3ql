@@ -22,7 +22,7 @@ do not qualify concurrent execution or representative deployments.
 | Catalogs and metadata | Synchronized publication and owned reader images; guards release before nested resolution |
 | Table metadata | Database/creation/owner identity, typed CREATE/DROP existence, definitions, and pending heads share guarded ownership; version slots are guarded, retained images capture identity with the definition, and publication remains exclusive |
 | Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
-| Resident rows | Per-table map guards and one guarded pending/committed version owner; issued readers retain chain ownership, including SQL and checkpoint walks; pending writes are immutable appends with checked identities and rollback tokens |
+| Resident rows | Pending image preparation precedes short version/map publication; shared pending writes and exact-head rollback preserve pinned byte readers and committed deletion markers. Issued metadata readers retain chain ownership, including full SQL/checkpoint walks; committed publication and reclamation remain exclusive |
 | Heap bytes | Readers pin published immutable ranges; appends initialize disjoint tails and publish complete bytes without excluding existing readers; relocation remains exclusive |
 | Deferred rows | Logical row identity, table incarnation, and exact pending/committed version tokens; later reads reacquire the selected version rather than retaining heap locations |
 
@@ -35,7 +35,7 @@ identities. Retained byte copies consume the fixed statement arena; deferred
 snapshots retain compact logical identities and exact version tokens.
 
 The reactor still executes statements serially. Shared table lifecycle mutation
-and retirement, row publication, concurrent cache/object I/O and maintenance,
+and retirement, committed row publication, concurrent cache/object I/O and maintenance,
 engine publication, and fixed workers remain open gates. Existing snapshot
 retention must remain coherent across those boundaries. Immutable SST reads
 carry no resident version handles.

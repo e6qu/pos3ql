@@ -232,6 +232,66 @@ mod tests {
             assert!(storage.tables[table].rows.test_write().is_ok());
         });
     }
+
+    #[test]
+    fn shared_row_publication_pool_exhaustion_leaves_no_row_or_statistics() {
+        let mut config = test_config();
+        config.max_connections = 1;
+        config.max_prepared_transactions = 0;
+        config.txn_rows = 1;
+        config.table_rows = 2;
+        let (storage, table) = fixture(&config);
+        let location = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let undo = storage.write_pending(table, 1, 7, 1, Some(location)).unwrap();
+            assert_eq!(storage.write_pending(table, 2, 7, 1, Some(location)).unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(storage.resident_row_state(table, 2).is_none());
+            assert_eq!(storage.cumulative_statistics().relation_transactions[0].n_tup_ins, 1);
+            storage.restore_pending(table, 1, 7, undo);
+            storage.write_pending(table, 2, 7, 1, Some(location)).unwrap();
+            assert!(storage.resident_row_state(table, 1).is_none());
+        });
+    }
+
+    #[test]
+    fn shared_row_publication_rejects_retired_table_preparations() {
+        let (mut storage, table) = fixture(&test_config());
+        let location = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+        let stale = storage.prepare_pending_write(table, 1, 7, 1, Some(location), true).unwrap();
+        storage.drop_table(table);
+        let replacement = storage.create_table(make_def("replacement", &[("id", ColType::Int4, false)])).unwrap();
+        assert_eq!(replacement, table);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.publish_pending_write(stale).err().unwrap().sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert!(storage.resident_row_state(table, 1).is_none());
+            assert!(storage.cumulative_statistics().relation_transactions.is_empty());
+        });
+    }
+
+    #[test]
+    fn shared_row_publication_preserves_active_history_on_capacity_failure() {
+        let mut config = test_config();
+        config.max_row_versions_per_row = 1;
+        let (mut storage, table) = fixture(&config);
+        let old = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+        let current = storage.heap.append_row(&[Datum::Int4(2)]).unwrap();
+        let mut state = RowState::committed_only_at(current, 9);
+        push_committed_version(&mut storage.row_versions.exclusive().committed_row_versions,
+            &mut state.history, 1, CommittedVersion { home: Some(RowHome::Heap(old)), lsn: 7 }).unwrap();
+        storage.tables[table].rows.insert(1, state).unwrap();
+        storage.register_snapshot(8, 7).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.write_pending(table, 1, 7, 1, None).unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            let row = storage.resident_row_state(table, 1).unwrap();
+            assert_eq!(row.visible_at(8, SNAPSHOT_ALL, 7), Some(Some(RowHome::Heap(old))));
+            assert!(row.pending.is_none());
+        });
+        storage.release_snapshot(8);
+        crate::mem::guard::forbid_alloc(|| {
+            storage.write_pending(table, 1, 7, 1, None).unwrap();
+            assert!(storage.resident_row_state(table, 1).unwrap().history.is_empty());
+        });
+    }
 }
 
 enum PendingPublication {

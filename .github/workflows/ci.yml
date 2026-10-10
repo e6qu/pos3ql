@@ -12,6 +12,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  heap-aliasing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri setup
+      - name: Shared heap aliasing and publication
+        run: cargo miri test --lib --locked shared_heap_append -- --test-threads=1
+
   release-package:
     runs-on: ubuntu-latest
     timeout-minutes: 10

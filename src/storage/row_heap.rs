@@ -1,8 +1,10 @@
-//! Fixed row bytes and append position share one ownership boundary.
+//! Published row bytes are immutable until exclusive relocation; appends use disjoint tails.
 
+use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::ops::Deref;
-use std::sync::{RwLock, RwLockReadGuard};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, RwLock, RwLockReadGuard};
 
 use super::RowLoc;
 use crate::mem::budget::{Budget, BudgetError};
@@ -14,10 +16,18 @@ pub(crate) struct RowHeap {
 }
 
 pub(super) struct RowHeapState {
-    buffer: Box<[u8]>,
-    used: usize,
+    buffer: Box<UnsafeCell<[u8]>>,
+    capacity: usize,
+    used: AtomicUsize,
+    append: Mutex<()>,
     generation: u64,
 }
+
+// SAFETY: readers access only ranges below the acquired publication frontier.
+// One append owner initializes the disjoint tail before releasing that frontier.
+// Every append and reader holds a relocation read guard; relocation and the
+// exclusive fixture API require exclusive state ownership before changing bytes.
+unsafe impl Sync for RowHeapState {}
 
 pub(crate) struct HeapRowRead<'a> {
     state: RwLockReadGuard<'a, RowHeapState>,
@@ -29,7 +39,8 @@ impl Deref for HeapRowRead<'_> {
 
     fn deref(&self) -> &[u8] {
         let start = self.location.offset as usize;
-        &self.state.buffer[start..start + self.location.len as usize]
+        self.state
+            .published_slice(start, self.location.len as usize)
     }
 }
 
@@ -41,7 +52,7 @@ impl HeapRowRead<'_> {
     pub(crate) fn other(&self, location: RowLoc) -> Result<&[u8], SqlError> {
         self.state.validate(location)?;
         let start = location.offset as usize;
-        Ok(&self.state.buffer[start..start + location.len as usize])
+        Ok(self.state.published_slice(start, location.len as usize))
     }
 }
 
@@ -63,15 +74,69 @@ impl RowHeap {
         budget.draw(bytes, "memtable")?;
         Ok(Self {
             state: RwLock::new(RowHeapState {
-                buffer: vec![0; bytes].into_boxed_slice(),
-                used: 0,
+                // SAFETY: UnsafeCell is layout-transparent and ownership of the
+                // allocation transfers exactly once; its length is unchanged.
+                buffer: unsafe {
+                    Box::from_raw(
+                        Box::into_raw(vec![0u8; bytes].into_boxed_slice()) as *mut UnsafeCell<[u8]>
+                    )
+                },
+                capacity: bytes,
+                used: AtomicUsize::new(0),
+                append: Mutex::new(()),
                 generation: 1,
             }),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn append(&mut self, len: usize) -> Result<(RowLoc, &mut [u8]), SqlError> {
         self.exclusive().append(len)
+    }
+
+    pub(crate) fn append_bytes(&self, bytes: &[u8]) -> Result<RowLoc, SqlError> {
+        self.append_with(bytes.len(), |out| {
+            out.copy_from_slice(bytes);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn append_row(
+        &self,
+        values: &[crate::sql::types::Datum<'_>],
+    ) -> Result<RowLoc, SqlError> {
+        self.append_with(super::rowenc::encoded_len(values), |out| {
+            super::rowenc::encode(values, out);
+            Ok(())
+        })
+    }
+
+    /// Initialization cannot retain the writable range or publish its location.
+    /// Release byte ownership before taking row-version or catalog write owners.
+    fn append_with(
+        &self,
+        len: usize,
+        initialize: impl FnOnce(&mut [u8]) -> Result<(), SqlError>,
+    ) -> Result<RowLoc, SqlError> {
+        let state = self.state.read().expect("row heap lock poisoned");
+        let _append = state.append.lock().expect("row heap append lock poisoned");
+        let start = state.used.load(Ordering::Acquire);
+        state.check_capacity(start, len)?;
+        let location = RowLoc {
+            offset: start as u32,
+            len: len as u32,
+            generation: state.generation,
+        };
+        // SAFETY: append ownership excludes another initializer. This tail is
+        // beyond the publication frontier and cannot overlap any issued read.
+        // The relocation guard prevents movement or reuse until initialization
+        // finishes. No reference to this range escapes the initializer.
+        let out = unsafe {
+            core::slice::from_raw_parts_mut(state.buffer.get().cast::<u8>().add(start), len)
+        };
+        initialize(out)?;
+        state.used.store(start + len, Ordering::Release);
+        Ok(location)
     }
 
     pub(crate) fn get(&self, location: RowLoc) -> Result<HeapRowRead<'_>, SqlError> {
@@ -81,15 +146,15 @@ impl RowHeap {
     }
 
     pub(crate) fn used(&self) -> usize {
-        self.state.read().expect("row heap lock poisoned").used
-    }
-
-    pub(crate) fn capacity(&self) -> usize {
         self.state
             .read()
             .expect("row heap lock poisoned")
-            .buffer
-            .len()
+            .used
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.state.read().expect("row heap lock poisoned").capacity
     }
 
     pub(super) fn exclusive(&mut self) -> &mut RowHeapState {
@@ -105,22 +170,34 @@ impl RowHeap {
 }
 
 impl RowHeapState {
-    fn append(&mut self, len: usize) -> Result<(RowLoc, &mut [u8]), SqlError> {
-        if len > self.buffer.len() - self.used {
+    fn published_slice(&self, start: usize, len: usize) -> &[u8] {
+        // SAFETY: callers validated this range against an acquired frontier
+        // under a relocation guard. Published bytes are never appended over.
+        unsafe { core::slice::from_raw_parts(self.buffer.get().cast::<u8>().add(start), len) }
+    }
+
+    fn check_capacity(&self, start: usize, len: usize) -> Result<(), SqlError> {
+        if len > self.capacity - start {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "memtable is full ({} bytes); with object storage on, rows spill at the next checkpoint — retry, raise memtable_bytes, or enable object storage",
-                self.buffer.len()
+                self.capacity
             ));
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn append(&mut self, len: usize) -> Result<(RowLoc, &mut [u8]), SqlError> {
+        let start = *self.used.get_mut();
+        self.check_capacity(start, len)?;
         let location = RowLoc {
-            offset: self.used as u32,
+            offset: start as u32,
             len: len as u32,
             generation: self.generation,
         };
-        let slice = &mut self.buffer[self.used..self.used + len];
-        self.used += len;
-        Ok((location, slice))
+        *self.used.get_mut() = start + len;
+        Ok((location, &mut self.buffer.get_mut()[start..start + len]))
     }
 
     pub(super) fn validate(&self, location: RowLoc) -> Result<(), SqlError> {
@@ -131,7 +208,7 @@ impl RowHeapState {
             ));
         }
         let end = (location.offset as usize).checked_add(location.len as usize);
-        if end.is_none_or(|end| end > self.used) {
+        if end.is_none_or(|end| end > self.used.load(Ordering::Acquire)) {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "row location exceeds initialized heap bytes"
@@ -172,6 +249,7 @@ impl RowHeapState {
         debug_assert!(destination <= start);
         if start != destination {
             self.buffer
+                .get_mut()
                 .copy_within(start..start + source.len as usize, destination);
         }
     }
@@ -186,9 +264,9 @@ impl RowHeapState {
     }
 
     pub(super) fn finish_relocation(&mut self, used: usize, generation: u64) {
-        debug_assert!(used <= self.used);
+        debug_assert!(used <= *self.used.get_mut());
         debug_assert_eq!(self.generation.checked_add(1), Some(generation));
-        self.used = used;
+        *self.used.get_mut() = used;
         self.generation = generation;
     }
 }
@@ -202,6 +280,155 @@ mod tests {
         let heap = RowHeap::new(&mut budget, bytes).unwrap();
         assert_eq!(budget.remaining(), 0);
         heap
+    }
+
+    #[test]
+    fn shared_heap_append_preserves_frontier_on_failure_and_exhaustion() {
+        let heap = heap(8);
+        crate::mem::guard::forbid_alloc(|| {
+            let old = heap.append_bytes(b"keep").unwrap();
+            let pinned = heap.get(old).unwrap();
+            let error = heap
+                .append_with(4, |out| {
+                    out[..2].copy_from_slice(b"xx");
+                    Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "encoding failed"
+                    ))
+                })
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(heap.used(), 4);
+            assert!(pinned.other(RowLoc::test(4, 4)).is_err());
+            assert_eq!(&*pinned, b"keep");
+            for len in [5, usize::MAX] {
+                assert_eq!(
+                    heap.append_with(len, |_| panic!("capacity must preflight"))
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
+                assert_eq!(heap.used(), 4);
+            }
+            let new = heap.append_bytes(b"next").unwrap();
+            assert_eq!(new, RowLoc::test(4, 4));
+            assert_eq!(pinned.other(new).unwrap(), b"next");
+            assert_eq!(
+                heap.append_bytes(b"!").unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+        });
+    }
+
+    #[test]
+    fn shared_heap_append_completes_while_an_older_reader_is_pinned() {
+        use std::sync::atomic::AtomicBool;
+        let heap = heap(8);
+        let old = heap.append_bytes(b"keep").unwrap();
+        let pinned = heap.get(old).unwrap();
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    let location = heap.append_bytes(b"next").unwrap();
+                    done.store(true, Ordering::Release);
+                    location
+                })
+            });
+            let completed_while_pinned = crate::mem::guard::forbid_alloc(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    assert_eq!(&*pinned, b"keep");
+                    std::thread::yield_now();
+                }
+                done.load(Ordering::Acquire)
+            });
+            drop(pinned);
+            let new = writer.join().unwrap();
+            assert!(
+                completed_while_pinned,
+                "append must progress before the old reader releases"
+            );
+            assert_eq!(&*heap.get(new).unwrap(), b"next");
+        });
+    }
+
+    #[test]
+    fn shared_heap_append_hides_incomplete_bytes_from_existing_readers() {
+        use std::sync::atomic::AtomicBool;
+        let heap = heap(8);
+        let old = heap.append_bytes(b"keep").unwrap();
+        let pinned = heap.get(old).unwrap();
+        let entered = AtomicBool::new(false);
+        let release = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    heap.append_with(4, |out| {
+                        out[..2].copy_from_slice(b"ne");
+                        entered.store(true, Ordering::Release);
+                        while !release.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        out[2..].copy_from_slice(b"xt");
+                        Ok(())
+                    })
+                    .unwrap()
+                })
+            });
+            let initialized_while_pinned = crate::mem::guard::forbid_alloc(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !entered.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let entered = entered.load(Ordering::Acquire);
+                assert_eq!(&*pinned, b"keep");
+                assert!(pinned.other(RowLoc::test(4, 4)).is_err());
+                release.store(true, Ordering::Release);
+                entered
+            });
+            drop(pinned);
+            let new = writer.join().unwrap();
+            assert!(initialized_while_pinned);
+            assert_eq!(&*heap.get(new).unwrap(), b"next");
+        });
+    }
+
+    #[test]
+    fn shared_heap_append_parallel_writers_publish_disjoint_complete_ranges() {
+        let heap = heap(128 * 8);
+        let start = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            let writers: [_; 4] = core::array::from_fn(|worker| {
+                let heap = &heap;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        let mut locations = [RowLoc::EMPTY; 32];
+                        for (index, location) in locations.iter_mut().enumerate() {
+                            let value = ((worker as u64) << 32) | index as u64;
+                            *location = heap.append_bytes(&value.to_le_bytes()).unwrap();
+                            assert_eq!(&*heap.get(*location).unwrap(), &value.to_le_bytes());
+                        }
+                        locations
+                    })
+                })
+            });
+            start.wait();
+            let mut occupied = [false; 128];
+            for (worker, writer) in writers.into_iter().enumerate() {
+                for (index, location) in writer.join().unwrap().into_iter().enumerate() {
+                    let slot = location.offset as usize / 8;
+                    assert!(!occupied[slot]);
+                    occupied[slot] = true;
+                    let value = ((worker as u64) << 32) | index as u64;
+                    assert_eq!(&*heap.get(location).unwrap(), &value.to_le_bytes());
+                }
+            }
+            assert!(occupied.into_iter().all(|used| used));
+            assert_eq!(heap.used(), heap.capacity());
+        });
     }
 
     #[test]
@@ -425,7 +652,7 @@ mod tests {
                 for epoch in 1u64..=500 {
                     loop {
                         if let Ok(mut writer) = heap.test_write() {
-                            writer.buffer[..8].copy_from_slice(&epoch.to_le_bytes());
+                            writer.buffer.get_mut()[..8].copy_from_slice(&epoch.to_le_bytes());
                             break;
                         }
                         std::thread::yield_now();

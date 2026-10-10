@@ -4852,8 +4852,7 @@ where
         )
     })?;
     rowenc::encode(&new_values[..def.n_columns], new_bytes);
-    let (new_loc, slice) = storage.heap.append(new_bytes.len())?;
-    slice.copy_from_slice(new_bytes);
+    let new_loc = storage.heap.append_bytes(new_bytes)?;
     let prior = storage.write_pending(
         table_index,
         rowid,
@@ -56550,11 +56549,10 @@ pub(crate) fn merge<'a>(
                                 rowenc::encode(&new_values[..def.n_columns], out);
                                 out
                             };
-                            let (loc, slice) = match storage.heap.append(out.len()) {
+                            let loc = match storage.heap.append_bytes(out) {
                                 Ok(x) => x,
                                 Err(e) => return sql_fail(e),
                             };
-                            slice.copy_from_slice(out);
                             if updated_table == target_tables[j] {
                                 match storage.write_pending(
                                     updated_table,
@@ -60269,11 +60267,10 @@ pub(crate) fn update<'a>(
         } else {
             row_table
         };
-        let (new_loc, slice) = match storage.heap.append(new_bytes.len()) {
+        let new_loc = match storage.heap.append_bytes(new_bytes) {
             Ok(x) => x,
             Err(e) => return sql_fail(e),
         };
-        slice.copy_from_slice(new_bytes);
         if target_table == row_table {
             match storage.write_pending(row_table, rowid, txn.txid, txn.command_id(), Some(new_loc))
             {
@@ -66047,12 +66044,10 @@ fn alter_table_relation(
                 rowenc::encode(values, buffer);
                 &*buffer
             };
-            let (loc, slice) = match storage.heap.append(new_bytes.len()) {
+            match storage.heap.append_bytes(new_bytes) {
                 Ok(x) => x,
                 Err(e) => return sql_fail(e),
-            };
-            slice.copy_from_slice(new_bytes);
-            loc
+            }
         } else {
             let crate::storage::RowReadSource::Snapshot(snapshot) = old_home else {
                 unreachable!("rewrite input retains an MVCC snapshot");
@@ -66080,12 +66075,10 @@ fn alter_table_relation(
                             ));
                         }
                     };
-                    let (loc, slice) = match storage.heap.append(copied.len()) {
+                    match storage.heap.append_bytes(copied) {
                         Ok(x) => x,
                         Err(e) => return sql_fail(e),
-                    };
-                    slice.copy_from_slice(copied);
-                    loc
+                    }
                 }
             }
         };
@@ -67821,11 +67814,7 @@ fn store_row_with_identity(
     rowid: Option<u64>,
     values: &[Datum],
 ) -> Result<PhysicalRow, SqlError> {
-    let len = rowenc::encoded_len(values);
-    // Encode straight into the heap: values may borrow the arena but not
-    // the heap (they come from INSERT expressions), so this is borrow-safe.
-    let (loc, slice) = storage.heap.append(len)?;
-    rowenc::encode(values, slice);
+    let loc = storage.heap.append_row(values)?;
     let rowid = rowid.unwrap_or_else(|| storage.next_rowid());
     let prior = storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), Some(loc))?;
     if let Err(e) = txn.touch(table_index as u32, rowid, prior) {

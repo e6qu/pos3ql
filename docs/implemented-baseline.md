@@ -23,23 +23,22 @@ do not qualify concurrent execution or representative deployments.
 | Table metadata | Database/creation/owner identity, typed CREATE/DROP existence, definitions, and pending heads share guarded ownership; version slots are guarded, retained images capture identity with the definition, and publication remains exclusive |
 | Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
 | Resident rows | Per-table map guards and one guarded pending/committed version owner; issued readers retain chain ownership, including SQL and checkpoint walks; pending writes are immutable appends with checked identities and rollback tokens |
-| Heap bytes | Visible reads acquire byte guards before releasing version ownership; callback/codec reads retain them, while retained byte images copy into the fixed statement arena |
+| Heap bytes | Readers pin published immutable ranges; appends initialize disjoint tails and publish complete bytes without excluding existing readers; relocation remains exclusive |
 | Deferred rows | Logical row identity, table incarnation, and exact pending/committed version tokens; later reads reacquire the selected version rather than retaining heap locations |
 
 Reader capacity, lock controls, and heap controls are charged at startup.
-Exhaustion is explicit; stale definition identity reacquisition fails rather than
-adopting a reused slot. Heap reads reject locations from an earlier relocation
-generation, even when the old range remains initialized. Compaction validates
-the full relocation set and generation capacity before changing bytes or handles,
-including aliases and empty locations. Startup rejects heaps beyond the 32-bit
-location range. Relocation generations are cache metadata; durable formats encode
-logical rows rather than heap locations. Retained heap and spilled byte images
-consume arena capacity; deferred snapshots consume bounded metadata. Sorted
-single-table scans share one incarnation and retain compact version/order keys.
+Exhaustion is explicit; readers reject reused table identities and stale heap
+locations. Appends release byte ownership before publishing row metadata;
+compaction preflights its complete relocation set before changing bytes or handles.
+Heap locations and relocation generations are cache metadata, not durable row
+identities. Retained byte copies consume the fixed statement arena; deferred
+snapshots retain compact logical identities and exact version tokens.
 
 The reactor still executes statements serially. Shared table lifecycle mutation
-and retirement, row publication and maintenance, engine publication, and fixed
-workers remain the roadmap's open concurrency gates. Immutable SST reads carry no resident version handles.
+and retirement, row publication, concurrent cache/object I/O and maintenance,
+engine publication, and fixed workers remain open gates. Existing snapshot
+retention must remain coherent across those boundaries. Immutable SST reads
+carry no resident version handles.
 
 ## Evidence limits
 

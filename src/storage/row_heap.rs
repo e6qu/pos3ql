@@ -39,7 +39,8 @@ impl Deref for HeapRowRead<'_> {
 
     fn deref(&self) -> &[u8] {
         let start = self.location.offset as usize;
-        self.state.published_slice(start, self.location.len as usize)
+        self.state
+            .published_slice(start, self.location.len as usize)
     }
 }
 
@@ -76,7 +77,9 @@ impl RowHeap {
                 // SAFETY: UnsafeCell is layout-transparent and ownership of the
                 // allocation transfers exactly once; its length is unchanged.
                 buffer: unsafe {
-                    Box::from_raw(Box::into_raw(vec![0u8; bytes].into_boxed_slice()) as *mut UnsafeCell<[u8]>)
+                    Box::from_raw(
+                        Box::into_raw(vec![0u8; bytes].into_boxed_slice()) as *mut UnsafeCell<[u8]>
+                    )
                 },
                 capacity: bytes,
                 used: AtomicUsize::new(0),
@@ -98,7 +101,10 @@ impl RowHeap {
         })
     }
 
-    pub(crate) fn append_row(&self, values: &[crate::sql::types::Datum<'_>]) -> Result<RowLoc, SqlError> {
+    pub(crate) fn append_row(
+        &self,
+        values: &[crate::sql::types::Datum<'_>],
+    ) -> Result<RowLoc, SqlError> {
         self.append_with(super::rowenc::encoded_len(values), |out| {
             super::rowenc::encode(values, out);
             Ok(())
@@ -140,14 +146,15 @@ impl RowHeap {
     }
 
     pub(crate) fn used(&self) -> usize {
-        self.state.read().expect("row heap lock poisoned").used.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn capacity(&self) -> usize {
         self.state
             .read()
             .expect("row heap lock poisoned")
-            .capacity
+            .used
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.state.read().expect("row heap lock poisoned").capacity
     }
 
     pub(super) fn exclusive(&mut self) -> &mut RowHeapState {
@@ -241,7 +248,8 @@ impl RowHeapState {
         let start = source.offset as usize;
         debug_assert!(destination <= start);
         if start != destination {
-            self.buffer.get_mut()
+            self.buffer
+                .get_mut()
                 .copy_within(start..start + source.len as usize, destination);
         }
     }
@@ -280,24 +288,35 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let old = heap.append_bytes(b"keep").unwrap();
             let pinned = heap.get(old).unwrap();
-            let error = heap.append_with(4, |out| {
-                out[..2].copy_from_slice(b"xx");
-                Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "encoding failed"))
-            }).unwrap_err();
+            let error = heap
+                .append_with(4, |out| {
+                    out[..2].copy_from_slice(b"xx");
+                    Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "encoding failed"
+                    ))
+                })
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(heap.used(), 4);
             assert!(pinned.other(RowLoc::test(4, 4)).is_err());
             assert_eq!(&*pinned, b"keep");
             for len in [5, usize::MAX] {
-                assert_eq!(heap.append_with(len, |_| panic!("capacity must preflight"))
-                    .unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(
+                    heap.append_with(len, |_| panic!("capacity must preflight"))
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
                 assert_eq!(heap.used(), 4);
             }
             let new = heap.append_bytes(b"next").unwrap();
             assert_eq!(new, RowLoc::test(4, 4));
             assert_eq!(pinned.other(new).unwrap(), b"next");
-            assert_eq!(heap.append_bytes(b"!").unwrap_err().sqlstate,
-                sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                heap.append_bytes(b"!").unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
         });
     }
 
@@ -309,11 +328,13 @@ mod tests {
         let pinned = heap.get(old).unwrap();
         let done = AtomicBool::new(false);
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| crate::mem::guard::forbid_alloc(|| {
-                let location = heap.append_bytes(b"next").unwrap();
-                done.store(true, Ordering::Release);
-                location
-            }));
+            let writer = scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    let location = heap.append_bytes(b"next").unwrap();
+                    done.store(true, Ordering::Release);
+                    location
+                })
+            });
             let completed_while_pinned = crate::mem::guard::forbid_alloc(|| {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while !done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
@@ -324,7 +345,10 @@ mod tests {
             });
             drop(pinned);
             let new = writer.join().unwrap();
-            assert!(completed_while_pinned, "append must progress before the old reader releases");
+            assert!(
+                completed_while_pinned,
+                "append must progress before the old reader releases"
+            );
             assert_eq!(&*heap.get(new).unwrap(), b"next");
         });
     }
@@ -338,15 +362,20 @@ mod tests {
         let entered = AtomicBool::new(false);
         let release = AtomicBool::new(false);
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| crate::mem::guard::forbid_alloc(|| {
-                heap.append_with(4, |out| {
-                    out[..2].copy_from_slice(b"ne");
-                    entered.store(true, Ordering::Release);
-                    while !release.load(Ordering::Acquire) { std::thread::yield_now(); }
-                    out[2..].copy_from_slice(b"xt");
-                    Ok(())
-                }).unwrap()
-            }));
+            let writer = scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    heap.append_with(4, |out| {
+                        out[..2].copy_from_slice(b"ne");
+                        entered.store(true, Ordering::Release);
+                        while !release.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        out[2..].copy_from_slice(b"xt");
+                        Ok(())
+                    })
+                    .unwrap()
+                })
+            });
             let initialized_while_pinned = crate::mem::guard::forbid_alloc(|| {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while !entered.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
@@ -374,17 +403,17 @@ mod tests {
                 let heap = &heap;
                 let start = &start;
                 scope.spawn(move || {
-                start.wait();
-                crate::mem::guard::forbid_alloc(|| {
-                    let mut locations = [RowLoc::EMPTY; 32];
-                    for (index, location) in locations.iter_mut().enumerate() {
-                        let value = ((worker as u64) << 32) | index as u64;
-                        *location = heap.append_bytes(&value.to_le_bytes()).unwrap();
-                        assert_eq!(&*heap.get(*location).unwrap(), &value.to_le_bytes());
-                    }
-                    locations
+                    start.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        let mut locations = [RowLoc::EMPTY; 32];
+                        for (index, location) in locations.iter_mut().enumerate() {
+                            let value = ((worker as u64) << 32) | index as u64;
+                            *location = heap.append_bytes(&value.to_le_bytes()).unwrap();
+                            assert_eq!(&*heap.get(*location).unwrap(), &value.to_le_bytes());
+                        }
+                        locations
+                    })
                 })
-            })
             });
             start.wait();
             let mut occupied = [false; 128];

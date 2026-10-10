@@ -66044,11 +66044,10 @@ fn alter_table_relation(
                 rowenc::encode(values, buffer);
                 &*buffer
             };
-            let loc = match storage.heap.append_bytes(new_bytes) {
+            match storage.heap.append_bytes(new_bytes) {
                 Ok(x) => x,
                 Err(e) => return sql_fail(e),
-            };
-            loc
+            }
         } else {
             let crate::storage::RowReadSource::Snapshot(snapshot) = old_home else {
                 unreachable!("rewrite input retains an MVCC snapshot");
@@ -66076,11 +66075,10 @@ fn alter_table_relation(
                             ));
                         }
                     };
-                    let loc = match storage.heap.append_bytes(copied) {
+                    match storage.heap.append_bytes(copied) {
                         Ok(x) => x,
                         Err(e) => return sql_fail(e),
-                    };
-                    loc
+                    }
                 }
             }
         };

@@ -14,11 +14,9 @@ boundaries. Object storage is authoritative in durable mode. One direct
 S3-compatible implementation serves every qualified provider. Unsupported
 behavior fails explicitly; runtime pools never grow to rescue an operation.
 
-PostgreSQL heap pages, physical XLOG/streaming replication, binary-WAL tools,
-server ABI/hooks, and third-party extension certification are non-goals.
-The existing SQL-extension package lifecycle remains accepted behavior.
-Active-active writers and transparent shared-storage replicas are outside the
-current single-writer protocol.
+The [compatibility contract](docs/postgresql-18-compatibility.md) owns accepted
+behavior and non-goals. One writer incarnation owns each durable prefix; many
+transactions within that process must execute concurrently.
 
 ## Where we are
 
@@ -123,12 +121,9 @@ separates PostgreSQL limits, durable identities, startup pools, statement memory
 and smaller implementation bounds. Verify accepted widths, errors, catalogs,
 WAL, checkpoints, and cold recovery together throughout the sequence.
 
-Manifest v14's 64 constraint/domain-check positions also define durable catalog
-and referential-trigger OIDs. Widening requires an explicit format/OID migration.
-Documented subsets, including XPath and planner behavior, remain explicit
-boundaries. Incompatible writers or reader removal require a verified offline
-migration under the [durable-format contract](docs/durable-format.md); no format
-retirement is currently enabled.
+Capacity widening that changes durable identities follows the
+[format migration contract](docs/durable-format.md). Preserve accepted widths
+and explicit compatibility subsets through every concurrency change.
 
 ## Completion gates
 

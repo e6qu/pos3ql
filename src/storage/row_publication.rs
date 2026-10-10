@@ -384,8 +384,9 @@ impl Storage {
             return Ok(PendingPublication::Wait(owner,
                 "statement is waiting for a concurrent table definition change"));
         }
-        let snapshots = self.snapshot_state();
-        let oldest = snapshots.active.iter().map(|(_, snapshot)| *snapshot).min();
+        // Snapshot registration/retirement still requires exclusive Storage.
+        // Do not retain its registry mutex while waiting for metadata readers.
+        let oldest = self.oldest_snapshot();
         // Match reader lock ordering. Never perform byte or object reads while
         // owning these locks; statistics failure is undone before release.
         let mut versions = self.row_versions.write();

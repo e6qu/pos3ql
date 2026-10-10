@@ -35,7 +35,7 @@ identities. Retained byte copies consume the fixed statement arena; deferred
 snapshots retain compact logical identities and exact version tokens.
 
 The reactor still executes statements serially. Shared table lifecycle mutation
-and retirement, row publication, concurrent cache/object I/O and maintenance,
+and retirement, committed row publication, concurrent cache/object I/O and maintenance,
 engine publication, and fixed workers remain open gates. Existing snapshot
 retention must remain coherent across those boundaries. Immutable SST reads
 carry no resident version handles.

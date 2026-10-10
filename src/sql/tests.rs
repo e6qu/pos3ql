@@ -7,6 +7,48 @@
 use super::*;
 
 #[test]
+fn shared_row_publication_rollback_keeps_sst_deletions_through_cold_recovery() {
+    let mut config = test_config("shared-row-deletion-retention");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("shared-row-deletion-retention-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE retained_delete(id integer PRIMARY KEY); INSERT INTO retained_delete VALUES (1)", true);
+    let table = engine.storage.find_table("public", "retained_delete").unwrap();
+    let rowid = engine.storage.resident_rows(table).iter().next().unwrap().0;
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(engine.storage.table(table).n_spill_ssts, 1);
+    session.success(&mut engine, "DELETE FROM retained_delete", false);
+    let marker = *engine.storage.resident_row_state(table, rowid).unwrap();
+    assert!(marker.committed.is_none() && marker.committed_lsn != 0);
+    // Reconstruction addresses physical row identities, including a deletion
+    // that still shadows an older immutable generation. Undo must retain it.
+    crate::mem::guard::forbid_alloc(|| {
+        let location = engine.storage.heap.append_row(&[Datum::Int4(2)]).unwrap();
+        let undo = engine.storage.write_pending_untracked(table, rowid, 777, 1, Some(location)).unwrap();
+        engine.storage.restore_pending(table, rowid, 777, undo);
+        assert_eq!(*engine.storage.resident_row_state(table, rowid).unwrap(), marker);
+    });
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) FROM retained_delete", false)), ["0"]);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(data_rows(&run_with(&mut cold, &mut cold_budget, "SELECT count(*) FROM retained_delete")), ["0"]);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn visible_row_heap_ownership_command_exhaustion_allows_rollback() {
     let (mut engine, mut budget) = test_engine();
     let mut txn = TxnState::new(&mut budget, 16).unwrap();

@@ -46,12 +46,16 @@ row identities and release broad metadata ownership before callbacks; their
 frozen overlay coverage survives eviction during SST merging. Pending uniqueness
 walks release chain ownership before byte reads and waits. Physical outer-join
 match tracking uses row identities across scan orders. Committed publication,
-table lifecycle, optimized byte/checkpoint walks, and in-place compaction still
-require further concurrency work.
+table lifecycle, resumable checkpoint walks, and in-place compaction still
+require further concurrency work. Optimized overlay/PAX byte scans share one
+startup-bounded partition through both phases; callbacks release row metadata
+before consuming bytes. SQL scans retain identities in the fixed statement arena
+so accepted wide joins do not exhaust per-workspace metadata-walk slots. Their Storage borrow retains the immutable SST list;
+it does not yet permit concurrent generation replacement or retirement.
 
 - Complete concurrent table lifecycle, committed row publication, snapshot
   registration, and statistics ownership with explicit lock ordering. Replace
-  optimized byte/checkpoint walk ownership with bounded retained scan generations.
+  resumable checkpoint walk ownership with bounded retained scan generations.
 - Preserve active snapshots and retained table/SST generations through retirement.
   Stale-token detection does not replace retention of a live reader's state.
 - Separate reclamation from active readers. Evaluate startup-sized segments and

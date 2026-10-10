@@ -48239,19 +48239,25 @@ pub fn create_index(
         }
         Ok(())
     };
-    let validation = storage.for_each_scan_overlay_row_state(table_index, &mut |rowid, state| {
-        let Some(home) = storage.committed_row_home(table_index, state)? else {
-            return Ok(core::ops::ControlFlow::Continue(()));
-        };
-        storage.with_row_bytes(table_index, rowid, home, |bytes| {
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
-            validate_values(rowid, &values[..tdef.n_columns])
+    let validation = storage.row_scan_in(table_index, arena).and_then(|scan| {
+        let overlay = scan.for_each_overlay(&mut |rowid, state| {
+            let Some(home) = storage.committed_row_home(table_index, state)? else {
+                return Ok(core::ops::ControlFlow::Continue(()));
+            };
+            storage.with_row_bytes(table_index, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
+                validate_values(rowid, &values[..tdef.n_columns])
+            })?;
+            Ok(core::ops::ControlFlow::Continue(()))
         })?;
-        Ok(core::ops::ControlFlow::Continue(()))
-    });
-    let validation = validation.and_then(|_| {
-        storage.for_each_spilled_row_batch(table_index, arena, true, None, &mut |rows| {
+        if overlay.is_break() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "index validation stopped before completing the scan"
+            ));
+        }
+        scan.for_each_spilled_row_batch(arena, true, None, &mut |rows| {
             for spilled in rows {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
                 let values = match spilled.representation {

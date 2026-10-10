@@ -35,7 +35,7 @@ use row_versions::{
     prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
     release_pending_chain,
 };
-use row_walks::{RetainedRowIds, RowWalkPool};
+use row_walks::{RetainedRowIds, RowScanIds, RowWalkPool};
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -13962,8 +13962,8 @@ struct SpillVersion {
 }
 
 #[derive(Clone, Copy)]
-enum SpillOverlayMode {
-    VisibleScan,
+enum SpillOverlayMode<'scan> {
+    VisibleScan(&'scan RowScanIds<'scan>),
     /// A checkpoint spans statements, so pending versions may appear without
     /// changing the committed generation. Partition only by committed home.
     CommittedCheckpoint,
@@ -28705,7 +28705,7 @@ impl Storage {
         recycle_rows: bool,
         decoded_columns: Option<&[bool; MAX_COLUMNS]>,
         coalesce_packed: bool,
-        overlay_mode: SpillOverlayMode,
+        overlay_mode: SpillOverlayMode<'_>,
         resume: Option<(&mut [MemberCursor], &mut u64, &mut usize, usize, u64)>,
         emit: &mut dyn FnMut(
             u64,
@@ -28850,10 +28850,7 @@ impl Storage {
                 commit_lsn,
             }) = verdict
                 && match overlay_mode {
-                    SpillOverlayMode::VisibleScan => self.tables[slot]
-                        .rows
-                        .get(&rowid)
-                        .is_none_or(|state| Self::redundant_spilled_row_state(&state)),
+                    SpillOverlayMode::VisibleScan(rowids) => !rowids.contains(rowid),
                     SpillOverlayMode::CommittedCheckpoint => {
                         self.tables[slot].rows.get(&rowid).is_none_or(|state| {
                             matches!(
@@ -29117,9 +29114,10 @@ impl Storage {
     /// Streams spill rows in bounded batches with bytes carried by the merged
     /// cursor. Mutable overlay rows stay in the row-state seam; redundant
     /// committed spill metadata does not force a second object read.
-    pub(crate) fn for_each_spilled_row_batch<'a, 'callback>(
+    fn for_each_spilled_row_batch<'a, 'callback>(
         &self,
         table_slot: usize,
+        rowids: &RowScanIds<'_>,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
         decoded_columns: Option<u64>,
@@ -29152,7 +29150,7 @@ impl Storage {
                 false,
                 decoded_columns.as_ref(),
                 decoded_columns.is_none(),
-                SpillOverlayMode::VisibleScan,
+                SpillOverlayMode::VisibleScan(rowids),
                 None,
                 &mut |rowid, _commit_lsn, representation| {
                     rows[len] = SpilledRow {
@@ -29542,23 +29540,6 @@ impl Storage {
             if let Some(state) = self.row_state(table_slot, rowid)?
                 && each(rowid, state)?.is_break()
             {
-                return Ok(core::ops::ControlFlow::Break(()));
-            }
-        }
-        Ok(core::ops::ControlFlow::Continue(()))
-    }
-
-    pub(crate) fn for_each_scan_overlay_row_state(
-        &self,
-        table_slot: usize,
-        each: &mut RowReadVisitor<'_>,
-    ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        let view = RowReadView::new(&self.row_versions, &self.tables[table_slot].rows);
-        for (rowid, state) in view.iter() {
-            if Self::redundant_spilled_row_state(&state) {
-                continue;
-            }
-            if each(rowid, state)?.is_break() {
                 return Ok(core::ops::ControlFlow::Break(()));
             }
         }
@@ -30087,7 +30068,8 @@ impl Storage {
         // rows absent from that overlay stream below with their payload from
         // the already resident merge cursor, avoiding one object point read
         // per row during cold ANALYZE.
-        let _ = self.for_each_scan_overlay_row_state(table_slot, &mut |rowid, state| {
+        let scan = self.row_scan(table_slot)?;
+        let _ = scan.for_each_overlay(&mut |rowid, state| {
             let Some(home) = self.visible_row_home(table_slot, rowid, state, txid)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
@@ -30105,7 +30087,7 @@ impl Storage {
             true,
             None,
             true,
-            SpillOverlayMode::VisibleScan,
+            SpillOverlayMode::VisibleScan(&scan.rowids),
             None,
             &mut |_rowid, _commit_lsn, representation| {
                 match representation {
@@ -30122,6 +30104,7 @@ impl Storage {
             },
         )?;
 
+        drop(scan);
         let mut statistics = self.table_statistics(table_slot, txid);
         statistics.valid = true;
         statistics.rows = rows;
@@ -31706,11 +31689,11 @@ impl Storage {
     /// all non-NULL, writing `(enforcer_index, hash)` for each into `out`.
     /// NULL keys remain in durable ordered generations but cannot satisfy an
     /// equality probe, so the resident exact map deliberately omits them.
-    fn row_enforcer_hashes(
+    fn row_enforcer_hashes<'image>(
         &self,
         table_index: usize,
         rowid: u64,
-        home: RowHome,
+        home: impl Into<RowByteRead<'image>>,
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
         let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -33837,8 +33820,9 @@ impl Storage {
             }
             core::ops::ControlFlow::Continue(())
         };
-        let overlay = self.for_each_scan_overlay_row_state(table_index, &mut |rowid, state| {
-            let Some(home) = state.committed else {
+        let scan = self.row_scan(table_index)?;
+        let overlay = scan.for_each_overlay(&mut |rowid, state| {
+            let Some(home) = self.committed_row_home(table_index, state)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
             let count = self.row_enforcer_hashes(table_index, rowid, home, &mut buf)?;
@@ -33867,7 +33851,7 @@ impl Storage {
                 true,
                 Some(&demanded),
                 demanded_count.saturating_mul(2) >= n_columns,
-                SpillOverlayMode::VisibleScan,
+                SpillOverlayMode::VisibleScan(&scan.rowids),
                 None,
                 &mut |rowid, _commit_lsn, representation| {
                     let mark = arena.mark();

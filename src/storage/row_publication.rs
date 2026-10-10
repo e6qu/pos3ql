@@ -347,7 +347,9 @@ mod tests {
                 .write_pending(table, 1, 7, 1, Some(location))
                 .unwrap();
             for rowid in 2..=capacity {
-                storage.write_pending(table, rowid, 7, 1, Some(location)).unwrap();
+                storage
+                    .write_pending(table, rowid, 7, 1, Some(location))
+                    .unwrap();
             }
             assert_eq!(
                 storage

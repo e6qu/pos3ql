@@ -67420,8 +67420,12 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
     scan.for_each_spilled_row_batch(&arena, true, None, &mut |rows| {
         visible_rows += rows.len();
         Ok(core::ops::ControlFlow::Continue(()))
-    }).unwrap();
-    assert_eq!(visible_rows, 0, "query scans must retain their older statement snapshot");
+    })
+    .unwrap();
+    assert_eq!(
+        visible_rows, 0,
+        "query scans must retain their older statement snapshot"
+    );
     drop(scan);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

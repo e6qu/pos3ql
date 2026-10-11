@@ -39,11 +39,16 @@ at startup. Bucket movement and pending rollback do not move their logical
 resume position; reproducible eviction routes unprocessed rows through the paced SST merge while
 preserving coverage for emitted resident rows.
 Selected committed images are pinned before releasing row metadata. Checkpoint
-SST sources use the committed storage boundary independently of foreground
-statement snapshots; query scans preserve their own visibility. Jobs still
-restart on table/generation changes. A statement scan's Storage borrow retains
-its table incarnation and immutable SST list; generation replacement and
-retirement are not yet concurrent.
+SST sources retain their committed boundary, immutable handles, schema, and shared
+read pool across beats. A startup-sized registry protects their durable or local
+temporary block graphs during retirement; garbage collection copies roots before
+object I/O. Releasing a root retained by a durable garbage pass schedules another
+maintenance pass without requiring a new write. Root and reader-count exhaustion
+reports SQLSTATE 54000 before changing registrations.
+
+Checkpoint jobs restart when committed input or table identity changes. Query
+scans still retain table incarnations through their Storage borrow; concurrent
+query retirement and generation publication remain open gates.
 
 Appends release byte ownership before publishing row metadata. Compaction
 preflights its relocation set before changing bytes or handles; readers reject

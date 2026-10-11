@@ -32115,9 +32115,7 @@ impl Storage {
         let table = &self.tables[table_index];
         if i < table.n_enforcers {
             let e = table.enforcer(i).expect("enforcer present");
-            let index = self
-                .value_indexes
-                .get(e.slot);
+            let index = self.value_indexes.get(e.slot);
             if index.is_complete_at(self.commit_snapshot()) {
                 let candidates = self.row_walks.retain_value_probe(&index, hash)?;
                 drop(index);
@@ -33980,7 +33978,9 @@ impl Storage {
 
     /// Populates startup-sized cache slots from committed row images.
     fn populate_enforcers(&mut self, table_index: usize) -> Result<(), SqlError> {
-        if self.tables[table_index].n_enforcers == 0 { return Ok(()) }
+        if self.tables[table_index].n_enforcers == 0 {
+            return Ok(());
+        }
         self.populate_into(table_index, &self.value_indexes)
     }
 

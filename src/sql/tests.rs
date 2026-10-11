@@ -67477,48 +67477,24 @@ fn retained_sst_next(
 #[test]
 fn shared_committed_publication_preserves_historical_index_probes() {
     let (mut engine, mut budget) = test_engine();
-    run_as(
-        &mut engine,
-        &mut budget,
-        61,
-        "CREATE TABLE historical_value_probe(id integer PRIMARY KEY); INSERT INTO historical_value_probe VALUES (1), (2)",
-    );
-    assert_eq!(
-        data_rows(&run_as(
-            &mut engine,
-            &mut budget,
-            61,
-            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM historical_value_probe WHERE id = 1"
-        )),
-        ["1"]
-    );
-    assert!(
-        !message_types(&run_as(
-            &mut engine,
-            &mut budget,
-            62,
-            "UPDATE historical_value_probe SET id = 9 WHERE id = 1"
-        ))
-        .contains(&b'E')
-    );
-    assert_eq!(
-        data_rows(&run_as(
-            &mut engine,
-            &mut budget,
-            61,
-            "SELECT id FROM historical_value_probe WHERE id = 1; SELECT count(*) FROM historical_value_probe WHERE id = 9"
-        )),
-        ["1", "0"]
-    );
-    assert_eq!(
-        data_rows(&run_as(
-            &mut engine,
-            &mut budget,
-            61,
-            "COMMIT; SELECT id FROM historical_value_probe WHERE id = 9"
-        )),
-        ["9"]
-    );
+    let mut reader = TxnState::new(&mut budget, 256).unwrap();
+    let mut writer = TxnState::new(&mut budget, 256).unwrap();
+    let setup = run_txn_bytes(&mut engine, &mut budget, &mut writer,
+        "CREATE TABLE historical_value_probe(id integer PRIMARY KEY); INSERT INTO historical_value_probe VALUES (1), (2)");
+    assert!(!message_types(&setup).contains(&b'E'), "{}", String::from_utf8_lossy(&setup));
+    let before = run_txn_bytes(&mut engine, &mut budget, &mut reader,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM historical_value_probe WHERE id = 1");
+    assert_eq!(data_rows(&before), ["1"], "{}", String::from_utf8_lossy(&before));
+    let update = run_txn_bytes(&mut engine, &mut budget, &mut writer,
+        "UPDATE historical_value_probe SET id = 9 WHERE id = 1");
+    assert!(!message_types(&update).contains(&b'E'), "{}", String::from_utf8_lossy(&update));
+    let historical = run_txn_bytes(&mut engine, &mut budget, &mut reader,
+        "SELECT id FROM historical_value_probe WHERE id = 1; SELECT count(*) FROM historical_value_probe WHERE id = 9");
+    assert!(!message_types(&historical).contains(&b'E'), "{}", String::from_utf8_lossy(&historical));
+    assert_eq!(data_rows(&historical), ["1", "0"]);
+    let after = run_txn_bytes(&mut engine, &mut budget, &mut reader,
+        "COMMIT; SELECT id FROM historical_value_probe WHERE id = 9");
+    assert_eq!(data_rows(&after), ["9"], "{}", String::from_utf8_lossy(&after));
 }
 
 #[test]

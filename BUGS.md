@@ -4,9 +4,9 @@ This file records only defects whose repair is prevented by an external blocker
 or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
-Reviewed for owned query SST roots, startup slot exhaustion, failed capture,
-retired schemas and read boundaries, and reader teardown on 2026-10-11: no
-defects meet these inclusion criteria.
+Reviewed for query SST root retention, temporary and durable reclamation
+namespaces, bounded capture, and cleanup on 2026-10-11: no defects meet these
+inclusion criteria.
 Resolved investigations are indexed in [history](docs/history/README.md).
 
 For a new entry, include a reproducer, affected boundary, observed behavior,

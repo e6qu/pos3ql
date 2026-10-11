@@ -88,6 +88,11 @@ temporary validation workflows before the final PR head. Fix failures on the
 same PR branch and rerun the affected gates; merge only when every required
 check passes on that head.
 
+Root-cause execution timeouts using step timings, logs, resource use, and the
+smallest reproducer. Fix the slow work, deadlock, resource contention, or workload
+partitioning; do not increase timeout durations. A job waiting without an assigned
+runner is a scheduling delay, not evidence of an execution timeout.
+
 CI also exercises shared heap publication with Miri to check the disjoint-range
 memory invariant alongside allocation-forbidden concurrent regressions.
 

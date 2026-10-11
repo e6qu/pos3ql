@@ -1,7 +1,7 @@
-name: Query SST root validation
+name: Owned reader qualification
 on:
   push:
-    branches: [codex/owned-query-sst-roots]
+    branches: [codex/qualify-owned-readers]
 concurrency:
   group: query-sst-roots-${{ github.ref }}
   cancel-in-progress: true

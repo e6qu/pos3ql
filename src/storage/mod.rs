@@ -40,7 +40,7 @@ use row_versions::{
     release_pending_chain, remap_committed_homes,
 };
 use row_walks::{RetainedRowIds, RowScanIds, RowWalkPool};
-use spill_generations::{SpillGenerationSnapshot, SpillRelation, SpillRootRegistry};
+use spill_generations::{QueryRootPool, SpillGenerationSnapshot, SpillRelation, SpillRootRegistry};
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -13540,6 +13540,7 @@ pub struct Storage {
     max_row_versions_per_row: usize,
     row_versions: RowVersionPools,
     row_walks: RowWalkPool,
+    query_roots: std::sync::Arc<QueryRootPool>,
     spill_roots: std::sync::Arc<SpillRootRegistry>,
     large_objects: std::sync::Mutex<LargeObjectCatalog>,
     large_object_page_table: u32,
@@ -17372,6 +17373,7 @@ impl Storage {
             + RowVersionPools::control_bytes()
             + Self::retained_row_walk_budget_bytes(config)
             + SpillRootRegistry::budget_bytes(config)
+            + QueryRootPool::budget_bytes(config)
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
             + Self::table_definition_image_budget_bytes(config)
             + committed_row_version_capacity(config)
@@ -17506,6 +17508,7 @@ impl Storage {
         let row_versions = RowVersionPools::new(config, budget)?;
         let row_walks = RowWalkPool::new(config, budget)?;
         let spill_roots = SpillRootRegistry::new(config, budget)?;
+        let query_roots = QueryRootPool::new(config, budget)?;
         let pending_table_defs =
             DefinitionVersions::new(budget, pending_table_definition_capacity(config))?;
         let pending_table_statistics = FixedVec::new(
@@ -18259,6 +18262,7 @@ impl Storage {
             row_versions,
             row_walks,
             spill_roots,
+            query_roots,
             large_objects: std::sync::Mutex::new(LargeObjectCatalog {
                 definitions: large_objects,
                 next_oid: LargeObjectOid::parse(16_384),
@@ -28723,8 +28727,8 @@ impl Storage {
 
     /// The merged walk behind the row-state seam: every SST-resident rowid
     /// of `slot`'s spill list not covered by the retained overlay, in ascending
-    /// rowid order. The newest member's verdict wins a rowid, and a tombstone
-    /// verdict suppresses it. Cursors keep one resident data block per
+    /// rowid order. The greatest admissible commit LSN wins; equal keys prefer
+    /// the newer member. A tombstone suppresses its rowid. Cursors keep one resident data block per
     /// member (leased from the spill reader's context pool), advancing
     /// through the sparse index; only keys are parsed here — row bytes are
     /// fetched later, by `row_bytes`, exactly as for any spilled row.
@@ -28734,18 +28738,16 @@ impl Storage {
         overlay_rowids: &RetainedRowIds<'_>,
         emit: &mut dyn FnMut(u64, u32, u32, u64) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<(), SqlError> {
-        let table = &self.tables[slot];
-        let n = table.n_spill_ssts;
-        let relation = SpillRelation::installed(table);
-        if n == 0 {
+        if self.tables[slot].n_spill_ssts == 0 {
             return Ok(());
         }
-        let Some(spill) = &self.spill else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "table has spill SSTs but no spill reader is attached"
-            ));
-        };
+        let roots = self.query_roots.retain(self, slot, self.commit_snapshot())?;
+        roots.with_snapshot(|snapshot| {
+        let relation = snapshot.relation();
+        let n = relation.len();
+        let spill = snapshot.reader.as_ref().ok_or_else(|| {
+            sql_err!(sqlstate::INTERNAL_ERROR, "query SST roots have no reader owner")
+        })?;
         let walk_id = spill.next_walk_id()?;
         let Some(mut cursor_lease) = try_mutex_pool(&spill.cursor_contexts, "spill cursor") else {
             return Err(sql_err!(
@@ -28804,7 +28806,7 @@ impl Storage {
                 while let Some((key, tombstone, len)) = cursor.head
                     && key.rowid == rowid
                 {
-                    if key.commit_lsn <= self.commit_snapshot()
+                    if key.commit_lsn <= snapshot.commit_lsn
                         && verdict.is_none_or(|current| {
                             key.commit_lsn > current.commit_lsn
                                 || (key.commit_lsn == current.commit_lsn
@@ -28832,6 +28834,7 @@ impl Storage {
                 return Ok(());
             }
         }
+        })
     }
 
     /// The payload-carrying form of [`Self::spill_merged_walk`]. A sequential
@@ -28856,25 +28859,23 @@ impl Storage {
             SpilledRowRepresentation<'a>,
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<bool, SqlError> {
-        let table = &self.tables[slot];
-        let relation = SpillRelation::installed(table);
-        if relation.len() == 0 {
+        if self.tables[slot].n_spill_ssts == 0 {
             return Ok(true);
         }
-        let Some(spill) = &self.spill else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "table has spill SSTs but no spill reader is attached"
-            ));
-        };
         let commit_snapshot = match overlay_mode {
             SpillOverlayMode::VisibleScan(_) => self.commit_snapshot(),
             SpillOverlayMode::CommittedCheckpoint(_) => self.lsn(),
         };
-        Self::walk_spill_bytes(
+        let roots = self.query_roots.retain(self, slot, commit_snapshot)?;
+        roots.with_snapshot(|snapshot| {
+            let relation = snapshot.relation();
+            let spill = snapshot.reader.as_ref().ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "query SST roots have no reader owner")
+            })?;
+            Self::walk_spill_bytes(
             spill,
             &relation,
-            commit_snapshot,
+            snapshot.commit_lsn,
             arena,
             recycle_rows,
             decoded_columns,
@@ -28883,6 +28884,7 @@ impl Storage {
             resume,
             emit,
         )
+        })
     }
 
     #[expect(clippy::too_many_arguments, reason = "immutable spill walk boundary")]

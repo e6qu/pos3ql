@@ -3,7 +3,7 @@
 use core::mem::size_of;
 use core::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::{
     ColType, MAX_COLUMNS, RelationPersistence, SpillReader, Storage, Table, table_slot_capacity,
@@ -193,6 +193,79 @@ impl<'a> SpillRelation<'a> {
     }
 }
 
+struct QueryRootSlot {
+    retained: AtomicBool,
+    snapshot: RwLock<SpillGenerationSnapshot>,
+}
+
+pub(super) struct QueryRootPool {
+    slots: FixedVec<QueryRootSlot>,
+}
+
+pub(super) struct QueryRootLease {
+    pool: Arc<QueryRootPool>,
+    slot: usize,
+}
+
+impl QueryRootPool {
+    fn slot_count(config: &Config) -> usize {
+        config.query_workspace_slots.saturating_mul(super::MAX_ROW_WALK_NESTING)
+    }
+
+    pub(super) fn budget_bytes(config: &Config) -> usize {
+        size_of::<Self>() + 2 * size_of::<std::sync::atomic::AtomicUsize>()
+            + Self::slot_count(config) * (size_of::<QueryRootSlot>()
+                + SpillGenerationSnapshot::budget_bytes(config.max_spill_generations_per_table))
+    }
+
+    pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Arc<Self>, BudgetError> {
+        budget.draw(size_of::<Self>() + 2 * size_of::<std::sync::atomic::AtomicUsize>(), "query SST root owner")?;
+        let count = Self::slot_count(config);
+        let mut slots = FixedVec::new(budget, "query SST root slots", count)?;
+        for _ in 0..count {
+            budget.draw(SpillGenerationSnapshot::budget_bytes(config.max_spill_generations_per_table), "query SST root members")?;
+            slots.push(QueryRootSlot {
+                retained: AtomicBool::new(false),
+                snapshot: RwLock::new(SpillGenerationSnapshot::new(config.max_spill_generations_per_table)),
+            }).expect("sized query root slots");
+        }
+        Ok(Arc::new(Self { slots }))
+    }
+
+    pub(super) fn retain(self: &Arc<Self>, storage: &Storage, table: usize, lsn: u64) -> Result<QueryRootLease, SqlError> {
+        for (slot, candidate) in self.slots.iter().enumerate() {
+            if candidate.retained.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                continue;
+            }
+            let lease = QueryRootLease { pool: Arc::clone(self), slot };
+            {
+                let mut snapshot = candidate.snapshot.write().expect("query SST roots poisoned");
+                snapshot.capture(storage, table)?;
+                snapshot.commit_lsn = lsn;
+            }
+            return Ok(lease);
+        }
+        Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "query SST root slots exhausted ({})", self.slots.len()))
+    }
+}
+
+impl QueryRootLease {
+    /// Only this source owns the slot. Its guard excludes no unrelated reader,
+    /// publisher, or retirement; registry ownership ends before object I/O.
+    pub(super) fn with_snapshot<T>(&self, read: impl FnOnce(&SpillGenerationSnapshot) -> Result<T, SqlError>) -> Result<T, SqlError> {
+        let snapshot = self.pool.slots[self.slot].snapshot.read().expect("query SST roots poisoned");
+        read(&snapshot)
+    }
+}
+
+impl Drop for QueryRootLease {
+    fn drop(&mut self) {
+        let slot = &self.pool.slots[self.slot];
+        slot.snapshot.write().expect("query SST roots poisoned").clear();
+        slot.retained.store(false, Ordering::Release);
+    }
+}
+
 /// The buffers are constructed at startup. Capturing only clones existing Arc
 /// owners and copies handles; registry ownership never spans object I/O.
 pub(super) struct SpillGenerationSnapshot {
@@ -337,6 +410,160 @@ mod tests {
             roster: BlockId([tag.wrapping_add(2); 32]),
             format: RowSstFormat::PackedV4,
         }
+    }
+
+    #[test]
+    fn query_sst_roots_charge_exact_startup_capacity_and_reuse_released_slots() {
+        let mut config = test_config();
+        config.query_workspace_slots = 1;
+        config.max_spill_generations_per_table = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("query_roots", &[("id", ColType::Int4, true)])).unwrap();
+        storage.set_spill_list(table, &[handle(1)]);
+        let expected = QueryRootPool::budget_bytes(&config);
+        let mut pool_budget = Budget::new(expected);
+        let pool = QueryRootPool::new(&config, &mut pool_budget).unwrap();
+        assert_eq!(pool_budget.used(), expected);
+        let mut leases = Vec::with_capacity(pool.slots.len());
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..pool.slots.len() {
+                leases.push(pool.retain(&storage, table, 7).unwrap());
+            }
+            assert_eq!(pool.retain(&storage, table, 9).err().unwrap().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            drop(leases.pop());
+            let replacement = pool.retain(&storage, table, 9).unwrap();
+            replacement.with_snapshot(|snapshot| {
+                assert_eq!(snapshot.commit_lsn, 9);
+                assert_eq!(snapshot.relation().handle(0), handle(1));
+                replacement.with_snapshot(|nested| {
+                    assert_eq!(nested.commit_lsn, snapshot.commit_lsn);
+                    assert_eq!(nested.relation().handle(0), snapshot.relation().handle(0));
+                    Ok(())
+                })?;
+                Ok(())
+            }).unwrap();
+            drop(replacement);
+            leases.clear();
+            assert!(pool.slots.iter().all(|slot| !slot.retained.load(Ordering::Acquire)));
+        });
+    }
+
+    #[test]
+    fn query_sst_roots_release_failed_capture_without_partial_pins() {
+        let mut config = test_config();
+        config.max_spill_generations_per_table = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("query_root_failure", &[("id", ColType::Int4, true)])).unwrap();
+        storage.set_spill_list(table, &[handle(1), handle(2)]);
+        config.max_spill_generations_per_table = 1;
+        let mut pool_budget = Budget::new(QueryRootPool::budget_bytes(&config));
+        let pool = QueryRootPool::new(&config, &mut pool_budget).unwrap();
+        let mut retained = Vec::with_capacity(2);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(pool.retain(&storage, table, 7).err().unwrap().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(pool.slots.iter().all(|slot| !slot.retained.load(Ordering::Acquire)));
+            storage.copy_retained_spill_roots(true, &mut retained).unwrap();
+            assert!(retained.is_empty());
+            storage.set_spill_list(table, &[handle(1)]);
+            drop(pool.retain(&storage, table, 7).unwrap());
+        });
+    }
+
+    #[test]
+    fn query_sst_roots_read_captured_versions_after_table_and_storage_retirement() {
+        use crate::sql::types::Datum;
+        use crate::storage::{SpillOverlayMode, SpilledRowRepresentation, rowenc};
+        use crate::storage::row_walks::RowScanIds;
+        use crate::store::{EphemeralBlockStore, SstKey, SstWriter};
+        let mut config = test_config();
+        config.max_spill_generations_per_table = 2;
+        let bytes = 32 * crate::store::BLOCK_SIZE;
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes
+            + SpillReader::budget_bytes(false, 2) + EphemeralBlockStore::budget_bytes(bytes) + (1 << 20));
+        let path = std::env::temp_dir().join(format!("pos3ql-query-root-{}.blocks", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut blocks = EphemeralBlockStore::open(&mut budget, &path, bytes).unwrap();
+        let mut writer = Box::new(SstWriter::new());
+        let mut row = [0u8; 32];
+        for (id, lsn, value) in [(1, 9, 88), (1, 7, 41), (2, 9, 99)] {
+            let values = [Datum::Int4(value)];
+            let len = rowenc::encoded_len(&values);
+            rowenc::encode(&values, &mut row[..len]);
+            writer.append_version(&mut blocks, SstKey::at(id, lsn), &row[..len]).unwrap();
+        }
+        let root = writer.finish(&mut blocks).unwrap().unwrap();
+        let blocks = Arc::new(Mutex::new(blocks));
+        let reader = SpillReader::new(&mut budget, 2, None, Some(blocks)).unwrap();
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage.attach_spill(reader);
+        let mut definition = make_def("retiring_query", &[("id", ColType::Int4, true)]);
+        definition.persistence = RelationPersistence::Temporary;
+        let table = storage.create_table(definition).unwrap();
+        storage.set_spill_list(table, &[root]);
+        let mut arena = crate::mem::arena::Arena::new(&mut budget, "query root result", 1 << 18).unwrap();
+        let mut retained = Vec::with_capacity(1);
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_commit_snapshot(7);
+            let scan = storage.row_scan(table).unwrap();
+            let RowScanIds::Reserved(rowids) = &scan.rowids else { unreachable!() };
+            let mut metadata_rows = 0;
+            storage.spill_merged_walk(table, rowids, &mut |rowid, _, _, lsn| {
+                assert_eq!((rowid, lsn), (1, 7));
+                storage.set_commit_snapshot(u64::MAX);
+                metadata_rows += 1;
+                Ok(core::ops::ControlFlow::Continue(()))
+            }).unwrap();
+            assert_eq!(metadata_rows, 1, "nested callbacks cannot advance the outer read boundary");
+            storage.set_commit_snapshot(7);
+            let error = storage.spill_merged_walk(table, rowids, &mut |_, _, _, _| {
+                Err(sql_err!(sqlstate::QUERY_CANCELED, "cancel retained scan"))
+            }).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::QUERY_CANCELED);
+            assert!(storage.query_roots.slots.iter().all(|slot| !slot.retained.load(Ordering::Acquire)));
+            drop(scan);
+            let lease = storage.query_roots.retain(&storage, table, 7).unwrap();
+            let registry = lease.with_snapshot(|snapshot| Ok(Arc::clone(snapshot.registry.as_ref().unwrap()))).unwrap();
+            storage.drop_table(table);
+            storage.create_table(make_def("retiring_query", &[("id", ColType::Text, true)])).unwrap();
+            drop(storage);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert_eq!(retained, [root]);
+            let mut count = 0;
+            lease.with_snapshot(|snapshot| {
+                let relation = snapshot.relation();
+                assert_eq!(relation.schema[0], ColType::Int4);
+                assert_eq!(snapshot.commit_lsn, 7);
+                Storage::walk_spill_bytes(
+                    snapshot.reader.as_ref().unwrap(), &relation, snapshot.commit_lsn,
+                    &arena, true, None, true,
+                    SpillOverlayMode::VisibleScan(&RowScanIds::Statement(&[])), None,
+                    &mut |rowid, lsn, representation| {
+                        assert_eq!((rowid, lsn), (1, 7));
+                        let mut decoded = [Datum::Null; MAX_COLUMNS];
+                        let values = match representation {
+                            SpilledRowRepresentation::Encoded(bytes) => {
+                                rowenc::decode(bytes, &relation.schema[..relation.n_columns], &mut decoded)?;
+                                &decoded[..relation.n_columns]
+                            }
+                            SpilledRowRepresentation::Values(values) => values,
+                        };
+                        assert_eq!(values, [Datum::Int4(41)]);
+                        count += 1;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    },
+                )?;
+                Ok(())
+            }).unwrap();
+            assert_eq!(count, 1);
+            drop(lease);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert!(retained.is_empty());
+            assert!(registry.take_reclamation_pending());
+        });
+        arena.reset();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

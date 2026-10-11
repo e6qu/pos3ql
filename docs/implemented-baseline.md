@@ -38,9 +38,9 @@ Resumable value-index checkpoint sources charge one table_rows identity/coverage
 at startup. Bucket movement and pending rollback do not move their logical
 resume position; reproducible eviction routes unprocessed rows through the paced SST merge while
 preserving coverage for emitted resident rows.
-Selected committed images are pinned before releasing row metadata. Checkpoint
-SST sources retain their committed boundary, immutable handles, schema, and shared
-read pool across beats. A startup-sized registry protects their durable or local
+Selected committed images are pinned before releasing row metadata. Query SST
+walks retain their read boundary, immutable handles, schema, and shared reader
+owner; checkpoint sources preserve that ownership across beats. A startup-sized registry protects their durable or local
 temporary block graphs during retirement; garbage collection copies roots before
 object I/O. Releasing a root retained by a durable garbage pass schedules another
 maintenance pass without requiring a new write. Root and reader-count exhaustion
@@ -53,9 +53,9 @@ member before selecting a snapshot image. Full rewrites with historical object
 versions remain explicitly guarded; configured merge scratch limits report
 SQLSTATE 54000. Heap relocation remains exclusive.
 
-Checkpoint jobs restart when committed input or table identity changes. Query
-scans still retain table incarnations through their Storage borrow; concurrent
-query retirement and generation publication remain open gates.
+Checkpoint jobs restart when committed input or table identity changes. Resident
+overlays and point reads still retain table incarnations through their Storage
+borrow; concurrent table retirement and generation publication remain open gates.
 
 Committed row publication prepares keys before metadata ownership and validates
 its selected pending head before changing state. Snapshot registration/pruning,
@@ -77,6 +77,16 @@ concurrent execution or heap relocation. COPY FROM retains its lease in the
 connection-owned setup through completion or abort and restores the captured
 snapshot for each data chunk; COPY TO finishes reads before returning. Spill walk
 identities fail with SQLSTATE 54000 before wraparound or active buffer reuse.
+Query SST sources lease startup-reserved root slots, capturing immutable members,
+schema, snapshot boundary, and the reader buffer owner. Capture and teardown hold
+registry ownership briefly; immutable source snapshots admit shared and nested
+reads, and their private slots exclude no unrelated scan.
+Sources survive table and Storage retirement and release roots on every return.
+The pool reserves 64 slots per query workspace; exhaustion and failed capture do
+not grow pools or partially pin generations. Metadata walks use their captured
+boundary even when nested callbacks change thread-local execution context.
+Point reads, resident overlays, table retirement, and relocation still need a
+coherent lifecycle transition before concurrent execution is enabled.
 
 Appends release byte ownership before publishing row metadata. Compaction
 preflights its relocation set before changing bytes or handles; readers reject

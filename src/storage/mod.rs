@@ -28986,6 +28986,16 @@ impl Storage {
                 context.owner = *walk_id;
                 context.pax_values_owner = None;
             }
+            // A merged member can carry newer versions before this snapshot's
+            // admissible image. Advance only those heads before choosing bytes;
+            // the selected head must remain available for payload materialization.
+            for (member, cursor) in cursors[..n].iter_mut().enumerate() {
+                while cursor.head.is_some_and(|(key, _, _)| {
+                    key.rowid == rowid && key.commit_lsn > commit_snapshot
+                }) {
+                    Self::cursor_advance(spill, relation, member, cursor, &mut context)?;
+                }
+            }
             let mut verdict: Option<SpillVersion> = None;
             for (member, cursor) in cursors[..n].iter().enumerate() {
                 if let Some((key, tombstone, len)) = cursor.head

@@ -70239,7 +70239,7 @@ fn checkpoint_live_block_capacity_exhausts_loudly() {
 }
 
 #[test]
-fn historical_sst_reads_survive_full_roster_replacement_and_cold_recovery() {
+fn historical_sst_reads_survive_paced_roster_replacement_and_cold_recovery() {
     let mut config = test_config("historical-sst-retirement");
     config.object_store_on = true;
     config.object_store_sim = true;

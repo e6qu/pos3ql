@@ -47,8 +47,10 @@ maintenance pass without requiring a new write. Root and reader-count exhaustion
 reports SQLSTATE 54000 before changing registrations.
 
 Full SST rewrites and adjacent-generation merges remap every retained committed
-version, preserving exact version LSNs and deletion markers. Historical snapshots
-do not prohibit full rewrites; configured merge scratch limits still report
+version, preserving exact version LSNs and deletion markers. Paced merges
+retain the historical baseline, and byte scans skip newer versions within each
+member before selecting a snapshot image. Full rewrites with historical object
+versions remain explicitly guarded; configured merge scratch limits report
 SQLSTATE 54000. Heap relocation remains exclusive.
 
 Checkpoint jobs restart when committed input or table identity changes. Query

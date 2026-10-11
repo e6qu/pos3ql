@@ -1374,8 +1374,6 @@ impl Checkpointer {
                 resume_lo: SstKey::MIN,
             },
             (None, _) => {
-                #[cfg(test)]
-                eprintln!("SST_MERGE slot={} oldest={:?} drop={} keys={:?}", job.slot, job.oldest_snapshot, job.drop_tombstones, self.merge_scratch.as_slice());
                 // Exact duplicates choose the newer list member.
                 self.merge_scratch
                     .sort_unstable_by_key(|&(key, kind)| (key, kind & 1));
@@ -11439,13 +11437,25 @@ impl Checkpointer {
             && storage.table(slot).dirty()
             && self.slice_scratch.n > 0
             && self.slice_scratch.n < self.slice_scratch.capacity();
-        #[cfg(test)]
-        eprintln!("SST_BUILD slot={slot} n={} clean={clean} delta={delta} oldest={:?}", self.slice_scratch.n, storage.oldest_snapshot());
         let changed_row_after_lsn = delta.then_some(if reuse_slice {
             self.sliced_lsn[slot]
         } else {
             self.manifest_lsn
         });
+
+        // A logical full scan does not enumerate historical object versions.
+        // Filled rosters must use the version-preserving paced merge first.
+        if storage.has_active_snapshots()
+            && !clean
+            && storage.table(slot).n_spill_ssts > 0
+            && !delta
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "historical snapshot pins a full SST generation list for table \"{}\"",
+                storage.table(slot).definition().name.as_str()
+            ));
+        }
 
         #[cfg(feature = "checkpoint-profile")]
         let row_started = checkpoint_profile_start();

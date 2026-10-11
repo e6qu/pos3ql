@@ -67316,6 +67316,135 @@ fn checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery() {
 }
 
 #[test]
+fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats() {
+    let mut config = test_config("checkpoint-retained-partition");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-checkpoint-retained-partition-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE retained_checkpoint(id integer PRIMARY KEY); INSERT INTO retained_checkpoint SELECT i FROM generate_series(1, 128) AS g(i)",
+    );
+    assert!(!message_types(&setup).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+    let slot = engine
+        .storage
+        .find_table("public", "retained_checkpoint")
+        .unwrap();
+    engine.storage.set_commit_snapshot(0);
+    let mut cursor = crate::storage::CheckpointValueCursor::new(
+        config.max_spill_generations_per_table,
+        config.table_rows,
+    );
+    let mut arena =
+        crate::mem::arena::Arena::new(&mut budget, "checkpoint retained source", 1 << 20).unwrap();
+    let mut output = [0u8; 128];
+    let mut seen = Vec::new();
+    assert!(
+        !engine
+            .storage
+            .for_each_value_binding_entry_batch(
+                slot,
+                0,
+                &mut cursor,
+                &arena,
+                &mut output,
+                1,
+                8,
+                &mut |entry| {
+                    seen.push(entry.rowid);
+                    Ok(core::ops::ControlFlow::Continue(()))
+                }
+            )
+            .unwrap()
+    );
+    engine.storage.evict_committed_table(slot);
+    engine.storage.evict_redundant_entries(slot);
+    assert!(engine.storage.spill_rows_are_unshadowed(slot));
+    loop {
+        let before = engine.storage.block_io_stats();
+        let done = engine
+            .storage
+            .for_each_value_binding_entry_batch(
+                slot,
+                0,
+                &mut cursor,
+                &arena,
+                &mut output,
+                16,
+                8,
+                &mut |entry| {
+                    let mut values = [crate::sql::types::Datum::Null];
+                    crate::storage::rowenc::decode(
+                        entry.key,
+                        &[crate::sql::types::ColType::Int4],
+                        &mut values,
+                    )?;
+                    assert_eq!(
+                        values[0],
+                        crate::sql::types::Datum::Int4(entry.rowid as i32)
+                    );
+                    seen.push(entry.rowid);
+                    Ok(core::ops::ControlFlow::Continue(()))
+                },
+            )
+            .unwrap();
+        let reads = engine.storage.block_io_stats().saturating_sub(before);
+        assert!(
+            reads.object_gets <= 8,
+            "eviction must preserve paced SST reads: {reads:?}"
+        );
+        arena.reset();
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        seen,
+        (1..=128).collect::<Vec<_>>(),
+        "eviction cannot duplicate or skip checkpoint source rows"
+    );
+    assert_eq!(engine.storage.commit_snapshot(), 0);
+    let scan = engine.storage.row_scan(slot).unwrap();
+    let mut visible_rows = 0;
+    scan.for_each_spilled_row_batch(&arena, true, None, &mut |rows| {
+        visible_rows += rows.len();
+        Ok(core::ops::ControlFlow::Continue(()))
+    })
+    .unwrap();
+    assert_eq!(
+        visible_rows, 0,
+        "query scans must retain their older statement snapshot"
+    );
+    drop(scan);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, 1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT count(*), min(id), max(id) FROM retained_checkpoint"
+        )),
+        ["128|1|128"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn checkpoint_value_source_resumes_inside_a_spilled_pax_block() {
     let mut config = test_config("checkpoint-value-pax-resume");
     config.object_store_on = true;

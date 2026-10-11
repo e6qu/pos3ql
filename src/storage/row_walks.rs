@@ -369,6 +369,118 @@ mod tests {
         });
     }
 
+    fn checkpoint_fixture() -> (Storage, usize) {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut definition = make_def("checkpoint_walk", &[("id", ColType::Int4, true)]);
+        definition.columns[0].primary = true;
+        let table = storage.create_table(definition).unwrap();
+        for rowid in 1..=2 {
+            let location = storage.heap.append_row(&[Datum::Int4(rowid as i32)]).unwrap();
+            storage.tables[table].rows.insert(rowid, RowState::committed_only_at(location, 7)).unwrap();
+        }
+        storage.refresh_enforcers(table).unwrap();
+        (storage, table)
+    }
+
+    #[test]
+    fn checkpoint_retained_rows_resume_after_rollback_and_later_publication() {
+        let (storage, table) = checkpoint_fixture();
+        let location = storage.heap.append_row(&[Datum::Int4(99)]).unwrap();
+        let undone = storage.write_pending(table, 3, 7, 1, Some(location)).unwrap();
+        let mut cursor = super::super::CheckpointValueCursor::new(1, 128);
+        let mut budget = Budget::new(4096);
+        let arena = crate::mem::arena::Arena::new(&mut budget, "checkpoint test", 4096).unwrap();
+        let mut output = [0u8; 128];
+        crate::mem::guard::forbid_alloc(|| {
+            let mut seen = [0u64; 2];
+            let mut count = 0;
+            let mut each = |entry: super::super::CheckpointValueEntry<'_>| {
+                assert!(storage.tables[table].rows.test_write().is_ok());
+                assert!(storage.row_versions.test_write().is_ok());
+                assert!(storage.heap.test_write().is_ok());
+                assert_eq!(entry.commit_lsn, 7);
+                let mut values = [Datum::Null];
+                super::super::rowenc::decode(entry.key, &[ColType::Int4], &mut values)?;
+                assert_eq!(values[0], Datum::Int4(entry.rowid as i32));
+                seen[count] = entry.rowid;
+                count += 1;
+                Ok(core::ops::ControlFlow::Continue(()))
+            };
+            assert!(!storage.for_each_value_binding_entry_batch(table, 0, &mut cursor, &arena, &mut output, 1, 8, &mut each).unwrap());
+            storage.restore_pending(table, 3, 7, undone);
+            let later = storage.write_pending(table, 4, 7, 1, Some(location)).unwrap();
+            let replacement = storage.write_pending(table, 2, 7, 1, Some(location)).unwrap();
+            while !storage.for_each_value_binding_entry_batch(table, 0, &mut cursor, &arena, &mut output, 1, 8, &mut each).unwrap() {}
+            assert_eq!(seen, [1, 2]);
+            assert_eq!(count, 2);
+            storage.restore_pending(table, 2, 7, replacement);
+            storage.restore_pending(table, 4, 7, later);
+        });
+    }
+
+    #[test]
+    fn checkpoint_retained_delta_rows_keep_tombstones_and_release_callbacks() {
+        let (mut storage, table) = checkpoint_fixture();
+        let mut deleted = *storage.resident_row_state(table, 1).unwrap();
+        deleted.committed = None;
+        deleted.committed_lsn = 9;
+        storage.tables[table].rows.insert(3, deleted).unwrap();
+        let mut cursor = super::super::CheckpointValueCursor::new(1, 128);
+        let mut changed = Vec::with_capacity(128);
+        let mut output = [0u8; 128];
+        crate::mem::guard::forbid_alloc(|| {
+            let mut count = 0;
+            let mut each = |entry: super::super::CheckpointValueEntry<'_>| {
+                assert!(storage.tables[table].rows.test_write().is_ok());
+                assert!(storage.row_versions.test_write().is_ok());
+                let location = storage.heap.append_row(&[Datum::Int4(99)])?;
+                let undo = storage.write_pending(table, entry.rowid, 7, 1, Some(location))?;
+                storage.restore_pending(table, entry.rowid, 7, undo);
+                count += 1;
+                Ok(core::ops::ControlFlow::Break(()))
+            };
+            while !storage.for_each_value_binding_delta_entry_batch(table, 0, 6, &mut cursor, &mut changed, &mut output, 1, &mut each).unwrap() {}
+            assert_eq!(count, 2);
+            assert_eq!(changed, [1, 2, 3]);
+            assert_eq!(storage.resident_row_state(table, 3).unwrap().committed_lsn, 9);
+        });
+    }
+
+    #[test]
+    fn checkpoint_retained_rows_capacity_and_error_reset_are_allocation_free() {
+        let (storage, table) = checkpoint_fixture();
+        let mut cursor = super::super::CheckpointValueCursor::new(1, 1);
+        let mut changed = Vec::with_capacity(128);
+        let mut output = [0u8; 128];
+        crate::mem::guard::forbid_alloc(|| {
+            let error = storage.for_each_value_binding_delta_entry_batch(table, 0, 6, &mut cursor, &mut changed, &mut output, 1, &mut |_| Ok(core::ops::ControlFlow::Continue(()))).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("checkpoint retained row identities"));
+            assert!(cursor.resident_rowids.is_empty());
+            assert!(!cursor.resident_initialized);
+            assert!(storage.tables[table].rows.test_write().is_ok());
+        });
+        let mut cursor = super::super::CheckpointValueCursor::new(1, 128);
+        crate::mem::guard::forbid_alloc(|| {
+            let error = storage.for_each_value_binding_delta_entry_batch(table, 0, 6, &mut cursor, &mut changed, &mut output, 1, &mut |_| Err(sql_err!(sqlstate::INTERNAL_ERROR, "checkpoint callback failure"))).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
+            assert!(storage.tables[table].rows.test_write().is_ok());
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.heap.test_write().is_ok());
+            cursor.reset();
+            changed.clear();
+            let mut count = 0;
+            assert!(storage.for_each_value_binding_delta_entry_batch(table, 0, 6, &mut cursor, &mut changed, &mut output, 128, &mut |_| {
+                count += 1;
+                Ok(core::ops::ControlFlow::Continue(()))
+            }).unwrap());
+            assert_eq!(count, 2);
+            assert_eq!(changed, [1, 2]);
+        });
+    }
+
     #[test]
     fn retained_byte_scan_allows_publication_during_a_pinned_callback() {
         let (storage, table) = fixture();

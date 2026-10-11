@@ -4,9 +4,9 @@ This file records only defects whose repair is prevented by an external blocker
 or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
-Reviewed for retained row and byte scans, frozen overlay/PAX coverage, join
-identities, and pending uniqueness on
-2026-10-10: no defects meet these inclusion criteria.
+Reviewed for retained row/byte scans and resumable checkpoint identity coverage,
+rollback, eviction, callback cleanup, and bounded capacity on
+2026-10-11: no defects meet these inclusion criteria.
 Resolved investigations are indexed in [history](docs/history/README.md).
 
 For a new entry, include a reproducer, affected boundary, observed behavior,

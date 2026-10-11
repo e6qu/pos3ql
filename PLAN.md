@@ -46,12 +46,16 @@ row identities and release broad metadata ownership before callbacks; their
 frozen overlay coverage survives eviction during SST merging. Pending uniqueness
 walks release chain ownership before byte reads and waits. Physical outer-join
 match tracking uses row identities across scan orders. Committed publication,
-table lifecycle, resumable checkpoint walks, and in-place compaction still
-require further concurrency work. Optimized overlay/PAX byte scans share one
+table lifecycle, retained SST generations across checkpoint beats, and in-place
+compaction still require further concurrency work. Optimized overlay/PAX byte scans share one
 startup-bounded partition through both phases; callbacks release row metadata
 before consuming bytes. SQL scans retain identities in the fixed statement arena
-so accepted wide joins do not exhaust per-workspace metadata-walk slots. Their Storage borrow retains the immutable SST list;
-it does not yet permit concurrent generation replacement or retirement.
+so accepted wide joins do not exhaust per-workspace metadata-walk slots.
+Resumable value-index checkpoint walks retain startup-bounded row identities
+and one committed overlay partition across beats, pinning selected images before
+releasing row metadata. Statement Storage borrows retain the immutable SST list;
+checkpoint jobs still validate generation changes and restart. Neither permits
+concurrent generation replacement or retirement.
 
 - Complete concurrent table lifecycle, committed row publication, snapshot
   registration, and statistics ownership with explicit lock ordering. Replace

@@ -1,0 +1,39 @@
+name: Checkpoint retention validation
+on:
+  push:
+    branches: [codex/checkpoint-row-retention]
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUST_MIN_STACK: 134217728
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format for review
+        run: |
+          cargo fmt
+          git diff > "$RUNNER_TEMP/format.patch"
+      - name: Compile all targets
+        run: cargo check --all-targets --locked
+      - name: Lint
+        run: cargo clippy --lib --bins --locked -- -D warnings
+      - name: Retained checkpoint identities
+        run: cargo test --lib --locked checkpoint_retained_rows -- --test-threads=1 --nocapture
+      - name: Retained checkpoint deltas
+        run: cargo test --lib --locked checkpoint_retained_delta -- --test-threads=1 --nocapture
+      - name: Checkpoint source and recovery
+        run: cargo test --lib --locked checkpoint_value_ -- --test-threads=1 --nocapture
+      - name: Architecture and documentation guards
+        run: |
+          bash tools/check-bugs.sh
+          bash tools/check-noops.sh
+          python3 tools/check-docs.py
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: checkpoint-retention-format
+          path: ${{ runner.temp }}/format.patch

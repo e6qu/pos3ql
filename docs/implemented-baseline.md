@@ -22,7 +22,7 @@ do not qualify concurrent execution or representative deployments.
 | Catalogs and metadata | Synchronized publication and owned reader images; guards release before nested resolution |
 | Table metadata | Database/creation/owner identity, typed CREATE/DROP existence, definitions, and pending heads share guarded ownership; version slots are guarded, retained images capture identity with the definition, and publication remains exclusive |
 | Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
-| Resident rows | Pending image preparation precedes short version/map publication; shared pending writes and exact-head rollback preserve pinned byte readers and committed deletion markers. Authoritative row-state walks retain startup-bounded row identities and frozen SST coverage, acquiring chain ownership only per selected row. Pending uniqueness callbacks receive detached changes with pinned byte images. Optimized overlay/PAX scans retain one frozen overlay partition across metadata and payload phases; their callbacks release row metadata before consuming bytes. Resumable checkpoint walks retain broader ownership; committed publication and reclamation remain exclusive |
+| Resident rows | Pending image preparation precedes short version/map publication; shared pending writes and exact-head rollback preserve pinned byte readers and committed deletion markers. Authoritative row-state walks retain startup-bounded row identities and frozen SST coverage, acquiring chain ownership only per selected row. Pending uniqueness callbacks receive detached changes with pinned byte images. Optimized overlay/PAX scans retain one frozen overlay partition across metadata and payload phases; their callbacks release row metadata before consuming bytes. Resumable value-index checkpoint walks retain a bounded identity set and committed overlay partition across beats, pinning images before releasing row metadata; committed publication and reclamation remain exclusive |
 | Heap bytes | Readers pin published immutable ranges; appends initialize disjoint tails and publish complete bytes without excluding existing readers; relocation remains exclusive |
 | Deferred rows | Logical row identity, table incarnation, and exact pending/committed version tokens; later reads reacquire the selected version rather than retaining heap locations |
 
@@ -31,8 +31,12 @@ walks and internal byte scans share 64 retention slots per query workspace, each
 of the table and large-object page overlays; exhaustion reports SQLSTATE 54000.
 SQL byte scans retain identities in the fixed statement arena, so accepted wide
 joins do not consume one metadata-walk slot per join edge. Arena exhaustion is
-SQLSTATE 54000. A scan's Storage borrow retains its table incarnation and immutable SST list;
-concurrent generation replacement and retirement remain unsupported.
+SQLSTATE 54000. Checkpoint value-index sources charge one additional table_rows
+identity buffer at startup; bucket movement, rollback, and reproducible eviction
+do not move their logical resume position or SST partition. Each statement scan's
+Storage borrow retains its table incarnation and immutable SST list. Checkpoint
+jobs still restart on generation changes; concurrent generation replacement and
+retirement remain unsupported.
 Exhaustion is explicit; readers reject reused table identities and stale heap
 locations. Appends release byte ownership before publishing row metadata;
 compaction preflights its complete relocation set before changing bytes or handles.

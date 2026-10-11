@@ -13897,9 +13897,11 @@ struct MemberCursor {
 
 /// Logical position of one checkpoint value-index source walk. Block buffers
 /// remain in the shared scan context and are reloaded on a later beat; this
-/// state contains only stable map offsets and immutable SST cursor positions.
+/// state retains sorted row identities and immutable SST cursor positions.
 pub(crate) struct CheckpointValueCursor {
-    resident_slot: usize,
+    resident_position: usize,
+    resident_rowids: Vec<u64>,
+    resident_initialized: bool,
     members: Box<[MemberCursor]>,
     /// Stable owner identity for shared scan buffers across checkpoint beats.
     spill_walk_id: u64,
@@ -13910,13 +13912,16 @@ pub(crate) struct CheckpointValueCursor {
 }
 
 impl CheckpointValueCursor {
-    pub(crate) fn budget_bytes(max_spill_generations: usize) -> usize {
+    pub(crate) fn budget_bytes(max_spill_generations: usize, table_rows: usize) -> usize {
         max_spill_generations * core::mem::size_of::<MemberCursor>()
+            + table_rows * core::mem::size_of::<u64>()
     }
 
-    pub(crate) fn new(max_spill_generations: usize) -> Self {
+    pub(crate) fn new(max_spill_generations: usize, table_rows: usize) -> Self {
         Self {
-            resident_slot: 0,
+            resident_position: 0,
+            resident_rowids: Vec::with_capacity(table_rows),
+            resident_initialized: false,
             members: vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
             spill_walk_id: 0,
             spill_initialized: 0,
@@ -13926,7 +13931,9 @@ impl CheckpointValueCursor {
     }
 
     pub(crate) fn reset(&mut self) {
-        self.resident_slot = 0;
+        self.resident_position = 0;
+        self.resident_rowids.clear();
+        self.resident_initialized = false;
         self.members.fill(MemberCursor::EMPTY);
         self.spill_walk_id = 0;
         self.spill_initialized = 0;
@@ -13964,9 +13971,8 @@ struct SpillVersion {
 #[derive(Clone, Copy)]
 enum SpillOverlayMode<'scan> {
     VisibleScan(&'scan RowScanIds<'scan>),
-    /// A checkpoint spans statements, so pending versions may appear without
-    /// changing the committed generation. Partition only by committed home.
-    CommittedCheckpoint,
+    /// The resident phase owns this frozen committed overlay partition.
+    CommittedCheckpoint(&'scan [u64]),
 }
 
 /// The reader's owned block buffers (index, data, physical column, chain
@@ -28851,16 +28857,8 @@ impl Storage {
             }) = verdict
                 && match overlay_mode {
                     SpillOverlayMode::VisibleScan(rowids) => !rowids.contains(rowid),
-                    SpillOverlayMode::CommittedCheckpoint => {
-                        self.tables[slot].rows.get(&rowid).is_none_or(|state| {
-                            matches!(
-                                state.committed,
-                                Some(RowHome::Spilled {
-                                    commit_lsn: current,
-                                    ..
-                                }) if current == commit_lsn
-                            )
-                        })
+                    SpillOverlayMode::CommittedCheckpoint(rowids) => {
+                        rowids.binary_search(&rowid).is_err()
                     }
                 } {
                 let cursor = &mut cursors[member as usize];
@@ -29546,6 +29544,36 @@ impl Storage {
         Ok(core::ops::ControlFlow::Continue(()))
     }
 
+    fn retain_checkpoint_rowids(
+        &self,
+        table_slot: usize,
+        cursor: &mut CheckpointValueCursor,
+        include_spilled: bool,
+    ) -> Result<(), SqlError> {
+        if cursor.resident_initialized {
+            return Ok(());
+        }
+        let rows = self.tables[table_slot].rows.read();
+        for (&rowid, state) in rows.iter() {
+            if !include_spilled && matches!(state.committed, Some(RowHome::Spilled { .. })) {
+                continue;
+            }
+            if cursor.resident_rowids.len() == cursor.resident_rowids.capacity() {
+                cursor.resident_rowids.clear();
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "checkpoint retained row identities exceed table_rows ({})",
+                    cursor.resident_rowids.capacity()
+                ));
+            }
+            cursor.resident_rowids.push(rowid);
+        }
+        drop(rows);
+        cursor.resident_rowids.sort_unstable();
+        cursor.resident_initialized = true;
+        Ok(())
+    }
+
     /// Resumes resident rows changed after one published value-index base and
     /// records the exact row identities represented by the delta. Heap rows
     /// contribute replacement entries and tombstones only suppress the base.
@@ -29565,20 +29593,21 @@ impl Storage {
             CheckpointValueEntry<'entry>,
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<bool, SqlError> {
-        let rows = self.tables[table_slot].rows.read();
+        self.retain_checkpoint_rowids(table_slot, cursor, true)?;
         let mut walked = 0usize;
-        while cursor.resident_slot < rows.backing_slot_count() && walked < max_rows {
-            let slot = cursor.resident_slot;
-            cursor.resident_slot += 1;
-            let Some((&rowid, state)) = rows.entry_at_slot(slot) else {
+        while cursor.resident_position < cursor.resident_rowids.len() && walked < max_rows {
+            let rowid = cursor.resident_rowids[cursor.resident_position];
+            cursor.resident_position += 1;
+            let Some(state) = self.resident_row_state(table_slot, rowid) else {
                 continue;
             };
             if state.committed_lsn <= after_lsn {
                 continue;
             }
             walked += 1;
-            let home = match state.committed {
-                Some(home @ RowHome::Heap(_)) => home,
+            let committed_lsn = state.committed_lsn;
+            match state.committed {
+                Some(RowHome::Heap(_)) => {},
                 None => {
                     if changed_rowids.len() == changed_rowids.capacity() {
                         return Err(sql_err!(
@@ -29595,7 +29624,7 @@ impl Storage {
                 // remains current; a binding-changing row cannot spill until
                 // the matching value generation publishes.
                 Some(RowHome::Spilled { .. }) => continue,
-            };
+            }
             if changed_rowids.len() == changed_rowids.capacity() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -29604,6 +29633,7 @@ impl Storage {
                 ));
             }
             changed_rowids.push(rowid);
+            let home = self.committed_row_home(table_slot, state)?.expect("committed heap image");
             let Some((key_len, payload_len, hash)) =
                 self.encode_value_binding_entry(table_slot, binding, rowid, home, output)?
             else {
@@ -29612,7 +29642,7 @@ impl Storage {
             let (key, payload) = output[..key_len + payload_len].split_at(key_len);
             if each(CheckpointValueEntry {
                 rowid,
-                commit_lsn: state.committed_lsn,
+                commit_lsn: committed_lsn,
                 hash,
                 key,
                 payload,
@@ -29622,7 +29652,7 @@ impl Storage {
                 return Ok(false);
             }
         }
-        Ok(cursor.resident_slot == rows.backing_slot_count())
+        Ok(cursor.resident_position == cursor.resident_rowids.len())
     }
 
     /// Resumes a complete checkpoint value-index source walk for at most
@@ -29642,22 +29672,23 @@ impl Storage {
             CheckpointValueEntry<'entry>,
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<bool, SqlError> {
+        self.retain_checkpoint_rowids(table_slot, cursor, false)?;
         let mut walked = 0usize;
         if !cursor.resident_done {
-            let rows = self.tables[table_slot].rows.read();
-            while cursor.resident_slot < rows.backing_slot_count() && walked < max_rows {
-                let slot = cursor.resident_slot;
-                cursor.resident_slot += 1;
-                let Some((&rowid, state)) = rows.entry_at_slot(slot) else {
-                    continue;
-                };
+            while cursor.resident_position < cursor.resident_rowids.len() && walked < max_rows {
+                let rowid = cursor.resident_rowids[cursor.resident_position];
+                cursor.resident_position += 1;
                 walked += 1;
-                // Spill-resident committed rows belong to the merged walk
-                // even when a later statement adds a pending version.
-                let Some(RowHome::Heap(location)) = state.committed else {
+                // Resolve a captured heap row even if maintenance evicted its
+                // reproducible metadata between beats. Later pending versions
+                // do not change the selected committed image.
+                let Some(state) = self.row_state(table_slot, rowid)? else {
                     continue;
                 };
-                let home = RowHome::Heap(location);
+                let committed_lsn = state.committed_lsn;
+                let Some(home) = self.committed_row_home(table_slot, state)? else {
+                    continue;
+                };
                 let Some((key_len, payload_len, hash)) = self
                     .encode_value_binding_entry(table_slot, binding, rowid, home, output)
                     .map_err(|error| SqlError {
@@ -29675,7 +29706,7 @@ impl Storage {
                 let (key, payload) = output[..key_len + payload_len].split_at(key_len);
                 if each(CheckpointValueEntry {
                     rowid,
-                    commit_lsn: state.committed_lsn,
+                    commit_lsn: committed_lsn,
                     hash,
                     key,
                     payload,
@@ -29685,7 +29716,7 @@ impl Storage {
                     return Ok(false);
                 }
             }
-            if cursor.resident_slot != rows.backing_slot_count() {
+            if cursor.resident_position != cursor.resident_rowids.len() {
                 return Ok(false);
             }
             cursor.resident_done = true;
@@ -29716,7 +29747,7 @@ impl Storage {
             true,
             Some(&decoded_columns),
             decoded_count.saturating_mul(2) >= n_columns,
-            SpillOverlayMode::CommittedCheckpoint,
+            SpillOverlayMode::CommittedCheckpoint(&cursor.resident_rowids),
             Some((
                 &mut cursor.members,
                 &mut cursor.spill_walk_id,
@@ -31752,12 +31783,12 @@ impl Storage {
         Ok(n_out)
     }
 
-    fn with_value_binding_key<R>(
+    fn with_value_binding_key<'image, R>(
         &self,
         table_index: usize,
         binding: usize,
         rowid: u64,
-        home: RowHome,
+        home: impl Into<RowByteRead<'image>>,
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let table = &self.tables[table_index];
@@ -33244,12 +33275,12 @@ impl Storage {
 
     /// Encodes one binding's key followed by its included-column payload into
     /// caller-owned scratch. The returned lengths are the sole split point.
-    pub(crate) fn encode_value_binding_entry(
+    pub(crate) fn encode_value_binding_entry<'image>(
         &self,
         table_index: usize,
         binding: usize,
         rowid: u64,
-        home: RowHome,
+        home: impl Into<RowByteRead<'image>>,
         output: &mut [u8],
     ) -> Result<Option<(usize, usize, u64)>, SqlError> {
         self.with_value_binding_key(

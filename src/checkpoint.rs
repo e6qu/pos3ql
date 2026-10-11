@@ -1100,7 +1100,7 @@ impl Checkpointer {
             + crate::store::MAX_PAYLOAD
             + 2 * crate::store::MAX_PAYLOAD
             + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
-            + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table)
+            + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table, config.table_rows)
             + config.table_rows * core::mem::size_of::<u64>()
             + config.max_prepared_transactions
                 * core::mem::size_of::<crate::storage::PreparedTransactionCatalogEntry>()
@@ -1674,7 +1674,7 @@ impl Checkpointer {
             .draw(
                 2 * crate::store::MAX_PAYLOAD
                     + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
-                    + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table)
+                    + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table, config.table_rows)
                     + config.table_rows * core::mem::size_of::<u64>(),
                 "checkpoint value-index scheduling",
             )
@@ -1750,7 +1750,7 @@ impl Checkpointer {
             value_source: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             value_sort_rows: vec![EMPTY_BUFFERED_VALUE_ROW; VALUE_SORT_ROWS_PER_CHUNK]
                 .into_boxed_slice(),
-            value_source_cursor: CheckpointValueCursor::new(config.max_spill_generations_per_table),
+            value_source_cursor: CheckpointValueCursor::new(config.max_spill_generations_per_table, config.table_rows),
             value_sort_reader: ExternalRunReader::new(),
             value_changed_rowids: Vec::with_capacity(config.table_rows),
             value_base_stream: ValueIndexStream::new(config.checkpoint_live_blocks),

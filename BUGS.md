@@ -5,7 +5,8 @@ or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 Reviewed for historical version placement through SST rewrites and merges,
-snapshot retention, bounded merge exhaustion, and cold recovery on 2026-10-11:
+snapshot retention, bounded merge exhaustion, cold recovery, and pinned CI image
+provenance on 2026-10-11:
 no defects meet these inclusion criteria.
 Resolved investigations are indexed in [history](docs/history/README.md).
 

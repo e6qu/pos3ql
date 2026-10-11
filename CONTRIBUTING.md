@@ -92,8 +92,8 @@ CI also exercises shared heap publication with Miri to check the disjoint-range
 memory invariant alongside allocation-forbidden concurrent regressions.
 
 PostgreSQL service and client containers use Docker's official image from
-[ECR Public](https://gallery.ecr.aws/docker/library/postgres), pinned by manifest
-digest. Keep service images, container selectors, and client adapters on the
+[Google's Docker Hub cache](https://docs.cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images),
+pinned by manifest digest. Keep service images, container selectors, and client adapters on the
 same digest. Verify updated manifests against Docker Hub's official image and
 retain that comparison in the PR; do not switch registries silently on failure.
 SeaweedFS qualification uses the upstream GHCR release image at the same digest

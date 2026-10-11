@@ -28,8 +28,8 @@ do not qualify concurrent execution or representative deployments.
 
 Reader capacity, lock controls, and heap controls are charged at startup.
 Authoritative metadata walks and internal byte scans share 64 retention slots
-per query workspace, sized for the larger of the table and large-object page
-overlays. SQL byte scans use the fixed statement arena, preserving accepted
+per query workspace, sized for table overlays, large-object pages, and resident
+value-index candidates. SQL byte scans use the fixed statement arena, preserving accepted
 wide joins without consuming a metadata slot for each edge. Both paths freeze
 one overlay partition through SST merging; outer joins track physical row
 identities across scan orders. Capacity exhaustion reports SQLSTATE 54000.

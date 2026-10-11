@@ -299,6 +299,31 @@ mod tests {
     }
 
     #[test]
+    fn shared_committed_publication_cache_slots_are_independent_and_budgeted() {
+        let mut budget = Budget::new(ValueIndexPool::budget_bytes(2, 8));
+        let mut pool = ValueIndexPool::new(&mut budget, 2, 8).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        let first = pool.acquire().unwrap();
+        let second = pool.acquire().unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let reader = pool.get(first);
+            let mut writer = pool.get_mut(second);
+            writer.insert(7, 1).unwrap();
+            writer.publish_at(9);
+            assert!(reader.is_empty());
+            assert!(!writer.is_complete_at(7));
+            assert!(writer.is_complete_at(9));
+            drop(writer);
+            drop(reader);
+            pool.release(second);
+            let reused = pool.acquire().unwrap();
+            assert_eq!(reused, second);
+            assert!(pool.get(reused).is_complete_at(0));
+            assert!(pool.get(reused).is_empty());
+        });
+    }
+
+    #[test]
     fn insert_probe_remove() {
         let mut budget = Budget::new(1 << 16);
         let mut index = ValueIndex::new(&mut budget, "test", 8).unwrap();

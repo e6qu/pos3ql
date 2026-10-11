@@ -49,7 +49,8 @@ contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime
   committed row publication and snapshot pruning use guarded table revisions,
   version/row metadata, and snapshot-aware value caches; transaction-wide durable
   publication still needs coordinated ownership.
-- Separate reclamation and heap relocation from active readers, using bounded
+- Register every executing statement snapshot before enabling concurrent
+  reclamation. Separate heap relocation from active readers, using bounded
   pins or reader epochs and startup-sized storage. Qualify identity reuse,
   rollback, and publication failure before enabling physical maintenance.
 

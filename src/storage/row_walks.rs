@@ -1021,6 +1021,7 @@ mod tests {
         let mut config = test_config();
         config.table_rows = 1;
         config.large_object_pages = 1;
+        config.value_index_rows = 1;
         let mut budget = Budget::new(RowWalkPool::budget_bytes(&config));
         let pool = RowWalkPool::new(&config, &mut budget).unwrap();
         let mut row_budget = Budget::new(4096);

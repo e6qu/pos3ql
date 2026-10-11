@@ -11442,17 +11442,6 @@ impl Checkpointer {
         } else {
             self.manifest_lsn
         });
-        if storage.has_active_snapshots()
-            && !clean
-            && storage.table(slot).n_spill_ssts > 0
-            && !delta
-        {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "historical snapshot pins a full SST generation list for table \"{}\"",
-                storage.table(slot).definition().name.as_str()
-            ));
-        }
 
         #[cfg(feature = "checkpoint-profile")]
         let row_started = checkpoint_profile_start();

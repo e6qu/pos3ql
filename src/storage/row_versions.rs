@@ -8,7 +8,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{
     CommittedHistory, CommittedVersion, CommittedVersionSlot, PendingChange, PendingVersionSlot,
-    PendingVersions, PendingWriteUndo, RowLoc, committed_row_version_capacity,
+    PendingVersions, PendingWriteUndo, RowHome, RowLoc, RowState, committed_row_version_capacity,
     pending_row_version_capacity,
 };
 use crate::config::Config;
@@ -335,6 +335,23 @@ pub(super) fn push_committed_version(
     history.tail = Some(slot);
     history.len += 1;
     Ok(())
+}
+
+/// Root retirement changes placement without changing version identity. Every
+/// committed home, including snapshot history, crosses this one boundary.
+pub(super) fn remap_committed_homes(
+    pool: &mut RowVersionPool<CommittedVersionSlot>,
+    state: &mut RowState,
+    remap: impl Fn(RowHome) -> RowHome,
+) {
+    state.committed = state.committed.map(&remap);
+    let mut slot = state.history.tail;
+    while let Some(index) = slot {
+        let entry = &mut pool[index];
+        debug_assert!(entry.used);
+        entry.version.home = entry.version.home.map(&remap);
+        slot = entry.previous;
+    }
 }
 
 pub(super) fn release_committed_chain(

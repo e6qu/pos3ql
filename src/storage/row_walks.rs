@@ -422,6 +422,63 @@ mod tests {
     }
 
     #[test]
+    fn historical_sst_retirement_remaps_every_version_home() {
+        use super::super::row_versions::push_committed_version;
+        use super::super::CommittedVersion;
+        use crate::store::{BlockId, RowSstFormat, SstHandle};
+
+        let handle = |tag| SstHandle {
+            index: BlockId([tag; 32]),
+            filter: BlockId([tag + 1; 32]),
+            roster: BlockId([tag + 2; 32]),
+            format: RowSstFormat::PackedV4,
+        };
+        let spilled = |sst, lsn| RowHome::Spilled {
+            len: 16,
+            sst,
+            commit_lsn: lsn,
+        };
+        for at in [0, 1] {
+            let (mut storage, table) = checkpoint_fixture();
+            storage.set_spill_list(table, &[handle(1), handle(5), handle(9)]);
+            let mut state = RowState::committed_only_at(super::super::RowLoc::test(1, 4), 11);
+            state.committed = Some(spilled(2, 11));
+            let versions = &mut storage.row_versions.exclusive().committed_row_versions;
+            for (home, lsn) in [
+                (Some(RowHome::Heap(super::super::RowLoc::test(1, 4))), 3),
+                (None, 5),
+                (Some(spilled(0, 7)), 7),
+                (Some(spilled(1, 9)), 9),
+            ] {
+                push_committed_version(versions, &mut state.history, 4, CommittedVersion { home, lsn }).unwrap();
+            }
+            storage.tables[table].rows.remove(1);
+            storage.tables[table].rows.insert(1, state).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                storage.merge_spill_pair(table, at, Some(handle(13)));
+                let state = storage.resident_row_state(table, 1).unwrap();
+                assert_eq!(state.committed, Some(spilled(1, 11)));
+                assert_eq!(state.history_get(0).unwrap().home, Some(spilled(at as u32, 9)));
+                assert_eq!(state.history_get(1).unwrap().home, Some(spilled(0, 7)));
+                assert_eq!(state.history_get(2).unwrap().home, None);
+                assert_eq!(state.history_get(3).unwrap().home, Some(RowHome::Heap(super::super::RowLoc::test(1, 4))));
+                assert_eq!(state.history_get(0).unwrap().lsn, 9);
+                assert_eq!(state.committed_lsn, 11);
+                drop(state);
+                storage.collapse_spill(table, handle(17));
+                let state = storage.resident_row_state(table, 1).unwrap();
+                assert_eq!(state.committed, Some(spilled(0, 11)));
+                assert_eq!(state.history_get(0).unwrap().home, Some(spilled(0, 9)));
+                assert_eq!(state.history_get(1).unwrap().home, Some(spilled(0, 7)));
+                assert_eq!(state.history_get(2).unwrap().home, None);
+                assert_eq!(state.history_get(3).unwrap().lsn, 3);
+                assert_eq!(state.checkpoint_change_lsn, 11);
+                assert!(state.pending.is_none());
+            });
+        }
+    }
+
+    #[test]
     fn shared_committed_publication_progresses_during_a_retained_value_probe() {
         let (storage, table) = checkpoint_fixture();
         storage.register_snapshot(99, 7).unwrap();

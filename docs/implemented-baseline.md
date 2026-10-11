@@ -46,6 +46,11 @@ object I/O. Releasing a root retained by a durable garbage pass schedules anothe
 maintenance pass without requiring a new write. Root and reader-count exhaustion
 reports SQLSTATE 54000 before changing registrations.
 
+Full SST rewrites and adjacent-generation merges remap every retained committed
+version, preserving exact version LSNs and deletion markers. Historical snapshots
+do not prohibit full rewrites; configured merge scratch limits still report
+SQLSTATE 54000. Heap relocation remains exclusive.
+
 Checkpoint jobs restart when committed input or table identity changes. Query
 scans still retain table incarnations through their Storage borrow; concurrent
 query retirement and generation publication remain open gates.

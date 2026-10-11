@@ -34,7 +34,7 @@ use row_reads::{RowReadView, RowReadVisitor};
 use row_versions::{
     RowVersionPools, clear_pending_versions, pending_last, pop_pending_version,
     prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
-    release_pending_chain,
+    release_pending_chain, remap_committed_homes,
 };
 use row_walks::{RetainedRowIds, RowScanIds, RowWalkPool};
 use spill_generations::{SpillGenerationSnapshot, SpillRelation, SpillRootRegistry};
@@ -30913,22 +30913,17 @@ impl Storage {
     /// A full rewrite: the new SST holds every committed row, so the list
     /// collapses to it and every spilled map entry is remapped to slot 0.
     pub(crate) fn collapse_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
+        let versions = &mut self.row_versions.exclusive().committed_row_versions;
         let table = &mut self.tables[slot];
         table.spill_ssts.fill(None);
         table.spill_through_lsn.fill(0);
         table.spill_ssts[0] = Some(handle);
         table.n_spill_ssts = 1;
         for (_, state) in table.rows.iter_mut() {
-            if let Some(RowHome::Spilled {
-                len, commit_lsn, ..
-            }) = state.committed
-            {
-                state.committed = Some(RowHome::Spilled {
-                    len,
-                    sst: 0,
-                    commit_lsn,
-                });
-            }
+            remap_committed_homes(versions, state, |home| match home {
+                RowHome::Spilled { len, commit_lsn, .. } => RowHome::Spilled { len, sst: 0, commit_lsn },
+                RowHome::Heap(_) => home,
+            });
         }
     }
 
@@ -30943,6 +30938,7 @@ impl Storage {
         at: usize,
         handle: Option<crate::store::SstHandle>,
     ) {
+        let versions = &mut self.row_versions.exclusive().committed_row_versions;
         let table = &mut self.tables[slot];
         let removed = if handle.is_some() { 1u32 } else { 2u32 };
         let mut n = 0;
@@ -30965,25 +30961,13 @@ impl Storage {
         table.n_spill_ssts = n;
         let at = at as u32;
         for (_, state) in table.rows.iter_mut() {
-            if let Some(RowHome::Spilled {
-                len,
-                sst,
-                commit_lsn,
-            }) = state.committed
-            {
-                let sst = if sst < at {
-                    sst
-                } else if sst == at || sst == at + 1 {
-                    at
-                } else {
-                    sst - removed
-                };
-                state.committed = Some(RowHome::Spilled {
-                    len,
-                    sst,
-                    commit_lsn,
-                });
-            }
+            remap_committed_homes(versions, state, |home| match home {
+                RowHome::Spilled { len, sst, commit_lsn } => {
+                    let sst = if sst < at { sst } else if sst == at || sst == at + 1 { at } else { sst - removed };
+                    RowHome::Spilled { len, sst, commit_lsn }
+                }
+                RowHome::Heap(_) => home,
+            });
         }
     }
 

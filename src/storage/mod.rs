@@ -19,8 +19,8 @@ mod row_publication;
 mod row_reads;
 mod row_versions;
 mod row_walks;
-mod spill_generations;
 pub(crate) mod rowenc;
+mod spill_generations;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;
@@ -13956,7 +13956,6 @@ impl CheckpointValueCursor {
 }
 
 impl CheckpointValueCursor {
-    #[expect(clippy::too_many_arguments, reason = "checkpoint retained source boundary")]
     pub(crate) fn walk_spilled_rows<'arena>(
         &mut self,
         arena: &'arena Arena,
@@ -13964,15 +13963,46 @@ impl CheckpointValueCursor {
         coalesce_packed: bool,
         max_rows: usize,
         max_object_gets: u64,
-        each: &mut dyn FnMut(u64, u64, SpilledRowRepresentation<'arena>) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        each: &mut dyn FnMut(
+            u64,
+            u64,
+            SpilledRowRepresentation<'arena>,
+        ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<bool, SqlError> {
-        if !self.resident_initialized { return Err(sql_err!(sqlstate::INTERNAL_ERROR, "checkpoint SST source has not been retained")); }
+        if !self.resident_initialized {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "checkpoint SST source has not been retained"
+            ));
+        }
         let relation = self.generations.relation();
-        if relation.len() == 0 { return Ok(true); }
-        let reader = self.generations.reader.as_ref().ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "retained SST roots have no reader owner"))?;
-        Storage::walk_spill_bytes(reader, &relation, self.generations.commit_lsn, arena, true, decoded_columns, coalesce_packed,
+        if relation.len() == 0 {
+            return Ok(true);
+        }
+        let reader = self.generations.reader.as_ref().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "retained SST roots have no reader owner"
+            )
+        })?;
+        Storage::walk_spill_bytes(
+            reader,
+            &relation,
+            self.generations.commit_lsn,
+            arena,
+            true,
+            decoded_columns,
+            coalesce_packed,
             SpillOverlayMode::CommittedCheckpoint(&self.resident_rowids),
-            Some((&mut self.members, &mut self.spill_walk_id, &mut self.spill_initialized, max_rows, max_object_gets)), each)
+            Some((
+                &mut self.members,
+                &mut self.spill_walk_id,
+                &mut self.spill_initialized,
+                max_rows,
+                max_object_gets,
+            )),
+            each,
+        )
     }
 }
 
@@ -14171,8 +14201,8 @@ impl SpillReader {
 
     /// The budget the contexts and scratch draw, for memory-plan estimates.
     pub(crate) fn budget_bytes(durable: bool, max_spill_generations: usize) -> usize {
-        let row_reader = Self::owner_bytes() + 2
-            * (5 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
+        let row_reader = Self::owner_bytes()
+            + 2 * (5 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
             + SCAN_CONTEXTS
                 * ((2 * max_spill_generations + 4) * crate::store::MAX_PAYLOAD
                     + 2 * max_spill_generations * core::mem::size_of::<Box<[u8]>>()
@@ -14199,7 +14229,10 @@ impl SpillReader {
     }
 
     fn io_stats(&self) -> crate::store::BlockIoStats {
-        self.blocks.as_ref().map(|blocks| blocks.lock().expect("block store lock poisoned").io_stats()).unwrap_or_default()
+        self.blocks
+            .as_ref()
+            .map(|blocks| blocks.lock().expect("block store lock poisoned").io_stats())
+            .unwrap_or_default()
     }
 
     fn next_walk_id(&self) -> u64 {
@@ -17276,12 +17309,20 @@ impl Storage {
         SpillRootRegistry::capacity(config)
     }
 
-    pub(crate) fn copy_retained_spill_roots(&self, durable: bool, output: &mut Vec<crate::store::SstHandle>) -> Result<(), SqlError> {
+    pub(crate) fn copy_retained_spill_roots(
+        &self,
+        durable: bool,
+        output: &mut Vec<crate::store::SstHandle>,
+    ) -> Result<(), SqlError> {
         self.spill_roots.copy_roots(durable, output)
     }
 
-    pub(crate) fn retained_sst_reclamation_pending(&self) -> bool { self.spill_roots.reclamation_pending() }
-    pub(crate) fn take_retained_sst_reclamation(&self) -> bool { self.spill_roots.take_reclamation_pending() }
+    pub(crate) fn retained_sst_reclamation_pending(&self) -> bool {
+        self.spill_roots.reclamation_pending()
+    }
+    pub(crate) fn take_retained_sst_reclamation(&self) -> bool {
+        self.spill_roots.take_reclamation_pending()
+    }
 
     pub(crate) fn retained_row_walk_budget_bytes(config: &Config) -> usize {
         RowWalkPool::budget_bytes(config)
@@ -28775,15 +28816,31 @@ impl Storage {
     ) -> Result<bool, SqlError> {
         let table = &self.tables[slot];
         let relation = SpillRelation::installed(table);
-        if relation.len() == 0 { return Ok(true); }
+        if relation.len() == 0 {
+            return Ok(true);
+        }
         let Some(spill) = &self.spill else {
-            return Err(sql_err!(sqlstate::INTERNAL_ERROR, "table has spill SSTs but no spill reader is attached"));
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "table has spill SSTs but no spill reader is attached"
+            ));
         };
         let commit_snapshot = match overlay_mode {
             SpillOverlayMode::VisibleScan(_) => self.commit_snapshot(),
             SpillOverlayMode::CommittedCheckpoint(_) => self.lsn(),
         };
-        Self::walk_spill_bytes(spill, &relation, commit_snapshot, arena, recycle_rows, decoded_columns, coalesce_packed, overlay_mode, resume, emit)
+        Self::walk_spill_bytes(
+            spill,
+            &relation,
+            commit_snapshot,
+            arena,
+            recycle_rows,
+            decoded_columns,
+            coalesce_packed,
+            overlay_mode,
+            resume,
+            emit,
+        )
     }
 
     #[expect(clippy::too_many_arguments, reason = "immutable spill walk boundary")]
@@ -28797,7 +28854,11 @@ impl Storage {
         coalesce_packed: bool,
         overlay_mode: SpillOverlayMode<'_>,
         resume: Option<(&mut [MemberCursor], &mut u64, &mut usize, usize, u64)>,
-        emit: &mut dyn FnMut(u64, u64, SpilledRowRepresentation<'a>) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        emit: &mut dyn FnMut(
+            u64,
+            u64,
+            SpilledRowRepresentation<'a>,
+        ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<bool, SqlError> {
         let n = relation.len();
         let mut cursor_lease;
@@ -29086,7 +29147,10 @@ impl Storage {
                     }
                     let schema = &relation.schema[..relation.n_columns];
                     if layout.columns() > schema.len() {
-                        return Err(sql_err!(sqlstate::INTERNAL_ERROR, "SST columns exceed the retained schema"));
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "SST columns exceed the retained schema"
+                        ));
                     }
                     let encoded = arena.alloc_slice_with(encoded_len, |_| 0u8).map_err(|_| {
                         sql_err!(

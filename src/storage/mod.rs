@@ -29607,7 +29607,7 @@ impl Storage {
             walked += 1;
             let committed_lsn = state.committed_lsn;
             match state.committed {
-                Some(RowHome::Heap(_)) => {},
+                Some(RowHome::Heap(_)) => {}
                 None => {
                     if changed_rowids.len() == changed_rowids.capacity() {
                         return Err(sql_err!(
@@ -29633,7 +29633,9 @@ impl Storage {
                 ));
             }
             changed_rowids.push(rowid);
-            let home = self.committed_row_home(table_slot, state)?.expect("committed heap image");
+            let home = self
+                .committed_row_home(table_slot, state)?
+                .expect("committed heap image");
             let Some((key_len, payload_len, hash)) =
                 self.encode_value_binding_entry(table_slot, binding, rowid, home, output)?
             else {

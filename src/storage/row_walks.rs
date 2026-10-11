@@ -377,8 +377,14 @@ mod tests {
         definition.columns[0].primary = true;
         let table = storage.create_table(definition).unwrap();
         for rowid in 1..=2 {
-            let location = storage.heap.append_row(&[Datum::Int4(rowid as i32)]).unwrap();
-            storage.tables[table].rows.insert(rowid, RowState::committed_only_at(location, 7)).unwrap();
+            let location = storage
+                .heap
+                .append_row(&[Datum::Int4(rowid as i32)])
+                .unwrap();
+            storage.tables[table]
+                .rows
+                .insert(rowid, RowState::committed_only_at(location, 7))
+                .unwrap();
         }
         storage.refresh_enforcers(table).unwrap();
         (storage, table)
@@ -388,7 +394,9 @@ mod tests {
     fn checkpoint_retained_rows_resume_after_rollback_and_later_publication() {
         let (storage, table) = checkpoint_fixture();
         let location = storage.heap.append_row(&[Datum::Int4(99)]).unwrap();
-        let undone = storage.write_pending(table, 3, 7, 1, Some(location)).unwrap();
+        let undone = storage
+            .write_pending(table, 3, 7, 1, Some(location))
+            .unwrap();
         let mut cursor = super::super::CheckpointValueCursor::new(1, 128);
         let mut budget = Budget::new(4096);
         let arena = crate::mem::arena::Arena::new(&mut budget, "checkpoint test", 4096).unwrap();
@@ -408,11 +416,40 @@ mod tests {
                 count += 1;
                 Ok(core::ops::ControlFlow::Continue(()))
             };
-            assert!(!storage.for_each_value_binding_entry_batch(table, 0, &mut cursor, &arena, &mut output, 1, 8, &mut each).unwrap());
+            assert!(
+                !storage
+                    .for_each_value_binding_entry_batch(
+                        table,
+                        0,
+                        &mut cursor,
+                        &arena,
+                        &mut output,
+                        1,
+                        8,
+                        &mut each
+                    )
+                    .unwrap()
+            );
             storage.restore_pending(table, 3, 7, undone);
-            let later = storage.write_pending(table, 4, 7, 1, Some(location)).unwrap();
-            let replacement = storage.write_pending(table, 2, 7, 1, Some(location)).unwrap();
-            while !storage.for_each_value_binding_entry_batch(table, 0, &mut cursor, &arena, &mut output, 1, 8, &mut each).unwrap() {}
+            let later = storage
+                .write_pending(table, 4, 7, 1, Some(location))
+                .unwrap();
+            let replacement = storage
+                .write_pending(table, 2, 7, 1, Some(location))
+                .unwrap();
+            while !storage
+                .for_each_value_binding_entry_batch(
+                    table,
+                    0,
+                    &mut cursor,
+                    &arena,
+                    &mut output,
+                    1,
+                    8,
+                    &mut each,
+                )
+                .unwrap()
+            {}
             assert_eq!(seen, [1, 2]);
             assert_eq!(count, 2);
             storage.restore_pending(table, 2, 7, replacement);
@@ -441,10 +478,25 @@ mod tests {
                 count += 1;
                 Ok(core::ops::ControlFlow::Break(()))
             };
-            while !storage.for_each_value_binding_delta_entry_batch(table, 0, 6, &mut cursor, &mut changed, &mut output, 1, &mut each).unwrap() {}
+            while !storage
+                .for_each_value_binding_delta_entry_batch(
+                    table,
+                    0,
+                    6,
+                    &mut cursor,
+                    &mut changed,
+                    &mut output,
+                    1,
+                    &mut each,
+                )
+                .unwrap()
+            {}
             assert_eq!(count, 2);
             assert_eq!(changed, [1, 2, 3]);
-            assert_eq!(storage.resident_row_state(table, 3).unwrap().committed_lsn, 9);
+            assert_eq!(
+                storage.resident_row_state(table, 3).unwrap().committed_lsn,
+                9
+            );
         });
     }
 
@@ -455,16 +507,48 @@ mod tests {
         let mut changed = Vec::with_capacity(128);
         let mut output = [0u8; 128];
         crate::mem::guard::forbid_alloc(|| {
-            let error = storage.for_each_value_binding_delta_entry_batch(table, 0, 6, &mut cursor, &mut changed, &mut output, 1, &mut |_| Ok(core::ops::ControlFlow::Continue(()))).unwrap_err();
+            let error = storage
+                .for_each_value_binding_delta_entry_batch(
+                    table,
+                    0,
+                    6,
+                    &mut cursor,
+                    &mut changed,
+                    &mut output,
+                    1,
+                    &mut |_| Ok(core::ops::ControlFlow::Continue(())),
+                )
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert!(error.message.as_str().contains("checkpoint retained row identities"));
+            assert!(
+                error
+                    .message
+                    .as_str()
+                    .contains("checkpoint retained row identities")
+            );
             assert!(cursor.resident_rowids.is_empty());
             assert!(!cursor.resident_initialized);
             assert!(storage.tables[table].rows.test_write().is_ok());
         });
         let mut cursor = super::super::CheckpointValueCursor::new(1, 128);
         crate::mem::guard::forbid_alloc(|| {
-            let error = storage.for_each_value_binding_delta_entry_batch(table, 0, 6, &mut cursor, &mut changed, &mut output, 1, &mut |_| Err(sql_err!(sqlstate::INTERNAL_ERROR, "checkpoint callback failure"))).unwrap_err();
+            let error = storage
+                .for_each_value_binding_delta_entry_batch(
+                    table,
+                    0,
+                    6,
+                    &mut cursor,
+                    &mut changed,
+                    &mut output,
+                    1,
+                    &mut |_| {
+                        Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "checkpoint callback failure"
+                        ))
+                    },
+                )
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
             assert!(storage.tables[table].rows.test_write().is_ok());
             assert!(storage.row_versions.test_write().is_ok());
@@ -472,10 +556,23 @@ mod tests {
             cursor.reset();
             changed.clear();
             let mut count = 0;
-            assert!(storage.for_each_value_binding_delta_entry_batch(table, 0, 6, &mut cursor, &mut changed, &mut output, 128, &mut |_| {
-                count += 1;
-                Ok(core::ops::ControlFlow::Continue(()))
-            }).unwrap());
+            assert!(
+                storage
+                    .for_each_value_binding_delta_entry_batch(
+                        table,
+                        0,
+                        6,
+                        &mut cursor,
+                        &mut changed,
+                        &mut output,
+                        128,
+                        &mut |_| {
+                            count += 1;
+                            Ok(core::ops::ControlFlow::Continue(()))
+                        }
+                    )
+                    .unwrap()
+            );
             assert_eq!(count, 2);
             assert_eq!(changed, [1, 2]);
         });

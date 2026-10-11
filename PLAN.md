@@ -38,32 +38,17 @@ and its linked documents; completed investigations belong in [history](docs/hist
 
 ### 1. Row publication, reader retention, and reclamation
 
-Allow readers to retain immutable selected images while unrelated writes progress.
-Heap appends and pending row publication progress while existing byte readers
-retain their images. Preparation precedes short, validated version/map updates;
-rollback uses the same ownership. Authoritative row-state walks retain bounded
-row identities and release broad metadata ownership before callbacks; their
-frozen overlay coverage survives eviction during SST merging. Pending uniqueness
-walks release chain ownership before byte reads and waits. Physical outer-join
-match tracking uses row identities across scan orders. Committed publication,
-table lifecycle, retained SST generations across checkpoint beats, and in-place
-compaction still require further concurrency work. Optimized overlay/PAX byte scans share one
-startup-bounded partition through both phases; callbacks release row metadata
-before consuming bytes. SQL scans retain identities in the fixed statement arena
-so accepted wide joins do not exhaust per-workspace metadata-walk slots.
-Resumable value-index checkpoint walks retain startup-bounded row identities
-and one committed overlay partition across beats, pinning selected images before
-releasing row metadata. Statement Storage borrows retain the immutable SST list;
-checkpoint jobs still validate generation changes and restart. Neither permits
-concurrent generation replacement or retirement.
+Allow readers to retain selected row images and immutable generations while
+unrelated writes and maintenance progress. Existing reader and pending-write
+contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime-ownership).
 
-- Complete concurrent table lifecycle, committed row publication, snapshot
-  registration, and statistics ownership with explicit lock ordering. Replace
-  resumable checkpoint walk ownership with bounded retained scan generations.
-- Preserve active snapshots and retained table/SST generations through retirement.
-  Stale-token detection does not replace retention of a live reader's state.
-- Separate reclamation from active readers. Evaluate startup-sized segments and
-  bounded pins or reader epochs before enabling concurrent physical maintenance.
+- Retain table/SST generations across resumable checkpoint beats and retirement.
+  Current jobs restart when a generation changes; this is not live retention.
+- Complete committed row publication, table lifecycle, snapshot registration,
+  and statistics ownership with explicit lock ordering.
+- Separate reclamation and heap relocation from active readers, using bounded
+  pins or reader epochs and startup-sized storage. Qualify identity reuse,
+  rollback, and publication failure before enabling physical maintenance.
 
 Acceptance: a retained reader permits an unrelated write to complete; failed
 publication preserves prior state; maintenance retains active images; bounded

@@ -67475,6 +67475,71 @@ fn retained_sst_next(
 }
 
 #[test]
+fn shared_committed_publication_preserves_historical_index_probes() {
+    let (mut engine, mut budget) = test_engine();
+    let mut reader = TxnState::new(&mut budget, 256).unwrap();
+    let mut writer = TxnState::new(&mut budget, 256).unwrap();
+    let setup = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE TABLE historical_value_probe(id integer PRIMARY KEY); INSERT INTO historical_value_probe VALUES (1), (2)",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let before = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM historical_value_probe WHERE id = 1",
+    );
+    assert_eq!(
+        data_rows(&before),
+        ["1"],
+        "{}",
+        String::from_utf8_lossy(&before)
+    );
+    let update = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "UPDATE historical_value_probe SET id = 9 WHERE id = 1",
+    );
+    assert!(
+        !message_types(&update).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&update)
+    );
+    let historical = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "SELECT id FROM historical_value_probe WHERE id = 1; SELECT count(*) FROM historical_value_probe WHERE id = 9",
+    );
+    assert!(
+        !message_types(&historical).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&historical)
+    );
+    assert_eq!(data_rows(&historical), ["1", "0"]);
+    let after = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "COMMIT; SELECT id FROM historical_value_probe WHERE id = 9",
+    );
+    assert_eq!(
+        data_rows(&after),
+        ["9"],
+        "{}",
+        String::from_utf8_lossy(&after)
+    );
+}
+
+#[test]
 fn retained_sst_durable_reader_survives_retirement_and_releases_garbage() {
     let mut config = test_config("retained-sst-retirement");
     config.object_store_on = true;
@@ -69421,8 +69486,8 @@ fn checkpoint_publishes_the_final_slice_without_a_dispatch_gap() {
     assert!(!message_types(&updated).contains(&b'E'));
     let first = engine.storage.find_table("public", "first_slice").unwrap();
     let final_slot = engine.storage.find_table("public", "final_slice").unwrap();
-    let first_generation = engine.storage.table(first).generation;
-    let final_generation = engine.storage.table(final_slot).generation;
+    let first_generation = engine.storage.table(first).generation();
+    let final_generation = engine.storage.table(final_slot).generation();
     let mut first_sliced = false;
     let mut beats = 0usize;
     let published_lsn = loop {
@@ -69536,7 +69601,7 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
         "{}",
         String::from_utf8_lossy(&changed)
     );
-    let first_generation = engine.storage.table(table).generation;
+    let first_generation = engine.storage.table(table).generation();
     let mut first_beats = 0usize;
     let first_slice = loop {
         first_beats += 1;
@@ -69560,7 +69625,7 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
         "UPDATE resliced_rows SET payload = 'final' WHERE id = 128",
     );
     assert!(!message_types(&changed_again).contains(&b'E'));
-    let reslice_generation = engine.storage.table(table).generation;
+    let reslice_generation = engine.storage.table(table).generation();
     let mut reslice_beats = 0usize;
     let reslice = loop {
         reslice_beats += 1;
@@ -69595,7 +69660,7 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
     );
 
     let tail = engine.storage.find_table("public", "reslice_tail").unwrap();
-    let tail_generation = engine.storage.table(tail).generation;
+    let tail_generation = engine.storage.table(tail).generation();
     let mut tail_beats = 0usize;
     let published_lsn = loop {
         tail_beats += 1;

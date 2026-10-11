@@ -216,7 +216,10 @@ impl RowWalkPool {
     }
 
     fn row_capacity(config: &Config) -> usize {
-        config.table_rows.max(config.large_object_pages)
+        config
+            .table_rows
+            .max(config.large_object_pages)
+            .max(config.value_index_rows)
     }
 
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -258,6 +261,33 @@ impl RowWalkPool {
         }
         rowids.as_mut_slice().sort_unstable();
         Ok((RetainedRowIds { rowids }, immutable_only))
+    }
+
+    pub(super) fn retain_value_probe(
+        &self,
+        index: &crate::mem::value_index::ValueIndex,
+        hash: u64,
+    ) -> Result<RetainedRowIds<'_>, SqlError> {
+        let mut rowids = try_mutex_pool(&self.slots, "row walk slots").ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "row walk retention slots are exhausted ({})",
+                self.slots.len()
+            )
+        })?;
+        rowids.clear();
+        let mut error = None;
+        index.probe(hash, |rowid| {
+            if error.is_none()
+                && let Err(full) = rowids.push(rowid)
+            {
+                error = Some(full);
+            }
+        });
+        if let Some(error) = error {
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error));
+        }
+        Ok(RetainedRowIds { rowids })
     }
 
     pub(super) fn retain(&self, rows: &RowMap) -> Result<RetainedRowIds<'_>, SqlError> {
@@ -389,6 +419,155 @@ mod tests {
         }
         storage.refresh_enforcers(table).unwrap();
         (storage, table)
+    }
+
+    #[test]
+    fn shared_committed_publication_progresses_during_a_retained_value_probe() {
+        let (storage, table) = checkpoint_fixture();
+        storage.register_snapshot(99, 7).unwrap();
+        storage.set_commit_snapshot(7);
+        let mut hashes = [(0, 0); super::super::MAX_VALUE_ENFORCERS];
+        let state = storage.resident_row_state(table, 1).unwrap();
+        let home = storage.committed_row_home(table, state).unwrap().unwrap();
+        assert_eq!(
+            storage
+                .row_enforcer_hashes(table, 1, home, &mut hashes)
+                .unwrap(),
+            1
+        );
+        let start = AtomicBool::new(false);
+        let completed = AtomicBool::new(false);
+        let mut progressed = false;
+        std::thread::scope(|scope| {
+            let storage = &storage;
+            let start = &start;
+            let completed = &completed;
+            let writer = scope.spawn(move || {
+                while !start.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                crate::mem::guard::forbid_alloc(|| {
+                    let location = storage.heap.append_row(&[Datum::Int4(20)]).unwrap();
+                    storage
+                        .write_pending(table, 1, 8, 1, Some(location))
+                        .unwrap();
+                    storage.commit_row(table, 1, 8, 9).unwrap();
+                    completed.store(true, Ordering::Release);
+                });
+            });
+            crate::mem::guard::forbid_alloc(|| {
+                assert!(
+                    storage
+                        .probe_value(table, &[0], hashes[0].1, |rowid, _| {
+                            let state = storage.resident_row_state(table, rowid).unwrap();
+                            let image = storage
+                                .visible_row_home_at(table, rowid, state, 99, SNAPSHOT_ALL, 7)?
+                                .unwrap();
+                            assert!(storage.tables[table].rows.test_write().is_ok());
+                            assert!(storage.row_versions.test_write().is_ok());
+                            start.store(true, Ordering::Release);
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
+                                std::thread::yield_now();
+                            }
+                            progressed = completed.load(Ordering::Acquire);
+                            storage.with_row_bytes(table, rowid, image, |bytes| {
+                                let mut values = [Datum::Null];
+                                super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                                assert_eq!(values[0], Datum::Int4(1));
+                                Ok(())
+                            })?;
+                            Ok(())
+                        })
+                        .unwrap()
+                );
+            });
+            writer.join().unwrap();
+        });
+        assert!(
+            progressed,
+            "commit must complete while the probe retains the old image"
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(storage.value_cache_complete(table, &[0]));
+            assert!(!storage.value_probe_complete(table, &[0]));
+            assert!(
+                !storage
+                    .probe_value(table, &[0], hashes[0].1, |_, _| panic!(
+                        "a newer cache cannot certify an old snapshot"
+                    ))
+                    .unwrap()
+            );
+            let state = storage.resident_row_state(table, 1).unwrap();
+            assert_eq!(state.committed_lsn, 9);
+            assert_eq!(state.history.len, 1);
+            drop(state);
+            storage.release_snapshot(99);
+            assert!(
+                storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .history
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn shared_committed_publication_rebuilt_cache_retains_deletion_boundary() {
+        let (mut storage, table) = checkpoint_fixture();
+        storage.register_snapshot(99, 7).unwrap();
+        storage.set_commit_snapshot(7);
+        crate::mem::guard::forbid_alloc(|| {
+            storage.write_pending(table, 1, 8, 1, None).unwrap();
+            storage.commit_row(table, 1, 8, 9).unwrap();
+        });
+        storage.refresh_enforcers(table).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(storage.value_cache_complete(table, &[0]));
+            assert!(
+                !storage.value_probe_complete(table, &[0]),
+                "a rebuilt cache must include the deletion boundary"
+            );
+            let state = storage.resident_row_state(table, 1).unwrap();
+            let image = storage
+                .visible_row_home_at(table, 1, state, 99, SNAPSHOT_ALL, 7)
+                .unwrap()
+                .unwrap();
+            storage
+                .with_row_bytes(table, 1, image, |bytes| {
+                    let mut values = [Datum::Null];
+                    super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                    assert_eq!(values[0], Datum::Int4(1));
+                    Ok(())
+                })
+                .unwrap();
+            storage.release_snapshot(99);
+            assert!(storage.resident_row_state(table, 1).is_none());
+        });
+    }
+
+    #[test]
+    fn shared_committed_publication_exhaustion_preserves_rows_and_cache() {
+        let (storage, table) = checkpoint_fixture();
+        let location = storage.heap.append_row(&[Datum::Int4(20)]).unwrap();
+        storage
+            .write_pending(table, 1, 8, 1, Some(location))
+            .unwrap();
+        storage.tables[table].publication().generation = u64::MAX;
+        let binding = storage.tables[table].enforcer(0).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let error = storage.commit_row(table, 1, 8, 9).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            let row = storage.resident_row_state(table, 1).unwrap();
+            assert_eq!(row.committed_lsn, 7);
+            assert_eq!(row.pending_last().unwrap().loc, Some(location));
+            drop(row);
+            let retained = storage.tables[table].enforcer(0).unwrap();
+            assert_eq!(retained.durable_dirty_lsn, binding.durable_dirty_lsn);
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.tables[table].rows.test_write().is_ok());
+        });
     }
 
     #[test]
@@ -878,6 +1057,7 @@ mod tests {
         let mut config = test_config();
         config.table_rows = 1;
         config.large_object_pages = 1;
+        config.value_index_rows = 1;
         let mut budget = Budget::new(RowWalkPool::budget_bytes(&config));
         let pool = RowWalkPool::new(&config, &mut budget).unwrap();
         let mut row_budget = Budget::new(4096);

@@ -47242,7 +47242,7 @@ pub(crate) fn analyze_extended_statistics(
         let mut data = ExtendedStatisticsData::EMPTY;
         data.valid = true;
         data.inherited = table_definition.partition.is_partitioned();
-        data.analyzed_generation = storage.table(table).generation;
+        data.analyzed_generation = storage.table(table).generation();
         data.rows = rows;
         data.non_null_rows = non_null_rows;
         data.distinct_values = distinct_estimate(&full_registers).min(non_null_rows);

@@ -243,7 +243,7 @@ impl SpillGenerationSnapshot {
         self.n_columns = definition.schema(&mut self.schema);
         self.table_slot = table_slot;
         self.created_at = table.created_at();
-        self.data_generation = table.generation;
+        self.data_generation = table.generation();
         self.commit_lsn = storage.lsn();
         for handle in &table.spill_ssts[..table.n_spill_ssts] {
             self.handles.push(handle.expect("counted SST member"));
@@ -275,7 +275,7 @@ impl SpillGenerationSnapshot {
             || table_slot >= storage.physical_table_count()
             || !storage.table(table_slot).live()
             || storage.table(table_slot).created_at() != self.created_at
-            || storage.table(table_slot).generation != self.data_generation
+            || storage.table(table_slot).generation() != self.data_generation
         {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,

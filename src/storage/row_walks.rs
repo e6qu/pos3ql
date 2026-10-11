@@ -514,6 +514,32 @@ mod tests {
     }
 
     #[test]
+    fn shared_committed_publication_rebuilt_cache_retains_deletion_boundary() {
+        let (mut storage, table) = checkpoint_fixture();
+        storage.register_snapshot(99, 7).unwrap();
+        storage.set_commit_snapshot(7);
+        crate::mem::guard::forbid_alloc(|| {
+            storage.write_pending(table, 1, 8, 1, None).unwrap();
+            storage.commit_row(table, 1, 8, 9).unwrap();
+        });
+        storage.refresh_enforcers(table).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(storage.value_cache_complete(table, &[0]));
+            assert!(!storage.value_probe_complete(table, &[0]), "a rebuilt cache must include the deletion boundary");
+            let state = storage.resident_row_state(table, 1).unwrap();
+            let image = storage.visible_row_home_at(table, 1, state, 99, SNAPSHOT_ALL, 7).unwrap().unwrap();
+            storage.with_row_bytes(table, 1, image, |bytes| {
+                let mut values = [Datum::Null];
+                super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                assert_eq!(values[0], Datum::Int4(1));
+                Ok(())
+            }).unwrap();
+            storage.release_snapshot(99);
+            assert!(storage.resident_row_state(table, 1).is_none());
+        });
+    }
+
+    #[test]
     fn shared_committed_publication_exhaustion_preserves_rows_and_cache() {
         let (storage, table) = checkpoint_fixture();
         let location = storage.heap.append_row(&[Datum::Int4(20)]).unwrap();

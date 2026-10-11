@@ -33991,6 +33991,8 @@ impl Storage {
         for (i, s) in slots.iter_mut().enumerate().take(n_enf) {
             *s = self.tables[table_index].enforcer(i).expect("enforcer").slot;
         }
+        let boundary = self.tables[table_index].rows.iter().fold(self.lsn(), |lsn, (_, state)| lsn.max(state.committed_lsn));
+        for &slot in &slots[..n_enf] { pool.get_mut(slot).publish_at(boundary); }
         let mut incomplete = false;
         let mut buf = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
         let mut insert_hashes = |rowid: u64, lsn: u64, hashes: &[(usize, u64)]| {

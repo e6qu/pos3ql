@@ -70306,13 +70306,13 @@ fn statement_snapshot_leases_cover_streaming_copy_completion_and_abort() {
         &mut writer,
         "CREATE TABLE copy_snapshot_input (id integer); CREATE TABLE copy_snapshot_other (id integer); INSERT INTO copy_snapshot_other VALUES (1)",
     );
-    for abort in [false, true] {
+    for (abort, binary) in [(false, false), (false, true), (true, false)] {
         run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
         run_txn(
             &mut engine,
             &mut budget,
             &mut transaction,
-            "COPY copy_snapshot_input FROM STDIN",
+            if binary { "COPY copy_snapshot_input FROM STDIN (FORMAT binary)" } else { "COPY copy_snapshot_input FROM STDIN" },
         );
         let setup = engine.take_pending_copy().expect("streaming COPY setup");
         let snapshot = engine.storage.commit_snapshot();
@@ -70325,16 +70325,29 @@ fn statement_snapshot_leases_cover_streaming_copy_completion_and_abort() {
         );
         assert!(engine.storage.lsn() > snapshot);
         assert_eq!(engine.storage.oldest_snapshot(), Some(snapshot));
-        copy_line(
-            &mut engine,
-            &mut budget,
-            &setup,
-            &mut transaction,
-            guc.seq_session(),
-            &arena,
-            b"7",
-            &mut transition,
-        ).unwrap();
+        if binary {
+            copy_binary_row(
+                &mut engine,
+                &mut budget,
+                &setup,
+                &mut transaction,
+                guc.seq_session(),
+                &arena,
+                &[0, 1, 0, 0, 0, 4, 0, 0, 0, 7],
+                &mut transition,
+            ).unwrap();
+        } else {
+            copy_line(
+                &mut engine,
+                &mut budget,
+                &setup,
+                &mut transaction,
+                guc.seq_session(),
+                &arena,
+                b"7",
+                &mut transition,
+            ).unwrap();
+        }
         assert_eq!(engine.storage.commit_snapshot(), snapshot, "another backend must not change COPY's boundary");
         if abort {
             engine.copy_abort(&mut transaction, &guc);

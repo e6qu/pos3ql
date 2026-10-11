@@ -25,7 +25,7 @@ transactions within that process must execute concurrently.
 | Compatibility | Broad PostgreSQL 18 SQL, catalogs, types, procedures, wire, drivers, dump/restore, and explicit command disposition | Preserve accepted shapes and explicit limits through the remaining changes |
 | Persistence | Durable response barriers, checkpoints, indexes, caches, paced maintenance, and cold recovery | Preserve these guarantees under concurrent execution and representative load |
 | Operations | Writer fencing, backups, independent-prefix export, point-in-time recovery, probes, credential rotation, packages, and passive promotion | Qualify multi-host recovery and failover with real routing and independent storage |
-| Concurrency | Private statement workspaces; synchronized catalogs, serial positions, row maps/version readers, retained query/DML definitions, and heap byte ownership | Shared table/row mutation, engine publication, and fixed execution workers |
+| Concurrency | Private statement workspaces; synchronized catalogs, serial positions, row maps/version readers, retained query/DML definitions, and heap byte ownership | Table lifecycle, reader retirement, engine publication, and fixed execution workers |
 | Performance | Fixture, MinIO, and SeaweedFS harness with host-available and CPU/memory-matched vanilla PostgreSQL 18 controls | Repeated representative runs and published raw evidence |
 
 Execution remains serial. Guarded reads and retained images are prerequisites;
@@ -56,9 +56,8 @@ contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime
 - Qualify physical reclamation against executing statement leases and retained
   transaction snapshots before enabling concurrency. Statement scopes capture
   their boundary under publication ownership and release on completion, error,
-  or transaction end, including streaming COPY; heap relocation still needs bounded
-  pins or reader epochs.
-  Qualify identity reuse, rollback, and publication failure before enabling
+  or transaction end, including streaming COPY. Heap relocation still needs
+  bounded pins or reader epochs. Qualify identity reuse, rollback, and publication failure before enabling
   physical maintenance.
 
 Acceptance: a retained reader permits an unrelated write to complete; failed

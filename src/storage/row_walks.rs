@@ -423,8 +423,8 @@ mod tests {
 
     #[test]
     fn historical_sst_retirement_remaps_every_version_home() {
-        use super::super::row_versions::push_committed_version;
         use super::super::CommittedVersion;
+        use super::super::row_versions::push_committed_version;
         use crate::store::{BlockId, RowSstFormat, SstHandle};
 
         let handle = |tag| SstHandle {
@@ -450,7 +450,13 @@ mod tests {
                 (Some(spilled(0, 7)), 7),
                 (Some(spilled(1, 9)), 9),
             ] {
-                push_committed_version(versions, &mut state.history, 4, CommittedVersion { home, lsn }).unwrap();
+                push_committed_version(
+                    versions,
+                    &mut state.history,
+                    4,
+                    CommittedVersion { home, lsn },
+                )
+                .unwrap();
             }
             storage.tables[table].rows.remove(&1);
             storage.tables[table].rows.insert(1, state).unwrap();
@@ -458,10 +464,16 @@ mod tests {
                 storage.merge_spill_pair(table, at, Some(handle(13)));
                 let state = storage.resident_row_state(table, 1).unwrap();
                 assert_eq!(state.committed, Some(spilled(1, 11)));
-                assert_eq!(state.history_get(0).unwrap().home, Some(spilled(at as u32, 9)));
+                assert_eq!(
+                    state.history_get(0).unwrap().home,
+                    Some(spilled(at as u32, 9))
+                );
                 assert_eq!(state.history_get(1).unwrap().home, Some(spilled(0, 7)));
                 assert_eq!(state.history_get(2).unwrap().home, None);
-                assert_eq!(state.history_get(3).unwrap().home, Some(RowHome::Heap(super::super::RowLoc::test(1, 4))));
+                assert_eq!(
+                    state.history_get(3).unwrap().home,
+                    Some(RowHome::Heap(super::super::RowLoc::test(1, 4)))
+                );
                 assert_eq!(state.history_get(0).unwrap().lsn, 9);
                 assert_eq!(state.committed_lsn, 11);
                 drop(state);

@@ -1374,6 +1374,8 @@ impl Checkpointer {
                 resume_lo: SstKey::MIN,
             },
             (None, _) => {
+                #[cfg(test)]
+                eprintln!("SST_MERGE slot={} oldest={:?} drop={} keys={:?}", job.slot, job.oldest_snapshot, job.drop_tombstones, self.merge_scratch.as_slice());
                 // Exact duplicates choose the newer list member.
                 self.merge_scratch
                     .sort_unstable_by_key(|&(key, kind)| (key, kind & 1));
@@ -11437,6 +11439,8 @@ impl Checkpointer {
             && storage.table(slot).dirty()
             && self.slice_scratch.n > 0
             && self.slice_scratch.n < self.slice_scratch.capacity();
+        #[cfg(test)]
+        eprintln!("SST_BUILD slot={slot} n={} clean={clean} delta={delta} oldest={:?}", self.slice_scratch.n, storage.oldest_snapshot());
         let changed_row_after_lsn = delta.then_some(if reuse_slice {
             self.sliced_lsn[slot]
         } else {
@@ -11531,7 +11535,7 @@ impl Checkpointer {
                     // A reslice appends only work newer than its prior
                     // immutable slice.
                     if slice_after_lsn.is_some_and(|floor| commit_lsn <= floor)
-                        || (!current
+                        || (delta && !current
                             && home.is_some_and(|location| {
                                 matches!(location, RowHome::Spilled { .. })
                             }))

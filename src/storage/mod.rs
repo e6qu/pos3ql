@@ -30921,7 +30921,13 @@ impl Storage {
         table.n_spill_ssts = 1;
         for (_, state) in table.rows.iter_mut() {
             remap_committed_homes(versions, state, |home| match home {
-                RowHome::Spilled { len, commit_lsn, .. } => RowHome::Spilled { len, sst: 0, commit_lsn },
+                RowHome::Spilled {
+                    len, commit_lsn, ..
+                } => RowHome::Spilled {
+                    len,
+                    sst: 0,
+                    commit_lsn,
+                },
                 RowHome::Heap(_) => home,
             });
         }
@@ -30962,9 +30968,23 @@ impl Storage {
         let at = at as u32;
         for (_, state) in table.rows.iter_mut() {
             remap_committed_homes(versions, state, |home| match home {
-                RowHome::Spilled { len, sst, commit_lsn } => {
-                    let sst = if sst < at { sst } else if sst == at || sst == at + 1 { at } else { sst - removed };
-                    RowHome::Spilled { len, sst, commit_lsn }
+                RowHome::Spilled {
+                    len,
+                    sst,
+                    commit_lsn,
+                } => {
+                    let sst = if sst < at {
+                        sst
+                    } else if sst == at || sst == at + 1 {
+                        at
+                    } else {
+                        sst - removed
+                    };
+                    RowHome::Spilled {
+                        len,
+                        sst,
+                        commit_lsn,
+                    }
                 }
                 RowHome::Heap(_) => home,
             });

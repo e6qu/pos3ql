@@ -70255,33 +70255,78 @@ fn historical_sst_reads_survive_full_roster_replacement_and_cold_recovery() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut writer = TxnState::new(&mut budget, 256).unwrap();
     let mut reader = TxnState::new(&mut budget, 256).unwrap();
-    run_txn(&mut engine, &mut budget, &mut writer,
-        "CREATE TABLE historical_roots (id integer PRIMARY KEY, value text); INSERT INTO historical_roots VALUES (1, 'before'), (2, 'remove-me')");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE TABLE historical_roots (id integer PRIMARY KEY, value text); INSERT INTO historical_roots VALUES (1, 'before'), (2, 'remove-me')",
+    );
     assert!(engine.checkpoint().unwrap());
-    run_txn(&mut engine, &mut budget, &mut writer,
-        "INSERT INTO historical_roots VALUES (3, 'later-root')");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "INSERT INTO historical_roots VALUES (3, 'later-root')",
+    );
     assert!(engine.checkpoint().unwrap());
-    let table = engine.storage.find_table("public", "historical_roots").unwrap();
-    assert_eq!(engine.ckpt.as_ref().unwrap().published_spill_generation_count(table), 2);
+    let table = engine
+        .storage
+        .find_table("public", "historical_roots")
+        .unwrap();
+    assert_eq!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_spill_generation_count(table),
+        2
+    );
     engine.storage.evict_committed_table(table);
     engine.storage.evict_redundant_entries(table);
-    run_txn(&mut engine, &mut budget, &mut reader,
-        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    );
     let expected = ["before", "remove-me", "later-root"];
-    assert_eq!(data_rows(&run_with_txn_bytes(&mut engine, &mut budget, &mut reader,
-        "SELECT value FROM historical_roots ORDER BY id")), expected);
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT value FROM historical_roots ORDER BY id"
+        )),
+        expected
+    );
     for version in 1..=8 {
-        let updated = run_txn(&mut engine, &mut budget, &mut writer,
-            &format!("UPDATE historical_roots SET value = 'after-{version}' WHERE id IN (1, 3)"));
+        let updated = run_txn(
+            &mut engine,
+            &mut budget,
+            &mut writer,
+            &format!("UPDATE historical_roots SET value = 'after-{version}' WHERE id IN (1, 3)"),
+        );
         assert!(updated.contains("UPDATE 2"), "{updated}");
         if version == 1 {
-            let deleted = run_txn(&mut engine, &mut budget, &mut writer,
-                "DELETE FROM historical_roots WHERE id = 2");
+            let deleted = run_txn(
+                &mut engine,
+                &mut budget,
+                &mut writer,
+                "DELETE FROM historical_roots WHERE id = 2",
+            );
             assert!(deleted.contains("DELETE 1"), "{deleted}");
         }
         assert!(engine.checkpoint().unwrap(), "checkpoint {version}");
-        assert_eq!(data_rows(&run_with_txn_bytes(&mut engine, &mut budget, &mut reader,
-            "SELECT value FROM historical_roots ORDER BY id")), expected, "checkpoint {version}");
+        assert_eq!(
+            data_rows(&run_with_txn_bytes(
+                &mut engine,
+                &mut budget,
+                &mut reader,
+                "SELECT value FROM historical_roots ORDER BY id"
+            )),
+            expected,
+            "checkpoint {version}"
+        );
     }
     run_txn(&mut engine, &mut budget, &mut reader, "COMMIT");
     engine.checkpoint().unwrap();
@@ -70289,8 +70334,14 @@ fn historical_sst_reads_survive_full_roster_replacement_and_cold_recovery() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut budget = test_engine_budget(&config, 1 << 30);
     let mut recovered = Engine::new(&config, &mut budget).unwrap();
-    assert_eq!(data_rows(&run_with(&mut recovered, &mut budget,
-        "SELECT id, value FROM historical_roots ORDER BY id")), ["1|after-8", "3|after-8"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT id, value FROM historical_roots ORDER BY id"
+        )),
+        ["1|after-8", "3|after-8"]
+    );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

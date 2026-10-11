@@ -11442,6 +11442,9 @@ impl Checkpointer {
         } else {
             self.manifest_lsn
         });
+
+        // A logical full scan does not enumerate historical object versions.
+        // Filled rosters must use the version-preserving paced merge first.
         if storage.has_active_snapshots()
             && !clean
             && storage.table(slot).n_spill_ssts > 0
@@ -11542,7 +11545,8 @@ impl Checkpointer {
                     // A reslice appends only work newer than its prior
                     // immutable slice.
                     if slice_after_lsn.is_some_and(|floor| commit_lsn <= floor)
-                        || (!current
+                        || (delta
+                            && !current
                             && home.is_some_and(|location| {
                                 matches!(location, RowHome::Spilled { .. })
                             }))

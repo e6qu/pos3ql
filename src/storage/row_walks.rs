@@ -452,7 +452,7 @@ mod tests {
             ] {
                 push_committed_version(versions, &mut state.history, 4, CommittedVersion { home, lsn }).unwrap();
             }
-            storage.tables[table].rows.remove(1);
+            storage.tables[table].rows.remove(&1);
             storage.tables[table].rows.insert(1, state).unwrap();
             crate::mem::guard::forbid_alloc(|| {
                 storage.merge_spill_pair(table, at, Some(handle(13)));

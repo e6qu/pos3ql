@@ -375,6 +375,7 @@ mod tests {
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let mut definition = make_def("checkpoint_walk", &[("id", ColType::Int4, true)]);
         definition.columns[0].primary = true;
+        definition.columns[0].unique = true;
         let table = storage.create_table(definition).unwrap();
         for rowid in 1..=2 {
             let location = storage

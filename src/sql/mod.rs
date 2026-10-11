@@ -4934,10 +4934,18 @@ impl Engine {
         }
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
         let lease = if takes_snapshot && retain_snapshot {
-            Some(self.storage.retain_statement_snapshot(txn.txid, |lsn| txn.statement_snapshot(lsn))?)
-        } else { None };
+            Some(
+                self.storage
+                    .retain_statement_snapshot(txn.txid, |lsn| txn.statement_snapshot(lsn))?,
+            )
+        } else {
+            None
+        };
         let snapshot = if takes_snapshot {
-            let snapshot = lease.as_ref().map_or_else(|| txn.statement_snapshot(self.storage.lsn()), |lease| lease.snapshot());
+            let snapshot = lease.as_ref().map_or_else(
+                || txn.statement_snapshot(self.storage.lsn()),
+                |lease| lease.snapshot(),
+            );
             if matches!(
                 txn.isolation,
                 TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
@@ -14198,8 +14206,12 @@ impl Engine {
                 "statement is waiting for a schema lock"
             )));
         }
-        let _snapshot_lease = match self.begin_command_snapshot(txn, true, true,
-            !matches!(statement, Stmt::Checkpoint | Stmt::Vacuum { .. })) {
+        let _snapshot_lease = match self.begin_command_snapshot(
+            txn,
+            true,
+            true,
+            !matches!(statement, Stmt::Checkpoint | Stmt::Vacuum { .. }),
+        ) {
             Ok(lease) => lease,
             Err(error) => return Ok(Err(error)),
         };

@@ -70244,20 +70244,50 @@ fn statement_snapshot_leases_release_after_sql_success_and_failure() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
-    run_txn(&mut engine, &mut budget, &mut transaction,
-        "CREATE TABLE statement_snapshots (id integer); INSERT INTO statement_snapshots VALUES (1)");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE statement_snapshots (id integer); INSERT INTO statement_snapshots VALUES (1)",
+    );
     assert!(!engine.storage.has_active_snapshots());
     run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
-    assert_eq!(data_rows(&run_with_txn_bytes(&mut engine, &mut budget, &mut transaction,
-        "SELECT id FROM statement_snapshots")), ["1"]);
-    assert!(!engine.storage.has_active_snapshots(), "read committed retention ends with each statement");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            "SELECT id FROM statement_snapshots"
+        )),
+        ["1"]
+    );
+    assert!(
+        !engine.storage.has_active_snapshots(),
+        "read committed retention ends with each statement"
+    );
     let failed = run_txn(&mut engine, &mut budget, &mut transaction, "SELECT 1 / 0");
     assert!(failed.contains("22012"), "{failed}");
-    assert!(!engine.storage.has_active_snapshots(), "errors release statement retention");
+    assert!(
+        !engine.storage.has_active_snapshots(),
+        "errors release statement retention"
+    );
     run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK");
-    run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN ISOLATION LEVEL REPEATABLE READ");
-    run_txn(&mut engine, &mut budget, &mut transaction, "SELECT id FROM statement_snapshots");
-    assert!(engine.storage.has_active_snapshots(), "transaction retention survives statement completion");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SELECT id FROM statement_snapshots",
+    );
+    assert!(
+        engine.storage.has_active_snapshots(),
+        "transaction retention survives statement completion"
+    );
     run_txn(&mut engine, &mut budget, &mut transaction, "COMMIT");
     assert!(!engine.storage.has_active_snapshots());
 }

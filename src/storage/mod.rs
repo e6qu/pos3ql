@@ -20,8 +20,8 @@ mod row_reads;
 mod row_versions;
 mod row_walks;
 pub(crate) mod rowenc;
-mod spill_generations;
 mod snapshot_leases;
+mod spill_generations;
 pub(crate) use snapshot_leases::StatementSnapshotLease;
 use snapshot_leases::{StatementSnapshot, snapshot_owner_bytes, statement_snapshot_capacity};
 
@@ -18170,7 +18170,11 @@ impl Storage {
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         budget.draw(snapshot_owner_bytes(), "snapshot and lock owners")?;
-        let statement_snapshots = FixedVec::new(budget, "statement snapshots", statement_snapshot_capacity(config))?;
+        let statement_snapshots = FixedVec::new(
+            budget,
+            "statement snapshots",
+            statement_snapshot_capacity(config),
+        )?;
         let active_snapshots = FixedVec::new(budget, "active_snapshots", transaction_capacity)?;
         let transaction_identities =
             FixedVec::new(budget, "transaction_identities", transaction_capacity)?;
@@ -48718,7 +48722,13 @@ impl Storage {
             .active
             .iter()
             .map(|(owner, _)| *owner)
-            .chain(snapshots.statements.iter().filter(|statement| statement.lsn.is_some()).map(|statement| statement.transaction))
+            .chain(
+                snapshots
+                    .statements
+                    .iter()
+                    .filter(|statement| statement.lsn.is_some())
+                    .map(|statement| statement.transaction),
+            )
             .chain(locks.table.iter().map(|lock| lock.owner))
             .find(|owner| *owner != txid)
     }

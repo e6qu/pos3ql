@@ -1,0 +1,21 @@
+name: Runner scheduling diagnostic
+on:
+  push:
+    branches: [codex/ci-owned-readers]
+concurrency:
+  group: runner-scheduling-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  schedule:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 2
+    steps:
+      - name: Record assigned runner
+        run: |
+          date -u
+          uname -sr
+          printf '%s\n' "$RUNNER_NAME" "$RUNNER_OS"

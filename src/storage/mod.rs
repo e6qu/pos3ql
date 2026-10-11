@@ -32210,10 +32210,7 @@ impl Storage {
             let enforcer = table.enforcer(index).expect("enforcer present");
             enforcer.index_created_at.is_none()
                 && enforcer.columns() == columns
-                && self
-                    .value_indexes
-                    .get(enforcer.slot)
-                    .is_complete()
+                && self.value_indexes.get(enforcer.slot).is_complete()
         })
     }
 

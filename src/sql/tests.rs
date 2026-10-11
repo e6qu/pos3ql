@@ -67341,6 +67341,7 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
         .storage
         .find_table("public", "retained_checkpoint")
         .unwrap();
+    engine.storage.set_commit_snapshot(0);
     let mut cursor = crate::storage::CheckpointValueCursor::new(
         config.max_spill_generations_per_table,
         config.table_rows,
@@ -67372,19 +67373,56 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
     assert!(engine.storage.spill_rows_are_unshadowed(slot));
     loop {
         let before = engine.storage.block_io_stats();
-        let done = engine.storage.for_each_value_binding_entry_batch(slot, 0, &mut cursor, &arena, &mut output, 16, 8, &mut |entry| {
-            let mut values = [crate::sql::types::Datum::Null];
-            crate::storage::rowenc::decode(entry.key, &[crate::sql::types::ColType::Int4], &mut values)?;
-            assert_eq!(values[0], crate::sql::types::Datum::Int4(entry.rowid as i32));
-            seen.push(entry.rowid);
-            Ok(core::ops::ControlFlow::Continue(()))
-        }).unwrap();
+        let done = engine
+            .storage
+            .for_each_value_binding_entry_batch(
+                slot,
+                0,
+                &mut cursor,
+                &arena,
+                &mut output,
+                16,
+                8,
+                &mut |entry| {
+                    let mut values = [crate::sql::types::Datum::Null];
+                    crate::storage::rowenc::decode(
+                        entry.key,
+                        &[crate::sql::types::ColType::Int4],
+                        &mut values,
+                    )?;
+                    assert_eq!(
+                        values[0],
+                        crate::sql::types::Datum::Int4(entry.rowid as i32)
+                    );
+                    seen.push(entry.rowid);
+                    Ok(core::ops::ControlFlow::Continue(()))
+                },
+            )
+            .unwrap();
         let reads = engine.storage.block_io_stats().saturating_sub(before);
-        assert!(reads.object_gets <= 8, "eviction must preserve paced SST reads: {reads:?}");
+        assert!(
+            reads.object_gets <= 8,
+            "eviction must preserve paced SST reads: {reads:?}"
+        );
         arena.reset();
-        if done { break; }
+        if done {
+            break;
+        }
     }
-    assert_eq!(seen, (1..=128).collect::<Vec<_>>(), "eviction cannot duplicate or skip checkpoint source rows");
+    assert_eq!(
+        seen,
+        (1..=128).collect::<Vec<_>>(),
+        "eviction cannot duplicate or skip checkpoint source rows"
+    );
+    assert_eq!(engine.storage.commit_snapshot(), 0);
+    let scan = engine.storage.row_scan(slot).unwrap();
+    let mut visible_rows = 0;
+    scan.for_each_spilled_row_batch(&arena, true, None, &mut |rows| {
+        visible_rows += rows.len();
+        Ok(core::ops::ControlFlow::Continue(()))
+    }).unwrap();
+    assert_eq!(visible_rows, 0, "query scans must retain their older statement snapshot");
+    drop(scan);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut recovered_budget = test_engine_budget(&config, 1 << 30);

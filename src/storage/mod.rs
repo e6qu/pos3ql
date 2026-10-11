@@ -28727,6 +28727,12 @@ impl Storage {
     ) -> Result<bool, SqlError> {
         let table = &self.tables[slot];
         let n = table.n_spill_ssts;
+        // Checkpoint sources describe committed storage, independently of
+        // the foreground worker's possibly older statement snapshot.
+        let commit_snapshot = match overlay_mode {
+            SpillOverlayMode::VisibleScan(_) => self.commit_snapshot(),
+            SpillOverlayMode::CommittedCheckpoint(_) => self.lsn(),
+        };
         if n == 0 {
             return Ok(true);
         }
@@ -28842,7 +28848,7 @@ impl Storage {
             for (member, cursor) in cursors[..n].iter().enumerate() {
                 if let Some((key, tombstone, len)) = cursor.head
                     && key.rowid == rowid
-                    && key.commit_lsn <= self.commit_snapshot()
+                    && key.commit_lsn <= commit_snapshot
                     && verdict.is_none_or(|current| {
                         key.commit_lsn > current.commit_lsn
                             || (key.commit_lsn == current.commit_lsn
@@ -28863,10 +28869,9 @@ impl Storage {
             }) = verdict
                 && match overlay_mode {
                     SpillOverlayMode::VisibleScan(rowids) => !rowids.contains(rowid),
-                    SpillOverlayMode::CommittedCheckpoint(rowids) => {
-                        rowids.binary_search_by_key(&rowid, |entry| entry.rowid)
-                            .map_or(true, |position| !rowids[position].suppress_spill)
-                    }
+                    SpillOverlayMode::CommittedCheckpoint(rowids) => rowids
+                        .binary_search_by_key(&rowid, |entry| entry.rowid)
+                        .map_or(true, |position| !rowids[position].suppress_spill),
                 } {
                 let cursor = &mut cursors[member as usize];
                 let (key, tombstone, _copied) = cursor.head.ok_or_else(|| {
@@ -29573,10 +29578,15 @@ impl Storage {
                     cursor.resident_rowids.capacity()
                 ));
             }
-            cursor.resident_rowids.push(CheckpointRowIdentity { rowid, suppress_spill: false });
+            cursor.resident_rowids.push(CheckpointRowIdentity {
+                rowid,
+                suppress_spill: false,
+            });
         }
         drop(rows);
-        cursor.resident_rowids.sort_unstable_by_key(|entry| entry.rowid);
+        cursor
+            .resident_rowids
+            .sort_unstable_by_key(|entry| entry.rowid);
         cursor.resident_initialized = true;
         Ok(())
     }

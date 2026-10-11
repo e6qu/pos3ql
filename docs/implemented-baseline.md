@@ -38,7 +38,9 @@ Resumable value-index checkpoint sources charge one table_rows identity/coverage
 at startup. Bucket movement and pending rollback do not move their logical
 resume position; reproducible eviction routes unprocessed rows through the paced SST merge while
 preserving coverage for emitted resident rows.
-Selected committed images are pinned before releasing row metadata. Jobs still
+Selected committed images are pinned before releasing row metadata. Checkpoint
+SST sources use the committed storage boundary independently of foreground
+statement snapshots; query scans preserve their own visibility. Jobs still
 restart on table/generation changes. A statement scan's Storage borrow retains
 its table incarnation and immutable SST list; generation replacement and
 retirement are not yet concurrent.

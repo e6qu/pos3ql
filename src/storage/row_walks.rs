@@ -525,15 +525,23 @@ mod tests {
         storage.refresh_enforcers(table).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             assert!(storage.value_cache_complete(table, &[0]));
-            assert!(!storage.value_probe_complete(table, &[0]), "a rebuilt cache must include the deletion boundary");
+            assert!(
+                !storage.value_probe_complete(table, &[0]),
+                "a rebuilt cache must include the deletion boundary"
+            );
             let state = storage.resident_row_state(table, 1).unwrap();
-            let image = storage.visible_row_home_at(table, 1, state, 99, SNAPSHOT_ALL, 7).unwrap().unwrap();
-            storage.with_row_bytes(table, 1, image, |bytes| {
-                let mut values = [Datum::Null];
-                super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
-                assert_eq!(values[0], Datum::Int4(1));
-                Ok(())
-            }).unwrap();
+            let image = storage
+                .visible_row_home_at(table, 1, state, 99, SNAPSHOT_ALL, 7)
+                .unwrap()
+                .unwrap();
+            storage
+                .with_row_bytes(table, 1, image, |bytes| {
+                    let mut values = [Datum::Null];
+                    super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                    assert_eq!(values[0], Datum::Int4(1));
+                    Ok(())
+                })
+                .unwrap();
             storage.release_snapshot(99);
             assert!(storage.resident_row_state(table, 1).is_none());
         });

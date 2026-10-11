@@ -32203,6 +32203,7 @@ impl Storage {
         Ok(false)
     }
 
+    /// Physical cache completeness; query usability also checks its snapshot.
     pub fn value_cache_complete(&self, table_index: usize, columns: &[u16]) -> bool {
         let table = &self.tables[table_index];
         (0..table.n_enforcers).any(|index| {
@@ -32212,7 +32213,7 @@ impl Storage {
                 && self
                     .value_indexes
                     .get(enforcer.slot)
-                    .is_complete_at(self.commit_snapshot())
+                    .is_complete()
         })
     }
 

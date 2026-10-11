@@ -489,6 +489,8 @@ mod tests {
             "commit must complete while the probe retains the old image"
         );
         crate::mem::guard::forbid_alloc(|| {
+            assert!(storage.value_cache_complete(table, &[0]));
+            assert!(!storage.value_probe_complete(table, &[0]));
             assert!(
                 !storage
                     .probe_value(table, &[0], hashes[0].1, |_, _| panic!(

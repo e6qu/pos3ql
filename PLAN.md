@@ -42,8 +42,9 @@ Allow readers to retain selected row images and immutable generations while
 unrelated writes and maintenance progress. Existing reader and pending-write
 contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime-ownership).
 
-- Retain table/SST generations across resumable checkpoint beats and retirement.
-  Current jobs restart when a generation changes; this is not live retention.
+- Extend owned SST roots, captured schemas, and read-pool retention to query
+  readers and concurrent table retirement. Resumable checkpoint sources retain
+  immutable roots; jobs restart when their committed input changes.
 - Complete committed row publication, table lifecycle, snapshot registration,
   and statistics ownership with explicit lock ordering.
 - Separate reclamation and heap relocation from active readers, using bounded

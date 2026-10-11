@@ -20,6 +20,7 @@ mod row_reads;
 mod row_versions;
 mod row_walks;
 pub(crate) mod rowenc;
+mod spill_generations;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;
@@ -36,6 +37,7 @@ use row_versions::{
     release_pending_chain,
 };
 use row_walks::{RetainedRowIds, RowScanIds, RowWalkPool};
+use spill_generations::{SpillGenerationSnapshot, SpillRelation, SpillRootRegistry};
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -13511,6 +13513,7 @@ pub struct Storage {
     max_row_versions_per_row: usize,
     row_versions: RowVersionPools,
     row_walks: RowWalkPool,
+    spill_roots: std::sync::Arc<SpillRootRegistry>,
     large_objects: std::sync::Mutex<LargeObjectCatalog>,
     large_object_page_table: u32,
     max_catalog_versions_per_object: u32,
@@ -13595,7 +13598,7 @@ pub struct Storage {
     /// The read path for spilled rows: the tiered block stack shared with the
     /// checkpointer, plus owned reader scratch. `None` without object storage
     /// — then rows never spill and the heap-full error stands.
-    spill: Option<SpillReader>,
+    spill: Option<std::sync::Arc<SpillReader>>,
     /// Startup-allocated value indexes shared by every table's enforcers. Held
     /// in an `Option` so a rebuild can take it out for the duration of a row
     /// walk (which borrows the rest of `self`) and put it back.
@@ -13909,6 +13912,7 @@ pub(crate) struct CheckpointValueCursor {
     resident_rowids: Vec<CheckpointRowIdentity>,
     resident_initialized: bool,
     members: Box<[MemberCursor]>,
+    generations: SpillGenerationSnapshot,
     /// Stable owner identity for shared scan buffers across checkpoint beats.
     spill_walk_id: u64,
     /// Member heads opened so far; opening a long generation list is paced.
@@ -13920,6 +13924,7 @@ pub(crate) struct CheckpointValueCursor {
 impl CheckpointValueCursor {
     pub(crate) fn budget_bytes(max_spill_generations: usize, table_rows: usize) -> usize {
         max_spill_generations * core::mem::size_of::<MemberCursor>()
+            + SpillGenerationSnapshot::budget_bytes(max_spill_generations)
             + table_rows * core::mem::size_of::<CheckpointRowIdentity>()
     }
 
@@ -13929,6 +13934,7 @@ impl CheckpointValueCursor {
             resident_rowids: Vec::with_capacity(table_rows),
             resident_initialized: false,
             members: vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
+            generations: SpillGenerationSnapshot::new(max_spill_generations),
             spill_walk_id: 0,
             spill_initialized: 0,
             resident_done: false,
@@ -13941,10 +13947,62 @@ impl CheckpointValueCursor {
         self.resident_rowids.clear();
         self.resident_initialized = false;
         self.members.fill(MemberCursor::EMPTY);
+        self.generations.clear();
         self.spill_walk_id = 0;
         self.spill_initialized = 0;
         self.resident_done = false;
         self.spill_done = false;
+    }
+}
+
+impl CheckpointValueCursor {
+    pub(crate) fn walk_spilled_rows<'arena>(
+        &mut self,
+        arena: &'arena Arena,
+        decoded_columns: Option<&[bool; MAX_COLUMNS]>,
+        coalesce_packed: bool,
+        max_rows: usize,
+        max_object_gets: u64,
+        each: &mut dyn FnMut(
+            u64,
+            u64,
+            SpilledRowRepresentation<'arena>,
+        ) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<bool, SqlError> {
+        if !self.resident_initialized {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "checkpoint SST source has not been retained"
+            ));
+        }
+        let relation = self.generations.relation();
+        if relation.len() == 0 {
+            return Ok(true);
+        }
+        let reader = self.generations.reader.as_ref().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "retained SST roots have no reader owner"
+            )
+        })?;
+        Storage::walk_spill_bytes(
+            reader,
+            &relation,
+            self.generations.commit_lsn,
+            arena,
+            true,
+            decoded_columns,
+            coalesce_packed,
+            SpillOverlayMode::CommittedCheckpoint(&self.resident_rowids),
+            Some((
+                &mut self.members,
+                &mut self.spill_walk_id,
+                &mut self.spill_initialized,
+                max_rows,
+                max_object_gets,
+            )),
+            each,
+        )
     }
 }
 
@@ -14027,12 +14085,11 @@ impl SpillReader {
         temporary_blocks: Option<
             std::sync::Arc<std::sync::Mutex<crate::store::EphemeralBlockStore>>,
         >,
-    ) -> Result<Self, BudgetError> {
+    ) -> Result<std::sync::Arc<Self>, BudgetError> {
         let durable = blocks.is_some();
+        budget.draw(Self::owner_bytes(), "shared spill reader owner")?;
         budget.draw(
-            2 * (5 * crate::store::MAX_PAYLOAD
-                + crate::store::MAX_ASSEMBLED
-                + core::mem::size_of::<SpillScratch>()),
+            2 * (5 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED),
             "spill reader",
         )?;
         budget.draw(
@@ -14129,7 +14186,7 @@ impl SpillReader {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Ok(Self {
+        Ok(std::sync::Arc::new(Self {
             blocks,
             temporary_blocks,
             scratch: [fresh(), fresh()],
@@ -14139,15 +14196,13 @@ impl SpillReader {
             value_scratch: durable.then(|| [value(), value()]),
             external_sorters: external_sorters.into_boxed_slice(),
             external_readers,
-        })
+        }))
     }
 
     /// The budget the contexts and scratch draw, for memory-plan estimates.
     pub(crate) fn budget_bytes(durable: bool, max_spill_generations: usize) -> usize {
-        let row_reader = 2
-            * (5 * crate::store::MAX_PAYLOAD
-                + crate::store::MAX_ASSEMBLED
-                + core::mem::size_of::<SpillScratch>())
+        let row_reader = Self::owner_bytes()
+            + 2 * (5 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
             + SCAN_CONTEXTS
                 * ((2 * max_spill_generations + 4) * crate::store::MAX_PAYLOAD
                     + 2 * max_spill_generations * core::mem::size_of::<Box<[u8]>>()
@@ -14169,6 +14224,17 @@ impl SpillReader {
         }
     }
 
+    fn owner_bytes() -> usize {
+        size_of::<Self>() + 2 * size_of::<std::sync::atomic::AtomicUsize>()
+    }
+
+    fn io_stats(&self) -> crate::store::BlockIoStats {
+        self.blocks
+            .as_ref()
+            .map(|blocks| blocks.lock().expect("block store lock poisoned").io_stats())
+            .unwrap_or_default()
+    }
+
     fn next_walk_id(&self) -> u64 {
         let mut next = self
             .next_walk_id
@@ -14180,11 +14246,11 @@ impl SpillReader {
     }
 
     fn relation_blocks<'a>(&'a self, table: &Table) -> RelationBlockStore<'a> {
-        if {
-            let definition = table.definition();
-            definition.persistence
-        } == RelationPersistence::Temporary
-        {
+        self.relation_blocks_for(table.definition().persistence)
+    }
+
+    fn relation_blocks_for(&self, persistence: RelationPersistence) -> RelationBlockStore<'_> {
+        if persistence == RelationPersistence::Temporary {
             RelationBlockStore::Temporary(
                 self.temporary_blocks
                     .as_ref()
@@ -17239,6 +17305,25 @@ impl Storage {
         definition_images::TableDefinitionImagePool::budget_bytes(config)
     }
 
+    pub(crate) fn retained_spill_root_capacity(config: &Config) -> usize {
+        SpillRootRegistry::capacity(config)
+    }
+
+    pub(crate) fn copy_retained_spill_roots(
+        &self,
+        durable: bool,
+        output: &mut Vec<crate::store::SstHandle>,
+    ) -> Result<(), SqlError> {
+        self.spill_roots.copy_roots(durable, output)
+    }
+
+    pub(crate) fn retained_sst_reclamation_pending(&self) -> bool {
+        self.spill_roots.reclamation_pending()
+    }
+    pub(crate) fn take_retained_sst_reclamation(&self) -> bool {
+        self.spill_roots.take_reclamation_pending()
+    }
+
     pub(crate) fn retained_row_walk_budget_bytes(config: &Config) -> usize {
         RowWalkPool::budget_bytes(config)
     }
@@ -17255,6 +17340,7 @@ impl Storage {
             + RowHeap::control_bytes()
             + RowVersionPools::control_bytes()
             + Self::retained_row_walk_budget_bytes(config)
+            + SpillRootRegistry::budget_bytes(config)
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
             + Self::table_definition_image_budget_bytes(config)
             + committed_row_version_capacity(config)
@@ -17388,6 +17474,7 @@ impl Storage {
         )?;
         let row_versions = RowVersionPools::new(config, budget)?;
         let row_walks = RowWalkPool::new(config, budget)?;
+        let spill_roots = SpillRootRegistry::new(config, budget)?;
         let pending_table_defs =
             DefinitionVersions::new(budget, pending_table_definition_capacity(config))?;
         let pending_table_statistics = FixedVec::new(
@@ -18132,6 +18219,7 @@ impl Storage {
             max_row_versions_per_row: config.max_row_versions_per_row,
             row_versions,
             row_walks,
+            spill_roots,
             large_objects: std::sync::Mutex::new(LargeObjectCatalog {
                 definitions: large_objects,
                 next_oid: LargeObjectOid::parse(16_384),
@@ -28474,7 +28562,7 @@ impl Storage {
 
     /// Attaches the spilled-row read path. The local temporary store is always
     /// present; its durable block stack is optional.
-    pub(crate) fn attach_spill(&mut self, reader: SpillReader) {
+    pub(crate) fn attach_spill(&mut self, reader: std::sync::Arc<SpillReader>) {
         self.spill = Some(reader);
     }
 
@@ -28606,6 +28694,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         let table = &self.tables[slot];
         let n = table.n_spill_ssts;
+        let relation = SpillRelation::installed(table);
         if n == 0 {
             return Ok(());
         }
@@ -28635,7 +28724,7 @@ impl Storage {
             context.owner = walk_id;
             context.pax_values_owner = None;
             for (member, cursor) in cursors[..n].iter_mut().enumerate() {
-                Self::cursor_advance(spill, table, member, cursor, &mut context)?;
+                Self::cursor_advance(spill, &relation, member, cursor, &mut context)?;
             }
         }
         loop {
@@ -28686,7 +28775,7 @@ impl Storage {
                             commit_lsn: key.commit_lsn,
                         });
                     }
-                    Self::cursor_advance(spill, table, member, cursor, &mut context)?;
+                    Self::cursor_advance(spill, &relation, member, cursor, &mut context)?;
                 }
             }
             drop(context);
@@ -28726,14 +28815,8 @@ impl Storage {
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[slot];
-        let n = table.n_spill_ssts;
-        // Checkpoint sources describe committed storage, independently of
-        // the foreground worker's possibly older statement snapshot.
-        let commit_snapshot = match overlay_mode {
-            SpillOverlayMode::VisibleScan(_) => self.commit_snapshot(),
-            SpillOverlayMode::CommittedCheckpoint(_) => self.lsn(),
-        };
-        if n == 0 {
+        let relation = SpillRelation::installed(table);
+        if relation.len() == 0 {
             return Ok(true);
         }
         let Some(spill) = &self.spill else {
@@ -28742,6 +28825,42 @@ impl Storage {
                 "table has spill SSTs but no spill reader is attached"
             ));
         };
+        let commit_snapshot = match overlay_mode {
+            SpillOverlayMode::VisibleScan(_) => self.commit_snapshot(),
+            SpillOverlayMode::CommittedCheckpoint(_) => self.lsn(),
+        };
+        Self::walk_spill_bytes(
+            spill,
+            &relation,
+            commit_snapshot,
+            arena,
+            recycle_rows,
+            decoded_columns,
+            coalesce_packed,
+            overlay_mode,
+            resume,
+            emit,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "immutable spill walk boundary")]
+    fn walk_spill_bytes<'a>(
+        spill: &SpillReader,
+        relation: &SpillRelation<'_>,
+        commit_snapshot: u64,
+        arena: &'a crate::mem::arena::Arena,
+        recycle_rows: bool,
+        decoded_columns: Option<&[bool; MAX_COLUMNS]>,
+        coalesce_packed: bool,
+        overlay_mode: SpillOverlayMode<'_>,
+        resume: Option<(&mut [MemberCursor], &mut u64, &mut usize, usize, u64)>,
+        emit: &mut dyn FnMut(
+            u64,
+            u64,
+            SpilledRowRepresentation<'a>,
+        ) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<bool, SqlError> {
+        let n = relation.len();
         let mut cursor_lease;
         let mut local_walk_id = 0;
         let mut local_initialized = 0;
@@ -28778,7 +28897,7 @@ impl Storage {
             cursors.fill(MemberCursor::EMPTY);
             *initialized = 0;
         }
-        let io_before = self.block_io_stats();
+        let io_before = spill.io_stats();
         if *initialized < n {
             let Some(mut context) = try_mutex_pool(&spill.scan_contexts, "spill scan context")
             else {
@@ -28800,13 +28919,13 @@ impl Storage {
             while *initialized < n {
                 Self::cursor_advance(
                     spill,
-                    table,
+                    relation,
                     *initialized,
                     &mut cursors[*initialized],
                     &mut context,
                 )?;
                 *initialized += 1;
-                if self.block_io_stats().saturating_sub(io_before).object_gets >= max_object_gets {
+                if spill.io_stats().saturating_sub(io_before).object_gets >= max_object_gets {
                     return Ok(false);
                 }
             }
@@ -28885,7 +29004,7 @@ impl Storage {
                     cursor.offset = cursor.head_offset;
                     cursor.raw_row = cursor.head_raw_row;
                     cursor.head = None;
-                    Self::cursor_advance(spill, table, member as usize, cursor, &mut context)?;
+                    Self::cursor_advance(spill, relation, member as usize, cursor, &mut context)?;
                     if cursor.head != expected {
                         return Err(sql_err!(
                             sqlstate::INTERNAL_ERROR,
@@ -28914,7 +29033,7 @@ impl Storage {
                             pax_row_buf,
                             ..
                         } = &mut *context;
-                        let mut blocks = spill.relation_blocks(table);
+                        let mut blocks = spill.relation_blocks_for(relation.persistence);
                         let mut at = 0usize;
                         let mut loaded_container = None;
                         pax_value_extents.fill(None);
@@ -29026,8 +29145,13 @@ impl Storage {
                             "PAX descriptor row length does not match its cursor header"
                         ));
                     }
-                    let mut schema = [ColType::Bool; MAX_COLUMNS];
-                    table.definition().schema(&mut schema);
+                    let schema = &relation.schema[..relation.n_columns];
+                    if layout.columns() > schema.len() {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "SST columns exceed the retained schema"
+                        ));
+                    }
                     let encoded = arena.alloc_slice_with(encoded_len, |_| 0u8).map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -29063,7 +29187,7 @@ impl Storage {
                         )
                     })?;
                     let (copied_key, copied_tombstone, copied) = {
-                        let mut blocks = spill.relation_blocks(table);
+                        let mut blocks = spill.relation_blocks_for(relation.persistence);
                         crate::store::copy_block_entry_at(
                             &mut *blocks,
                             &context.member_blocks[member as usize][..cursor.loaded_len],
@@ -29098,7 +29222,7 @@ impl Storage {
             };
             for (member, cursor) in cursors[..n].iter_mut().enumerate() {
                 while cursor.head.is_some_and(|(key, ..)| key.rowid == rowid) {
-                    Self::cursor_advance(spill, table, member, cursor, &mut context)?;
+                    Self::cursor_advance(spill, relation, member, cursor, &mut context)?;
                 }
             }
             drop(context);
@@ -29115,7 +29239,7 @@ impl Storage {
             if emitted?.is_break() {
                 return Ok(false);
             }
-            if self.block_io_stats().saturating_sub(io_before).object_gets >= max_object_gets {
+            if spill.io_stats().saturating_sub(io_before).object_gets >= max_object_gets {
                 return Ok(false);
             }
         }
@@ -29246,7 +29370,7 @@ impl Storage {
     /// the cache tiers) as it crosses block boundaries.
     fn cursor_advance(
         spill: &SpillReader,
-        table: &Table,
+        relation: &SpillRelation<'_>,
         member: usize,
         cursor: &mut MemberCursor,
         context: &mut ScanContext,
@@ -29255,10 +29379,10 @@ impl Storage {
         if cursor.done {
             return Ok(());
         }
-        let handle = table.spill_ssts[member].expect("cursor members exist");
+        let handle = relation.handle(member);
         loop {
             if let Some((ordinal, leaf)) = cursor.prefetched_leaf {
-                let mut blocks = spill.relation_blocks(table);
+                let mut blocks = spill.relation_blocks_for(relation.persistence);
                 if let Some(reference) = crate::store::take_prefetched_index_first_data(
                     &mut *blocks,
                     &leaf,
@@ -29285,7 +29409,7 @@ impl Storage {
                     0
                 };
                 let resume_raw_row = cursor.loaded.is_none().then_some(cursor.raw_row);
-                let mut blocks = spill.relation_blocks(table);
+                let mut blocks = spill.relation_blocks_for(relation.persistence);
                 // Both index shapes resolve through one helper; the index
                 // buffer is scratch for the descent and the decompression
                 // bounce alike.
@@ -29563,7 +29687,7 @@ impl Storage {
         include_spilled: bool,
     ) -> Result<(), SqlError> {
         if cursor.resident_initialized {
-            return Ok(());
+            return cursor.generations.validate(self, table_slot);
         }
         let rows = self.tables[table_slot].rows.read();
         for (&rowid, state) in rows.iter() {
@@ -29587,6 +29711,10 @@ impl Storage {
         cursor
             .resident_rowids
             .sort_unstable_by_key(|entry| entry.rowid);
+        if let Err(error) = cursor.generations.capture(self, table_slot) {
+            cursor.reset();
+            return Err(error);
+        }
         cursor.resident_initialized = true;
         Ok(())
     }
@@ -29763,20 +29891,12 @@ impl Storage {
             .iter()
             .filter(|&&selected| selected)
             .count();
-        let done = self.spill_merged_walk_bytes(
-            table_slot,
+        let done = cursor.walk_spilled_rows(
             arena,
-            true,
             Some(&decoded_columns),
             decoded_count.saturating_mul(2) >= n_columns,
-            SpillOverlayMode::CommittedCheckpoint(&cursor.resident_rowids),
-            Some((
-                &mut cursor.members,
-                &mut cursor.spill_walk_id,
-                &mut cursor.spill_initialized,
-                max_rows - walked,
-                max_object_gets,
-            )),
+            max_rows - walked,
+            max_object_gets,
             &mut |rowid, commit_lsn, representation| {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
                 let values = match representation {

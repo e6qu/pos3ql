@@ -67477,11 +67477,48 @@ fn retained_sst_next(
 #[test]
 fn shared_committed_publication_preserves_historical_index_probes() {
     let (mut engine, mut budget) = test_engine();
-    run_as(&mut engine, &mut budget, 61, "CREATE TABLE historical_value_probe(id integer PRIMARY KEY); INSERT INTO historical_value_probe VALUES (1), (2)");
-    assert_eq!(data_rows(&run_as(&mut engine, &mut budget, 61, "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM historical_value_probe WHERE id = 1")), ["1"]);
-    assert!(!message_types(&run_as(&mut engine, &mut budget, 62, "UPDATE historical_value_probe SET id = 9 WHERE id = 1")).contains(&b'E'));
-    assert_eq!(data_rows(&run_as(&mut engine, &mut budget, 61, "SELECT id FROM historical_value_probe WHERE id = 1; SELECT count(*) FROM historical_value_probe WHERE id = 9")), ["1", "0"]);
-    assert_eq!(data_rows(&run_as(&mut engine, &mut budget, 61, "COMMIT; SELECT id FROM historical_value_probe WHERE id = 9")), ["9"]);
+    run_as(
+        &mut engine,
+        &mut budget,
+        61,
+        "CREATE TABLE historical_value_probe(id integer PRIMARY KEY); INSERT INTO historical_value_probe VALUES (1), (2)",
+    );
+    assert_eq!(
+        data_rows(&run_as(
+            &mut engine,
+            &mut budget,
+            61,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM historical_value_probe WHERE id = 1"
+        )),
+        ["1"]
+    );
+    assert!(
+        !message_types(&run_as(
+            &mut engine,
+            &mut budget,
+            62,
+            "UPDATE historical_value_probe SET id = 9 WHERE id = 1"
+        ))
+        .contains(&b'E')
+    );
+    assert_eq!(
+        data_rows(&run_as(
+            &mut engine,
+            &mut budget,
+            61,
+            "SELECT id FROM historical_value_probe WHERE id = 1; SELECT count(*) FROM historical_value_probe WHERE id = 9"
+        )),
+        ["1", "0"]
+    );
+    assert_eq!(
+        data_rows(&run_as(
+            &mut engine,
+            &mut budget,
+            61,
+            "COMMIT; SELECT id FROM historical_value_probe WHERE id = 9"
+        )),
+        ["9"]
+    );
 }
 
 #[test]

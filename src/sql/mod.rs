@@ -5982,7 +5982,8 @@ impl Engine {
                 self.storage
                     .commit_rewritten_row(table, rowid, txn.txid, commit_lsn)?;
             } else {
-                self.storage.commit_row(table, rowid, txn.txid, commit_lsn)?;
+                self.storage
+                    .commit_row(table, rowid, txn.txid, commit_lsn)?;
             }
         }
         for undo in txn.ddl() {

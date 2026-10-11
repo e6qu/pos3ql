@@ -231,10 +231,18 @@ impl ValueIndexPool {
     }
 
     pub fn new(budget: &mut Budget, capacity: usize, rows: usize) -> Result<Self, BudgetError> {
-        budget.draw_array(capacity, size_of::<std::sync::RwLock<ValueIndex>>(), "value_index_pool")?;
+        budget.draw_array(
+            capacity,
+            size_of::<std::sync::RwLock<ValueIndex>>(),
+            "value_index_pool",
+        )?;
         let mut indexes = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            indexes.push(std::sync::RwLock::new(ValueIndex::new(budget, "value_index", rows)?));
+            indexes.push(std::sync::RwLock::new(ValueIndex::new(
+                budget,
+                "value_index",
+                rows,
+            )?));
         }
         let mut free = super::fixed_vec::FixedVec::new(budget, "value_index_free", capacity)?;
         for slot in (0..capacity as u32).rev() {
@@ -250,22 +258,32 @@ impl ValueIndexPool {
     /// exhausted (the caller raises a loud error).
     pub fn acquire(&mut self) -> Option<u32> {
         let slot = self.free.pop()?;
-        self.indexes[slot as usize].get_mut().expect("value index lock poisoned").clear();
+        self.indexes[slot as usize]
+            .get_mut()
+            .expect("value index lock poisoned")
+            .clear();
         Some(slot)
     }
 
     /// Returns a slot to the pool, clearing its index.
     pub fn release(&mut self, slot: u32) {
-        self.indexes[slot as usize].get_mut().expect("value index lock poisoned").clear();
+        self.indexes[slot as usize]
+            .get_mut()
+            .expect("value index lock poisoned")
+            .clear();
         self.free.push(slot).expect("free list sized to capacity");
     }
 
-    pub fn get(&self, slot: u32) -> std::sync::RwLockReadGuard<'_ , ValueIndex> {
-        self.indexes[slot as usize].read().expect("value index lock poisoned")
+    pub fn get(&self, slot: u32) -> std::sync::RwLockReadGuard<'_, ValueIndex> {
+        self.indexes[slot as usize]
+            .read()
+            .expect("value index lock poisoned")
     }
 
-    pub fn get_mut(&self, slot: u32) -> std::sync::RwLockWriteGuard<'_ , ValueIndex> {
-        self.indexes[slot as usize].write().expect("value index lock poisoned")
+    pub fn get_mut(&self, slot: u32) -> std::sync::RwLockWriteGuard<'_, ValueIndex> {
+        self.indexes[slot as usize]
+            .write()
+            .expect("value index lock poisoned")
     }
 }
 

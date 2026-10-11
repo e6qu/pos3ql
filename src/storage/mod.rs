@@ -31877,8 +31877,7 @@ impl Storage {
                 enforcer.durable_dirty_lsn = commit_lsn;
             }
         } else {
-            let pool = self
-                .value_indexes;
+            let pool = &self.value_indexes;
             for (binding, enforcer) in publication.enforcers[..table.n_enforcers]
                 .iter_mut()
                 .enumerate()

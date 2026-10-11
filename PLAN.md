@@ -45,8 +45,10 @@ contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime
 - Extend owned SST roots, captured schemas, and read-pool retention to query
   readers and concurrent table retirement. Resumable checkpoint sources retain
   immutable roots; jobs restart when their committed input changes. Historical
-  version homes follow full rewrites and adjacent-generation merges; query
-  retirement still needs ownership beyond a borrowed Storage lifetime.
+  version homes follow root position changes, and byte scans select older
+  versions within merged members. Query retirement needs ownership beyond a
+  borrowed Storage lifetime; historical full rewrites need a complete object
+  version source rather than the current logical row scan.
 - Complete table lifecycle, statistics, and engine publication ownership. Shared
   committed row publication and snapshot pruning use guarded table revisions,
   version/row metadata, and snapshot-aware value caches; transaction-wide durable

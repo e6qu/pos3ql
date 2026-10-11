@@ -8975,7 +8975,9 @@ impl Engine {
     pub fn checkpoint_work_pending(&self) -> bool {
         self.post_publish_cleanup.is_some()
             || self.ckpt.as_ref().is_some_and(|c| {
-                c.sweep_active() || c.maintenance_pending(&self.storage) || c.merge_work_pending(&self.storage)
+                c.sweep_active()
+                    || c.maintenance_pending(&self.storage)
+                    || c.merge_work_pending(&self.storage)
             })
     }
 

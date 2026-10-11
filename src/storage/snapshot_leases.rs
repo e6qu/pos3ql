@@ -225,39 +225,68 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let (storage, table) = fixture();
-        let reader = crate::mem::guard::forbid_alloc(|| storage.retain_statement_snapshot(99, |lsn| lsn).unwrap());
+        let reader = crate::mem::guard::forbid_alloc(|| {
+            storage.retain_statement_snapshot(99, |lsn| lsn).unwrap()
+        });
         let image = crate::mem::guard::forbid_alloc(|| {
             let state = storage.resident_row_state(table, 1).unwrap();
-            storage.visible_row_home_at(table, 1, state, 99, crate::storage::SNAPSHOT_ALL, reader.snapshot()).unwrap().unwrap()
+            storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    state,
+                    99,
+                    crate::storage::SNAPSHOT_ALL,
+                    reader.snapshot(),
+                )
+                .unwrap()
+                .unwrap()
         });
         let completed = AtomicBool::new(false);
         let mut progressed = false;
         std::thread::scope(|scope| {
             let storage = &storage;
             let completed = &completed;
-            let writer = scope.spawn(move || crate::mem::guard::forbid_alloc(|| {
-                let location = storage.heap.append_row(&[Datum::Int4(20)]).unwrap();
-                storage.write_pending(table, 1, 8, 1, Some(location)).unwrap();
-                storage.commit_row(table, 1, 8, 9).unwrap();
-                completed.store(true, Ordering::Release);
-            }));
+            let writer = scope.spawn(move || {
+                crate::mem::guard::forbid_alloc(|| {
+                    let location = storage.heap.append_row(&[Datum::Int4(20)]).unwrap();
+                    storage
+                        .write_pending(table, 1, 8, 1, Some(location))
+                        .unwrap();
+                    storage.commit_row(table, 1, 8, 9).unwrap();
+                    completed.store(true, Ordering::Release);
+                })
+            });
             crate::mem::guard::forbid_alloc(|| {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while !completed.load(Ordering::Acquire) && Instant::now() < deadline { std::thread::yield_now(); }
+                while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
                 progressed = completed.load(Ordering::Acquire);
-                storage.with_row_bytes(table, 1, image, |bytes| {
-                    let mut values = [Datum::Null];
-                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
-                    assert_eq!(values[0], Datum::Int4(1));
-                    Ok(())
-                }).unwrap();
+                storage
+                    .with_row_bytes(table, 1, image, |bytes| {
+                        let mut values = [Datum::Null];
+                        crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                        assert_eq!(values[0], Datum::Int4(1));
+                        Ok(())
+                    })
+                    .unwrap();
                 drop(reader);
             });
             writer.join().unwrap();
         });
-        assert!(progressed, "writer must finish before the statement lease and selected bytes release");
+        assert!(
+            progressed,
+            "writer must finish before the statement lease and selected bytes release"
+        );
         crate::mem::guard::forbid_alloc(|| storage.prune_released_statement_snapshots());
-        assert!(storage.resident_row_state(table, 1).unwrap().history.is_empty());
+        assert!(
+            storage
+                .resident_row_state(table, 1)
+                .unwrap()
+                .history
+                .is_empty()
+        );
     }
 
     #[test]

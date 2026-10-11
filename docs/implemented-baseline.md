@@ -20,7 +20,7 @@ do not qualify concurrent execution or representative deployments.
 |---|---|
 | Statement execution | Startup-bounded arenas, DML scratch, backend/database context, and FIFO dispatcher leases; COPY/subscription state has separately charged buffers |
 | Catalogs and metadata | Synchronized publication and owned reader images; guards release before nested resolution |
-| Table metadata | Database/creation/owner identity, typed CREATE/DROP existence, definitions, and pending heads share guarded ownership; version slots are guarded, retained images capture identity with the definition, and publication remains exclusive |
+| Table metadata | Database/creation/owner identity, typed CREATE/DROP existence, definitions, and pending heads share guarded ownership; version slots are guarded, retained images capture identity with the definition, and table lifecycle mutation remains exclusive |
 | Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
 | Resident rows | Shared pending publication and exact-head rollback preserve pinned readers and committed deletion markers. Metadata, uniqueness, optimized byte, and resumable value-index checkpoint walks release row ownership before consuming selected bytes; committed publication uses shared storage ownership; physical reclamation remains exclusive |
 | Heap bytes | Readers pin published immutable ranges; appends initialize disjoint tails and publish complete bytes without excluding existing readers; relocation remains exclusive |

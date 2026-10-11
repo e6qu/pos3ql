@@ -42,13 +42,13 @@ Allow readers to retain selected row images and immutable generations while
 unrelated writes and maintenance progress. Existing reader and pending-write
 contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime-ownership).
 
-- Extend owned SST roots, captured schemas, and read-pool retention to query
-  readers and concurrent table retirement. Resumable checkpoint sources retain
-  immutable roots; jobs restart when their committed input changes. Historical
-  version homes follow root position changes, and byte scans select older
-  versions within merged members. Query retirement needs ownership beyond a
-  borrowed Storage lifetime; historical full rewrites need a complete object
-  version source rather than the current logical row scan.
+- Complete query retirement across point reads and concurrent table lifecycle.
+  Query metadata/payload walks and resumable checkpoint sources retain immutable
+  roots, schemas, read boundaries, and reader buffers; query source ownership can
+  outlive Storage. Overlay/point-read ownership still needs a coherent table
+  incarnation transition. Historical version homes follow roster changes, and
+  merged byte scans select older versions. Historical full rewrites need a
+  complete object version source rather than the current logical row scan.
 - Complete table lifecycle, statistics, and engine publication ownership. Shared
   committed row publication and snapshot pruning use guarded table revisions,
   version/row metadata, and snapshot-aware value caches; transaction-wide durable

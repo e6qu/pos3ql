@@ -1,9 +1,9 @@
-name: Statement snapshot validation
+name: Query SST root validation
 on:
   push:
-    branches: [codex/statement-snapshot-retention]
+    branches: [codex/owned-query-sst-roots]
 concurrency:
-  group: statement-snapshot-${{ github.ref }}
+  group: query-sst-roots-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   validate:
@@ -22,10 +22,12 @@ jobs:
           git diff > "$RUNNER_TEMP/format.patch"
       - uses: actions/upload-artifact@v6
         with:
-          name: statement-snapshot-format
+          name: query-sst-roots-format
           path: ${{ runner.temp }}/format.patch
       - run: cargo check --all-targets --locked
       - run: cargo clippy --lib --bins --locked -- -D warnings
+      - run: cargo test --lib --locked query_sst_roots_ -- --test-threads=1
+      - run: cargo test --lib --locked retained_sst_ -- --test-threads=1
       - run: cargo test --lib --locked statement_snapshot_leases_ -- --test-threads=1
       - run: cargo test --lib --locked spill_walk_identity_exhaustion -- --test-threads=1
       - run: cargo test --lib --locked copy_from_ -- --test-threads=1

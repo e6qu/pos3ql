@@ -70312,7 +70312,11 @@ fn statement_snapshot_leases_cover_streaming_copy_completion_and_abort() {
             &mut engine,
             &mut budget,
             &mut transaction,
-            if binary { "COPY copy_snapshot_input FROM STDIN (FORMAT binary)" } else { "COPY copy_snapshot_input FROM STDIN" },
+            if binary {
+                "COPY copy_snapshot_input FROM STDIN (FORMAT binary)"
+            } else {
+                "COPY copy_snapshot_input FROM STDIN"
+            },
         );
         let setup = engine.take_pending_copy().expect("streaming COPY setup");
         let snapshot = engine.storage.commit_snapshot();
@@ -70335,7 +70339,8 @@ fn statement_snapshot_leases_cover_streaming_copy_completion_and_abort() {
                 &arena,
                 &[0, 1, 0, 0, 0, 4, 0, 0, 0, 7],
                 &mut transition,
-            ).unwrap();
+            )
+            .unwrap();
         } else {
             copy_line(
                 &mut engine,
@@ -70346,9 +70351,14 @@ fn statement_snapshot_leases_cover_streaming_copy_completion_and_abort() {
                 &arena,
                 b"7",
                 &mut transition,
-            ).unwrap();
+            )
+            .unwrap();
         }
-        assert_eq!(engine.storage.commit_snapshot(), snapshot, "another backend must not change COPY's boundary");
+        assert_eq!(
+            engine.storage.commit_snapshot(),
+            snapshot,
+            "another backend must not change COPY's boundary"
+        );
         if abort {
             engine.copy_abort(&mut transaction, &guc);
             drop(setup);
@@ -70360,8 +70370,12 @@ fn statement_snapshot_leases_cover_streaming_copy_completion_and_abort() {
                 &mut transaction,
                 &guc,
                 &mut transition,
-            ).unwrap();
-            assert!(!engine.storage.has_active_snapshots(), "CopyDone releases retention even while the setup remains alive");
+            )
+            .unwrap();
+            assert!(
+                !engine.storage.has_active_snapshots(),
+                "CopyDone releases retention even while the setup remains alive"
+            );
             drop(setup);
         }
         assert!(!engine.storage.has_active_snapshots());

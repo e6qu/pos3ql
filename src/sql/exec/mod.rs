@@ -50954,7 +50954,12 @@ impl CopySetup {
     }
 
     fn restore_snapshot(&self, storage: &Storage) {
-        let snapshot = self.snapshot_lease.lock().unwrap().as_ref().map(|lease| lease.snapshot());
+        let snapshot = self
+            .snapshot_lease
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|lease| lease.snapshot());
         if let Some(snapshot) = snapshot {
             storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
             storage.set_commit_snapshot(snapshot);

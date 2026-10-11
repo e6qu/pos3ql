@@ -14270,7 +14270,10 @@ impl SpillReader {
             .expect("spill walk identifier lock poisoned");
         let id = *next;
         *next = id.checked_add(1).ok_or_else(|| {
-            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "spill walk identity exhausted")
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "spill walk identity exhausted"
+            )
         })?;
         Ok(id)
     }
@@ -28741,99 +28744,105 @@ impl Storage {
         if self.tables[slot].n_spill_ssts == 0 {
             return Ok(());
         }
-        let roots = self.query_roots.retain(self, slot, self.commit_snapshot())?;
+        let roots = self
+            .query_roots
+            .retain(self, slot, self.commit_snapshot())?;
         roots.with_snapshot(|snapshot| {
-        let relation = snapshot.relation();
-        let n = relation.len();
-        let spill = snapshot.reader.as_ref().ok_or_else(|| {
-            sql_err!(sqlstate::INTERNAL_ERROR, "query SST roots have no reader owner")
-        })?;
-        let walk_id = spill.next_walk_id()?;
-        let Some(mut cursor_lease) = try_mutex_pool(&spill.cursor_contexts, "spill cursor") else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "row-state cursor nesting exceeds the statement-list boundary"
-            ));
-        };
-        cursor_lease.fill(MemberCursor::EMPTY);
-        let cursors: &mut [MemberCursor] = &mut cursor_lease;
-        {
-            let Some(mut context) = try_mutex_pool(&spill.scan_contexts, "spill scan context")
+            let relation = snapshot.relation();
+            let n = relation.len();
+            let spill = snapshot.reader.as_ref().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "query SST roots have no reader owner"
+                )
+            })?;
+            let walk_id = spill.next_walk_id()?;
+            let Some(mut cursor_lease) = try_mutex_pool(&spill.cursor_contexts, "spill cursor")
             else {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "row-state block context is already in use"
+                    "row-state cursor nesting exceeds the statement-list boundary"
                 ));
             };
-            context.owner = walk_id;
-            context.pax_values_owner = None;
-            for (member, cursor) in cursors[..n].iter_mut().enumerate() {
-                Self::cursor_advance(spill, &relation, member, cursor, &mut context)?;
-            }
-        }
-        loop {
-            let mut min: Option<u64> = None;
-            for cursor in cursors[..n].iter() {
-                if let Some((key, ..)) = cursor.head {
-                    min = Some(min.map_or(key.rowid, |rowid: u64| rowid.min(key.rowid)));
-                }
-            }
-            let Some(rowid) = min else { return Ok(()) };
-            let Some(mut context) = try_mutex_pool(&spill.scan_contexts, "spill scan context")
-            else {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "row-state block context is already in use"
-                ));
-            };
-            if context.owner != walk_id {
-                // A nested walk ran while this walk's row callback was active
-                // and reused the buffers. Parsed heads are owned values and
-                // remain valid; only buffer-residency claims are stale.
-                for cursor in &mut cursors[..n] {
-                    cursor.loaded = None;
-                    cursor.loaded_len = 0;
-                    cursor.loaded_type = None;
-                }
+            cursor_lease.fill(MemberCursor::EMPTY);
+            let cursors: &mut [MemberCursor] = &mut cursor_lease;
+            {
+                let Some(mut context) = try_mutex_pool(&spill.scan_contexts, "spill scan context")
+                else {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "row-state block context is already in use"
+                    ));
+                };
                 context.owner = walk_id;
                 context.pax_values_owner = None;
-            }
-            // Consume every version of this row from every member. The
-            // greatest commit LSN admitted by the statement snapshot wins;
-            // equal keys prefer the newer list member.
-            let mut verdict: Option<SpillVersion> = None;
-            for (member, cursor) in cursors[..n].iter_mut().enumerate() {
-                while let Some((key, tombstone, len)) = cursor.head
-                    && key.rowid == rowid
-                {
-                    if key.commit_lsn <= snapshot.commit_lsn
-                        && verdict.is_none_or(|current| {
-                            key.commit_lsn > current.commit_lsn
-                                || (key.commit_lsn == current.commit_lsn
-                                    && member as u32 > current.member)
-                        })
-                    {
-                        verdict = Some(SpillVersion {
-                            len: (!tombstone).then_some(len),
-                            member: member as u32,
-                            commit_lsn: key.commit_lsn,
-                        });
-                    }
+                for (member, cursor) in cursors[..n].iter_mut().enumerate() {
                     Self::cursor_advance(spill, &relation, member, cursor, &mut context)?;
                 }
             }
-            drop(context);
-            if let Some(SpillVersion {
-                len: Some(len),
-                member,
-                commit_lsn,
-            }) = verdict
-                && !overlay_rowids.contains(rowid)
-                && emit(rowid, len, member, commit_lsn)?.is_break()
-            {
-                return Ok(());
+            loop {
+                let mut min: Option<u64> = None;
+                for cursor in cursors[..n].iter() {
+                    if let Some((key, ..)) = cursor.head {
+                        min = Some(min.map_or(key.rowid, |rowid: u64| rowid.min(key.rowid)));
+                    }
+                }
+                let Some(rowid) = min else { return Ok(()) };
+                let Some(mut context) = try_mutex_pool(&spill.scan_contexts, "spill scan context")
+                else {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "row-state block context is already in use"
+                    ));
+                };
+                if context.owner != walk_id {
+                    // A nested walk ran while this walk's row callback was active
+                    // and reused the buffers. Parsed heads are owned values and
+                    // remain valid; only buffer-residency claims are stale.
+                    for cursor in &mut cursors[..n] {
+                        cursor.loaded = None;
+                        cursor.loaded_len = 0;
+                        cursor.loaded_type = None;
+                    }
+                    context.owner = walk_id;
+                    context.pax_values_owner = None;
+                }
+                // Consume every version of this row from every member. The
+                // greatest commit LSN admitted by the statement snapshot wins;
+                // equal keys prefer the newer list member.
+                let mut verdict: Option<SpillVersion> = None;
+                for (member, cursor) in cursors[..n].iter_mut().enumerate() {
+                    while let Some((key, tombstone, len)) = cursor.head
+                        && key.rowid == rowid
+                    {
+                        if key.commit_lsn <= snapshot.commit_lsn
+                            && verdict.is_none_or(|current| {
+                                key.commit_lsn > current.commit_lsn
+                                    || (key.commit_lsn == current.commit_lsn
+                                        && member as u32 > current.member)
+                            })
+                        {
+                            verdict = Some(SpillVersion {
+                                len: (!tombstone).then_some(len),
+                                member: member as u32,
+                                commit_lsn: key.commit_lsn,
+                            });
+                        }
+                        Self::cursor_advance(spill, &relation, member, cursor, &mut context)?;
+                    }
+                }
+                drop(context);
+                if let Some(SpillVersion {
+                    len: Some(len),
+                    member,
+                    commit_lsn,
+                }) = verdict
+                    && !overlay_rowids.contains(rowid)
+                    && emit(rowid, len, member, commit_lsn)?.is_break()
+                {
+                    return Ok(());
+                }
             }
-        }
         })
     }
 
@@ -28870,20 +28879,23 @@ impl Storage {
         roots.with_snapshot(|snapshot| {
             let relation = snapshot.relation();
             let spill = snapshot.reader.as_ref().ok_or_else(|| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "query SST roots have no reader owner")
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "query SST roots have no reader owner"
+                )
             })?;
             Self::walk_spill_bytes(
-            spill,
-            &relation,
-            snapshot.commit_lsn,
-            arena,
-            recycle_rows,
-            decoded_columns,
-            coalesce_packed,
-            overlay_mode,
-            resume,
-            emit,
-        )
+                spill,
+                &relation,
+                snapshot.commit_lsn,
+                arena,
+                recycle_rows,
+                decoded_columns,
+                coalesce_packed,
+                overlay_mode,
+                resume,
+                emit,
+            )
         })
     }
 

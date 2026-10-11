@@ -67333,7 +67333,7 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
     let setup = run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE retained_checkpoint(id integer PRIMARY KEY); INSERT INTO retained_checkpoint VALUES (1), (2)",
+        "CREATE TABLE retained_checkpoint(id integer PRIMARY KEY); INSERT INTO retained_checkpoint SELECT i FROM generate_series(1, 128) AS g(i)",
     );
     assert!(!message_types(&setup).contains(&b'E'));
     assert!(engine.checkpoint().unwrap());
@@ -67370,40 +67370,21 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
     engine.storage.evict_committed_table(slot);
     engine.storage.evict_redundant_entries(slot);
     assert!(engine.storage.spill_rows_are_unshadowed(slot));
-    while !engine
-        .storage
-        .for_each_value_binding_entry_batch(
-            slot,
-            0,
-            &mut cursor,
-            &arena,
-            &mut output,
-            1,
-            8,
-            &mut |entry| {
-                let mut values = [crate::sql::types::Datum::Null];
-                crate::storage::rowenc::decode(
-                    entry.key,
-                    &[crate::sql::types::ColType::Int4],
-                    &mut values,
-                )?;
-                assert_eq!(
-                    values[0],
-                    crate::sql::types::Datum::Int4(entry.rowid as i32)
-                );
-                seen.push(entry.rowid);
-                Ok(core::ops::ControlFlow::Continue(()))
-            },
-        )
-        .unwrap()
-    {
+    loop {
+        let before = engine.storage.block_io_stats();
+        let done = engine.storage.for_each_value_binding_entry_batch(slot, 0, &mut cursor, &arena, &mut output, 16, 8, &mut |entry| {
+            let mut values = [crate::sql::types::Datum::Null];
+            crate::storage::rowenc::decode(entry.key, &[crate::sql::types::ColType::Int4], &mut values)?;
+            assert_eq!(values[0], crate::sql::types::Datum::Int4(entry.rowid as i32));
+            seen.push(entry.rowid);
+            Ok(core::ops::ControlFlow::Continue(()))
+        }).unwrap();
+        let reads = engine.storage.block_io_stats().saturating_sub(before);
+        assert!(reads.object_gets <= 8, "eviction must preserve paced SST reads: {reads:?}");
         arena.reset();
+        if done { break; }
     }
-    assert_eq!(
-        seen,
-        [1, 2],
-        "eviction cannot duplicate the resident phase in the SST phase"
-    );
+    assert_eq!(seen, (1..=128).collect::<Vec<_>>(), "eviction cannot duplicate or skip checkpoint source rows");
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut recovered_budget = test_engine_budget(&config, 1 << 30);
@@ -67412,9 +67393,9 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
         data_rows(&run_with(
             &mut recovered,
             &mut recovered_budget,
-            "SELECT id FROM retained_checkpoint ORDER BY id"
+            "SELECT count(*), min(id), max(id) FROM retained_checkpoint"
         )),
-        ["1", "2"]
+        ["128|1|128"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

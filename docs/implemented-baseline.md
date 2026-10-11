@@ -34,9 +34,10 @@ wide joins without consuming a metadata slot for each edge. Both paths freeze
 one overlay partition through SST merging; outer joins track physical row
 identities across scan orders. Capacity exhaustion reports SQLSTATE 54000.
 
-Resumable value-index checkpoint sources charge one table_rows identity buffer
+Resumable value-index checkpoint sources charge one table_rows identity/coverage buffer
 at startup. Bucket movement and pending rollback do not move their logical
-resume position; reproducible eviction preserves their resident/SST partition.
+resume position; reproducible eviction routes unprocessed rows through the paced SST merge while
+preserving coverage for emitted resident rows.
 Selected committed images are pinned before releasing row metadata. Jobs still
 restart on table/generation changes. A statement scan's Storage borrow retains
 its table incarnation and immutable SST list; generation replacement and

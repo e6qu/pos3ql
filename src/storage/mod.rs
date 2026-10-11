@@ -13895,12 +13895,18 @@ struct MemberCursor {
     done: bool,
 }
 
+#[derive(Clone, Copy)]
+struct CheckpointRowIdentity {
+    rowid: u64,
+    suppress_spill: bool,
+}
+
 /// Logical position of one checkpoint value-index source walk. Block buffers
 /// remain in the shared scan context and are reloaded on a later beat; this
 /// state retains sorted row identities and immutable SST cursor positions.
 pub(crate) struct CheckpointValueCursor {
     resident_position: usize,
-    resident_rowids: Vec<u64>,
+    resident_rowids: Vec<CheckpointRowIdentity>,
     resident_initialized: bool,
     members: Box<[MemberCursor]>,
     /// Stable owner identity for shared scan buffers across checkpoint beats.
@@ -13914,7 +13920,7 @@ pub(crate) struct CheckpointValueCursor {
 impl CheckpointValueCursor {
     pub(crate) fn budget_bytes(max_spill_generations: usize, table_rows: usize) -> usize {
         max_spill_generations * core::mem::size_of::<MemberCursor>()
-            + table_rows * core::mem::size_of::<u64>()
+            + table_rows * core::mem::size_of::<CheckpointRowIdentity>()
     }
 
     pub(crate) fn new(max_spill_generations: usize, table_rows: usize) -> Self {
@@ -13972,7 +13978,7 @@ struct SpillVersion {
 enum SpillOverlayMode<'scan> {
     VisibleScan(&'scan RowScanIds<'scan>),
     /// The resident phase owns this frozen committed overlay partition.
-    CommittedCheckpoint(&'scan [u64]),
+    CommittedCheckpoint(&'scan [CheckpointRowIdentity]),
 }
 
 /// The reader's owned block buffers (index, data, physical column, chain
@@ -28858,7 +28864,8 @@ impl Storage {
                 && match overlay_mode {
                     SpillOverlayMode::VisibleScan(rowids) => !rowids.contains(rowid),
                     SpillOverlayMode::CommittedCheckpoint(rowids) => {
-                        rowids.binary_search(&rowid).is_err()
+                        rowids.binary_search_by_key(&rowid, |entry| entry.rowid)
+                            .map_or(true, |position| !rowids[position].suppress_spill)
                     }
                 } {
                 let cursor = &mut cursors[member as usize];
@@ -29566,10 +29573,10 @@ impl Storage {
                     cursor.resident_rowids.capacity()
                 ));
             }
-            cursor.resident_rowids.push(rowid);
+            cursor.resident_rowids.push(CheckpointRowIdentity { rowid, suppress_spill: false });
         }
         drop(rows);
-        cursor.resident_rowids.sort_unstable();
+        cursor.resident_rowids.sort_unstable_by_key(|entry| entry.rowid);
         cursor.resident_initialized = true;
         Ok(())
     }
@@ -29596,7 +29603,7 @@ impl Storage {
         self.retain_checkpoint_rowids(table_slot, cursor, true)?;
         let mut walked = 0usize;
         while cursor.resident_position < cursor.resident_rowids.len() && walked < max_rows {
-            let rowid = cursor.resident_rowids[cursor.resident_position];
+            let rowid = cursor.resident_rowids[cursor.resident_position].rowid;
             cursor.resident_position += 1;
             let Some(state) = self.resident_row_state(table_slot, rowid) else {
                 continue;
@@ -29678,15 +29685,18 @@ impl Storage {
         let mut walked = 0usize;
         if !cursor.resident_done {
             while cursor.resident_position < cursor.resident_rowids.len() && walked < max_rows {
-                let rowid = cursor.resident_rowids[cursor.resident_position];
+                let rowid = cursor.resident_rowids[cursor.resident_position].rowid;
                 cursor.resident_position += 1;
                 walked += 1;
-                // Resolve a captured heap row even if maintenance evicted its
-                // reproducible metadata between beats. Later pending versions
-                // do not change the selected committed image.
-                let Some(state) = self.row_state(table_slot, rowid)? else {
+                // Unprocessed evicted rows belong to the paced SST stream,
+                // avoiding one object-store point lookup per captured row.
+                let Some(state) = self.resident_row_state(table_slot, rowid) else {
                     continue;
                 };
+                if matches!(state.committed, Some(RowHome::Spilled { .. })) {
+                    continue;
+                }
+                cursor.resident_rowids[cursor.resident_position - 1].suppress_spill = true;
                 let committed_lsn = state.committed_lsn;
                 let Some(home) = self.committed_row_home(table_slot, state)? else {
                     continue;

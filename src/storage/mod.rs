@@ -20,7 +20,10 @@ mod row_reads;
 mod row_versions;
 mod row_walks;
 pub(crate) mod rowenc;
+mod snapshot_leases;
 mod spill_generations;
+pub(crate) use snapshot_leases::StatementSnapshotLease;
+use snapshot_leases::{StatementSnapshot, snapshot_owner_bytes, statement_snapshot_capacity};
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;
@@ -12987,6 +12990,9 @@ struct TransactionIdentityState {
 struct SnapshotState {
     active: FixedVec<(u32, u64)>,
     serializable: FixedVec<(u32, u32, u64, bool)>,
+    statements: FixedVec<StatementSnapshot>,
+    next_statement: u64,
+    statement_reclamation_pending: bool,
 }
 
 struct TemporaryTransactionState {
@@ -13603,14 +13609,14 @@ pub struct Storage {
     next_rowid: u64,
     /// Repeatable-read retention and serializable read tracking share one
     /// startup-bounded transaction snapshot state.
-    snapshots: std::sync::Mutex<SnapshotState>,
+    snapshots: std::sync::Arc<std::sync::Mutex<SnapshotState>>,
     /// Assigned top-level transaction identities visible to SQL snapshots.
     /// The registry includes prepared transactions and is startup-bounded by
     /// the same connection/prepared-transaction capacity as MVCC snapshots.
     transaction_identities: std::sync::Mutex<TransactionIdentityState>,
     /// Relation, row, and advisory locks share one wait graph and acquisition
     /// sequence. One boundary keeps cross-registry transitions atomic.
-    locks: std::sync::Mutex<LockState>,
+    locks: std::sync::Arc<std::sync::Mutex<LockState>>,
     /// Log sequence number of the latest write; becomes the WAL position.
     lsn: u64,
     /// ALTER TABLE replay is encoded as a compact identity/mapping marker
@@ -14256,14 +14262,16 @@ impl SpillReader {
             .unwrap_or_default()
     }
 
-    fn next_walk_id(&self) -> u64 {
+    fn next_walk_id(&self) -> Result<u64, SqlError> {
         let mut next = self
             .next_walk_id
             .lock()
             .expect("spill walk identifier lock poisoned");
         let id = *next;
-        *next = id.wrapping_add(1).max(1);
-        id
+        *next = id.checked_add(1).ok_or_else(|| {
+            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "spill walk identity exhausted")
+        })?;
+        Ok(id)
     }
 
     fn relation_blocks<'a>(&'a self, table: &Table) -> RelationBlockStore<'a> {
@@ -17351,6 +17359,8 @@ impl Storage {
 
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
+            + snapshot_owner_bytes()
+            + statement_snapshot_capacity(config) * size_of::<StatementSnapshot>()
             + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
             + 2 * config.collation_scratch_bytes
             + table_slot_capacity(config)
@@ -18161,6 +18171,12 @@ impl Storage {
         let index_arena = Arena::new(budget, "index expression evaluation", INDEX_ARENA_BYTES)?;
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
+        budget.draw(snapshot_owner_bytes(), "snapshot and lock owners")?;
+        let statement_snapshots = FixedVec::new(
+            budget,
+            "statement snapshots",
+            statement_snapshot_capacity(config),
+        )?;
         let active_snapshots = FixedVec::new(budget, "active_snapshots", transaction_capacity)?;
         let transaction_identities =
             FixedVec::new(budget, "transaction_identities", transaction_capacity)?;
@@ -18376,22 +18392,25 @@ impl Storage {
             }),
             comments: std::sync::Mutex::new(CommentCatalog { entries: comments }),
             catalog_sequence: CatalogSequence::new(0),
-            snapshots: std::sync::Mutex::new(SnapshotState {
+            snapshots: std::sync::Arc::new(std::sync::Mutex::new(SnapshotState {
                 active: active_snapshots,
                 serializable: serializable_snapshots,
-            }),
+                statements: statement_snapshots,
+                next_statement: 0,
+                statement_reclamation_pending: false,
+            })),
             transaction_identities: std::sync::Mutex::new(TransactionIdentityState {
                 active: transaction_identities,
                 recent: recent_transaction_statuses,
                 recent_cursor: 0,
                 latest: 0,
             }),
-            locks: std::sync::Mutex::new(LockState {
+            locks: std::sync::Arc::new(std::sync::Mutex::new(LockState {
                 table: table_locks,
                 row: row_locks,
                 advisory: advisory_locks,
                 sequence: 0,
-            }),
+            })),
             next_rowid: 1,
             lsn: 0,
             replay_table_rewrite: None,
@@ -28727,7 +28746,7 @@ impl Storage {
                 "table has spill SSTs but no spill reader is attached"
             ));
         };
-        let walk_id = spill.next_walk_id();
+        let walk_id = spill.next_walk_id()?;
         let Some(mut cursor_lease) = try_mutex_pool(&spill.cursor_contexts, "spill cursor") else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -28916,7 +28935,7 @@ impl Storage {
                 )
             };
         if *walk_id == 0 {
-            *walk_id = spill.next_walk_id();
+            *walk_id = spill.next_walk_id()?;
             cursors.fill(MemberCursor::EMPTY);
             *initialized = 0;
         }
@@ -31832,7 +31851,7 @@ impl Storage {
         };
 
         let snapshots = self.snapshot_state();
-        if rewritten && !snapshots.active.is_empty() {
+        if rewritten && snapshots.retains_for(txid) {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "table rewrite publication conflicts with an active snapshot"
@@ -31863,7 +31882,7 @@ impl Storage {
                 "pending row changed before committed publication"
             ));
         }
-        if !snapshots.active.is_empty() && (state.committed.is_some() || state.committed_lsn != 0) {
+        if snapshots.retains_for(txid) && (state.committed.is_some() || state.committed_lsn != 0) {
             let old = CommittedVersion {
                 home: state.committed,
                 lsn: state.committed_lsn,
@@ -47950,7 +47969,14 @@ impl Storage {
             return;
         };
         snapshots.active.swap_remove(index);
-        let oldest = snapshots.active.iter().map(|(_, snapshot)| *snapshot).min();
+        self.prune_snapshot_versions(snapshots.oldest());
+        drop(snapshots);
+        // Snapshot release can unblock schema waits without a held row lock.
+        let wait_owner = self.transaction_wait_owner(txid);
+        self.lock_state().row.resource_released(wait_owner);
+    }
+
+    fn prune_snapshot_versions(&self, oldest: Option<u64>) {
         let mut versions = self.row_versions.write();
         for table in self.tables.iter() {
             let mut rows = table.rows.write();
@@ -47986,23 +48012,22 @@ impl Storage {
                 }
             }
         }
-        drop(versions);
-        drop(snapshots);
-        // Snapshot release can unblock schema waits without a held row lock.
-        let wait_owner = self.transaction_wait_owner(txid);
-        self.lock_state().row.resource_released(wait_owner);
+    }
+
+    pub(crate) fn prune_released_statement_snapshots(&self) {
+        let mut snapshots = self.snapshot_state();
+        if !core::mem::take(&mut snapshots.statement_reclamation_pending) {
+            return;
+        }
+        self.prune_snapshot_versions(snapshots.oldest());
     }
 
     pub fn oldest_snapshot(&self) -> Option<u64> {
-        self.snapshot_state()
-            .active
-            .iter()
-            .map(|(_, snapshot)| *snapshot)
-            .min()
+        self.snapshot_state().oldest()
     }
 
     pub fn has_active_snapshots(&self) -> bool {
-        !self.snapshot_state().active.is_empty()
+        self.oldest_snapshot().is_some()
     }
 
     pub(crate) fn acquire_advisory_lock(
@@ -48699,6 +48724,13 @@ impl Storage {
             .active
             .iter()
             .map(|(owner, _)| *owner)
+            .chain(
+                snapshots
+                    .statements
+                    .iter()
+                    .filter(|statement| statement.lsn.is_some())
+                    .map(|statement| statement.transaction),
+            )
             .chain(locks.table.iter().map(|lock| lock.owner))
             .find(|owner| *owner != txid)
     }
@@ -57959,7 +57991,7 @@ mod tests {
                             .lock()
                             .expect("spill cursor lock poisoned")[0]
                             .ordinal += 1;
-                        let _ = spill.next_walk_id();
+                        spill.next_walk_id().unwrap();
                     }
                 });
             }
@@ -57994,6 +58026,21 @@ mod tests {
                 1_000
             );
         }
+    }
+
+    #[test]
+    fn spill_walk_identity_exhaustion_preserves_active_buffer_owners() {
+        let mut budget = Budget::new(SpillReader::budget_bytes(false, 1));
+        let spill = SpillReader::new(&mut budget, 1, None, None).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            *spill.next_walk_id.lock().unwrap() = u64::MAX - 1;
+            assert_eq!(spill.next_walk_id().unwrap(), u64::MAX - 1);
+            spill.scan_contexts[0].lock().unwrap().owner = 1;
+            let error = spill.next_walk_id().unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(*spill.next_walk_id.lock().unwrap(), u64::MAX);
+            assert_eq!(spill.scan_contexts[0].lock().unwrap().owner, 1);
+        });
     }
 
     #[test]

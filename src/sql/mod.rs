@@ -4922,7 +4922,8 @@ impl Engine {
         txn: &mut TxnState,
         takes_snapshot: bool,
         advance_command: bool,
-    ) -> Result<(), SqlError> {
+        retain_snapshot: bool,
+    ) -> Result<Option<crate::storage::StatementSnapshotLease>, SqlError> {
         self.storage.set_foreign_statement_context(
             txn.txid,
             txn.isolation == TransactionIsolation::Serializable,
@@ -4932,8 +4933,19 @@ impl Engine {
             txn.begin_command()?;
         }
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
+        let lease = if takes_snapshot && retain_snapshot {
+            Some(
+                self.storage
+                    .retain_statement_snapshot(txn.txid, |lsn| txn.statement_snapshot(lsn))?,
+            )
+        } else {
+            None
+        };
         let snapshot = if takes_snapshot {
-            let snapshot = txn.statement_snapshot(self.storage.lsn());
+            let snapshot = lease.as_ref().map_or_else(
+                || txn.statement_snapshot(self.storage.lsn()),
+                |lease| lease.snapshot(),
+            );
             if matches!(
                 txn.isolation,
                 TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
@@ -4948,7 +4960,7 @@ impl Engine {
             self.storage.lsn()
         };
         self.storage.set_commit_snapshot(snapshot);
-        Ok(())
+        Ok(lease)
     }
 
     pub fn commit_txn(&mut self, txn: &mut TxnState, guc: &GucState) -> Result<(), SqlError> {
@@ -5885,7 +5897,7 @@ impl Engine {
         // commit boundary are complete, so the statement retry can resume the
         // same transaction instead of observing cleared undo buffers.
         if prepared_slot.is_none() {
-            self.storage.release_snapshot(txn.txid);
+            self.storage.end_transaction_snapshots(txn.txid);
             self.storage.release_serializable(txn.txid);
             self.storage.release_table_locks(txn.txid);
             self.storage.release_row_locks(txn.txid);
@@ -6880,7 +6892,7 @@ impl Engine {
                     apply_wal_op(&mut self.storage, resolution_lsn, operation)
                 })
         } else if commit {
-            self.storage.release_snapshot(txn.txid);
+            self.storage.end_transaction_snapshots(txn.txid);
             self.storage.release_serializable(txn.txid);
             self.storage.release_table_locks(txn.txid);
             self.storage.release_row_locks(txn.txid);
@@ -7350,7 +7362,7 @@ impl Engine {
             return;
         }
         foreign::abort_session(&self.storage, txn.txid);
-        self.storage.release_snapshot(txn.txid);
+        self.storage.end_transaction_snapshots(txn.txid);
         self.storage.release_serializable(txn.txid);
         self.storage.release_table_locks(txn.txid);
         self.storage.release_row_locks(txn.txid);
@@ -8883,7 +8895,7 @@ impl Engine {
         inserted: &exec::DmlScratch,
     ) -> Result<(), SqlError> {
         self.work.reset();
-        Self::copy_finish_with_scratch(
+        let result = Self::copy_finish_with_scratch(
             &mut self.storage,
             &self.work,
             setup,
@@ -8892,7 +8904,9 @@ impl Engine {
             responder,
             &mut self.dml_scratch,
             inserted,
-        )?;
+        );
+        setup.release_snapshot();
+        result?;
         if txn.mode == TxnMode::Implicit {
             return self.commit_txn(txn, guc);
         }
@@ -9650,16 +9664,19 @@ impl Engine {
             responder.ready_for_query(txn.status_byte())?;
             return Ok(false);
         }
-        if let Err(error) = self.begin_command_snapshot(txn, true, true) {
-            if txn.is_explicit() {
-                txn.failed = true;
-            } else {
-                self.rollback_txn(txn, guc);
+        let _snapshot_lease = match self.begin_command_snapshot(txn, true, true, true) {
+            Ok(lease) => lease,
+            Err(error) => {
+                if txn.is_explicit() {
+                    txn.failed = true;
+                } else {
+                    self.rollback_txn(txn, guc);
+                }
+                responder.error(error.sqlstate, error.message.as_str())?;
+                responder.ready_for_query(txn.status_byte())?;
+                return Ok(false);
             }
-            responder.error(error.sqlstate, error.message.as_str())?;
-            responder.ready_for_query(txn.status_byte())?;
-            return Ok(false);
-        }
+        };
         let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
         let result = if arguments.iter().any(Datum::is_null) {
             Ok(Datum::Null)
@@ -14191,9 +14208,15 @@ impl Engine {
                 "statement is waiting for a schema lock"
             )));
         }
-        if let Err(error) = self.begin_command_snapshot(txn, true, true) {
-            return Ok(Err(error));
-        }
+        let _snapshot_lease = match self.begin_command_snapshot(
+            txn,
+            true,
+            true,
+            !matches!(statement, Stmt::Checkpoint | Stmt::Vacuum { .. }),
+        ) {
+            Ok(lease) => lease,
+            Err(error) => return Ok(Err(error)),
+        };
         let event_tag = event_trigger_tag(statement);
         if let Some(tag) = event_tag
             && let Err(error) = self.fire_event_triggers(
@@ -14505,13 +14528,15 @@ impl Engine {
                 | Stmt::Show(_)
                 | Stmt::ShowAll
         );
-        if let Err(error) = self.begin_command_snapshot(
+        let mut snapshot_lease = match self.begin_command_snapshot(
             txn,
             takes_snapshot,
             !matches!(statement, Stmt::Commit | Stmt::Rollback),
+            !matches!(statement, Stmt::Checkpoint | Stmt::Vacuum { .. }),
         ) {
-            return Ok(Err(error));
-        }
+            Ok(lease) => lease,
+            Err(error) => return Ok(Err(error)),
+        };
         if statement_writes(statement) {
             self.storage.assign_transaction_identity(txn.txid);
         }
@@ -16649,7 +16674,7 @@ impl Engine {
                         },
                     );
                 }
-                let setup = match exec::copy_begin(&self.storage, c, txn.txid) {
+                let mut setup = match exec::copy_begin(&self.storage, c, txn.txid) {
                     Ok(s) => s,
                     Err(e) => return Ok(Err(e)),
                 };
@@ -16688,6 +16713,7 @@ impl Engine {
                         return Ok(Err(error));
                     }
                     responder.copy_in_response(setup.n_targets, setup.fmt.binary)?;
+                    setup.retain_snapshot(snapshot_lease.take());
                     self.pending_copy = Some(setup);
                     Ok(Ok(()))
                 }

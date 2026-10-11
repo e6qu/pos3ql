@@ -70239,6 +70239,138 @@ fn checkpoint_live_block_capacity_exhausts_loudly() {
 }
 
 #[test]
+fn statement_snapshot_leases_release_after_sql_success_and_failure() {
+    let config = test_config("statement-snapshot-lifetime");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE statement_snapshots (id integer); INSERT INTO statement_snapshots VALUES (1)",
+    );
+    assert!(!engine.storage.has_active_snapshots());
+    run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            "SELECT id FROM statement_snapshots"
+        )),
+        ["1"]
+    );
+    assert!(
+        !engine.storage.has_active_snapshots(),
+        "read committed retention ends with each statement"
+    );
+    let failed = run_txn(&mut engine, &mut budget, &mut transaction, "SELECT 1 / 0");
+    assert!(failed.contains("22012"), "{failed}");
+    assert!(
+        !engine.storage.has_active_snapshots(),
+        "errors release statement retention"
+    );
+    run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SELECT id FROM statement_snapshots",
+    );
+    assert!(
+        engine.storage.has_active_snapshots(),
+        "transaction retention survives statement completion"
+    );
+    run_txn(&mut engine, &mut budget, &mut transaction, "COMMIT");
+    assert!(!engine.storage.has_active_snapshots());
+}
+
+#[test]
+fn statement_snapshot_leases_cover_streaming_copy_completion_and_abort() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    let mut writer = TxnState::new(&mut budget, 256).unwrap();
+    let mut transition = copy_transition_scratch(&mut budget);
+    let arena = Arena::new(&mut budget, "copy snapshot sql", 1 << 18).unwrap();
+    let guc = GucState::new();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE TABLE copy_snapshot_input (id integer); CREATE TABLE copy_snapshot_other (id integer); INSERT INTO copy_snapshot_other VALUES (1)",
+    );
+    for (abort, binary) in [(false, false), (false, true), (true, false)] {
+        run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            if binary { "COPY copy_snapshot_input FROM STDIN (FORMAT binary)" } else { "COPY copy_snapshot_input FROM STDIN" },
+        );
+        let setup = engine.take_pending_copy().expect("streaming COPY setup");
+        let snapshot = engine.storage.commit_snapshot();
+        assert_eq!(engine.storage.oldest_snapshot(), Some(snapshot));
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut writer,
+            "UPDATE copy_snapshot_other SET id = id + 1",
+        );
+        assert!(engine.storage.lsn() > snapshot);
+        assert_eq!(engine.storage.oldest_snapshot(), Some(snapshot));
+        if binary {
+            copy_binary_row(
+                &mut engine,
+                &mut budget,
+                &setup,
+                &mut transaction,
+                guc.seq_session(),
+                &arena,
+                &[0, 1, 0, 0, 0, 4, 0, 0, 0, 7],
+                &mut transition,
+            ).unwrap();
+        } else {
+            copy_line(
+                &mut engine,
+                &mut budget,
+                &setup,
+                &mut transaction,
+                guc.seq_session(),
+                &arena,
+                b"7",
+                &mut transition,
+            ).unwrap();
+        }
+        assert_eq!(engine.storage.commit_snapshot(), snapshot, "another backend must not change COPY's boundary");
+        if abort {
+            engine.copy_abort(&mut transaction, &guc);
+            drop(setup);
+        } else {
+            finish_copy(
+                &mut engine,
+                &mut budget,
+                &setup,
+                &mut transaction,
+                &guc,
+                &mut transition,
+            ).unwrap();
+            assert!(!engine.storage.has_active_snapshots(), "CopyDone releases retention even while the setup remains alive");
+            drop(setup);
+        }
+        assert!(!engine.storage.has_active_snapshots());
+        run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK");
+        transition.clear();
+    }
+}
+
+#[test]
 fn historical_sst_reads_survive_paced_roster_replacement_and_cold_recovery() {
     let mut config = test_config("historical-sst-retirement");
     config.object_store_on = true;

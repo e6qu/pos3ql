@@ -20,7 +20,7 @@ do not qualify concurrent execution or representative deployments.
 |---|---|
 | Statement execution | Startup-bounded arenas, DML scratch, backend/database context, and FIFO dispatcher leases; COPY/subscription state has separately charged buffers |
 | Catalogs and metadata | Synchronized publication and owned reader images; guards release before nested resolution |
-| Table metadata | Database/creation/owner identity, typed CREATE/DROP existence, definitions, and pending heads share guarded ownership; version slots are guarded, retained images capture identity with the definition, and publication remains exclusive |
+| Table metadata | Database/creation/owner identity, typed CREATE/DROP existence, definitions, and pending heads share guarded ownership; version slots are guarded, retained images capture identity with the definition, and table lifecycle mutation remains exclusive |
 | Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
 | Resident rows | Shared pending publication and exact-head rollback preserve pinned readers and committed deletion markers. Metadata, uniqueness, optimized byte, and resumable value-index checkpoint walks release row ownership before consuming selected bytes; committed publication uses shared storage ownership; physical reclamation remains exclusive |
 | Heap bytes | Readers pin published immutable ranges; appends initialize disjoint tails and publish complete bytes without excluding existing readers; relocation remains exclusive |
@@ -64,6 +64,19 @@ value caches use explicit guards. Publication acquires snapshot, table, version,
 row, then cache ownership. Cache probes retain bounded candidate identities and
 release cache ownership before callbacks; newer cache images cannot certify
 older snapshots. Transaction-wide durable publication remains an engine gate.
+
+Executing SQL and large-object fast-path statements retain owned snapshot leases.
+Capture and registration share publication ownership; nested scopes do not replace
+transaction snapshots. Each query workspace reserves 1,024 snapshot slots at
+startup, with checked identities and named SQLSTATE 54000 exhaustion. Lease release
+wakes schema waiters and schedules guarded version pruning. Transaction completion
+ends its retention even when a procedure's outer frame remains alive. Checkpoint
+and vacuum use their maintenance source ownership; buffered portals and SQL cursors
+finish their storage reads before suspension. Statement retention does not enable
+concurrent execution or heap relocation. COPY FROM retains its lease in the
+connection-owned setup through completion or abort and restores the captured
+snapshot for each data chunk; COPY TO finishes reads before returning. Spill walk
+identities fail with SQLSTATE 54000 before wraparound or active buffer reuse.
 
 Appends release byte ownership before publishing row metadata. Compaction
 preflights its relocation set before changing bytes or handles; readers reject

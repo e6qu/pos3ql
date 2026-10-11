@@ -1,0 +1,37 @@
+name: Shared publication validation
+on:
+  push:
+    branches: [codex/shared-committed-row-publication]
+concurrency:
+  group: shared-publication-validation
+  cancel-in-progress: true
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUST_MIN_STACK: 134217728
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format patch
+        run: |
+          cargo fmt --all
+          git diff > "$RUNNER_TEMP/format.patch"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: shared-publication-format
+          path: ${{ runner.temp }}/format.patch
+      - run: cargo check --all-targets --locked
+      - run: cargo clippy --lib --bins --locked -- -D warnings
+      - run: cargo test --lib --locked shared_committed_publication -- --test-threads=1 --nocapture
+      - run: cargo test --lib --locked retained_row_walk -- --test-threads=1 --nocapture
+      - run: cargo test --lib --locked retained_sst_ -- --test-threads=1 --nocapture
+      - run: cargo test --lib --locked checkpoint_retained_ -- --test-threads=1 --nocapture
+      - run: cargo test --lib --locked mem::value_index -- --test-threads=1 --nocapture
+      - run: python3 tools/check-docs.py
+      - run: bash tools/check-noops.sh
+      - run: bash tools/check-bugs.sh
+      - run: bash tools/check-object-store-boundary.sh

@@ -724,11 +724,11 @@ impl TemporarySpiller {
                     let definition = table.definition();
                     definition.persistence
                 } == crate::storage::RelationPersistence::Temporary
-                && table.dirty
+                && table.dirty()
         }) else {
             return Ok(None);
         };
-        let generation = storage.table(slot).generation;
+        let generation = storage.table(slot).generation();
         let delta = storage.table(slot).n_spill_ssts > 0
             && storage.table(slot).n_spill_ssts < storage.table(slot).spill_ssts.len();
 
@@ -1250,7 +1250,7 @@ impl Checkpointer {
             storage.table(slot).live()
                 && storage.table(slot).definition().persistence
                     != crate::storage::RelationPersistence::Temporary
-                && storage.table(slot).dirty
+                && storage.table(slot).dirty()
                 && self.merge_done[slot].is_none()
                 && self
                     .prev_ssts
@@ -1267,7 +1267,7 @@ impl Checkpointer {
             let Some(list) = self.prev_ssts.get(slot) else {
                 continue;
             };
-            if must_free_full_list && (!storage.table(slot).dirty || list.n != list.capacity()) {
+            if must_free_full_list && (!storage.table(slot).dirty() || list.n != list.capacity()) {
                 continue;
             }
             if self.merge_done[slot].is_some() {
@@ -7811,7 +7811,7 @@ impl Checkpointer {
             storage.table(slot).live()
                 && storage.table(slot).definition().persistence
                     != crate::storage::RelationPersistence::Temporary
-                && storage.table(slot).dirty
+                && storage.table(slot).dirty()
                 && self.merge_done[slot].is_none()
                 && self
                     .prev_ssts
@@ -7890,7 +7890,7 @@ impl Checkpointer {
             if !self.needs_slice(storage, slot) {
                 continue;
             }
-            let generation = storage.table(slot).generation;
+            let generation = storage.table(slot).generation();
             self.build_table_list(storage, sort_scratch, slot)?;
             self.sliced_generation[slot] = generation;
             self.sliced_lsn[slot] = storage.lsn();
@@ -8002,8 +8002,8 @@ impl Checkpointer {
                 let definition = table.definition();
                 definition.persistence
             } != crate::storage::RelationPersistence::Temporary
-            && table.dirty
-            && self.sliced_generation[slot] != table.generation
+            && table.dirty()
+            && self.sliced_generation[slot] != table.generation()
     }
 
     /// Assembles and publishes the manifest from the sweep's recorded
@@ -11428,13 +11428,13 @@ impl Checkpointer {
             staged_install_count += 1;
         }
         // A clean table carries its whole SST list forward untouched.
-        let clean = !storage.table(slot).dirty && self.slice_scratch.n > 0;
+        let clean = !storage.table(slot).dirty() && self.slice_scratch.n > 0;
         // A dirty table with spilled SSTs and room flushes a *delta* from the
         // committed row identities retained in the overlay since the last
         // checkpoint. Otherwise it rewrites fully. The overlay is already
         // startup-sized by `table_rows`, so there is no second row-id limit.
         let delta = !clean
-            && storage.table(slot).dirty
+            && storage.table(slot).dirty()
             && self.slice_scratch.n > 0
             && self.slice_scratch.n < self.slice_scratch.capacity();
         let changed_row_after_lsn = delta.then_some(if reuse_slice {
@@ -11809,7 +11809,7 @@ impl Checkpointer {
             self.value_schedule_job = Some(ValueScheduleJob {
                 slot,
                 table_created_at: storage.table(slot).created_at(),
-                table_generation: storage.table(slot).generation,
+                table_generation: storage.table(slot).generation(),
                 binding,
                 columns,
                 n_columns,
@@ -11854,7 +11854,7 @@ impl Checkpointer {
         if job.slot >= storage.physical_table_count()
             || !storage.table(job.slot).live()
             || storage.table(job.slot).created_at() != job.table_created_at
-            || storage.table(job.slot).generation != job.table_generation
+            || storage.table(job.slot).generation() != job.table_generation
             || job.binding >= storage.value_binding_count(job.slot)
             || !storage.value_binding_is_committed(job.slot, job.binding)
         {

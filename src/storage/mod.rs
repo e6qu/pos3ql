@@ -2509,6 +2509,12 @@ impl TableSerialState {
     }
 }
 
+struct TablePublication {
+    dirty: bool,
+    generation: u64,
+    enforcers: [Option<Enforcer>; MAX_VALUE_ENFORCERS],
+}
+
 pub struct Table {
     definition: TableDefinition,
     pub rows: RowMap,
@@ -2516,14 +2522,7 @@ pub struct Table {
     /// clears, but an aborted CREATE RULE must not publish it.
     pending_has_rules_txid: Option<u32>,
     /// Changed since the last checkpoint (drives delta checkpoints).
-    pub dirty: bool,
-    /// Bumped on every committed change ([`Table::mark_dirty`], the one
-    /// place `dirty` may be set). The sliced checkpoint compares it against
-    /// the generation it captured when it wrote the table's SSTs, so a
-    /// table that changed after its slice is re-sliced before the manifest
-    /// publishes — the bug class this kills is a snapshot quietly missing
-    /// writes that landed between beats.
-    pub generation: u64,
+    publication: std::sync::Mutex<TablePublication>,
     /// Planner statistics produced by ANALYZE. They are derived metadata:
     /// query correctness never depends on them, and the authoritative rows
     /// remain in immutable object-store generations.
@@ -2558,7 +2557,6 @@ pub struct Table {
     /// Value caches accelerating this table's uniqueness and equality probes,
     /// one per distinct constrained or named-index tuple, rebuilt whenever the
     /// definition/index set changes and maintained per committed row otherwise.
-    pub(crate) enforcers: [Option<Enforcer>; MAX_VALUE_ENFORCERS],
     pub(crate) n_enforcers: usize,
 }
 
@@ -3820,9 +3818,19 @@ impl Table {
     /// The one place `dirty` is set: every committed change advances the
     /// generation with it, so the sliced checkpoint can tell "dirty since
     /// the last publish" from "dirty since my slice of this sweep".
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
-        self.generation += 1;
+    fn publication(&self) -> std::sync::MutexGuard<'_, TablePublication> {
+        self.publication.lock().expect("table publication lock poisoned")
+    }
+
+    pub(crate) fn generation(&self) -> u64 { self.publication().generation }
+    pub(crate) fn dirty(&self) -> bool { self.publication().dirty }
+    fn enforcer(&self, binding: usize) -> Option<Enforcer> { self.publication().enforcer(binding) }
+    fn enforcers(&self) -> [Option<Enforcer>; MAX_VALUE_ENFORCERS] { self.publication().enforcers }
+
+    pub fn mark_dirty(&self) {
+        let mut publication = self.publication();
+        publication.generation = publication.generation.checked_add(1).expect("table publication generation exhausted");
+        publication.dirty = true;
     }
 
     /// Whether `txid` sees this table exist: its own pending CREATE/DROP,
@@ -17501,8 +17509,7 @@ impl Storage {
                         },
                     )?,
                     pending_has_rules_txid: None,
-                    dirty: false,
-                    generation: 1,
+                    publication: std::sync::Mutex::new(TablePublication { dirty: false, generation: 1, enforcers: [None; MAX_VALUE_ENFORCERS] }),
                     statistics: TableStatistics::EMPTY,
                     statistics_dirty: false,
                     statistics_wal_dirty: false,
@@ -17514,7 +17521,6 @@ impl Storage {
                     spill_through_lsn: vec![0; config.max_spill_generations_per_table]
                         .into_boxed_slice(),
                     n_spill_ssts: 0,
-                    enforcers: [None; MAX_VALUE_ENFORCERS],
                     n_enforcers: 0,
                 })
                 .expect("sized to max_tables");
@@ -29880,7 +29886,7 @@ impl Storage {
 
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = self.tables[table_slot].definition().schema(&mut schema);
-        let dependency_mask = self.tables[table_slot].enforcers[binding]
+        let dependency_mask = self.tables[table_slot].enforcer(binding)
             .expect("binding")
             .dependency_mask;
         // PAX source reads need only key, predicate, expression, and INCLUDE
@@ -30285,7 +30291,7 @@ impl Storage {
             .checked_div(rows)
             .unwrap_or(0)
             .min(u64::from(u32::MAX)) as u32;
-        statistics.analyzed_generation = self.tables[table_slot].generation;
+        statistics.analyzed_generation = self.tables[table_slot].generation();
         for column in 0..n_columns {
             if !selected[column] {
                 continue;
@@ -30876,10 +30882,11 @@ impl Storage {
     }
 
     pub(crate) fn clear_table_dirty_through(&mut self, slot: usize, generation: u64) {
-        if self.tables[slot].generation == generation {
-            let table = &mut self.tables[slot];
-            table.dirty = false;
-            for (_, state) in table.rows.iter_mut() {
+        let table = &mut self.tables[slot];
+        let mut publication = table.publication();
+        if publication.generation == generation {
+            publication.dirty = false;
+            for (_, state) in table.rows.write().iter_mut() {
                 state.checkpoint_change_lsn = 0;
             }
         }
@@ -31416,12 +31423,14 @@ impl Storage {
     /// Clears only table images captured by a published checkpoint.
     pub fn clear_dirty_through(&mut self, generations: &[u64]) {
         for (slot, t) in self.tables.iter_mut().enumerate() {
-            if generations.get(slot).copied() == Some(t.generation) {
-                t.dirty = false;
-                for (_, state) in t.rows.iter_mut() {
+            let mut publication = t.publication();
+            if generations.get(slot).copied() == Some(publication.generation) {
+                publication.dirty = false;
+                for (_, state) in t.rows.write().iter_mut() {
                     state.checkpoint_change_lsn = 0;
                 }
             }
+            drop(publication);
             t.statistics_dirty = false;
             t.statistics_wal_dirty = false;
         }
@@ -31627,7 +31636,7 @@ impl Storage {
                     let definition = table.definition();
                     definition.persistence
                 } == RelationPersistence::Temporary
-                && table.dirty
+                && table.dirty()
                 && table.rows.len() * 100 >= table.rows.capacity() * 50
         })
     }
@@ -31723,139 +31732,78 @@ impl Storage {
         Ok(())
     }
 
-    /// Promotes a row's pending change to committed. The WAL record must
-    /// already be durable.
-    pub fn commit_row(&mut self, table_index: usize, rowid: u64, txid: u32, commit_lsn: u64) {
-        // Read the transition without holding a mutable borrow.
-        let (old_committed, old_lsn, pending) = {
-            let Some(state) = self.tables[table_index].rows.get(&rowid) else {
-                return;
-            };
-            match pending_last(
-                &self.row_versions.read().pending_row_versions,
-                state.pending,
-            ) {
-                Some(p) if p.txid == txid => (state.committed, state.committed_lsn, p),
-                _ => return,
+    /// WAL durability precedes publication. Snapshot, table, version, row, and
+    /// cache ownership are acquired in that order after encoding the new keys.
+    pub fn commit_row(&self, table_index: usize, rowid: u64, txid: u32, commit_lsn: u64) -> Result<(), SqlError> {
+        self.commit_selected_row(table_index, rowid, txid, commit_lsn, false)
+    }
+
+    pub fn commit_rewritten_row(&self, table_index: usize, rowid: u64, txid: u32, commit_lsn: u64) -> Result<(), SqlError> {
+        self.commit_selected_row(table_index, rowid, txid, commit_lsn, true)
+    }
+
+    fn commit_selected_row(&self, table_index: usize, rowid: u64, txid: u32, commit_lsn: u64, rewritten: bool) -> Result<(), SqlError> {
+        let table = &self.tables[table_index];
+        let Some(selected) = self.resident_row_state(table_index, rowid) else { return Ok(()) };
+        let Some(pending) = selected.pending_last().filter(|pending| pending.txid == txid) else { return Ok(()) };
+        let head = selected.pending_head_identity().expect("selected pending head");
+        let image = pending.loc.map(|location| self.pin_visible_home(RowSnapshot {
+            created_at: table.created_at(), version: row_images::RowVersionIdentity::Pending(head),
+        }, RowHome::Heap(location))).transpose()?;
+        drop(selected);
+        let mut inserts = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
+        let count = if !rewritten {
+            match image { Some(image) => self.row_enforcer_hashes(table_index, rowid, image, &mut inserts)?, None => 0 }
+        } else { drop(image); 0 };
+
+        let snapshots = self.snapshot_state();
+        if rewritten && !snapshots.active.is_empty() {
+            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "table rewrite publication conflicts with an active snapshot"));
+        }
+        let mut publication = table.publication();
+        let generation = publication.generation.checked_add(1).ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "table publication generation exhausted"))?;
+        let mut versions = self.row_versions.write();
+        let mut rows = table.rows.write();
+        let state = rows.get_mut(&rowid).ok_or_else(|| sql_err!(sqlstate::SERIALIZATION_FAILURE, "pending row disappeared before committed publication"))?;
+        if state.pending.tail.is_none_or(|slot| versions.pending_row_versions[slot].identity != head) {
+            return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "pending row changed before committed publication"));
+        }
+        if !snapshots.active.is_empty() && (state.committed.is_some() || state.committed_lsn != 0) {
+            let old = CommittedVersion { home: state.committed, lsn: state.committed_lsn };
+            push_committed_version(&mut versions.committed_row_versions, &mut state.history, self.max_row_versions_per_row, old)?;
+        } else {
+            prune_committed_history(&mut versions.committed_row_versions, &mut state.history, None);
+        }
+        if rewritten {
+            for enforcer in publication.enforcers[..table.n_enforcers].iter_mut().flatten() {
+                enforcer.durable_dirty = true;
+                enforcer.durable_rebuild = true;
+                enforcer.durable_dirty_lsn = commit_lsn;
             }
-        };
-        let new_loc = pending.loc;
-        // Maintain the value indexes: drop the old committed value's key, add
-        // the new one. The row images are still readable (committed not yet
-        // repointed, new bytes already in the heap).
-        self.maintain_indexes_on_commit(table_index, rowid, new_loc);
-        let n_enforcers = self.tables[table_index].n_enforcers;
-        for enforcer in self.tables[table_index].enforcers[..n_enforcers]
-            .iter_mut()
-            .flatten()
-        {
-            if pending.changes_existence
-                || enforcer.dependency_mask.intersects(pending.changed_columns)
-            {
+        } else {
+            let pool = self.value_indexes.as_ref().expect("value index pool present");
+            for (binding, enforcer) in publication.enforcers[..table.n_enforcers].iter_mut().enumerate().filter_map(|(binding, enforcer)| enforcer.as_mut().map(|enforcer| (binding, enforcer))) {
+                if !pending.changes_existence && !enforcer.dependency_mask.intersects(pending.changed_columns) { continue; }
+                let mut index = pool.get_mut(enforcer.slot);
+                index.remove_rowid(rowid);
+                for &(_, hash) in inserts[..count].iter().filter(|&&(candidate, _)| candidate == binding) {
+                    if index.insert(hash, rowid).is_err() { index.mark_incomplete(); }
+                }
+                index.publish_at(commit_lsn);
                 enforcer.durable_dirty = true;
                 enforcer.durable_dirty_lsn = commit_lsn;
             }
         }
-
-        let retain_history = !self.snapshot_state().active.is_empty();
-        {
-            let row_versions = self.row_versions.exclusive();
-            let (tables, committed_versions, pending_versions) = (
-                &mut self.tables,
-                &mut row_versions.committed_row_versions,
-                &mut row_versions.pending_row_versions,
-            );
-            let state = tables[table_index]
-                .rows
-                .get_mut(&rowid)
-                .expect("row present after read");
-            if retain_history && (old_committed.is_some() || old_lsn != 0) {
-                push_committed_version(
-                    committed_versions,
-                    &mut state.history,
-                    self.max_row_versions_per_row,
-                    CommittedVersion {
-                        home: old_committed,
-                        lsn: old_lsn,
-                    },
-                )
-                .expect("write_pending reserved historical-version capacity");
-            } else if !retain_history {
-                prune_committed_history(committed_versions, &mut state.history, None);
-            }
-            state.committed = new_loc.map(RowHome::Heap);
-            state.committed_lsn = commit_lsn;
-            state.checkpoint_change_lsn = commit_lsn;
-            clear_pending_versions(pending_versions, &mut state.pending);
+        state.committed = pending.loc.map(RowHome::Heap);
+        state.committed_lsn = commit_lsn;
+        state.checkpoint_change_lsn = commit_lsn;
+        clear_pending_versions(&mut versions.pending_row_versions, &mut state.pending);
+        if state.committed.is_none() && table.n_spill_ssts == 0 && state.history.is_empty() {
+            rows.remove(&rowid);
         }
-        let table = &mut self.tables[table_index];
-        let state = table.rows.get(&rowid).expect("row present after commit");
-        if state.committed.is_none() {
-            // A rowid that ever reached an SST — even if its latest version was
-            // heap-resident — must tombstone, or a cold start resurrects the
-            // SST's version. And until that tombstone is *flushed*, the entry
-            // itself stays behind as a marker (`committed: None, pending:
-            // None`): the merged walk treats any entry as shadowing the spill
-            // list, so the marker is what keeps the deleted row invisible right
-            // now. `clear_tombstones` purges the markers once an install has
-            // made the SSTs themselves say deleted.
-            if table.n_spill_ssts == 0 && state.history.is_empty() {
-                table.rows.remove(&rowid);
-            }
-        }
-        table.mark_dirty();
-    }
-
-    /// Promotes a row rewritten under a pending table definition. Value
-    /// indexes are rebuilt once after every row and the definition are
-    /// promoted, because the old and new encodings cannot share an index
-    /// decoder.
-    pub fn commit_rewritten_row(
-        &mut self,
-        table_index: usize,
-        rowid: u64,
-        txid: u32,
-        commit_lsn: u64,
-    ) {
-        let new_loc = {
-            let Some(state) = self.tables[table_index].rows.get(&rowid) else {
-                return;
-            };
-            match pending_last(
-                &self.row_versions.read().pending_row_versions,
-                state.pending,
-            ) {
-                Some(pending) if pending.txid == txid => pending.loc,
-                _ => return,
-            }
-        };
-        {
-            let row_versions = self.row_versions.exclusive();
-            let (tables, committed_versions, pending_versions) = (
-                &mut self.tables,
-                &mut row_versions.committed_row_versions,
-                &mut row_versions.pending_row_versions,
-            );
-            let state = tables[table_index]
-                .rows
-                .get_mut(&rowid)
-                .expect("row present after read");
-            // Definition rewrites are rejected while a historical snapshot
-            // is active, so no old-schema row image can be retained here.
-            prune_committed_history(committed_versions, &mut state.history, None);
-            state.committed = new_loc.map(RowHome::Heap);
-            state.committed_lsn = commit_lsn;
-            state.checkpoint_change_lsn = commit_lsn;
-            clear_pending_versions(pending_versions, &mut state.pending);
-        }
-        let table = &mut self.tables[table_index];
-        let state = table.rows.get(&rowid).expect("row present after rewrite");
-        if state.committed.is_none() && table.n_spill_ssts == 0 {
-            table.rows.remove(&rowid);
-        }
-        self.mark_value_bindings_rebuild_at(table_index, commit_lsn);
-        let table = &mut self.tables[table_index];
-        table.mark_dirty();
+        publication.generation = generation;
+        publication.dirty = true;
+        Ok(())
     }
 
     /// Decodes the row at `home` and hashes every enforcer key whose values are
@@ -31967,7 +31915,7 @@ impl Storage {
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let table = &self.tables[table_index];
-        let enforcer = table.enforcers[binding].expect("binding");
+        let enforcer = table.enforcer(binding).expect("binding");
         let mut key = [Datum::Null; MAX_INDEX_COLS];
         let index;
         if let Some(created_at) = enforcer.index_created_at {
@@ -32023,55 +31971,6 @@ impl Storage {
         visit(Some(&key[..enforcer.n_cols]), values, &enforcer)
     }
 
-    /// The value-index maintenance for one committed row transition: remove the
-    /// old entry by row identity, then insert the new value's key. Removing by
-    /// identity keeps publication independent of object-store availability:
-    /// the old row may be object-resident, while the new encoded bytes are
-    /// already in the heap. Physical headroom guarantees the insert fits.
-    fn maintain_indexes_on_commit(
-        &mut self,
-        table_index: usize,
-        rowid: u64,
-        new_loc: Option<RowLoc>,
-    ) {
-        if self.tables[table_index].n_enforcers == 0 {
-            return;
-        }
-        let mut inserts = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
-        let n_inserts = match new_loc {
-            Some(loc) => self
-                .row_enforcer_hashes(table_index, rowid, RowHome::Heap(loc), &mut inserts)
-                .expect("new row decodes"),
-            None => 0,
-        };
-        let mut slots = [u32::MAX; MAX_VALUE_ENFORCERS];
-        for (i, s) in slots
-            .iter_mut()
-            .enumerate()
-            .take(self.tables[table_index].n_enforcers)
-        {
-            *s = self.tables[table_index].enforcers[i]
-                .expect("enforcer")
-                .slot;
-        }
-        let pool = self
-            .value_indexes
-            .as_mut()
-            .expect("value index pool present");
-        for &slot in &slots[..self.tables[table_index].n_enforcers] {
-            pool.get_mut(slot).remove_rowid(rowid);
-        }
-        for &(ei, hash) in &inserts[..n_inserts] {
-            let index = pool.get_mut(slots[ei]);
-            if index.insert(hash, rowid).is_err() {
-                // This structure is an acceleration cache, not durable state.
-                // Once it cannot represent the complete committed image, a
-                // negative probe must fall through to the authoritative rows.
-                index.mark_incomplete();
-            }
-        }
-    }
-
     /// Probes the value cache for the indexed tuple covering exactly `columns`,
     /// visiting every candidate rowid whose key hashes to `hash`. Durable and
     /// overlay candidates carry their encoded key; hash-only resident-cache
@@ -32087,7 +31986,7 @@ impl Storage {
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
         let Some(i) = (0..table.n_enforcers).find(|index| {
-            let enforcer = table.enforcers[*index].expect("enforcer present");
+            let enforcer = table.enforcer(*index).expect("enforcer present");
             enforcer.index_created_at.is_none() && enforcer.columns() == columns
         }) else {
             return Ok(false);
@@ -32104,26 +32003,19 @@ impl Storage {
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
         if i < table.n_enforcers {
-            let e = table.enforcers[i].expect("enforcer present");
+            let e = table.enforcer(i).expect("enforcer present");
             let index = self
                 .value_indexes
                 .as_ref()
                 .expect("value index pool present")
                 .get(e.slot);
-            if index.is_complete() {
-                let mut callback_error = None;
-                index.probe(hash, |rowid| {
-                    if callback_error.is_none()
-                        && let Err(error) = visit(rowid, None)
-                    {
-                        callback_error = Some(error);
-                    }
-                });
-                if let Some(error) = callback_error {
-                    return Err(error);
-                }
+            if index.is_complete_at(self.commit_snapshot()) {
+                let candidates = self.row_walks.retain_value_probe(&index, hash)?;
+                drop(index);
+                for rowid in candidates.iter() { visit(rowid, None)?; }
                 return Ok(true);
             }
+            drop(index);
             let Some(handle) = e.durable else {
                 return Ok(false);
             };
@@ -32205,7 +32097,7 @@ impl Storage {
     pub fn value_cache_complete(&self, table_index: usize, columns: &[u16]) -> bool {
         let table = &self.tables[table_index];
         (0..table.n_enforcers).any(|index| {
-            let enforcer = table.enforcers[index].expect("enforcer present");
+            let enforcer = table.enforcer(index).expect("enforcer present");
             enforcer.index_created_at.is_none()
                 && enforcer.columns() == columns
                 && self
@@ -32213,14 +32105,14 @@ impl Storage {
                     .as_ref()
                     .expect("value index pool present")
                     .get(enforcer.slot)
-                    .is_complete()
+                    .is_complete_at(self.commit_snapshot())
         })
     }
 
     pub fn value_probe_complete(&self, table_index: usize, columns: &[u16]) -> bool {
         let table = &self.tables[table_index];
         (0..table.n_enforcers).any(|index| {
-            let enforcer = table.enforcers[index].expect("enforcer present");
+            let enforcer = table.enforcer(index).expect("enforcer present");
             enforcer.index_created_at.is_none()
                 && enforcer.columns() == columns
                 && (self
@@ -32228,7 +32120,7 @@ impl Storage {
                     .as_ref()
                     .expect("value index pool present")
                     .get(enforcer.slot)
-                    .is_complete()
+                    .is_complete_at(self.commit_snapshot())
                     || enforcer
                         .durable
                         .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn))
@@ -32238,7 +32130,7 @@ impl Storage {
     pub fn value_durable_complete(&self, table_index: usize, columns: &[u16]) -> bool {
         let table = &self.tables[table_index];
         (0..table.n_enforcers).any(|index| {
-            let enforcer = table.enforcers[index].expect("enforcer present");
+            let enforcer = table.enforcer(index).expect("enforcer present");
             enforcer.index_created_at.is_none()
                 && enforcer.columns() == columns
                 && enforcer
@@ -32254,7 +32146,7 @@ impl Storage {
     ) -> Option<usize> {
         let table = &self.tables[table_index];
         (0..table.n_enforcers).find(|binding| {
-            table.enforcers[*binding]
+            table.enforcer(*binding)
                 .is_some_and(|enforcer| enforcer.index_created_at == Some(created_at))
         })
     }
@@ -32531,22 +32423,22 @@ impl Storage {
     }
 
     pub(crate) fn value_binding_cache_complete(&self, table_index: usize, binding: usize) -> bool {
-        self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
+        self.tables[table_index].enforcer(binding).is_some_and(|enforcer| {
             self.value_indexes
                 .as_ref()
                 .expect("value index pool present")
                 .get(enforcer.slot)
-                .is_complete()
+                .is_complete_at(self.commit_snapshot())
         })
     }
 
     pub(crate) fn value_binding_probe_complete(&self, table_index: usize, binding: usize) -> bool {
-        self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
+        self.tables[table_index].enforcer(binding).is_some_and(|enforcer| {
             self.value_indexes
                 .as_ref()
                 .expect("value index pool present")
                 .get(enforcer.slot)
-                .is_complete()
+                .is_complete_at(self.commit_snapshot())
                 || enforcer
                     .durable
                     .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn)
@@ -32561,7 +32453,7 @@ impl Storage {
         self.spill
             .as_ref()
             .is_some_and(|spill| spill.blocks.is_some())
-            && self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
+            && self.tables[table_index].enforcer(binding).is_some_and(|enforcer| {
                 enforcer
                     .durable
                     .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn)
@@ -32573,7 +32465,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> ([ColType; MAX_INDEX_COLS], usize) {
-        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
         (enforcer.key_types, enforcer.n_cols)
     }
 
@@ -32584,7 +32476,7 @@ impl Storage {
     ) -> Option<crate::store::NavigationSpec> {
         use crate::sql::types::{GinOperatorClass, GistOperatorClass, SpGistOperatorClass};
         use crate::store::{NavigationKind, NavigationSpec};
-        let enforcer = self.tables[table_index].enforcers[binding]?;
+        let enforcer = self.tables[table_index].enforcer(binding)?;
         let created_at = enforcer.index_created_at?;
         let index = self
             .index_catalog()
@@ -32668,7 +32560,7 @@ impl Storage {
                 "posting summaries require an encoded token"
             ));
         }
-        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
         if usize::from(navigation.position) >= enforcer.n_cols {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -32711,7 +32603,7 @@ impl Storage {
                     "posting token extraction requires a GIN binding"
                 )
             })?;
-        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
         let position = usize::from(navigation.position);
         let mut values = [Datum::Null; MAX_INDEX_COLS];
         rowenc::decode(
@@ -32728,7 +32620,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> ([Collation; MAX_INDEX_COLS], usize) {
-        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
         (enforcer.collations, enforcer.n_cols)
     }
 
@@ -32737,7 +32629,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> Option<u64> {
-        self.tables[table_index].enforcers[binding]
+        self.tables[table_index].enforcer(binding)
             .expect("binding")
             .index_created_at
     }
@@ -32752,7 +32644,7 @@ impl Storage {
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
         let Some((binding, handle)) = (0..table.n_enforcers).find_map(|binding| {
-            let enforcer = table.enforcers[binding].expect("enforcer");
+            let enforcer = table.enforcer(binding).expect("enforcer");
             (enforcer.index_created_at.is_none() && enforcer.columns() == columns)
                 .then_some((binding, enforcer.durable?))
         }) else {
@@ -32834,7 +32726,7 @@ impl Storage {
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
         let Some(binding) = (0..table.n_enforcers).find(|binding| {
-            let enforcer = table.enforcers[*binding].expect("enforcer");
+            let enforcer = table.enforcer(*binding).expect("enforcer");
             enforcer.index_created_at.is_none() && enforcer.columns() == columns
         }) else {
             return Ok(false);
@@ -32868,7 +32760,7 @@ impl Storage {
         mut visit: impl FnMut(u64, u64, &[u8], &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
-        let Some(handle) = table.enforcers[binding].and_then(|enforcer| enforcer.durable) else {
+        let Some(handle) = table.enforcer(binding).and_then(|enforcer| enforcer.durable) else {
             return Ok(false);
         };
         if self.commit_snapshot() < handle.published_lsn {
@@ -32965,7 +32857,7 @@ impl Storage {
         ) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
-        let Some(handle) = table.enforcers[binding].and_then(|enforcer| enforcer.durable) else {
+        let Some(handle) = table.enforcer(binding).and_then(|enforcer| enforcer.durable) else {
             return Ok(false);
         };
         if self.commit_snapshot() < handle.published_lsn {
@@ -33127,7 +33019,7 @@ impl Storage {
         else {
             return Ok(false);
         };
-        let Some(handle) = table.enforcers[binding].and_then(|enforcer| enforcer.durable) else {
+        let Some(handle) = table.enforcer(binding).and_then(|enforcer| enforcer.durable) else {
             return Ok(false);
         };
         if self.commit_snapshot() < handle.published_lsn {
@@ -33258,7 +33150,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> ([u16; MAX_INDEX_COLS], usize) {
-        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
         (enforcer.columns, enforcer.n_cols)
     }
 
@@ -33267,7 +33159,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> ColumnSet {
-        self.tables[table_index].enforcers[binding]
+        self.tables[table_index].enforcer(binding)
             .expect("binding")
             .include_mask
     }
@@ -33277,13 +33169,13 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> Option<crate::store::ValueIndexHandle> {
-        self.tables[table_index].enforcers[binding]
+        self.tables[table_index].enforcer(binding)
             .expect("binding")
             .durable
     }
 
     pub(crate) fn value_binding_needs_publish(&self, table_index: usize, binding: usize) -> bool {
-        self.tables[table_index].enforcers[binding]
+        self.tables[table_index].enforcer(binding)
             .expect("binding")
             .durable_dirty
     }
@@ -33293,7 +33185,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> Option<u64> {
-        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
         enforcer.durable_dirty.then_some(enforcer.durable_dirty_lsn)
     }
 
@@ -33302,7 +33194,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> bool {
-        self.tables[table_index].enforcers[binding]
+        self.tables[table_index].enforcer(binding)
             .expect("binding")
             .durable_rebuild
     }
@@ -33317,7 +33209,7 @@ impl Storage {
 
     pub(crate) fn mark_value_bindings_changed_at(&mut self, table_index: usize, dirty_lsn: u64) {
         let n_enforcers = self.tables[table_index].n_enforcers;
-        for enforcer in self.tables[table_index].enforcers[..n_enforcers]
+        for enforcer in self.tables[table_index].publication().enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
         {
@@ -33329,7 +33221,7 @@ impl Storage {
     fn mark_value_bindings_rebuild_at(&mut self, table_index: usize, dirty_lsn: u64) {
         self.mark_value_bindings_changed_at(table_index, dirty_lsn);
         let n_enforcers = self.tables[table_index].n_enforcers;
-        for enforcer in self.tables[table_index].enforcers[..n_enforcers]
+        for enforcer in self.tables[table_index].publication().enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
         {
@@ -33338,7 +33230,7 @@ impl Storage {
     }
 
     pub(crate) fn value_binding_is_committed(&self, table_index: usize, binding: usize) -> bool {
-        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
         if let Some(created_at) = enforcer.index_created_at {
             let table = &self.tables[table_index];
             return self.index_catalog().iter().any(|index| {
@@ -33395,7 +33287,8 @@ impl Storage {
         handle: Option<crate::store::ValueIndexHandle>,
     ) -> Result<(), SqlError> {
         let n_enforcers = self.tables[table_index].n_enforcers;
-        let Some(enforcer) = self.tables[table_index].enforcers[..n_enforcers]
+        let mut publication = self.tables[table_index].publication();
+        let Some(enforcer) = publication.enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
             .find(|enforcer| {
@@ -33519,7 +33412,7 @@ impl Storage {
         left: &[u8],
         right: &[u8],
     ) -> Result<core::cmp::Ordering, SqlError> {
-        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
         if navigation
             .is_some_and(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
         {
@@ -33646,7 +33539,7 @@ impl Storage {
         }
         let mut slots = [u32::MAX; MAX_VALUE_ENFORCERS];
         for (i, s) in slots.iter_mut().enumerate().take(n) {
-            if let Some(e) = self.tables[table_index].enforcers[i] {
+            if let Some(e) = self.tables[table_index].enforcer(i) {
                 *s = e.slot;
             }
         }
@@ -33657,7 +33550,7 @@ impl Storage {
                 }
             }
         }
-        self.tables[table_index].enforcers = [None; MAX_VALUE_ENFORCERS];
+        self.tables[table_index].publication().enforcers = [None; MAX_VALUE_ENFORCERS];
         self.tables[table_index].n_enforcers = 0;
     }
 
@@ -33705,7 +33598,7 @@ impl Storage {
         let mut published = [None; MAX_VALUE_ENFORCERS];
         let n_published = self.tables[table_index].n_enforcers;
         for (index, entry) in published.iter_mut().enumerate().take(n_published) {
-            let enforcer = self.tables[table_index].enforcers[index].expect("enforcer");
+            let enforcer = self.tables[table_index].enforcer(index).expect("enforcer");
             *entry = Some(enforcer);
         }
         self.release_enforcers(table_index);
@@ -33934,7 +33827,7 @@ impl Storage {
                         && enforcer.columns[..enforcer.n_cols] == wanted.columns[..wanted.n_columns]
                 })
                 .copied();
-            self.tables[table_index].enforcers[w] = Some(Enforcer {
+            self.tables[table_index].publication().enforcers[w] = Some(Enforcer {
                 slot,
                 columns: wanted.columns,
                 n_cols: wanted.n_columns,
@@ -33977,15 +33870,16 @@ impl Storage {
         let n_enf = self.tables[table_index].n_enforcers;
         let mut slots = [u32::MAX; MAX_VALUE_ENFORCERS];
         for (i, s) in slots.iter_mut().enumerate().take(n_enf) {
-            *s = self.tables[table_index].enforcers[i]
+            *s = self.tables[table_index].enforcer(i)
                 .expect("enforcer")
                 .slot;
         }
         let mut incomplete = false;
         let mut buf = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
-        let mut insert_hashes = |rowid: u64, hashes: &[(usize, u64)]| {
+        let mut insert_hashes = |rowid: u64, lsn: u64, hashes: &[(usize, u64)]| {
             for &(binding, hash) in hashes {
-                let index = pool.get_mut(slots[binding]);
+                let mut index = pool.get_mut(slots[binding]);
+                index.publish_at(lsn);
                 if index.insert(hash, rowid).is_err() {
                     incomplete = true;
                     return core::ops::ControlFlow::Break(());
@@ -33995,16 +33889,17 @@ impl Storage {
         };
         let scan = self.row_scan(table_index)?;
         let overlay = scan.for_each_overlay(&mut |rowid, state| {
+            let lsn = state.committed_lsn;
             let Some(home) = self.committed_row_home(table_index, state)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
             let count = self.row_enforcer_hashes(table_index, rowid, home, &mut buf)?;
-            Ok(insert_hashes(rowid, &buf[..count]))
+            Ok(insert_hashes(rowid, lsn, &buf[..count]))
         })?;
         if overlay.is_continue() {
             let mut schema = [ColType::Bool; MAX_COLUMNS];
             let n_columns = self.tables[table_index].definition().schema(&mut schema);
-            let dependency_mask = self.tables[table_index].enforcers[..n_enf]
+            let dependency_mask = self.tables[table_index].enforcers()[..n_enf]
                 .iter()
                 .flatten()
                 .fold(ColumnSet::EMPTY, |mask, enforcer| {
@@ -34026,7 +33921,7 @@ impl Storage {
                 demanded_count.saturating_mul(2) >= n_columns,
                 SpillOverlayMode::VisibleScan(&scan.rowids),
                 None,
-                &mut |rowid, _commit_lsn, representation| {
+                &mut |rowid, commit_lsn, representation| {
                     let mark = arena.mark();
                     let mut decoded = [Datum::Null; MAX_COLUMNS];
                     let values = match representation {
@@ -34041,7 +33936,7 @@ impl Storage {
                     // binding ordinals from expression evaluation.
                     unsafe { arena.rewind_to(mark) };
                     let count = hashes?;
-                    Ok(insert_hashes(rowid, &buf[..count]))
+                    Ok(insert_hashes(rowid, commit_lsn, &buf[..count]))
                 },
             )?;
         }
@@ -47890,7 +47785,7 @@ impl Storage {
             }))
     }
 
-    pub fn register_snapshot(&mut self, txid: u32, snapshot: u64) -> Result<(), SqlError> {
+    pub fn register_snapshot(&self, txid: u32, snapshot: u64) -> Result<(), SqlError> {
         let mut snapshots = self.snapshot_state();
         if let Some((_, existing)) = snapshots
             .active
@@ -47910,59 +47805,38 @@ impl Storage {
         })
     }
 
-    pub fn release_snapshot(&mut self, txid: u32) {
-        let oldest = {
-            let mut snapshots = self.snapshot_state();
-            let Some(index) = snapshots
-                .active
-                .iter()
-                .position(|(owner, _)| *owner == txid)
-            else {
-                return;
-            };
-            snapshots.active.swap_remove(index);
-            snapshots.active.iter().map(|(_, snapshot)| *snapshot).min()
-        };
-        // Schema waits can be blocked by a historical snapshot even when the
-        // reader holds no row lock. Wake the shared wait graph when it ends.
-        let wait_owner = self.transaction_wait_owner(txid);
-        self.lock_state().row.resource_released(wait_owner);
-        let row_versions = self.row_versions.exclusive();
-        let (tables, versions) = (&mut self.tables, &mut row_versions.committed_row_versions);
-        for table in tables.iter_mut() {
-            for (_, state) in table.rows.iter_mut() {
-                prune_committed_history(versions, &mut state.history, oldest);
+    pub fn release_snapshot(&self, txid: u32) {
+        let mut snapshots = self.snapshot_state();
+        let Some(index) = snapshots.active.iter().position(|(owner, _)| *owner == txid) else { return };
+        snapshots.active.swap_remove(index);
+        let oldest = snapshots.active.iter().map(|(_, snapshot)| *snapshot).min();
+        let mut versions = self.row_versions.write();
+        for table in self.tables.iter() {
+            let mut rows = table.rows.write();
+            for (_, state) in rows.iter_mut() {
+                prune_committed_history(&mut versions.committed_row_versions, &mut state.history, oldest);
             }
-        }
-        if oldest.is_none() {
-            for table in self.tables.iter_mut() {
-                if table.n_spill_ssts != 0 {
-                    continue;
-                }
+            if oldest.is_none() && table.n_spill_ssts == 0 {
                 loop {
                     let mut batch = [0u64; 512];
-                    let mut count = 0usize;
-                    for (rowid, state) in table.rows.iter() {
-                        if state.committed.is_none()
-                            && state.history.is_empty()
-                            && state.pending.is_none()
-                        {
-                            batch[count] = rowid;
+                    let mut count = 0;
+                    for (rowid, state) in rows.iter() {
+                        if state.committed.is_none() && state.history.is_empty() && state.pending.is_none() {
+                            batch[count] = *rowid;
                             count += 1;
-                            if count == batch.len() {
-                                break;
-                            }
+                            if count == batch.len() { break; }
                         }
                     }
-                    if count == 0 {
-                        break;
-                    }
-                    for &rowid in &batch[..count] {
-                        table.rows.remove(&rowid);
-                    }
+                    if count == 0 { break; }
+                    for rowid in &batch[..count] { rows.remove(rowid); }
                 }
             }
         }
+        drop(versions);
+        drop(snapshots);
+        // Snapshot release can unblock schema waits without a held row lock.
+        let wait_owner = self.transaction_wait_owner(txid);
+        self.lock_state().row.resource_released(wait_owner);
     }
 
     pub fn oldest_snapshot(&self) -> Option<u64> {
@@ -48638,7 +48512,7 @@ impl Storage {
 
     pub(crate) fn validate_serializable(&self, txid: u32) -> Result<(), SqlError> {
         for &(owner, table, generation, read) in self.snapshot_state().serializable.iter() {
-            if owner == txid && read && self.tables[table as usize].generation != generation {
+            if owner == txid && read && self.tables[table as usize].generation() != generation {
                 return Err(sql_err!(
                     sqlstate::SERIALIZATION_FAILURE,
                     "could not serialize access due to read/write dependencies among transactions"
@@ -53665,7 +53539,7 @@ mod tests {
                 assert!(rejected.ownership().pending.is_none());
                 assert_eq!(rejected.existence(), CatalogDdlState::Absent);
                 assert_eq!(rejected.n_enforcers, 0);
-                assert!(rejected.enforcers.iter().all(Option::is_none));
+                assert!(rejected.enforcers().iter().all(Option::is_none));
                 assert_eq!(storage.tables[retained_slot].n_enforcers, 1);
                 let mut replacement = retained;
                 replacement.name = SqlName::parse("replacement").unwrap();
@@ -59517,13 +59391,13 @@ mod tests {
                 &[("id", ColType::Int4, true)],
             ))
             .unwrap();
-        let captured = storage.table(slot).generation;
+        let captured = storage.table(slot).generation();
         let _ = storage.tables[slot]
             .rows
             .insert(1, RowState::committed_only_at(RowLoc::test(0, 4), 42));
         storage.table_mut(slot).mark_dirty();
         storage.clear_dirty_through(&[captured]);
-        assert!(storage.table(slot).dirty);
+        assert!(storage.table(slot).dirty());
         assert_eq!(
             storage.tables[slot]
                 .rows
@@ -59532,9 +59406,9 @@ mod tests {
                 .checkpoint_change_lsn,
             42
         );
-        let current = storage.table(slot).generation;
+        let current = storage.table(slot).generation();
         storage.clear_dirty_through(&[current]);
-        assert!(!storage.table(slot).dirty);
+        assert!(!storage.table(slot).dirty());
         assert_eq!(
             storage.tables[slot]
                 .rows

@@ -22,7 +22,7 @@ do not qualify concurrent execution or representative deployments.
 | Catalogs and metadata | Synchronized publication and owned reader images; guards release before nested resolution |
 | Table metadata | Database/creation/owner identity, typed CREATE/DROP existence, definitions, and pending heads share guarded ownership; version slots are guarded, retained images capture identity with the definition, and publication remains exclusive |
 | Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
-| Resident rows | Shared pending publication and exact-head rollback preserve pinned readers and committed deletion markers. Metadata, uniqueness, optimized byte, and resumable value-index checkpoint walks release row ownership before consuming selected bytes; committed publication and reclamation remain exclusive |
+| Resident rows | Shared pending publication and exact-head rollback preserve pinned readers and committed deletion markers. Metadata, uniqueness, optimized byte, and resumable value-index checkpoint walks release row ownership before consuming selected bytes; committed publication uses shared storage ownership; physical reclamation remains exclusive |
 | Heap bytes | Readers pin published immutable ranges; appends initialize disjoint tails and publish complete bytes without excluding existing readers; relocation remains exclusive |
 | Deferred rows | Logical row identity, table incarnation, and exact pending/committed version tokens; later reads reacquire the selected version rather than retaining heap locations |
 
@@ -50,6 +50,14 @@ Checkpoint jobs restart when committed input or table identity changes. Query
 scans still retain table incarnations through their Storage borrow; concurrent
 query retirement and generation publication remain open gates.
 
+Committed row publication prepares keys before metadata ownership and validates
+its selected pending head before changing state. Snapshot registration/pruning,
+table revisions and binding flags, row-version chains, row maps, and resident
+value caches use explicit guards. Publication acquires snapshot, table, version,
+row, then cache ownership. Cache probes retain bounded candidate identities and
+release cache ownership before callbacks; newer cache images cannot certify
+older snapshots. Transaction-wide durable publication remains an engine gate.
+
 Appends release byte ownership before publishing row metadata. Compaction
 preflights its relocation set before changing bytes or handles; readers reject
 reused table identities and stale heap locations. Heap locations and relocation
@@ -57,7 +65,7 @@ generations are cache metadata. Retained byte copies use the statement arena;
 deferred snapshots retain logical row identities and exact version tokens.
 
 The reactor still executes statements serially. Shared table lifecycle mutation
-and retirement, committed row publication, concurrent cache/object I/O and maintenance,
+and retirement, concurrent cache/object I/O and maintenance,
 engine publication, and fixed workers remain open gates. Existing snapshot
 retention must remain coherent across those boundaries. Immutable SST reads
 carry no resident version handles.

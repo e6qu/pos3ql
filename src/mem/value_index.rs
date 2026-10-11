@@ -26,6 +26,7 @@ pub struct ValueIndex {
     /// callers must then use the authoritative row store for a conclusive
     /// negative answer.
     complete: bool,
+    published_lsn: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +48,14 @@ impl fmt::Display for IndexFull {
 impl std::error::Error for IndexFull {}
 
 impl ValueIndex {
+    pub(crate) fn is_complete_at(&self, snapshot: u64) -> bool {
+        self.complete && self.published_lsn <= snapshot
+    }
+
+    pub(crate) fn publish_at(&mut self, lsn: u64) {
+        self.published_lsn = self.published_lsn.max(lsn);
+    }
+
     /// Bytes `new` will draw from the budget for a given capacity.
     pub fn budget_bytes(capacity: usize) -> usize {
         Self::slot_count(capacity) * size_of::<Option<(u64, u64)>>()
@@ -76,6 +85,7 @@ impl ValueIndex {
             len: 0,
             max_len: capacity,
             complete: true,
+            published_lsn: 0,
         })
     }
 
@@ -198,6 +208,7 @@ impl ValueIndex {
         self.slots.fill_with(|| None);
         self.len = 0;
         self.complete = true;
+        self.published_lsn = 0;
     }
 }
 
@@ -206,7 +217,7 @@ impl ValueIndex {
 /// new constraint at runtime allocates nothing — it just clears a spare and
 /// hands back its slot. Exhausting the pool is a loud error, never growth.
 pub struct ValueIndexPool {
-    indexes: Box<[ValueIndex]>,
+    indexes: Box<[std::sync::RwLock<ValueIndex>]>,
     free: super::fixed_vec::FixedVec<u32>,
 }
 
@@ -214,16 +225,16 @@ impl ValueIndexPool {
     /// Bytes `new` draws for `capacity` indexes each holding up to `rows`
     /// entries (the container, each index's slots, and the free list).
     pub fn budget_bytes(capacity: usize, rows: usize) -> usize {
-        capacity * size_of::<ValueIndex>()
+        capacity * size_of::<std::sync::RwLock<ValueIndex>>()
             + capacity * ValueIndex::budget_bytes(rows)
             + capacity * size_of::<u32>()
     }
 
     pub fn new(budget: &mut Budget, capacity: usize, rows: usize) -> Result<Self, BudgetError> {
-        budget.draw_array(capacity, size_of::<ValueIndex>(), "value_index_pool")?;
+        budget.draw_array(capacity, size_of::<std::sync::RwLock<ValueIndex>>(), "value_index_pool")?;
         let mut indexes = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            indexes.push(ValueIndex::new(budget, "value_index", rows)?);
+            indexes.push(std::sync::RwLock::new(ValueIndex::new(budget, "value_index", rows)?));
         }
         let mut free = super::fixed_vec::FixedVec::new(budget, "value_index_free", capacity)?;
         for slot in (0..capacity as u32).rev() {
@@ -239,22 +250,22 @@ impl ValueIndexPool {
     /// exhausted (the caller raises a loud error).
     pub fn acquire(&mut self) -> Option<u32> {
         let slot = self.free.pop()?;
-        self.indexes[slot as usize].clear();
+        self.indexes[slot as usize].get_mut().expect("value index lock poisoned").clear();
         Some(slot)
     }
 
     /// Returns a slot to the pool, clearing its index.
     pub fn release(&mut self, slot: u32) {
-        self.indexes[slot as usize].clear();
+        self.indexes[slot as usize].get_mut().expect("value index lock poisoned").clear();
         self.free.push(slot).expect("free list sized to capacity");
     }
 
-    pub fn get(&self, slot: u32) -> &ValueIndex {
-        &self.indexes[slot as usize]
+    pub fn get(&self, slot: u32) -> std::sync::RwLockReadGuard<'_ , ValueIndex> {
+        self.indexes[slot as usize].read().expect("value index lock poisoned")
     }
 
-    pub fn get_mut(&mut self, slot: u32) -> &mut ValueIndex {
-        &mut self.indexes[slot as usize]
+    pub fn get_mut(&self, slot: u32) -> std::sync::RwLockWriteGuard<'_ , ValueIndex> {
+        self.indexes[slot as usize].write().expect("value index lock poisoned")
     }
 }
 

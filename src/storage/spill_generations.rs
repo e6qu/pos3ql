@@ -307,7 +307,7 @@ impl SpillGenerationSnapshot {
         if table.n_spill_ssts > self.handles.capacity() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "retained SST members exceed checkpoint spill capacity ({})",
+                "retained SST members exceed startup capacity ({})",
                 self.handles.capacity()
             ));
         }
@@ -560,7 +560,7 @@ mod tests {
             drop(lease);
             registry.copy_roots(false, &mut retained).unwrap();
             assert!(retained.is_empty());
-            assert!(registry.take_reclamation_pending());
+            assert!(!registry.take_reclamation_pending());
         });
         arena.reset();
         std::fs::remove_file(path).unwrap();

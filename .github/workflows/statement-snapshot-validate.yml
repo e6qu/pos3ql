@@ -27,6 +27,7 @@ jobs:
       - run: cargo check --all-targets --locked
       - run: cargo clippy --lib --bins --locked -- -D warnings
       - run: cargo test --lib --locked statement_snapshot_leases_ -- --test-threads=1
+      - run: cargo test --lib --locked spill_walk_identity_exhaustion -- --test-threads=1
       - run: cargo test --lib --locked copy_from_ -- --test-threads=1
       - run: cargo test --lib --locked shared_committed_publication -- --test-threads=1
       - run: cargo test --lib --locked historical_sst_ -- --test-threads=1

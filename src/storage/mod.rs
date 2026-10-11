@@ -14262,14 +14262,16 @@ impl SpillReader {
             .unwrap_or_default()
     }
 
-    fn next_walk_id(&self) -> u64 {
+    fn next_walk_id(&self) -> Result<u64, SqlError> {
         let mut next = self
             .next_walk_id
             .lock()
             .expect("spill walk identifier lock poisoned");
         let id = *next;
-        *next = id.wrapping_add(1).max(1);
-        id
+        *next = id.checked_add(1).ok_or_else(|| {
+            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "spill walk identity exhausted")
+        })?;
+        Ok(id)
     }
 
     fn relation_blocks<'a>(&'a self, table: &Table) -> RelationBlockStore<'a> {
@@ -28744,7 +28746,7 @@ impl Storage {
                 "table has spill SSTs but no spill reader is attached"
             ));
         };
-        let walk_id = spill.next_walk_id();
+        let walk_id = spill.next_walk_id()?;
         let Some(mut cursor_lease) = try_mutex_pool(&spill.cursor_contexts, "spill cursor") else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -28933,7 +28935,7 @@ impl Storage {
                 )
             };
         if *walk_id == 0 {
-            *walk_id = spill.next_walk_id();
+            *walk_id = spill.next_walk_id()?;
             cursors.fill(MemberCursor::EMPTY);
             *initialized = 0;
         }
@@ -57989,7 +57991,7 @@ mod tests {
                             .lock()
                             .expect("spill cursor lock poisoned")[0]
                             .ordinal += 1;
-                        let _ = spill.next_walk_id();
+                        spill.next_walk_id().unwrap();
                     }
                 });
             }
@@ -58024,6 +58026,21 @@ mod tests {
                 1_000
             );
         }
+    }
+
+    #[test]
+    fn spill_walk_identity_exhaustion_preserves_active_buffer_owners() {
+        let mut budget = Budget::new(SpillReader::budget_bytes(false, 1));
+        let spill = SpillReader::new(&mut budget, 1, None, None).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            *spill.next_walk_id.lock().unwrap() = u64::MAX - 1;
+            assert_eq!(spill.next_walk_id().unwrap(), u64::MAX - 1);
+            spill.scan_contexts[0].lock().unwrap().owner = 1;
+            let error = spill.next_walk_id().unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(*spill.next_walk_id.lock().unwrap(), u64::MAX);
+            assert_eq!(spill.scan_contexts[0].lock().unwrap().owner, 1);
+        });
     }
 
     #[test]

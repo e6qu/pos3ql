@@ -75,7 +75,8 @@ and vacuum use their maintenance source ownership; buffered portals and SQL curs
 finish their storage reads before suspension. Statement retention does not enable
 concurrent execution or heap relocation. COPY FROM retains its lease in the
 connection-owned setup through completion or abort and restores the captured
-snapshot for each data chunk; COPY TO finishes reads before returning.
+snapshot for each data chunk; COPY TO finishes reads before returning. Spill walk
+identities fail with SQLSTATE 54000 before wraparound or active buffer reuse.
 
 Appends release byte ownership before publishing row metadata. Compaction
 preflights its relocation set before changing bytes or handles; readers reject

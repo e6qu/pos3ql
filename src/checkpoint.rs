@@ -17352,7 +17352,7 @@ mod stored_dependency_tests {
         table_rows.table_rows += 1;
         assert_eq!(
             Checkpointer::budget_bytes(&table_rows) - base_bytes,
-            core::mem::size_of::<u64>()
+            core::mem::size_of::<u64>() + CheckpointValueCursor::budget_bytes(0, 1)
         );
 
         let mut garbage = base.clone();

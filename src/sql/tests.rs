@@ -67444,6 +67444,115 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
+fn retained_sst_next(cursor: &mut crate::storage::CheckpointValueCursor, arena: &mut crate::mem::arena::Arena, seen: &mut Vec<i32>) -> bool {
+    let done = cursor.walk_spilled_rows(arena, None, true, 1, 8, &mut |_, _, row| {
+        let mut decoded = [crate::sql::types::Datum::Null];
+        let values = match row {
+            crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                crate::storage::rowenc::decode(bytes, &[crate::sql::types::ColType::Int4], &mut decoded)?;
+                &decoded[..]
+            }
+            crate::storage::SpilledRowRepresentation::Values(values) => values,
+        };
+        let crate::sql::types::Datum::Int4(value) = values[0] else { panic!("retained schema changed") };
+        seen.push(value);
+        Ok(core::ops::ControlFlow::Continue(()))
+    }).unwrap();
+    arena.reset();
+    done
+}
+
+#[test]
+fn retained_sst_durable_reader_survives_retirement_and_releases_garbage() {
+    let mut config = test_config("retained-sst-retirement");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-retained-sst-retirement-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+    let mut budget = test_engine_budget(&config, 1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert!(!message_types(&run_with(&mut engine, &mut budget,
+        "CREATE TABLE retained_sst_reader(id integer PRIMARY KEY); INSERT INTO retained_sst_reader VALUES (1), (2)")).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+    let slot = engine.storage.find_table("public", "retained_sst_reader").unwrap();
+    let old = engine.storage.table(slot).spill_ssts[0].unwrap();
+    let mut hex = [0; 64];
+    old.roster.write_key(&mut hex);
+    let key = format!("blocks/{}", std::str::from_utf8(&hex).unwrap());
+    assert!(namespace.borrow().object_bytes(&key).is_some());
+    engine.storage.evict_committed_table(slot);
+    engine.storage.evict_redundant_entries(slot);
+    let mut cursor = crate::storage::CheckpointValueCursor::new(config.max_spill_generations_per_table, config.table_rows);
+    let mut arena = crate::mem::arena::Arena::new(&mut budget, "retained SST test", 1 << 20).unwrap();
+    let mut output = [0; 128];
+    assert!(!engine.storage.for_each_value_binding_entry_batch(slot, 0, &mut cursor, &arena, &mut output, 0, 8,
+        &mut |_| panic!("zero-row capture emitted a row")).unwrap());
+    let mut seen = Vec::new();
+    assert!(!retained_sst_next(&mut cursor, &mut arena, &mut seen));
+    assert_eq!(seen, [1]);
+    assert!(!message_types(&run_with(&mut engine, &mut budget,
+        "DROP TABLE retained_sst_reader; CREATE TABLE retained_sst_reader(id text PRIMARY KEY); INSERT INTO retained_sst_reader VALUES ('new')")).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+    assert!(namespace.borrow().object_bytes(&key).is_some(), "active readers retain old durable roots");
+    while !retained_sst_next(&mut cursor, &mut arena, &mut seen) {}
+    assert_eq!(seen, [1, 2]);
+    cursor.reset();
+    assert!(engine.checkpoint_work_pending(), "reader release schedules reclamation without another write");
+    let checkpointer = engine.ckpt.as_mut().unwrap();
+    checkpointer.disable_async_block_reads();
+    checkpointer.finish_maintenance(&engine.storage).unwrap();
+    checkpointer.enable_async_block_reads();
+    assert!(namespace.borrow().object_bytes(&key).is_none(), "released roots are reclaimed");
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, 1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(data_rows(&run_with(&mut recovered, &mut recovered_budget, "SELECT id FROM retained_sst_reader")), ["new"]);
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn retained_sst_temporary_reader_survives_retirement_and_releases_blocks() {
+    let mut config = test_config("retained-sst-temporary");
+    config.temporary_spill_bytes = 64 * crate::store::BLOCK_SIZE;
+    let mut budget = test_engine_budget(&config, 1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert!(!message_types(&run_as(&mut engine, &mut budget, 51,
+        "CREATE TEMP TABLE retained_temp_sst(id integer PRIMARY KEY); INSERT INTO retained_temp_sst VALUES (1), (2)")).contains(&b'E'));
+    assert!(engine.temporary_spiller.as_mut().unwrap().spill_step(&mut engine.storage, &mut engine.scratch).unwrap().is_some());
+    let crate::storage::ResolvedRelation::Table(slot) = engine.storage.resolve_relation(None, "retained_temp_sst", 0).unwrap() else { panic!("missing temporary table") };
+    let mut cursor = crate::storage::CheckpointValueCursor::new(config.max_spill_generations_per_table, config.table_rows);
+    let mut arena = crate::mem::arena::Arena::new(&mut budget, "retained temporary SST test", 1 << 20).unwrap();
+    let mut output = [0; 128];
+    assert!(!engine.storage.for_each_value_binding_entry_batch(slot, 0, &mut cursor, &arena, &mut output, 0, 8,
+        &mut |_| panic!("zero-row capture emitted a row")).unwrap());
+    let mut seen = Vec::new();
+    assert!(!retained_sst_next(&mut cursor, &mut arena, &mut seen));
+    assert!(!message_types(&run_as(&mut engine, &mut budget, 51,
+        "DROP TABLE retained_temp_sst; CREATE TEMP TABLE retained_temp_sst(id text PRIMARY KEY); INSERT INTO retained_temp_sst VALUES ('new')")).contains(&b'E'));
+    assert!(engine.temporary_spiller.as_mut().unwrap().spill_step(&mut engine.storage, &mut engine.scratch).unwrap().is_some());
+    let before = engine.temporary_spiller.as_ref().unwrap().block_count();
+    while !retained_sst_next(&mut cursor, &mut arena, &mut seen) {}
+    assert_eq!(seen, [1, 2]);
+    cursor.reset();
+    engine.temporary_spiller.as_mut().unwrap().cleanup(&engine.storage);
+    assert!(engine.temporary_spiller.as_ref().unwrap().block_count() < before);
+    assert_eq!(data_rows(&run_as(&mut engine, &mut budget, 51, "SELECT id FROM retained_temp_sst")), ["new"]);
+    run_as(&mut engine, &mut budget, 51, "DROP TABLE retained_temp_sst");
+    engine.temporary_spiller.as_mut().unwrap().cleanup(&engine.storage);
+    assert_eq!(engine.temporary_spiller.as_ref().unwrap().block_count(), 0);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
 #[test]
 fn checkpoint_value_source_resumes_inside_a_spilled_pax_block() {
     let mut config = test_config("checkpoint-value-pax-resume");
@@ -68989,7 +69098,7 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
     assert!(remaining > config.checkpoint_delete_objects_per_beat);
     let mut beats = 0usize;
     let mut maintenance_lists = 0u64;
-    while engine.ckpt.as_ref().unwrap().maintenance_pending() {
+    while engine.ckpt.as_ref().unwrap().maintenance_pending(&engine.storage) {
         let lists_before = namespace.borrow().list_count;
         engine
             .ckpt
@@ -69134,7 +69243,7 @@ fn checkpoint_reports_publication_before_paced_maintenance() {
         match step {
             crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
             crate::checkpoint::CheckpointStep::Working => assert!(
-                !engine.ckpt.as_ref().unwrap().maintenance_pending(),
+                !engine.ckpt.as_ref().unwrap().maintenance_pending(&engine.storage),
                 "a durable manifest must be handed to local cleanup in the same beat"
             ),
             crate::checkpoint::CheckpointStep::Idle => {

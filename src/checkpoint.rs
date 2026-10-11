@@ -652,6 +652,11 @@ fn push_slot_list(list: &mut SlotList, prior: PrevSst) -> Result<(), SqlError> {
     Ok(())
 }
 
+fn garbage_sst_root_capacity(config: &Config) -> usize {
+    crate::storage::Storage::retained_spill_root_capacity(config)
+        + crate::storage::table_slot_capacity(config).saturating_mul(config.max_spill_generations_per_table)
+}
+
 pub(crate) struct TemporarySpiller {
     blocks: std::sync::Arc<std::sync::Mutex<crate::store::EphemeralBlockStore>>,
     handles: Vec<SstHandle>,
@@ -662,9 +667,7 @@ pub(crate) struct TemporarySpiller {
 impl TemporarySpiller {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
         crate::store::EphemeralBlockStore::budget_bytes(config.temporary_spill_bytes)
-            + crate::storage::table_slot_capacity(config)
-                .saturating_mul(config.max_spill_generations_per_table)
-                .saturating_mul(core::mem::size_of::<SstHandle>())
+            + garbage_sst_root_capacity(config) * core::mem::size_of::<SstHandle>()
             + SST_ARENA_BYTES
             + SstWriter::budget_bytes()
     }
@@ -679,12 +682,11 @@ impl TemporarySpiller {
                 .map_err(|error| {
                     CheckpointSetupError::ObjectStore(format!("temporary spill store: {error}"))
                 })?;
+        budget.draw(SstWriter::budget_bytes(), "temporary spill writer").map_err(CheckpointSetupError::Budget)?;
+        budget.draw(garbage_sst_root_capacity(config) * core::mem::size_of::<SstHandle>(), "temporary spill retained root roster").map_err(CheckpointSetupError::Budget)?;
         Ok(Self {
             blocks: std::sync::Arc::new(std::sync::Mutex::new(blocks)),
-            handles: Vec::with_capacity(
-                crate::storage::table_slot_capacity(config)
-                    .saturating_mul(config.max_spill_generations_per_table),
-            ),
+            handles: Vec::with_capacity(garbage_sst_root_capacity(config)),
             sst_arena: Arena::new(budget, "temporary spill sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
             writer: SstWriter::new(),
@@ -846,7 +848,7 @@ impl TemporarySpiller {
     }
 
     fn reclaim(&mut self, storage: &Storage) -> Result<(), SqlError> {
-        self.handles.clear();
+        storage.copy_retained_spill_roots(false, &mut self.handles)?;
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
             if !table.live() || {
@@ -866,6 +868,8 @@ impl TemporarySpiller {
                 self.handles.push(*handle);
             }
         }
+        self.handles.sort_unstable_by_key(|handle| handle.roster);
+        self.handles.dedup_by_key(|handle| handle.roster);
         if self.handles.is_empty() {
             self.blocks
                 .lock()
@@ -902,6 +906,7 @@ pub(crate) struct Checkpointer {
     /// Published index identities during a rebuild; untyped block identities
     /// during garbage collection. Both uses fit checkpoint_live_blocks.
     roster_scratch: Vec<(BlockId, Option<BlockType>)>,
+    garbage_sst_roots: Vec<SstHandle>,
     doomed_blocks: Vec<StackStr<80>>,
     manifest_buf: FixedBuf,
     prepared_transaction_snapshot: FixedVec<crate::storage::PreparedTransactionCatalogEntry>,
@@ -1100,6 +1105,7 @@ impl Checkpointer {
             + crate::store::MAX_PAYLOAD
             + 2 * crate::store::MAX_PAYLOAD
             + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
+            + garbage_sst_root_capacity(config) * core::mem::size_of::<SstHandle>()
             + CheckpointValueCursor::budget_bytes(
                 config.max_spill_generations_per_table,
                 config.table_rows,
@@ -1304,8 +1310,8 @@ impl Checkpointer {
             || self.merge_candidate(storage).is_some()
     }
 
-    pub(crate) fn maintenance_pending(&self) -> bool {
-        self.published_lsn_pending_maintenance.is_some()
+    pub(crate) fn maintenance_pending(&self, storage: &Storage) -> bool {
+        self.published_lsn_pending_maintenance.is_some() || storage.retained_sst_reclamation_pending()
     }
 
     /// A schedule beat: scan a bounded stretch of one member, collecting
@@ -1691,6 +1697,7 @@ impl Checkpointer {
                 "checkpoint row-merge source cursors",
             )
             .map_err(CheckpointSetupError::Budget)?;
+        budget.draw(garbage_sst_root_capacity(config) * core::mem::size_of::<SstHandle>(), "garbage collection retained SST roots").map_err(CheckpointSetupError::Budget)?;
         Ok(Self {
             client: ObjectStore::new(config, budget)
                 .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
@@ -1705,6 +1712,7 @@ impl Checkpointer {
             ),
             merge_scratch: Vec::with_capacity(config.checkpoint_merge_entries),
             roster_scratch: Vec::with_capacity(config.checkpoint_live_blocks),
+            garbage_sst_roots: Vec::with_capacity(garbage_sst_root_capacity(config)),
             doomed_blocks: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             manifest_buf: FixedBuf::new(budget, "manifest_buf", manifest_capacity)
                 .map_err(CheckpointSetupError::Budget)?,
@@ -7713,10 +7721,18 @@ impl Checkpointer {
         self.sweeping
     }
 
+    fn observe_retained_root_release(&mut self, storage: &Storage) {
+        if !self.block_garbage_pending && storage.take_retained_sst_reclamation() {
+            self.block_garbage_pending = true;
+            self.published_lsn_pending_maintenance.get_or_insert(storage.lsn());
+        }
+    }
+
     /// Drains the bounded post-publication deletion batches synchronously.
     /// Explicit `CHECKPOINT` and shutdown use this after applying their local
     /// publication transition; ordinary event-loop beats use the paced path.
     pub(crate) fn finish_maintenance(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        self.observe_retained_root_release(storage);
         while self.published_lsn_pending_maintenance.is_some() {
             if let Some(up_to_lsn) = self.commit_prune_through {
                 if self.prune_commit_batch(up_to_lsn)? {
@@ -7756,6 +7772,7 @@ impl Checkpointer {
         storage: &mut Storage,
         sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<CheckpointStep, SqlError> {
+        self.observe_retained_root_release(storage);
         if self.published_lsn_pending_maintenance.is_some() {
             if let Some(up_to_lsn) = self.commit_prune_through {
                 if self.prune_commit_batch(up_to_lsn)? {
@@ -12460,6 +12477,7 @@ impl Checkpointer {
     }
 
     fn finish_value_schedule(&mut self, job: ValueScheduleJob, source: ValueIndexSource) {
+        self.value_source_cursor.reset();
         self.value_changed_rowids.sort_unstable();
         self.value_changed_rowids.dedup();
         if let Some(spec) = job.navigation {
@@ -12500,6 +12518,7 @@ impl Checkpointer {
             .expect("checked by checkpoint scheduler");
         if !Self::value_schedule_job_is_current(storage, &job) {
             self.slice_writer.reset();
+            self.value_source_cursor.reset();
             self.roster_scratch.clear();
             self.value_changed_rowids.clear();
             return Ok(());
@@ -12958,8 +12977,16 @@ impl Checkpointer {
                     self.roster_scratch.push((*id, None));
                 }
             }
+            storage.copy_retained_spill_roots(true, &mut self.garbage_sst_roots)?;
             for prev in self.prev_ssts.iter().flat_map(SlotList::iter) {
-                let h = prev.handle;
+                if self.garbage_sst_roots.len() == self.garbage_sst_roots.capacity() {
+                    return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "garbage collection SST roots exceed fixed scratch capacity"));
+                }
+                self.garbage_sst_roots.push(prev.handle);
+            }
+            self.garbage_sst_roots.sort_unstable_by_key(|handle| handle.roster);
+            self.garbage_sst_roots.dedup_by_key(|handle| handle.roster);
+            for h in self.garbage_sst_roots.iter().copied() {
                 if self.roster_scratch.len() == self.roster_scratch.capacity() {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -13151,6 +13178,7 @@ impl Checkpointer {
                 .io_stats(),
             deleted,
         );
+        if done && storage.take_retained_sst_reclamation() { return Ok(false); }
         Ok(done)
     }
 
@@ -17222,6 +17250,18 @@ mod stored_dependency_tests {
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;
     use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependencies};
+
+    #[test]
+    fn retained_sst_temporary_spill_constructor_charges_its_startup_budget() {
+        let mut config = Config::default_dev();
+        config.temporary_spill_bytes = 8 * crate::store::BLOCK_SIZE;
+        config.data_dir = std::env::temp_dir().join(format!("pos3ql-retained-sst-budget-{}", std::process::id())).to_str().unwrap().to_owned();
+        let mut budget = Budget::new(TemporarySpiller::budget_bytes(&config));
+        let spiller = TemporarySpiller::new(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        drop(spiller);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
 
     #[test]
     fn manifest_catalog_duplicates_reject_before_replacement() {

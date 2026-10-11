@@ -8975,7 +8975,7 @@ impl Engine {
     pub fn checkpoint_work_pending(&self) -> bool {
         self.post_publish_cleanup.is_some()
             || self.ckpt.as_ref().is_some_and(|c| {
-                c.sweep_active() || c.maintenance_pending() || c.merge_work_pending(&self.storage)
+                c.sweep_active() || c.maintenance_pending(&self.storage) || c.merge_work_pending(&self.storage)
             })
     }
 
@@ -9059,7 +9059,7 @@ impl Engine {
         };
         let wal_full = self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50;
         if !(ckpt.sweep_active()
-            || ckpt.maintenance_pending()
+            || ckpt.maintenance_pending(&self.storage)
             || ckpt.merge_work_pending(&self.storage)
             || heap_full
             || wal_full

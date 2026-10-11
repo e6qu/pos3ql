@@ -4,9 +4,8 @@ This file records only defects whose repair is prevented by an external blocker
 or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
-Reviewed for retained row/byte scans and resumable checkpoint identity coverage,
-rollback, paced eviction, checkpoint/query visibility, callback cleanup, and
-bounded capacity on
+Reviewed for immutable SST root retention, table retirement, durable and temporary
+reclamation, release-triggered maintenance, and startup spill budgets on
 2026-10-11: no defects meet these inclusion criteria.
 Resolved investigations are indexed in [history](docs/history/README.md).
 

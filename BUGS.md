@@ -5,7 +5,7 @@ or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 Reviewed for executing statement snapshot retention, nested scopes, transaction
-completion, bounded exhaustion, and error cleanup on 2026-10-11: no defects meet
+completion, streaming COPY, bounded exhaustion, and error cleanup on 2026-10-11: no defects meet
 these inclusion criteria.
 Resolved investigations are indexed in [history](docs/history/README.md).
 

@@ -50929,6 +50929,7 @@ pub fn cluster(
 /// COPY's per-statement setup: the resolved table and target columns, in
 /// COPY's column order. Held by the connection across CopyData messages.
 pub struct CopySetup {
+    snapshot_lease: std::sync::Mutex<Option<crate::storage::StatementSnapshotLease>>,
     definitions: crate::storage::TableDefinitionImages,
     pub table_index: usize,
     pub txid: u32,
@@ -50942,6 +50943,28 @@ pub struct CopySetup {
     /// SQL COPY is authorized as the role fixed when the statement begins.
     /// Subscription apply is a replication operation and has no SQL role.
     security_role: Option<u16>,
+}
+
+impl CopySetup {
+    pub(crate) fn retain_snapshot(
+        &mut self,
+        lease: Option<crate::storage::StatementSnapshotLease>,
+    ) {
+        *self.snapshot_lease.get_mut().unwrap() = lease;
+    }
+
+    fn restore_snapshot(&self, storage: &Storage) {
+        let snapshot = self.snapshot_lease.lock().unwrap().as_ref().map(|lease| lease.snapshot());
+        if let Some(snapshot) = snapshot {
+            storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
+            storage.set_commit_snapshot(snapshot);
+        }
+    }
+
+    pub(crate) fn release_snapshot(&self) {
+        let lease = self.snapshot_lease.lock().unwrap().take();
+        drop(lease);
+    }
 }
 
 /// COPY FROM either admits every decoded candidate or evaluates the one
@@ -51418,6 +51441,7 @@ pub fn copy_begin(
     let definitions = storage.table_definition_images();
     definitions.definition(storage, table_index, txid)?;
     Ok(CopySetup {
+        snapshot_lease: std::sync::Mutex::new(None),
         definitions,
         table_index,
         txid,
@@ -51495,6 +51519,7 @@ pub(crate) fn subscription_copy_setup(
     let definitions = storage.table_definition_images();
     definitions.definition(storage, table_index, txid)?;
     Ok(CopySetup {
+        snapshot_lease: std::sync::Mutex::new(None),
         definitions,
         table_index,
         txid,
@@ -51582,6 +51607,7 @@ pub(crate) fn copy_statement_end(
     scratch: &mut DmlScratch,
     inserted: &DmlScratch,
 ) -> Result<(), SqlError> {
+    setup.restore_snapshot(storage);
     let definition = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;
@@ -51653,6 +51679,7 @@ pub fn copy_match_header(
     line: &[u8],
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    setup.restore_snapshot(storage);
     let def = storage.table_def(setup.table_index, setup.txid);
     let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
     let count = if setup.fmt.csv {
@@ -51727,6 +51754,7 @@ pub(crate) fn copy_row(
     scratch: &mut DmlScratch,
     inserted: &mut DmlScratch,
 ) -> Result<CopyRowOutcome, SqlError> {
+    setup.restore_snapshot(storage);
     let def = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;
@@ -51858,6 +51886,7 @@ pub(crate) fn copy_row_binary(
     scratch: &mut DmlScratch,
     inserted: &mut DmlScratch,
 ) -> Result<CopyRowOutcome, SqlError> {
+    setup.restore_snapshot(storage);
     let def = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;

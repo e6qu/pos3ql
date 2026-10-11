@@ -8895,7 +8895,7 @@ impl Engine {
         inserted: &exec::DmlScratch,
     ) -> Result<(), SqlError> {
         self.work.reset();
-        Self::copy_finish_with_scratch(
+        let result = Self::copy_finish_with_scratch(
             &mut self.storage,
             &self.work,
             setup,
@@ -8904,7 +8904,9 @@ impl Engine {
             responder,
             &mut self.dml_scratch,
             inserted,
-        )?;
+        );
+        setup.release_snapshot();
+        result?;
         if txn.mode == TxnMode::Implicit {
             return self.commit_txn(txn, guc);
         }
@@ -14526,7 +14528,7 @@ impl Engine {
                 | Stmt::Show(_)
                 | Stmt::ShowAll
         );
-        let _snapshot_lease = match self.begin_command_snapshot(
+        let mut snapshot_lease = match self.begin_command_snapshot(
             txn,
             takes_snapshot,
             !matches!(statement, Stmt::Commit | Stmt::Rollback),
@@ -16672,7 +16674,7 @@ impl Engine {
                         },
                     );
                 }
-                let setup = match exec::copy_begin(&self.storage, c, txn.txid) {
+                let mut setup = match exec::copy_begin(&self.storage, c, txn.txid) {
                     Ok(s) => s,
                     Err(e) => return Ok(Err(e)),
                 };
@@ -16711,6 +16713,7 @@ impl Engine {
                         return Ok(Err(error));
                     }
                     responder.copy_in_response(setup.n_targets, setup.fmt.binary)?;
+                    setup.retain_snapshot(snapshot_lease.take());
                     self.pending_copy = Some(setup);
                     Ok(Ok(()))
                 }

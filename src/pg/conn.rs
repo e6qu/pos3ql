@@ -569,6 +569,9 @@ impl Conn {
     }
 
     pub fn close(&mut self) -> Option<TcpStream> {
+        self.copy = None;
+        self.copy_buf.clear();
+        self.copy_transition_scratch.clear();
         // Drop the TLS session (inside its scope, so the pool is credited)
         // before the socket goes.
         self.tls = None;

@@ -56,7 +56,8 @@ contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime
 - Qualify physical reclamation against executing statement leases and retained
   transaction snapshots before enabling concurrency. Statement scopes capture
   their boundary under publication ownership and release on completion, error,
-  or transaction end; heap relocation still needs bounded pins or reader epochs.
+  or transaction end, including streaming COPY; heap relocation still needs bounded
+  pins or reader epochs.
   Qualify identity reuse, rollback, and publication failure before enabling
   physical maintenance.
 

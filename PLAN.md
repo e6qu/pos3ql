@@ -53,10 +53,12 @@ contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime
   committed row publication and snapshot pruning use guarded table revisions,
   version/row metadata, and snapshot-aware value caches; transaction-wide durable
   publication still needs coordinated ownership.
-- Register every executing statement snapshot before enabling concurrent
-  reclamation. Separate heap relocation from active readers, using bounded
-  pins or reader epochs and startup-sized storage. Qualify identity reuse,
-  rollback, and publication failure before enabling physical maintenance.
+- Qualify physical reclamation against executing statement leases and retained
+  transaction snapshots before enabling concurrency. Statement scopes capture
+  their boundary under publication ownership and release on completion, error,
+  or transaction end; heap relocation still needs bounded pins or reader epochs.
+  Qualify identity reuse, rollback, and publication failure before enabling
+  physical maintenance.
 
 Acceptance: a retained reader permits an unrelated write to complete; failed
 publication preserves prior state; maintenance retains active images; bounded

@@ -65,6 +65,16 @@ row, then cache ownership. Cache probes retain bounded candidate identities and
 release cache ownership before callbacks; newer cache images cannot certify
 older snapshots. Transaction-wide durable publication remains an engine gate.
 
+Executing SQL and large-object fast-path statements retain owned snapshot leases.
+Capture and registration share publication ownership; nested scopes do not replace
+transaction snapshots. Each query workspace reserves 1,024 snapshot slots at
+startup, with checked identities and named SQLSTATE 54000 exhaustion. Lease release
+wakes schema waiters and schedules guarded version pruning. Transaction completion
+ends its retention even when a procedure's outer frame remains alive. Checkpoint
+and vacuum use their maintenance source ownership; buffered portals and SQL cursors
+finish their storage reads before suspension. Statement retention does not enable
+concurrent execution or heap relocation.
+
 Appends release byte ownership before publishing row metadata. Compaction
 preflights its relocation set before changing bytes or handles; readers reject
 reused table identities and stale heap locations. Heap locations and relocation

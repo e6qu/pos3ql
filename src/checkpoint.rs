@@ -11545,7 +11545,8 @@ impl Checkpointer {
                     // A reslice appends only work newer than its prior
                     // immutable slice.
                     if slice_after_lsn.is_some_and(|floor| commit_lsn <= floor)
-                        || (delta && !current
+                        || (delta
+                            && !current
                             && home.is_some_and(|location| {
                                 matches!(location, RowHome::Spilled { .. })
                             }))

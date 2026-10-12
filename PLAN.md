@@ -60,7 +60,8 @@ contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime
   bounded pins or reader epochs. Qualify identity reuse, rollback, and publication failure before enabling
   physical maintenance.
 
-Acceptance: a retained reader permits an unrelated write to complete; failed
+Acceptance: reader pools charge their complete startup inventory; a retained
+reader permits an unrelated write to complete; failed
 publication preserves prior state; maintenance retains active images; bounded
 exhaustion, identity reuse, rollback, and cold recovery remain allocation-free.
 

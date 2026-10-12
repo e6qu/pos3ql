@@ -964,19 +964,14 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     let role_graph_workspace_bytes = core::mem::size_of::<
         std::cell::RefCell<crate::mem::fixed_vec::FixedVec<bool>>,
     >() + config.max_roles * core::mem::size_of::<bool>();
-    let foreign_statement_workspace_bytes =
-        crate::storage::foreign_statement_context_workspace_bytes(&config);
     assert_eq!(
         Engine::extra_budget_bytes(&config) - Engine::extra_budget_bytes(&one),
         2 * (config.work_arena_bytes
             + core::mem::size_of::<QueryWorkspace>()
             + dml_workspace_bytes
-            + role_graph_workspace_bytes
-            + foreign_statement_workspace_bytes)
-            + Storage::table_definition_image_budget_bytes(&config)
-            - Storage::table_definition_image_budget_bytes(&one)
-            + Storage::retained_row_walk_budget_bytes(&config)
-            - Storage::retained_row_walk_budget_bytes(&one)
+            + role_graph_workspace_bytes)
+            + Storage::extra_budget_bytes(&config)
+            - Storage::extra_budget_bytes(&one)
     );
     let bytes = config.query_workspace_slots
         * (config.work_arena_bytes + core::mem::size_of::<QueryWorkspace>());

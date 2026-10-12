@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::{
-    ColType, MAX_COLUMNS, RelationPersistence, SpillReader, Storage, Table, table_slot_capacity,
+    ColType, MAX_COLUMNS, RelationPersistence, SpillReader, Storage, table_slot_capacity,
 };
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
@@ -153,43 +153,20 @@ impl SpillRootRegistry {
     }
 }
 
-pub(super) enum SpillHandles<'a> {
-    Installed(&'a [Option<SstHandle>]),
-    Retained(&'a [SstHandle]),
-}
-
 pub(super) struct SpillRelation<'a> {
     pub(super) persistence: RelationPersistence,
     pub(super) schema: [ColType; MAX_COLUMNS],
     pub(super) n_columns: usize,
-    pub(super) handles: SpillHandles<'a>,
+    pub(super) handles: &'a [SstHandle],
 }
 
 impl<'a> SpillRelation<'a> {
-    pub(super) fn installed(table: &'a Table) -> Self {
-        let definition = table.definition();
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        let n_columns = definition.schema(&mut schema);
-        Self {
-            persistence: definition.persistence,
-            schema,
-            n_columns,
-            handles: SpillHandles::Installed(&table.spill_ssts[..table.n_spill_ssts]),
-        }
-    }
-
     pub(super) fn len(&self) -> usize {
-        match &self.handles {
-            SpillHandles::Installed(handles) => handles.len(),
-            SpillHandles::Retained(handles) => handles.len(),
-        }
+        self.handles.len()
     }
 
     pub(super) fn handle(&self, member: usize) -> SstHandle {
-        match &self.handles {
-            SpillHandles::Installed(handles) => handles[member].expect("counted SST member"),
-            SpillHandles::Retained(handles) => handles[member],
-        }
+        self.handles[member]
     }
 }
 
@@ -417,7 +394,7 @@ impl SpillGenerationSnapshot {
             persistence: self.persistence,
             schema: self.schema,
             n_columns: self.n_columns,
-            handles: SpillHandles::Retained(&self.handles),
+            handles: &self.handles,
         }
     }
 
@@ -777,7 +754,7 @@ mod tests {
             storage.collapse_spill(table, replacement);
             assert_eq!(snapshot.relation().handle(0), original);
             assert_eq!(
-                SpillRelation::installed(storage.table(table)).handle(0),
+                storage.table(table).spill_ssts[0].unwrap(),
                 replacement
             );
             storage.drop_table(table);

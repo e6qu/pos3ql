@@ -26,6 +26,7 @@ jobs:
           path: ${{ runner.temp }}/format.patch
       - run: cargo check --all-targets --locked
       - run: cargo clippy --lib --bins --locked -- -D warnings
+      - run: cargo test --lib --locked query_workspaces_are_startup_bounded_and_isolated -- --test-threads=1
       - run: cargo test --lib --locked query_sst_roots_ -- --test-threads=1
       - run: cargo test --lib --locked retained_sst_ -- --test-threads=1
       - run: cargo test --lib --locked statement_snapshot_leases_ -- --test-threads=1

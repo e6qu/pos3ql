@@ -9,6 +9,7 @@ use super::row_versions::{
     RowVersionPools, RowVersionState, committed_history_get, committed_version_at, pending_last,
     pending_version_at, pending_visible_at, retained_pending_home,
 };
+use super::spill_generations::SpilledRowState;
 use super::{CommittedVersion, PendingChange, RowHome, RowLoc, RowState};
 use crate::mem::fixed_map::FixedMap;
 
@@ -28,7 +29,7 @@ pub(super) type RowReadVisitor<'a> = dyn for<'row> FnMut(
 enum VersionOwner<'a> {
     Retained(RwLockReadGuard<'a, RowVersionState>),
     Borrowed(&'a RowVersionState),
-    Immutable,
+    Immutable(SpilledRowState),
 }
 
 impl Deref for RowRead<'_> {
@@ -44,16 +45,23 @@ impl RowRead<'_> {
         match &self.versions {
             VersionOwner::Retained(owner) => Some(owner),
             VersionOwner::Borrowed(owner) => Some(owner),
-            VersionOwner::Immutable => None,
+            VersionOwner::Immutable(_) => None,
         }
     }
 
     /// Immutable SST metadata has no resident chain handles or lock owner.
-    pub(super) fn immutable(state: RowState) -> Self {
-        assert!(state.pending.is_none() && state.history.is_empty());
+    pub(super) fn immutable(source: SpilledRowState) -> Self {
+        let state = source.state();
         Self {
             state,
-            versions: VersionOwner::Immutable,
+            versions: VersionOwner::Immutable(source),
+        }
+    }
+
+    pub(super) fn spilled_source(&self) -> Option<&SpilledRowState> {
+        match &self.versions {
+            VersionOwner::Immutable(source) => Some(source),
+            VersionOwner::Borrowed(_) | VersionOwner::Retained(_) => None,
         }
     }
 
@@ -371,10 +379,40 @@ mod tests {
     #[test]
     fn row_read_ownership_immutable_images_need_no_resident_owner() {
         let (versions, rows) = owners();
+        let config = super::super::tests::test_config();
+        let mut budget = super::super::tests::test_budget(&config);
+        let mut storage = super::super::Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(super::super::tests::make_def(
+                "immutable_row",
+                &[("id", super::super::ColType::Int4, true)],
+            ))
+            .unwrap();
+        storage.set_spill_list(
+            table,
+            &[crate::store::SstHandle {
+                index: crate::store::BlockId([1; 32]),
+                filter: crate::store::BlockId([2; 32]),
+                roster: crate::store::BlockId([3; 32]),
+                format: crate::store::RowSstFormat::PackedV4,
+            }],
+        );
         crate::mem::guard::forbid_alloc(|| {
             assert!(RowReadView::point(&versions, &rows, 1).is_none());
             assert!(versions.test_write().is_ok());
-            let row = RowRead::immutable(RowState::committed_only_at(RowLoc::test(8, 4), 9));
+            let roots = storage
+                .query_roots
+                .retain_point(&storage, table, 9)
+                .unwrap();
+            let row = RowRead::immutable(SpilledRowState::new(
+                roots,
+                1,
+                super::super::SpillVersion {
+                    len: Some(4),
+                    member: 0,
+                    commit_lsn: 9,
+                },
+            ));
             assert!(row.pending_last().is_none());
             assert!(row.history_get(0).is_none());
             assert_eq!(row.visible_at(7, 1, 8), None);

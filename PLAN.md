@@ -63,11 +63,18 @@ Queries that walk immutable tables and resumable checkpoint jobs already retain
 their selected storage objects, schema, read position, and buffers. Executing
 statements, including streaming `COPY FROM`, retain their read position until
 completion or cleanup. Metadata-only ALTER preserves rows and storage roots.
+Individual object-backed row reads now retain their selected generation list
+through lookup and byte retrieval. They can resolve an older version even when
+the newest saved version is a deletion, and captured sources remain readable
+after table replacement or Storage teardown. Point reads have separate fixed
+startup slots, preserving existing scan capacity.
 
 Still to do:
 
-- Give point reads and in-memory changes the same reliable ownership when a
-  table is dropped, replaced, or publishes a new storage generation.
+- Complete the table lifecycle transition for capturing row sources alongside
+  in-memory changes when a table is dropped, replaced, or publishes a new
+  storage generation. Retained object sources no longer depend on the live
+  table's generation list; capturing resident overlays still needs coordination.
 - Finish shared-state protection for table creation/removal, statistics, and
   engine-wide publication.
 - Keep row bytes safe while memory is moved or reclaimed. Complete rewrites

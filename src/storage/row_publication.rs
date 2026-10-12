@@ -16,6 +16,333 @@ struct PreparedPendingWrite {
     track_statistics: bool,
 }
 
+enum PendingPublication {
+    Written(PendingWriteUndo),
+    Retry,
+    Wait(u32, &'static str),
+}
+
+impl Storage {
+    /// Publishes one immutable pending image. Byte preparation and object I/O
+    /// precede the short version-pool/map transition; retained heap readers
+    /// do not exclude it. Conflicting transactions park through the wait graph.
+    pub fn write_pending(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        cid: u32,
+        loc: Option<RowLoc>,
+    ) -> Result<PendingWriteUndo, SqlError> {
+        self.write_pending_inner(table_index, rowid, txid, cid, loc, true)
+    }
+
+    /// Rewrites and WAL reconstruction share publication without DML counts.
+    pub(crate) fn write_pending_untracked(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        cid: u32,
+        loc: Option<RowLoc>,
+    ) -> Result<PendingWriteUndo, SqlError> {
+        self.write_pending_inner(table_index, rowid, txid, cid, loc, false)
+    }
+
+    pub(super) fn write_pending_inner(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        cid: u32,
+        loc: Option<RowLoc>,
+        track_statistics: bool,
+    ) -> Result<PendingWriteUndo, SqlError> {
+        loop {
+            let prepared =
+                self.prepare_pending_write(table_index, rowid, txid, cid, loc, track_statistics)?;
+            match self.publish_pending_write(prepared)? {
+                PendingPublication::Written(undo) => return Ok(undo),
+                PendingPublication::Retry => continue,
+                PendingPublication::Wait(owner, message) => {
+                    return Err(self.pending_write_wait(txid, owner, message));
+                }
+            }
+        }
+    }
+
+    fn pending_write_wait(&self, txid: u32, owner: u32, message: &'static str) -> SqlError {
+        match self.wait_for_transaction(txid, owner) {
+            Err(error) => error,
+            Ok(()) => sql_err!(sqlstate::INTERNAL_LOCK_WAIT, "{}", message),
+        }
+    }
+
+    fn prepare_pending_write(
+        &self,
+        table: usize,
+        rowid: u64,
+        txid: u32,
+        cid: u32,
+        loc: Option<RowLoc>,
+        track_statistics: bool,
+    ) -> Result<PreparedPendingWrite, SqlError> {
+        // Shared Storage ownership excludes relocation and table retirement.
+        // Even reconstruction paths must validate the complete heap image.
+        if let Some(location) = loc {
+            self.heap.get(location)?;
+        }
+        let incarnation = {
+            let definition = self.table_def(table, txid);
+            if let Some(owner) = definition.locked_by_other(txid) {
+                return Err(self.pending_write_wait(
+                    txid,
+                    owner,
+                    "statement is waiting for a concurrent table definition change",
+                ));
+            }
+            definition.identity().created_at
+        };
+        let (expected, pending_identity, existed) = match self.resident_row_state(table, rowid) {
+            Some(state) => {
+                if let Some(owner) = state.locked_by_other(txid) {
+                    drop(state);
+                    return Err(self.pending_write_wait(
+                        txid,
+                        owner,
+                        "statement is waiting for a concurrent row update",
+                    ));
+                }
+                (
+                    Some(*state),
+                    state.pending_head_identity(),
+                    state
+                        .visible_at(txid, SNAPSHOT_ALL, u64::MAX)
+                        .flatten()
+                        .is_some(),
+                )
+            }
+            None => (None, None, false),
+        };
+        // No chain/map guard survives into a cold point read or comparison.
+        let spilled = if expected.is_none() {
+            self.spill_probe_at(table, rowid, u64::MAX)?
+        } else {
+            None
+        };
+        let committed = expected.map_or_else(
+            || {
+                spilled.and_then(|version| {
+                    version.len.map(|len| RowHome::Spilled {
+                        len,
+                        sst: version.member,
+                        commit_lsn: version.commit_lsn,
+                    })
+                })
+            },
+            |state| state.committed,
+        );
+        let committed_lsn = expected.map_or_else(
+            || spilled.map_or(0, |version| version.commit_lsn),
+            |state| state.committed_lsn,
+        );
+        let (changed_columns, changes_existence) =
+            self.pending_change_footprint(table, rowid, committed, loc, txid, track_statistics)?;
+        Ok(PreparedPendingWrite {
+            table,
+            incarnation,
+            rowid,
+            expected,
+            pending_identity,
+            committed,
+            committed_lsn,
+            change: PendingChange {
+                txid,
+                cid,
+                loc,
+                changed_columns,
+                changes_existence,
+            },
+            existed: existed || (expected.is_none() && committed.is_some()),
+            track_statistics,
+        })
+    }
+
+    fn publish_pending_write(
+        &self,
+        prepared: PreparedPendingWrite,
+    ) -> Result<PendingPublication, SqlError> {
+        let PreparedPendingWrite {
+            table,
+            incarnation,
+            rowid,
+            expected,
+            pending_identity,
+            committed,
+            committed_lsn,
+            change,
+            existed,
+            track_statistics,
+        } = prepared;
+        let definition = self.tables[table].definition.read();
+        if definition.identity.created_at != incarnation {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "pending row belongs to a retired table incarnation"
+            ));
+        }
+        if let Some(owner) = definition
+            .identity
+            .existence
+            .pending_txid()
+            .or_else(|| definition.pending.map(|head| head.transaction))
+            .filter(|&owner| owner != change.txid)
+        {
+            return Ok(PendingPublication::Wait(
+                owner,
+                "statement is waiting for a concurrent table definition change",
+            ));
+        }
+        // Snapshot registration/retirement still requires exclusive Storage.
+        // Do not retain its registry mutex while waiting for metadata readers.
+        let oldest = self.oldest_snapshot();
+        // Match reader lock ordering. Never perform byte or object reads while
+        // owning these locks; statistics failure is undone before release.
+        let mut versions = self.row_versions.write();
+        let mut rows = self.tables[table].rows.write();
+        let current = rows.get(&rowid).copied();
+        if let Some(owner) = current.and_then(|state| {
+            pending_last(&versions.pending_row_versions, state.pending)
+                .filter(|head| head.txid != change.txid)
+                .map(|head| head.txid)
+        }) {
+            return Ok(PendingPublication::Wait(
+                owner,
+                "statement is waiting for a concurrent row update",
+            ));
+        }
+        let current_identity = current
+            .and_then(|state| state.pending.tail)
+            .map(|slot| versions.pending_row_versions[slot].identity);
+        if current != expected || current_identity != pending_identity {
+            return Ok(PendingPublication::Retry);
+        }
+        if current.is_none() && rows.len() == rows.capacity() {
+            Self::evict_redundant_rows(&mut rows);
+            if rows.len() == rows.capacity() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table row limit reached ({} rows in memtable)",
+                    rows.capacity()
+                ));
+            }
+        }
+        let mut state = current.unwrap_or(RowState {
+            committed,
+            committed_lsn,
+            checkpoint_change_lsn: 0,
+            history: CommittedHistory::empty(),
+            pending: PendingVersions::empty(),
+        });
+        prune_committed_history(
+            &mut versions.committed_row_versions,
+            &mut state.history,
+            oldest,
+        );
+        // Pruning releases slots, so publish its chain handles even if a later
+        // capacity check fails. Readers can never traverse a released chain.
+        if current.is_some() {
+            *rows.get_mut(&rowid).expect("validated row") = state;
+        }
+        if oldest.is_some()
+            && state.pending.is_none()
+            && (state.committed.is_some() || state.committed_lsn != 0)
+            && state.history.len() == self.max_row_versions_per_row
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "active snapshot history for row {} reached max_row_versions_per_row ({})",
+                rowid,
+                self.max_row_versions_per_row
+            ));
+        }
+        let undo = push_pending_version(
+            &mut versions.pending_row_versions,
+            &mut state.pending,
+            self.max_row_versions_per_row,
+            change,
+        )?;
+        rows.insert(rowid, state)
+            .expect("map capacity reserved under its owner");
+        if track_statistics
+            && let Err(error) =
+                self.record_relation_write(change.txid, table, existed, change.loc.is_some())
+        {
+            Self::restore_pending_locked(&mut versions, &mut rows, rowid, change.txid, undo);
+            return Err(error);
+        }
+        Ok(PendingPublication::Written(undo))
+    }
+
+    /// Undo checks and removes one exact head under the same publication locks.
+    pub fn restore_pending(&self, table: usize, rowid: u64, txid: u32, undo: PendingWriteUndo) {
+        let mut versions = self.row_versions.write();
+        let mut rows = self.tables[table].rows.write();
+        Self::restore_pending_locked(&mut versions, &mut rows, rowid, txid, undo);
+    }
+
+    fn restore_pending_locked(
+        versions: &mut RowVersionState,
+        rows: &mut FixedMap<u64, RowState>,
+        rowid: u64,
+        txid: u32,
+        undo: PendingWriteUndo,
+    ) {
+        let Some(state) = rows.get_mut(&rowid) else {
+            return;
+        };
+        let Some(slot) = state.pending.tail else {
+            return;
+        };
+        let head = versions.pending_row_versions[slot];
+        if head.identity != undo.identity || head.change.txid != txid {
+            return;
+        }
+        pop_pending_version(&mut versions.pending_row_versions, &mut state.pending);
+        // A committed deletion still shadows older immutable SST images.
+        if (state.committed.is_none()
+            && state.committed_lsn == 0
+            && state.history.is_empty()
+            && state.pending.is_none())
+            || Self::redundant_spilled_row_state(state)
+        {
+            rows.remove(&rowid);
+        }
+    }
+
+    pub(super) fn evict_redundant_rows(rows: &mut FixedMap<u64, RowState>) {
+        loop {
+            let mut batch = [0u64; 512];
+            let mut n = 0usize;
+            for (&rowid, state) in rows.iter() {
+                if Self::redundant_spilled_row_state(state) {
+                    batch[n] = rowid;
+                    n += 1;
+                    if n == batch.len() {
+                        break;
+                    }
+                }
+            }
+            if n == 0 {
+                return;
+            }
+            for rowid in &batch[..n] {
+                rows.remove(rowid);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{make_def, test_budget, test_config};
@@ -444,332 +771,5 @@ mod tests {
                     .is_empty()
             );
         });
-    }
-}
-
-enum PendingPublication {
-    Written(PendingWriteUndo),
-    Retry,
-    Wait(u32, &'static str),
-}
-
-impl Storage {
-    /// Publishes one immutable pending image. Byte preparation and object I/O
-    /// precede the short version-pool/map transition; retained heap readers
-    /// do not exclude it. Conflicting transactions park through the wait graph.
-    pub fn write_pending(
-        &self,
-        table_index: usize,
-        rowid: u64,
-        txid: u32,
-        cid: u32,
-        loc: Option<RowLoc>,
-    ) -> Result<PendingWriteUndo, SqlError> {
-        self.write_pending_inner(table_index, rowid, txid, cid, loc, true)
-    }
-
-    /// Rewrites and WAL reconstruction share publication without DML counts.
-    pub(crate) fn write_pending_untracked(
-        &self,
-        table_index: usize,
-        rowid: u64,
-        txid: u32,
-        cid: u32,
-        loc: Option<RowLoc>,
-    ) -> Result<PendingWriteUndo, SqlError> {
-        self.write_pending_inner(table_index, rowid, txid, cid, loc, false)
-    }
-
-    pub(super) fn write_pending_inner(
-        &self,
-        table_index: usize,
-        rowid: u64,
-        txid: u32,
-        cid: u32,
-        loc: Option<RowLoc>,
-        track_statistics: bool,
-    ) -> Result<PendingWriteUndo, SqlError> {
-        loop {
-            let prepared =
-                self.prepare_pending_write(table_index, rowid, txid, cid, loc, track_statistics)?;
-            match self.publish_pending_write(prepared)? {
-                PendingPublication::Written(undo) => return Ok(undo),
-                PendingPublication::Retry => continue,
-                PendingPublication::Wait(owner, message) => {
-                    return Err(self.pending_write_wait(txid, owner, message));
-                }
-            }
-        }
-    }
-
-    fn pending_write_wait(&self, txid: u32, owner: u32, message: &'static str) -> SqlError {
-        match self.wait_for_transaction(txid, owner) {
-            Err(error) => error,
-            Ok(()) => sql_err!(sqlstate::INTERNAL_LOCK_WAIT, "{}", message),
-        }
-    }
-
-    fn prepare_pending_write(
-        &self,
-        table: usize,
-        rowid: u64,
-        txid: u32,
-        cid: u32,
-        loc: Option<RowLoc>,
-        track_statistics: bool,
-    ) -> Result<PreparedPendingWrite, SqlError> {
-        // Shared Storage ownership excludes relocation and table retirement.
-        // Even reconstruction paths must validate the complete heap image.
-        if let Some(location) = loc {
-            self.heap.get(location)?;
-        }
-        let incarnation = {
-            let definition = self.table_def(table, txid);
-            if let Some(owner) = definition.locked_by_other(txid) {
-                return Err(self.pending_write_wait(
-                    txid,
-                    owner,
-                    "statement is waiting for a concurrent table definition change",
-                ));
-            }
-            definition.identity().created_at
-        };
-        let (expected, pending_identity, existed) = match self.resident_row_state(table, rowid) {
-            Some(state) => {
-                if let Some(owner) = state.locked_by_other(txid) {
-                    drop(state);
-                    return Err(self.pending_write_wait(
-                        txid,
-                        owner,
-                        "statement is waiting for a concurrent row update",
-                    ));
-                }
-                (
-                    Some(*state),
-                    state.pending_head_identity(),
-                    state
-                        .visible_at(txid, SNAPSHOT_ALL, u64::MAX)
-                        .flatten()
-                        .is_some(),
-                )
-            }
-            None => (None, None, false),
-        };
-        // No chain/map guard survives into a cold point read or comparison.
-        let spilled = if expected.is_none() {
-            self.spill_probe_at(table, rowid, u64::MAX)?
-        } else {
-            None
-        };
-        let committed = expected.map_or_else(
-            || {
-                spilled.and_then(|version| {
-                    version.len.map(|len| RowHome::Spilled {
-                        len,
-                        sst: version.member,
-                        commit_lsn: version.commit_lsn,
-                    })
-                })
-            },
-            |state| state.committed,
-        );
-        let committed_lsn = expected.map_or_else(
-            || spilled.map_or(0, |version| version.commit_lsn),
-            |state| state.committed_lsn,
-        );
-        let (changed_columns, changes_existence) =
-            self.pending_change_footprint(table, rowid, committed, loc, txid, track_statistics)?;
-        Ok(PreparedPendingWrite {
-            table,
-            incarnation,
-            rowid,
-            expected,
-            pending_identity,
-            committed,
-            committed_lsn,
-            change: PendingChange {
-                txid,
-                cid,
-                loc,
-                changed_columns,
-                changes_existence,
-            },
-            existed: existed || (expected.is_none() && committed.is_some()),
-            track_statistics,
-        })
-    }
-
-    fn publish_pending_write(
-        &self,
-        prepared: PreparedPendingWrite,
-    ) -> Result<PendingPublication, SqlError> {
-        let PreparedPendingWrite {
-            table,
-            incarnation,
-            rowid,
-            expected,
-            pending_identity,
-            committed,
-            committed_lsn,
-            change,
-            existed,
-            track_statistics,
-        } = prepared;
-        let definition = self.tables[table].definition.read();
-        if definition.identity.created_at != incarnation {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "pending row belongs to a retired table incarnation"
-            ));
-        }
-        if let Some(owner) = definition
-            .identity
-            .existence
-            .pending_txid()
-            .or_else(|| definition.pending.map(|head| head.transaction))
-            .filter(|&owner| owner != change.txid)
-        {
-            return Ok(PendingPublication::Wait(
-                owner,
-                "statement is waiting for a concurrent table definition change",
-            ));
-        }
-        // Snapshot registration/retirement still requires exclusive Storage.
-        // Do not retain its registry mutex while waiting for metadata readers.
-        let oldest = self.oldest_snapshot();
-        // Match reader lock ordering. Never perform byte or object reads while
-        // owning these locks; statistics failure is undone before release.
-        let mut versions = self.row_versions.write();
-        let mut rows = self.tables[table].rows.write();
-        let current = rows.get(&rowid).copied();
-        if let Some(owner) = current.and_then(|state| {
-            pending_last(&versions.pending_row_versions, state.pending)
-                .filter(|head| head.txid != change.txid)
-                .map(|head| head.txid)
-        }) {
-            return Ok(PendingPublication::Wait(
-                owner,
-                "statement is waiting for a concurrent row update",
-            ));
-        }
-        let current_identity = current
-            .and_then(|state| state.pending.tail)
-            .map(|slot| versions.pending_row_versions[slot].identity);
-        if current != expected || current_identity != pending_identity {
-            return Ok(PendingPublication::Retry);
-        }
-        if current.is_none() && rows.len() == rows.capacity() {
-            Self::evict_redundant_rows(&mut rows);
-            if rows.len() == rows.capacity() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table row limit reached ({} rows in memtable)",
-                    rows.capacity()
-                ));
-            }
-        }
-        let mut state = current.unwrap_or(RowState {
-            committed,
-            committed_lsn,
-            checkpoint_change_lsn: 0,
-            history: CommittedHistory::empty(),
-            pending: PendingVersions::empty(),
-        });
-        prune_committed_history(
-            &mut versions.committed_row_versions,
-            &mut state.history,
-            oldest,
-        );
-        // Pruning releases slots, so publish its chain handles even if a later
-        // capacity check fails. Readers can never traverse a released chain.
-        if current.is_some() {
-            *rows.get_mut(&rowid).expect("validated row") = state;
-        }
-        if oldest.is_some()
-            && state.pending.is_none()
-            && (state.committed.is_some() || state.committed_lsn != 0)
-            && state.history.len() == self.max_row_versions_per_row
-        {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "active snapshot history for row {} reached max_row_versions_per_row ({})",
-                rowid,
-                self.max_row_versions_per_row
-            ));
-        }
-        let undo = push_pending_version(
-            &mut versions.pending_row_versions,
-            &mut state.pending,
-            self.max_row_versions_per_row,
-            change,
-        )?;
-        rows.insert(rowid, state)
-            .expect("map capacity reserved under its owner");
-        if track_statistics
-            && let Err(error) =
-                self.record_relation_write(change.txid, table, existed, change.loc.is_some())
-        {
-            Self::restore_pending_locked(&mut versions, &mut rows, rowid, change.txid, undo);
-            return Err(error);
-        }
-        Ok(PendingPublication::Written(undo))
-    }
-
-    /// Undo checks and removes one exact head under the same publication locks.
-    pub fn restore_pending(&self, table: usize, rowid: u64, txid: u32, undo: PendingWriteUndo) {
-        let mut versions = self.row_versions.write();
-        let mut rows = self.tables[table].rows.write();
-        Self::restore_pending_locked(&mut versions, &mut rows, rowid, txid, undo);
-    }
-
-    fn restore_pending_locked(
-        versions: &mut RowVersionState,
-        rows: &mut FixedMap<u64, RowState>,
-        rowid: u64,
-        txid: u32,
-        undo: PendingWriteUndo,
-    ) {
-        let Some(state) = rows.get_mut(&rowid) else {
-            return;
-        };
-        let Some(slot) = state.pending.tail else {
-            return;
-        };
-        let head = versions.pending_row_versions[slot];
-        if head.identity != undo.identity || head.change.txid != txid {
-            return;
-        }
-        pop_pending_version(&mut versions.pending_row_versions, &mut state.pending);
-        // A committed deletion still shadows older immutable SST images.
-        if (state.committed.is_none()
-            && state.committed_lsn == 0
-            && state.history.is_empty()
-            && state.pending.is_none())
-            || Self::redundant_spilled_row_state(state)
-        {
-            rows.remove(&rowid);
-        }
-    }
-
-    pub(super) fn evict_redundant_rows(rows: &mut FixedMap<u64, RowState>) {
-        loop {
-            let mut batch = [0u64; 512];
-            let mut n = 0usize;
-            for (&rowid, state) in rows.iter() {
-                if Self::redundant_spilled_row_state(state) {
-                    batch[n] = rowid;
-                    n += 1;
-                    if n == batch.len() {
-                        break;
-                    }
-                }
-            }
-            if n == 0 {
-                return;
-            }
-            for rowid in &batch[..n] {
-                rows.remove(rowid);
-            }
-        }
     }
 }

@@ -1,6 +1,7 @@
 //! Visible heap images retain byte ownership; deferred reads retain snapshots.
 
 use super::row_heap::HeapRowRead;
+use super::spill_generations::SpilledRowRead;
 use super::{RowHome, RowLoc};
 
 /// A table incarnation and the exact row version selected by MVCC.
@@ -92,7 +93,7 @@ impl core::fmt::Debug for VisibleRowHome<'_> {
 
 pub(super) enum VisibleRowBytes<'a> {
     Heap(HeapRowRead<'a>),
-    Spilled { len: u32, sst: u32, commit_lsn: u64 },
+    Spilled(SpilledRowRead),
 }
 
 impl<'a> VisibleRowHome<'a> {
@@ -103,14 +104,10 @@ impl<'a> VisibleRowHome<'a> {
         }
     }
 
-    pub(super) fn spilled(snapshot: RowSnapshot, len: u32, sst: u32, commit_lsn: u64) -> Self {
+    pub(super) fn spilled(source: SpilledRowRead) -> Self {
         Self {
-            snapshot,
-            bytes: VisibleRowBytes::Spilled {
-                len,
-                sst,
-                commit_lsn,
-            },
+            snapshot: source.snapshot(),
+            bytes: VisibleRowBytes::Spilled(source),
         }
     }
 
@@ -121,14 +118,14 @@ impl<'a> VisibleRowHome<'a> {
     pub(crate) fn byte_len(&self) -> u32 {
         match &self.bytes {
             VisibleRowBytes::Heap(bytes) => bytes.location().len,
-            VisibleRowBytes::Spilled { len, .. } => *len,
+            VisibleRowBytes::Spilled(source) => source.len,
         }
     }
 
     pub(crate) fn heap_loc(&self) -> Option<RowLoc> {
         match &self.bytes {
             VisibleRowBytes::Heap(bytes) => Some(bytes.location()),
-            VisibleRowBytes::Spilled { .. } => None,
+            VisibleRowBytes::Spilled(_) => None,
         }
     }
 
@@ -136,14 +133,10 @@ impl<'a> VisibleRowHome<'a> {
     pub(super) fn metadata(&self) -> RowHome {
         match &self.bytes {
             VisibleRowBytes::Heap(bytes) => RowHome::Heap(bytes.location()),
-            VisibleRowBytes::Spilled {
-                len,
-                sst,
-                commit_lsn,
-            } => RowHome::Spilled {
-                len: *len,
-                sst: *sst,
-                commit_lsn: *commit_lsn,
+            VisibleRowBytes::Spilled(source) => RowHome::Spilled {
+                len: source.len,
+                sst: source.member,
+                commit_lsn: source.commit_lsn,
             },
         }
     }
@@ -200,24 +193,38 @@ mod tests {
         let mut heap = super::super::RowHeap::new(&mut budget, 32).unwrap();
         let (location, bytes) = heap.append(4).unwrap();
         bytes.copy_from_slice(b"row!");
-        let table = TableRowSnapshot { created_at: 7 };
-        let other = TableRowSnapshot { created_at: 8 };
+        let config = super::super::tests::test_config();
+        let mut object_budget = super::super::tests::test_budget(&config);
+        let mut storage = super::super::Storage::new(&config, &mut object_budget).unwrap();
+        let slot = storage
+            .create_table(super::super::tests::make_def(
+                "ordered_row",
+                &[("id", super::super::ColType::Int4, true)],
+            ))
+            .unwrap();
+        storage.set_spill_list(
+            slot,
+            &[crate::store::SstHandle {
+                index: crate::store::BlockId([1; 32]),
+                filter: crate::store::BlockId([2; 32]),
+                roster: crate::store::BlockId([3; 32]),
+                format: crate::store::RowSstFormat::PackedV4,
+            }],
+        );
+        let created_at = storage.table(slot).created_at();
+        let table = TableRowSnapshot { created_at };
+        let other = TableRowSnapshot {
+            created_at: created_at + 1,
+        };
         let image = VisibleRowHome::heap(
             RowSnapshot {
-                created_at: 7,
+                created_at,
                 version: RowVersionIdentity::Pending(1),
             },
             heap.get(location).unwrap(),
         );
-        let spilled = VisibleRowHome::spilled(
-            RowSnapshot {
-                created_at: 7,
-                version: RowVersionIdentity::Committed(4),
-            },
-            4,
-            0,
-            4,
-        );
+        let spilled =
+            VisibleRowHome::spilled(storage.retain_spilled_row(slot, u64::MAX, 4, 0, 4).unwrap());
         crate::mem::guard::forbid_alloc(|| {
             let resident = table.retain(1, &image).unwrap();
             let object = table.retain(u64::MAX, &spilled).unwrap();

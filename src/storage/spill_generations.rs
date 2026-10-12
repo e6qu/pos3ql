@@ -2,7 +2,7 @@
 
 use core::mem::size_of;
 use core::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::{ColType, MAX_COLUMNS, RelationPersistence, SpillReader, Storage, table_slot_capacity};
@@ -170,11 +170,13 @@ impl<'a> SpillRelation<'a> {
 
 struct QueryRootSlot {
     retained: AtomicBool,
+    readers: AtomicUsize,
     snapshot: RwLock<SpillGenerationSnapshot>,
 }
 
 pub(super) struct QueryRootPool {
     slots: FixedVec<QueryRootSlot>,
+    slots_per_use: usize,
 }
 
 pub(super) struct QueryRootLease {
@@ -192,7 +194,7 @@ impl QueryRootPool {
     pub(super) fn budget_bytes(config: &Config) -> usize {
         size_of::<Self>()
             + 2 * size_of::<std::sync::atomic::AtomicUsize>()
-            + Self::slot_count(config)
+            + 2 * Self::slot_count(config)
                 * (size_of::<QueryRootSlot>()
                     + SpillGenerationSnapshot::budget_bytes(config.max_spill_generations_per_table))
     }
@@ -203,8 +205,8 @@ impl QueryRootPool {
             "query SST root owner",
         )?;
         let count = Self::slot_count(config);
-        let mut slots = FixedVec::new(budget, "query SST root slots", count)?;
-        for _ in 0..count {
+        let mut slots = FixedVec::new(budget, "query SST root slots", 2 * count)?;
+        for _ in 0..2 * count {
             budget.draw(
                 SpillGenerationSnapshot::budget_bytes(config.max_spill_generations_per_table),
                 "query SST root members",
@@ -212,13 +214,17 @@ impl QueryRootPool {
             slots
                 .push(QueryRootSlot {
                     retained: AtomicBool::new(false),
+                    readers: AtomicUsize::new(0),
                     snapshot: RwLock::new(SpillGenerationSnapshot::new(
                         config.max_spill_generations_per_table,
                     )),
                 })
                 .expect("sized query root slots");
         }
-        Ok(Arc::new(Self { slots }))
+        Ok(Arc::new(Self {
+            slots,
+            slots_per_use: count,
+        }))
     }
 
     pub(super) fn retain(
@@ -227,7 +233,27 @@ impl QueryRootPool {
         table: usize,
         lsn: u64,
     ) -> Result<QueryRootLease, SqlError> {
-        for (slot, candidate) in self.slots.iter().enumerate() {
+        self.retain_in(storage, table, lsn, 0)
+    }
+
+    pub(super) fn retain_point(
+        self: &Arc<Self>,
+        storage: &Storage,
+        table: usize,
+        lsn: u64,
+    ) -> Result<QueryRootLease, SqlError> {
+        self.retain_in(storage, table, lsn, self.slots_per_use)
+    }
+
+    fn retain_in(
+        self: &Arc<Self>,
+        storage: &Storage,
+        table: usize,
+        lsn: u64,
+        start: usize,
+    ) -> Result<QueryRootLease, SqlError> {
+        for slot in start..start + self.slots_per_use {
+            let candidate = &self.slots[slot];
             if candidate
                 .retained
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -235,6 +261,7 @@ impl QueryRootPool {
             {
                 continue;
             }
+            candidate.readers.store(1, Ordering::Relaxed);
             let lease = QueryRootLease {
                 pool: Arc::clone(self),
                 slot,
@@ -252,13 +279,34 @@ impl QueryRootPool {
         Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "query SST root slots exhausted ({})",
-            self.slots.len()
+            self.slots_per_use
         ))
     }
 }
 
 impl QueryRootLease {
-    /// Only this source owns the slot. Its guard excludes no unrelated reader,
+    pub(super) fn try_clone(&self) -> Result<Self, SqlError> {
+        let readers = &self.pool.slots[self.slot].readers;
+        let mut count = readers.load(Ordering::Relaxed);
+        loop {
+            let next = count.checked_add(1).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "query SST source reader count exhausted"
+                )
+            })?;
+            match readers.compare_exchange_weak(count, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(current) => count = current,
+            }
+        }
+        Ok(Self {
+            pool: Arc::clone(&self.pool),
+            slot: self.slot,
+        })
+    }
+
+    /// Only this source and its clones own the slot. Its guard excludes no unrelated reader,
     /// publisher, or retirement; registry ownership ends before object I/O.
     pub(super) fn with_snapshot<T>(
         &self,
@@ -275,11 +323,187 @@ impl QueryRootLease {
 impl Drop for QueryRootLease {
     fn drop(&mut self) {
         let slot = &self.pool.slots[self.slot];
+        if slot.readers.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
         slot.snapshot
             .write()
             .expect("query SST roots poisoned")
             .clear();
         slot.retained.store(false, Ordering::Release);
+    }
+}
+
+/// A point verdict includes deletions so an older reader can still select
+/// historical bytes from the same captured generation set.
+pub(super) struct SpilledRowState {
+    roots: QueryRootLease,
+    rowid: u64,
+    version: super::SpillVersion,
+}
+
+impl SpilledRowState {
+    pub(super) fn new(roots: QueryRootLease, rowid: u64, version: super::SpillVersion) -> Self {
+        Self {
+            roots,
+            rowid,
+            version,
+        }
+    }
+
+    pub(super) fn state(&self) -> super::RowState {
+        super::RowState {
+            committed: self.version.len.map(|len| super::RowHome::Spilled {
+                len,
+                sst: self.version.member,
+                commit_lsn: self.version.commit_lsn,
+            }),
+            committed_lsn: self.version.commit_lsn,
+            checkpoint_change_lsn: 0,
+            history: super::CommittedHistory::empty(),
+            pending: super::PendingVersions::empty(),
+        }
+    }
+
+    pub(super) fn validate_request(&self, table: usize, rowid: u64) -> Result<(), SqlError> {
+        self.roots.with_snapshot(|source| {
+            if source.table_slot != table || self.rowid != rowid {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained object state does not match the requested table and row"
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn visible_at(
+        &self,
+        commit_snapshot: u64,
+    ) -> Result<Option<SpilledRowRead>, SqlError> {
+        let version = self.roots.with_snapshot(|source| {
+            if self.version.commit_lsn <= commit_snapshot && commit_snapshot <= source.commit_lsn {
+                Ok(Some(self.version))
+            } else {
+                Storage::probe_spill_snapshot(source, self.rowid, commit_snapshot)
+            }
+        })?;
+        let Some(super::SpillVersion {
+            len: Some(len),
+            member,
+            commit_lsn,
+        }) = version
+        else {
+            return Ok(None);
+        };
+        SpilledRowRead::new(self.roots.try_clone()?, self.rowid, len, member, commit_lsn).map(Some)
+    }
+}
+
+/// The selected version and its complete immutable source share one lease.
+/// Older snapshot probes never consult a replacement table's generation list.
+pub(super) struct SpilledRowRead {
+    roots: QueryRootLease,
+    pub(super) table_slot: usize,
+    pub(super) created_at: u64,
+    pub(super) rowid: u64,
+    pub(super) len: u32,
+    pub(super) member: u32,
+    pub(super) commit_lsn: u64,
+}
+
+impl SpilledRowRead {
+    pub(super) fn new(
+        roots: QueryRootLease,
+        rowid: u64,
+        len: u32,
+        member: u32,
+        commit_lsn: u64,
+    ) -> Result<Self, SqlError> {
+        let (table_slot, created_at) =
+            roots.with_snapshot(|source| Ok((source.table_slot, source.created_at)))?;
+        Ok(Self {
+            roots,
+            table_slot,
+            created_at,
+            rowid,
+            len,
+            member,
+            commit_lsn,
+        })
+    }
+
+    pub(super) fn snapshot(&self) -> super::RowSnapshot {
+        super::RowSnapshot {
+            created_at: self.created_at,
+            version: super::row_images::RowVersionIdentity::Committed(self.commit_lsn),
+        }
+    }
+
+    pub(super) fn validate_request(&self, table: usize, rowid: u64) -> Result<(), SqlError> {
+        if table != self.table_slot || rowid != self.rowid {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "retained object row does not match the requested table and row"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn copy_bytes<'arena>(
+        &self,
+        arena: &'arena crate::mem::arena::Arena,
+    ) -> Result<&'arena [u8], SqlError> {
+        self.roots.with_snapshot(|source| {
+            let reader = source.reader.as_ref().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained object row has no reader"
+                )
+            })?;
+            let handle = source.handles.get(self.member as usize).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained object row has no SST member"
+                )
+            })?;
+            reader.copy_row_bytes(
+                source.persistence,
+                *handle,
+                self.rowid,
+                self.len,
+                self.commit_lsn,
+                arena,
+            )
+        })
+    }
+
+    pub(super) fn with_bytes<R>(
+        &self,
+        consume: impl FnOnce(&[u8]) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        self.roots.with_snapshot(|source| {
+            let reader = source.reader.as_ref().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained object row has no reader"
+                )
+            })?;
+            let handle = source.handles.get(self.member as usize).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained object row has no SST member"
+                )
+            })?;
+            reader.with_row_bytes(
+                source.persistence,
+                *handle,
+                self.rowid,
+                self.len,
+                self.commit_lsn,
+                consume,
+            )
+        })
     }
 }
 
@@ -429,6 +653,326 @@ mod tests {
         }
     }
 
+    struct PointFixture {
+        storage: Storage,
+        table: usize,
+        roots: [SstHandle; 3],
+        arena: crate::mem::arena::Arena,
+        path: std::path::PathBuf,
+    }
+
+    fn point_fixture(label: &str) -> PointFixture {
+        use crate::sql::types::Datum;
+        use crate::storage::rowenc;
+        use crate::store::{EphemeralBlockStore, SstKey, SstWriter};
+        let mut config = test_config();
+        config.max_spill_generations_per_table = 3;
+        let bytes = 32 * crate::store::BLOCK_SIZE;
+        let mut budget = Budget::new(
+            Storage::extra_budget_bytes(&config)
+                + config.memtable_bytes
+                + SpillReader::budget_bytes(false, 3)
+                + EphemeralBlockStore::budget_bytes(bytes)
+                + (1 << 20),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "pos3ql-retained-point-{label}-{}.blocks",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut blocks = EphemeralBlockStore::open(&mut budget, &path, bytes).unwrap();
+        let mut writer = Box::new(SstWriter::new());
+        let mut encoded = [0u8; 128];
+        for (rowid, value) in [(1, 41), (2, 17)] {
+            let values = [Datum::Int4(value)];
+            let len = rowenc::encoded_len(&values);
+            rowenc::encode(&values, &mut encoded[..len]);
+            writer
+                .append_version(&mut blocks, SstKey::at(rowid, 7), &encoded[..len])
+                .unwrap();
+        }
+        let old = writer.finish(&mut blocks).unwrap().unwrap();
+        writer.reset();
+        let values = [Datum::Int4(88)];
+        let len = rowenc::encoded_len(&values);
+        rowenc::encode(&values, &mut encoded[..len]);
+        writer
+            .append_version(&mut blocks, SstKey::at(1, 9), &encoded[..len])
+            .unwrap();
+        writer
+            .append_tombstone_version(&mut blocks, SstKey::at(2, 9))
+            .unwrap();
+        let current = writer.finish(&mut blocks).unwrap().unwrap();
+        writer.reset();
+        let values = [Datum::Text("replacement")];
+        let len = rowenc::encoded_len(&values);
+        rowenc::encode(&values, &mut encoded[..len]);
+        writer
+            .append_version(&mut blocks, SstKey::at(1, 11), &encoded[..len])
+            .unwrap();
+        let replacement = writer.finish(&mut blocks).unwrap().unwrap();
+        let blocks = Arc::new(Mutex::new(blocks));
+        let reader = SpillReader::new(&mut budget, 3, None, Some(blocks)).unwrap();
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage.attach_spill(reader);
+        let mut definition = make_def(label, &[("id", ColType::Int4, true)]);
+        definition.persistence = RelationPersistence::Temporary;
+        let table = storage.create_table(definition).unwrap();
+        storage.set_spill_list(table, &[old, current]);
+        let arena = crate::mem::arena::Arena::new(&mut budget, "point result", 1 << 18).unwrap();
+        PointFixture {
+            storage,
+            table,
+            roots: [old, current, replacement],
+            arena,
+            path,
+        }
+    }
+
+    fn assert_point_value(source: &SpilledRowRead, arena: &crate::mem::arena::Arena, value: i32) {
+        use crate::sql::types::Datum;
+        let bytes = source.copy_bytes(arena).unwrap();
+        let mut values = [Datum::Null];
+        crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values).unwrap();
+        assert_eq!(values, [Datum::Int4(value)]);
+        source
+            .with_bytes(|bytes| {
+                let mut values = [Datum::Null];
+                crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                assert_eq!(values, [Datum::Int4(value)]);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn retained_object_rows_keep_versions_schema_and_deletions_after_retirement() {
+        let PointFixture {
+            mut storage,
+            table,
+            roots,
+            arena,
+            path,
+        } = point_fixture("retirement");
+        let mut retained = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            let state = storage
+                .spill_row_state_at(table, 1, u64::MAX)
+                .unwrap()
+                .unwrap();
+            let deleted = storage
+                .spill_row_state_at(table, 2, u64::MAX)
+                .unwrap()
+                .unwrap();
+            let current = state.visible_at(u64::MAX).unwrap().unwrap();
+            let old = state.visible_at(7).unwrap().unwrap();
+            let deleted_old = deleted.visible_at(7).unwrap().unwrap();
+            assert!(deleted.visible_at(u64::MAX).unwrap().is_none());
+            let deferred = storage
+                .read_row_snapshot(
+                    table,
+                    2,
+                    super::super::RowSnapshot {
+                        created_at: storage.table(table).created_at(),
+                        version: super::super::row_images::RowVersionIdentity::Committed(7),
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                deferred.snapshot().version,
+                super::super::row_images::RowVersionIdentity::Committed(7)
+            );
+            let bytes = storage.row_bytes(table, 2, deferred, &arena).unwrap();
+            let mut values = [crate::sql::types::Datum::Null];
+            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values).unwrap();
+            assert_eq!(values, [crate::sql::types::Datum::Int4(17)]);
+            let registry = Arc::clone(&storage.spill_roots);
+            storage.set_spill_list(table, &[roots[2]]);
+            storage.drop_table(table);
+            let mut definition = make_def("retirement", &[("id", ColType::Text, true)]);
+            definition.persistence = RelationPersistence::Temporary;
+            let replacement = storage.create_table(definition).unwrap();
+            storage.set_spill_list(replacement, &[roots[2]]);
+            drop(storage);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert_eq!(retained.len(), 2);
+            assert!(retained.contains(&roots[0]) && retained.contains(&roots[1]));
+            state
+                .roots
+                .with_snapshot(|snapshot| {
+                    assert_eq!(snapshot.relation().schema[0], ColType::Int4);
+                    Ok(())
+                })
+                .unwrap();
+            assert_point_value(&current, &arena, 88);
+            assert_point_value(&old, &arena, 41);
+            assert_point_value(&deleted_old, &arena, 17);
+            assert!(deleted.visible_at(9).unwrap().is_none());
+            current.with_bytes(|_| old.with_bytes(|_| Ok(()))).unwrap();
+            assert_eq!(
+                old.validate_request(table, 2).unwrap_err().sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            let error = current
+                .with_bytes::<()>(|_| {
+                    Err(sql_err!(sqlstate::QUERY_CANCELED, "cancel retained row"))
+                })
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::QUERY_CANCELED);
+            drop((state, deleted, current, old, deleted_old));
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert!(retained.is_empty());
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn retained_object_rows_use_captured_roots_for_latest_committed_validation() {
+        let PointFixture {
+            storage,
+            table,
+            arena,
+            path,
+            ..
+        } = point_fixture("validation");
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_commit_snapshot(7);
+            storage
+                .for_each_row_state(table, &mut |rowid, state| {
+                    assert_eq!(state.committed_lsn, 7);
+                    let home = storage.committed_row_home(table, rowid, state)?;
+                    if rowid == 1 {
+                        let home = home.expect("newer committed row");
+                        assert_eq!(
+                            home.snapshot().version,
+                            super::super::row_images::RowVersionIdentity::Committed(9)
+                        );
+                        let super::super::VisibleRowBytes::Spilled(source) = home.bytes else {
+                            unreachable!()
+                        };
+                        assert_point_value(&source, &arena, 88);
+                    } else {
+                        assert!(home.is_none(), "latest deletion wins uniqueness validation");
+                    }
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn retained_object_rows_allow_replacement_while_a_reader_consumes_old_bytes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        struct Release<'a>(&'a AtomicBool);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let PointFixture {
+            mut storage,
+            table,
+            roots,
+            path,
+            ..
+        } = point_fixture("overlap");
+        let state = storage
+            .spill_row_state_at(table, 1, u64::MAX)
+            .unwrap()
+            .unwrap();
+        let source = state.visible_at(7).unwrap().unwrap();
+        let ready = AtomicBool::new(false);
+        let replaced = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let finish = Release(&replaced);
+            let reader = scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    source
+                        .with_bytes(|bytes| {
+                            ready.store(true, Ordering::Release);
+                            while !replaced.load(Ordering::Acquire) {
+                                std::thread::yield_now();
+                            }
+                            let mut values = [crate::sql::types::Datum::Null];
+                            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                            assert_eq!(values, [crate::sql::types::Datum::Int4(41)]);
+                            Ok(())
+                        })
+                        .unwrap();
+                });
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let reading = ready.load(Ordering::Acquire);
+            if reading {
+                crate::mem::guard::forbid_alloc(|| {
+                    storage.set_spill_list(table, &[roots[2]]);
+                    storage.drop_table(table);
+                    let mut definition = make_def("overlap", &[("id", ColType::Text, true)]);
+                    definition.persistence = RelationPersistence::Temporary;
+                    let replacement = storage.create_table(definition).unwrap();
+                    storage.set_spill_list(replacement, &[roots[2]]);
+                });
+            }
+            drop(finish);
+            reader.join().unwrap();
+            assert!(
+                reading,
+                "replacement must finish before the reader releases its bytes"
+            );
+        });
+        drop((state, source, storage));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn retained_object_rows_bound_scratch_and_release_after_nested_errors() {
+        let PointFixture {
+            storage,
+            table,
+            arena,
+            path,
+            ..
+        } = point_fixture("scratch");
+        let mut tiny_budget = Budget::new(1);
+        let tiny_arena = crate::mem::arena::Arena::new(&mut tiny_budget, "tiny result", 1).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let state = storage
+                .spill_row_state_at(table, 1, u64::MAX)
+                .unwrap()
+                .unwrap();
+            let row = state.visible_at(7).unwrap().unwrap();
+            row.with_bytes(|_| {
+                row.with_bytes(|_| {
+                    let error = row.with_bytes(|_| Ok(())).unwrap_err();
+                    assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                    Ok(())
+                })
+            })
+            .unwrap();
+            assert_point_value(&row, &arena, 41);
+            let mut oversized = state.visible_at(7).unwrap().unwrap();
+            oversized.len = u32::MAX;
+            let error = oversized.with_bytes(|_| Ok(())).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_point_value(&row, &arena, 41);
+            let error = state
+                .visible_at(7)
+                .unwrap()
+                .unwrap()
+                .copy_bytes(&tiny_arena)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn query_sst_roots_charge_exact_startup_capacity_and_reuse_released_slots() {
         let mut config = test_config();
@@ -446,7 +990,7 @@ mod tests {
         assert_eq!(pool_budget.used(), expected);
         let mut leases = Vec::with_capacity(pool.slots.len());
         crate::mem::guard::forbid_alloc(|| {
-            for _ in 0..pool.slots.len() {
+            for _ in 0..pool.slots_per_use {
                 leases.push(pool.retain(&storage, table, 7).unwrap());
             }
             assert_eq!(
@@ -478,6 +1022,81 @@ mod tests {
     }
 
     #[test]
+    fn retained_object_rows_preserve_scan_capacity_and_reuse_only_after_last_reader() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("source_capacity", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        storage.set_spill_list(table, &[handle(1)]);
+        let pool = Arc::clone(&storage.query_roots);
+        let mut scans = Vec::with_capacity(pool.slots_per_use);
+        let mut points = Vec::with_capacity(pool.slots_per_use);
+        let mut retained = Vec::with_capacity(1);
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..pool.slots_per_use {
+                scans.push(pool.retain(&storage, table, 7).unwrap());
+                points.push(pool.retain_point(&storage, table, 7).unwrap());
+            }
+            assert_eq!(
+                pool.retain(&storage, table, 7).err().unwrap().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                pool.retain_point(&storage, table, 7)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            let source = points.pop().unwrap();
+            let copy = source.try_clone().unwrap();
+            let slot = source.slot;
+            drop(source);
+            assert!(pool.slots[slot].retained.load(Ordering::Acquire));
+            assert_eq!(
+                pool.retain_point(&storage, table, 7)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            drop(copy);
+            assert!(!pool.slots[slot].retained.load(Ordering::Acquire));
+            let replacement = pool.retain_point(&storage, table, 7).unwrap();
+            pool.slots[replacement.slot]
+                .readers
+                .store(usize::MAX, Ordering::Relaxed);
+            assert_eq!(
+                replacement.try_clone().err().unwrap().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            pool.slots[replacement.slot]
+                .readers
+                .store(1, Ordering::Relaxed);
+            storage
+                .copy_retained_spill_roots(true, &mut retained)
+                .unwrap();
+            assert_eq!(retained, [handle(1)]);
+            drop(replacement);
+            scans.clear();
+            points.clear();
+            storage
+                .copy_retained_spill_roots(true, &mut retained)
+                .unwrap();
+            assert!(retained.is_empty());
+            assert!(storage.spill_roots.take_reclamation_pending());
+            assert!(
+                pool.slots
+                    .iter()
+                    .all(|slot| !slot.retained.load(Ordering::Acquire)
+                        && slot.readers.load(Ordering::Relaxed) == 0)
+            );
+        });
+    }
+
+    #[test]
     fn query_sst_roots_release_failed_capture_without_partial_pins() {
         let mut config = test_config();
         config.max_spill_generations_per_table = 2;
@@ -497,6 +1116,13 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(
                 pool.retain(&storage, table, 7).err().unwrap().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                pool.retain_point(&storage, table, 7)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
             assert!(
@@ -563,7 +1189,8 @@ mod tests {
             };
             let mut metadata_rows = 0;
             storage
-                .spill_merged_walk(table, rowids, &mut |rowid, _, _, lsn| {
+                .spill_merged_walk(table, rowids, &mut |rowid, source| {
+                    let lsn = source.version.commit_lsn;
                     assert_eq!((rowid, lsn), (1, 7));
                     storage.set_commit_snapshot(u64::MAX);
                     metadata_rows += 1;
@@ -576,7 +1203,7 @@ mod tests {
             );
             storage.set_commit_snapshot(7);
             let error = storage
-                .spill_merged_walk(table, rowids, &mut |_, _, _, _| {
+                .spill_merged_walk(table, rowids, &mut |_, _| {
                     Err(sql_err!(sqlstate::QUERY_CANCELED, "cancel retained scan"))
                 })
                 .unwrap_err();

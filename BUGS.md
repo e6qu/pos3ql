@@ -4,10 +4,10 @@ This file records only defects whose repair is prevented by an external blocker
 or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
-Reviewed for retained readers, statement and streaming COPY cleanup, SST source
-ownership, startup accounting, metadata ALTER publication, constraint validation, and reclamation on
-2026-10-12: no defects
-meet these inclusion criteria.
+The documentation review on 2026-10-12 checked current claims against the
+implemented behavior, compatibility limits, and remaining plan. No known
+defects meet this file's inclusion criteria. This does not mean all planned
+work is finished or that every possible bug has been ruled out.
 Resolved investigations are indexed in [history](docs/history/README.md).
 
 For a new entry, include a reproducer, affected boundary, observed behavior,

@@ -1,6 +1,24 @@
-# Logical replication boundary
+# Copying table changes with logical replication
 
-pos3ql implements PostgreSQL 18 logical replication where the protocol can be derived from object-native commits. Its local WAL is a checksummed journal, not PostgreSQL physical XLOG; PostgreSQL heap pages, physical replication, and logical decoding of prepared transactions are deliberately rejected.
+Logical replication sends table changes to a separate database using
+PostgreSQL's publication/subscription protocol. Each database saves its own
+data. The subscriber can lag behind the publisher; reading it immediately after
+an order update does not guarantee that the update has arrived.
+
+**User example:** on a publisher with an existing `orders` table, an authorized
+role can select that table for replication:
+
+```sql
+CREATE PUBLICATION orders_feed FOR TABLE orders;
+```
+
+A subscriber needs matching table definitions, connection credentials, and a
+subscription to `orders_feed`. Bootstrap copies the initial rows; later commits
+send changes. The publisher and subscriber paths are tested with real PostgreSQL.
+This is not a physical PostgreSQL standby or a second writer sharing one prefix.
+
+pos3ql's recovery journal is not PostgreSQL physical XLOG. Physical replication
+and logical decoding of prepared transactions are explicitly rejected.
 
 ## Publisher
 
@@ -12,7 +30,12 @@ pos3ql implements PostgreSQL 18 logical replication where the protocol can be de
 
 ## Subscriber
 
-A subscription imports the exported snapshot with binary COPY, then applies ordinary and streamed pgoutput transactions. Its local row changes and publisher frontier commit together before feedback acknowledges the remote LSN. Definition generations prevent a delayed worker from advancing a replaced stream. Managed slot cleanup remains durable work across crashes.
+A subscription copies the publisher's initial snapshot with binary COPY, then
+applies ordinary and streamed pgoutput transactions. It saves local row changes
+and its publisher progress together before acknowledging that progress. If it
+crashes and restarts, it must not claim to have saved a transaction it lost.
+Definition generations prevent a delayed worker from advancing a replaced
+stream. Managed slot cleanup remains durable work across crashes.
 
 ## SQL and monitoring
 

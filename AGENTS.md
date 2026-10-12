@@ -16,6 +16,7 @@ Leave every file better than you found it. Fix every bug you encounter, includin
 - Object storage is the durable tier. RAM and disk are caches. Do not add provider-specific behavior above the provider-neutral storage contract.
 - Spell names out as defined in [docs/terminology.md](docs/terminology.md).
 - Keep comments and docs concise. Explain non-obvious invariants and externally visible behavior, not a line-by-line restatement of code.
+- Write user guidance in plain language. Explain technical terms at first use, add concrete user examples, and distinguish current behavior from future goals. Preserve exact limits, errors, and provenance in technical guides.
 
 ## Change rules
 

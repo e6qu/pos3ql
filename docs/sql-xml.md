@@ -1,4 +1,18 @@
-# PostgreSQL 18 SQL/XML boundary
+# Querying XML values
+
+**User example:** read order IDs and names from an XML document:
+
+```sql
+SELECT * FROM XMLTABLE(
+  '/orders/order' PASSING
+    ('<orders><order id="1"><name>Gift</name></order></orders>'::xml)
+  COLUMNS id integer PATH '@id', name text PATH 'name');
+```
+
+This returns one row with `id = 1` and `name = 'Gift'`. The supported XPath
+subset includes these child paths and attributes. Expressions using other
+axes, operators, or functions must fail explicitly; full XPath compatibility
+is not implemented. Exact supported forms and capacities are listed below.
 
 pos3ql models PostgreSQL's `xml` and `xml[]` types as validated UTF-8 XML
 spelling. The original value is retained for casts to `text`; XML text and

@@ -18,19 +18,36 @@ Keep PLAN.md focused on open gates and acceptance criteria; BUGS.md contains
 only blocked defects. Preserve completed investigations in PRs and the
 [history index](docs/history/README.md), without appending progress journals.
 
+## Write documentation people can use
+
+Begin with what the reader can do, what happens, and what the limits mean.
+Explain technical terms at first use and add a small example from the user's
+point of view. Mark future behavior as a goal rather than implying it works.
+
+For example, explain that “a confirmed order survives loss of the server's
+disk in object-store mode” before detailing journal publication and
+compare-and-swap. For a capacity limit, say which operation fails, whether the
+limit is configurable, and when a change takes effect. Keep exact formats,
+numbers, error codes, and source provenance in the appropriate technical guide.
+
+Use the documentation index to avoid repeating the same contract across files.
+Preserve dated measurements and upstream licenses; simplify current guidance
+without rewriting historical evidence.
+
 ## Engineering boundaries
 
 - Match vanilla PostgreSQL strictly at SQL, SQLSTATE, wire, and catalog inputs
   and outputs. Unsupported client-visible behavior must fail explicitly.
-- Fix classes of bugs through types, parse boundaries, and shared publication
-  paths. Do not accept and ignore behavior or introduce silent fallbacks.
+- Fix repeated causes through types, input validation, and common update paths.
+  Do not accept and ignore behavior or introduce silent fallbacks.
 - Charge runtime buffers and pools exactly at startup. No growing collections,
   heap allocation, or allocating sorts after the runtime memory freeze.
   Exhaustion names the capacity. Object-store TLS is isolated and budgeted.
 - Keep durable data in object storage and cache state disposable. Provider
   behavior belongs in the shared object-store contract, not database logic.
-- Preserve MVCC, lock ordering, durable acknowledgement, retry ownership,
-  reader lifetimes, and backpressure when changing concurrency.
+- When changing concurrency, preserve which versions transactions see, lock
+  order, durable success responses, safe retries, reader lifetimes, and bounded
+  queues. The [glossary](docs/terminology.md) defines the technical terms.
 - A format change follows the [migration contract](docs/durable-format.md).
   Preserve old readers and provenance until a verified migration permits removal.
 
@@ -40,7 +57,7 @@ explicit policy decision and memory-accounting review.
 
 ## Development and resource policy
 
-Use the Rust toolchain exercised by CI. PostgreSQL 18 supplies the SQL oracle;
+Use the Rust toolchain exercised by CI. PostgreSQL 18 supplies reference results;
 external suites also use Python 3, Docker, and the client tools installed by
 the workflow that owns the check. The release target is Linux x86-64; the event
 loop also contains macOS support. See `Cargo.toml`, `examples/dev.conf`, and

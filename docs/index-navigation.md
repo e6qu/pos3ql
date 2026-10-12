@@ -1,4 +1,30 @@
-# Immutable specialized-index navigation
+# Finding rows without reading every storage object
+
+Indexes narrow the data that a query needs to inspect. pos3ql builds them in
+immutable objects rather than PostgreSQL index pages. This guide describes
+specialized indexes; the [compatibility table](postgresql-18-compatibility.md#physical-access-paths)
+also lists btree and hash behavior.
+
+**User example:** to find orders containing a tag:
+
+```sql
+CREATE TABLE tagged_orders (id integer PRIMARY KEY, tags text[]);
+INSERT INTO tagged_orders VALUES (1, ARRAY['urgent']), (2, ARRAY['gift']);
+CREATE INDEX tagged_orders_tags ON tagged_orders USING gin (tags);
+SELECT id FROM tagged_orders WHERE tags @> ARRAY['urgent'];
+```
+
+The result is order `1`. For a sufficiently large table and eligible plan, GIN
+can use the `urgent` token to narrow candidate rows. It still checks the actual
+array and transaction visibility, so approximate summaries or token collisions
+cannot change the answer. A small table may use a sequential scan instead.
+
+Spatial indexes similarly use bounding boxes to skip regions that cannot match;
+range indexes skip disjoint intervals. “Pruning” means safely skipping such
+data. The sections below specify the saved summaries, exact checks, and memory
+limits used to do this.
+
+## How objects are organized
 
 GiST point, box, polygon, and circle classes and SP-GiST quad-point, k-d point,
 box, and polygon classes use bounding-box summaries. GIN array, `tsvector`,
@@ -109,6 +135,14 @@ the SQL oracle in `tests/external/differential/173_geometric_navigation.sql`
 through `176_gin_postings.sql`. Warm-memory and cold-object performance
 artifacts cover every signature, posting, and interval operator-class path
 independently.
+
+## Nearest results and when early stopping is safe
+
+**User example:** a location search asks for the nearest ten points using
+`ORDER BY location <-> '(0,0)'::point LIMIT 10`. Eligible geometric indexes
+can stop exploring regions too far away to change that top ten. If the query
+also filters results or skips locked rows, early stopping could leave fewer
+than ten valid matches. Those cases retain complete exact ordering.
 
 Finite unfiltered `<-> point` limits on built-in geometric GiST and SP-GiST
 classes use a bounded depth-first branch-and-bound cursor. Children are visited

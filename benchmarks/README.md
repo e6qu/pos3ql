@@ -1,16 +1,22 @@
 # Retained benchmark evidence
 
+**User example:** to compare an old result with a new run, first match the
+commit, row count, clients, hardware, and storage. A faster number from a
+different setup does not establish that today's database became faster.
+The reports below keep their original observations and caveats.
+
 These dated runs preserve their original workload, revision/binary hashes,
 service/storage provenance, raw JSON, and derived reports. They are exploratory
 measurements on the stated hosts, not current production guarantees. Use
 [performance.md](../docs/performance.md) to run the harness and
 [PLAN.md](../PLAN.md) for outstanding representative qualification.
 
-The resource-matched matrix retains both stock PostgreSQL 18 controls for each
-fixture, MinIO, and SeaweedFS leg. PostgreSQL uses its ordinary local durable
-tier. MinIO and SeaweedFS here are same-host services, not independently operated
-storage. Different operation counts and generation shapes limit timing ratios;
-request metrics describe each engine's actual persistence design.
+The matrix keeps two vanilla PostgreSQL 18 comparisons for each fixture,
+MinIO, and SeaweedFS run: available host resources and the same CPU/memory
+allowance as pos3ql. PostgreSQL saves data on ordinary local storage. MinIO and
+SeaweedFS run on the same test host. Different operation counts and saved data
+layouts limit timing comparisons; request metrics describe the actual storage
+work performed.
 
 ## Comparison evidence
 

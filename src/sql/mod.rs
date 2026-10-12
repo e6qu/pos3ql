@@ -5989,7 +5989,7 @@ impl Engine {
             if self
                 .commit_altered_tables
                 .iter()
-                .any(|&(altered, _)| altered == table)
+                .any(|&(altered, rewrote_rows)| altered == table && rewrote_rows)
             {
                 self.storage
                     .commit_rewritten_row(table, rowid, txn.txid, commit_lsn)?;

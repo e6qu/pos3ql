@@ -25,7 +25,7 @@ transactions within that process must execute concurrently.
 | Compatibility | Broad PostgreSQL 18 SQL, catalogs, types, procedures, wire, drivers, dump/restore, and explicit command disposition | Preserve accepted shapes and explicit limits through the remaining changes |
 | Persistence | Durable response barriers, checkpoints, indexes, caches, paced maintenance, and cold recovery | Preserve these guarantees under concurrent execution and representative load |
 | Operations | Writer fencing, backups, independent-prefix export, point-in-time recovery, probes, credential rotation, packages, and passive promotion | Qualify multi-host recovery and failover with real routing and independent storage |
-| Concurrency | Private statement workspaces; synchronized catalogs, serial positions, row maps/version readers, retained query/DML definitions, and heap byte ownership | Qualify retained-reader regressions; table lifecycle, reader retirement, engine publication, and fixed execution workers |
+| Concurrency | Private statement workspaces; synchronized catalogs, serial positions, row maps/version readers, retained query/DML definitions, and heap byte ownership | Owned point reads; table lifecycle, reader retirement, engine publication, and fixed execution workers |
 | Performance | Fixture, MinIO, and SeaweedFS harness with host-available and CPU/memory-matched vanilla PostgreSQL 18 controls | Repeated representative runs and published raw evidence |
 
 Execution remains serial. Guarded reads and retained images are prerequisites;
@@ -51,7 +51,9 @@ contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime
   complete object version source rather than the current logical row scan.
 - Complete table lifecycle, statistics, and engine publication ownership. Shared
   committed row publication and snapshot pruning use guarded table revisions,
-  version/row metadata, and snapshot-aware value caches; transaction-wide durable
+  version/row metadata, and snapshot-aware value caches. Metadata-only ALTER
+  preserves existing row images and immutable roots while validating committed
+  and transaction-owned rows; transaction-wide durable
   publication still needs coordinated ownership.
 - Qualify physical reclamation against executing statement leases and retained
   transaction snapshots before enabling concurrency. Statement scopes capture
@@ -60,9 +62,10 @@ contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime
   bounded pins or reader epochs. Qualify identity reuse, rollback, and publication failure before enabling
   physical maintenance.
 
-Acceptance: a retained reader permits an unrelated write to complete; failed
-publication preserves prior state; maintenance retains active images; bounded
-exhaustion, identity reuse, rollback, and cold recovery remain allocation-free.
+Acceptance: reader pools charge their complete startup inventory; a retained
+reader permits an unrelated write to complete; failed publication preserves prior
+state; maintenance retains active images; bounded exhaustion, identity reuse,
+rollback, and cold recovery remain allocation-free.
 
 ### 2. Concurrent object reads and maintenance
 

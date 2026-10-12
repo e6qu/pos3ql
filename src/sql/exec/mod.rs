@@ -65917,6 +65917,7 @@ fn alter_table_relation(
     }
 
     let has_rewrite = added_any || dropped_any || retyped_any || generated_changed;
+    let rewritten_rows = if has_rewrite { scratch.len() } else { 0 };
 
     let mut old_schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut old_schema);
@@ -65968,9 +65969,9 @@ fn alter_table_relation(
         Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
-    for i in 0..scratch.len() {
+    for i in 0..rewritten_rows {
         let (_, rowid, old_home) = scratch[i].local_parts();
-        let new_loc = if has_rewrite {
+        let new_loc = {
             // Build the new image in the statement arena so the heap borrow
             // (decoded text refs) ends before the heap append.
             let new_bytes: &[u8] = {
@@ -66088,39 +66089,6 @@ fn alter_table_relation(
                 Ok(x) => x,
                 Err(e) => return sql_fail(e),
             }
-        } else {
-            let crate::storage::RowReadSource::Snapshot(snapshot) = old_home else {
-                unreachable!("rewrite input retains an MVCC snapshot");
-            };
-            let image = match storage.read_row_snapshot(table_index, rowid, snapshot) {
-                Ok(image) => image,
-                Err(error) => return sql_fail(error),
-            };
-            match image.heap_loc() {
-                Some(loc) => loc,
-                None => {
-                    // The ALTER journals a full re-upsert of every row, so a
-                    // spilled row's bytes come back into the heap here; the
-                    // next checkpoint spills them again.
-                    let bytes = match storage.row_bytes(table_index, rowid, image, arena) {
-                        Ok(b) => b,
-                        Err(e) => return sql_fail(e),
-                    };
-                    let copied = match arena.alloc_slice_copy(bytes) {
-                        Ok(c) => c,
-                        Err(_) => {
-                            return sql_fail(sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "ALTER rewrite exceeds the statement arena"
-                            ));
-                        }
-                    };
-                    match storage.heap.append_bytes(copied) {
-                        Ok(x) => x,
-                        Err(e) => return sql_fail(e),
-                    }
-                }
-            }
         };
         scratch[i] = PhysicalRow::staged(table_index, rowid, new_loc);
     }
@@ -66230,7 +66198,7 @@ fn alter_table_relation(
             &WalOp::BeginTableRewrite {
                 previous_schema: def.schema.as_str(),
                 previous_name: def.name.as_str(),
-                preserve_rows: false,
+                preserve_rows: !has_rewrite,
                 column_mapping: wal_column_mapping,
             },
         ) {
@@ -66240,7 +66208,7 @@ fn alter_table_relation(
         if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
             return sql_fail(e);
         }
-        for i in 0..scratch.len() {
+        for i in 0..rewritten_rows {
             let (_, rowid, new_home) = scratch[i].local_parts();
             let crate::storage::RowReadSource::StagedHeap(new_loc) = new_home else {
                 unreachable!("the rewrite pass re-homes every row to the heap");
@@ -66459,7 +66427,7 @@ fn alter_table_relation(
     }
 
     if let Err(error) =
-        storage.write_table_def(table_index, txn.txid, new_def, &column_mapping, true)
+        storage.write_table_def(table_index, txn.txid, new_def, &column_mapping, has_rewrite)
     {
         return sql_fail(error);
     }
@@ -66826,7 +66794,7 @@ fn alter_table_relation(
             }
         }
     }
-    for i in 0..scratch.len() {
+    for i in 0..rewritten_rows {
         let (_, rowid, new_home) = scratch[i].local_parts();
         let crate::storage::RowReadSource::StagedHeap(new_loc) = new_home else {
             unreachable!("the rewrite pass re-homes every row to the heap");

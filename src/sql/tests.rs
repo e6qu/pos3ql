@@ -70284,6 +70284,161 @@ fn statement_snapshot_leases_release_after_sql_success_and_failure() {
 }
 
 #[test]
+fn metadata_alter_commits_updates_while_unrelated_copy_retains_snapshot() {
+    let (mut engine, mut budget) = test_engine();
+    let mut writer = TxnState::new(&mut budget, 256).unwrap();
+    let mut copier = TxnState::new(&mut budget, 256).unwrap();
+    for sql in [
+        "CREATE TABLE metadata_target(id integer, value integer); CREATE TABLE metadata_copy(id integer); INSERT INTO metadata_target VALUES (1, 10)",
+        "BEGIN; UPDATE metadata_target SET value = 20; ALTER TABLE metadata_target ADD CONSTRAINT metadata_unique UNIQUE(id)",
+    ] {
+        let response = run_txn_bytes(&mut engine, &mut budget, &mut writer, sql);
+        assert!(
+            !message_types(&response).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+    let response = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut copier,
+        "BEGIN; COPY metadata_copy FROM STDIN",
+    );
+    assert!(
+        !message_types(&response).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let setup = engine.take_pending_copy().unwrap();
+    let snapshot = engine.storage.oldest_snapshot().unwrap();
+    let response = run_txn_bytes(&mut engine, &mut budget, &mut writer, "COMMIT");
+    assert!(
+        !message_types(&response).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let table = engine
+        .storage
+        .find_table("public", "metadata_target")
+        .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let state = engine.storage.resident_row_state(table, 1).unwrap();
+        let image = engine
+            .storage
+            .visible_row_home_at(
+                table,
+                1,
+                state,
+                copier.txid,
+                crate::storage::SNAPSHOT_ALL,
+                snapshot,
+            )
+            .unwrap()
+            .unwrap();
+        engine
+            .storage
+            .with_row_bytes(table, 1, image, |bytes| {
+                let mut values = [Datum::Null; 2];
+                crate::storage::rowenc::decode(
+                    bytes,
+                    &[ColType::Int4, ColType::Int4],
+                    &mut values,
+                )?;
+                assert_eq!(values, [Datum::Int4(1), Datum::Int4(10)]);
+                Ok(())
+            })
+            .unwrap();
+    });
+    engine.copy_abort(&mut copier, &GucState::new());
+    drop(setup);
+    run_txn(&mut engine, &mut budget, &mut copier, "ROLLBACK");
+    let response = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "SELECT value FROM metadata_target WHERE id = 1",
+    );
+    assert_eq!(data_rows(&response), ["20"]);
+    let response = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "INSERT INTO metadata_target VALUES (1, 30)",
+    );
+    assert!(message_types(&response).contains(&b'E'));
+    assert!(response.windows(5).any(|field| field == b"23505"));
+}
+
+#[test]
+fn metadata_alter_keeps_immutable_roots_and_survives_cold_recovery() {
+    let mut config = test_config("metadata-alter-roots");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-metadata-alter-roots-{}", std::process::id());
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let response = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE metadata_roots(id integer, value integer); INSERT INTO metadata_roots VALUES (1, 10)",
+    );
+    assert!(
+        !message_types(&response).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(engine.checkpoint().unwrap());
+    let table = engine
+        .storage
+        .find_table("public", "metadata_roots")
+        .unwrap();
+    let root = engine.storage.table(table).spill_ssts[0].unwrap();
+    engine.storage.evict_committed_table(table);
+    engine.storage.evict_redundant_entries(table);
+    let response = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE metadata_roots ADD CONSTRAINT metadata_roots_unique UNIQUE(id); ALTER TABLE metadata_roots ALTER COLUMN value SET DEFAULT 99",
+    );
+    assert!(
+        !message_types(&response).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(engine.storage.spill_generation_count(table), 1);
+    assert_eq!(engine.storage.table(table).spill_ssts[0], Some(root));
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, 1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let response = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value FROM metadata_roots WHERE id = 1; INSERT INTO metadata_roots(id) VALUES (2); SELECT value FROM metadata_roots WHERE id = 2",
+    );
+    assert!(
+        !message_types(&response).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(data_rows(&response), ["10", "99"]);
+    let response = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO metadata_roots VALUES (1, 30)",
+    );
+    assert!(message_types(&response).contains(&b'E'));
+    assert!(response.windows(5).any(|field| field == b"23505"));
+}
+
+#[test]
 fn statement_snapshot_leases_cover_streaming_copy_completion_and_abort() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();

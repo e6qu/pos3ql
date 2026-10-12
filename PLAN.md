@@ -51,7 +51,8 @@ contracts are in the [implemented baseline](docs/implemented-baseline.md#runtime
   complete object version source rather than the current logical row scan.
 - Complete table lifecycle, statistics, and engine publication ownership. Shared
   committed row publication and snapshot pruning use guarded table revisions,
-  version/row metadata, and snapshot-aware value caches; transaction-wide durable
+  version/row metadata, and snapshot-aware value caches. Metadata-only ALTER
+  preserves existing row images and immutable roots; transaction-wide durable
   publication still needs coordinated ownership.
 - Qualify physical reclamation against executing statement leases and retained
   transaction snapshots before enabling concurrency. Statement scopes capture

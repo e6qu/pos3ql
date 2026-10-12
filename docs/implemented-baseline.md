@@ -65,7 +65,10 @@ table or Storage owner is retired. Capturing or releasing a source holds shared
 registry state briefly; object I/O and scan callbacks do not hold that registry.
 Scans capture resident row identities, the saved-file list, schema, and read
 position under one ordered transition before running callbacks. Metadata and
-byte phases use that captured partition. Checkpoint cursors follow the same
+byte phases use that captured partition. Rows kept in the in-memory map also
+resolve saved versions from those files; changing a file's position in the live
+list cannot redirect a selected read. Version ownership ends before object I/O.
+Checkpoint cursors follow the same
 capture order. Preserving resident row images through table removal and memory
 relocation remains planned work before concurrent execution is enabled.
 

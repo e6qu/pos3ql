@@ -1704,7 +1704,7 @@ mod tests {
             }
             scan.roots
                 .with_view(|source| {
-                    assert_eq!(source.handles, roots[..2]);
+                    assert_eq!(source.handles, &roots[..2]);
                     Ok(())
                 })
                 .unwrap();

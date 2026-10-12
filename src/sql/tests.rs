@@ -332,7 +332,7 @@ fn visible_row_heap_ownership_command_exhaustion_allows_rollback() {
 
 #[test]
 fn visible_row_heap_ownership_transaction_exhaustion_rejects_wire_statement() {
-    let (mut engine, mut budget) = test_engine();
+    let (mut engine, budget) = test_engine();
     engine.next_txid = u32::MAX;
     let output = run_with_fixed_memory(
         &mut engine,

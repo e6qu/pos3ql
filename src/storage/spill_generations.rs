@@ -5,9 +5,7 @@ use core::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::{
-    ColType, MAX_COLUMNS, RelationPersistence, SpillReader, Storage, table_slot_capacity,
-};
+use super::{ColType, MAX_COLUMNS, RelationPersistence, SpillReader, Storage, table_slot_capacity};
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
@@ -753,10 +751,7 @@ mod tests {
             );
             storage.collapse_spill(table, replacement);
             assert_eq!(snapshot.relation().handle(0), original);
-            assert_eq!(
-                storage.table(table).spill_ssts[0].unwrap(),
-                replacement
-            );
+            assert_eq!(storage.table(table).spill_ssts[0].unwrap(), replacement);
             storage.drop_table(table);
             assert_eq!(
                 snapshot.validate(&storage, table).unwrap_err().sqlstate,

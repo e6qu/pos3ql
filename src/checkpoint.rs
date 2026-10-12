@@ -729,8 +729,10 @@ impl TemporarySpiller {
             return Ok(None);
         };
         let generation = storage.table(slot).generation();
-        let delta = storage.table(slot).n_spill_ssts > 0
-            && storage.table(slot).n_spill_ssts < storage.table(slot).spill_ssts.len();
+        let delta = {
+            let generations = storage.table(slot).spill_generations();
+            !generations.is_empty() && generations.len() < generations.capacity()
+        };
 
         sort_scratch.clear();
         storage.for_each_row_state(slot, &mut |rowid, state| {
@@ -866,14 +868,15 @@ impl TemporarySpiller {
             {
                 continue;
             }
-            for handle in table.spill_ssts.iter().take(table.n_spill_ssts).flatten() {
+            let generations = table.spill_generations();
+            for member in generations.iter() {
                 if self.handles.len() == self.handles.capacity() {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "temporary spill handle roster exceeds its fixed capacity"
                     ));
                 }
-                self.handles.push(*handle);
+                self.handles.push(member.handle);
             }
         }
         self.handles.sort_unstable_by_key(|handle| handle.roster);
@@ -7514,7 +7517,7 @@ impl Checkpointer {
         }
         for (slot, list) in self.prev_ssts.iter().enumerate() {
             if list.n > 0 {
-                storage.set_spill_list_from_iter(slot, list.n, list.iter().map(|p| p.handle));
+                storage.set_spill_list_from_iter(slot, list.n, list.iter().map(|p| p.handle))?;
             }
         }
         // Named indexes are serialized after tables, so establish the final
@@ -7959,14 +7962,15 @@ impl Checkpointer {
                 continue;
             }
             let table = storage.table(slot);
+            let generations = table.spill_generations();
             let matches_storage = table.live()
                 && {
                     let definition = table.definition();
                     definition.persistence
                 } != crate::storage::RelationPersistence::Temporary
-                && table.n_spill_ssts == published.n
+                && generations.len() == published.n
                 && (0..published.n).all(|index| {
-                    table.spill_ssts[index] == published.ssts[index].map(|prior| prior.handle)
+                    generations.handle(index) == published.ssts[index].map(|prior| prior.handle)
                 });
             if matches_storage {
                 continue;
@@ -11324,17 +11328,14 @@ impl Checkpointer {
                     handle,
                     through_lsn,
                 } => {
-                    storage.append_spill(slot, handle);
-                    let generation = storage.spill_generation_count(slot) - 1;
-                    storage.set_spill_generation_through(slot, generation, through_lsn);
+                    storage.append_spill_through(slot, handle, through_lsn);
                 }
                 SlotInstall::Replace {
                     handle,
                     through_lsn,
                 } => {
                     if let Some(handle) = handle {
-                        storage.collapse_spill(slot, handle);
-                        storage.set_spill_generation_through(slot, 0, through_lsn);
+                        storage.collapse_spill_through(slot, handle, through_lsn);
                     } else {
                         storage.set_spill_list(slot, &[]);
                     }
@@ -11447,7 +11448,7 @@ impl Checkpointer {
         // Filled rosters must use the version-preserving paced merge first.
         if storage.has_active_snapshots()
             && !clean
-            && storage.table(slot).n_spill_ssts > 0
+            && !storage.table(slot).spill_generations().is_empty()
             && !delta
         {
             return Err(sql_err!(

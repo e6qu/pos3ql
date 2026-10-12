@@ -1,0 +1,29 @@
+name: Spill generation qualification
+on:
+  push:
+    branches: [codex/guarded-spill-generation-publication]
+concurrency:
+  group: spill-generation-qualification-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  retained-storage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --lib --locked guarded_spill_generations -- --test-threads=1 --nocapture
+      - run: cargo test --lib --locked retained_object_rows -- --test-threads=1 --nocapture
+      - run: cargo test --lib --locked query_sst_roots -- --test-threads=1 --nocapture
+      - run: cargo test --lib --locked row_read_ownership -- --test-threads=1 --nocapture
+      - run: cargo test --lib --locked startup_bounded -- --test-threads=1 --nocapture

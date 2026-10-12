@@ -30832,7 +30832,8 @@ impl Storage {
     /// borrows the heap; a spilled row is fetched into the spill reader's own
     /// scratch for the duration of the call. For consume-in-place readers
     /// (constraint scans) whose decoded values do not outlive the closure.
-    /// `f` must not fetch another spilled row (the scratch is singular).
+    /// Nested fetches use independent startup scratch; exhaustion reports
+    /// SQLSTATE 54000 instead of aliasing the outer callback's bytes.
     pub(crate) fn with_row_bytes<'image, R>(
         &self,
         table_slot: usize,

@@ -755,32 +755,69 @@ impl SpillGenerationImage {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SpillGenerationMetadata {
+    persistence: RelationPersistence,
+    table_slot: usize,
+    created_at: u64,
+    data_generation: u64,
+    commit_lsn: u64,
+}
+
+impl SpillGenerationImage {
+    fn metadata(&self) -> SpillGenerationMetadata {
+        SpillGenerationMetadata {
+            persistence: self.persistence,
+            table_slot: self.table_slot,
+            created_at: self.created_at,
+            data_generation: self.data_generation,
+            commit_lsn: self.commit_lsn,
+        }
+    }
+}
+
 pub(super) struct SpillSourceView<'a> {
     registry: &'a Arc<SpillRootRegistry>,
     pub(super) reader: Option<&'a Arc<SpillReader>>,
     handles: &'a [SstHandle],
-    image: &'a SpillGenerationImage,
+    metadata: SpillGenerationMetadata,
+    schema: &'a [ColType],
 }
 
 impl SpillSourceView<'_> {
+    fn image(&self) -> SpillGenerationImage {
+        let mut image = SpillGenerationImage::EMPTY;
+        image.persistence = self.metadata.persistence;
+        image.table_slot = self.metadata.table_slot;
+        image.created_at = self.metadata.created_at;
+        image.data_generation = self.metadata.data_generation;
+        image.commit_lsn = self.metadata.commit_lsn;
+        image.n_columns = self.schema.len();
+        image.schema[..self.schema.len()].copy_from_slice(self.schema);
+        image
+    }
+
     pub(super) fn relation(&self) -> SpillRelation<'_> {
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        schema[..self.schema.len()].copy_from_slice(self.schema);
         SpillRelation {
-            persistence: self.image.persistence,
-            schema: self.image.schema,
-            n_columns: self.image.n_columns,
+            persistence: self.metadata.persistence,
+            schema,
+            n_columns: self.schema.len(),
             handles: self.handles,
         }
     }
 
     pub(super) fn commit_lsn(&self) -> u64 {
-        self.image.commit_lsn
+        self.metadata.commit_lsn
     }
 }
 
 pub(super) struct StatementSpillRoots<'a> {
     registry: Arc<SpillRootRegistry>,
     reader: Option<Arc<SpillReader>>,
-    image: &'a SpillGenerationImage,
+    metadata: SpillGenerationMetadata,
+    schema: &'a [ColType],
     handles: &'a [SstHandle],
 }
 
@@ -791,12 +828,15 @@ impl<'a> StatementSpillRoots<'a> {
         generations: &SpillGenerationList,
         arena: &'a crate::mem::arena::Arena,
     ) -> Result<Self, SqlError> {
-        let image = arena.alloc(image).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "retained scan schema exceeds the statement arena"
-            )
-        })?;
+        let metadata = image.metadata();
+        let schema = arena
+            .alloc_slice_with(image.n_columns, |index| image.schema[index])
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "retained scan schema exceeds the statement arena"
+                )
+            })?;
         let handles = arena
             .alloc_slice_with(generations.len(), |index| {
                 generations.handle(index).expect("complete generation list")
@@ -813,7 +853,8 @@ impl<'a> StatementSpillRoots<'a> {
         Ok(Self {
             registry: Arc::clone(&storage.spill_roots),
             reader: storage.spill.as_ref().map(Arc::clone),
-            image,
+            metadata,
+            schema,
             handles,
         })
     }
@@ -823,7 +864,8 @@ impl<'a> StatementSpillRoots<'a> {
             registry: &self.registry,
             reader: self.reader.as_ref(),
             handles: self.handles,
-            image: self.image,
+            metadata: self.metadata,
+            schema: self.schema,
         }
     }
 }
@@ -832,7 +874,7 @@ impl Drop for StatementSpillRoots<'_> {
     fn drop(&mut self) {
         self.registry.release(
             self.handles,
-            self.image.persistence != RelationPersistence::Temporary,
+            self.metadata.persistence != RelationPersistence::Temporary,
         );
     }
 }
@@ -960,7 +1002,8 @@ impl SpillGenerationSnapshot {
             registry: self.registry.as_ref().expect("captured source registry"),
             reader: self.reader.as_ref(),
             handles: &self.handles,
-            image: &self.image,
+            metadata: self.image.metadata(),
+            schema: &self.schema[..self.n_columns],
         }
     }
 
@@ -973,7 +1016,7 @@ impl SpillGenerationSnapshot {
                 self.handles.capacity()
             ));
         }
-        self.image = *source.image;
+        self.image = source.image();
         for &handle in source.handles {
             self.handles.push(handle);
         }
@@ -1726,11 +1769,11 @@ mod tests {
         let mut scans = Vec::with_capacity(count);
         let source_capacity = storage.query_roots.slots_per_use;
         let mut leases = Vec::with_capacity(source_capacity);
-        let mut small_budget = Budget::new(size_of::<SpillGenerationImage>() + 64);
+        let mut small_budget = Budget::new(size_of::<ColType>());
         let small = crate::mem::arena::Arena::new(
             &mut small_budget,
             "partial scan source",
-            size_of::<SpillGenerationImage>() + 64,
+            size_of::<ColType>(),
         )
         .unwrap();
         let mut copied = Vec::with_capacity(3);

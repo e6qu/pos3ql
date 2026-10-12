@@ -31855,6 +31855,8 @@ impl Storage {
             .loc
             .map(|location| {
                 self.pin_visible_home(
+                    table_index,
+                    rowid,
                     RowSnapshot {
                         created_at: table.created_at(),
                         version: row_images::RowVersionIdentity::Pending(head),

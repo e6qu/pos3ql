@@ -286,17 +286,20 @@ impl QueryRootPool {
 
 impl QueryRootLease {
     pub(super) fn try_clone(&self) -> Result<Self, SqlError> {
-        self.pool.slots[self.slot]
-            .readers
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                count.checked_add(1)
-            })
-            .map_err(|_| {
+        let readers = &self.pool.slots[self.slot].readers;
+        let mut count = readers.load(Ordering::Relaxed);
+        loop {
+            let next = count.checked_add(1).ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "query SST source reader count exhausted"
                 )
             })?;
+            match readers.compare_exchange_weak(count, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(current) => count = current,
+            }
+        }
         Ok(Self {
             pool: Arc::clone(&self.pool),
             slot: self.slot,
@@ -783,10 +786,14 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let super::super::VisibleRowBytes::Spilled(deferred) = deferred.bytes else {
-                panic!("historical deletion must resolve from objects")
-            };
-            assert_point_value(&deferred, &arena, 17);
+            assert_eq!(
+                deferred.snapshot().version,
+                super::super::row_images::RowVersionIdentity::Committed(7)
+            );
+            let bytes = storage.row_bytes(table, 2, deferred, &arena).unwrap();
+            let mut values = [crate::sql::types::Datum::Null];
+            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values).unwrap();
+            assert_eq!(values, [crate::sql::types::Datum::Int4(17)]);
             let registry = Arc::clone(&storage.spill_roots);
             storage.set_spill_list(table, &[roots[2]]);
             storage.drop_table(table);
@@ -820,7 +827,7 @@ mod tests {
                 })
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::QUERY_CANCELED);
-            drop((state, deleted, current, old, deleted_old, deferred));
+            drop((state, deleted, current, old, deleted_old));
             registry.copy_roots(false, &mut retained).unwrap();
             assert!(retained.is_empty());
         });

@@ -1,13 +1,27 @@
-# Documentation index
+# Find the guide you need
+
+Start with the [overview](../README.md) for where the project is today and the
+[plan](../PLAN.md) for what remains. The guides below describe current behavior;
+an example of a future goal is labeled as remaining work in the plan.
+
+| Your question | Start here |
+|---|---|
+| Can my application use this PostgreSQL feature? | [Compatibility and limits](postgresql-18-compatibility.md) |
+| How do I install, monitor, or replace a server? | [Installation](../packaging/README.md), [operations](operations.md) |
+| How do I recover an earlier state or copy the database? | [Backup and restore](backup-restore.md) |
+| What happens if the local disk or object store fails? | [Object storage](object-storage.md) |
+| Will an upgrade read my existing data? | [Durable formats](durable-format.md) |
+| How do I compare speed and resource use with PostgreSQL? | [Performance](performance.md) |
+| What does an unfamiliar term mean? | [Glossary](terminology.md) |
 
 ## Current guidance
 
-| Document | Owns |
+| Document | What it explains |
 |---|---|
-| [Project overview](../README.md) | Architecture, status, and first run |
-| [Roadmap](../PLAN.md) | Open gates, implementation sequence, and acceptance criteria |
-| [Implemented baseline](implemented-baseline.md) | Summary of current capabilities |
-| [PostgreSQL 18 compatibility](postgresql-18-compatibility.md) | SQL/wire scope, capacity inventory, and non-goals |
+| [Project overview](../README.md) | Purpose, status, destination, and first run |
+| [Roadmap](../PLAN.md) | Remaining work, its order, and how we know it is done |
+| [What works today](implemented-baseline.md) | Current behavior and concurrency preparation |
+| [PostgreSQL 18 compatibility](postgresql-18-compatibility.md) | Supported behavior, capacity limits, and features outside the design |
 | [Contributing](../CONTRIBUTING.md) | Development, verification, and PR workflow |
 | [Agent rules](../AGENTS.md) | Required engineering and change rules |
 | [Terminology](terminology.md) | Naming and glossary |
@@ -34,9 +48,8 @@
 - [Retained benchmarks](../benchmarks/README.md): dated raw artifacts and reports.
 - [Implementation history](history/README.md): immutable implementation records and completed investigations.
 - Fixture generation: `tests/data/README.md` in the source repository.
-- Upstream corpora and checksums: `vendor/README.md` and `vendor/SHA256SUMS`.
+- Original third-party tests and checksums: `vendor/README.md` and `vendor/SHA256SUMS`.
 
-Keep current behavior in its owning document and unfinished work in PLAN.md.
-Completed investigations belong in PRs and the history index. Preserve original benchmark
-artifacts and upstream provenance; link them rather than rewriting observations
-as current production claims.
+Keep current behavior in the guide that explains it and unfinished work in
+PLAN.md. Preserve original measurements, third-party sources, and completed
+investigations; their dates and revisions matter when interpreting a result.

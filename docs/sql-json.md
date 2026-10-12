@@ -1,6 +1,21 @@
-# PostgreSQL 18 SQL/JSON boundary
+# Querying JSON values
 
-pos3ql implements PostgreSQL 18 SQL/JSON as typed SQL and wire behavior, not as text aliases. `json` preserves lexical spelling and duplicate keys; `jsonb` uses canonical object semantics; `jsonpath` is parsed and validated at every input boundary and stored in canonical text form.
+JSON values keep their PostgreSQL types when stored, sent through a driver,
+or recovered. `json` preserves the original spelling and duplicate keys;
+`jsonb` normalizes objects; `jsonpath` stores a validated path expression.
+
+**User example:** extract a typed order ID, with a stated choice for a missing
+field:
+
+```sql
+SELECT JSON_VALUE('{"order_id":"12"}', '$.order_id' RETURNING integer);
+SELECT JSON_VALUE('{}', '$.order_id' RETURNING integer DEFAULT 7 ON EMPTY);
+```
+
+These return integers `12` and `7`. The default is requested by the SQL
+expression. Invalid paths and unsupported behavior are not silently accepted.
+For multi-row documents, `JSON_TABLE` turns selected values into rows you can
+join, filter, or insert like other query results.
 
 ## Supported surface
 
@@ -33,4 +48,8 @@ Catalog identities, grammar, evaluation behavior, error SQLSTATEs, and binary fo
 - [JSON and JSONB SQL functions](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/adt/jsonfuncs.c)
 - [JSONB representation utilities](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/adt/jsonb_util.c)
 
-The conformance ratchets are `tests/external/differential/147_sql_json.sql` and `tests/external/differential/183_json_value_width.sql`, backed by PostgreSQL 18.4 and 18.6 respectively. Flat and nested JSON_TABLE paths cross the former 256-row bound against PostgreSQL 18. The generated differential fuzzer also emits path operators/functions, aggregates, subscripts, lateral set-returning queries, and `JSON_TABLE`; raw-wire and type-fidelity probes cover binary and catalog metadata.
+The comparison tests are `tests/external/differential/147_sql_json.sql` and
+`tests/external/differential/183_json_value_width.sql`, backed by PostgreSQL 18.4
+and 18.6 respectively. They cover ordinary paths and JSON_TABLE results beyond
+256 rows. Generated queries also exercise path functions, aggregates,
+subscripts, and `JSON_TABLE`; wire tests check binary values and catalog types.

@@ -1,5 +1,10 @@
 # Installing the release archive
 
+**User example:** install a release on a Linux x86-64 host, configure where
+it saves data, and check readiness before sending application traffic. The
+starter configuration does not make an object store or credentials for you.
+The installed operations guide described below covers monitoring and replacement.
+
 The archive contains one Linux executable and its operator files. Create the
 `pos3ql` system user before installation. Replace `VERSION` with the downloaded
 release version, verify the adjacent checksum, and enter the extracted archive:
@@ -31,7 +36,8 @@ sudo systemctl enable --now pos3ql
 curl --fail http://127.0.0.1:9187/readyz
 ```
 
-See `share/doc/pos3ql/docs/README.md` for the documentation index and
+The installed archive includes its documentation. See
+`share/doc/pos3ql/docs/README.md` for the documentation index and
 `share/doc/pos3ql/docs/operations.md` for probes, credential rotation, alerts,
 and controlled replacement. The previous flat operator paths redirect there.
 

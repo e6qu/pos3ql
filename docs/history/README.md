@@ -1,8 +1,13 @@
 # Historical implementation records
 
-Current guidance is maintained as contracts and open completion gates. These
-immutable snapshots preserve earlier progress journals and original observations;
-they can describe limits since lifted or work since completed.
+Use the current guides and plan to decide what works now and what remains.
+The fixed revisions below preserve earlier plans, investigations, and original
+observations. A statement in an old snapshot may describe a limit since removed
+or work since completed.
+
+For example, an old report showing costly checkpoint rewrites describes the
+binary and workload recorded there. It is evidence for that investigation,
+not a measurement of today's code.
 
 ## Original implementation record
 
@@ -32,6 +37,11 @@ profiling and row-version ownership investigation.
 [PR #605](https://github.com/e6qu/pos3ql/pull/605) retains issued-reader validation.
 [PR #606](https://github.com/e6qu/pos3ql/pull/606) records heap ownership and
 compaction repair, including [focused validation](https://github.com/e6qu/pos3ql/actions/runs/37767694197).
+
+[PR #623](https://github.com/e6qu/pos3ql/pull/623) records the retained-reader
+qualification and the fixes that keep metadata-only ALTER from needlessly
+rewriting rows while still enforcing uniqueness. Its full CI evidence covers
+the preparation merged in PRs #620–#622.
 
 For an offline checkout, use `git show REVISION:PATH` with the corresponding
 revision above. Use the current [roadmap](../../PLAN.md),

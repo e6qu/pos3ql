@@ -1,5 +1,15 @@
 # PostgreSQL 18 compatibility
 
+Use this guide before assuming that a PostgreSQL application or tool works
+unchanged. We compare SQL results, error codes, catalog metadata, and messages
+sent to clients with actual PostgreSQL. Broad support does not mean every
+PostgreSQL feature, query shape, or third-party extension is implemented.
+
+**User example:** `psql`, a driver, and `pg_restore` can exercise the tested
+paths. A PostgreSQL extension containing a C library cannot be installed just
+because its SQL installation command is recognized. Unsupported behavior must
+fail explicitly.
+
 Compatibility is verified at SQL, SQLSTATE, result shape/value, catalog, and
 wire boundaries. The server reports `18.4 (pos3ql 0.1)`; the vendored regression
 slice is pinned to PostgreSQL 18.6. Older fixtures retain their exact provenance.
@@ -45,6 +55,16 @@ layouts and custom native callbacks are not implemented.
 
 ## Capacity boundaries
 
+Some limits come from PostgreSQL, some are smaller implementation limits, and
+some are reservations you choose in the startup configuration. These are
+different promises. A wide query can be a supported SQL shape yet still need
+more statement memory than you reserved.
+
+**User example:** adding a 65th constraint of a modeled kind fails with
+SQLSTATE `54000` even if memory remains available. Filling `max_tables` also
+fails, but that reservation can be changed before the next startup. Increasing
+a startup reservation does not remove a durable-format limit.
+
 Named exhaustion is part of the fixed-memory contract. Explicit rejection of a
 smaller width does not make that width PostgreSQL-compatible. These principal
 boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
@@ -61,7 +81,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |
 | Executing snapshot retention | 1,024 owned statement snapshot slots per query workspace; separate transaction snapshots; checked 64-bit lease identities | Startup-owned registry; SQLSTATE 54000 before partial registration or identity reuse |
 | Query SST root retention | 64 source slots per query workspace; configured generation capacity per slot; shared unique-root capacity twice the startup table-slot × generation capacity | Startup-owned roots, schema, and reader buffers; SQLSTATE 54000 before partial capture |
-| Internal transaction identities | Checked 32-bit transaction identities and per-transaction command counters; exhaustion returns SQLSTATE 54000 before identity reuse or command advancement |
+| Internal transaction identities | Checked 32-bit transaction identities and per-transaction command counters | SQLSTATE 54000 before identity reuse or command advancement |
 | Statement memory | Retained heap/spilled row images, escaped query metadata, lists, joins, programs, retry logs, event graphs, JSON widths, table-function rows, and variable-width geometry | Fixed arenas; arena exhaustion is a program-limit error |
 | Value-specific limits | Full-text, XML/XPath, JSON/path nesting, rendered values, GUC bytes, and finite catalog identities | Typed source boundaries and specialized contracts below |
 
@@ -85,6 +105,11 @@ JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 accepted width can still exhaust its named statement or startup budget.
 
 ## Architecture boundaries and remaining gaps
+
+**User example:** an application can receive logically replicated order
+changes, but a PostgreSQL physical standby cannot replay pos3ql's journal.
+Similarly, familiar index names describe SQL behavior; they do not imply
+PostgreSQL's on-disk page layout.
 
 - Query execution is still serial. Workspace and catalog synchronization
   prepare for the [remaining concurrency work](../PLAN.md#remaining-sequence).

@@ -1,5 +1,15 @@
 # Durable format compatibility
 
+Use this guide when upgrading a database that already has saved objects.
+New binaries must recognize those objects before reading them, and older
+binaries may not recognize newly written formats. The table below states the
+actual supported readers and writers.
+
+**User example:** a current server can open a checkpoint written in manifest
+v13 and write v14 at its next checkpoint. Do not assume you can then downgrade
+to a binary that cannot read v14. No incompatible offline migration is currently
+available, and unknown formats stop startup explicitly.
+
 Object storage is the durable tier. Immutable objects may outlive the binary
 that wrote them, so every root and row SST carries a format identity that is
 checked before its bytes are interpreted. Unknown identities stop startup;
@@ -22,6 +32,22 @@ they never select a guessed decoder.
 | Published row SST | `v2` | yes | no | Compatible generations remain readable and are replaced when sliced or merged. |
 | Published row SST | `v3` | yes | no | Compatible packed PAX generations remain readable. |
 | Published row SST | `v4` | yes | yes | Current packed format: PAX full slices and row-packed deltas. |
+
+## Why the storage layout matters
+
+**User example:** an orders table has an ID, status, and a large description.
+A query that needs only IDs and statuses can read those column extents from
+a full PAX slice without fetching the description solely to decode each row.
+Small updates use packed row groups instead of writing a separate descriptor
+and column container for every small group.
+
+Packing shares objects across useful data ranges; ranged reads can fetch the
+needed extent. These mechanisms are implemented. Their effect on latency,
+downloaded bytes, and rewritten bytes must still be measured for representative
+workloads. They do not promise that every query reads only projected columns:
+filters and exact result checks can need more data.
+
+## Format details for implementers
 
 The manifest header versions the catalog and root record grammar. Each `dsst`
 manifest reference separately names its row SST format. `v2` uses direct
@@ -62,14 +88,14 @@ or retrying a write. A successor changes the fence before touching either root,
 then advances both root ETags before it can become active. The final active CAS
 is the ownership-transfer point; a failed or starved transition grants no new
 owner. Thus a request begun before promotion either lands and is preserved by
-the successor's rewrite, or arrives
-later with a stale ETag and
-fails. An interrupted transition is taken over and completed by the next
+the successor's rewrite, or arrives later with a stale ETag and fails.
+An interrupted transition is taken over and completed by the next
 startup.
 
 Commit-head v1 readers accept both legacy 64-bit writer labels and current
-128-bit process tokens. A prefix without `writer-fence` is promoted in place;
-its existing manifest and commit head remain byte-identical. Binaries that
+128-bit process tokens. A prefix without `writer-fence` is promoted in place.
+Its manifest and commit head gain the new writer identity; their referenced
+database state is preserved, but the root bytes and ETags change. Binaries that
 predate writer fencing must be stopped before this first promotion and must not
 subsequently open the prefix, because they do not participate in the fence.
 The current manifest writer line is 16 bytes wider than its legacy form and is

@@ -1,49 +1,74 @@
-# Performance and scaling boundary
+# Measuring performance and resource use
 
-pos3ql has a reproducible measurement harness, not a blanket production
-performance claim. The same dependency-free PostgreSQL v3 client drives
-pos3ql and PostgreSQL 18; every run records database identity, workload shape,
-latency and throughput summaries, and resource evidence as schema-versioned
-JSON. `tools/benchmark-report.py` derives a report from those raw files.
+The benchmark suite runs the same PostgreSQL client against pos3ql and
+PostgreSQL 18. Each run records the database, workload, response times,
+completed work, and resource use in versioned JSON files.
+`tools/benchmark-report.py` builds a report from those raw files.
+
+## What the numbers can tell you
+
+**User example:** an orders screen makes many small lookups while background
+work updates orders. Measure both the usual response time and the slow tail,
+with and without checkpoints. A good average can hide requests that users
+experience as stalls. A p95 of 20 ms means 95% of measured requests finished
+within 20 ms; p99 describes the slowest 1% boundary.
+
+| Your question | Measure |
+|---|---|
+| How quickly can users look up a cached order? | Warm-memory and warm-disk reads |
+| What happens after losing local caches? | Empty-cache recovery and first object reads |
+| Do background jobs stall users? | Mixed reads/writes with and without checkpoints |
+| Does an index reduce storage work? | Access paths, object requests, and bytes fetched |
+| Does the layout avoid expensive rewrites? | Bytes written for updates and maintenance relative to changed data |
+| Will more connections or workers help? | Completed work, latency, errors, CPU, and memory as concurrency changes |
+| How long until a replica shows an update? | Observed subscriber catch-up time |
+
+Compare with two vanilla PostgreSQL 18 controls: available host resources and
+an equal CPU/memory allowance. Both use ordinary local durable storage. pos3ql
+uses object storage, a network path, and local caches. Record those differences
+so someone choosing a database knows what was actually compared.
+
+Existing results use a fixture and same-host MinIO/SeaweedFS. They establish
+tested behavior and exploratory costs, not production speed or a provider
+ranking. Separate storage services, fixed hardware, repeated runs, and actual
+failover routing remain in [the plan](../PLAN.md).
 
 ## Current execution and evidence limits
 
-- One server process owns one writable database state and
-  serializes query execution. Startup-sized pools bound memory and make
-  saturation an explicit error. `query_workspace_slots` reserves independent
-  execution arenas and ordinary DML row-selection buffers. The dispatcher
-  leases both together through an exactly charged FIFO pool. The current
-  reactor still executes one statement at a time, so additional slots provide
-  state isolation and memory accounting rather than a throughput claim.
-  Logical subscription apply and bootstrap COPY use their worker-owned arena
-  and DML scratch instead of a client workspace.
-  Long-lived COPY streams keep transition rows in their connection's fixed
-  startup buffer, so interleaved clients do not share statement state.
-- Heap append/read overlap is an ownership capability, not concurrent query
-  execution. The [roadmap](../PLAN.md) requires reader/writer progress during
-  cold misses and maintenance before claiming worker scaling.
-- Object storage is durable; memory and local disk are disposable caches.
-  Immutable journal batches and a compare-and-swap commit head are published
-  before success reaches a client.
-- One reactor turn is the group-commit unit. Readable clients and statements
-  resumed after row-lock or object-read waits retain their response in their
-  fixed connection buffer, share one journal publication barrier, and only
-  then flush. A failed barrier replaces every guarded success response with an
-  explicit unknown-outcome error. No runtime queue or buffer grows.
-- Logical publications and subscriptions build independently durable read
-  copies. They are asynchronous logical replicas, not transparent
-  shared-storage replicas.
-- One writer incarnation owns an object prefix at a time. Starting another
-  process promotes it through the durable writer fence and causes later
-  publishes by the displaced process to fail. The packaged passive-candidate
-  monitor starts that promotion after bounded readiness failures. Ownership
-  leases and a read-only shared-snapshot protocol do not exist.
-- Eligible two-source equi-joins use a bounded hash build for physical tables,
-  synthesized catalogs, and derived tables, including external runs. NULL keys,
-  duplicate matches, residual ON predicates, and LEFT JOIN preservation share
-  one execution path. The fixed build-entry ceiling still bounds eligibility;
-  larger builds choose a nested-loop plan before execution.
+Statements still execute one at a time. `query_workspace_slots` reserves
+independent statement arenas and DML row-selection buffers, leased together
+through a fixed, ordered dispatcher pool. More slots isolate state and account
+for memory; they do not currently add execution throughput. Subscription apply
+and bootstrap COPY use separately owned buffers, and streaming COPY keeps
+transition rows in each connection's startup buffer. Heap reads can retain
+bytes while other bytes are appended, but that does not enable concurrent SQL.
+
+In durable mode, success waits for an immutable journal upload and an update
+of the commit head. Transactions completed in one event-loop turn can share
+that publication. Connections keep their responses in fixed buffers until it
+finishes, including statements resumed after lock or object-read waits. A
+failed publication replaces guarded success responses with an explicit
+unknown-outcome error. Buffers and queues do not grow at runtime.
+
+One active process writes to each object prefix. Starting a replacement
+transfers that ownership and prevents the old process from publishing further
+changes. The packaged monitor can start a passive candidate after repeated
+readiness failures. There is no time-based ownership lease or read-only
+shared-snapshot protocol. Logical subscribers are separate, asynchronous,
+independently durable databases.
+
+Eligible two-source equality joins use a bounded hash build for tables,
+catalogs, and derived results, including external runs. NULL keys, duplicate
+matches, extra ON conditions, and LEFT JOIN preservation share the same path.
+A build beyond the fixed entry ceiling chooses a nested-loop plan before
+execution. [The compatibility guide](postgresql-18-compatibility.md) records
+other SQL and capacity limits.
+
 ## Running the suite
+
+Run full builds, test gates, and large benchmark runs on dedicated or GitHub
+runners as described in [contributing](../CONTRIBUTING.md#development-and-resource-policy).
+The examples below are for those hosts.
 
 The smoke suite needs Rust, Python 3, and `nc`:
 
@@ -68,7 +93,7 @@ retains the same raw workload schema, and requires
 ```sh
 POS3QL_BENCH_ROWS=1000 POS3QL_BENCH_TABLE_CAPACITY=2048 \
 POS3QL_BENCH_OPERATIONS=50 POS3QL_BENCH_CLIENTS=4 \
-POS3QL_BENCH_DISK_CACHE_MIB=1024 POS3QL_BENCH_TIMEOUT_SECONDS=120 \
+POS3QL_BENCH_DISK_CACHE_MIB=1024 \
 tools/run-performance.sh checkpoint ./performance-results/checkpoint
 ```
 
@@ -151,8 +176,10 @@ can be overridden with `POS3QL_BENCH_ROWS`,
 fixed local disk block cache (default 128 MiB), and
 `POS3QL_BENCH_TIMEOUT_SECONDS` sets the per-query socket timeout (default 30
 seconds). Both settings are recorded in the environment manifest; the timeout
-also appears in each workload file. The capacity must cover both the setup
-rows and all rows inserted by the configured clients and operations.
+also appears in each workload file. A timeout is a failed measurement to
+investigate, not a result to improve by extending the deadline. The capacity
+must cover both the setup rows and all rows inserted by the configured clients
+and operations.
 Full mode requires at least four clients so its synchronized update workload
 can enforce the group-commit amplification bound; smaller values are rejected
 before measurement.
@@ -212,6 +239,12 @@ generation shapes prevent a controlled production timing ratio.
 
 ## Measured scenarios
 
+The labels below name exact harness workloads. “Warm” means data is already
+in a cache; “object-cold” means the path must read from object storage. A
+“covering” index contains the requested values so eligible reads need not fetch
+the table row. These are tested paths, not a promise that every SQL query will
+use them.
+
 | Scenario | Boundary measured |
 |---|---|
 | warm memory | Repeated hash-index point reads in the process that created and checkpointed the data |
@@ -250,6 +283,11 @@ instrumentation; production code never calls a private endpoint or a provider
 branch.
 
 ## CI policy
+
+CI checks correct answers, complete runs, memory use, and intended access paths.
+For example, an indexed order lookup must not become a full-table scan while
+still appearing fast on a tiny dataset. Hosted-runner timing is recorded, but
+absolute speed is not a pass/fail threshold on those noisy hosts.
 
 CI runs the smoke suite and retains all raw artifacts. It gates zero errors
 and complete operation counts, present and ordered percentiles, peak RSS no

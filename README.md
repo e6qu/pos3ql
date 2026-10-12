@@ -1,52 +1,69 @@
 # pos3ql
 
-pos3ql is a PostgreSQL-compatible database engine in Rust. SQL, catalogs, and
-the PostgreSQL v3 wire protocol define its client boundary. In durable mode,
-object storage holds the authoritative data; RAM and local disk are bounded,
-disposable caches.
+pos3ql is a database written in Rust that aims to work like PostgreSQL for
+applications and people using SQL. Its durable data lives in an S3-compatible
+object store. Memory and local disk hold caches that can be rebuilt.
 
-## Status
+## Where we are
 
-The engine implements broad PostgreSQL 18 SQL, types, procedural execution,
-client tooling, and logical replication. Compatibility is verified against
-actual PostgreSQL; unsupported behavior must fail explicitly. The
-[compatibility matrix](docs/postgresql-18-compatibility.md) records accepted
-forms, capacity limits, and architecture boundaries.
+Much of the database works today: SQL, transactions, PostgreSQL clients,
+indexes, logical replication, backups, and recovery. Tests compare results,
+errors, and client behavior with actual PostgreSQL 18. There are still
+[compatibility limits](docs/postgresql-18-compatibility.md); the PostgreSQL
+name alone is not a promise that every feature or extension works.
 
-Query execution still runs serially in one process. Independent statement
-workspaces and retained immutable images prepare for overlapping reads and
-writes with fixed workers. Representative production performance remains
-unqualified. [PLAN.md](PLAN.md) records the remaining work and completion gates.
+**Queries still execute one at a time in each server process.** The recent
+work protects data that a reader still needs while other work changes it.
+That is preparation for concurrent execution. We have not yet enabled several
+queries to execute together or demonstrated production performance and failover
+on separate machines.
 
-## Architecture
+For example, you can connect with `psql`, save a row, and recover it from object
+storage after losing both local caches. We still need to show that a slow report
+fetching uncached data lets another customer update an unrelated order promptly.
 
-- **Durability:** immutable commit batches and SST blocks, published through
-  compare-and-swap roots. Recovery can start with both local caches empty.
-- **Ownership:** one writer incarnation per object prefix. Promotion fences the
-  previous process before the replacement becomes active.
-- **Object storage:** one direct S3-compatible client for qualified endpoints,
-  with conditional PUT, full/ranged GET, paginated LIST, DELETE, signing, and
-  opaque entity tags. No provider-specific database behavior.
-- **Memory:** pools, queues, and execution buffers are charged at startup.
-  Exhaustion is a named error. Object-store TLS has an isolated allocation budget.
-- **Execution:** event-driven dispatch, MVCC, bounded locks and retries, and
-  deterministic fault simulation. Object-native btree, hash, BRIN, GiST, GIN,
-  and SP-GiST paths retain SQL and MVCC rechecks.
-- **Replication:** PostgreSQL logical publications and subscriptions create
-  independently durable copies. Physical PostgreSQL XLOG and shared-storage
-  replicas are outside the implemented boundary.
+See [what works today](docs/implemented-baseline.md) and the
+[remaining plan](PLAN.md) for the details and the evidence still needed.
 
-## Durability modes
+## Where we want to get
 
-| Configuration | Success acknowledgement | Survives local-disk loss |
+A database where you can:
+
+- Use familiar PostgreSQL SQL and client tools, with clear errors for features
+  we do not support.
+- Run reports and updates at the same time without incorrect results or a
+  slow storage request stopping unrelated work.
+- Trust a successful commit even if the database machine loses its local disk.
+- Replace a failed server, recover from object storage, and route clients to
+  the replacement with a tested procedure.
+- Choose a memory budget before startup and get an explicit capacity error
+  when it is exhausted.
+- Judge speed and cost from repeatable measurements against vanilla
+  PostgreSQL, including a comparison with the same CPU and memory allowance.
+
+The storage layout should make useful reads small and avoid rewriting unchanged
+data. For example, reading two columns of a wide table should not require
+downloading every column. [Storage layout](docs/durable-format.md) and
+[indexes](docs/index-navigation.md) describe the existing mechanisms; the
+[performance guide](docs/performance.md) explains how we measure their effect.
+
+One active server writes to each configured object-store prefix, the group of
+object names belonging to that database. The goal is concurrent transactions
+inside that server. Logical replication creates separate, asynchronously
+updated databases. [Replacement](docs/operations.md#controlled-replacement)
+transfers write ownership to another server.
+
+## Choose where committed data is saved
+
+| Setting | What happens before a success response | If local disk is lost |
 |---|---|---|
-| `object_store = off` | Local journal sync | No |
-| `object_store = on` | Immutable commit-batch PUT and commit-head CAS | Yes |
+| `object_store = off` | The local recovery journal is synced to disk. | Local-only data is lost. |
+| `object_store = on` | The transaction data is uploaded and the durable commit record is updated. | The database can recover from object storage. |
 
-In durable mode, transactions completed in one reactor turn share publication.
-Success responses wait for the durable barrier. Checkpoints publish a separate
-CAS manifest; recovery replays the commit head beyond that manifest. See
-[object storage](docs/object-storage.md) and [durable formats](docs/durable-format.md).
+In durable mode, transactions can share an upload and commit-record update.
+Each success response waits for that work. Checkpoints organize saved data for
+recovery and later reads. [Object storage](docs/object-storage.md) and
+[durable formats](docs/durable-format.md) explain the failure and upgrade rules.
 
 ## Getting started
 
@@ -58,20 +75,25 @@ pos3ql --config examples/dev.conf
 psql -h 127.0.0.1 -p 5433 -U postgres -d postgres
 ```
 
-The development configuration uses local-only durability. Before enabling
-object storage, configure a qualified endpoint, bucket, unique prefix, TLS,
-and an owner-only credential file. All startup capacities must fit the host.
-Build and validation guidance is in [CONTRIBUTING.md](CONTRIBUTING.md).
+In `psql`, try:
+
+```sql
+CREATE TABLE orders (id integer PRIMARY KEY, status text);
+INSERT INTO orders VALUES (1, 'new');
+SELECT status FROM orders WHERE id = 1;
+```
+
+This returns `new`. The development configuration saves data locally. To use
+object storage, configure a supported endpoint, bucket, unique prefix, TLS,
+and a credential file readable only by its owner. Size the startup memory
+reservations for the host before starting the server.
 
 ## Documentation
 
-Use the [implemented baseline](docs/implemented-baseline.md) for current
-capabilities, [PLAN.md](PLAN.md) for open completion gates, and
-[CONTRIBUTING.md](CONTRIBUTING.md) for development and verification.
-
-The [documentation index](docs/README.md) includes specialized SQL boundaries,
-fixture provenance, and historical records. [BUGS.md](BUGS.md) holds only
-externally blocked or genuinely intractable defects. License terms are in
-[LICENSE](LICENSE).
+The [documentation index](docs/README.md) routes questions about compatibility,
+running the server, backups, storage, and performance. [CONTRIBUTING.md](CONTRIBUTING.md)
+explains development and checks. [BUGS.md](BUGS.md) lists only known defects
+that cannot currently be fixed because of a stated blocker; it is not a list
+of all unfinished work. License terms are in [LICENSE](LICENSE).
 
 Copyright (c) Adrian Mârza and pos3ql contributors

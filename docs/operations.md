@@ -1,5 +1,14 @@
 # Operations
 
+Use this guide to monitor the server, rotate storage credentials, and replace
+the active writer. Recovery and replacement mechanisms are implemented;
+failover across separate machines with real client routing still needs the
+evidence listed in [the plan](../PLAN.md).
+
+**User example:** a server process can answer a local health check while it
+cannot save new commits. Route new database work only after readiness succeeds;
+process liveness alone does not establish durable storage or writer ownership.
+
 pos3ql can expose a separate HTTP listener for process probes, Prometheus
 metrics, and startup capacity. It is disabled by default. Enable it on a
 private interface:
@@ -18,6 +27,17 @@ requests therefore remain independent of `max_connections` and cannot grow
 runtime memory.
 
 ## HTTP endpoints
+
+To distinguish those cases on a configured development server:
+
+```sh
+curl --fail http://127.0.0.1:9187/livez
+curl --fail http://127.0.0.1:9187/readyz
+curl --fail http://127.0.0.1:9187/capacity
+```
+
+`/capacity` shows the reservations chosen at startup and their current use.
+More client connections do not currently mean more statements executing together.
 
 | Path | Success | Meaning |
 |---|---:|---|
@@ -106,6 +126,11 @@ runs its executable, starts it from the packaged configuration, probes
 
 ## Controlled replacement
 
+**User example:** moving the database to another machine uses the same bucket
+and prefix but a separate local cache directory. Starting the replacement
+transfers write ownership. An old server that later wakes up cannot publish
+over the replacement's state. The routing change remains an operator action.
+
 1. Confirm the replacement uses the intended bucket and prefix, configuration,
    and durable credentials.
 2. Start the replacement. Startup recovery promotes its fresh writer
@@ -131,6 +156,10 @@ and promote their own writer incarnation, so no server may continue using the
 same prefix.
 
 ## Automatic failure detection and promotion
+
+The monitor starts a replacement; it does not configure your load balancer or
+application connection addresses. Test that clients reach the ready replacement
+and stop reaching the displaced server as part of deployment qualification.
 
 The release archive includes `libexec/pos3ql/failover-monitor`, an example
 configuration, and `pos3ql-failover.service`. Run the service on one passive

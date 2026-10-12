@@ -1,5 +1,15 @@
 # Backup and restore
 
+**User example:** before an upgrade, stop traffic and the server, create a
+backup named `before-upgrade`, then restart the server. If the upgrade damages
+data, stop it again and restore that point. To protect against losing the
+entire source prefix, export the backup to a separate prefix as well.
+
+These commands take write ownership of the database. They are offline
+operations: no server may continue using the same prefix while they run.
+Recovery to a timestamp also requires retained history after the backup;
+a backup does not recreate history that has already been discarded.
+
 pos3ql can retain a named, checkpoint-consistent recovery point inside the
 configured object-store prefix. The operation copies the published manifest
 and commit head under `backups/<name>/` and publishes a checksummed completion
@@ -7,8 +17,8 @@ record last.
 
 Each backup operation that opens the database promotes its own writer
 incarnation. A running server on the same prefix is fenced and its next durable
-publish fails with SQLSTATE `40001`. Coordinate these commands with traffic to
-avoid disrupting clients; restart the intended server after the operation.
+publish fails with SQLSTATE `40001`. Stop traffic and the intended server before
+these commands; restart it after the operation.
 
 ```sh
 pos3ql --config /path/to/pos3ql.conf --backup before-upgrade
@@ -54,6 +64,11 @@ or before the supplied PostgreSQL `timestamptz`; include `Z` or a numeric
 offset in operational commands. Timestamp recovery requires a backup written
 with the current `pos3ql-backup-v2` completion record. Older v1 backups remain
 restorable by their named point or an exact LSN.
+
+For example, restoring to `14:30:00+00` selects the last retained transaction
+committed no later than that time, rather than stopping partway through a
+transaction. Restoring creates a new live history; do not expect to recover a
+discarded later branch from that new history.
 
 Recovery validates the retained descriptor chain, immutable batch checksum,
 WAL framing, and commit timestamps before publishing `restore-pending`. If the

@@ -1,5 +1,10 @@
 # Test fixtures
 
+These files let tests reproduce real client and recovery behavior. For
+example, the dump archives check that a user can restore data with PostgreSQL's
+own tools, including a parallel `pg_restore --clean --if-exists`.
+Keep the recorded generator, sources, and checksums with each fixture.
+
 `tls-test-cert.pem` / `tls-test-key.pem` — a self-signed certificate for the
 in-process TLS round-trip test (`object_store::http::tests::tls_round_trip`). Test-only trust:
 the test passes the certificate as `object_store_tls_ca_file`; nothing outside tests

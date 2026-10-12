@@ -1,18 +1,27 @@
 # S3-compatible object storage
 
-pos3ql treats object storage as the only durable tier. The production protocol
-boundary is the common S3-compatible HTTP API implemented by independently
-built object stores. The engine connects to that API directly. It does not use
-a vendor SDK, intermediary storage service, translation proxy, or behavior
-selected by an endpoint name.
+With `object_store = on`, committed data is saved in object storage. Losing
+local caches does not lose that data: a replacement server can recover it from
+the configured bucket and prefix. With `object_store = off`, the local journal
+is the durable copy instead; losing it loses local-only data.
 
-This is a protocol-compatibility claim, not a claim that every object-storage
-product has identical control-plane features. An endpoint is supported only
-when the qualification suite proves the required data-plane semantics.
+**User example:** after `COMMIT` succeeds in durable mode, losing the server's
+disk should not lose the saved order. If storage publication fails, success
+must not be sent. If the final response is lost, the client may not know whether
+the commit happened; it must check before retrying an operation that could
+charge the customer twice.
+
+pos3ql connects directly to the shared S3-compatible HTTP API. It uses one
+implementation for supported endpoints, with no vendor SDK, translation proxy,
+or database behavior selected by the endpoint's brand.
+
+An endpoint is supported only after tests prove the operations below behave
+correctly. Bucket creation, account administration, and credentials are set up
+outside pos3ql; an “S3-compatible” label alone is not enough.
 
 ## Required S3-compatible subset
 
-| S3 operation | Required semantic |
+| S3 operation | Required behavior |
 |---|---|
 | `PutObject` with `If-None-Match: *` | Create immutable data or fail without replacing an existing object. |
 | Conditional `PutObject` with `If-Match` | Replace precisely the named generation or fail. |
@@ -30,16 +39,21 @@ MD5 digest or infer its shape from the provider. Conditional failure, missing
 objects, throttling, transient transport failure, authentication failure, and
 malformed responses remain distinct typed outcomes.
 
-The `writer-fence` object is the ownership serialization point. Promotion
-publishes a transition by CAS, conditionally rewrites both mutable roots with
-the new random process incarnation, and activates that incarnation by CAS.
-Token-bearing empty roots cover a prefix without published state. Commit-head
-and manifest writers retain their root ETags; a conflict may be adopted or
-retried only after the process proves that it still owns the active fence. This
-makes a delayed old request visible to the promoting process before it
-rewrites that root or stale after the rewrite. Immutable batches and blocks
-written by a displaced process remain harmless orphans when root publication
-fails.
+### Preventing an old server from overwriting a replacement
+
+The `writer-fence` object records which process may write. For example, after
+you replace a failed primary, that primary must not overwrite newer commits if
+it later reconnects. Compare-and-swap (CAS) means updating a reference only if
+its stored generation still matches the one read earlier.
+
+Promotion first marks ownership as changing, updates the commit head and
+checkpoint manifest with the replacement's identity, then activates that
+identity. The commit head names recoverable commits; the manifest names the
+checkpoint's saved objects. A delayed old request either lands before the
+replacement updates its root and is preserved, or fails because the generation
+has changed. Uploaded objects without a successful root update cannot become
+confirmed commits. [Durable formats](durable-format.md#format-details-for-implementers)
+specifies empty roots, writer identities, conflict handling, and upgrade rules.
 
 Profile v1 accepts S3's 1,024-byte object-key limit, opaque continuation tokens
 up to 1,024 bytes, and strong quoted ETags up to 80 bytes. Exceeding a fixed
@@ -77,6 +91,11 @@ Implementation refactors must not change the profile.
 
 ## Transport and authentication
 
+**User example:** when temporary storage credentials expire, install their
+replacement while both credentials still work, then reload. A rejected
+replacement keeps the installed credential but makes readiness fail so routing
+can stop until the problem is corrected.
+
 The direct client uses HTTP over TLS, S3 virtual-hosted or path-style bucket
 addressing, and S3 Signature Version 4 as the shared request-signing
 protocol. Configuration supplies an endpoint, region/signing scope, bucket,
@@ -112,7 +131,12 @@ retention, retry, and publication contract is in [backup and restore](backup-res
 
 ## Qualification
 
-Qualification separates required CI from external-service evidence:
+CI tests MinIO and SeaweedFS as two independent S3 implementations, plus a
+deterministic fixture for exact requests and failures. Those services run on
+the test machine. The same executable can test a separately operated endpoint;
+that deployment evidence is still required by [the plan](../PLAN.md).
+
+The checks are:
 
 1. Golden-wire tests compare exact requests, canonical signing inputs, parsed
    responses, pagination, error mapping, TLS transport, and retry behavior with

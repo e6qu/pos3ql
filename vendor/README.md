@@ -1,4 +1,9 @@
-# `vendor/` — third-party material, kept out of the build
+# Third-party test material
+
+For example, a SQL query from PostgreSQL's own tests is run against both
+PostgreSQL and pos3ql, and their results are compared. The files here supply
+those test inputs and record where they came from. They are not part of the
+database executable.
 
 Everything under `vendor/` is **third-party** and is **never compiled into the
 pos3ql binary**: there is no `build.rs`, no `include_str!`/`include_bytes!`, and
@@ -12,7 +17,7 @@ Each item records its **upstream source**, the **exact pinned commit/tag** it
 was taken at, and its **license** (a `COPYRIGHT`/`LICENSE` file alongside it),
 and every corpus file is checksum-pinned in `SHA256SUMS`.
 
-## Layout — what is here and what it is for
+## What is here and how it is used
 
     vendor/
       README.md      <- this file
@@ -34,13 +39,14 @@ such item. Runtime dependencies come from Cargo as described above.
 ## Test-only corpora (`vendor/test/`)
 
 ### `test/sqllogictest/` — testing only
+
 - **Upstream:** https://github.com/gregrahn/sqllogictest
 - **Pinned commit:** `c67f97bf3ca7e590d12e073408bcacaf2ff0f3a0`
 - **License:** multi-licensed (GPL / BSD / MIT / CC0) by D. Richard Hipp —
   see `test/sqllogictest/COPYRIGHT.md`. "No attribution is required."
 - **What:** the `select1..5` core corpus plus a few `evidence/` files
   (~11k statement/query blocks). Originally SQLite's tests; here we use the
-  SQL as a *source of statements* and diff real PostgreSQL against pos3ql,
+  SQL as a *source of statements* and compare real PostgreSQL with pos3ql,
   ignoring the embedded SQLite result hashes.
 - **Fetch:**
   `curl -sSL https://raw.githubusercontent.com/gregrahn/sqllogictest/<commit>/test/<file>`
@@ -50,6 +56,7 @@ The full upstream corpus is far larger (millions of query records). Point
 subset here keeps the repo small while covering the core.
 
 ### `test/postgres-regress/` — testing only
+
 - **Upstream:** https://github.com/postgres/postgres (`src/test/regress`)
 - **Pinned tag/commit:** `REL_18_6` = `724edf9bde9d356724ad384a2e196edc3c9f80f7`
 - **License:** The PostgreSQL License — see `test/postgres-regress/COPYRIGHT`.
@@ -57,7 +64,7 @@ subset here keeps the repo small while covering the core.
   `expected/*.out`) that exercises `boolean`, `text`, `int4`, `int8`,
   `float8`, `case`, `bit`, `uuid`, `enum`, `varchar`, `char`, `name`, `md5`,
   and `pg_lsn`. The manifest in
-  `tests/external/postgres_regress_schedule.tsv` is executable policy: every
+  `tests/external/postgres_regress_schedule.tsv` selects the tests: every
   listed statement-boundary range is run against PostgreSQL and pos3ql with a
   zero-mismatch budget. Its explicit gaps require review and correspond to
   documented architecture limits rather than hidden expected failures.

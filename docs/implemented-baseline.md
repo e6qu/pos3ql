@@ -1,112 +1,131 @@
-# Implemented baseline
+# What works today
 
-This summarizes current capabilities and verification mechanisms. Completion
-requires the open gates in [PLAN.md](../PLAN.md); implemented mechanisms alone
-do not qualify concurrent execution or representative deployments.
+This is a summary of implemented behavior. The [plan](../PLAN.md) describes
+what still needs to be built or demonstrated. Statement execution remains
+serial, and representative production performance has not been established.
 
-| Boundary | Implemented | Detailed contract |
+## From an application's point of view
+
+| You want to… | What is implemented | Where to check the limits |
 |---|---|---|
-| SQL and clients | PostgreSQL 18 command disposition, broad types and expressions, DDL/DML, MVCC, locks, savepoints, two-phase transactions, procedures, catalogs, drivers, and dump/restore | [Compatibility and capacities](postgresql-18-compatibility.md) |
-| Durable storage | Immutable commits/checkpoints, durable response barriers, writer fencing, warm/cold caches, paced publication and deletion, mixed-format recovery | [Storage profile](object-storage.md), [formats](durable-format.md) |
-| Physical indexes | Object-native btree, hash, BRIN, GiST, GIN, and SP-GiST paths, overlays, covering payloads, conservative pruning and exact rechecks | [Index navigation](index-navigation.md) |
-| Recovery and operations | Named backups, independent-prefix export, LSN/time recovery, health/metrics/capacity, credential reload, packaged passive-candidate promotion | [Backup](backup-restore.md), [operations](operations.md) |
-| Logical copies | PostgreSQL publisher/subscriber and pgoutput interoperability with bounded bootstrap/apply | [Logical replication](logical-replication.md) |
-| Specialized SQL | Typed JSON/JSONB/jsonpath and SQL/JSON; XML and the documented XPath subset | [SQL/JSON](sql-json.md), [SQL/XML](sql-xml.md) |
-| Verification | Allocation-forbidden tests, SQLSTATE and wire probes, drivers, PostgreSQL differential/regression corpora, cold recovery, storage VOPR, and performance-smoke gates | [Contributing](../CONTRIBUTING.md), [performance](performance.md) |
+| Connect using PostgreSQL tools | SQL, transactions, catalogs, drivers, and dump/restore, compared with PostgreSQL 18 | [Compatibility](postgresql-18-compatibility.md) |
+| Save data outside the database machine | Object-store commits and checkpoints; success waits for durable publication | [Object storage](object-storage.md) |
+| Find selected rows without reading every object | Btree, hash, BRIN, GiST, GIN, and SP-GiST access paths with exact result checks | [Indexes](index-navigation.md) |
+| Recover after losing local caches | Recovery from saved objects and the durable commit history | [Formats](durable-format.md) |
+| Save a recovery point or make a separate copy | Named backups, export to another prefix, recovery to an LSN or timestamp | [Backup and restore](backup-restore.md) |
+| Run and replace the server | Probes, metrics, capacity reporting, credential reload, packages, and passive-candidate promotion | [Operations](operations.md) |
+| Maintain another database's copy of selected tables | PostgreSQL logical publication/subscription and pgoutput interoperability | [Logical replication](logical-replication.md) |
+| Query JSON or XML values | Typed JSON/JSONB/jsonpath and SQL/JSON; XML with an explicit XPath subset | [JSON](sql-json.md), [XML](sql-xml.md) |
+
+For example, a successful durable commit can be recovered with empty RAM and
+local disk caches. A logical subscriber can receive an order update, but it
+may lag behind the publisher. An unsupported XPath expression returns an
+error rather than quietly giving a different answer.
 
 ## Runtime ownership
 
-| State | Current boundary |
-|---|---|
-| Statement execution | Startup-bounded arenas, DML scratch, backend/database context, and FIFO dispatcher leases; COPY/subscription state has separately charged buffers |
-| Catalogs and metadata | Synchronized publication and owned reader images; guards release before nested resolution |
-| Table metadata | Database/creation/owner identity, typed CREATE/DROP existence, definitions, and pending heads share guarded ownership; version slots are guarded, retained images capture identity with the definition, and table lifecycle mutation remains exclusive |
-| Serial positions | Per-table synchronization, coherent WAL/checkpoint images, checked arithmetic, and acknowledgement tied to unchanged staged positions |
-| Resident rows | Shared pending publication and exact-head rollback preserve pinned readers and committed deletion markers. Metadata, uniqueness, optimized byte, and resumable value-index checkpoint walks release row ownership before consuming selected bytes; committed publication uses shared storage ownership; physical reclamation remains exclusive |
-| Heap bytes | Readers pin published immutable ranges; appends initialize disjoint tails and publish complete bytes without excluding existing readers; relocation remains exclusive |
-| Deferred rows | Logical row identity, table incarnation, and exact pending/committed version tokens; later reads reacquire the selected version rather than retaining heap locations |
+This section explains the recent concurrency preparation. “Ownership” means
+keeping data and buffers valid until the operation using them has finished.
+It does not mean that SQL statements already execute in parallel.
 
-Reader capacity, lock controls, and heap controls are charged at startup.
-Authoritative metadata walks and internal byte scans share 64 retention slots
-per query workspace, sized for table overlays, large-object pages, and resident
-value-index candidates. SQL byte scans use the fixed statement arena, preserving accepted
-wide joins without consuming a metadata slot for each edge. Both paths freeze
-one overlay partition through SST merging; outer joins track physical row
-identities across scan orders. Capacity exhaustion reports SQLSTATE 54000.
+**User example:** transaction A reads an order, transaction B updates it, and
+A reads again. Under repeatable-read isolation, A still needs its earlier
+version. Background cleanup must keep those bytes and objects until A releases
+that version. Read-committed statements may select a newer version on their
+next statement.
 
-Resumable value-index checkpoint sources charge one table_rows identity/coverage buffer
-at startup. Bucket movement and pending rollback do not move their logical
-resume position; reproducible eviction routes unprocessed rows through the paced SST merge while
-preserving coverage for emitted resident rows.
-Selected committed images are pinned before releasing row metadata. Query SST
-walks retain their read boundary, immutable handles, schema, and shared reader
-owner; checkpoint sources preserve that ownership across beats. A startup-sized registry protects their durable or local
-temporary block graphs during retirement; garbage collection copies roots before
-object I/O. Releasing a root retained by a durable garbage pass schedules another
-maintenance pass without requiring a new write. Root and reader-count exhaustion
-reports SQLSTATE 54000 before changing registrations.
+| Shared state | Protection implemented | Work still needed for concurrent execution |
+|---|---|---|
+| Statement buffers | Startup-sized arenas, row-selection scratch, connection/database context, and ordered dispatcher leases; COPY and subscriptions have separate buffers | Run statements on workers and coordinate all remaining shared state |
+| Catalogs and table definitions | Synchronized updates; readers retain the definition and table identity they selected; nested lookups release shared guards | Concurrent creation/removal and retirement of table state |
+| Sequence positions | Per-table synchronization, checked arithmetic, coherent journal/checkpoint images, and acknowledgement of unchanged staged positions | Preserve these rules through engine-wide concurrent publication |
+| Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state; selected images are retained before releasing metadata | Safe movement and reclamation while readers remain active |
+| Row bytes | Readers pin immutable published ranges; appends initialize separate tails before publishing them | Concurrent relocation of existing bytes |
+| Deferred reads | Logical row identity, table identity, and exact version identity, rather than remembered heap addresses | Coherent table lifecycle changes across every read path |
 
-Full SST rewrites and adjacent-generation merges remap every retained committed
-version, preserving exact version LSNs and deletion markers. Paced merges
-retain the historical baseline, and byte scans skip newer versions within each
-member before selecting a snapshot image. Full rewrites with historical object
-versions remain explicitly guarded; configured merge scratch limits report
-SQLSTATE 54000. Heap relocation remains exclusive.
+### How long reads keep data alive
 
-Checkpoint jobs restart when committed input or table identity changes. Resident
-overlays and point reads still retain table incarnations through their Storage
-borrow; concurrent table retirement and generation publication remain open gates.
+Executing SQL and large-object fast-path statements register an owned snapshot
+lease: a reservation recording the read position they must preserve. Each
+query workspace reserves 1,024 slots at startup. Registration happens under
+the same synchronization as row publication, so it cannot miss an intervening
+commit. Nested statements do not replace a transaction's snapshot. Completion,
+errors, and transaction end release retention, wake schema waiters, and
+schedule pruning.
 
-Committed row publication prepares keys before metadata ownership and validates
-its selected pending head before changing state. Snapshot registration/pruning,
-table revisions and binding flags, row-version chains, row maps, and resident
-value caches use explicit guards. Publication acquires snapshot, table, version,
-row, then cache ownership. Cache probes retain bounded candidate identities and
-release cache ownership before callbacks; newer cache images cannot certify
-older snapshots. Transaction-wide durable publication remains an engine gate.
+Streaming `COPY FROM` keeps its lease in the connection's setup until completion
+or abort and restores the captured read position for each chunk. `COPY TO`,
+buffered portals, and SQL cursors finish their storage reads before suspension.
+Checkpoint and vacuum keep data through their own maintenance sources.
 
-Executing SQL and large-object fast-path statements retain owned snapshot leases.
-Capture and registration share publication ownership; nested scopes do not replace
-transaction snapshots. Each query workspace reserves 1,024 snapshot slots at
-startup, with checked identities and named SQLSTATE 54000 exhaustion. Lease release
-wakes schema waiters and schedules guarded version pruning. Transaction completion
-ends its retention even when a procedure's outer frame remains alive. Checkpoint
-and vacuum use their maintenance source ownership; buffered portals and SQL cursors
-finish their storage reads before suspension. Statement retention does not enable
-concurrent execution or heap relocation. COPY FROM retains its lease in the
-connection-owned setup through completion or abort and restores the captured
-snapshot for each data chunk; COPY TO finishes reads before returning. Spill walk
-identities fail with SQLSTATE 54000 before wraparound or active buffer reuse.
-Query SST sources lease startup-reserved root slots, capturing immutable members,
-schema, snapshot boundary, and the reader buffer owner. Capture and teardown hold
-registry ownership briefly; immutable source snapshots admit shared and nested
-reads, and their private slots exclude no unrelated scan.
-Sources survive table and Storage retirement and release roots on every return.
-The pool reserves 64 slots per query workspace; exhaustion and failed capture do
-not grow pools or partially pin generations. Metadata walks use their captured
-boundary even when nested callbacks change thread-local execution context.
-Point reads, resident overlays, table retirement, and relocation still need a
-coherent lifecycle transition before concurrent execution is enabled.
+Query walks over immutable sorted tables (SSTs) retain the selected objects,
+schema, read position, and reader buffers. The 64 source slots per workspace
+are reserved at startup. An already captured source remains valid after its
+table or Storage owner is retired. Capturing or releasing a source holds shared
+registry state briefly; object I/O and scan callbacks do not hold that registry.
+Point reads and in-memory row overlays still need a coherent table lifecycle
+transition before concurrent execution is enabled.
 
-Appends release byte ownership before publishing row metadata. Compaction
-preflights its relocation set before changing bytes or handles; readers reject
-reused table identities and stale heap locations. Heap locations and relocation
-generations are cache metadata. Retained byte copies use the statement arena;
-deferred snapshots retain logical row identities and exact version tokens.
+Internal metadata/byte scans also reserve 64 retention slots per workspace.
+SQL byte scans use the statement arena so wide joins do not spend one metadata
+slot per join edge. Checked reader identities and full pools return SQLSTATE
+`54000` before reuse or partial registration. These are separate reservations;
+the [capacity inventory](postgresql-18-compatibility.md#capacity-boundaries)
+records their limits.
 
-The reactor still executes statements serially. Shared table lifecycle mutation
-and retirement, concurrent cache/object I/O and maintenance,
-engine publication, and fixed workers remain open gates. Existing snapshot
-retention must remain coherent across those boundaries. Immutable SST reads
-carry no resident version handles.
+### What maintenance may change
 
-## Evidence limits
+Resumable value-index checkpoint jobs keep a startup-sized `table_rows` buffer
+of row identities and completed work. Moving a row between buckets or rolling
+back a write does not change its logical resume position. Eviction sends
+unprocessed rows through paced SST merging. Jobs restart if committed input or
+the table identity changes.
 
-The performance harness includes the instrumented fixture, pinned local MinIO
-and SeaweedFS, and host-available and resource-matched vanilla PostgreSQL 18.
-Retained runs qualify mechanisms and exploratory costs. They do not establish
-production latency, throughput, or multi-host availability.
+Full SST rewrites and adjacent-generation merges remap retained committed
+versions, including their exact commit positions and deletion markers. Paced
+merges keep the historical baseline, and byte scans skip versions newer than
+the selected snapshot. Complete rewrites with historical object versions remain
+explicitly guarded until a complete historical source exists. Merge scratch
+exhaustion returns `54000`.
 
-Original implementation narratives and per-change observations are preserved
-in [history](history/README.md). Current limits belong in the compatibility
-matrix and specialized contracts above.
+A startup-sized registry protects durable and temporary object graphs used by
+readers. Garbage collection copies retained root references before object I/O.
+Releasing a root used by a durable garbage pass schedules more maintenance even
+without another write. Active backups also retain their reachable objects.
+
+### What publication may change
+
+Row publication prepares keys before taking metadata ownership and verifies
+that the selected pending version is still current. Its acquisition order is
+snapshot, table, version, row, then cache. Cache probes retain bounded candidate
+identities and release cache ownership before callbacks; a newer cached image
+cannot certify an older snapshot.
+
+Metadata-only ALTER keeps existing rows and immutable objects when their
+representation is unchanged. For example, adding a UNIQUE constraint still
+checks existing and transaction-modified rows; it does not needlessly rewrite
+those rows. Operations that change row representation retain the rewrite path.
+
+Appends release byte ownership before publishing metadata. Compaction checks
+its complete relocation set before changing bytes or handles. Readers reject
+reused table identities and stale heap locations. Heap addresses and relocation
+generations describe caches, not durable row identity. Retained byte copies
+use statement memory; physical reclamation and relocation remain exclusive.
+
+Transaction-wide durable publication, concurrent cache/object I/O and
+maintenance, table lifecycle changes, and execution workers are still open.
+A retained reader must remain safe across all of those changes.
+
+## What the tests establish
+
+Tests forbid runtime allocation, compare SQL and wire behavior with PostgreSQL,
+exercise real drivers, recover without local caches, and inject reproducible
+storage failures. See [contributing](../CONTRIBUTING.md) for required checks.
+
+Performance tests use the instrumented fixture, MinIO, SeaweedFS, and vanilla
+PostgreSQL 18 with available and matched CPU/memory. Existing measurements
+establish tested behavior and exploratory costs. They do not establish
+production latency, throughput, or availability across machines.
+
+Past implementation narratives and their evidence remain in
+[history](history/README.md).

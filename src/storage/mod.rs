@@ -34294,6 +34294,11 @@ impl Storage {
         self.tables[index].pending_definition_transaction() == Some(txid)
     }
 
+    pub(crate) fn pending_table_rows_rewritten(&self, index: usize, txid: u32) -> bool {
+        self.pending_table_def(index)
+            .is_some_and(|pending| pending.txid == txid && pending.rewrites_rows)
+    }
+
     fn pending_table_def(&self, index: usize) -> Option<PendingDefinitionRead<'_>> {
         PendingDefinitionRead::current(&self.tables[index].definition, &self.pending_table_defs)
     }

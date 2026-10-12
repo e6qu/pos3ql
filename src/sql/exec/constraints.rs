@@ -619,6 +619,20 @@ fn enforce_key_uniqueness(
         return Ok(());
     }
     if storage.has_pending_table_def(table_index, txid) {
+        if !storage.pending_table_rows_rewritten(table_index, txid) {
+            committed_scan_uniqueness(
+                storage,
+                table_index,
+                schema,
+                columns,
+                nulls_not_distinct,
+                values,
+                self_rowid,
+                txid,
+                def,
+                name,
+            )?;
+        }
         return pending_scan_uniqueness(
             storage,
             table_index,
@@ -682,6 +696,7 @@ fn enforce_key_uniqueness(
             nulls_not_distinct,
             values,
             self_rowid,
+            txid,
             def,
             name,
         )?;
@@ -711,6 +726,7 @@ fn committed_scan_uniqueness(
     nulls_not_distinct: bool,
     values: &[Datum],
     self_rowid: Option<u64>,
+    txid: u32,
     def: &TableDef,
     name: &ConstraintName,
 ) -> Result<(), SqlError> {
@@ -719,7 +735,15 @@ fn committed_scan_uniqueness(
         if Some(rowid) == self_rowid {
             return Ok(ControlFlow::Continue(()));
         }
-        let Some(home) = storage.committed_row_home(table_index, state)? else {
+        let Some(home) = storage.visible_row_home_at(
+            table_index,
+            rowid,
+            state,
+            txid,
+            crate::storage::SNAPSHOT_ALL,
+            u64::MAX,
+        )?
+        else {
             return Ok(ControlFlow::Continue(()));
         };
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {

@@ -1,0 +1,25 @@
+name: Metadata ALTER qualification
+on:
+  push:
+    branches: [codex/ci-owned-readers]
+concurrency:
+  group: metadata-alter-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUST_MIN_STACK: 134217728
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --lib --bins --locked -- -D warnings
+      - run: cargo test --lib --locked metadata_alter_ -- --test-threads=1
+      - run: cargo test --lib --locked deferrable_constraints_follow_statement_transaction_and_savepoint_boundaries -- --test-threads=1
+      - run: cargo test --lib --locked not_valid_and_not_enforced_constraints_have_distinct_lifecycles -- --test-threads=1
+      - run: cargo test --lib --locked generated_expression_evolution_rewrites_rows_and_survives_cold_recovery -- --test-threads=1
+      - run: cargo test --lib --locked query_workspaces_are_startup_bounded_and_isolated -- --test-threads=1

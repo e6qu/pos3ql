@@ -70284,6 +70284,39 @@ fn statement_snapshot_leases_release_after_sql_success_and_failure() {
 }
 
 #[test]
+fn metadata_alter_uniqueness_includes_committed_and_own_changed_rows() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE metadata_keys(id integer); INSERT INTO metadata_keys VALUES (1)",
+    );
+    let response = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "BEGIN; ALTER TABLE metadata_keys ADD CONSTRAINT metadata_key UNIQUE(id); INSERT INTO metadata_keys VALUES (1)",
+    );
+    assert!(message_types(&response).contains(&b'E'));
+    assert!(response.windows(5).any(|field| field == b"23505"));
+    run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK");
+    let response = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "BEGIN; ALTER TABLE metadata_keys ADD CONSTRAINT metadata_key UNIQUE(id); DELETE FROM metadata_keys WHERE id = 1; INSERT INTO metadata_keys VALUES (1); COMMIT; SELECT id FROM metadata_keys",
+    );
+    assert!(
+        !message_types(&response).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(data_rows(&response), ["1"]);
+}
+
+#[test]
 fn metadata_alter_commits_updates_while_unrelated_copy_retains_snapshot() {
     let (mut engine, mut budget) = test_engine();
     let mut writer = TxnState::new(&mut budget, 256).unwrap();

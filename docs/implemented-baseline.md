@@ -93,6 +93,19 @@ consume-in-place byte limits also fail with `54000`, including nested fetches;
 errors release the request buffers and retained sources. These reservations are
 included in the startup memory plan.
 
+The installed generation list groups each file handle with the commit boundary
+used for memory eviction. A short guard keeps replacement from interleaving
+with capture and root registration; downloads and row callbacks run after that
+guard ends. New lists use a second fixed startup buffer, so an invalid or
+oversized installation preserves the prior list. Appending to a full list
+returns `54000` without changing installed members. Database clones retain both
+handles and boundaries.
+
+**User example:** a read keeps the complete set of saved order files it selected
+while maintenance replaces that set. A new capture sees a complete replacement,
+never half of the old list mixed with half of the new one. Coordinating this
+with rows still in memory and table removal remains planned work.
+
 ### What maintenance may change
 
 Resumable value-index checkpoint jobs keep a startup-sized `table_rows` buffer

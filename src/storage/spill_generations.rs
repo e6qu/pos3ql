@@ -3,7 +3,7 @@
 use core::mem::size_of;
 use core::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{ColType, MAX_COLUMNS, RelationPersistence, SpillReader, Storage, table_slot_capacity};
 use crate::config::Config;
@@ -12,6 +12,184 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use crate::store::SstHandle;
+
+/// Handles and their eviction boundaries are published as one complete list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpillGeneration {
+    pub(crate) handle: SstHandle,
+    /// Cold recovery leaves this zero: recovered rows already name their exact member.
+    pub(crate) through_lsn: u64,
+}
+
+pub(crate) struct SpillGenerationList {
+    members: FixedVec<SpillGeneration>,
+    staging: FixedVec<SpillGeneration>,
+}
+
+impl SpillGenerationList {
+    pub(crate) fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.members.capacity()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &SpillGeneration> {
+        self.members.iter()
+    }
+
+    pub(crate) fn handle(&self, index: usize) -> Option<SstHandle> {
+        self.members.get(index).map(|member| member.handle)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.members.clear();
+        self.staging.clear();
+    }
+
+    pub(super) fn replace(
+        &mut self,
+        len: usize,
+        handles: impl Iterator<Item = SstHandle>,
+    ) -> Result<(), SqlError> {
+        self.staging.clear();
+        if len > self.capacity() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table SST generations exceed startup capacity ({})",
+                self.capacity()
+            ));
+        }
+        for handle in handles {
+            if self.staging.len() == len {
+                self.staging.clear();
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "SST generation iterator exceeds declared length"
+                ));
+            }
+            self.staging
+                .push(SpillGeneration {
+                    handle,
+                    through_lsn: 0,
+                })
+                .expect("validated generation capacity");
+        }
+        if self.staging.len() != len {
+            self.staging.clear();
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "SST generation iterator is shorter than declared length"
+            ));
+        }
+        std::mem::swap(&mut self.members, &mut self.staging);
+        self.staging.clear();
+        Ok(())
+    }
+
+    pub(super) fn copy_from(&mut self, source: &Self) -> Result<(), SqlError> {
+        if source.len() > self.capacity() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "cloned SST generations exceed startup capacity ({})",
+                self.capacity()
+            ));
+        }
+        self.clear();
+        for &member in source.iter() {
+            self.members.push(member).expect("validated clone capacity");
+        }
+        Ok(())
+    }
+
+    pub(super) fn append(&mut self, handle: SstHandle, through_lsn: u64) -> Result<(), SqlError> {
+        self.members
+            .push(SpillGeneration {
+                handle,
+                through_lsn,
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table SST generations exceed startup capacity ({})",
+                    self.capacity()
+                )
+            })
+    }
+
+    pub(super) fn collapse(&mut self, handle: SstHandle, through_lsn: u64) -> Result<(), SqlError> {
+        if self.capacity() == 0 {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table SST generations exceed startup capacity (0)"
+            ));
+        }
+        self.clear();
+        self.append(handle, through_lsn)
+    }
+
+    pub(super) fn merge_pair(&mut self, at: usize, handle: Option<SstHandle>) {
+        assert!(
+            at.checked_add(1).is_some_and(|next| next < self.len()),
+            "merge pair is outside the installed generation list"
+        );
+        let through_lsn = self.members[at]
+            .through_lsn
+            .max(self.members[at + 1].through_lsn);
+        let removed = if let Some(handle) = handle {
+            self.members[at] = SpillGeneration {
+                handle,
+                through_lsn,
+            };
+            1
+        } else {
+            2
+        };
+        let destination = at + 2 - removed;
+        self.members
+            .as_mut_slice()
+            .copy_within(at + 2.., destination);
+        for _ in 0..removed {
+            self.members.pop();
+        }
+    }
+}
+
+pub(super) struct SpillGenerationRoster {
+    state: RwLock<SpillGenerationList>,
+}
+
+impl SpillGenerationRoster {
+    pub(super) fn member_budget_bytes(capacity: usize) -> usize {
+        2 * capacity * size_of::<SpillGeneration>()
+    }
+
+    pub(super) fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
+        Ok(Self {
+            state: RwLock::new(SpillGenerationList {
+                members: FixedVec::new(budget, "table SST generations", capacity)?,
+                staging: FixedVec::new(budget, "table SST generation staging", capacity)?,
+            }),
+        })
+    }
+
+    pub(super) fn read(&self) -> RwLockReadGuard<'_, SpillGenerationList> {
+        self.state
+            .read()
+            .expect("table SST generation lock poisoned")
+    }
+
+    pub(super) fn write(&self) -> RwLockWriteGuard<'_, SpillGenerationList> {
+        self.state
+            .write()
+            .expect("table SST generation lock poisoned")
+    }
+}
 
 struct PinnedRoot {
     handle: SstHandle,
@@ -545,32 +723,44 @@ impl SpillGenerationSnapshot {
     pub(super) fn capture(&mut self, storage: &Storage, table_slot: usize) -> Result<(), SqlError> {
         self.clear();
         let table = storage.table(table_slot);
-        if table.n_spill_ssts > self.handles.capacity() {
+        let definition = table.definition.read();
+        self.persistence = definition.committed.persistence;
+        self.n_columns = definition.committed.schema(&mut self.schema);
+        self.table_slot = table_slot;
+        self.created_at = definition.identity.created_at;
+        self.data_generation = table.generation();
+        self.commit_lsn = storage.lsn();
+        // Retain roots before releasing list ownership. Replacement cannot
+        // retire a member between copying its handle and registering the read.
+        let generations = table.spill_generations();
+        self.retain_members(&generations, &storage.spill_roots)?;
+        self.reader = storage.spill.as_ref().map(Arc::clone);
+        Ok(())
+    }
+
+    fn retain_members(
+        &mut self,
+        generations: &SpillGenerationList,
+        registry: &Arc<SpillRootRegistry>,
+    ) -> Result<(), SqlError> {
+        if generations.len() > self.handles.capacity() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "retained SST members exceed startup capacity ({})",
                 self.handles.capacity()
             ));
         }
-        let definition = table.definition();
-        self.persistence = definition.persistence;
-        self.n_columns = definition.schema(&mut self.schema);
-        self.table_slot = table_slot;
-        self.created_at = table.created_at();
-        self.data_generation = table.generation();
-        self.commit_lsn = storage.lsn();
-        for handle in &table.spill_ssts[..table.n_spill_ssts] {
-            self.handles.push(handle.expect("counted SST member"));
+        for member in generations.iter() {
+            self.handles.push(member.handle);
         }
-        if let Err(error) = storage.spill_roots.pin(
+        if let Err(error) = registry.pin(
             &self.handles,
             self.persistence != RelationPersistence::Temporary,
         ) {
             self.handles.clear();
             return Err(error);
         }
-        self.registry = Some(Arc::clone(&storage.spill_roots));
-        self.reader = storage.spill.as_ref().map(Arc::clone);
+        self.registry = Some(Arc::clone(registry));
         Ok(())
     }
 
@@ -651,6 +841,173 @@ mod tests {
             roster: BlockId([tag.wrapping_add(2); 32]),
             format: RowSstFormat::PackedV4,
         }
+    }
+
+    #[test]
+    fn guarded_spill_generations_preserve_previous_list_on_failed_install() {
+        let bytes = SpillGenerationRoster::member_budget_bytes(3);
+        let mut budget = Budget::new(bytes);
+        let roster = SpillGenerationRoster::new(&mut budget, 3).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut list = roster.write();
+            list.append(handle(1), 7).unwrap();
+            list.append(handle(5), 9).unwrap();
+            for (declared, members, state) in [
+                (4, &[handle(9)][..], sqlstate::PROGRAM_LIMIT_EXCEEDED),
+                (2, &[handle(9)][..], sqlstate::INTERNAL_ERROR),
+                (1, &[handle(9), handle(13)][..], sqlstate::INTERNAL_ERROR),
+                (0, &[handle(9)][..], sqlstate::INTERNAL_ERROR),
+            ] {
+                let error = list.replace(declared, members.iter().copied()).unwrap_err();
+                assert_eq!(error.sqlstate, state);
+                assert_eq!(list.len(), 2);
+                assert_eq!(list.handle(0), Some(handle(1)));
+                assert_eq!(list.handle(1), Some(handle(5)));
+                assert_eq!(list.members[0].through_lsn, 7);
+                assert_eq!(list.members[1].through_lsn, 9);
+                assert!(list.staging.is_empty());
+            }
+            list.append(handle(9), 11).unwrap();
+            let error = list.append(handle(17), 19).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(list.len(), 3);
+            assert_eq!(
+                list.members[2],
+                SpillGeneration {
+                    handle: handle(9),
+                    through_lsn: 11
+                }
+            );
+            list.merge_pair(0, Some(handle(13)));
+            assert_eq!(list.len(), 2);
+            assert_eq!(
+                list.members[0],
+                SpillGeneration {
+                    handle: handle(13),
+                    through_lsn: 9
+                }
+            );
+            assert_eq!(
+                list.members[1],
+                SpillGeneration {
+                    handle: handle(9),
+                    through_lsn: 11
+                }
+            );
+            list.merge_pair(0, None);
+            assert!(list.is_empty());
+            list.replace(3, [handle(1), handle(5), handle(9)].into_iter())
+                .unwrap();
+            list.merge_pair(1, None);
+            assert_eq!(list.len(), 1);
+            assert_eq!(list.handle(0), Some(handle(1)));
+            list.replace(0, [].into_iter()).unwrap();
+            assert!(list.is_empty());
+            list.collapse(handle(17), 19).unwrap();
+            assert_eq!(list.members[0].through_lsn, 19);
+        });
+    }
+
+    #[test]
+    fn guarded_spill_generations_retain_roots_before_releasing_list() {
+        use std::time::{Duration, Instant};
+        let config = test_config();
+        let mut budget = Budget::new(
+            SpillRootRegistry::budget_bytes(&config)
+                + SpillGenerationRoster::member_budget_bytes(2),
+        );
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let roster = SpillGenerationRoster::new(&mut budget, 2).unwrap();
+        roster
+            .write()
+            .replace(2, [handle(1), handle(5)].into_iter())
+            .unwrap();
+        let mut snapshot = SpillGenerationSnapshot::new(2);
+        let ready = AtomicBool::new(false);
+        let mut copied = Vec::with_capacity(2);
+        let pinned = registry.roots.lock().unwrap();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    let list = roster.read();
+                    ready.store(true, Ordering::Release);
+                    snapshot.retain_members(&list, &registry).unwrap();
+                });
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let started = ready.load(Ordering::Acquire);
+            let excluded = matches!(
+                roster.state.try_write(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            // Release before assertions so a failing test cannot strand the reader.
+            drop(pinned);
+            reader.join().unwrap();
+            assert!(started, "reader did not reach root registration");
+            assert!(excluded, "replacement raced root registration");
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            roster.write().replace(1, [handle(9)].into_iter()).unwrap();
+            assert_eq!(snapshot.handles, [handle(1), handle(5)]);
+            registry.copy_roots(true, &mut copied).unwrap();
+            assert_eq!(copied, [handle(1), handle(5)]);
+            snapshot.clear();
+            assert!(registry.take_reclamation_pending());
+            registry.copy_roots(true, &mut copied).unwrap();
+            assert!(copied.is_empty());
+            let list = roster.read();
+            snapshot.retain_members(&list, &registry).unwrap();
+            assert_eq!(snapshot.handles, [handle(9)]);
+            drop(list);
+            snapshot.clear();
+        });
+    }
+
+    #[test]
+    fn guarded_spill_generations_capture_complete_lists_during_replacement() {
+        let mut config = test_config();
+        config.max_spill_generations_per_table = 3;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("coherent", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        storage.set_spill_list(table, &[handle(1), handle(5)]);
+        let first = [handle(1), handle(5)];
+        let second = [handle(9), handle(13), handle(17)];
+        let mut snapshot = SpillGenerationSnapshot::new(3);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                crate::mem::guard::forbid_alloc(|| {
+                    for index in 0..512 {
+                        let members: &[SstHandle] = if index % 2 == 0 { &second } else { &first };
+                        storage
+                            .table(table)
+                            .spill_generations
+                            .write()
+                            .replace(members.len(), members.iter().copied())
+                            .unwrap();
+                    }
+                });
+            });
+            barrier.wait();
+            crate::mem::guard::forbid_alloc(|| {
+                for _ in 0..512 {
+                    snapshot.capture(&storage, table).unwrap();
+                    assert!(snapshot.handles == first || snapshot.handles == second);
+                    assert_eq!(snapshot.created_at, storage.table(table).created_at());
+                    assert_eq!(snapshot.schema[0], ColType::Int4);
+                    snapshot.clear();
+                }
+            });
+        });
+        assert!(storage.spill_roots.roots.lock().unwrap().is_empty());
     }
 
     struct PointFixture {
@@ -1376,9 +1733,12 @@ mod tests {
                 snapshot.validate(&other, table).unwrap_err().sqlstate,
                 sqlstate::INTERNAL_ERROR
             );
-            storage.collapse_spill(table, replacement);
+            storage.collapse_spill(table, replacement).unwrap();
             assert_eq!(snapshot.relation().handle(0), original);
-            assert_eq!(storage.table(table).spill_ssts[0].unwrap(), replacement);
+            assert_eq!(
+                storage.table(table).spill_generations().handle(0).unwrap(),
+                replacement
+            );
             storage.drop_table(table);
             assert_eq!(
                 snapshot.validate(&storage, table).unwrap_err().sqlstate,

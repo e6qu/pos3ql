@@ -41,8 +41,8 @@ use row_versions::{
 };
 use row_walks::{RetainedRowIds, RowScanIds, RowWalkPool};
 use spill_generations::{
-    QueryRootPool, SpillGenerationSnapshot, SpillRelation, SpillRootRegistry, SpilledRowRead,
-    SpilledRowState,
+    QueryRootPool, SpillGenerationRoster, SpillGenerationSnapshot, SpillRelation,
+    SpillRootRegistry, SpilledRowRead, SpilledRowState,
 };
 
 use core::cell::Cell;
@@ -2549,17 +2549,9 @@ pub struct Table {
     /// (without RESTART IDENTITY) do not rewind it, and a rolled-back insert
     /// still consumes its number.
     serial: std::sync::Mutex<TableSerialState>,
-    /// The SSTs holding this table's spilled rows, in flush order. Full
-    /// rewrites replace the list, delta checkpoints append, and paced
-    /// compaction merges adjacent members. A row's map entry names the list
-    /// slot containing its bytes.
-    pub(crate) spill_ssts: Box<[Option<crate::store::SstHandle>]>,
-    /// Highest commit LSN captured by each generation in this process. Cold
-    /// recovery leaves these zero because recovered rows already name their
-    /// exact SST; local heap rows use the boundaries when pressure later
-    /// evicts them without sacrificing warm-memory reads after publication.
-    pub(crate) spill_through_lsn: Box<[u64]>,
-    pub(crate) n_spill_ssts: usize,
+    /// Ordered immutable row generations and their eviction boundaries.
+    /// Capture and replacement share ownership until reader roots are retained.
+    spill_generations: SpillGenerationRoster,
     /// Value caches accelerating this table's uniqueness and equality probes,
     /// one per distinct constrained or named-index tuple, rebuilt whenever the
     /// definition/index set changes and maintained per committed row otherwise.
@@ -3828,6 +3820,12 @@ impl Table {
         self.publication
             .lock()
             .expect("table publication lock poisoned")
+    }
+
+    pub(crate) fn spill_generations(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, spill_generations::SpillGenerationList> {
+        self.spill_generations.read()
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -17510,9 +17508,9 @@ impl Storage {
             + 2 * config.collation_scratch_bytes
             + table_slot_capacity(config)
                 * (size_of::<Table>() + FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
-            + table_slot_capacity(config)
-                .saturating_mul(config.max_spill_generations_per_table)
-                .saturating_mul(size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>())
+            + table_slot_capacity(config).saturating_mul(
+                SpillGenerationRoster::member_budget_bytes(config.max_spill_generations_per_table),
+            )
             + RowHeap::control_bytes()
             + RowVersionPools::control_bytes()
             + Self::retained_row_walk_budget_bytes(config)
@@ -17644,11 +17642,6 @@ impl Storage {
         let mut tables = FixedVec::new(budget, "tables", table_capacity)?;
         let table_definition_images =
             definition_images::TableDefinitionImagePool::new(config, budget)?;
-        budget.draw_array(
-            table_capacity.saturating_mul(config.max_spill_generations_per_table),
-            size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>(),
-            "table spill-generation rosters",
-        )?;
         let row_versions = RowVersionPools::new(config, budget)?;
         let row_walks = RowWalkPool::new(config, budget)?;
         let spill_roots = SpillRootRegistry::new(config, budget)?;
@@ -17690,11 +17683,10 @@ impl Storage {
                     pending_statistics_tail: None,
                     pending_statistics_txid: None,
                     serial: std::sync::Mutex::new(TableSerialState::EMPTY),
-                    spill_ssts: vec![None; config.max_spill_generations_per_table]
-                        .into_boxed_slice(),
-                    spill_through_lsn: vec![0; config.max_spill_generations_per_table]
-                        .into_boxed_slice(),
-                    n_spill_ssts: 0,
+                    spill_generations: SpillGenerationRoster::new(
+                        budget,
+                        config.max_spill_generations_per_table,
+                    )?,
                     n_enforcers: 0,
                 })
                 .expect("sized to max_tables");
@@ -19995,7 +19987,6 @@ impl Storage {
                 let ownership = self.tables[source_slot].ownership().committed();
                 let statistics = self.tables[source_slot].statistics;
                 let serial_values = self.table_serial_values(source_slot);
-                let n_spill_ssts = self.tables[source_slot].n_spill_ssts;
                 let target_slot = self.alloc_table(definition, Some(txid))?;
                 {
                     let target_table = &mut self.tables[target_slot];
@@ -20009,12 +20000,11 @@ impl Storage {
                         values: serial_values,
                         ..TableSerialState::EMPTY
                     };
-                    target_table.n_spill_ssts = n_spill_ssts;
                 }
-                for member in 0..n_spill_ssts {
-                    let handle = self.tables[source_slot].spill_ssts[member];
-                    self.tables[target_slot].spill_ssts[member] = handle;
-                }
+                self.tables[target_slot]
+                    .spill_generations
+                    .write()
+                    .copy_from(&self.tables[source_slot].spill_generations())?;
                 let row_count = self.tables[source_slot].rows.len();
                 for position in 0..row_count {
                     let (rowid, mut state) = self.tables[source_slot]
@@ -28866,7 +28856,7 @@ impl Storage {
 
     /// Number of immutable row generations currently backing a table.
     pub(crate) fn spill_generation_count(&self, table_slot: usize) -> usize {
-        self.tables[table_slot].n_spill_ssts
+        self.tables[table_slot].spill_generations().len()
     }
 
     /// The merged walk behind the row-state seam: every SST-resident rowid
@@ -28882,7 +28872,7 @@ impl Storage {
         overlay_rowids: &RetainedRowIds<'_>,
         emit: &mut dyn FnMut(u64, SpilledRowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<(), SqlError> {
-        if self.tables[slot].n_spill_ssts == 0 {
+        if self.tables[slot].spill_generations().is_empty() {
             return Ok(());
         }
         let roots = self
@@ -29021,7 +29011,7 @@ impl Storage {
             SpilledRowRepresentation<'a>,
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<bool, SqlError> {
-        if self.tables[slot].n_spill_ssts == 0 {
+        if self.tables[slot].spill_generations().is_empty() {
             return Ok(true);
         }
         let commit_snapshot = match overlay_mode {
@@ -29761,7 +29751,7 @@ impl Storage {
         rowid: u64,
         snapshot: u64,
     ) -> Result<Option<SpillVersion>, SqlError> {
-        if self.tables[slot].n_spill_ssts == 0 {
+        if self.tables[slot].spill_generations().is_empty() {
             return Ok(None);
         }
         let roots = self.query_roots.retain_point(self, slot, snapshot)?;
@@ -29828,7 +29818,7 @@ impl Storage {
         rowid: u64,
         snapshot: u64,
     ) -> Result<Option<SpilledRowState>, SqlError> {
-        if self.tables[table].n_spill_ssts == 0 {
+        if self.tables[table].spill_generations().is_empty() {
             return Ok(None);
         }
         let roots = self.query_roots.retain_point(self, table, snapshot)?;
@@ -29870,7 +29860,7 @@ impl Storage {
         {
             return Ok(());
         }
-        if self.tables[table_slot].n_spill_ssts == 0 {
+        if self.tables[table_slot].spill_generations().is_empty() {
             return Ok(());
         }
         // Then everything that lives only in the bucket, synthesized.
@@ -30712,7 +30702,7 @@ impl Storage {
         let table = &self.tables[table_slot];
         if table.statistics.valid {
             table.statistics.rows
-        } else if table.n_spill_ssts == 0 {
+        } else if table.spill_generations().is_empty() {
             table.rows.len() as u64
         } else {
             (table.rows.len() as u64).max(1_000)
@@ -30910,18 +30900,19 @@ impl Storage {
     /// residents. Temporary spill uses this narrower form because a durable
     /// table may have changed since its last manifest publication.
     pub(crate) fn evict_committed_table(&mut self, slot: usize) {
-        if !self.tables[slot].live() || self.tables[slot].n_spill_ssts == 0 {
+        if !self.tables[slot].live() || self.tables[slot].spill_generations().is_empty() {
             return;
         }
         let table = &mut self.tables[slot];
-        let newest = (table.n_spill_ssts - 1) as u32;
+        let generations = table.spill_generations.read();
+        let newest = (generations.len() - 1) as u32;
         for (_, state) in table.rows.iter_mut() {
             if let Some(RowHome::Heap(loc)) = state.committed {
-                let sst = table
-                    .spill_through_lsn
+                let sst = generations
                     .iter()
-                    .take(table.n_spill_ssts)
-                    .position(|&through_lsn| through_lsn != 0 && state.committed_lsn <= through_lsn)
+                    .position(|member| {
+                        member.through_lsn != 0 && state.committed_lsn <= member.through_lsn
+                    })
                     .map_or(newest, |generation| generation as u32);
                 state.committed = Some(RowHome::Spilled {
                     len: loc.len,
@@ -30930,20 +30921,6 @@ impl Storage {
                 });
             }
         }
-    }
-
-    /// Records the commit boundary captured by a locally published generation.
-    /// Heap rows remain warm until pressure evicts them; the boundaries then
-    /// map each row to the first generation that contains its current image.
-    pub(crate) fn set_spill_generation_through(
-        &mut self,
-        slot: usize,
-        generation: usize,
-        through_lsn: u64,
-    ) {
-        let table = &mut self.tables[slot];
-        debug_assert!(generation < table.n_spill_ssts);
-        table.spill_through_lsn[generation] = through_lsn;
     }
 
     pub(crate) fn release_table_histories(&mut self, slot: usize) {
@@ -30967,13 +30944,24 @@ impl Storage {
 
     /// A full rewrite: the new SST holds every committed row, so the list
     /// collapses to it and every spilled map entry is remapped to slot 0.
-    pub(crate) fn collapse_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
+    pub(crate) fn collapse_spill(
+        &mut self,
+        slot: usize,
+        handle: crate::store::SstHandle,
+    ) -> Result<(), SqlError> {
+        self.collapse_spill_through(slot, handle, 0)
+    }
+
+    pub(crate) fn collapse_spill_through(
+        &mut self,
+        slot: usize,
+        handle: crate::store::SstHandle,
+        through_lsn: u64,
+    ) -> Result<(), SqlError> {
         let versions = &mut self.row_versions.exclusive().committed_row_versions;
         let table = &mut self.tables[slot];
-        table.spill_ssts.fill(None);
-        table.spill_through_lsn.fill(0);
-        table.spill_ssts[0] = Some(handle);
-        table.n_spill_ssts = 1;
+        let mut generations = table.spill_generations.write();
+        generations.collapse(handle, through_lsn)?;
         for (_, state) in table.rows.iter_mut() {
             remap_committed_homes(versions, state, |home| match home {
                 RowHome::Spilled {
@@ -30986,6 +30974,7 @@ impl Storage {
                 RowHome::Heap(_) => home,
             });
         }
+        Ok(())
     }
 
     /// Paced compaction merged the adjacent spill-SST pair at (`at`,
@@ -31002,24 +30991,8 @@ impl Storage {
         let versions = &mut self.row_versions.exclusive().committed_row_versions;
         let table = &mut self.tables[slot];
         let removed = if handle.is_some() { 1u32 } else { 2u32 };
-        let mut n = 0;
-        table.spill_ssts.copy_within(0..at, 0);
-        table.spill_through_lsn.copy_within(0..at, 0);
-        n += at;
-        if let Some(h) = handle {
-            table.spill_ssts[n] = Some(h);
-            table.spill_through_lsn[n] =
-                table.spill_through_lsn[at].max(table.spill_through_lsn[at + 1]);
-            n += 1;
-        }
-        for i in at + 2..table.n_spill_ssts {
-            table.spill_ssts[n] = table.spill_ssts[i];
-            table.spill_through_lsn[n] = table.spill_through_lsn[i];
-            n += 1;
-        }
-        table.spill_ssts[n..].fill(None);
-        table.spill_through_lsn[n..].fill(0);
-        table.n_spill_ssts = n;
+        let mut generations = table.spill_generations.write();
+        generations.merge_pair(at, handle);
         let at = at as u32;
         for (_, state) in table.rows.iter_mut() {
             remap_committed_homes(versions, state, |home| match home {
@@ -31049,21 +31022,30 @@ impl Storage {
     /// A delta flush: the new SST (heap rows + tombstones) joins the list;
     /// existing spilled entries keep their slots. The caller guarantees the
     /// list has room.
-    pub(crate) fn append_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
-        let table = &mut self.tables[slot];
-        assert!(
-            table.n_spill_ssts < table.spill_ssts.len(),
-            "delta flush into a full list"
-        );
-        table.spill_ssts[table.n_spill_ssts] = Some(handle);
-        table.spill_through_lsn[table.n_spill_ssts] = 0;
-        table.n_spill_ssts += 1;
+    pub(crate) fn append_spill(
+        &mut self,
+        slot: usize,
+        handle: crate::store::SstHandle,
+    ) -> Result<(), SqlError> {
+        self.append_spill_through(slot, handle, 0)
     }
 
-    /// Installs a cold-start spill list verbatim (entries were installed with
-    /// their slots by the manifest scan).
+    pub(crate) fn append_spill_through(
+        &mut self,
+        slot: usize,
+        handle: crate::store::SstHandle,
+        through_lsn: u64,
+    ) -> Result<(), SqlError> {
+        self.tables[slot]
+            .spill_generations
+            .write()
+            .append(handle, through_lsn)
+    }
+
+    /// Installs a validated cold-start list without allocating or partial publication.
     pub(crate) fn set_spill_list(&mut self, slot: usize, handles: &[crate::store::SstHandle]) {
-        self.set_spill_list_from_iter(slot, handles.len(), handles.iter().copied());
+        self.set_spill_list_from_iter(slot, handles.len(), handles.iter().copied())
+            .expect("validated spill list fits configured capacity");
     }
 
     pub(crate) fn set_spill_list_from_iter(
@@ -31071,25 +31053,11 @@ impl Storage {
         slot: usize,
         len: usize,
         handles: impl Iterator<Item = crate::store::SstHandle>,
-    ) {
-        let table = &mut self.tables[slot];
-        assert!(
-            len <= table.spill_ssts.len(),
-            "validated spill list fits configured capacity"
-        );
-        table.spill_ssts.fill(None);
-        table.spill_through_lsn.fill(0);
-        let mut installed = 0;
-        for handle in handles {
-            assert!(installed < len, "spill iterator exceeds declared length");
-            table.spill_ssts[installed] = Some(handle);
-            installed += 1;
-        }
-        assert_eq!(
-            installed, len,
-            "spill iterator is shorter than declared length"
-        );
-        table.n_spill_ssts = len;
+    ) -> Result<(), SqlError> {
+        self.tables[slot]
+            .spill_generations
+            .write()
+            .replace(len, handles)
     }
 
     /// Clears a table's shadowing deletion markers only after the manifest
@@ -31692,7 +31660,7 @@ impl Storage {
     /// is what unbinds a table's row count from `table_rows`: the map holds
     /// the working set, the bucket holds the rest.
     pub fn evict_redundant_entries(&self, slot: usize) {
-        if self.tables[slot].n_spill_ssts != 0 {
+        if !self.tables[slot].spill_generations().is_empty() {
             Self::evict_redundant_rows(&mut self.tables[slot].rows.write());
         }
     }
@@ -31701,9 +31669,11 @@ impl Storage {
     /// analogue of heap pressure. Rows are counted against entries, not
     /// bytes: a table of tiny rows fills its map long before its heap.
     pub fn map_pressure(&self) -> bool {
-        self.tables
-            .iter()
-            .any(|t| t.live() && t.n_spill_ssts > 0 && t.rows.len() * 100 >= t.rows.capacity() * 50)
+        self.tables.iter().any(|t| {
+            t.live()
+                && !t.spill_generations().is_empty()
+                && t.rows.len() * 100 >= t.rows.capacity() * 50
+        })
     }
 
     pub(crate) fn temporary_map_pressure(&self) -> bool {
@@ -31755,7 +31725,7 @@ impl Storage {
         for i in 0..self.tables.len() {
             let table = &self.tables[i];
             if !table.live()
-                || table.n_spill_ssts == 0
+                || table.spill_generations().is_empty()
                 || table.rows.len() * 100 < table.rows.capacity() * 50
             {
                 continue;
@@ -31772,7 +31742,7 @@ impl Storage {
         rowid: u64,
         commit_lsn: u64,
     ) -> Result<(), SqlError> {
-        if self.tables[table_index].n_spill_ssts == 0 {
+        if self.tables[table_index].spill_generations().is_empty() {
             if self.remove_row_state(table_index, rowid).is_some() {
                 self.mark_value_bindings_changed_at(table_index, commit_lsn);
                 self.tables[table_index].mark_dirty();
@@ -31970,7 +31940,10 @@ impl Storage {
         state.committed_lsn = commit_lsn;
         state.checkpoint_change_lsn = commit_lsn;
         clear_pending_versions(&mut versions.pending_row_versions, &mut state.pending);
-        if state.committed.is_none() && table.n_spill_ssts == 0 && state.history.is_empty() {
+        if state.committed.is_none()
+            && table.spill_generations().is_empty()
+            && state.history.is_empty()
+        {
             rows.remove(&rowid);
         }
         publication.generation = generation;
@@ -34605,9 +34578,7 @@ impl Storage {
             .serial
             .get_mut()
             .expect("table serial state lock poisoned") = TableSerialState::EMPTY;
-        table.spill_ssts.fill(None);
-        table.spill_through_lsn.fill(0);
-        table.n_spill_ssts = 0;
+        table.spill_generations.write().clear();
         let schema = {
             let definition = table.definition();
             definition.schema
@@ -48020,7 +47991,7 @@ impl Storage {
                     oldest,
                 );
             }
-            if oldest.is_none() && table.n_spill_ssts == 0 {
+            if oldest.is_none() && table.spill_generations().is_empty() {
                 loop {
                     let mut batch = [0u64; 512];
                     let mut count = 0;
@@ -54348,6 +54319,66 @@ mod tests {
     }
 
     #[test]
+    fn guarded_spill_generations_database_clone_preserves_eviction_boundaries() {
+        fn handle(tag: u8) -> crate::store::SstHandle {
+            crate::store::SstHandle {
+                index: crate::store::BlockId([tag; 32]),
+                filter: crate::store::BlockId([tag + 1; 32]),
+                roster: crate::store::BlockId([tag + 2; 32]),
+                format: crate::store::RowSstFormat::PackedV4,
+            }
+        }
+        let mut config = test_config();
+        config.max_databases = 4;
+        config.max_schemas = 5;
+        config.max_spill_generations_per_table = 3;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let source = storage
+            .create_table(make_def("saved_orders", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.append_spill_through(source, handle(1), 7).unwrap();
+            storage.append_spill_through(source, handle(5), 9).unwrap();
+            let database = storage
+                .create_database(
+                    None,
+                    DatabaseOid::POSTGRES,
+                    test_database_definition("cloned_orders"),
+                    0,
+                    17,
+                )
+                .unwrap();
+            let oid = storage.database(database).oid;
+            storage.commit_database_create(database);
+            storage.select_database(oid).unwrap();
+            let target = storage.find_table("public", "saved_orders").unwrap();
+            assert_ne!(source, target);
+            storage.append_spill_through(target, handle(9), 11).unwrap();
+            for (rowid, commit_lsn) in [(1, 7), (2, 9), (3, 11)] {
+                let values = [Datum::Int4(rowid as i32)];
+                let (location, bytes) = storage.heap.append(rowenc::encoded_len(&values)).unwrap();
+                rowenc::encode(&values, bytes);
+                storage.tables[target]
+                    .rows
+                    .insert(rowid, RowState::committed_only_at(location, commit_lsn))
+                    .unwrap();
+            }
+            storage.evict_committed_table(target);
+            for (rowid, sst, commit_lsn) in [(1, 0, 7), (2, 1, 9), (3, 2, 11)] {
+                let state = storage.resident_row_state(target, rowid).unwrap();
+                assert!(
+                    matches!(state.committed, Some(RowHome::Spilled { sst: member, commit_lsn: version, .. })
+                    if member == sst && version == commit_lsn)
+                );
+            }
+            assert_eq!(storage.table(source).spill_generations().len(), 2);
+            assert_eq!(storage.table(target).spill_generations().len(), 3);
+            storage.select_database(DatabaseOid::POSTGRES).unwrap();
+        });
+    }
+
+    #[test]
     fn database_retirement_and_failed_clone_clear_complete_images() {
         let mut config = test_config();
         config.max_databases = 4;
@@ -55724,7 +55755,7 @@ mod tests {
             storage
                 .tables
                 .iter()
-                .all(|table| table.spill_ssts.len() == 12)
+                .all(|table| table.spill_generations().capacity() == 12)
         );
         assert_eq!(
             storage.pending_table_defs.capacity(),

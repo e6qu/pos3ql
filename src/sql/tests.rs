@@ -30,7 +30,7 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
     }
     rowids.sort_unstable();
     assert!(engine.checkpoint().unwrap());
-    assert_eq!(engine.storage.table(table).n_spill_ssts, 1);
+    assert_eq!(engine.storage.table(table).spill_generations().len(), 1);
     // Checkpoint publication can keep hot heap images. Reopen without either
     // cache so this fixture begins with immutable rows only.
     drop(session);
@@ -43,7 +43,7 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
         .storage
         .find_table("public", "retained_walk")
         .unwrap();
-    assert_eq!(engine.storage.table(table).n_spill_ssts, 1);
+    assert_eq!(engine.storage.table(table).spill_generations().len(), 1);
     engine.storage.set_commit_snapshot(engine.storage.lsn());
     engine.storage.evict_redundant_entries(table);
     assert!(
@@ -253,7 +253,7 @@ fn shared_row_publication_rollback_keeps_sst_deletions_through_cold_recovery() {
         .unwrap();
     let rowid = engine.storage.resident_rows(table).iter().next().unwrap().0;
     assert!(engine.checkpoint().unwrap());
-    assert_eq!(engine.storage.table(table).n_spill_ssts, 1);
+    assert_eq!(engine.storage.table(table).spill_generations().len(), 1);
     session.success(&mut engine, "DELETE FROM retained_delete", false);
     let marker = *engine.storage.resident_row_state(table, rowid).unwrap();
     assert!(marker.committed.is_none() && marker.committed_lsn != 0);
@@ -67552,7 +67552,12 @@ fn retained_sst_durable_reader_survives_retirement_and_releases_garbage() {
         .storage
         .find_table("public", "retained_sst_reader")
         .unwrap();
-    let old = engine.storage.table(slot).spill_ssts[0].unwrap();
+    let old = engine
+        .storage
+        .table(slot)
+        .spill_generations()
+        .handle(0)
+        .unwrap();
     let mut hex = [0; 64];
     old.roster.write_key(&mut hex);
     let key = format!("blocks/{}", std::str::from_utf8(&hex).unwrap());
@@ -70431,7 +70436,12 @@ fn metadata_alter_keeps_immutable_roots_and_survives_cold_recovery() {
         .storage
         .find_table("public", "metadata_roots")
         .unwrap();
-    let root = engine.storage.table(table).spill_ssts[0].unwrap();
+    let root = engine
+        .storage
+        .table(table)
+        .spill_generations()
+        .handle(0)
+        .unwrap();
     engine.storage.evict_committed_table(table);
     engine.storage.evict_redundant_entries(table);
     let response = run_with(
@@ -70445,7 +70455,10 @@ fn metadata_alter_keeps_immutable_roots_and_survives_cold_recovery() {
         String::from_utf8_lossy(&response)
     );
     assert_eq!(engine.storage.spill_generation_count(table), 1);
-    assert_eq!(engine.storage.table(table).spill_ssts[0], Some(root));
+    assert_eq!(
+        engine.storage.table(table).spill_generations().handle(0),
+        Some(root)
+    );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -77545,7 +77558,7 @@ fn remaining_inline_widths_are_allocation_free_and_survive_cold_recovery() {
         .storage
         .find_table("public", "checkpoint_delete_width")
         .unwrap();
-    assert_eq!(engine.storage.table(slot).n_spill_ssts, 1);
+    assert_eq!(engine.storage.table(slot).spill_generations().len(), 1);
     // The simulator constructs heap-backed object keys on GET. Production
     // clients use startup-reserved request buffers, so keep that fixture-only
     // work outside the allocation guard while scanning the spilled rows.
@@ -77556,7 +77569,7 @@ fn remaining_inline_widths_are_allocation_free_and_survive_cold_recovery() {
     );
     assert!(engine.checkpoint().unwrap());
     assert_eq!(
-        engine.storage.table(slot).n_spill_ssts,
+        engine.storage.table(slot).spill_generations().len(),
         2,
         "more than 1,024 deletion markers must remain a delta checkpoint"
     );

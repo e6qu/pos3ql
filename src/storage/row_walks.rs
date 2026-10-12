@@ -479,7 +479,7 @@ mod tests {
                 assert_eq!(state.history_get(0).unwrap().lsn, 9);
                 assert_eq!(state.committed_lsn, 11);
                 drop(state);
-                storage.collapse_spill(table, handle(17));
+                storage.collapse_spill(table, handle(17)).unwrap();
                 let state = storage.resident_row_state(table, 1).unwrap();
                 assert_eq!(state.committed, Some(spilled(0, 11)));
                 assert_eq!(state.history_get(0).unwrap().home, Some(spilled(0, 9)));

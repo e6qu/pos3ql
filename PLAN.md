@@ -67,14 +67,19 @@ Individual object-backed row reads now retain their selected generation list
 through lookup and byte retrieval. They can resolve an older version even when
 the newest saved version is a deletion, and captured sources remain readable
 after table replacement or Storage teardown. Point reads have separate fixed
-startup slots, preserving existing scan capacity.
+startup slots, preserving existing scan capacity. A table's saved-file list and
+its eviction boundaries now publish together. Capture retains every selected
+file before releasing list ownership; a rejected replacement preserves the
+previous list, and an append to a full list returns a capacity error. Database
+cloning preserves the same boundaries.
 
 Still to do:
 
 - Complete the table lifecycle transition for capturing row sources alongside
   in-memory changes when a table is dropped, replaced, or publishes a new
-  storage generation. Retained object sources no longer depend on the live
-  table's generation list; capturing resident overlays still needs coordination.
+  storage generation. The saved-file list has its own capture/publication guard;
+  coordinating that list with resident overlays and table lifecycle changes
+  remains open.
 - Finish shared-state protection for table creation/removal, statistics, and
   engine-wide publication.
 - Keep row bytes safe while memory is moved or reclaimed. Complete rewrites

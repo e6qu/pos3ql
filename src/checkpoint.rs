@@ -7517,7 +7517,13 @@ impl Checkpointer {
         }
         for (slot, list) in self.prev_ssts.iter().enumerate() {
             if list.n > 0 {
-                storage.set_spill_list_from_iter(slot, list.n, list.iter().map(|p| p.handle))?;
+                storage
+                    .set_spill_list_from_iter(slot, list.n, list.iter().map(|p| p.handle))
+                    .map_err(|_| {
+                        CheckpointSetupError::Corrupt(
+                            "manifest SST list has invalid length or exceeds table capacity",
+                        )
+                    })?;
             }
         }
         // Named indexes are serialized after tables, so establish the final

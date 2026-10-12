@@ -3,7 +3,7 @@
 **User example:** install a release on a Linux x86-64 host, configure where
 it saves data, and check readiness before sending application traffic. The
 starter configuration does not make an object store or credentials for you.
-Follow [operations](../docs/operations.md) for monitoring and replacement.
+The installed operations guide described below covers monitoring and replacement.
 
 The archive contains one Linux executable and its operator files. Create the
 `pos3ql` system user before installation. Replace `VERSION` with the downloaded

@@ -28,6 +28,10 @@ impl RetainedRowIds<'_> {
         self.rowids.binary_search(&rowid).is_ok()
     }
 
+    fn sort(&mut self) {
+        self.rowids.as_mut_slice().sort_unstable();
+    }
+
     fn as_slice(&self) -> &[u64] {
         &self.rowids
     }
@@ -51,25 +55,82 @@ impl RowScanIds<'_> {
     }
 }
 
-/// One overlay partition shared by the metadata and payload phases. Borrowing
-/// Storage retains its table incarnation and immutable SST list; replacement
-/// and physical retirement still require exclusive Storage ownership.
+/// Both scan phases share the partition captured before any callback runs.
 pub(crate) struct RowScan<'storage> {
     storage: &'storage Storage,
     table_slot: usize,
+    created_at: u64,
     pub(super) rowids: RowScanIds<'storage>,
+    pub(super) roots: super::spill_generations::CapturedSpillRoots<'storage>,
     immutable_only: bool,
 }
 
 impl Storage {
-    pub(crate) fn row_scan(&self, table_slot: usize) -> Result<RowScan<'_>, SqlError> {
-        let (rowids, immutable_only) = self.row_walks.retain_scan(&self.tables[table_slot].rows)?;
-        Ok(RowScan {
-            storage: self,
+    /// Capture only copies fixed metadata and retains roots. Guard order is
+    /// definition, publication, generation list, then row map; no I/O or user
+    /// callback may run in this transition.
+    pub(super) fn capture_row_partition<T>(
+        &self,
+        table_slot: usize,
+        commit_lsn: u64,
+        capture: impl FnOnce(
+            super::spill_generations::SpillGenerationImage,
+            &super::spill_generations::SpillGenerationList,
+            &crate::mem::fixed_map::FixedMap<u64, super::RowState>,
+        ) -> Result<T, SqlError>,
+    ) -> Result<T, SqlError> {
+        let table = &self.tables[table_slot];
+        let definition = table.definition.read();
+        let publication = table.publication();
+        let generations = table.spill_generations();
+        let rows = table.rows.read();
+        let image = super::spill_generations::SpillGenerationImage::capture(
+            &definition,
+            publication.generation,
             table_slot,
-            rowids: RowScanIds::Reserved(rowids),
-            immutable_only,
-        })
+            commit_lsn,
+        );
+        capture(image, &generations, &rows)
+    }
+
+    pub(crate) fn row_scan(&self, table_slot: usize) -> Result<RowScan<'_>, SqlError> {
+        self.reserved_row_scan(table_slot, true)
+    }
+
+    pub(super) fn metadata_row_scan(&self, table_slot: usize) -> Result<RowScan<'_>, SqlError> {
+        self.reserved_row_scan(table_slot, false)
+    }
+
+    fn reserved_row_scan(
+        &self,
+        table_slot: usize,
+        skip_redundant: bool,
+    ) -> Result<RowScan<'_>, SqlError> {
+        let mut scan = self.capture_row_partition(
+            table_slot,
+            self.commit_snapshot(),
+            |image, generations, rows| {
+                let (rowids, immutable_only) = self.row_walks.retain_from(rows, skip_redundant)?;
+                let roots = super::spill_generations::CapturedSpillRoots::capture(
+                    self,
+                    image,
+                    generations,
+                    None,
+                )?;
+                Ok(RowScan {
+                    storage: self,
+                    table_slot,
+                    created_at: image.created_at,
+                    rowids: RowScanIds::Reserved(rowids),
+                    roots,
+                    immutable_only,
+                })
+            },
+        )?;
+        if let RowScanIds::Reserved(rowids) = &mut scan.rowids {
+            rowids.sort();
+        }
+        Ok(scan)
     }
 
     pub(crate) fn row_scan_in<'scan>(
@@ -77,31 +138,44 @@ impl Storage {
         table_slot: usize,
         arena: &'scan crate::mem::arena::Arena,
     ) -> Result<RowScan<'scan>, SqlError> {
-        let rows = self.tables[table_slot].rows.read();
-        let immutable_only = rows.is_empty();
-        let count = rows
-            .iter()
-            .filter(|(_, state)| !Self::redundant_spilled_row_state(state))
-            .count();
-        let rowids = arena.alloc_slice_with(count, |_| 0u64).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "retained byte scan identities exceed the statement arena"
-            )
-        })?;
-        let mut index = 0;
-        for (&rowid, state) in rows.iter() {
-            if !Self::redundant_spilled_row_state(state) {
-                rowids[index] = rowid;
-                index += 1;
-            }
-        }
-        drop(rows);
+        let (image, rowids, roots, immutable_only) = self.capture_row_partition(
+            table_slot,
+            self.commit_snapshot(),
+            |image, generations, rows| {
+                let immutable_only = rows.is_empty();
+                let count = rows
+                    .iter()
+                    .filter(|(_, state)| !Self::redundant_spilled_row_state(state))
+                    .count();
+                let rowids = arena.alloc_slice_with(count, |_| 0u64).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "retained byte scan identities exceed the statement arena"
+                    )
+                })?;
+                let mut index = 0;
+                for (&rowid, state) in rows.iter() {
+                    if !Self::redundant_spilled_row_state(state) {
+                        rowids[index] = rowid;
+                        index += 1;
+                    }
+                }
+                let roots = super::spill_generations::CapturedSpillRoots::capture(
+                    self,
+                    image,
+                    generations,
+                    Some(arena),
+                )?;
+                Ok((image, rowids, roots, immutable_only))
+            },
+        )?;
         rowids.sort_unstable();
         Ok(RowScan {
             storage: self,
             table_slot,
+            created_at: image.created_at,
             rowids: RowScanIds::Statement(rowids),
+            roots,
             immutable_only,
         })
     }
@@ -123,18 +197,59 @@ impl Storage {
 }
 
 impl RowScan<'_> {
+    fn validate_identity(&self) -> Result<(), SqlError> {
+        if self.storage.tables[self.table_slot].created_at() != self.created_at {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "retained scan table identity changed"
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn for_each_overlay(
         &self,
         each: &mut super::RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
+        self.validate_identity()?;
         for &rowid in self.rowids.as_slice() {
-            if let Some(state) = self.storage.row_state(self.table_slot, rowid)?
+            let state = match self.storage.resident_row_state(self.table_slot, rowid) {
+                Some(state) => Some(state),
+                None => {
+                    let Some(roots) = self.roots.owned_source(self.storage)? else {
+                        continue;
+                    };
+                    let version = roots.with_snapshot(|snapshot| {
+                        Storage::probe_spill_snapshot(snapshot, rowid, u64::MAX)
+                    })?;
+                    version.map(|version| {
+                        super::RowRead::immutable(super::SpilledRowState::new(
+                            roots, rowid, version,
+                        ))
+                    })
+                }
+            };
+            if let Some(state) = state
                 && each(rowid, state)?.is_break()
             {
                 return Ok(core::ops::ControlFlow::Break(()));
             }
         }
         Ok(core::ops::ControlFlow::Continue(()))
+    }
+
+    pub(super) fn for_each_spilled_state(
+        &self,
+        each: &mut super::RowReadVisitor<'_>,
+    ) -> Result<(), SqlError> {
+        self.validate_identity()?;
+        let Some(roots) = self.roots.owned_source(self.storage)? else {
+            return Ok(());
+        };
+        self.storage
+            .spill_merged_walk(&roots, &self.rowids, &mut |rowid, source| {
+                each(rowid, super::RowRead::immutable(source))
+            })
     }
 
     pub(crate) fn for_each_spilled_row_batch<'arena, 'callback>(
@@ -144,8 +259,9 @@ impl RowScan<'_> {
         decoded_columns: Option<u64>,
         each: &mut super::SpilledRowBatchVisitor<'arena, 'callback>,
     ) -> Result<(), SqlError> {
+        self.validate_identity()?;
         self.storage.for_each_spilled_row_batch(
-            self.table_slot,
+            &self.roots,
             &self.rowids,
             arena,
             recycle_rows,
@@ -240,7 +356,18 @@ impl RowWalkPool {
         Ok(Self { slots })
     }
 
+    #[cfg(test)]
     fn retain_scan(&self, rows: &RowMap) -> Result<(RetainedRowIds<'_>, bool), SqlError> {
+        let (mut rowids, immutable_only) = self.retain_from(&rows.read(), true)?;
+        rowids.sort();
+        Ok((rowids, immutable_only))
+    }
+
+    fn retain_from(
+        &self,
+        rows: &crate::mem::fixed_map::FixedMap<u64, super::RowState>,
+        skip_redundant: bool,
+    ) -> Result<(RetainedRowIds<'_>, bool), SqlError> {
         let mut rowids = try_mutex_pool(&self.slots, "row walk slots").ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -249,20 +376,14 @@ impl RowWalkPool {
             )
         })?;
         rowids.clear();
-        let immutable_only;
-        {
-            let rows = rows.read();
-            immutable_only = rows.is_empty();
-            for (&rowid, state) in rows.iter() {
-                if !Storage::redundant_spilled_row_state(state) {
-                    rowids
-                        .push(rowid)
-                        .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
-                }
+        for (&rowid, state) in rows.iter() {
+            if !skip_redundant || !Storage::redundant_spilled_row_state(state) {
+                rowids
+                    .push(rowid)
+                    .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
             }
         }
-        rowids.as_mut_slice().sort_unstable();
-        Ok((RetainedRowIds { rowids }, immutable_only))
+        Ok((RetainedRowIds { rowids }, rows.is_empty()))
     }
 
     pub(super) fn retain_value_probe(
@@ -293,26 +414,9 @@ impl RowWalkPool {
     }
 
     pub(super) fn retain(&self, rows: &RowMap) -> Result<RetainedRowIds<'_>, SqlError> {
-        let mut rowids = try_mutex_pool(&self.slots, "row walk slots").ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "row walk retention slots are exhausted ({})",
-                self.slots.len()
-            )
-        })?;
-        rowids.clear();
-        {
-            let rows = rows.read();
-            for (&rowid, _) in rows.iter() {
-                rowids
-                    .push(rowid)
-                    .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
-            }
-        }
-        // A sorted frozen set also owns SST suppression. Current map
-        // membership can change after callbacks and cannot define coverage.
-        rowids.as_mut_slice().sort_unstable();
-        Ok(RetainedRowIds { rowids })
+        let (mut rowids, _) = self.retain_from(&rows.read(), false)?;
+        rowids.sort();
+        Ok(rowids)
     }
 }
 

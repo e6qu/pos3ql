@@ -63,8 +63,11 @@ schema, read position, and reader buffers. The 64 source slots per workspace
 are reserved at startup. An already captured source remains valid after its
 table or Storage owner is retired. Capturing or releasing a source holds shared
 registry state briefly; object I/O and scan callbacks do not hold that registry.
-Point reads and in-memory row overlays still need a coherent table lifecycle
-transition before concurrent execution is enabled.
+Scans capture resident row identities, the saved-file list, schema, and read
+position under one ordered transition before running callbacks. Metadata and
+byte phases use that captured partition. Checkpoint cursors follow the same
+capture order. Preserving resident row images through table removal and memory
+relocation remains planned work before concurrent execution is enabled.
 
 Individual object-row lookups retain their full generation list, schema,
 table identity, and reader buffers through byte retrieval. Their metadata also
@@ -80,8 +83,10 @@ saved version deletes the order. Replacing the table's storage list cannot make
 that already selected read fetch the replacement table's row instead.
 
 Internal metadata/byte scans also reserve 64 retention slots per workspace.
-SQL byte scans use the statement arena so wide joins do not spend one metadata
-slot per join edge. Checked reader identities and full pools return SQLSTATE
+SQL byte scans keep their row identities, saved-file handles, and schema in the
+statement arena so wide joins do not spend one metadata source slot per join
+edge. The scan releases registered files before its statement memory is reset;
+an object-row source selected from it copies ownership into a startup slot. Checked reader identities and full pools return SQLSTATE
 `54000` before reuse or partial registration. These are separate reservations;
 the [capacity inventory](postgresql-18-compatibility.md#capacity-boundaries)
 records their limits.
@@ -105,6 +110,12 @@ handles and boundaries.
 while maintenance replaces that set. A new capture sees a complete replacement,
 never half of the old list mixed with half of the new one. Coordinating this
 with rows still in memory and table removal remains planned work.
+
+**User example:** a report reads some orders from memory and others from saved
+files. Maintenance replaces those files while the report processes its first
+rows. The report continues with its original file set and read position; a new
+scan captures the replacement. Downloads and callbacks hold none of the table
+capture guards. Cancellation and failed capture release reader registrations.
 
 ### What maintenance may change
 

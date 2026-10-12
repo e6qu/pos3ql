@@ -39,10 +39,10 @@ use row_versions::{
     prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
     release_pending_chain, remap_committed_homes,
 };
-use row_walks::{RetainedRowIds, RowScanIds, RowWalkPool};
+use row_walks::{RowScanIds, RowWalkPool};
 use spill_generations::{
-    QueryRootPool, SpillGenerationRoster, SpillGenerationSnapshot, SpillRelation,
-    SpillRootRegistry, SpilledRowRead, SpilledRowState,
+    CapturedSpillRoots, QueryRootLease, QueryRootPool, SpillGenerationRoster,
+    SpillGenerationSnapshot, SpillRelation, SpillRootRegistry, SpilledRowRead, SpilledRowState,
 };
 
 use core::cell::Cell;
@@ -28868,16 +28868,10 @@ impl Storage {
     /// fetched later, by `row_bytes`, exactly as for any spilled row.
     fn spill_merged_walk(
         &self,
-        slot: usize,
-        overlay_rowids: &RetainedRowIds<'_>,
+        roots: &QueryRootLease,
+        overlay_rowids: &RowScanIds<'_>,
         emit: &mut dyn FnMut(u64, SpilledRowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<(), SqlError> {
-        if self.tables[slot].spill_generations().is_empty() {
-            return Ok(());
-        }
-        let roots = self
-            .query_roots
-            .retain(self, slot, self.commit_snapshot())?;
         roots.with_snapshot(|snapshot| {
             let relation = snapshot.relation();
             let n = relation.len();
@@ -28998,7 +28992,7 @@ impl Storage {
     #[expect(clippy::too_many_arguments, reason = "merged row decoder state")]
     fn spill_merged_walk_bytes<'a>(
         &self,
-        slot: usize,
+        roots: &CapturedSpillRoots<'_>,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
         decoded_columns: Option<&[bool; MAX_COLUMNS]>,
@@ -29011,35 +29005,29 @@ impl Storage {
             SpilledRowRepresentation<'a>,
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<bool, SqlError> {
-        if self.tables[slot].spill_generations().is_empty() {
-            return Ok(true);
-        }
-        let commit_snapshot = match overlay_mode {
-            SpillOverlayMode::VisibleScan(_) => self.commit_snapshot(),
-            SpillOverlayMode::CommittedCheckpoint(_) => self.lsn(),
-        };
-        let roots = self.query_roots.retain(self, slot, commit_snapshot)?;
-        roots.with_snapshot(|snapshot| {
-            let relation = snapshot.relation();
-            let spill = snapshot.reader.as_ref().ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "query SST roots have no reader owner"
+        roots
+            .with_view(|source| {
+                let relation = source.relation();
+                let spill = source.reader.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "query SST roots have no reader owner"
+                    )
+                })?;
+                Self::walk_spill_bytes(
+                    spill,
+                    &relation,
+                    source.commit_lsn(),
+                    arena,
+                    recycle_rows,
+                    decoded_columns,
+                    coalesce_packed,
+                    overlay_mode,
+                    resume,
+                    emit,
                 )
-            })?;
-            Self::walk_spill_bytes(
-                spill,
-                &relation,
-                snapshot.commit_lsn,
-                arena,
-                recycle_rows,
-                decoded_columns,
-                coalesce_packed,
-                overlay_mode,
-                resume,
-                emit,
-            )
-        })
+            })
+            .map(|completed| completed.unwrap_or(true))
     }
 
     #[expect(clippy::too_many_arguments, reason = "immutable spill walk boundary")]
@@ -29459,7 +29447,7 @@ impl Storage {
     /// committed spill metadata does not force a second object read.
     fn for_each_spilled_row_batch<'a, 'callback>(
         &self,
-        table_slot: usize,
+        roots: &CapturedSpillRoots<'_>,
         rowids: &RowScanIds<'_>,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
@@ -29488,7 +29476,7 @@ impl Storage {
         let mut stopped = false;
         let mut result = self
             .spill_merged_walk_bytes(
-                table_slot,
+                roots,
                 arena,
                 false,
                 decoded_columns.as_ref(),
@@ -29763,8 +29751,16 @@ impl Storage {
         rowid: u64,
         snapshot: u64,
     ) -> Result<Option<SpillVersion>, SqlError> {
+        Self::probe_spill_source(&source.view(), rowid, snapshot)
+    }
+
+    fn probe_spill_source(
+        source: &spill_generations::SpillSourceView<'_>,
+        rowid: u64,
+        snapshot: u64,
+    ) -> Result<Option<SpillVersion>, SqlError> {
         let relation = source.relation();
-        let spill = source.reader.as_ref().ok_or_else(|| {
+        let spill = source.reader.ok_or_else(|| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "retained SST source has no spill reader"
@@ -29853,20 +29849,11 @@ impl Storage {
         table_slot: usize,
         each: &mut RowReadVisitor<'_>,
     ) -> Result<(), SqlError> {
-        let rowids = self.row_walks.retain(&self.tables[table_slot].rows)?;
-        if self
-            .for_each_retained_row_state(table_slot, &rowids, each)?
-            .is_break()
-        {
+        let scan = self.metadata_row_scan(table_slot)?;
+        if scan.for_each_overlay(each)?.is_break() {
             return Ok(());
         }
-        if self.tables[table_slot].spill_generations().is_empty() {
-            return Ok(());
-        }
-        // Then everything that lives only in the bucket, synthesized.
-        self.spill_merged_walk(table_slot, &rowids, &mut |rowid, source| {
-            each(rowid, RowRead::immutable(source))
-        })
+        scan.for_each_spilled_state(each)
     }
 
     pub(crate) fn resident_rows(&self, table_slot: usize) -> RowReadView<'_> {
@@ -29889,25 +29876,6 @@ impl Storage {
         Ok(core::ops::ControlFlow::Continue(()))
     }
 
-    fn for_each_retained_row_state(
-        &self,
-        table_slot: usize,
-        rowids: &RetainedRowIds<'_>,
-        each: &mut RowReadVisitor<'_>,
-    ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        for rowid in rowids.iter() {
-            // Only reproducible spill entries and rolled-back inserts can
-            // disappear under shared ownership. Resolve an evicted entry from
-            // its immutable generation; an undone insert contributes no row.
-            if let Some(state) = self.row_state(table_slot, rowid)?
-                && each(rowid, state)?.is_break()
-            {
-                return Ok(core::ops::ControlFlow::Break(()));
-            }
-        }
-        Ok(core::ops::ControlFlow::Continue(()))
-    }
-
     fn retain_checkpoint_rowids(
         &self,
         table_slot: usize,
@@ -29917,32 +29885,34 @@ impl Storage {
         if cursor.resident_initialized {
             return cursor.generations.validate(self, table_slot);
         }
-        let rows = self.tables[table_slot].rows.read();
-        for (&rowid, state) in rows.iter() {
-            if !include_spilled && matches!(state.committed, Some(RowHome::Spilled { .. })) {
-                continue;
-            }
-            if cursor.resident_rowids.len() == cursor.resident_rowids.capacity() {
-                cursor.resident_rowids.clear();
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "checkpoint retained row identities exceed table_rows ({})",
-                    cursor.resident_rowids.capacity()
-                ));
-            }
-            cursor.resident_rowids.push(CheckpointRowIdentity {
-                rowid,
-                suppress_spill: false,
+        let captured =
+            self.capture_row_partition(table_slot, self.lsn(), |image, generations, rows| {
+                for (&rowid, state) in rows.iter() {
+                    if !include_spilled && matches!(state.committed, Some(RowHome::Spilled { .. }))
+                    {
+                        continue;
+                    }
+                    if cursor.resident_rowids.len() == cursor.resident_rowids.capacity() {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "checkpoint retained row identities exceed table_rows ({})",
+                            cursor.resident_rowids.capacity()
+                        ));
+                    }
+                    cursor.resident_rowids.push(CheckpointRowIdentity {
+                        rowid,
+                        suppress_spill: false,
+                    });
+                }
+                cursor.generations.capture_image(self, image, generations)
             });
-        }
-        drop(rows);
-        cursor
-            .resident_rowids
-            .sort_unstable_by_key(|entry| entry.rowid);
-        if let Err(error) = cursor.generations.capture(self, table_slot) {
+        if let Err(error) = captured {
             cursor.reset();
             return Err(error);
         }
+        cursor
+            .resident_rowids
+            .sort_unstable_by_key(|entry| entry.rowid);
         cursor.resident_initialized = true;
         Ok(())
     }
@@ -30491,7 +30461,7 @@ impl Storage {
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
         self.spill_merged_walk_bytes(
-            table_slot,
+            &scan.roots,
             arena,
             true,
             None,
@@ -34069,7 +34039,7 @@ impl Storage {
                 .lock()
                 .expect("index expression arena lock poisoned");
             self.spill_merged_walk_bytes(
-                table_index,
+                &scan.roots,
                 &arena,
                 true,
                 Some(&demanded),

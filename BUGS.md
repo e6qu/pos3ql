@@ -5,7 +5,8 @@ or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 The saved-file publication review on 2026-10-13 checked complete-list capture,
-root registration before replacement, rejected installation, and database-clone
+root registration before replacement, rejected installation and full-list
+capacity errors, and database-clone
 eviction boundaries. No known
 defects meet this file's inclusion criteria. This does not mean all planned
 work is finished or that every possible bug has been ruled out.

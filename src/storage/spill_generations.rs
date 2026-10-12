@@ -107,18 +107,30 @@ impl SpillGenerationList {
         Ok(())
     }
 
-    pub(super) fn append(&mut self, handle: SstHandle, through_lsn: u64) {
+    pub(super) fn append(&mut self, handle: SstHandle, through_lsn: u64) -> Result<(), SqlError> {
         self.members
             .push(SpillGeneration {
                 handle,
                 through_lsn,
             })
-            .expect("delta flush into a full list");
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table SST generations exceed startup capacity ({})",
+                    self.capacity()
+                )
+            })
     }
 
-    pub(super) fn collapse(&mut self, handle: SstHandle, through_lsn: u64) {
+    pub(super) fn collapse(&mut self, handle: SstHandle, through_lsn: u64) -> Result<(), SqlError> {
+        if self.capacity() == 0 {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table SST generations exceed startup capacity (0)"
+            ));
+        }
         self.clear();
-        self.append(handle, through_lsn);
+        self.append(handle, through_lsn)
     }
 
     pub(super) fn merge_pair(&mut self, at: usize, handle: Option<SstHandle>) {
@@ -839,8 +851,8 @@ mod tests {
         assert_eq!(budget.remaining(), 0);
         crate::mem::guard::forbid_alloc(|| {
             let mut list = roster.write();
-            list.append(handle(1), 7);
-            list.append(handle(5), 9);
+            list.append(handle(1), 7).unwrap();
+            list.append(handle(5), 9).unwrap();
             for (declared, members, state) in [
                 (4, &[handle(9)][..], sqlstate::PROGRAM_LIMIT_EXCEEDED),
                 (2, &[handle(9)][..], sqlstate::INTERNAL_ERROR),
@@ -856,7 +868,17 @@ mod tests {
                 assert_eq!(list.members[1].through_lsn, 9);
                 assert!(list.staging.is_empty());
             }
-            list.append(handle(9), 11);
+            list.append(handle(9), 11).unwrap();
+            let error = list.append(handle(17), 19).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(list.len(), 3);
+            assert_eq!(
+                list.members[2],
+                SpillGeneration {
+                    handle: handle(9),
+                    through_lsn: 11
+                }
+            );
             list.merge_pair(0, Some(handle(13)));
             assert_eq!(list.len(), 2);
             assert_eq!(
@@ -882,7 +904,7 @@ mod tests {
             assert_eq!(list.handle(0), Some(handle(1)));
             list.replace(0, [].into_iter()).unwrap();
             assert!(list.is_empty());
-            list.collapse(handle(17), 19);
+            list.collapse(handle(17), 19).unwrap();
             assert_eq!(list.members[0].through_lsn, 19);
         });
     }
@@ -1711,7 +1733,7 @@ mod tests {
                 snapshot.validate(&other, table).unwrap_err().sqlstate,
                 sqlstate::INTERNAL_ERROR
             );
-            storage.collapse_spill(table, replacement);
+            storage.collapse_spill(table, replacement).unwrap();
             assert_eq!(snapshot.relation().handle(0), original);
             assert_eq!(
                 storage.table(table).spill_generations().handle(0).unwrap(),

@@ -826,9 +826,9 @@ impl TemporarySpiller {
             .finish(&mut *blocks.lock().expect("block store lock poisoned"))
             .map_err(temporary_sst_to_sql)?;
         match (delta, handle) {
-            (true, Some(handle)) => storage.append_spill(slot, handle),
+            (true, Some(handle)) => storage.append_spill(slot, handle)?,
             (true, None) => {}
-            (false, Some(handle)) => storage.collapse_spill(slot, handle),
+            (false, Some(handle)) => storage.collapse_spill(slot, handle)?,
             (false, None) => storage.set_spill_list(slot, &[]),
         }
         storage.clear_tombstones(slot);
@@ -11334,14 +11334,14 @@ impl Checkpointer {
                     handle,
                     through_lsn,
                 } => {
-                    storage.append_spill_through(slot, handle, through_lsn);
+                    storage.append_spill_through(slot, handle, through_lsn)?;
                 }
                 SlotInstall::Replace {
                     handle,
                     through_lsn,
                 } => {
                     if let Some(handle) = handle {
-                        storage.collapse_spill_through(slot, handle, through_lsn);
+                        storage.collapse_spill_through(slot, handle, through_lsn)?;
                     } else {
                         storage.set_spill_list(slot, &[]);
                     }

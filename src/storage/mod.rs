@@ -30944,8 +30944,12 @@ impl Storage {
 
     /// A full rewrite: the new SST holds every committed row, so the list
     /// collapses to it and every spilled map entry is remapped to slot 0.
-    pub(crate) fn collapse_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
-        self.collapse_spill_through(slot, handle, 0);
+    pub(crate) fn collapse_spill(
+        &mut self,
+        slot: usize,
+        handle: crate::store::SstHandle,
+    ) -> Result<(), SqlError> {
+        self.collapse_spill_through(slot, handle, 0)
     }
 
     pub(crate) fn collapse_spill_through(
@@ -30953,11 +30957,11 @@ impl Storage {
         slot: usize,
         handle: crate::store::SstHandle,
         through_lsn: u64,
-    ) {
+    ) -> Result<(), SqlError> {
         let versions = &mut self.row_versions.exclusive().committed_row_versions;
         let table = &mut self.tables[slot];
         let mut generations = table.spill_generations.write();
-        generations.collapse(handle, through_lsn);
+        generations.collapse(handle, through_lsn)?;
         for (_, state) in table.rows.iter_mut() {
             remap_committed_homes(versions, state, |home| match home {
                 RowHome::Spilled {
@@ -30970,6 +30974,7 @@ impl Storage {
                 RowHome::Heap(_) => home,
             });
         }
+        Ok(())
     }
 
     /// Paced compaction merged the adjacent spill-SST pair at (`at`,
@@ -31017,8 +31022,12 @@ impl Storage {
     /// A delta flush: the new SST (heap rows + tombstones) joins the list;
     /// existing spilled entries keep their slots. The caller guarantees the
     /// list has room.
-    pub(crate) fn append_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
-        self.append_spill_through(slot, handle, 0);
+    pub(crate) fn append_spill(
+        &mut self,
+        slot: usize,
+        handle: crate::store::SstHandle,
+    ) -> Result<(), SqlError> {
+        self.append_spill_through(slot, handle, 0)
     }
 
     pub(crate) fn append_spill_through(
@@ -31026,11 +31035,11 @@ impl Storage {
         slot: usize,
         handle: crate::store::SstHandle,
         through_lsn: u64,
-    ) {
+    ) -> Result<(), SqlError> {
         self.tables[slot]
             .spill_generations
             .write()
-            .append(handle, through_lsn);
+            .append(handle, through_lsn)
     }
 
     /// Installs a validated cold-start list without allocating or partial publication.
@@ -54329,8 +54338,8 @@ mod tests {
             .create_table(make_def("saved_orders", &[("id", ColType::Int4, false)]))
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            storage.append_spill_through(source, handle(1), 7);
-            storage.append_spill_through(source, handle(5), 9);
+            storage.append_spill_through(source, handle(1), 7).unwrap();
+            storage.append_spill_through(source, handle(5), 9).unwrap();
             let database = storage
                 .create_database(
                     None,
@@ -54345,7 +54354,7 @@ mod tests {
             storage.select_database(oid).unwrap();
             let target = storage.find_table("public", "saved_orders").unwrap();
             assert_ne!(source, target);
-            storage.append_spill_through(target, handle(9), 11);
+            storage.append_spill_through(target, handle(9), 11).unwrap();
             for (rowid, commit_lsn) in [(1, 7), (2, 9), (3, 11)] {
                 let values = [Datum::Int4(rowid as i32)];
                 let (location, bytes) = storage.heap.append(rowenc::encoded_len(&values)).unwrap();

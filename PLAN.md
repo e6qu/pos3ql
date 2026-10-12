@@ -70,7 +70,8 @@ after table replacement or Storage teardown. Point reads have separate fixed
 startup slots, preserving existing scan capacity. A table's saved-file list and
 its eviction boundaries now publish together. Capture retains every selected
 file before releasing list ownership; a rejected replacement preserves the
-previous list. Database cloning preserves the same boundaries.
+previous list, and an append to a full list returns a capacity error. Database
+cloning preserves the same boundaries.
 
 Still to do:
 

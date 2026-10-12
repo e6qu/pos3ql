@@ -97,7 +97,8 @@ The installed generation list groups each file handle with the commit boundary
 used for memory eviction. A short guard keeps replacement from interleaving
 with capture and root registration; downloads and row callbacks run after that
 guard ends. New lists use a second fixed startup buffer, so an invalid or
-oversized installation preserves the prior list. Database clones retain both
+oversized installation preserves the prior list. Appending to a full list
+returns `54000` without changing installed members. Database clones retain both
 handles and boundaries.
 
 **User example:** a read keeps the complete set of saved order files it selected

@@ -433,14 +433,6 @@ impl SpilledRowRead {
         })
     }
 
-    pub(super) fn home(&self) -> super::RowHome {
-        super::RowHome::Spilled {
-            len: self.len,
-            sst: self.member,
-            commit_lsn: self.commit_lsn,
-        }
-    }
-
     pub(super) fn snapshot(&self) -> super::RowSnapshot {
         super::RowSnapshot {
             created_at: self.created_at,
@@ -867,6 +859,74 @@ mod tests {
                 .unwrap();
         });
         drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn retained_object_rows_allow_replacement_while_a_reader_consumes_old_bytes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        struct Release<'a>(&'a AtomicBool);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let PointFixture {
+            mut storage,
+            table,
+            roots,
+            path,
+            ..
+        } = point_fixture("overlap");
+        let state = storage
+            .spill_row_state_at(table, 1, u64::MAX)
+            .unwrap()
+            .unwrap();
+        let source = state.visible_at(7).unwrap().unwrap();
+        let ready = AtomicBool::new(false);
+        let replaced = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let finish = Release(&replaced);
+            let reader = scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    source
+                        .with_bytes(|bytes| {
+                            ready.store(true, Ordering::Release);
+                            while !replaced.load(Ordering::Acquire) {
+                                std::thread::yield_now();
+                            }
+                            let mut values = [crate::sql::types::Datum::Null];
+                            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                            assert_eq!(values, [crate::sql::types::Datum::Int4(41)]);
+                            Ok(())
+                        })
+                        .unwrap();
+                });
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let reading = ready.load(Ordering::Acquire);
+            if reading {
+                crate::mem::guard::forbid_alloc(|| {
+                    storage.set_spill_list(table, &[roots[2]]);
+                    storage.drop_table(table);
+                    let mut definition = make_def("overlap", &[("id", ColType::Text, true)]);
+                    definition.persistence = RelationPersistence::Temporary;
+                    let replacement = storage.create_table(definition).unwrap();
+                    storage.set_spill_list(replacement, &[roots[2]]);
+                });
+            }
+            drop(finish);
+            reader.join().unwrap();
+            assert!(
+                reading,
+                "replacement must finish before the reader releases its bytes"
+            );
+        });
+        drop((state, source, storage));
         std::fs::remove_file(path).unwrap();
     }
 

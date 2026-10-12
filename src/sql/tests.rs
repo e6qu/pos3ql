@@ -336,7 +336,7 @@ fn visible_row_heap_ownership_transaction_exhaustion_rejects_wire_statement() {
     engine.next_txid = u32::MAX;
     let output = run_with_fixed_memory(
         &mut engine,
-        &mut budget,
+        &budget,
         "CREATE TABLE exhausted_identity (id integer)",
         1 << 20,
     );

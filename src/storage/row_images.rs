@@ -133,7 +133,11 @@ impl<'a> VisibleRowHome<'a> {
     pub(super) fn metadata(&self) -> RowHome {
         match &self.bytes {
             VisibleRowBytes::Heap(bytes) => RowHome::Heap(bytes.location()),
-            VisibleRowBytes::Spilled(source) => source.home(),
+            VisibleRowBytes::Spilled(source) => RowHome::Spilled {
+                len: source.len,
+                sst: source.member,
+                commit_lsn: source.commit_lsn,
+            },
         }
     }
 }

@@ -48241,7 +48241,7 @@ pub fn create_index(
     };
     let validation = storage.row_scan_in(table_index, arena).and_then(|scan| {
         let overlay = scan.for_each_overlay(&mut |rowid, state| {
-            let Some(home) = storage.committed_row_home(table_index, state)? else {
+            let Some(home) = storage.committed_row_home(table_index, rowid, state)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
             storage.with_row_bytes(table_index, rowid, home, |bytes| {
@@ -48504,7 +48504,7 @@ fn create_partition_index_children(
             table.schema(&mut schema);
             let validation = storage.for_each_row_state(table_slot, &mut |rowid, state| {
                 use core::ops::ControlFlow;
-                let Some(home) = storage.committed_row_home(table_slot, state)? else {
+                let Some(home) = storage.committed_row_home(table_slot, rowid, state)? else {
                     return Ok(ControlFlow::Continue(()));
                 };
                 storage.with_row_bytes(table_slot, rowid, home, |bytes| {

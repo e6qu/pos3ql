@@ -184,6 +184,8 @@ impl Storage {
                 .loc
                 .map(|location| {
                     self.pin_visible_home(
+                        table,
+                        rowid,
                         RowSnapshot {
                             created_at: self.tables[table].created_at(),
                             version: RowVersionIdentity::Pending(
@@ -497,7 +499,10 @@ mod tests {
         storage.set_commit_snapshot(7);
         let mut hashes = [(0, 0); super::super::MAX_VALUE_ENFORCERS];
         let state = storage.resident_row_state(table, 1).unwrap();
-        let home = storage.committed_row_home(table, state).unwrap().unwrap();
+        let home = storage
+            .committed_row_home(table, 1, state)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             storage
                 .row_enforcer_hashes(table, 1, home, &mut hashes)
@@ -972,7 +977,10 @@ mod tests {
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let state = storage.resident_row_state(table, 1).unwrap();
-            let image = storage.committed_row_home(table, state).unwrap().unwrap();
+            let image = storage
+                .committed_row_home(table, 1, state)
+                .unwrap()
+                .unwrap();
             assert!(storage.row_versions.test_write().is_ok());
             assert!(storage.tables[table].rows.test_write().is_ok());
             assert!(storage.heap.test_write().is_err());

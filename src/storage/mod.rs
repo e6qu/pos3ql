@@ -40,7 +40,10 @@ use row_versions::{
     release_pending_chain, remap_committed_homes,
 };
 use row_walks::{RetainedRowIds, RowScanIds, RowWalkPool};
-use spill_generations::{QueryRootPool, SpillGenerationSnapshot, SpillRelation, SpillRootRegistry};
+use spill_generations::{
+    QueryRootPool, SpillGenerationSnapshot, SpillRelation, SpillRootRegistry, SpilledRowRead,
+    SpilledRowState,
+};
 
 use core::cell::Cell;
 use core::hash::{Hash, Hasher};
@@ -14278,8 +14281,146 @@ impl SpillReader {
         Ok(id)
     }
 
-    fn relation_blocks<'a>(&'a self, table: &Table) -> RelationBlockStore<'a> {
-        self.relation_blocks_for(table.definition().persistence)
+    fn copy_row_bytes<'arena>(
+        &self,
+        persistence: RelationPersistence,
+        handle: crate::store::SstHandle,
+        rowid: u64,
+        len: u32,
+        commit_lsn: u64,
+        arena: &'arena Arena,
+    ) -> Result<&'arena [u8], SqlError> {
+        let out = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "spilled rows exceed the statement arena; raise work_arena_bytes"
+            )
+        })?;
+        // Both borrows are per-fetch; the copy into the arena ends
+        // them before returning.
+        let Some(mut scratch) = try_mutex_pool(&self.scratch, "spill row scratch") else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "spill row scratch exhausted (maximum nested fetches 2)"
+            ));
+        };
+        let mut blocks = self.relation_blocks_for(persistence);
+        let SpillScratch {
+            index_buf,
+            data_buf,
+            decoded_buf,
+            column_buf,
+            assembly_buf,
+            decoded_data_ref,
+            ..
+        } = &mut *scratch;
+        let mut reader = crate::store::SstReader::over(
+            index_buf,
+            data_buf,
+            decoded_buf,
+            column_buf,
+            assembly_buf,
+        );
+        reader.restore_cached_data_block(
+            handle.format,
+            (*decoded_data_ref).and_then(|(cached_handle, reference, cached_len)| {
+                (cached_handle == handle).then_some((reference, cached_len))
+            }),
+        );
+        let got = reader
+            .get_at(&mut *blocks, &handle, rowid, commit_lsn, out)
+            .map_err(spill_read_error)?;
+        *decoded_data_ref = reader
+            .cached_data_block()
+            .map(|(reference, cached_len)| (handle, reference, cached_len));
+        match got {
+            Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {
+                Ok(&out[..len as usize])
+            }
+            Some(_) => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "spilled row version mismatch"
+            )),
+            None => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "spilled row missing from its SST"
+            )),
+        }
+    }
+
+    fn with_row_bytes<R>(
+        &self,
+        persistence: RelationPersistence,
+        handle: crate::store::SstHandle,
+        rowid: u64,
+        len: u32,
+        commit_lsn: u64,
+        f: impl FnOnce(&[u8]) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        let Some(mut scratch) = try_mutex_pool(&self.scratch, "spill row scratch") else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "spill row scratch exhausted (maximum nested fetches 2)"
+            ));
+        };
+        let SpillScratch {
+            index_buf,
+            data_buf,
+            decoded_buf,
+            column_buf,
+            assembly_buf,
+            bounce_buf,
+            decoded_data_ref,
+        } = &mut *scratch;
+        // The assembly buffer doubles as the row destination: `get`
+        // assembles a chained row into the caller buffer directly, so
+        // the two uses never overlap. The reader's own staging slot is
+        // the bounce buffer (a compressed data block decompresses
+        // through it).
+        let capacity = assembly_buf.len();
+        let row_buf = assembly_buf.get_mut(..len as usize).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "spilled row exceeds startup row scratch ({})",
+                capacity
+            )
+        })?;
+        let got = {
+            let mut blocks = self.relation_blocks_for(persistence);
+            let mut reader = crate::store::SstReader::over(
+                index_buf,
+                data_buf,
+                decoded_buf,
+                column_buf,
+                bounce_buf,
+            );
+            reader.restore_cached_data_block(
+                handle.format,
+                (*decoded_data_ref).and_then(|(cached_handle, reference, cached_len)| {
+                    (cached_handle == handle).then_some((reference, cached_len))
+                }),
+            );
+            let got = reader
+                .get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf)
+                .map_err(spill_read_error)?;
+            *decoded_data_ref = reader
+                .cached_data_block()
+                .map(|(reference, cached_len)| (handle, reference, cached_len));
+            got
+        };
+        match got {
+            Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {
+                f(&row_buf[..len as usize])
+            }
+            Some(_) => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "spilled row version mismatch"
+            )),
+            None => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "spilled row missing from its SST"
+            )),
+        }
     }
 
     fn relation_blocks_for(&self, persistence: RelationPersistence) -> RelationBlockStore<'_> {
@@ -28739,7 +28880,7 @@ impl Storage {
         &self,
         slot: usize,
         overlay_rowids: &RetainedRowIds<'_>,
-        emit: &mut dyn FnMut(u64, u32, u32, u64) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        emit: &mut dyn FnMut(u64, SpilledRowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<(), SqlError> {
         if self.tables[slot].n_spill_ssts == 0 {
             return Ok(());
@@ -28838,7 +28979,19 @@ impl Storage {
                     commit_lsn,
                 }) = verdict
                     && !overlay_rowids.contains(rowid)
-                    && emit(rowid, len, member, commit_lsn)?.is_break()
+                    && emit(
+                        rowid,
+                        SpilledRowState::new(
+                            roots.try_clone()?,
+                            rowid,
+                            SpillVersion {
+                                len: Some(len),
+                                member,
+                                commit_lsn,
+                            },
+                        ),
+                    )?
+                    .is_break()
                 {
                     return Ok(());
                 }
@@ -29608,25 +29761,34 @@ impl Storage {
         rowid: u64,
         snapshot: u64,
     ) -> Result<Option<SpillVersion>, SqlError> {
-        let table = &self.tables[slot];
-        if table.n_spill_ssts == 0 {
+        if self.tables[slot].n_spill_ssts == 0 {
             return Ok(None);
         }
-        let Some(spill) = &self.spill else {
-            return Err(sql_err!(
+        let roots = self.query_roots.retain_point(self, slot, snapshot)?;
+        roots.with_snapshot(|source| Self::probe_spill_snapshot(source, rowid, snapshot))
+    }
+
+    fn probe_spill_snapshot(
+        source: &SpillGenerationSnapshot,
+        rowid: u64,
+        snapshot: u64,
+    ) -> Result<Option<SpillVersion>, SqlError> {
+        let relation = source.relation();
+        let spill = source.reader.as_ref().ok_or_else(|| {
+            sql_err!(
                 sqlstate::INTERNAL_ERROR,
-                "table has spill SSTs but no spill reader is attached"
-            ));
-        };
+                "retained SST source has no spill reader"
+            )
+        })?;
         let Some(mut scratch) = try_mutex_pool(&spill.scratch, "spill row scratch") else {
             return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "spill fetches nested deeper than the reader scratch"
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "spill row scratch exhausted (maximum nested fetches {})",
+                spill.scratch.len()
             ));
         };
         let scratch = &mut *scratch;
-        // This multi-SST probe reuses the decoded buffer without preserving a
-        // single row block, so it invalidates the point-reader cache.
+        // This probe reuses the decoded buffer across members.
         scratch.decoded_data_ref = None;
         let mut reader = crate::store::SstReader::over(
             &mut scratch.index_buf,
@@ -29636,10 +29798,10 @@ impl Storage {
             &mut scratch.assembly_buf,
         );
         let mut best: Option<SpillVersion> = None;
-        for member in 0..table.n_spill_ssts {
-            let handle = table.spill_ssts[member].expect("counted");
+        for member in 0..relation.len() {
+            let handle = relation.handle(member);
             let verdict = {
-                let mut blocks = spill.relation_blocks(table);
+                let mut blocks = spill.relation_blocks_for(relation.persistence);
                 reader.probe_at(&mut *blocks, &handle, rowid, snapshot)
             }
             .map_err(spill_read_error)?;
@@ -29658,6 +29820,33 @@ impl Storage {
             }
         }
         Ok(best)
+    }
+
+    fn spill_row_state_at(
+        &self,
+        table: usize,
+        rowid: u64,
+        snapshot: u64,
+    ) -> Result<Option<SpilledRowState>, SqlError> {
+        if self.tables[table].n_spill_ssts == 0 {
+            return Ok(None);
+        }
+        let roots = self.query_roots.retain_point(self, table, snapshot)?;
+        let version =
+            roots.with_snapshot(|source| Self::probe_spill_snapshot(source, rowid, snapshot))?;
+        Ok(version.map(|version| SpilledRowState::new(roots, rowid, version)))
+    }
+
+    fn retain_spilled_row(
+        &self,
+        table: usize,
+        rowid: u64,
+        len: u32,
+        member: u32,
+        commit_lsn: u64,
+    ) -> Result<SpilledRowRead, SqlError> {
+        let roots = self.query_roots.retain_point(self, table, commit_lsn)?;
+        SpilledRowRead::new(roots, rowid, len, member, commit_lsn)
     }
 
     /// The one place a table's row states are enumerated. The bounded map is
@@ -29685,26 +29874,9 @@ impl Storage {
             return Ok(());
         }
         // Then everything that lives only in the bucket, synthesized.
-        self.spill_merged_walk(
-            table_slot,
-            &rowids,
-            &mut |rowid, len, member, commit_lsn| {
-                each(
-                    rowid,
-                    RowRead::immutable(RowState {
-                        committed: Some(RowHome::Spilled {
-                            len,
-                            sst: member,
-                            commit_lsn,
-                        }),
-                        committed_lsn: commit_lsn,
-                        checkpoint_change_lsn: 0,
-                        history: CommittedHistory::empty(),
-                        pending: PendingVersions::empty(),
-                    }),
-                )
-            },
-        )
+        self.spill_merged_walk(table_slot, &rowids, &mut |rowid, source| {
+            each(rowid, RowRead::immutable(source))
+        })
     }
 
     pub(crate) fn resident_rows(&self, table_slot: usize) -> RowReadView<'_> {
@@ -29845,7 +30017,7 @@ impl Storage {
             }
             changed_rowids.push(rowid);
             let home = self
-                .committed_row_home(table_slot, state)?
+                .committed_row_home(table_slot, rowid, state)?
                 .expect("committed heap image");
             let Some((key_len, payload_len, hash)) =
                 self.encode_value_binding_entry(table_slot, binding, rowid, home, output)?
@@ -29902,7 +30074,7 @@ impl Storage {
                 }
                 cursor.resident_rowids[cursor.resident_position - 1].suppress_spill = true;
                 let committed_lsn = state.committed_lsn;
-                let Some(home) = self.committed_row_home(table_slot, state)? else {
+                let Some(home) = self.committed_row_home(table_slot, rowid, state)? else {
                     continue;
                 };
                 let Some((key_len, payload_len, hash)) = self
@@ -30021,22 +30193,8 @@ impl Storage {
             return Ok(Some(state));
         }
         Ok(self
-            .spill_probe_at(table_slot, rowid, u64::MAX)?
-            .and_then(|version| {
-                version.len.map(|len| {
-                    RowRead::immutable(RowState {
-                        committed: Some(RowHome::Spilled {
-                            len,
-                            sst: version.member,
-                            commit_lsn: version.commit_lsn,
-                        }),
-                        committed_lsn: version.commit_lsn,
-                        checkpoint_change_lsn: 0,
-                        history: CommittedHistory::empty(),
-                        pending: PendingVersions::empty(),
-                    })
-                })
-            }))
+            .spill_row_state_at(table_slot, rowid, u64::MAX)?
+            .map(RowRead::immutable))
     }
 
     /// Returns only a row state already present in the bounded mutable
@@ -30086,6 +30244,12 @@ impl Storage {
         command_snapshot: u32,
         commit_snapshot: u64,
     ) -> Result<Option<VisibleRowHome<'_>>, SqlError> {
+        if let Some(source) = state.spilled_source() {
+            source.validate_request(table_slot, rowid)?;
+            let selected = source.visible_at(commit_snapshot)?;
+            drop(state);
+            return Ok(selected.map(VisibleRowHome::spilled));
+        }
         let created_at = self.tables[table_slot].created_at();
         let visible = state.visible_version_at(txid, command_snapshot, commit_snapshot);
         // Acquire bytes before releasing the owner of the selected location.
@@ -30093,6 +30257,8 @@ impl Storage {
             .and_then(|(version, home)| home.map(|home| (version, home)))
             .map(|(version, home)| {
                 self.pin_visible_home(
+                    table_slot,
+                    rowid,
                     RowSnapshot {
                         created_at,
                         version,
@@ -30105,21 +30271,12 @@ impl Storage {
         if visible.is_some() {
             return Ok(resident);
         }
-        Ok(self
-            .spill_probe_at(table_slot, rowid, commit_snapshot)?
-            .and_then(|version| {
-                version.len.map(|len| {
-                    VisibleRowHome::spilled(
-                        RowSnapshot {
-                            created_at,
-                            version: RowVersionIdentity::Committed(version.commit_lsn),
-                        },
-                        len,
-                        version.member,
-                        version.commit_lsn,
-                    )
-                })
-            }))
+        match self.spill_row_state_at(table_slot, rowid, commit_snapshot)? {
+            Some(source) => Ok(source
+                .visible_at(commit_snapshot)?
+                .map(VisibleRowHome::spilled)),
+            None => Ok(None),
+        }
     }
 
     /// Uniqueness validation checks the latest committed image regardless of
@@ -30127,12 +30284,21 @@ impl Storage {
     pub(crate) fn committed_row_home(
         &self,
         table_slot: usize,
+        rowid: u64,
         state: RowRead<'_>,
     ) -> Result<Option<VisibleRowHome<'_>>, SqlError> {
+        if let Some(source) = state.spilled_source() {
+            source.validate_request(table_slot, rowid)?;
+            let selected = source.visible_at(u64::MAX)?;
+            drop(state);
+            return Ok(selected.map(VisibleRowHome::spilled));
+        }
         let image = state
             .committed
             .map(|home| {
                 self.pin_visible_home(
+                    table_slot,
+                    rowid,
                     RowSnapshot {
                         created_at: self.tables[table_slot].created_at(),
                         version: RowVersionIdentity::Committed(state.committed_lsn),
@@ -30147,6 +30313,8 @@ impl Storage {
 
     fn pin_visible_home(
         &self,
+        table_slot: usize,
+        rowid: u64,
         snapshot: RowSnapshot,
         home: RowHome,
     ) -> Result<VisibleRowHome<'_>, SqlError> {
@@ -30156,7 +30324,18 @@ impl Storage {
                 len,
                 sst,
                 commit_lsn,
-            } => Ok(VisibleRowHome::spilled(snapshot, len, sst, commit_lsn)),
+            } => {
+                let source = self.retain_spilled_row(table_slot, rowid, len, sst, commit_lsn)?;
+                if source.snapshot().created_at != snapshot.created_at
+                    || source.snapshot().version != snapshot.version
+                {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "selected object row belongs to a different table or version"
+                    ));
+                }
+                Ok(VisibleRowHome::spilled(source))
+            }
         }
     }
 
@@ -30189,7 +30368,7 @@ impl Storage {
                             "retained pending row version is no longer available"
                         )
                     })?;
-                self.pin_visible_home(snapshot, RowHome::Heap(home))
+                self.pin_visible_home(table_slot, rowid, snapshot, RowHome::Heap(home))
             }
             RowVersionIdentity::Committed(commit_lsn) => {
                 let image = self
@@ -30608,20 +30787,10 @@ impl Storage {
     ) -> Result<&'a [u8], SqlError> {
         match image.bytes {
             VisibleRowBytes::Heap(row) => Self::copy_heap_row(row, arena),
-            VisibleRowBytes::Spilled {
-                len,
-                sst,
-                commit_lsn,
-            } => self.physical_row_bytes(
-                table_slot,
-                rowid,
-                RowHome::Spilled {
-                    len,
-                    sst,
-                    commit_lsn,
-                },
-                arena,
-            ),
+            VisibleRowBytes::Spilled(source) => {
+                source.validate_request(table_slot, rowid)?;
+                source.copy_bytes(arena)
+            }
         }
     }
 
@@ -30648,89 +30817,14 @@ impl Storage {
         arena: &'a crate::mem::arena::Arena,
     ) -> Result<&'a [u8], SqlError> {
         match home {
-            RowHome::Heap(loc) => {
-                let row = self.heap.get(loc)?;
-                Self::copy_heap_row(row, arena)
-            }
+            RowHome::Heap(location) => Self::copy_heap_row(self.heap.get(location)?, arena),
             RowHome::Spilled {
                 len,
                 sst,
                 commit_lsn,
-            } => {
-                let Some(spill) = &self.spill else {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "row is spilled but no spill reader is attached"
-                    ));
-                };
-                let Some(handle) = self.tables[table_slot]
-                    .spill_ssts
-                    .get(sst as usize)
-                    .copied()
-                    .flatten()
-                else {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "row is spilled but its table has no spill SST"
-                    ));
-                };
-                let out = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "spilled rows exceed the statement arena; raise work_arena_bytes"
-                    )
-                })?;
-                // Both borrows are per-fetch; the copy into the arena ends
-                // them before returning.
-                let Some(mut scratch) = try_mutex_pool(&spill.scratch, "spill row scratch") else {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "spilled-row fetches nested deeper than the reader supports"
-                    ));
-                };
-                let mut blocks = spill.relation_blocks(&self.tables[table_slot]);
-                let SpillScratch {
-                    index_buf,
-                    data_buf,
-                    decoded_buf,
-                    column_buf,
-                    assembly_buf,
-                    decoded_data_ref,
-                    ..
-                } = &mut *scratch;
-                let mut reader = crate::store::SstReader::over(
-                    index_buf,
-                    data_buf,
-                    decoded_buf,
-                    column_buf,
-                    assembly_buf,
-                );
-                reader.restore_cached_data_block(
-                    handle.format,
-                    (*decoded_data_ref).and_then(|(cached_handle, reference, cached_len)| {
-                        (cached_handle == handle).then_some((reference, cached_len))
-                    }),
-                );
-                let got = reader
-                    .get_at(&mut *blocks, &handle, rowid, commit_lsn, out)
-                    .map_err(spill_read_error)?;
-                *decoded_data_ref = reader
-                    .cached_data_block()
-                    .map(|(reference, cached_len)| (handle, reference, cached_len));
-                match got {
-                    Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {
-                        Ok(&out[..len as usize])
-                    }
-                    Some(_) => Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "spilled row version mismatch"
-                    )),
-                    None => Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "spilled row missing from its SST"
-                    )),
-                }
-            }
+            } => self
+                .retain_spilled_row(table_slot, rowid, len, sst, commit_lsn)?
+                .copy_bytes(arena),
         }
     }
 
@@ -30769,20 +30863,10 @@ impl Storage {
     ) -> Result<R, SqlError> {
         match image.bytes {
             VisibleRowBytes::Heap(row) => f(&row),
-            VisibleRowBytes::Spilled {
-                len,
-                sst,
-                commit_lsn,
-            } => self.with_physical_row_bytes(
-                table_slot,
-                rowid,
-                RowHome::Spilled {
-                    len,
-                    sst,
-                    commit_lsn,
-                },
-                f,
-            ),
+            VisibleRowBytes::Spilled(source) => {
+                source.validate_request(table_slot, rowid)?;
+                source.with_bytes(f)
+            }
         }
     }
 
@@ -30794,87 +30878,14 @@ impl Storage {
         f: impl FnOnce(&[u8]) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         match home {
-            RowHome::Heap(loc) => f(&self.heap.get(loc)?),
+            RowHome::Heap(location) => f(&self.heap.get(location)?),
             RowHome::Spilled {
                 len,
                 sst,
                 commit_lsn,
-            } => {
-                let Some(spill) = &self.spill else {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "row is spilled but no spill reader is attached"
-                    ));
-                };
-                let Some(handle) = self.tables[table_slot]
-                    .spill_ssts
-                    .get(sst as usize)
-                    .copied()
-                    .flatten()
-                else {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "row is spilled but its table has no spill SST"
-                    ));
-                };
-                let Some(mut scratch) = try_mutex_pool(&spill.scratch, "spill row scratch") else {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "spilled-row fetches nested deeper than the reader supports"
-                    ));
-                };
-                let SpillScratch {
-                    index_buf,
-                    data_buf,
-                    decoded_buf,
-                    column_buf,
-                    assembly_buf,
-                    bounce_buf,
-                    decoded_data_ref,
-                } = &mut *scratch;
-                // The assembly buffer doubles as the row destination: `get`
-                // assembles a chained row into the caller buffer directly, so
-                // the two uses never overlap. The reader's own staging slot is
-                // the bounce buffer (a compressed data block decompresses
-                // through it).
-                let row_buf = &mut assembly_buf[..len as usize];
-                let got = {
-                    let mut blocks = spill.relation_blocks(&self.tables[table_slot]);
-                    let mut reader = crate::store::SstReader::over(
-                        index_buf,
-                        data_buf,
-                        decoded_buf,
-                        column_buf,
-                        bounce_buf,
-                    );
-                    reader.restore_cached_data_block(
-                        handle.format,
-                        (*decoded_data_ref).and_then(|(cached_handle, reference, cached_len)| {
-                            (cached_handle == handle).then_some((reference, cached_len))
-                        }),
-                    );
-                    let got = reader
-                        .get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf)
-                        .map_err(spill_read_error)?;
-                    *decoded_data_ref = reader
-                        .cached_data_block()
-                        .map(|(reference, cached_len)| (handle, reference, cached_len));
-                    got
-                };
-                match got {
-                    Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {
-                        f(&row_buf[..len as usize])
-                    }
-                    Some(_) => Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "spilled row version mismatch"
-                    )),
-                    None => Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "spilled row missing from its SST"
-                    )),
-                }
-            }
+            } => self
+                .retain_spilled_row(table_slot, rowid, len, sst, commit_lsn)?
+                .with_bytes(f),
         }
     }
 
@@ -34058,7 +34069,7 @@ impl Storage {
         let scan = self.row_scan(table_index)?;
         let overlay = scan.for_each_overlay(&mut |rowid, state| {
             let lsn = state.committed_lsn;
-            let Some(home) = self.committed_row_home(table_index, state)? else {
+            let Some(home) = self.committed_row_home(table_index, rowid, state)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
             let count = self.row_enforcer_hashes(table_index, rowid, home, &mut buf)?;

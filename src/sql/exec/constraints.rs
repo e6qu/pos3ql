@@ -244,7 +244,7 @@ fn committed_key_matches(
     let Some(state) = storage.row_state(table_index, rowid)? else {
         return Ok(false);
     };
-    let Some(home) = storage.committed_row_home(table_index, state)? else {
+    let Some(home) = storage.committed_row_home(table_index, rowid, state)? else {
         return Ok(false);
     };
     storage.with_row_bytes(table_index, rowid, home, |bytes| {
@@ -553,7 +553,7 @@ fn enforce_expression_index_uniqueness<'a>(
         if Some(rowid) == self_rowid {
             return Ok(ControlFlow::Continue(()));
         }
-        let Some(home) = storage.committed_row_home(table_index, state)? else {
+        let Some(home) = storage.committed_row_home(table_index, rowid, state)? else {
             return Ok(ControlFlow::Continue(()));
         };
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
@@ -844,7 +844,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
         if Some(rowid) == self_rowid {
             return Ok(ControlFlow::Continue(()));
         }
-        let Some(home) = storage.committed_row_home(table_index, state)? else {
+        let Some(home) = storage.committed_row_home(table_index, rowid, state)? else {
             return Ok(ControlFlow::Continue(()));
         };
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {

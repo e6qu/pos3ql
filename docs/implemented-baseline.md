@@ -66,12 +66,32 @@ registry state briefly; object I/O and scan callbacks do not hold that registry.
 Point reads and in-memory row overlays still need a coherent table lifecycle
 transition before concurrent execution is enabled.
 
+Individual object-row lookups retain their full generation list, schema,
+table identity, and reader buffers through byte retrieval. Their metadata also
+represents a newest deletion, so an older transaction can still resolve the
+preceding saved version after resident history disappears. Latest-committed
+constraint checks probe the captured objects beyond an older scan's read
+position instead of treating that scan's selected row as the latest version.
+Captured sources remain readable after table replacement and Storage teardown.
+The last shared lease releases the roots and makes its slot reusable.
+
+**User example:** a report keeps an order's earlier status even if a later
+saved version deletes the order. Replacing the table's storage list cannot make
+that already selected read fetch the replacement table's row instead.
+
 Internal metadata/byte scans also reserve 64 retention slots per workspace.
 SQL byte scans use the statement arena so wide joins do not spend one metadata
 slot per join edge. Checked reader identities and full pools return SQLSTATE
 `54000` before reuse or partial registration. These are separate reservations;
 the [capacity inventory](postgresql-18-compatibility.md#capacity-boundaries)
 records their limits.
+
+Point sources reserve another 64 slots per workspace, independent of the 64
+scan-source slots. Sharing one captured source uses checked reader counts;
+exhaustion returns `54000` without partial retention. Row-fetch scratch and
+consume-in-place byte limits also fail with `54000`, including nested fetches;
+errors release the request buffers and retained sources. These reservations are
+included in the startup memory plan.
 
 ### What maintenance may change
 

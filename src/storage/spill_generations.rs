@@ -406,6 +406,7 @@ impl QueryRootPool {
         }))
     }
 
+    #[cfg(test)]
     pub(super) fn retain(
         self: &Arc<Self>,
         storage: &Storage,
@@ -1371,7 +1372,7 @@ mod tests {
             storage,
             table,
             roots,
-            arena,
+            arena: _arena,
             path,
         } = scan_fixture("metadata-partition");
         let mut seen = [u64::MAX; 3];
@@ -1447,7 +1448,6 @@ mod tests {
                     .all(|slot| !slot.retained.load(Ordering::Acquire))
             );
             assert!(storage.row_scan(table).is_ok());
-            let _ = &arena;
         });
         drop(storage);
         std::fs::remove_file(path).unwrap();
@@ -1669,6 +1669,7 @@ mod tests {
                 Some(roots[0])
             );
         });
+        drop(scans);
         drop(storage);
         std::fs::remove_file(path).unwrap();
     }

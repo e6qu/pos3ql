@@ -24,6 +24,7 @@ impl RetainedRowIds<'_> {
         self.rowids.iter().copied()
     }
 
+    #[cfg(test)]
     pub(super) fn contains(&self, rowid: u64) -> bool {
         self.rowids.binary_search(&rowid).is_ok()
     }

@@ -30210,33 +30210,8 @@ impl Storage {
             drop(state);
             return Ok(selected.map(VisibleRowHome::spilled));
         }
-        let created_at = self.tables[table_slot].created_at();
         let visible = state.visible_version_at(txid, command_snapshot, commit_snapshot);
-        // Acquire bytes before releasing the owner of the selected location.
-        let resident = visible
-            .and_then(|(version, home)| home.map(|home| (version, home)))
-            .map(|(version, home)| {
-                self.pin_visible_home(
-                    table_slot,
-                    rowid,
-                    RowSnapshot {
-                        created_at,
-                        version,
-                    },
-                    home,
-                )
-            })
-            .transpose()?;
-        drop(state);
-        if visible.is_some() {
-            return Ok(resident);
-        }
-        match self.spill_row_state_at(table_slot, rowid, commit_snapshot)? {
-            Some(source) => Ok(source
-                .visible_at(commit_snapshot)?
-                .map(VisibleRowHome::spilled)),
-            None => Ok(None),
-        }
+        self.pin_row_selection(table_slot, rowid, state, visible, Some(commit_snapshot))
     }
 
     /// Uniqueness validation checks the latest committed image regardless of
@@ -30253,22 +30228,86 @@ impl Storage {
             drop(state);
             return Ok(selected.map(VisibleRowHome::spilled));
         }
-        let image = state
-            .committed
-            .map(|home| {
-                self.pin_visible_home(
-                    table_slot,
-                    rowid,
-                    RowSnapshot {
-                        created_at: self.tables[table_slot].created_at(),
-                        version: RowVersionIdentity::Committed(state.committed_lsn),
-                    },
-                    home,
-                )
-            })
-            .transpose()?;
+        let selected = Some((
+            RowVersionIdentity::Committed(state.committed_lsn),
+            state.committed,
+        ));
+        self.pin_row_selection(table_slot, rowid, state, selected, None)
+    }
+
+    fn pin_row_selection(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+        state: RowRead<'_>,
+        selected: Option<(RowVersionIdentity, Option<RowHome>)>,
+        object_snapshot: Option<u64>,
+    ) -> Result<Option<VisibleRowHome<'_>>, SqlError> {
+        let roots = state.captured_roots();
+        if let Some((version, home)) = selected {
+            let Some(home) = home else { return Ok(None) };
+            let snapshot = RowSnapshot {
+                created_at: self.tables[table_slot].created_at(),
+                version,
+            };
+            if let RowHome::Spilled {
+                len, commit_lsn, ..
+            } = home
+                && let Some(roots) = roots
+            {
+                drop(state);
+                let source = roots.owned_source(self)?.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "selected row has no captured object source"
+                    )
+                })?;
+                let found = source.with_snapshot(|snapshot| {
+                    Self::probe_spill_snapshot(snapshot, rowid, commit_lsn)
+                })?;
+                let member = found
+                    .filter(|found| found.commit_lsn == commit_lsn && found.len == Some(len))
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::SERIALIZATION_FAILURE,
+                            "selected row version is absent from the captured objects"
+                        )
+                    })?
+                    .member;
+                let source = SpilledRowRead::new(source, rowid, len, member, commit_lsn)?;
+                if source.snapshot().created_at != snapshot.created_at
+                    || source.snapshot().version != snapshot.version
+                {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "selected object row belongs to a different table or version"
+                    ));
+                }
+                return Ok(Some(VisibleRowHome::spilled(source)));
+            }
+            // A heap image must be pinned before its version owner is released.
+            let image = self.pin_visible_home(table_slot, rowid, snapshot, home)?;
+            drop(state);
+            return Ok(Some(image));
+        }
         drop(state);
-        Ok(image)
+        let Some(snapshot) = object_snapshot else {
+            return Ok(None);
+        };
+        let source = if let Some(roots) = roots {
+            let Some(source) = roots.owned_source(self)? else {
+                return Ok(None);
+            };
+            let version = source
+                .with_snapshot(|source| Self::probe_spill_snapshot(source, rowid, snapshot))?;
+            version.map(|version| SpilledRowState::new(source, rowid, version))
+        } else {
+            self.spill_row_state_at(table_slot, rowid, snapshot)?
+        };
+        match source {
+            Some(source) => Ok(source.visible_at(snapshot)?.map(VisibleRowHome::spilled)),
+            None => Ok(None),
+        }
     }
 
     fn pin_visible_home(

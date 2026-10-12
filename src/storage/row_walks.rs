@@ -214,8 +214,9 @@ impl RowScan<'_> {
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
         self.validate_identity()?;
         for &rowid in self.rowids.as_slice() {
+            self.validate_identity()?;
             let state = match self.storage.resident_row_state(self.table_slot, rowid) {
-                Some(state) => Some(state),
+                Some(state) => Some(state.with_captured_roots(&self.roots)),
                 None => {
                     let Some(roots) = self.roots.owned_source(self.storage)? else {
                         continue;

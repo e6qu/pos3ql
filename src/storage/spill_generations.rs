@@ -1341,20 +1341,37 @@ mod tests {
         use crate::sql::types::Datum;
         use crate::store::SstWriter;
         let mut fixture = point_fixture(label);
-        let values = [Datum::Int4(111)];
         let mut encoded = [0u8; 128];
-        let len = crate::storage::rowenc::encoded_len(&values);
-        crate::storage::rowenc::encode(&values, &mut encoded[..len]);
         let mut writer = Box::new(SstWriter::new());
         let spill = fixture.storage.spill.as_ref().unwrap();
         let mut blocks = spill.relation_blocks_for(RelationPersistence::Temporary);
-        writer
-            .append_version(
-                &mut *blocks,
-                crate::store::SstKey::at(1, 11),
-                &encoded[..len],
-            )
-            .unwrap();
+        for (rowid, commit_lsn, value) in [
+            (1, 11, Some(111)),
+            (1, 9, Some(88)),
+            (1, 7, Some(41)),
+            (2, 9, None),
+            (2, 7, Some(17)),
+        ] {
+            if let Some(value) = value {
+                let values = [Datum::Int4(value)];
+                let len = crate::storage::rowenc::encoded_len(&values);
+                crate::storage::rowenc::encode(&values, &mut encoded[..len]);
+                writer
+                    .append_version(
+                        &mut *blocks,
+                        crate::store::SstKey::at(rowid, commit_lsn),
+                        &encoded[..len],
+                    )
+                    .unwrap();
+            } else {
+                writer
+                    .append_tombstone_version(
+                        &mut *blocks,
+                        crate::store::SstKey::at(rowid, commit_lsn),
+                    )
+                    .unwrap();
+            }
+        }
         fixture.roots[2] = writer.finish(&mut *blocks).unwrap().unwrap();
         drop(blocks);
         let location = fixture.storage.heap.append_row(&[Datum::Int4(99)]).unwrap();
@@ -1469,19 +1486,21 @@ mod tests {
             let scan = storage.row_scan_in(table, &arena).unwrap();
             assert!(scan.rowids.contains(0));
             let mut overlay = 0;
-            scan.for_each_overlay(&mut |rowid, state| {
-                assert_eq!(rowid, 0);
-                drop(state);
-                overlay += 1;
-                storage
-                    .table(table)
-                    .spill_generations
-                    .write()
-                    .replace(1, [roots[2]].into_iter())?;
-                storage.set_commit_snapshot(u64::MAX);
-                Ok(core::ops::ControlFlow::Continue(()))
-            })
-            .unwrap();
+            let completed = scan
+                .for_each_overlay(&mut |rowid, state| {
+                    assert_eq!(rowid, 0);
+                    drop(state);
+                    overlay += 1;
+                    storage
+                        .table(table)
+                        .spill_generations
+                        .write()
+                        .replace(1, [roots[2]].into_iter())?;
+                    storage.set_commit_snapshot(u64::MAX);
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
+            assert!(completed.is_continue());
             assert_eq!(overlay, 1);
             for columns in [None, Some(1)] {
                 let mut ids = [0u64; 2];
@@ -1576,23 +1595,32 @@ mod tests {
                 .write()
                 .replace(1, [roots[2]].into_iter())
                 .unwrap();
-            scan.for_each_overlay(&mut |rowid, state| {
-                if rowid == 2 {
-                    assert!(
-                        state.committed.is_none(),
-                        "captured newest deletion remains metadata"
-                    );
-                    let home = storage
-                        .visible_row_home_at(table, rowid, state, 8, super::super::SNAPSHOT_ALL, 7)?
-                        .unwrap();
-                    let super::super::VisibleRowBytes::Spilled(source) = home.bytes else {
-                        unreachable!()
-                    };
-                    saved = Some(source);
-                }
-                Ok(core::ops::ControlFlow::Continue(()))
-            })
-            .unwrap();
+            let completed = scan
+                .for_each_overlay(&mut |rowid, state| {
+                    if rowid == 2 {
+                        assert!(
+                            state.committed.is_none(),
+                            "captured newest deletion remains metadata"
+                        );
+                        let home = storage
+                            .visible_row_home_at(
+                                table,
+                                rowid,
+                                state,
+                                8,
+                                super::super::SNAPSHOT_ALL,
+                                7,
+                            )?
+                            .unwrap();
+                        let super::super::VisibleRowBytes::Spilled(source) = home.bytes else {
+                            unreachable!()
+                        };
+                        saved = Some(source);
+                    }
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
+            assert!(completed.is_continue());
             drop(scan);
             arena.reset();
             let source = saved.take().unwrap();
@@ -1602,6 +1630,84 @@ mod tests {
             drop(source);
             storage.spill_roots.copy_roots(false, &mut copied).unwrap();
             assert!(copied.is_empty());
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn captured_row_scans_resident_spill_uses_captured_versions_after_remapping() {
+        use crate::sql::types::Datum;
+        let PointFixture {
+            storage,
+            table,
+            roots,
+            arena,
+            path,
+        } = scan_fixture("resident-spill");
+        let mut state =
+            super::super::RowState::committed_only_at(super::super::RowLoc::test(0, 0), 9);
+        state.committed = Some(super::super::RowHome::Spilled {
+            len: 7,
+            sst: 1,
+            commit_lsn: 9,
+        });
+        state.checkpoint_change_lsn = 9;
+        storage.tables[table].rows.write().insert(1, state).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_commit_snapshot(7);
+            let scan = storage.row_scan_in(table, &arena).unwrap();
+            {
+                let mut generations = storage.table(table).spill_generations.write();
+                let mut rows = storage.tables[table].rows.write();
+                generations.replace(1, [roots[2]].into_iter()).unwrap();
+                rows.get_mut(&1).unwrap().committed = Some(super::super::RowHome::Spilled {
+                    len: 7,
+                    sst: 0,
+                    commit_lsn: 9,
+                });
+            }
+            for latest in [false, true] {
+                let mut selected = 0;
+                let completed = scan
+                    .for_each_overlay(&mut |rowid, state| {
+                        if rowid != 1 {
+                            drop(state);
+                            return Ok(core::ops::ControlFlow::Continue(()));
+                        }
+                        let home = if latest {
+                            storage.committed_row_home(table, rowid, state)?
+                        } else {
+                            storage.visible_row_home_at(
+                                table,
+                                rowid,
+                                state,
+                                8,
+                                super::super::SNAPSHOT_ALL,
+                                7,
+                            )?
+                        }
+                        .unwrap();
+                        assert!(storage.row_versions.test_write().is_ok());
+                        selected += 1;
+                        storage.with_row_bytes(table, rowid, home, |bytes| {
+                            let mut values = [Datum::Null];
+                            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                            assert_eq!(values, [Datum::Int4(if latest { 88 } else { 41 })]);
+                            Ok(())
+                        })?;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })
+                    .unwrap();
+                assert!(completed.is_continue());
+                assert_eq!(selected, 1);
+            }
+            scan.roots
+                .with_view(|source| {
+                    assert_eq!(source.handles, roots[..2]);
+                    Ok(())
+                })
+                .unwrap();
         });
         drop(storage);
         std::fs::remove_file(path).unwrap();

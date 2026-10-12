@@ -939,9 +939,8 @@ mod tests {
             path,
             ..
         } = point_fixture("scratch");
-        let mut empty_budget = Budget::new(0);
-        let empty_arena =
-            crate::mem::arena::Arena::new(&mut empty_budget, "empty result", 0).unwrap();
+        let mut tiny_budget = Budget::new(1);
+        let tiny_arena = crate::mem::arena::Arena::new(&mut tiny_budget, "tiny result", 1).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let state = storage
                 .spill_row_state_at(table, 1, u64::MAX)
@@ -966,7 +965,7 @@ mod tests {
                 .visible_at(7)
                 .unwrap()
                 .unwrap()
-                .copy_bytes(&empty_arena)
+                .copy_bytes(&tiny_arena)
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         });

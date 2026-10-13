@@ -3536,7 +3536,7 @@ impl Engine {
         lsn: u64,
     ) -> Result<crate::util::StackStr<128>, SqlError> {
         self.storage.export_replication_snapshot(conn_id, lsn)?;
-        Ok(stack_format!(128, "pos3ql:{conn_id}:{lsn:X}"))
+        Ok(crate::storage::SnapshotIdentifier::issued(conn_id, lsn))
     }
 
     pub(crate) fn invalidate_replication_snapshot(&self, conn_id: i32) {
@@ -3549,45 +3549,9 @@ impl Engine {
                 .assigned_transaction_identity(txn.txid)
                 .is_some(),
         )?;
-        let Some(rest) = name.strip_prefix("pos3ql:") else {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid snapshot identifier"
-            ));
-        };
-        let Some((connection, lsn)) = rest.split_once(':') else {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid snapshot identifier"
-            ));
-        };
-        let connection = connection.parse::<i32>().map_err(|_| {
-            sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid snapshot identifier"
-            )
-        })?;
-        let lsn = u64::from_str_radix(lsn, 16).map_err(|_| {
-            sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid snapshot identifier"
-            )
-        })?;
+        let identifier = crate::storage::SnapshotIdentifier::parse(name)?;
         self.storage
-            .import_replication_snapshot(connection, lsn, import.transaction(), || {
-                import.accept(lsn)
-            })
-            .map_err(|error| {
-                if error.sqlstate == sqlstate::UNDEFINED_OBJECT {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "snapshot \"{}\" does not exist",
-                        name
-                    )
-                } else {
-                    error
-                }
-            })
+            .import_replication_snapshot(identifier, import.transaction(), |lsn| import.accept(lsn))
     }
 
     /// Creates a durable logical-replication resume point outside SQL

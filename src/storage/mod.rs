@@ -25,10 +25,10 @@ mod statistics;
 pub(crate) use statistics::StatisticsReceiptPool;
 use statistics::{StatisticsVersions, TableStatisticsOwner};
 mod spill_generations;
-pub(crate) use snapshot_leases::StatementSnapshotLease;
 use snapshot_leases::{
     ExportedSnapshot, StatementSnapshot, snapshot_owner_bytes, statement_snapshot_capacity,
 };
+pub(crate) use snapshot_leases::{SnapshotIdentifier, StatementSnapshotLease};
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;

@@ -8,7 +8,33 @@ use super::{DatabaseOid, LockState, SnapshotState, Storage};
 use crate::config::Config;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::lock::WaitOwner;
-use crate::sql_err;
+use crate::{sql_err, stack_format};
+
+pub(crate) struct SnapshotIdentifier<'name>(&'name str);
+
+impl<'name> SnapshotIdentifier<'name> {
+    pub(crate) fn parse(name: &'name str) -> Result<Self, SqlError> {
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte) || byte == b'-')
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid snapshot identifier: \"{}\"",
+                name
+            ));
+        }
+        Ok(Self(name))
+    }
+
+    pub(crate) fn issued(connection: i32, lsn: u64) -> crate::util::StackStr<128> {
+        stack_format!(128, "{connection:08X}-{lsn:08X}-1")
+    }
+
+    fn matches(&self, snapshot: &ExportedSnapshot) -> bool {
+        self.0 == Self::issued(snapshot.connection, snapshot.lsn).as_str()
+    }
+}
 
 pub(super) struct ExportedSnapshot {
     pub(super) connection: i32,
@@ -155,20 +181,20 @@ impl Storage {
     /// been checked; it must not call back into Storage or perform I/O.
     pub(crate) fn import_replication_snapshot(
         &self,
-        connection: i32,
-        lsn: u64,
+        identifier: SnapshotIdentifier<'_>,
         transaction: u32,
-        accept: impl FnOnce() -> Result<(), SqlError>,
+        accept: impl FnOnce(u64) -> Result<(), SqlError>,
     ) -> Result<(), SqlError> {
         let mut snapshots = self.snapshot_state();
         let Some(exported) = snapshots
             .exported
             .iter()
-            .find(|snapshot| snapshot.connection == connection && snapshot.lsn == lsn)
+            .find(|snapshot| identifier.matches(snapshot))
         else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
-                "snapshot identifier is no longer valid"
+                "snapshot \"{}\" does not exist",
+                identifier.0
             ));
         };
         if exported.database != self.current_database_oid() {
@@ -177,6 +203,7 @@ impl Storage {
                 "cannot import a snapshot from a different database"
             ));
         }
+        let lsn = exported.lsn;
         let prior = snapshots
             .active
             .iter()
@@ -188,7 +215,7 @@ impl Storage {
                 snapshots.active.capacity()
             ));
         }
-        accept()?;
+        accept(lsn)?;
         if let Some(index) = prior {
             snapshots.active[index].1 = lsn;
         } else {
@@ -273,6 +300,24 @@ mod tests {
     use crate::storage::RowState;
     use crate::storage::tests::{make_def, test_budget, test_config};
 
+    fn import_snapshot(
+        storage: &Storage,
+        connection: i32,
+        lsn: u64,
+        transaction: u32,
+        accept: impl FnOnce() -> Result<(), SqlError>,
+    ) -> Result<(), SqlError> {
+        let name = SnapshotIdentifier::issued(connection, lsn);
+        storage.import_replication_snapshot(
+            SnapshotIdentifier::parse(name.as_str())?,
+            transaction,
+            |captured| {
+                assert_eq!(captured, lsn);
+                accept()
+            },
+        )
+    }
+
     fn fixture() -> (Storage, usize) {
         let config = test_config();
         let mut budget = test_budget(&config);
@@ -318,9 +363,7 @@ mod tests {
             storage.export_replication_snapshot(77, 7).unwrap();
             storage.prune_released_statement_snapshots();
             assert_original_row(&storage, table, 99);
-            storage
-                .import_replication_snapshot(77, 7, 99, || Ok(()))
-                .unwrap();
+            import_snapshot(&storage, 77, 7, 99, || Ok(())).unwrap();
             storage.invalidate_replication_snapshot(77);
             assert_eq!(storage.oldest_snapshot(), Some(7));
             assert_original_row(&storage, table, 99);
@@ -365,25 +408,21 @@ mod tests {
                 storage.register_snapshot(index as u32 + 1, 8).unwrap();
             }
             let mut accepted = false;
-            let error = storage
-                .import_replication_snapshot(77, 7, u32::MAX, || {
-                    accepted = true;
-                    Ok(())
-                })
-                .unwrap_err();
+            let error = import_snapshot(&storage, 77, 7, u32::MAX, || {
+                accepted = true;
+                Ok(())
+            })
+            .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(!accepted);
             assert_eq!(storage.oldest_snapshot(), Some(7));
-            storage
-                .import_replication_snapshot(77, 7, 1, || Ok(()))
-                .unwrap();
+            import_snapshot(&storage, 77, 7, 1, || Ok(())).unwrap();
             assert_eq!(storage.snapshot_state().active.len(), capacity);
             storage.release_snapshot(2);
-            let error = storage
-                .import_replication_snapshot(77, 7, u32::MAX, || {
-                    Err(sql_err!(sqlstate::ACTIVE_SQL_TRANSACTION, "already read"))
-                })
-                .unwrap_err();
+            let error = import_snapshot(&storage, 77, 7, u32::MAX, || {
+                Err(sql_err!(sqlstate::ACTIVE_SQL_TRANSACTION, "already read"))
+            })
+            .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::ACTIVE_SQL_TRANSACTION);
             assert!(
                 !storage
@@ -393,25 +432,23 @@ mod tests {
                     .any(|(owner, _)| *owner == u32::MAX)
             );
             assert_eq!(
-                storage
-                    .import_replication_snapshot(77, 8, u32::MAX, || {
-                        accepted = true;
-                        Ok(())
-                    })
-                    .unwrap_err()
-                    .sqlstate,
+                import_snapshot(&storage, 77, 8, u32::MAX, || {
+                    accepted = true;
+                    Ok(())
+                })
+                .unwrap_err()
+                .sqlstate,
                 sqlstate::UNDEFINED_OBJECT
             );
             assert!(!accepted);
             storage.invalidate_replication_snapshot(77);
             assert_eq!(
-                storage
-                    .import_replication_snapshot(77, 7, u32::MAX, || {
-                        accepted = true;
-                        Ok(())
-                    })
-                    .unwrap_err()
-                    .sqlstate,
+                import_snapshot(&storage, 77, 7, u32::MAX, || {
+                    accepted = true;
+                    Ok(())
+                })
+                .unwrap_err()
+                .sqlstate,
                 sqlstate::UNDEFINED_OBJECT
             );
             assert!(!accepted);
@@ -428,7 +465,7 @@ mod tests {
             let prior = storage.current_database_oid();
             crate::sql::set_execution_database_oid(DatabaseOid::parse(16_384).unwrap());
             let mut accepted = false;
-            let result = storage.import_replication_snapshot(77, 7, 99, || {
+            let result = import_snapshot(&storage, 77, 7, 99, || {
                 accepted = true;
                 Ok(())
             });
@@ -439,9 +476,7 @@ mod tests {
             );
             assert!(!accepted);
             assert!(storage.snapshot_state().active.is_empty());
-            storage
-                .import_replication_snapshot(77, 7, 99, || Ok(()))
-                .unwrap();
+            import_snapshot(&storage, 77, 7, 99, || Ok(())).unwrap();
             storage.invalidate_replication_snapshot(77);
             assert_eq!(storage.oldest_snapshot(), Some(7));
             storage.release_snapshot(99);
@@ -522,7 +557,7 @@ mod tests {
                 scope.spawn(|| {
                     start.wait();
                     crate::mem::guard::forbid_alloc(|| {
-                        let result = storage.import_replication_snapshot(77, 7, 99, || {
+                        let result = import_snapshot(&storage, 77, 7, 99, || {
                             imported.store(true, Ordering::Release);
                             Ok(())
                         });

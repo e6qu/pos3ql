@@ -1669,7 +1669,15 @@ def test_replication_snapshot_lifetime():
         malformed = simple_query(setup, "ROLLBACK; BEGIN ISOLATION LEVEL REPEATABLE READ; "
                                  "SET TRANSACTION SNAPSHOT 'not-a-snapshot'")
         check(f"snapshot {suffix}: malformed names use a distinct SQLSTATE",
-              has_sqlstate(malformed, "22023"), malformed)
+              has_sqlstate(malformed, "22023")
+              and any(kind == b"E" and b'Minvalid snapshot identifier: "not-a-snapshot"\x00' in payload
+                      for kind, payload in malformed), malformed)
+        unknown = simple_query(setup, "ROLLBACK; BEGIN ISOLATION LEVEL REPEATABLE READ; "
+                               "SET TRANSACTION SNAPSHOT 'ABC'")
+        check(f"snapshot {suffix}: validly formed unissued names do not exist",
+              has_sqlstate(unknown, "42704")
+              and any(kind == b"E" and b'Msnapshot "ABC" does not exist\x00' in payload
+                      for kind, payload in unknown), unknown)
         simple_query(setup, "ROLLBACK")
         retained = simple_query(importer, "SELECT id FROM wire_snapshot_source; COMMIT")
         check(f"snapshot {suffix}: successful import survives exporter expiration",

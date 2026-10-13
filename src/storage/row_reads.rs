@@ -1,7 +1,12 @@
 //! Row images whose chain handles retain the version owner that issued them.
 
+use crate::config::Config;
+use crate::mem::budget::{Budget, BudgetError};
+use crate::mem::fixed_vec::FixedVec;
+use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql_err;
 use core::ops::Deref;
-use std::sync::RwLockReadGuard;
+use std::sync::{Mutex, MutexGuard, RwLockReadGuard};
 
 use super::row_images::RowVersionIdentity;
 use super::row_map::RowMap;
@@ -13,8 +18,111 @@ use super::spill_generations::{CapturedSpillRoots, SpilledRowState};
 use super::{CommittedVersion, PendingChange, RowHome, RowLoc, RowState};
 use crate::mem::fixed_map::FixedMap;
 
-/// Metadata is copied, but reusable chain slots remain pinned until this read
-/// ends. Only the owning view can construct a read from resident metadata.
+const METADATA_READS_PER_WORKSPACE: usize = 64;
+
+pub(super) struct CapturedRowMetadata {
+    pending: FixedVec<(u64, PendingChange)>,
+    history: FixedVec<CommittedVersion>,
+}
+
+pub(super) struct RowMetadataPool {
+    slots: FixedVec<Mutex<CapturedRowMetadata>>,
+}
+
+impl RowMetadataPool {
+    pub(super) fn allocation_bytes(config: &Config) -> usize {
+        let slots = config
+            .query_workspace_slots
+            .saturating_mul(METADATA_READS_PER_WORKSPACE);
+        slots.saturating_mul(
+            size_of::<Mutex<CapturedRowMetadata>>().saturating_add(
+                config.max_row_versions_per_row.saturating_mul(
+                    size_of::<(u64, PendingChange)>() + size_of::<CommittedVersion>(),
+                ),
+            ),
+        )
+    }
+
+    pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+        let count = config
+            .query_workspace_slots
+            .saturating_mul(METADATA_READS_PER_WORKSPACE);
+        let mut slots = FixedVec::new(budget, "row metadata read slots", count)?;
+        for _ in 0..count {
+            slots
+                .push(Mutex::new(CapturedRowMetadata {
+                    pending: FixedVec::new(
+                        budget,
+                        "captured pending row versions",
+                        config.max_row_versions_per_row,
+                    )?,
+                    history: FixedVec::new(
+                        budget,
+                        "captured committed row versions",
+                        config.max_row_versions_per_row,
+                    )?,
+                }))
+                .expect("sized to row metadata read slots");
+        }
+        Ok(Self { slots })
+    }
+
+    fn capture(
+        &self,
+        versions: &RowVersionState,
+        state: RowState,
+    ) -> Result<MutexGuard<'_, CapturedRowMetadata>, SqlError> {
+        let workspace = crate::sql::execution_query_workspace().index();
+        let slots = workspace
+            .checked_mul(METADATA_READS_PER_WORKSPACE)
+            .and_then(|start| {
+                start
+                    .checked_add(METADATA_READS_PER_WORKSPACE)
+                    .and_then(|end| self.slots.get(start..end))
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "row metadata workspace is outside its startup reservation"
+                )
+            })?;
+        let mut image =
+            super::try_mutex_pool(slots, "row metadata read slots").ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "row metadata read slots exhausted ({})",
+                    slots.len()
+                )
+            })?;
+        image.pending.clear();
+        image.history.clear();
+        let capacity = || {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "retained row metadata exceeds max_row_versions_per_row"
+            )
+        };
+        let mut slot = state.pending.tail;
+        while let Some(index) = slot {
+            let entry = versions.pending_row_versions[index];
+            image
+                .pending
+                .push((entry.identity, entry.change))
+                .map_err(|_| capacity())?;
+            slot = entry.previous;
+        }
+        let mut slot = state.history.tail;
+        while let Some(index) = slot {
+            let entry = versions.committed_row_versions[index];
+            image.history.push(entry.version).map_err(|_| capacity())?;
+            slot = entry.previous;
+        }
+        Ok(image)
+    }
+}
+
+/// Point reads own copies of their chain images; coherent whole-map views
+/// borrow their owner. Only these owning views can issue resident reads.
 pub(crate) struct RowRead<'a> {
     state: RowState,
     versions: VersionOwner<'a>,
@@ -28,7 +136,7 @@ pub(super) type RowReadVisitor<'a> = dyn for<'row> FnMut(
     + 'a;
 
 enum VersionOwner<'a> {
-    Retained(RwLockReadGuard<'a, RowVersionState>),
+    Retained(MutexGuard<'a, CapturedRowMetadata>),
     Borrowed(&'a RowVersionState),
     Immutable(SpilledRowState),
 }
@@ -44,7 +152,7 @@ impl Deref for RowRead<'_> {
 impl<'owner> RowRead<'owner> {
     fn versions(&self) -> Option<&RowVersionState> {
         match &self.versions {
-            VersionOwner::Retained(owner) => Some(owner),
+            VersionOwner::Retained(_) => None,
             VersionOwner::Borrowed(owner) => Some(owner),
             VersionOwner::Immutable(_) => None,
         }
@@ -86,10 +194,16 @@ impl<'owner> RowRead<'owner> {
     }
 
     pub(crate) fn pending_last(&self) -> Option<PendingChange> {
+        if let VersionOwner::Retained(image) = &self.versions {
+            return image.pending.first().map(|(_, change)| *change);
+        }
         pending_last(&self.versions()?.pending_row_versions, self.state.pending)
     }
 
     pub(super) fn pending_head_identity(&self) -> Option<u64> {
+        if let VersionOwner::Retained(image) = &self.versions {
+            return image.pending.first().map(|(identity, _)| *identity);
+        }
         self.state.pending.tail.map(|slot| {
             self.versions()
                 .expect("resident pending chain")
@@ -99,6 +213,9 @@ impl<'owner> RowRead<'owner> {
     }
 
     pub(crate) fn history_get(&self, index: usize) -> Option<CommittedVersion> {
+        if let VersionOwner::Retained(image) = &self.versions {
+            return image.history.get(index).copied();
+        }
         committed_history_get(
             &self.versions()?.committed_row_versions,
             self.state.history,
@@ -113,6 +230,12 @@ impl<'owner> RowRead<'owner> {
     }
 
     pub(super) fn has_visible_pending(&self, txid: u32, snapshot: u32) -> bool {
+        if let VersionOwner::Retained(image) = &self.versions {
+            return image
+                .pending
+                .iter()
+                .any(|(_, change)| change.txid == txid && change.cid < snapshot);
+        }
         self.versions().is_some_and(|versions| {
             pending_visible_at(
                 &versions.pending_row_versions,
@@ -125,6 +248,13 @@ impl<'owner> RowRead<'owner> {
     }
 
     pub(super) fn retained_pending_home(&self, identity: u64) -> Option<Option<RowLoc>> {
+        if let VersionOwner::Retained(image) = &self.versions {
+            return image
+                .pending
+                .iter()
+                .find(|(id, _)| *id == identity)
+                .map(|(_, change)| change.loc);
+        }
         retained_pending_home(
             &self.versions()?.pending_row_versions,
             self.state.pending,
@@ -138,6 +268,29 @@ impl<'owner> RowRead<'owner> {
         command_snapshot: u32,
         commit_snapshot: u64,
     ) -> Option<(RowVersionIdentity, Option<RowHome>)> {
+        if let VersionOwner::Retained(image) = &self.versions {
+            if let Some((identity, change)) = image
+                .pending
+                .iter()
+                .find(|(_, change)| change.txid == txid && change.cid < command_snapshot)
+            {
+                return Some((
+                    RowVersionIdentity::Pending(*identity),
+                    change.loc.map(RowHome::Heap),
+                ));
+            }
+            if self.state.committed_lsn <= commit_snapshot {
+                return Some((
+                    RowVersionIdentity::Committed(self.state.committed_lsn),
+                    self.state.committed,
+                ));
+            }
+            return image
+                .history
+                .iter()
+                .find(|version| version.lsn <= commit_snapshot)
+                .map(|version| (RowVersionIdentity::Committed(version.lsn), version.home));
+        }
         if let Some(versions) = self.versions()
             && let Some((identity, location)) = pending_version_at(
                 &versions.pending_row_versions,
@@ -195,14 +348,18 @@ impl<'a> RowReadView<'a> {
         versions: &'a RowVersionPools,
         rows: &RowMap,
         rowid: u64,
-    ) -> Option<RowRead<'a>> {
-        let versions = versions.read();
-        let state = rows.read().get(&rowid).copied()?;
-        Some(RowRead {
+    ) -> Result<Option<RowRead<'a>>, SqlError> {
+        let owner = versions.read();
+        let Some(state) = rows.read().get(&rowid).copied() else {
+            return Ok(None);
+        };
+        let image = versions.metadata.capture(&owner, state)?;
+        drop(owner);
+        Ok(Some(RowRead {
             state,
-            versions: VersionOwner::Retained(versions),
+            versions: VersionOwner::Retained(image),
             captured_roots: None,
-        })
+        }))
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, RowRead<'_>)> {
@@ -298,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn row_read_ownership_point_pins_reused_slots_until_release() {
+    fn row_read_ownership_point_copies_survive_chain_slot_reuse() {
         let (versions, rows) = owners();
         install(
             &mut versions.test_write().unwrap(),
@@ -306,24 +463,86 @@ mod tests {
             1,
         );
         crate::mem::guard::forbid_alloc(|| {
-            let row = RowReadView::point(&versions, &rows, 2).unwrap();
+            let row = RowReadView::point(&versions, &rows, 2).unwrap().unwrap();
             observe(&row);
             let copied = row.pending_last().unwrap();
-            assert!(versions.test_write().is_err());
-            drop(row);
+            assert!(versions.test_write().is_ok());
             install(
                 &mut versions.test_write().unwrap(),
                 &mut rows.test_write().unwrap(),
                 2,
             );
-            assert!(RowReadView::point(&versions, &rows, 2).is_none());
-            let row = RowReadView::point(&versions, &rows, 1).unwrap();
+            observe(&row);
+            assert_eq!(row.pending_last().unwrap().cid, 1);
+            drop(row);
+            assert!(RowReadView::point(&versions, &rows, 2).unwrap().is_none());
+            let row = RowReadView::point(&versions, &rows, 1).unwrap().unwrap();
             observe(&row);
             assert_eq!(copied.cid, 1);
             assert_eq!(row.pending_last().unwrap().cid, 2);
         });
         assert!(versions.test_write().is_ok());
         assert!(rows.test_write().is_ok());
+    }
+
+    #[test]
+    fn row_read_ownership_capture_capacity_releases_on_error_and_reuse() {
+        let (versions, rows) = owners();
+        install(
+            &mut versions.test_write().unwrap(),
+            &mut rows.test_write().unwrap(),
+            1,
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            let mut reads: [Option<RowRead<'_>>; METADATA_READS_PER_WORKSPACE] =
+                std::array::from_fn(|_| None);
+            for read in &mut reads {
+                *read = RowReadView::point(&versions, &rows, 2).unwrap();
+            }
+            let error = RowReadView::point(&versions, &rows, 2)
+                .err()
+                .expect("full metadata pool");
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(
+                error
+                    .message
+                    .as_str()
+                    .contains("row metadata read slots exhausted")
+            );
+            assert!(RowReadView::point(&versions, &rows, 999).unwrap().is_none());
+            install(
+                &mut versions.test_write().unwrap(),
+                &mut rows.test_write().unwrap(),
+                2,
+            );
+            for read in &reads {
+                observe(read.as_ref().unwrap());
+                assert_eq!(read.as_ref().unwrap().pending_last().unwrap().cid, 1);
+            }
+            drop(reads[0].take());
+            let replacement = RowReadView::point(&versions, &rows, 1).unwrap().unwrap();
+            observe(&replacement);
+            assert_eq!(replacement.pending_last().unwrap().cid, 2);
+            drop(replacement);
+            drop(reads);
+            assert!(versions.test_write().is_ok());
+        });
+    }
+
+    #[test]
+    fn row_read_ownership_metadata_reservation_is_exact_and_startup_bounded() {
+        let mut config = Config::default_dev();
+        config.query_workspace_slots = 2;
+        config.max_row_versions_per_row = 3;
+        let mut budget = Budget::new(RowMetadataPool::allocation_bytes(&config));
+        let pool = RowMetadataPool::new(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        assert_eq!(pool.slots.len(), 2 * METADATA_READS_PER_WORKSPACE);
+        for slot in pool.slots.iter() {
+            let image = slot.lock().unwrap();
+            assert_eq!(image.pending.capacity(), 3);
+            assert_eq!(image.history.capacity(), 3);
+        }
     }
 
     #[test]
@@ -366,7 +585,7 @@ mod tests {
                     start.wait();
                     crate::mem::guard::forbid_alloc(|| {
                         for _ in 0..500 {
-                            if let Some(row) = RowReadView::point(versions, rows, 1) {
+                            if let Some(row) = RowReadView::point(versions, rows, 1).unwrap() {
                                 observe(&row);
                                 assert_eq!(row.committed_lsn % 2, 0);
                             }
@@ -420,7 +639,7 @@ mod tests {
             }],
         );
         crate::mem::guard::forbid_alloc(|| {
-            assert!(RowReadView::point(&versions, &rows, 1).is_none());
+            assert!(RowReadView::point(&versions, &rows, 1).unwrap().is_none());
             assert!(versions.test_write().is_ok());
             let roots = storage
                 .query_roots

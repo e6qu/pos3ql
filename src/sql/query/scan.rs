@@ -3029,7 +3029,7 @@ fn ranked_knn_candidates<'a>(
         },
         |source, rowid, commit_lsn, key, _| {
             scanned += 1;
-            if let Some(state) = storage.resident_row_state(slot, rowid)
+            if let Some(state) = storage.resident_row_state(slot, rowid).unwrap()
                 && (state.committed_lsn != commit_lsn
                     || storage
                         .visible_row_home(slot, rowid, state, txid)?
@@ -3695,7 +3695,7 @@ fn indexed_candidates_for_plan<'a>(
         candidates.sort_unstable_by_key(|candidate| candidate.rowid);
         for read in 0..candidates.len() {
             let candidate = candidates[read];
-            if let Some(state) = storage.resident_row_state(slot, candidate.rowid)
+            if let Some(state) = storage.resident_row_state(slot, candidate.rowid).unwrap()
                 && (state.committed_lsn != candidate.commit_lsn
                     || storage
                         .visible_row_home(slot, candidate.rowid, state, txid)?

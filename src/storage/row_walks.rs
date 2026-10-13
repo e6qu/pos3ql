@@ -215,7 +215,7 @@ impl RowScan<'_> {
         self.validate_identity()?;
         for &rowid in self.rowids.as_slice() {
             self.validate_identity()?;
-            let state = match self.storage.resident_row_state(self.table_slot, rowid) {
+            let state = match self.storage.resident_row_state(self.table_slot, rowid)? {
                 Some(state) => Some(state.with_captured_roots(&self.roots)),
                 None => {
                     let Some(roots) = self.roots.owned_source(self.storage)? else {
@@ -292,7 +292,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         let rowids = self.row_walks.retain(&self.tables[table].rows)?;
         for rowid in rowids.iter() {
-            let Some(state) = self.resident_row_state(table, rowid) else {
+            let Some(state) = self.resident_row_state(table, rowid)? else {
                 continue;
             };
             let Some(change) = state.pending_last() else {
@@ -570,7 +570,7 @@ mod tests {
             storage.tables[table].rows.insert(1, state).unwrap();
             crate::mem::guard::forbid_alloc(|| {
                 storage.merge_spill_pair(table, at, Some(handle(13)));
-                let state = storage.resident_row_state(table, 1).unwrap();
+                let state = storage.resident_row_state(table, 1).unwrap().unwrap();
                 assert_eq!(state.committed, Some(spilled(1, 11)));
                 assert_eq!(
                     state.history_get(0).unwrap().home,
@@ -586,7 +586,7 @@ mod tests {
                 assert_eq!(state.committed_lsn, 11);
                 drop(state);
                 storage.collapse_spill(table, handle(17)).unwrap();
-                let state = storage.resident_row_state(table, 1).unwrap();
+                let state = storage.resident_row_state(table, 1).unwrap().unwrap();
                 assert_eq!(state.committed, Some(spilled(0, 11)));
                 assert_eq!(state.history_get(0).unwrap().home, Some(spilled(0, 9)));
                 assert_eq!(state.history_get(1).unwrap().home, Some(spilled(0, 7)));
@@ -604,7 +604,7 @@ mod tests {
         storage.register_snapshot(99, 7).unwrap();
         storage.set_commit_snapshot(7);
         let mut hashes = [(0, 0); super::super::MAX_VALUE_ENFORCERS];
-        let state = storage.resident_row_state(table, 1).unwrap();
+        let state = storage.resident_row_state(table, 1).unwrap().unwrap();
         let home = storage
             .committed_row_home(table, 1, state)
             .unwrap()
@@ -639,7 +639,7 @@ mod tests {
                 assert!(
                     storage
                         .probe_value(table, &[0], hashes[0].1, |rowid, _| {
-                            let state = storage.resident_row_state(table, rowid).unwrap();
+                            let state = storage.resident_row_state(table, rowid).unwrap().unwrap();
                             let image = storage
                                 .visible_row_home_at(table, rowid, state, 99, SNAPSHOT_ALL, 7)?
                                 .unwrap();
@@ -678,7 +678,7 @@ mod tests {
                     ))
                     .unwrap()
             );
-            let state = storage.resident_row_state(table, 1).unwrap();
+            let state = storage.resident_row_state(table, 1).unwrap().unwrap();
             assert_eq!(state.committed_lsn, 9);
             assert_eq!(state.history.len, 1);
             drop(state);
@@ -686,6 +686,7 @@ mod tests {
             assert!(
                 storage
                     .resident_row_state(table, 1)
+                    .unwrap()
                     .unwrap()
                     .history
                     .is_empty()
@@ -709,7 +710,7 @@ mod tests {
                 !storage.value_probe_complete(table, &[0]),
                 "a rebuilt cache must include the deletion boundary"
             );
-            let state = storage.resident_row_state(table, 1).unwrap();
+            let state = storage.resident_row_state(table, 1).unwrap().unwrap();
             let image = storage
                 .visible_row_home_at(table, 1, state, 99, SNAPSHOT_ALL, 7)
                 .unwrap()
@@ -723,7 +724,7 @@ mod tests {
                 })
                 .unwrap();
             storage.release_snapshot(99);
-            assert!(storage.resident_row_state(table, 1).is_none());
+            assert!(storage.resident_row_state(table, 1).unwrap().is_none());
         });
     }
 
@@ -739,7 +740,7 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let error = storage.commit_row(table, 1, 8, 9).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            let row = storage.resident_row_state(table, 1).unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             assert_eq!(row.committed_lsn, 7);
             assert_eq!(row.pending_last().unwrap().loc, Some(location));
             drop(row);
@@ -820,7 +821,7 @@ mod tests {
     #[test]
     fn checkpoint_retained_delta_rows_keep_tombstones_and_release_callbacks() {
         let (mut storage, table) = checkpoint_fixture();
-        let mut deleted = *storage.resident_row_state(table, 1).unwrap();
+        let mut deleted = *storage.resident_row_state(table, 1).unwrap().unwrap();
         deleted.committed = None;
         deleted.committed_lsn = 9;
         storage.tables[table].rows.insert(3, deleted).unwrap();
@@ -854,7 +855,11 @@ mod tests {
             assert_eq!(count, 2);
             assert_eq!(changed, [1, 2, 3]);
             assert_eq!(
-                storage.resident_row_state(table, 3).unwrap().committed_lsn,
+                storage
+                    .resident_row_state(table, 3)
+                    .unwrap()
+                    .unwrap()
+                    .committed_lsn,
                 9
             );
         });
@@ -1057,7 +1062,7 @@ mod tests {
                     assert!(storage.row_versions.test_write().is_ok());
                     storage.restore_pending(table, rowid, 7, undo);
                     assert_eq!(change.loc, Some(location));
-                    assert!(storage.resident_row_state(table, rowid).is_none());
+                    assert!(storage.resident_row_state(table, rowid).unwrap().is_none());
                     assert!(storage.heap.test_write().is_err());
                     storage.with_row_bytes(table, rowid, image.unwrap(), |bytes| {
                         let mut values = [Datum::Null];
@@ -1082,7 +1087,7 @@ mod tests {
             .write_pending(table, 1, 7, 1, Some(location))
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let state = storage.resident_row_state(table, 1).unwrap();
+            let state = storage.resident_row_state(table, 1).unwrap().unwrap();
             let image = storage
                 .committed_row_home(table, 1, state)
                 .unwrap()
@@ -1106,7 +1111,7 @@ mod tests {
     #[test]
     fn retained_byte_scan_filters_redundant_entries_and_releases_on_error() {
         let (mut storage, table) = fixture();
-        let mut redundant = *storage.resident_row_state(table, 1).unwrap();
+        let mut redundant = *storage.resident_row_state(table, 1).unwrap().unwrap();
         redundant.committed = Some(RowHome::Spilled {
             len: 4,
             sst: 0,

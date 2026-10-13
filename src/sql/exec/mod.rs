@@ -4659,7 +4659,7 @@ where
     let mut new_values = [Datum::Null; MAX_COLUMNS];
     {
         let state = storage
-            .resident_row_state(table_index, rowid)
+            .resident_row_state(table_index, rowid)?
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
         let home = storage
             .visible_row_home(table_index, rowid, state, txn.txid)?
@@ -67904,7 +67904,7 @@ fn store_row_with_identity(
         return Err(e);
     }
     let state = storage
-        .resident_row_state(table_index, rowid)
+        .resident_row_state(table_index, rowid)?
         .expect("a successful pending append publishes its row state");
     let image = storage
         .visible_row_home_at(

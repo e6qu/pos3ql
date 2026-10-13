@@ -26,7 +26,9 @@ pub(crate) use statistics::StatisticsReceiptPool;
 use statistics::{StatisticsVersions, TableStatisticsOwner};
 mod spill_generations;
 pub(crate) use snapshot_leases::StatementSnapshotLease;
-use snapshot_leases::{StatementSnapshot, snapshot_owner_bytes, statement_snapshot_capacity};
+use snapshot_leases::{
+    ExportedSnapshot, StatementSnapshot, snapshot_owner_bytes, statement_snapshot_capacity,
+};
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;
@@ -12983,7 +12985,14 @@ struct TransactionIdentityState {
     latest: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SchemaLockBlocker {
+    Transaction(u32),
+    Connection(i32),
+}
+
 struct SnapshotState {
+    exported: FixedVec<ExportedSnapshot>,
     active: FixedVec<(u32, u64)>,
     serializable: FixedVec<(u32, u32, u64, bool)>,
     statements: FixedVec<StatementSnapshot>,
@@ -17505,6 +17514,7 @@ impl Storage {
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
             + snapshot_owner_bytes()
+            + config.max_connections as usize * size_of::<ExportedSnapshot>()
             + statement_snapshot_capacity(config) * size_of::<StatementSnapshot>()
             + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
             + 2 * config.collation_scratch_bytes
@@ -18312,6 +18322,11 @@ impl Storage {
             "statement snapshots",
             statement_snapshot_capacity(config),
         )?;
+        let exported_snapshots = FixedVec::new(
+            budget,
+            "exported_snapshots",
+            config.max_connections as usize,
+        )?;
         let active_snapshots = FixedVec::new(budget, "active_snapshots", transaction_capacity)?;
         let transaction_identities =
             FixedVec::new(budget, "transaction_identities", transaction_capacity)?;
@@ -18529,6 +18544,7 @@ impl Storage {
             comments: std::sync::Mutex::new(CommentCatalog { entries: comments }),
             catalog_sequence: CatalogSequence::new(0),
             snapshots: std::sync::Arc::new(std::sync::Mutex::new(SnapshotState {
+                exported: exported_snapshots,
                 active: active_snapshots,
                 serializable: serializable_snapshots,
                 statements: statement_snapshots,
@@ -48540,7 +48556,7 @@ impl Storage {
         !self.lock_state().table.is_empty()
     }
 
-    pub(crate) fn schema_lock_blocker(&self, txid: u32) -> Option<u32> {
+    pub(crate) fn schema_lock_blocker(&self, txid: u32) -> Option<SchemaLockBlocker> {
         let snapshots = self.snapshot_state();
         let locks = self.lock_state();
         snapshots
@@ -48556,6 +48572,28 @@ impl Storage {
             )
             .chain(locks.table.iter().map(|lock| lock.owner))
             .find(|owner| *owner != txid)
+            .map(SchemaLockBlocker::Transaction)
+            .or_else(|| {
+                snapshots
+                    .exported
+                    .first()
+                    .map(|snapshot| SchemaLockBlocker::Connection(snapshot.connection))
+            })
+    }
+
+    pub(crate) fn wait_for_schema_lock(
+        &self,
+        waiter: u32,
+        blocker: SchemaLockBlocker,
+    ) -> Result<(), SqlError> {
+        let waiter = self.transaction_wait_owner(waiter);
+        let blocker = match blocker {
+            SchemaLockBlocker::Transaction(transaction) => self.transaction_wait_owner(transaction),
+            SchemaLockBlocker::Connection(connection) => {
+                crate::sql::lock::connection_wait_owner(connection)
+            }
+        };
+        self.lock_state().row.wait_for(waiter, blocker)
     }
 
     pub(crate) fn wait_for_transaction(&self, waiter: u32, blocker: u32) -> Result<(), SqlError> {

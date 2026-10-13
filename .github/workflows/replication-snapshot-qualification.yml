@@ -1,0 +1,27 @@
+name: Replication snapshot qualification
+on:
+  push:
+    branches: [codex/replication-snapshot-retention]
+concurrency:
+  group: replication-snapshot-qualification-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  snapshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --lib --locked replication_snapshot -- --nocapture
+      - run: cargo test --lib --locked statement_snapshot -- --nocapture
+      - run: cargo test --lib --locked startup_bounded -- --nocapture
+      - run: cargo test --lib --locked query_workspaces_are_startup_bounded_and_isolated -- --nocapture

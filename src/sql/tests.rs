@@ -64761,6 +64761,88 @@ fn subscription_failure_policy_is_durable_and_typed() {
 }
 
 #[test]
+fn replication_snapshot_failed_import_does_not_change_transaction() {
+    let mut config = test_config("replication-snapshot-import-capacity");
+    config.max_connections = 2;
+    config.max_prepared_transactions = 0;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "BEGIN ISOLATION LEVEL REPEATABLE READ", true);
+    let exported = engine
+        .export_replication_snapshot(77, engine.storage.lsn())
+        .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        engine.storage.register_snapshot(50_001, 0).unwrap();
+        engine.storage.register_snapshot(50_002, 0).unwrap();
+        let error = engine
+            .import_replication_snapshot(&mut session.transaction, exported.as_str())
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(session.transaction.snapshot_lsn(), None);
+        engine.storage.release_snapshot(50_002);
+        session.transaction.isolation = txn::TransactionIsolation::Serializable;
+        let error = engine
+            .import_replication_snapshot(&mut session.transaction, exported.as_str())
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::FEATURE_NOT_SUPPORTED);
+        assert_eq!(session.transaction.snapshot_lsn(), None);
+        session.transaction.isolation = txn::TransactionIsolation::RepeatableRead;
+        engine
+            .import_replication_snapshot(&mut session.transaction, exported.as_str())
+            .unwrap();
+        assert_eq!(
+            session.transaction.snapshot_lsn(),
+            Some(engine.storage.lsn())
+        );
+        engine.invalidate_replication_snapshot(77);
+        assert_eq!(engine.storage.oldest_snapshot(), Some(0));
+        engine.storage.release_snapshot(50_001);
+    });
+    session.success(&mut engine, "COMMIT", true);
+    assert_eq!(engine.storage.oldest_snapshot(), None);
+}
+
+#[test]
+fn replication_snapshot_replacement_keeps_original_sql_rows() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE snapshot_replaced (id integer PRIMARY KEY); INSERT INTO snapshot_replaced VALUES (1)",
+    );
+    let position = engine.storage.lsn();
+    let exported = engine.export_replication_snapshot(77, position).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE snapshot_replaced SET id = 20",
+    );
+    crate::mem::guard::forbid_alloc(|| {
+        let replacement = engine.export_replication_snapshot(77, position).unwrap();
+        assert_eq!(replacement.as_str(), exported.as_str());
+    });
+    let imported = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SET TRANSACTION SNAPSHOT '{}'; \
+         SELECT id FROM snapshot_replaced; COMMIT",
+            exported.as_str()
+        ),
+    );
+    assert_eq!(
+        data_rows(&imported),
+        ["1"],
+        "{}",
+        String::from_utf8_lossy(&imported)
+    );
+    engine.invalidate_replication_snapshot(77);
+    let current = run_with(&mut engine, &mut budget, "SELECT id FROM snapshot_replaced");
+    assert_eq!(data_rows(&current), ["20"]);
+}
+
+#[test]
 fn exported_replication_snapshot_pins_one_importable_sql_snapshot() {
     let (mut engine, mut budget) = test_engine();
     run_with(

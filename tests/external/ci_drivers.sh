@@ -72,6 +72,15 @@ diff_driver() { # name  build-and-run-fn
   fi
 }
 
+# The same raw protocol assertions run against both servers. Snapshot names
+# and positions differ; visible rows and SQLSTATEs must agree.
+replication_snapshot_probe() {
+  POS3QL_HOST=$2 POS3QL_PORT=$3 \
+    POS3QL_WIRE_PROBE=test_replication_snapshot_lifetime \
+    python3 tests/external/wire_probe.py > "$1" 2>&1
+}
+diff_driver replication-snapshot replication_snapshot_probe
+
 # --- pgJDBC (Java) ---------------------------------------------------------
 JDBC_VER=42.7.4
 JAR="$WORK/postgresql-$JDBC_VER.jar"

@@ -63478,7 +63478,7 @@ fn alter_partition_attachment(
                 crate::storage::PartitionAttachmentState::DetachPending,
             ) => {
                 if let Some(blocker) = storage.schema_lock_blocker(txn.txid) {
-                    if let Err(error) = storage.wait_for_transaction(txn.txid, blocker) {
+                    if let Err(error) = storage.wait_for_schema_lock(txn.txid, blocker) {
                         return sql_fail(error);
                     }
                     return sql_fail(sql_err!(

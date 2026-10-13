@@ -1603,6 +1603,68 @@ def test_parse_rejects_invalid_type_counts_and_trailing_bytes():
     s.close()
 
 
+def test_replication_snapshot_lifetime():
+    setup = connect()
+    setup.sendall(startup_payload(0))
+    drain_startup(setup)
+    simple_query(setup, "DROP TABLE IF EXISTS wire_snapshot_source; "
+                 "CREATE TABLE wire_snapshot_source (id integer); "
+                 "INSERT INTO wire_snapshot_source VALUES (1)")
+    for suffix, command in (("identify", "IDENTIFY_SYSTEM"), ("sql", "SELECT 1")):
+        slot = f"wire_snapshot_{suffix}"
+        simple_query(setup, "UPDATE wire_snapshot_source SET id = 1")
+        exporter = connect()
+        exporter.sendall(startup_payload(0, parameters=(("replication", "database"),)))
+        drain_startup(exporter)
+        exported = simple_query(exporter, f"CREATE_REPLICATION_SLOT {slot} LOGICAL pgoutput EXPORT_SNAPSHOT")
+        fields = next((text_row_fields(payload) for kind, payload in exported if kind == b"D"), None)
+        check(f"snapshot {suffix}: slot exports an identifier",
+              fields is not None and len(fields) == 4 and fields[2] is not None, exported)
+        if fields is None or len(fields) != 4 or fields[2] is None:
+            exporter.close()
+            continue
+        identifier = fields[2].replace("'", "''")
+        serializable = simple_query(setup, "BEGIN ISOLATION LEVEL SERIALIZABLE; "
+                                     f"SET TRANSACTION SNAPSHOT '{identifier}'")
+        check(f"snapshot {suffix}: serializable import rejects a non-serializable source",
+              has_sqlstate(serializable, "0A000"), serializable)
+        simple_query(setup, "ROLLBACK")
+        peer = connect()
+        peer.sendall(startup_payload(0, parameters=(("database", "template1"),)))
+        drain_startup(peer)
+        foreign = simple_query(peer, "BEGIN ISOLATION LEVEL REPEATABLE READ; "
+                               f"SET TRANSACTION SNAPSHOT '{identifier}'")
+        check(f"snapshot {suffix}: another database cannot import it",
+              has_sqlstate(foreign, "0A000"), foreign)
+        simple_query(peer, "ROLLBACK")
+        peer.close()
+        simple_query(setup, "UPDATE wire_snapshot_source SET id = 20")
+        importer = connect()
+        importer.sendall(startup_payload(0))
+        drain_startup(importer)
+        imported = simple_query(importer,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; "
+            f"SET TRANSACTION SNAPSHOT '{identifier}'; SELECT id FROM wire_snapshot_source")
+        check(f"snapshot {suffix}: import preserves the original row",
+              not any(kind == b"E" for kind, _ in imported) and first_text_row(imported) == "1", imported)
+        expired = simple_query(exporter, command)
+        check(f"snapshot {suffix}: next command succeeds",
+              not any(kind == b"E" for kind, _ in expired), expired)
+        late = simple_query(setup, "BEGIN ISOLATION LEVEL REPEATABLE READ; "
+                            f"SET TRANSACTION SNAPSHOT '{identifier}'")
+        check(f"snapshot {suffix}: next command expires new imports", has_sqlstate(late, "22023"), late)
+        simple_query(setup, "ROLLBACK")
+        retained = simple_query(importer, "SELECT id FROM wire_snapshot_source; COMMIT")
+        check(f"snapshot {suffix}: successful import survives exporter expiration",
+              not any(kind == b"E" for kind, _ in retained) and first_text_row(retained) == "1", retained)
+        importer.close()
+        exporter.close()
+        dropped = simple_query(setup, f"SELECT pg_drop_replication_slot('{slot}')")
+        check(f"snapshot {suffix}: slot cleanup succeeds", not any(kind == b"E" for kind, _ in dropped), dropped)
+    simple_query(setup, "DROP TABLE wire_snapshot_source")
+    setup.close()
+
+
 def test_logical_replication_simple_query_mode():
     s = connect()
     s.sendall(startup_payload(0, parameters=(("replication", "database"),)))

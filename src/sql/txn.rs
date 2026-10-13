@@ -1254,7 +1254,7 @@ impl TxnState {
         }
     }
 
-    pub fn import_snapshot(&mut self, snapshot: u64) -> Result<(), SqlError> {
+    pub fn import_replication_snapshot(&mut self, snapshot: u64) -> Result<(), SqlError> {
         if !self.is_explicit() {
             return Err(sql_err!(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
@@ -1274,6 +1274,12 @@ impl TxnState {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "a snapshot-importing transaction must use REPEATABLE READ or SERIALIZABLE"
+            ));
+        }
+        if self.isolation == TransactionIsolation::Serializable {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a serializable transaction cannot import a snapshot from a non-serializable transaction"
             ));
         }
         self.snapshot_lsn = Some(snapshot);

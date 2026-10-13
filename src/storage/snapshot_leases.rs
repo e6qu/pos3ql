@@ -335,7 +335,7 @@ mod tests {
     }
 
     fn assert_original_row(storage: &Storage, table: usize, transaction: u32) {
-        let row = storage.resident_row_state(table, 1).unwrap();
+        let row = storage.resident_row_state(table, 1).unwrap().unwrap();
         let image = storage
             .visible_row_home_at(table, 1, row, transaction, crate::storage::SNAPSHOT_ALL, 7)
             .unwrap()
@@ -372,6 +372,7 @@ mod tests {
             assert!(
                 storage
                     .resident_row_state(table, 1)
+                    .unwrap()
                     .unwrap()
                     .history
                     .is_empty()
@@ -514,7 +515,7 @@ mod tests {
         let finished = AtomicBool::new(false);
         let start = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
-            let reader = storage.resident_row_state(table, 1).unwrap();
+            let reader = storage.resident_row_state(table, 1).unwrap().unwrap();
             scope.spawn(|| {
                 start.wait();
                 crate::mem::guard::forbid_alloc(|| {
@@ -593,6 +594,7 @@ mod tests {
                     storage
                         .resident_row_state(table, 1)
                         .unwrap()
+                        .unwrap()
                         .history
                         .is_empty()
                 );
@@ -611,7 +613,7 @@ mod tests {
                 .write_pending(table, 1, 8, 1, Some(location))
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
-            let state = storage.resident_row_state(table, 1).unwrap();
+            let state = storage.resident_row_state(table, 1).unwrap().unwrap();
             assert_eq!(state.history.len(), 1);
             let image = storage
                 .visible_row_home_at(
@@ -644,6 +646,7 @@ mod tests {
                 storage
                     .resident_row_state(table, 1)
                     .unwrap()
+                    .unwrap()
                     .history
                     .is_empty()
             );
@@ -660,7 +663,7 @@ mod tests {
             storage.retain_statement_snapshot(99, |lsn| lsn).unwrap()
         });
         let image = crate::mem::guard::forbid_alloc(|| {
-            let state = storage.resident_row_state(table, 1).unwrap();
+            let state = storage.resident_row_state(table, 1).unwrap().unwrap();
             storage
                 .visible_row_home_at(
                     table,
@@ -715,6 +718,7 @@ mod tests {
             storage
                 .resident_row_state(table, 1)
                 .unwrap()
+                .unwrap()
                 .history
                 .is_empty()
         );
@@ -750,6 +754,7 @@ mod tests {
             assert!(
                 storage
                     .resident_row_state(table, 1)
+                    .unwrap()
                     .unwrap()
                     .history
                     .is_empty(),

@@ -67,6 +67,7 @@ pub(super) struct RowVersionState {
 
 pub(super) struct RowVersionPools {
     state: RwLock<RowVersionState>,
+    pub(super) metadata: super::row_reads::RowMetadataPool,
 }
 
 impl RowVersionPools {
@@ -74,9 +75,14 @@ impl RowVersionPools {
         size_of::<Self>()
     }
 
+    pub(super) fn metadata_budget_bytes(config: &Config) -> usize {
+        super::row_reads::RowMetadataPool::allocation_bytes(config)
+    }
+
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         budget.draw(Self::control_bytes(), "row-version pool controls")?;
         Ok(Self {
+            metadata: super::row_reads::RowMetadataPool::new(config, budget)?,
             state: RwLock::new(RowVersionState {
                 pending_row_versions: RowVersionPool::new(
                     budget,
@@ -403,10 +409,14 @@ mod tests {
     use crate::storage::{ColumnSet, RowHome};
 
     fn pools(capacity: usize) -> RowVersionPools {
+        let mut config = Config::default_dev();
+        config.max_row_versions_per_row = capacity;
         let mut budget = Budget::new(
-            capacity * (size_of::<PendingVersionSlot>() + size_of::<CommittedVersionSlot>()),
+            capacity * (size_of::<PendingVersionSlot>() + size_of::<CommittedVersionSlot>())
+                + RowVersionPools::metadata_budget_bytes(&config),
         );
         RowVersionPools {
+            metadata: super::super::row_reads::RowMetadataPool::new(&config, &mut budget).unwrap(),
             state: RwLock::new(RowVersionState {
                 pending_row_versions: RowVersionPool::new(&mut budget, "test pending", capacity)
                     .unwrap(),

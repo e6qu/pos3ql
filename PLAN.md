@@ -61,7 +61,9 @@ an already running read following reused memory or deleted objects.
 
 Statements and streaming `COPY FROM` retain their read position. Scans capture
 row identities, saved files, and schema before callbacks. Selected rows own
-their sources through table removal; two fixed heap buffers let reclamation
+their sources through table removal. Point metadata reads copy their version
+chains into startup-reserved slots, so keeping metadata no longer holds the
+shared version lock. Two fixed heap buffers let reclamation
 preserve selected bytes. Statistics and journal acknowledgements now retain
 the exact image they captured.
 

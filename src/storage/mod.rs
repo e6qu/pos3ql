@@ -17559,6 +17559,11 @@ impl Storage {
     }
 
     #[cfg(test)]
+    pub(crate) fn retained_row_metadata_budget_bytes(config: &Config) -> usize {
+        RowVersionPools::metadata_budget_bytes(config) + size_of::<row_reads::RowMetadataPool>()
+    }
+
+    #[cfg(test)]
     pub(crate) fn row_heap_relocation_budget_bytes(config: &Config) -> usize {
         RowHeap::relocation_budget_bytes(config.memtable_bytes)
     }
@@ -17578,6 +17583,7 @@ impl Storage {
             + RowHeap::control_bytes()
             + config.memtable_bytes
             + RowVersionPools::control_bytes()
+            + RowVersionPools::metadata_budget_bytes(config)
             + Self::retained_row_walk_budget_bytes(config)
             + SpillRootRegistry::budget_bytes(config)
             + QueryRootPool::budget_bytes(config)
@@ -29931,7 +29937,7 @@ impl Storage {
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
         let rowids = self.row_walks.retain(&self.tables[table_slot].rows)?;
         for rowid in rowids.iter() {
-            if let Some(state) = self.resident_row_state(table_slot, rowid)
+            if let Some(state) = self.resident_row_state(table_slot, rowid)?
                 && each(rowid, state)?.is_break()
             {
                 return Ok(core::ops::ControlFlow::Break(()));
@@ -30005,7 +30011,7 @@ impl Storage {
         while cursor.resident_position < cursor.resident_rowids.len() && walked < max_rows {
             let rowid = cursor.resident_rowids[cursor.resident_position].rowid;
             cursor.resident_position += 1;
-            let Some(state) = self.resident_row_state(table_slot, rowid) else {
+            let Some(state) = self.resident_row_state(table_slot, rowid)? else {
                 continue;
             };
             if state.committed_lsn <= after_lsn {
@@ -30090,7 +30096,7 @@ impl Storage {
                 walked += 1;
                 // Unprocessed evicted rows belong to the paced SST stream,
                 // avoiding one object-store point lookup per captured row.
-                let Some(state) = self.resident_row_state(table_slot, rowid) else {
+                let Some(state) = self.resident_row_state(table_slot, rowid)? else {
                     continue;
                 };
                 if matches!(state.committed, Some(RowHome::Spilled { .. })) {
@@ -30212,7 +30218,7 @@ impl Storage {
         rowid: u64,
     ) -> Result<Option<RowRead<'_>>, SqlError> {
         if let Some(state) =
-            RowReadView::point(&self.row_versions, &self.tables[table_slot].rows, rowid)
+            RowReadView::point(&self.row_versions, &self.tables[table_slot].rows, rowid)?
         {
             return Ok(Some(state));
         }
@@ -30225,7 +30231,11 @@ impl Storage {
     /// overlay. Immutable index generations use this to detect keys shadowed
     /// by later changes without point-reading the immutable table for every
     /// unchanged index entry.
-    pub(crate) fn resident_row_state(&self, table_slot: usize, rowid: u64) -> Option<RowRead<'_>> {
+    pub(crate) fn resident_row_state(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+    ) -> Result<Option<RowRead<'_>>, SqlError> {
         RowReadView::point(&self.row_versions, &self.tables[table_slot].rows, rowid)
     }
 
@@ -31696,7 +31706,7 @@ impl Storage {
         rewritten: bool,
     ) -> Result<(), SqlError> {
         let table = &self.tables[table_index];
-        let Some(selected) = self.resident_row_state(table_index, rowid) else {
+        let Some(selected) = self.resident_row_state(table_index, rowid)? else {
             return Ok(());
         };
         let Some(pending) = selected
@@ -52694,14 +52704,14 @@ mod tests {
                 .write_pending(table, 1, 7, 1, Some(location))
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert!(storage.resident_row_state(table, 1).is_none());
+            assert!(storage.resident_row_state(table, 1).unwrap().is_none());
             storage.tables[table]
                 .rows
                 .insert(1, RowState::committed_only_at(location, 7))
                 .unwrap();
             let error = storage.write_pending(table, 1, 7, 1, None).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            let row = storage.resident_row_state(table, 1).unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             assert!(row.pending.is_none());
             assert_eq!(row.committed, Some(RowHome::Heap(location)));
             drop(row);
@@ -52727,7 +52737,7 @@ mod tests {
             .unwrap();
         let arena = Arena::new(&mut budget, "visible row image", 4).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let row = storage.resident_row_state(table, 1).unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             let image = storage
                 .visible_row_home_at(table, 1, row, 8, SNAPSHOT_ALL, 7)
                 .unwrap()
@@ -52740,7 +52750,7 @@ mod tests {
             );
             assert_eq!(storage.row_bytes(table, 1, image, &arena).unwrap(), b"row!");
             assert!(storage.heap.test_write().is_ok());
-            let row = storage.resident_row_state(table, 1).unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             let image = storage
                 .visible_row_home_at(table, 1, row, 8, SNAPSHOT_ALL, 7)
                 .unwrap()
@@ -52753,7 +52763,7 @@ mod tests {
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
             assert!(storage.heap.test_write().is_ok());
-            let row = storage.resident_row_state(table, 1).unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             let image = storage
                 .visible_row_home_at(table, 1, row, 8, SNAPSHOT_ALL, 7)
                 .unwrap()
@@ -52793,7 +52803,7 @@ mod tests {
             .visible_row_home_at(
                 table,
                 1,
-                storage.resident_row_state(table, 1).unwrap(),
+                storage.resident_row_state(table, 1).unwrap().unwrap(),
                 7,
                 SNAPSHOT_ALL,
                 u64::MAX,
@@ -52829,7 +52839,7 @@ mod tests {
                 .visible_row_home_at(
                     table,
                     1,
-                    storage.resident_row_state(table, 1).unwrap(),
+                    storage.resident_row_state(table, 1).unwrap().unwrap(),
                     7,
                     SNAPSHOT_ALL,
                     u64::MAX,
@@ -52872,7 +52882,7 @@ mod tests {
             .visible_row_home_at(
                 table,
                 1,
-                storage.resident_row_state(table, 1).unwrap(),
+                storage.resident_row_state(table, 1).unwrap().unwrap(),
                 7,
                 SNAPSHOT_ALL,
                 7,
@@ -52893,7 +52903,7 @@ mod tests {
                 .visible_row_home_at(
                     table,
                     1,
-                    storage.resident_row_state(table, 1).unwrap(),
+                    storage.resident_row_state(table, 1).unwrap().unwrap(),
                     7,
                     SNAPSHOT_ALL,
                     7,
@@ -52933,7 +52943,12 @@ mod tests {
             );
             storage.restore_pending(table, 1, 7, second);
             assert_eq!(
-                storage.resident_row_state(table, 1).unwrap().pending.len(),
+                storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .pending
+                    .len(),
                 2
             );
             assert_eq!(
@@ -52946,7 +52961,7 @@ mod tests {
                 b"old!"
             );
             storage.restore_pending(table, 1, 7, first);
-            assert!(storage.resident_row_state(table, 1).is_none());
+            assert!(storage.resident_row_state(table, 1).unwrap().is_none());
             assert!(storage.heap.test_write().is_ok());
             assert!(storage.row_versions.test_write().is_ok());
         });
@@ -52983,7 +52998,7 @@ mod tests {
         let mut scratch = FixedVec::new(&mut budget, "snapshot compaction", 8).unwrap();
         let arena = Arena::new(&mut budget, "deferred row images", 32).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let row = storage.resident_row_state(table, 1).unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             let image = storage
                 .visible_row_home_at(table, 1, row, 7, SNAPSHOT_ALL, 7)
                 .unwrap()
@@ -53018,7 +53033,7 @@ mod tests {
                 b"old!"
             );
             assert!(storage.heap.test_write().is_ok());
-            let row = storage.resident_row_state(table, 1).unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             let current = storage
                 .visible_row_home_at(table, 1, row, 7, SNAPSHOT_ALL, 7)
                 .unwrap()
@@ -53148,7 +53163,7 @@ mod tests {
                 .visible_row_home_at(
                     0,
                     1,
-                    storage.resident_row_state(0, 1).unwrap(),
+                    storage.resident_row_state(0, 1).unwrap().unwrap(),
                     7,
                     SNAPSHOT_ALL,
                     41
@@ -53162,7 +53177,7 @@ mod tests {
                 .visible_row_home_at(
                     0,
                     1,
-                    storage.resident_row_state(0, 1).unwrap(),
+                    storage.resident_row_state(0, 1).unwrap().unwrap(),
                     7,
                     SNAPSHOT_ALL,
                     42
@@ -53176,7 +53191,7 @@ mod tests {
                 .visible_row_home_at(
                     0,
                     1,
-                    storage.resident_row_state(0, 1).unwrap(),
+                    storage.resident_row_state(0, 1).unwrap().unwrap(),
                     7,
                     SNAPSHOT_ALL,
                     99
@@ -53207,14 +53222,28 @@ mod tests {
         storage.tables[0].rows.insert(1, pending).unwrap();
         assert_eq!(
             storage
-                .visible_row_home_at(0, 1, storage.resident_row_state(0, 1).unwrap(), 7, 4, 41)
+                .visible_row_home_at(
+                    0,
+                    1,
+                    storage.resident_row_state(0, 1).unwrap().unwrap(),
+                    7,
+                    4,
+                    41
+                )
                 .unwrap()
                 .map(|image| image.metadata()),
             Some(RowHome::Heap(RowLoc::test(20, 4)))
         );
         assert_eq!(
             storage
-                .visible_row_home_at(0, 1, storage.resident_row_state(0, 1).unwrap(), 8, 4, 41)
+                .visible_row_home_at(
+                    0,
+                    1,
+                    storage.resident_row_state(0, 1).unwrap().unwrap(),
+                    8,
+                    4,
+                    41
+                )
                 .unwrap()
                 .map(|image| image.metadata()),
             None
@@ -53340,7 +53369,7 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             storage
                 .for_each_row_state(0, &mut |_, row| {
-                    assert!(storage.row_versions.test_write().is_err());
+                    assert!(storage.row_versions.test_write().is_ok());
                     assert!(storage.tables[0].rows.test_write().is_ok());
                     assert_eq!(row.committed_lsn, 7);
                     Ok(core::ops::ControlFlow::Break(()))
@@ -53360,7 +53389,7 @@ mod tests {
             assert!(storage.row_versions.test_write().is_ok());
             assert!(storage.tables[0].rows.test_write().is_ok());
             let row = storage.row_state(0, 1).unwrap().unwrap();
-            assert!(storage.row_versions.test_write().is_err());
+            assert!(storage.row_versions.test_write().is_ok());
             assert_eq!(
                 storage
                     .visible_row_home_at(0, 1, row, 7, SNAPSHOT_ALL, 7)
@@ -54275,7 +54304,7 @@ mod tests {
             }
             storage.evict_committed_table(target);
             for (rowid, sst, commit_lsn) in [(1, 0, 7), (2, 1, 9), (3, 2, 11)] {
-                let state = storage.resident_row_state(target, rowid).unwrap();
+                let state = storage.resident_row_state(target, rowid).unwrap().unwrap();
                 assert!(
                     matches!(state.committed, Some(RowHome::Spilled { sst: member, commit_lsn: version, .. })
                     if member == sst && version == commit_lsn)
@@ -60209,7 +60238,7 @@ mod tests {
                     assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
                 }
                 for (txid, lsn, expected) in [(8, 6, b"old!"), (8, 7, b"live"), (9, 7, b"edit")] {
-                    let row = storage.resident_row_state(0, 1).unwrap();
+                    let row = storage.resident_row_state(0, 1).unwrap().unwrap();
                     let home = storage
                         .visible_row_home_at(0, 1, row, txid, SNAPSHOT_ALL, lsn)
                         .unwrap()
@@ -60220,7 +60249,12 @@ mod tests {
                 assert!(storage.row_versions.test_write().is_ok());
                 // A second relocation changes the generation even when offsets
                 // are unchanged. Historical and pending images remain readable.
-                let previous = storage.resident_row_state(0, 1).unwrap().committed.unwrap();
+                let previous = storage
+                    .resident_row_state(0, 1)
+                    .unwrap()
+                    .unwrap()
+                    .committed
+                    .unwrap();
                 storage.compact_heap(&mut scratch).unwrap();
                 assert_eq!(
                     storage
@@ -60229,7 +60263,7 @@ mod tests {
                         .sqlstate,
                     sqlstate::SERIALIZATION_FAILURE
                 );
-                let row = storage.resident_row_state(0, 1).unwrap();
+                let row = storage.resident_row_state(0, 1).unwrap().unwrap();
                 let home = storage
                     .visible_row_home_at(0, 1, row, 9, SNAPSHOT_ALL, 7)
                     .unwrap()
@@ -60351,6 +60385,7 @@ mod tests {
 
         let compacted = storage
             .resident_row_state(slot, 1)
+            .unwrap()
             .unwrap()
             .pending_last()
             .unwrap()

@@ -50,12 +50,14 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
         engine
             .storage
             .resident_row_state(table, rowids[0])
+            .unwrap()
             .is_none()
     );
     assert!(
         engine
             .storage
             .resident_row_state(table, rowids[1])
+            .unwrap()
             .is_none()
     );
     let location = engine.storage.heap.append_row(&[Datum::Int4(99)]).unwrap();
@@ -96,7 +98,13 @@ fn retained_row_walk_keeps_frozen_sst_coverage_through_rollback_and_recovery() {
                 })?;
             if rowid == rowids[0] {
                 engine.storage.restore_pending(table, rowid, 777, original);
-                assert!(engine.storage.resident_row_state(table, rowid).is_none());
+                assert!(
+                    engine
+                        .storage
+                        .resident_row_state(table, rowid)
+                        .unwrap()
+                        .is_none()
+                );
                 replacement = Some(engine.storage.write_pending_untracked(
                     table,
                     rowids[1],
@@ -255,7 +263,11 @@ fn shared_row_publication_rollback_keeps_sst_deletions_through_cold_recovery() {
     assert!(engine.checkpoint().unwrap());
     assert_eq!(engine.storage.table(table).spill_generations().len(), 1);
     session.success(&mut engine, "DELETE FROM retained_delete", false);
-    let marker = *engine.storage.resident_row_state(table, rowid).unwrap();
+    let marker = *engine
+        .storage
+        .resident_row_state(table, rowid)
+        .unwrap()
+        .unwrap();
     assert!(marker.committed.is_none() && marker.committed_lsn != 0);
     // Reconstruction addresses physical row identities, including a deletion
     // that still shadows an older immutable generation. Undo must retain it.
@@ -267,7 +279,11 @@ fn shared_row_publication_rollback_keeps_sst_deletions_through_cold_recovery() {
             .unwrap();
         engine.storage.restore_pending(table, rowid, 777, undo);
         assert_eq!(
-            *engine.storage.resident_row_state(table, rowid).unwrap(),
+            *engine
+                .storage
+                .resident_row_state(table, rowid)
+                .unwrap()
+                .unwrap(),
             marker
         );
     });
@@ -70842,7 +70858,11 @@ fn metadata_alter_commits_updates_while_unrelated_copy_retains_snapshot() {
         .find_table("public", "metadata_target")
         .unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        let state = engine.storage.resident_row_state(table, 1).unwrap();
+        let state = engine
+            .storage
+            .resident_row_state(table, 1)
+            .unwrap()
+            .unwrap();
         let image = engine
             .storage
             .visible_row_home_at(

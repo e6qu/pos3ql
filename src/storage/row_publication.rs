@@ -103,7 +103,7 @@ impl Storage {
             }
             definition.identity().created_at
         };
-        let (expected, pending_identity, existed) = match self.resident_row_state(table, rowid) {
+        let (expected, pending_identity, existed) = match self.resident_row_state(table, rowid)? {
             Some(state) => {
                 if let Some(owner) = state.locked_by_other(txid) {
                     drop(state);
@@ -360,6 +360,46 @@ mod tests {
     }
 
     #[test]
+    fn row_read_ownership_retained_metadata_allows_unrelated_publication() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let config = test_config();
+        let (mut storage, table) = fixture(&config);
+        let original = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+        storage.tables[table]
+            .rows
+            .insert(1, RowState::committed_only_at(original, 7))
+            .unwrap();
+        storage.set_lsn(7);
+        let retained = storage.resident_row_state(table, 1).unwrap().unwrap();
+        let location = storage.heap.append_row(&[Datum::Int4(20)]).unwrap();
+        let finished = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    let undo = storage
+                        .write_pending(table, 2, 8, 1, Some(location))
+                        .unwrap();
+                    storage.restore_pending(table, 2, 8, undo);
+                    finished.store(true, Ordering::Release);
+                });
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let progressed = finished.load(Ordering::Acquire);
+            assert_eq!(retained.committed_lsn, 7);
+            // Release before reporting a failure so a regression cannot hang CI.
+            drop(retained);
+            assert!(
+                progressed,
+                "retained metadata blocked an unrelated row publication"
+            );
+        });
+    }
+
+    #[test]
     fn shared_row_publication_completes_with_a_retained_visible_reader() {
         let (mut storage, table) = fixture(&test_config());
         let old = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
@@ -367,7 +407,7 @@ mod tests {
             .rows
             .insert(1, RowState::committed_only_at(old, 7))
             .unwrap();
-        let row = storage.resident_row_state(table, 1).unwrap();
+        let row = storage.resident_row_state(table, 1).unwrap().unwrap();
         let image = storage
             .visible_row_home_at(table, 1, row, 8, SNAPSHOT_ALL, 7)
             .unwrap()
@@ -407,13 +447,14 @@ mod tests {
                     storage
                         .resident_row_state(table, 2)
                         .unwrap()
+                        .unwrap()
                         .pending_last()
                         .unwrap()
                         .txid,
                     7
                 );
                 storage.restore_pending(table, 2, 7, undo);
-                assert!(storage.resident_row_state(table, 2).is_none());
+                assert!(storage.resident_row_state(table, 2).unwrap().is_none());
             });
         });
     }
@@ -445,7 +486,7 @@ mod tests {
                     .count(),
                 1
             );
-            let row = storage.resident_row_state(table, 1).unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             let owner = row.pending_last().unwrap().txid;
             assert_eq!(row.pending.len(), 1);
             assert!(results.iter().any(
@@ -485,18 +526,28 @@ mod tests {
             ));
             storage.restore_pending(table, 1, 7, prior);
             assert_eq!(
-                storage.resident_row_state(table, 1).unwrap().pending.len(),
+                storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .pending
+                    .len(),
                 1
             );
             let deletion = storage.write_pending(table, 1, 7, 2, None).unwrap();
             storage.restore_pending(table, 1, 7, current);
             assert_eq!(
-                storage.resident_row_state(table, 1).unwrap().pending.len(),
+                storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .pending
+                    .len(),
                 2
             );
             storage.restore_pending(table, 1, 7, deletion);
             storage.restore_pending(table, 1, 7, current);
-            assert!(storage.resident_row_state(table, 1).is_none());
+            assert!(storage.resident_row_state(table, 1).unwrap().is_none());
         });
     }
 
@@ -530,7 +581,7 @@ mod tests {
         });
         crate::mem::guard::forbid_alloc(|| {
             for rowid in 1..=64 {
-                let row = storage.resident_row_state(table, rowid).unwrap();
+                let row = storage.resident_row_state(table, rowid).unwrap().unwrap();
                 let pending = row.pending_last().unwrap();
                 assert_eq!(pending.txid, ((rowid - 1) / 16) as u32 + 7);
                 let bytes = storage.heap.get(pending.loc.unwrap()).unwrap();
@@ -584,7 +635,9 @@ mod tests {
                 std::thread::yield_now();
             }
             let reader = scope.spawn(move || {
-                crate::mem::guard::forbid_alloc(|| storage.resident_row_state(table, 1).is_none())
+                crate::mem::guard::forbid_alloc(|| {
+                    storage.resident_row_state(table, 1).unwrap().is_none()
+                })
             });
             drop(statistics);
             assert_eq!(writer.join().unwrap(), sqlstate::PROGRAM_LIMIT_EXCEEDED);
@@ -619,7 +672,7 @@ mod tests {
                 .unwrap();
             storage.restore_pending(table, 1, 7, undo);
             assert_eq!(storage.tables[table].rows.get(&1), Some(marker));
-            let row = storage.resident_row_state(table, 1).unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             assert_eq!(row.visible_at(8, SNAPSHOT_ALL, 9), Some(None));
             assert_eq!(row.checkpoint_change_lsn, 9);
         });
@@ -647,7 +700,12 @@ mod tests {
                 );
             }
             assert_eq!(
-                storage.resident_row_state(table, 1).unwrap().pending.len(),
+                storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .pending
+                    .len(),
                 1
             );
             storage.restore_pending(table, 1, 7, undo);
@@ -685,7 +743,12 @@ mod tests {
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
-            assert!(storage.resident_row_state(table, capacity + 1).is_none());
+            assert!(
+                storage
+                    .resident_row_state(table, capacity + 1)
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(
                 storage.cumulative_statistics().relation_transactions[0].n_tup_ins,
                 capacity
@@ -694,7 +757,7 @@ mod tests {
             storage
                 .write_pending(table, capacity + 1, 7, 1, Some(location))
                 .unwrap();
-            assert!(storage.resident_row_state(table, 1).is_none());
+            assert!(storage.resident_row_state(table, 1).unwrap().is_none());
         });
     }
 
@@ -715,7 +778,7 @@ mod tests {
                 storage.publish_pending_write(stale).err().unwrap().sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
-            assert!(storage.resident_row_state(table, 1).is_none());
+            assert!(storage.resident_row_state(table, 1).unwrap().is_none());
             assert!(
                 storage
                     .cumulative_statistics()
@@ -753,7 +816,7 @@ mod tests {
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
-            let row = storage.resident_row_state(table, 1).unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             assert_eq!(
                 row.visible_at(8, SNAPSHOT_ALL, 7),
                 Some(Some(RowHome::Heap(old)))
@@ -766,6 +829,7 @@ mod tests {
             assert!(
                 storage
                     .resident_row_state(table, 1)
+                    .unwrap()
                     .unwrap()
                     .history
                     .is_empty()

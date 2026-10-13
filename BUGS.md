@@ -4,9 +4,9 @@ This file records only defects whose repair is prevented by an external blocker
 or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
-The transaction-identity review on 2026-10-13 checked allocation, active-registry
-capacity, maintenance, prepared transactions, and recovery. Separate counters
-and a panic on full registration are repaired through one checked storage owner.
+The row-metadata review on 2026-10-14 checked retained images, chain reuse,
+unrelated publication, and startup capacity. Retained point metadata now uses
+bounded copies rather than holding the shared version pool locked.
 No known defects meet this file's inclusion criteria. This does not mean all
 planned work is finished or that every possible bug has been ruled out.
 Resolved investigations are indexed in [history](docs/history/README.md).

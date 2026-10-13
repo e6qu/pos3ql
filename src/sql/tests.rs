@@ -43335,16 +43335,15 @@ fn analyze_statistics_journal_capture_preserves_database_isolation() {
             "{}",
             String::from_utf8_lossy(&output)
         );
-        let output = run_with(
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
             &mut engine,
-            &mut budget,
-            "BEGIN; INSERT INTO shared_estimates VALUES (NULL); ANALYZE shared_estimates; ROLLBACK",
+            "BEGIN; INSERT INTO shared_estimates VALUES (NULL); ANALYZE shared_estimates",
+            true,
         );
-        assert!(
-            !message_types(&output).contains(&b'E'),
-            "{}",
-            String::from_utf8_lossy(&output)
-        );
+        // Connection abort leaves the in-place counts pending without the
+        // SQL ROLLBACK statement's following implicit journal transaction.
+        engine.rollback_txn(&mut session.transaction, &session.guc);
         let peer_table = engine
             .storage
             .find_table("public", "shared_estimates")

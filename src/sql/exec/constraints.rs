@@ -1374,8 +1374,44 @@ pub(crate) fn parse_generated<'a>(
     Ok(out)
 }
 
-/// Enforces unique keys, CHECK predicates, and outbound foreign keys for one
-/// candidate row about to be stored.
+/// The stored identity and the row excluded from uniqueness checks can differ
+/// when an update moves to another partition. Validation publishes no row.
+#[derive(Clone, Copy)]
+pub(crate) enum ConstraintRow {
+    Stored { excluded: Option<u64>, rowid: u64 },
+    Validation { excluded: Option<u64> },
+}
+
+impl ConstraintRow {
+    pub(crate) fn insert(rowid: u64) -> Self {
+        Self::Stored {
+            excluded: None,
+            rowid,
+        }
+    }
+
+    pub(crate) fn update(rowid: u64) -> Self {
+        Self::Stored {
+            excluded: Some(rowid),
+            rowid,
+        }
+    }
+
+    fn excluded(self) -> Option<u64> {
+        match self {
+            Self::Stored { excluded, .. } | Self::Validation { excluded } => excluded,
+        }
+    }
+
+    pub(crate) fn stored(self) -> Option<u64> {
+        match self {
+            Self::Stored { rowid, .. } => Some(rowid),
+            Self::Validation { .. } => None,
+        }
+    }
+}
+
+/// Enforces constraints using the exact identity that the caller will store.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn enforce_row_constraints(
     storage: &Storage,
@@ -1383,13 +1419,14 @@ pub(crate) fn enforce_row_constraints(
     def: &TableDef,
     schema: &[ColType],
     values: &[Datum],
-    self_rowid: Option<u64>,
+    row: ConstraintRow,
     txid: u32,
     mut txn: Option<&mut TxnState>,
     checks: &ParsedChecks,
     arena: &Arena,
     params: &[Datum],
 ) -> Result<(), SqlError> {
+    let self_rowid = row.excluded();
     check_index_tuple_sizes(storage, def, values, txid, arena)?;
     let constraint_table = storage
         .find_visible(def.schema.as_str(), def.name.as_str(), txid)
@@ -1416,7 +1453,7 @@ pub(crate) fn enforce_row_constraints(
                 def,
                 schema,
                 values,
-                self_rowid,
+                row,
                 txid,
                 txn.as_deref_mut(),
             )?;
@@ -1427,7 +1464,7 @@ pub(crate) fn enforce_row_constraints(
                 def,
                 schema,
                 values,
-                self_rowid,
+                row,
                 txid,
                 txn.as_deref_mut(),
                 checks,
@@ -1452,7 +1489,7 @@ pub(crate) fn enforce_row_constraints(
             def,
             schema,
             values,
-            self_rowid,
+            row,
             txid,
             txn.as_deref_mut(),
         )?;
@@ -1463,7 +1500,7 @@ pub(crate) fn enforce_row_constraints(
             def,
             schema,
             values,
-            self_rowid,
+            row,
             txid,
             txn.as_deref_mut(),
             checks,
@@ -1473,15 +1510,7 @@ pub(crate) fn enforce_row_constraints(
     check_detached_partition_bound(def, values)?;
     check_row_checks(storage, def, checks, values, txid, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;
-    check_or_defer_fk_child(
-        storage,
-        constraint_table,
-        def,
-        values,
-        self_rowid,
-        txid,
-        txn,
-    )?;
+    check_or_defer_fk_child(storage, constraint_table, def, values, row, txid, txn)?;
     Ok(())
 }
 
@@ -1628,17 +1657,18 @@ fn check_or_defer_unique_keys(
     def: &TableDef,
     schema: &[ColType],
     values: &[Datum],
-    self_rowid: Option<u64>,
+    row: ConstraintRow,
     txid: u32,
     mut txn: Option<&mut TxnState>,
 ) -> Result<(), SqlError> {
+    let self_rowid = row.excluded();
     for key in def.uniques() {
         if key.timing.is_deferrable()
+            && let Some(rowid) = row.stored()
             && let Some(transaction) = txn.as_deref_mut()
         {
             let identity = transaction.constraint_identity(constraint_table as u32, key.name);
-            transaction
-                .defer_constraint(identity, self_rowid.unwrap_or(storage.peek_next_rowid()))?;
+            transaction.defer_constraint(identity, rowid)?;
             continue;
         }
         enforce_key_uniqueness(
@@ -1665,19 +1695,20 @@ fn check_or_defer_exclusions(
     def: &TableDef,
     schema: &[ColType],
     values: &[Datum],
-    self_rowid: Option<u64>,
+    row: ConstraintRow,
     txid: u32,
     mut txn: Option<&mut TxnState>,
     expressions: &ParsedChecks,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    let self_rowid = row.excluded();
     for (index, exclusion) in def.exclusions().iter().enumerate() {
         if exclusion.timing.is_deferrable()
+            && let Some(rowid) = row.stored()
             && let Some(transaction) = txn.as_deref_mut()
         {
             let identity = transaction.constraint_identity(constraint_table as u32, exclusion.name);
-            transaction
-                .defer_constraint(identity, self_rowid.unwrap_or(storage.peek_next_rowid()))?;
+            transaction.defer_constraint(identity, rowid)?;
             continue;
         }
         enforce_exclusion_constraint(
@@ -1788,7 +1819,7 @@ fn check_or_defer_fk_child(
     constraint_table: usize,
     def: &TableDef,
     values: &[Datum],
-    self_rowid: Option<u64>,
+    row: ConstraintRow,
     txid: u32,
     mut txn: Option<&mut TxnState>,
 ) -> Result<(), SqlError> {
@@ -1802,11 +1833,11 @@ fn check_or_defer_fk_child(
             continue;
         }
         if fk.timing.is_deferrable()
+            && let Some(rowid) = row.stored()
             && let Some(transaction) = txn.as_deref_mut()
         {
             let identity = transaction.constraint_identity(constraint_table as u32, fk.name);
-            transaction
-                .defer_constraint(identity, self_rowid.unwrap_or(storage.peek_next_rowid()))?;
+            transaction.defer_constraint(identity, rowid)?;
             continue;
         }
         check_fk_child_one(storage, def, fk, values, txid)?;
@@ -2641,7 +2672,7 @@ pub(crate) fn apply_fk_parent_actions(
                     &cdef,
                     cschema,
                     new_child,
-                    Some(rowid),
+                    ConstraintRow::update(rowid),
                     txn.txid,
                     Some(txn),
                     &checks,

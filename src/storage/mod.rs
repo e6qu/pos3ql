@@ -13,6 +13,7 @@ use table_definitions::{
 };
 pub(crate) mod foreign;
 mod row_heap;
+mod row_identities;
 mod row_images;
 mod row_map;
 mod row_publication;
@@ -13612,7 +13613,7 @@ pub struct Storage {
     comments: std::sync::Mutex<CommentCatalog>,
     /// Monotonic stamp shared by every catalog's `created_at` fields.
     catalog_sequence: CatalogSequence,
-    next_rowid: u64,
+    next_rowid: row_identities::RowIdentities,
     /// Repeatable-read retention and serializable read tracking share one
     /// startup-bounded transaction snapshot state.
     snapshots: std::sync::Arc<std::sync::Mutex<SnapshotState>>,
@@ -18563,7 +18564,7 @@ impl Storage {
                 advisory: advisory_locks,
                 sequence: 0,
             })),
-            next_rowid: 1,
+            next_rowid: row_identities::RowIdentities::new(),
             lsn: 0,
             replay_table_rewrite: None,
             spill: None,
@@ -47478,14 +47479,12 @@ impl Storage {
         );
     }
 
-    pub fn next_rowid(&mut self) -> u64 {
-        let id = self.next_rowid;
-        self.next_rowid += 1;
-        id
+    pub fn next_rowid(&self) -> Result<u64, SqlError> {
+        self.next_rowid.reserve()
     }
 
     pub fn peek_next_rowid(&self) -> u64 {
-        self.next_rowid
+        self.next_rowid.next()
     }
 
     pub fn bump_lsn(&mut self) -> u64 {
@@ -52603,8 +52602,8 @@ impl Storage {
     }
 
     /// Recovery: ensures freshly assigned rowids stay above replayed ones.
-    pub fn observe_rowid(&mut self, rowid: u64) {
-        self.next_rowid = self.next_rowid.max(rowid + 1);
+    pub fn observe_rowid(&self, rowid: u64) {
+        self.next_rowid.observe(rowid);
     }
 }
 

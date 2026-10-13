@@ -1603,6 +1603,49 @@ def test_parse_rejects_invalid_type_counts_and_trailing_bytes():
     s.close()
 
 
+def test_partition_move_deferred_constraints():
+    connection = connect()
+    connection.sendall(startup_payload(0))
+    drain_startup(connection)
+    setup = simple_query(connection,
+        "DROP TABLE IF EXISTS wire_move_child CASCADE; "
+        "DROP TABLE IF EXISTS wire_move_parent CASCADE; "
+        "DROP TABLE IF EXISTS wire_move_source; "
+        "CREATE TABLE wire_move_parent (id integer PRIMARY KEY); "
+        "INSERT INTO wire_move_parent VALUES (1); "
+        "CREATE TABLE wire_move_child (bucket integer, parent_id integer, "
+        "CONSTRAINT wire_move_fk FOREIGN KEY (parent_id) REFERENCES wire_move_parent(id) "
+        "DEFERRABLE INITIALLY DEFERRED) PARTITION BY RANGE (bucket); "
+        "CREATE TABLE wire_move_low PARTITION OF wire_move_child FOR VALUES FROM (0) TO (10); "
+        "CREATE TABLE wire_move_high PARTITION OF wire_move_child FOR VALUES FROM (10) TO (20); "
+        "INSERT INTO wire_move_child VALUES (1, 1); "
+        "CREATE TABLE wire_move_source (bucket integer, parent_id integer); "
+        "INSERT INTO wire_move_source VALUES (11, 99)")
+    check("partition move: setup", not any(kind == b"E" for kind, _ in setup), setup)
+    for label, mutation in (
+        ("UPDATE", "UPDATE wire_move_child SET bucket = 11, parent_id = 99"),
+        ("MERGE", "MERGE INTO wire_move_child AS target USING wire_move_source AS source ON true "
+         "WHEN MATCHED THEN UPDATE SET bucket = source.bucket, parent_id = source.parent_id"),
+    ):
+        simple_query(connection, "BEGIN")
+        changed = simple_query(connection, mutation)
+        check(f"partition move: {label} defers the foreign key check",
+              not any(kind == b"E" for kind, _ in changed), changed)
+        committed = simple_query(connection, "COMMIT")
+        check(f"partition move: {label} commit rejects the new invalid row",
+              has_sqlstate(committed, "23503"), committed)
+        rows = simple_query(connection, "SELECT bucket, parent_id FROM wire_move_child")
+        check(f"partition move: {label} failure restores the original row",
+              [text_row_fields(payload) for kind, payload in rows if kind == b"D"] == [["1", "1"]], rows)
+    valid = simple_query(connection, "BEGIN; UPDATE wire_move_child SET bucket = 11; COMMIT")
+    check("partition move: a valid foreign key commits", not any(kind == b"E" for kind, _ in valid), valid)
+    rows = simple_query(connection, "SELECT bucket, parent_id FROM wire_move_child")
+    check("partition move: committed row is in the new partition",
+          [text_row_fields(payload) for kind, payload in rows if kind == b"D"] == [["11", "1"]], rows)
+    simple_query(connection, "DROP TABLE wire_move_child; DROP TABLE wire_move_source; DROP TABLE wire_move_parent")
+    connection.close()
+
+
 def test_replication_snapshot_lifetime():
     setup = connect()
     setup.sendall(startup_payload(0))

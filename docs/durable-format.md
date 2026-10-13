@@ -185,3 +185,16 @@ A durable-format change is complete only when it includes:
 - garbage retention for both the published root and in-progress output;
 - upgrade and downgrade behavior in this matrix; and
 - a manifest-capacity assessment for any added reference bytes.
+
+## Row identity exhaustion
+
+For example, inserting an order needs a new internal row identity; updating an
+existing order in the same table retains its identity. The allocator reserves
+`u64::MAX` as a terminal next value and returns `54000` (`row identities
+exhausted`) instead of wrapping. Failed inserts can leave gaps, and those gaps
+are never reused during the process lifetime. This is not a configurable limit.
+
+The manifest's existing unsigned `next_rowid` field preserves this terminal
+value across recovery. Journal and saved-file observations advance the counter
+with saturating arithmetic, including legacy maximum identities. Row key and
+manifest encodings are unchanged; the allocator adds no startup reservation.

@@ -30442,6 +30442,163 @@ fn every_mutation_path_raises_deferred_row_obligations() {
 }
 
 #[test]
+fn row_identity_partition_moves_keep_deferred_checks_on_the_new_row() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 512).unwrap();
+    let setup = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE move_parent (id integer PRIMARY KEY); \
+         INSERT INTO move_parent VALUES (1); \
+         CREATE TABLE move_child (bucket integer, parent_id integer, \
+           CONSTRAINT move_fk FOREIGN KEY (parent_id) REFERENCES move_parent(id) \
+             DEFERRABLE INITIALLY DEFERRED) PARTITION BY RANGE (bucket); \
+         CREATE TABLE move_low PARTITION OF move_child FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE move_high PARTITION OF move_child FOR VALUES FROM (10) TO (20); \
+         INSERT INTO move_child VALUES (1, 1); \
+         CREATE TABLE move_source (bucket integer, parent_id integer); \
+         INSERT INTO move_source VALUES (11, 99)",
+    );
+    assert!(!setup.contains("ERROR"), "{setup}");
+    for mutation in [
+        "UPDATE move_child SET bucket = 11, parent_id = 99",
+        "MERGE INTO move_child AS target USING move_source AS source ON true \
+         WHEN MATCHED THEN UPDATE SET bucket = source.bucket, parent_id = source.parent_id",
+    ] {
+        run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+        let changed = run_txn(&mut engine, &mut budget, &mut txn, mutation);
+        assert!(!changed.contains("ERROR"), "{changed}");
+        let commit = run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
+        assert!(commit.contains("23503"), "{mutation}: {commit}");
+        assert_eq!(
+            data_rows(&run_with_txn_bytes(
+                &mut engine,
+                &mut budget,
+                &mut txn,
+                "SELECT bucket, parent_id FROM move_child",
+            )),
+            ["1|1"]
+        );
+    }
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "UPDATE move_child SET bucket = 11",
+    );
+    let valid = run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
+    assert!(!valid.contains("ERROR"), "{valid}");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT bucket, parent_id FROM move_child",
+        )),
+        ["11|1"]
+    );
+}
+
+#[test]
+fn row_identity_exhaustion_fails_before_heap_append_and_preserves_updates() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE identity_limit (id integer PRIMARY KEY); INSERT INTO identity_limit VALUES (1)",
+    );
+    engine.storage.observe_rowid(u64::MAX - 1);
+    let used = engine.storage.heap.used();
+    let failed = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO identity_limit VALUES (2)",
+    );
+    assert!(
+        failed.contains("54000") && failed.contains("row identities exhausted"),
+        "{failed}"
+    );
+    assert_eq!(engine.storage.heap.used(), used);
+    let updated = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "UPDATE identity_limit SET id = 3",
+    );
+    assert!(!updated.contains("ERROR"), "{updated}");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT id FROM identity_limit"
+        )),
+        ["3"]
+    );
+    assert_eq!(engine.storage.peek_next_rowid(), u64::MAX);
+}
+
+#[test]
+fn row_identity_high_watermark_survives_journal_and_checkpoint_cold_recovery() {
+    let mut config = test_config("row-identity-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("row-identity-cold-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.block_cache_bytes = 512 * 1024;
+    config.disk_cache_bytes = 1 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE high_identity (id integer)",
+    );
+    engine.storage.observe_rowid(u64::MAX - 2);
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO high_identity VALUES (7)",
+    );
+    assert!(!String::from_utf8_lossy(&inserted).contains("ERROR"));
+    assert_eq!(engine.storage.peek_next_rowid(), u64::MAX);
+    engine.commit_wal().unwrap();
+    drop(engine);
+    for pass in 0..2 {
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut recovered = Engine::new(&config, &mut budget).unwrap();
+        assert_eq!(recovered.storage.peek_next_rowid(), u64::MAX);
+        assert_eq!(
+            data_rows(&run_with(
+                &mut recovered,
+                &mut budget,
+                "SELECT id FROM high_identity"
+            )),
+            ["7"]
+        );
+        let inserted = run_with(
+            &mut recovered,
+            &mut budget,
+            "INSERT INTO high_identity VALUES (8)",
+        );
+        assert!(String::from_utf8_lossy(&inserted).contains("54000"));
+        assert_eq!(recovered.checkpoint().unwrap(), pass == 0);
+        drop(recovered);
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn update_from_and_delete_using() {
     // Row images verified against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();

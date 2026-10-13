@@ -64781,13 +64781,13 @@ fn replication_snapshot_failed_import_does_not_change_transaction() {
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(session.transaction.snapshot_lsn(), None);
         engine.storage.release_snapshot(50_002);
-        session.transaction.isolation = txn::TransactionIsolation::Serializable;
+        session.transaction.isolation = TransactionIsolation::Serializable;
         let error = engine
             .import_replication_snapshot(&mut session.transaction, exported.as_str())
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::FEATURE_NOT_SUPPORTED);
         assert_eq!(session.transaction.snapshot_lsn(), None);
-        session.transaction.isolation = txn::TransactionIsolation::RepeatableRead;
+        session.transaction.isolation = TransactionIsolation::RepeatableRead;
         engine
             .import_replication_snapshot(&mut session.transaction, exported.as_str())
             .unwrap();

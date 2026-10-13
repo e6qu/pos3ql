@@ -78,9 +78,11 @@ SQL scans retain file handles and schema in statement memory, preserving join
 depth and separate metadata-source capacity. Resumable checkpoints use the same
 capture order. Selected resident row bytes now own the startup heap allocation,
 so they survive table-slot reuse and Storage teardown without retaining a heap
-read guard. Appends remain independent. Reclaiming that allocation while row
-bytes are retained returns `54000` before changing bytes or row locations;
-reclamation can proceed after the last reader releases it.
+read guard. Appends remain independent. Reclamation can now copy live images
+into an unretained startup buffer while selected bytes keep their old buffer.
+Both buffers are reserved and counted at startup, each `memtable_bytes` in size.
+If readers retain both buffers, reclamation returns `54000` before changing
+bytes or row locations; releasing readers permits a retry.
 
 Still to do:
 
@@ -89,9 +91,9 @@ Still to do:
   preserving all unselected resident versions still needs coordination.
 - Finish shared-state protection for table creation/removal, statistics, and
   engine-wide publication.
-- Let reclamation progress around retained row bytes instead of rejecting
-  movement of the whole heap. Complete rewrites must preserve historical
-  object versions needed by active readers.
+- Integrate bounded heap relocation with concurrent table publication and
+  maintenance scheduling. Complete rewrites must preserve historical object
+  versions needed by active readers.
 - Verify release after errors, rollback, and transaction end, and prevent
   reused identities from being mistaken for older data.
 

@@ -40,7 +40,7 @@ next statement.
 | Catalogs and table definitions | Synchronized updates; readers retain the definition and table identity they selected; nested lookups release shared guards | Concurrent creation/removal and retirement of table state |
 | Sequence positions | Per-table synchronization, checked arithmetic, coherent journal/checkpoint images, and acknowledgement of unchanged staged positions | Preserve these rules through engine-wide concurrent publication |
 | Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state; selected images are retained before releasing metadata | Safe movement and reclamation while readers remain active |
-| Row bytes | Selected rows own the startup heap allocation through table removal or Storage teardown; appends initialize separate tails | Reclaiming other heap ranges while a selected row remains retained |
+| Row bytes | Selected rows own their startup heap allocation; reclamation can copy live rows into an unretained buffer | Integrate relocation with concurrent table publication and maintenance scheduling |
 | Deferred reads | Logical row identity, table identity, and exact version identity, rather than remembered heap addresses | Coherent table lifecycle changes across every read path |
 
 ### How long reads keep data alive
@@ -71,16 +71,22 @@ list cannot redirect a selected read. Version ownership ends before object I/O.
 Checkpoint cursors follow the same
 capture order. Selected resident row bytes own the startup heap allocation;
 retaining them does not keep a heap read guard held. They remain readable after
-table removal, reuse of its slot, or Storage teardown. This ownership adds only
-fixed startup controls, not a row copy or an allocation per read. Heap
-reclamation returns `54000` before changing bytes or locations while any row
-bytes are retained, and can be retried after readers release them. Invalid row
+table removal, reuse of its slot, or Storage teardown. Retaining a read does not
+copy a row or allocate memory. Two heap buffers are reserved at startup, each
+`memtable_bytes` in size. Reclamation moves bytes in place when the current
+buffer is unretained; otherwise it copies live rows into the free buffer and
+preserves the old one for readers. Current, historical, and pending row
+locations change together, and old detached locations remain invalid.
+If readers retain both buffers, reclamation returns `54000` before changing
+bytes or locations and can be retried after readers release them. Invalid row
 requests, cancellation, and statement-buffer exhaustion release ownership.
 
 **User example:** once a read has selected an order's in-memory contents,
 removing the table cannot replace those contents with a newly created table's
-row. Finishing the same guarantee for rows the scan has not selected yet, and
-reclaiming other memory while selected rows remain active, are still planned.
+row. Reclamation can free space for new rows while that read keeps its old
+bytes. With `memtable_bytes = 64MiB`, heap bytes reserve 128 MiB before other
+startup controls. Finishing the same guarantee for rows the scan has not selected
+yet and coordinating table publication with concurrent maintenance are planned.
 
 Individual object-row lookups retain their full generation list, schema,
 table identity, and reader buffers through byte retrieval. Their metadata also
@@ -167,7 +173,8 @@ Appends release byte ownership before publishing metadata. Compaction checks
 its complete relocation set before changing bytes or handles. Readers reject
 reused table identities and stale heap locations. Heap addresses and relocation
 generations describe caches, not durable row identity. Retained byte copies
-use statement memory; physical reclamation and relocation remain exclusive.
+use statement memory. Physical reclamation still requires exclusive table
+metadata, but retained byte readers can continue using the old heap buffer.
 
 Transaction-wide durable publication, concurrent cache/object I/O and
 maintenance, table lifecycle changes, and execution workers are still open.

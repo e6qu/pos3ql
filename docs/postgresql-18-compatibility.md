@@ -99,7 +99,9 @@ number of objects cleanup may ultimately process.
 Wire and durable identity widths are validated at startup and recovery. Arrays,
 programs, statement lists, multiranges, and mutable-routine results use their
 fixed memory budgets without separate staging-count ceilings. Heap locations
-use 32-bit addresses; `memtable_bytes` must not exceed `u32::MAX`. Effective search paths use
+use 32-bit addresses; `memtable_bytes` must not exceed `u32::MAX`. Startup reserves
+two heap buffers of that size, including one for relocation while readers retain
+old bytes. Reclamation returns `54000` while both buffers are retained. Effective search paths use
 the accepted GUC byte representation; cursor indexes use `cursor_bytes`.
 JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 [SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;

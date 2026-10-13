@@ -4,9 +4,10 @@ This file records only defects whose repair is prevented by an external blocker
 or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
-The resident-row review on 2026-10-13 checked selected bytes through table
-removal, slot reuse, Storage teardown, concurrent appends, rejected reclamation,
-and consumer errors within the startup budget. No known defects meet this
+The heap-relocation review on 2026-10-13 checked retained byte readers during
+copying, historical and pending versions, empty aliases, busy buffers,
+generation exhaustion, failed preflight, retries, exact startup accounting,
+and SQL fixture workspace headroom. No known defects meet this
 file's inclusion criteria. This does not mean all planned work is finished
 or that every possible bug has been ruled out.
 Resolved investigations are indexed in [history](docs/history/README.md).

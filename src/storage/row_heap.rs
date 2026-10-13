@@ -4,7 +4,7 @@ use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use super::RowLoc;
 use crate::mem::budget::{Budget, BudgetError};
@@ -13,6 +13,7 @@ use crate::sql_err;
 
 pub(crate) struct RowHeap {
     state: Arc<RwLock<RowHeapState>>,
+    spare: Arc<RwLock<RowHeapState>>,
 }
 
 pub(super) struct RowHeapState {
@@ -69,7 +70,15 @@ impl HeapRowRead {
 
 impl RowHeap {
     pub(super) const fn control_bytes() -> usize {
-        size_of::<Self>() + size_of::<RwLock<RowHeapState>>() + 2 * size_of::<usize>()
+        size_of::<Self>() + 2 * (size_of::<RwLock<RowHeapState>>() + 2 * size_of::<usize>())
+    }
+
+    #[cfg(test)]
+    pub(super) const fn relocation_budget_bytes(bytes: usize) -> usize {
+        bytes
+            + size_of::<Arc<RwLock<RowHeapState>>>()
+            + size_of::<RwLock<RowHeapState>>()
+            + 2 * size_of::<usize>()
     }
 
     pub(super) fn new(budget: &mut Budget, bytes: usize) -> Result<Self, BudgetError> {
@@ -83,8 +92,9 @@ impl RowHeap {
         }
         budget.draw(Self::control_bytes(), "row heap controls")?;
         budget.draw(bytes, "memtable")?;
-        Ok(Self {
-            state: Arc::new(RwLock::new(RowHeapState {
+        budget.draw(bytes, "row heap relocation buffer")?;
+        let allocation = || {
+            Arc::new(RwLock::new(RowHeapState {
                 // SAFETY: UnsafeCell is layout-transparent and ownership of the
                 // allocation transfers exactly once; its length is unchanged.
                 buffer: unsafe {
@@ -96,8 +106,41 @@ impl RowHeap {
                 used: AtomicUsize::new(0),
                 append: Mutex::new(()),
                 generation: 1,
-            })),
+            }))
+        };
+        Ok(Self {
+            state: allocation(),
+            spare: allocation(),
         })
+    }
+
+    /// A retained source stays untouched; only an unretained buffer can change.
+    /// Publication follows successful byte and row-location preflight and movement.
+    pub(super) fn with_relocation(
+        &mut self,
+        move_rows: impl FnOnce(&mut HeapRelocation<'_>) -> Result<RelocationCompleted, SqlError>,
+    ) -> Result<(), SqlError> {
+        if let Some(state) = Arc::get_mut(&mut self.state) {
+            let mut relocation =
+                HeapRelocation::InPlace(state.get_mut().expect("row heap lock poisoned"));
+            move_rows(&mut relocation)?;
+        } else {
+            let target = Arc::get_mut(&mut self.spare)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "row heap relocation buffers are retained by readers"
+                    )
+                })?
+                .get_mut()
+                .expect("row heap lock poisoned");
+            let source = self.state.read().expect("row heap lock poisoned");
+            let mut relocation = HeapRelocation::Copy { source, target };
+            move_rows(&mut relocation)?;
+            drop(relocation);
+            core::mem::swap(&mut self.state, &mut self.spare);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -171,6 +214,7 @@ impl RowHeap {
         self.state.read().expect("row heap lock poisoned").capacity
     }
 
+    #[cfg(test)]
     pub(super) fn exclusive(&mut self) -> Result<&mut RowHeapState, SqlError> {
         Arc::get_mut(&mut self.state)
             .ok_or_else(|| {
@@ -193,6 +237,79 @@ impl RowHeap {
             return Err(std::sync::TryLockError::WouldBlock);
         }
         Ok(state)
+    }
+}
+
+/// Only finish can produce the token needed to publish a relocated heap.
+pub(super) struct RelocationCompleted {
+    _private: (),
+}
+
+pub(super) enum HeapRelocation<'a> {
+    InPlace(&'a mut RowHeapState),
+    Copy {
+        source: RwLockReadGuard<'a, RowHeapState>,
+        target: &'a mut RowHeapState,
+    },
+}
+
+impl HeapRelocation<'_> {
+    fn source(&self) -> &RowHeapState {
+        match self {
+            Self::InPlace(state) => state,
+            Self::Copy { source, .. } => source,
+        }
+    }
+
+    pub(super) fn validate_relocation(
+        &self,
+        locations: impl Iterator<Item = RowLoc>,
+    ) -> Result<(), SqlError> {
+        self.source().validate_relocation(locations)
+    }
+
+    pub(super) fn next_relocation_generation(&self) -> Result<u64, SqlError> {
+        self.source().next_relocation_generation()
+    }
+
+    pub(super) fn relocate(&mut self, source: RowLoc, destination: usize) {
+        match self {
+            Self::InPlace(state) => state.relocate(source, destination),
+            Self::Copy {
+                source: state,
+                target,
+            } => {
+                assert!(
+                    state.validate(source).is_ok(),
+                    "unvalidated heap relocation source"
+                );
+                let start = source.offset as usize;
+                // SAFETY: the range is validated against the initialized frontier.
+                // The source read guard and retained owners prevent modification;
+                // the target is a different allocation with unique ownership.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        state.buffer.get().cast::<u8>().add(start),
+                        source.len as usize,
+                    )
+                };
+                target.buffer.get_mut()[destination..destination + source.len as usize]
+                    .copy_from_slice(bytes);
+            }
+        }
+    }
+
+    pub(super) fn finish(&mut self, used: usize, generation: u64) -> RelocationCompleted {
+        debug_assert_eq!(self.source().generation.checked_add(1), Some(generation));
+        match self {
+            Self::InPlace(state) => state.finish_relocation(used, generation),
+            Self::Copy { target, .. } => {
+                debug_assert!(used <= target.capacity);
+                *target.used.get_mut() = used;
+                target.generation = generation;
+            }
+        }
+        RelocationCompleted { _private: () }
     }
 }
 
@@ -297,7 +414,7 @@ mod tests {
     use super::*;
 
     fn heap(bytes: usize) -> RowHeap {
-        let mut budget = Budget::new(bytes + RowHeap::control_bytes());
+        let mut budget = Budget::new(2 * bytes + RowHeap::control_bytes());
         let heap = RowHeap::new(&mut budget, bytes).unwrap();
         assert_eq!(budget.remaining(), 0);
         heap
@@ -760,10 +877,160 @@ mod tests {
     }
 
     #[test]
+    fn shared_heap_append_retained_bytes_survive_copy_relocation_and_busy_retry() {
+        let mut heap = heap(16);
+        heap.append_bytes(b"dead").unwrap();
+        let first = heap.append_bytes(b"keep").unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let old = heap.get(first).unwrap();
+            heap.with_relocation(|move_rows| {
+                move_rows.validate_relocation(core::iter::once(first))?;
+                let generation = move_rows.next_relocation_generation()?;
+                move_rows.relocate(first, 0);
+                assert_eq!(&*old, b"keep");
+                Ok(move_rows.finish(4, generation))
+            })
+            .unwrap();
+            assert_eq!(&*old, b"keep");
+            assert_eq!(old.other(first).unwrap(), b"keep");
+            assert_eq!(heap.used(), 4);
+            assert_eq!(
+                heap.get(first).err().unwrap().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let second = RowLoc {
+                offset: 0,
+                len: 4,
+                generation: 2,
+            };
+            let current = heap.get(second).unwrap();
+            let source = Arc::as_ptr(&heap.state);
+            let error = heap
+                .with_relocation(|_| panic!("busy buffers entered relocation"))
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                error.message.as_str(),
+                "row heap relocation buffers are retained by readers"
+            );
+            assert_eq!(Arc::as_ptr(&heap.state), source);
+            let appended = heap.append_bytes(b"next").unwrap();
+            assert_eq!(current.other(appended).unwrap(), b"next");
+            assert_eq!(
+                old.other(appended).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            drop(old);
+            heap.with_relocation(|move_rows| {
+                move_rows.validate_relocation(core::iter::once(appended))?;
+                let generation = move_rows.next_relocation_generation()?;
+                move_rows.relocate(appended, 0);
+                Ok(move_rows.finish(4, generation))
+            })
+            .unwrap();
+            assert_eq!(&*current, b"keep");
+            assert_eq!(current.other(appended).unwrap(), b"next");
+            assert_eq!(
+                &*heap
+                    .get(RowLoc {
+                        offset: 0,
+                        len: 4,
+                        generation: 3
+                    })
+                    .unwrap(),
+                b"next"
+            );
+            drop(current);
+        });
+    }
+
+    #[test]
+    fn shared_heap_append_copy_relocation_progresses_while_old_bytes_are_read() {
+        let mut heap = heap(16);
+        heap.append_bytes(b"dead").unwrap();
+        let location = heap.append_bytes(b"keep").unwrap();
+        let old = heap.get(location).unwrap();
+        let start = std::sync::Barrier::new(2);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let start_ref = &start;
+            let done_ref = &done;
+            let reader = scope.spawn(move || {
+                start_ref.wait();
+                crate::mem::guard::forbid_alloc(|| {
+                    while !done_ref.load(Ordering::Acquire) {
+                        assert_eq!(&*old, b"keep");
+                        std::thread::yield_now();
+                    }
+                    assert_eq!(&*old, b"keep");
+                });
+            });
+            start.wait();
+            crate::mem::guard::forbid_alloc(|| {
+                heap.with_relocation(|move_rows| {
+                    move_rows.validate_relocation(core::iter::once(location))?;
+                    let generation = move_rows.next_relocation_generation()?;
+                    move_rows.relocate(location, 0);
+                    Ok(move_rows.finish(4, generation))
+                })
+                .unwrap();
+                let appended = heap.append_bytes(b"next").unwrap();
+                assert_eq!(&*heap.get(appended).unwrap(), b"next");
+                done.store(true, Ordering::Release);
+            });
+            reader.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn shared_heap_append_copy_relocation_preserves_rejected_sources_and_generation() {
+        let mut heap = heap(8);
+        let location = heap.append_bytes(b"original").unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let retained = heap.get(location).unwrap();
+            let owner = Arc::as_ptr(&heap.state);
+            let overlap = [RowLoc::test(0, 6), RowLoc::test(4, 4)];
+            let error = heap
+                .with_relocation(|move_rows| {
+                    move_rows.validate_relocation(overlap.into_iter())?;
+                    panic!("invalid ranges passed preflight")
+                })
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
+            assert_eq!(Arc::as_ptr(&heap.state), owner);
+            assert_eq!(heap.spare.read().unwrap().used.load(Ordering::Acquire), 0);
+            assert_eq!(heap.used(), 8);
+            assert_eq!(&*retained, b"original");
+            drop(retained);
+        });
+        heap.exclusive().unwrap().generation = u64::MAX;
+        let exhausted = RowLoc {
+            generation: u64::MAX,
+            ..location
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let retained = heap.get(exhausted).unwrap();
+            let owner = Arc::as_ptr(&heap.state);
+            let error = heap
+                .with_relocation(|move_rows| {
+                    move_rows.validate_relocation(core::iter::once(exhausted))?;
+                    move_rows.next_relocation_generation()?;
+                    panic!("generation exhaustion passed preflight")
+                })
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(Arc::as_ptr(&heap.state), owner);
+            assert_eq!(heap.spare.read().unwrap().used.load(Ordering::Acquire), 0);
+            assert_eq!(&*retained, b"original");
+        });
+    }
+
+    #[test]
     fn row_heap_ownership_controls_and_address_limits_are_charged_at_startup() {
         let _ = heap(8);
-        let mut short = Budget::new(8 + RowHeap::control_bytes() - 1);
-        assert!(RowHeap::new(&mut short, 8).is_err());
+        let mut short = Budget::new(16 + RowHeap::control_bytes() - 1);
+        let error = RowHeap::new(&mut short, 8).err().unwrap();
+        assert_eq!(error.what, "row heap relocation buffer");
         if usize::BITS > 32 {
             let mut budget = Budget::new(usize::MAX);
             let error = match RowHeap::new(&mut budget, u32::MAX as usize + 1) {

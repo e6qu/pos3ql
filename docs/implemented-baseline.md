@@ -87,8 +87,8 @@ that already selected read fetch the replacement table's row instead.
 
 Internal metadata/byte scans also reserve 64 retention slots per workspace.
 SQL byte scans keep their row identities, saved-file handles, and schema in the
-statement arena so wide joins do not spend one metadata source slot per join
-edge. The scan releases registered files before its statement memory is reset;
+statement arena, copying only used columns, so wide joins do not spend one
+metadata source slot per join edge. The scan releases registered files before its statement memory is reset;
 an object-row source selected from it copies ownership into a startup slot. Checked reader identities and full pools return SQLSTATE
 `54000` before reuse or partial registration. These are separate reservations;
 the [capacity inventory](postgresql-18-compatibility.md#capacity-boundaries)

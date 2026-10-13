@@ -3755,6 +3755,10 @@ struct PendingTableDefSlot {
 }
 
 impl Table {
+    pub(crate) fn committed_statistics(&self) -> TableStatistics {
+        self.statistics.committed()
+    }
+
     pub(crate) fn identity(&self) -> table_definitions::TableIdentity {
         self.definition.read().identity
     }

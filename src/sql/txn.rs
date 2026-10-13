@@ -729,6 +729,29 @@ pub(crate) enum StatisticsUndo {
     Extended(u32),
 }
 
+/// An eligible transaction cannot advance while its import is authenticated.
+pub(crate) struct SnapshotImport<'txn> {
+    transaction: &'txn mut TxnState,
+}
+
+impl SnapshotImport<'_> {
+    pub(crate) fn transaction(&self) -> u32 {
+        self.transaction.txid
+    }
+
+    pub(crate) fn accept(self, snapshot: u64) -> Result<(), SqlError> {
+        if self.transaction.isolation == TransactionIsolation::Serializable {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a serializable transaction cannot import a snapshot from a non-serializable transaction"
+            ));
+        }
+        self.transaction.snapshot_lsn = Some(snapshot);
+        self.transaction.snapshot_taken = true;
+        Ok(())
+    }
+}
+
 impl TxnState {
     pub const fn budget_bytes(capacity: usize) -> usize {
         Self::budget_bytes_with_large_objects(
@@ -1254,14 +1277,14 @@ impl TxnState {
         }
     }
 
-    pub fn import_snapshot(&mut self, snapshot: u64) -> Result<(), SqlError> {
+    fn check_snapshot_import(&self, assigned: bool) -> Result<(), SqlError> {
         if !self.is_explicit() {
             return Err(sql_err!(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                 "SET TRANSACTION SNAPSHOT can only be used in transaction blocks"
             ));
         }
-        if self.snapshot_taken {
+        if self.snapshot_taken || assigned || self.has_savepoints() {
             return Err(sql_err!(
                 sqlstate::ACTIVE_SQL_TRANSACTION,
                 "SET TRANSACTION SNAPSHOT must be called before any query"
@@ -1273,12 +1296,18 @@ impl TxnState {
         ) {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
-                "a snapshot-importing transaction must use REPEATABLE READ or SERIALIZABLE"
+                "a snapshot-importing transaction must have isolation level SERIALIZABLE or REPEATABLE READ"
             ));
         }
-        self.snapshot_lsn = Some(snapshot);
-        self.snapshot_taken = true;
         Ok(())
+    }
+
+    pub(crate) fn prepare_snapshot_import(
+        &mut self,
+        assigned: bool,
+    ) -> Result<SnapshotImport<'_>, SqlError> {
+        self.check_snapshot_import(assigned)?;
+        Ok(SnapshotImport { transaction: self })
     }
 
     pub fn snapshot_lsn(&self) -> Option<u64> {

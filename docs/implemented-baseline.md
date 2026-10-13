@@ -42,6 +42,7 @@ next statement.
 | Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state; selected images are retained before releasing metadata | Safe movement and reclamation while readers remain active |
 | Planner statistics | Readers copy their visible estimates; private versions and saved-state markers use guarded cells and fixed pools | Integrate these captures with concurrent engine publication |
 | Row bytes | Selected rows own their startup heap allocation; reclamation can copy live rows into an unretained buffer | Integrate relocation with concurrent table publication and maintenance scheduling |
+| Read positions | Statement and transaction retention; replication export validity and import protection share one guard, with separate fixed capacities | Integrate every remaining table lifecycle path and engine publication |
 | Deferred reads | Logical row identity, table identity, and exact version identity, rather than remembered heap addresses | Coherent table lifecycle changes across every read path |
 
 ### How long reads keep data alive

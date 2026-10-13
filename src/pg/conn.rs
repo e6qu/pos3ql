@@ -3475,6 +3475,9 @@ impl Conn {
     }
 
     fn handle_query(&mut self, engine: &mut Engine, total: usize) -> Step {
+        if self.replication == ReplicationMode::Logical {
+            engine.invalidate_replication_snapshot(self.id);
+        }
         // The query text borrows recv, and execution writes into send and
         // allocates from the arena — all disjoint fields.
         let payload = &self.recv.readable()[5..total];
@@ -3635,7 +3638,6 @@ impl Conn {
             return Step::Continue;
         }
         if self.replication == ReplicationMode::Logical {
-            engine.invalidate_replication_snapshot(self.id);
             let command = {
                 let payload = &self.recv.readable()[5..total];
                 let Ok(text) = MsgIn::new(payload).cstr() else {

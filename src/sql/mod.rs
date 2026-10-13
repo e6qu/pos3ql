@@ -432,10 +432,6 @@ pub struct Engine {
     /// LISTEN/NOTIFY registry and delivery outbox, shared across every
     /// connection (see [`notify`]).
     notify: notify::NotifyState,
-    /// Snapshot exports are connection-scoped protocol capabilities. Their
-    /// fixed registry both authenticates imports and pins row history until
-    /// the exporting connection advances or closes.
-    exported_snapshots: FixedVec<(i32, u64)>,
     /// Stable identity exposed by the replication protocol. It is derived
     /// from the durable namespace rather than process-local state, so a
     /// restarted or cold-recovered server remains the same publisher.
@@ -3166,7 +3162,6 @@ impl Engine {
             + config.wal_buffer_bytes
             + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
             + config.max_connections as usize * config.wal_buffer_bytes
-            + config.max_connections as usize * size_of::<(i32, u64)>()
             + config.max_roles * size_of::<u16>()
             + config.max_databases * size_of::<u16>()
             + notify::NotifyState::budget_bytes(
@@ -3503,11 +3498,6 @@ impl Engine {
                 config.max_connections as usize * notify::CHANNELS_PER_CONN,
                 notify::OUTBOX,
             )?,
-            exported_snapshots: FixedVec::new(
-                budget,
-                "exported_snapshots",
-                config.max_connections as usize,
-            )?,
             replication_system_id: crate::object_store::writer_id(config),
             role_connections,
             database_connections,
@@ -3540,102 +3530,28 @@ impl Engine {
         (self.replication_system_id, self.wal.last_lsn())
     }
 
-    fn exported_snapshot_owner(conn_id: i32) -> u32 {
-        0x8000_0000 | conn_id as u32
-    }
-
     pub(crate) fn export_replication_snapshot(
-        &mut self,
+        &self,
         conn_id: i32,
         lsn: u64,
     ) -> Result<crate::util::StackStr<128>, SqlError> {
-        if conn_id <= 0 {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication snapshot requires a live connection"
-            ));
-        }
-        if let Some(entry) = self
-            .exported_snapshots
-            .iter_mut()
-            .find(|entry| entry.0 == conn_id)
-        {
-            self.storage
-                .release_snapshot(Self::exported_snapshot_owner(conn_id));
-            *entry = (conn_id, lsn);
-        } else {
-            self.exported_snapshots.push((conn_id, lsn)).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many exported replication snapshots"
-                )
-            })?;
-        }
-        if let Err(error) = self
-            .storage
-            .register_snapshot(Self::exported_snapshot_owner(conn_id), lsn)
-        {
-            if let Some(index) = self
-                .exported_snapshots
-                .iter()
-                .position(|entry| entry.0 == conn_id)
-            {
-                self.exported_snapshots.swap_remove(index);
-            }
-            return Err(error);
-        }
-        Ok(stack_format!(128, "pos3ql:{conn_id}:{lsn:X}"))
+        self.storage.export_replication_snapshot(conn_id, lsn)?;
+        Ok(crate::storage::SnapshotIdentifier::issued(conn_id, lsn))
     }
 
-    pub(crate) fn invalidate_replication_snapshot(&mut self, conn_id: i32) {
-        if let Some(index) = self
-            .exported_snapshots
-            .iter()
-            .position(|entry| entry.0 == conn_id)
-        {
-            self.exported_snapshots.swap_remove(index);
-            self.storage
-                .release_snapshot(Self::exported_snapshot_owner(conn_id));
-        }
+    pub(crate) fn invalidate_replication_snapshot(&self, conn_id: i32) {
+        self.storage.invalidate_replication_snapshot(conn_id);
     }
 
-    fn import_replication_snapshot(
-        &mut self,
-        txn: &mut TxnState,
-        name: &str,
-    ) -> Result<(), SqlError> {
-        let Some(rest) = name.strip_prefix("pos3ql:") else {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid snapshot identifier"
-            ));
-        };
-        let Some((connection, lsn)) = rest.split_once(':') else {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid snapshot identifier"
-            ));
-        };
-        let connection = connection.parse::<i32>().map_err(|_| {
-            sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid snapshot identifier"
-            )
-        })?;
-        let lsn = u64::from_str_radix(lsn, 16).map_err(|_| {
-            sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid snapshot identifier"
-            )
-        })?;
-        if !self.exported_snapshots.contains(&(connection, lsn)) {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "snapshot identifier is no longer valid"
-            ));
-        }
-        txn.import_snapshot(lsn)?;
-        self.storage.register_snapshot(txn.txid, lsn)
+    fn import_replication_snapshot(&self, txn: &mut TxnState, name: &str) -> Result<(), SqlError> {
+        let import = txn.prepare_snapshot_import(
+            self.storage
+                .assigned_transaction_identity(txn.txid)
+                .is_some(),
+        )?;
+        let identifier = crate::storage::SnapshotIdentifier::parse(name)?;
+        self.storage
+            .import_replication_snapshot(identifier, import.transaction(), |lsn| import.accept(lsn))
     }
 
     /// Creates a durable logical-replication resume point outside SQL
@@ -14197,7 +14113,7 @@ impl Engine {
         if statement_changes_schema(statement)
             && let Some(blocker) = self.storage.schema_lock_blocker(txn.txid)
         {
-            if let Err(error) = self.storage.wait_for_transaction(txn.txid, blocker) {
+            if let Err(error) = self.storage.wait_for_schema_lock(txn.txid, blocker) {
                 return Ok(Err(error));
             }
             return Ok(Err(sql_err!(
@@ -14494,7 +14410,7 @@ impl Engine {
         if statement_changes_schema(statement)
             && let Some(blocker) = self.storage.schema_lock_blocker(txn.txid)
         {
-            if let Err(error) = self.storage.wait_for_transaction(txn.txid, blocker) {
+            if let Err(error) = self.storage.wait_for_schema_lock(txn.txid, blocker) {
                 return Ok(Err(error));
             }
             return Ok(Err(sql_err!(

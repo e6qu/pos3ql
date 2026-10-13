@@ -59,20 +59,16 @@ and linked PRs preserve the investigations; this file keeps only current work.
 appropriate to its transaction. Dropping or rebuilding a table must not leave
 an already running read following reused memory or deleted objects.
 
-Executing statements and streaming `COPY FROM` retain their read position.
-Scans capture row identities, saved files, schema, and read position before
-callbacks. Selected object rows and resident row bytes own their startup
-sources through table removal or Storage teardown. Two heap buffers, each
-`memtable_bytes` in size, let reclamation preserve selected bytes while moving
-live images; retaining both returns `54000` until readers release one.
+Statements and streaming `COPY FROM` retain their read position. Scans capture
+row identities, saved files, and schema before callbacks. Selected rows own
+their sources through table removal; two fixed heap buffers let reclamation
+preserve selected bytes. Statistics and journal acknowledgements now retain
+the exact image they captured.
 
-Statistics readers now copy a coherent visible image from guarded state.
-Transaction-private column versions share a fixed guarded pool. Journal batches
-retain the exact relation-count revision they captured, so an older batch cannot
-clear a newer change or a reused table slot. Receipt workspaces are counted at
-startup and cover every configured table. Database filtering preserves changes
-until their own database journals them. PostgreSQL's different rollback rules
-for relation counts and column estimates remain intact.
+Replication snapshot validity and history protection share one guarded registry.
+Imports retain history before the exporter can expire, and failed imports leave
+the transaction unchanged. Every new command on the replication connection
+expires its export; successful imports survive until their transaction ends.
 
 The [implementation guide](docs/implemented-baseline.md) owns the detailed
 contracts and limits; this sequence keeps the remaining acceptance gates.

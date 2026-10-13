@@ -64761,6 +64761,49 @@ fn subscription_failure_policy_is_durable_and_typed() {
 }
 
 #[test]
+fn replication_snapshot_preconditions_precede_identifier_validation() {
+    let config = test_config("replication-snapshot-preconditions");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for (begin, expected) in [
+        ("BEGIN", sqlstate::FEATURE_NOT_SUPPORTED),
+        (
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1",
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+        ),
+        (
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SAVEPOINT snapshot_guard",
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+        ),
+    ] {
+        session.success(&mut engine, begin, true);
+        crate::mem::guard::forbid_alloc(|| {
+            let prior = session.transaction.snapshot_lsn();
+            let error = engine
+                .import_replication_snapshot(&mut session.transaction, "not-a-snapshot")
+                .unwrap_err();
+            assert_eq!(error.sqlstate, expected);
+            assert_eq!(session.transaction.snapshot_lsn(), prior);
+        });
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+    session.success(&mut engine, "BEGIN ISOLATION LEVEL REPEATABLE READ", true);
+    crate::mem::guard::forbid_alloc(|| {
+        assert!(!session.transaction.snapshot_taken());
+        engine
+            .storage
+            .assign_transaction_identity(session.transaction.txid);
+        let error = engine
+            .import_replication_snapshot(&mut session.transaction, "not-a-snapshot")
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::ACTIVE_SQL_TRANSACTION);
+        assert_eq!(session.transaction.snapshot_lsn(), None);
+    });
+    session.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
 fn replication_snapshot_failed_import_does_not_change_transaction() {
     let mut config = test_config("replication-snapshot-import-capacity");
     config.max_connections = 2;

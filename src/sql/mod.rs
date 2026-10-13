@@ -3544,6 +3544,11 @@ impl Engine {
     }
 
     fn import_replication_snapshot(&self, txn: &mut TxnState, name: &str) -> Result<(), SqlError> {
+        let import = txn.prepare_snapshot_import(
+            self.storage
+                .assigned_transaction_identity(txn.txid)
+                .is_some(),
+        )?;
         let Some(rest) = name.strip_prefix("pos3ql:") else {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
@@ -3569,8 +3574,8 @@ impl Engine {
             )
         })?;
         self.storage
-            .import_replication_snapshot(connection, lsn, txn.txid, || {
-                txn.import_replication_snapshot(lsn)
+            .import_replication_snapshot(connection, lsn, import.transaction(), || {
+                import.accept(lsn)
             })
             .map_err(|error| {
                 if error.sqlstate == sqlstate::UNDEFINED_OBJECT {

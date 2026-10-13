@@ -50,7 +50,10 @@ or into a serializable transaction returns `0A000`, matching PostgreSQL's replic
 
 Validity and history protection are updated under one short guard. Replacement
 cannot briefly release retained history; import checks capacity before changing
-the importing transaction. Expiration schedules history cleanup at the next
+the importing transaction. Import requires a fresh top-level transaction:
+`25001` rejects an import after a query or inside a savepoint, even when its
+identifier is malformed. Transaction eligibility is checked before the name,
+as in PostgreSQL. Expiration schedules history cleanup at the next
 statement boundary, so it does not walk every table under the validity guard.
 Exports reserve `max_connections` entries at startup,
 separately from transaction snapshot entries. Exhaustion returns `54000` without

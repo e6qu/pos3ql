@@ -1624,6 +1624,15 @@ def test_replication_snapshot_lifetime():
             exporter.close()
             continue
         identifier = fields[2].replace("'", "''")
+        for label, begin, expected in (
+            ("read committed", "BEGIN", "0A000"),
+            ("after a query", "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1", "25001"),
+            ("inside a savepoint", "BEGIN ISOLATION LEVEL REPEATABLE READ; SAVEPOINT snapshot_guard", "25001"),
+        ):
+            rejected = simple_query(setup, begin + "; SET TRANSACTION SNAPSHOT 'not-a-snapshot'")
+            check(f"snapshot {suffix}: {label} rejects before name validation",
+                  has_sqlstate(rejected, expected), rejected)
+            simple_query(setup, "ROLLBACK")
         serializable = simple_query(setup, "BEGIN ISOLATION LEVEL SERIALIZABLE; "
                                      f"SET TRANSACTION SNAPSHOT '{identifier}'")
         check(f"snapshot {suffix}: serializable import rejects a non-serializable source",

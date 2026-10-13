@@ -59,38 +59,31 @@ and linked PRs preserve the investigations; this file keeps only current work.
 appropriate to its transaction. Dropping or rebuilding a table must not leave
 an already running read following reused memory or deleted objects.
 
-Queries that walk immutable tables and resumable checkpoint jobs already retain
-their selected storage objects, schema, read position, and buffers. Executing
-statements, including streaming `COPY FROM`, retain their read position until
-completion or cleanup. Metadata-only ALTER preserves rows and storage roots.
-Individual object-backed row reads now retain their selected generation list
-through lookup and byte retrieval. They can resolve an older version even when
-the newest saved version is a deletion, and captured sources remain readable
-after table replacement or Storage teardown. Point reads have separate fixed
-startup slots, preserving existing scan capacity. A table's saved-file list and
-its eviction boundaries now publish together. Capture retains every selected
-file before releasing list ownership; a rejected replacement preserves the
-previous list, and an append to a full list returns a capacity error. Database
-cloning preserves the same boundaries. Scans now capture resident row identities,
-saved files, schema, and read position together before callbacks. Their metadata
-and byte phases keep those sources instead of recapturing the live file list.
-SQL scans retain file handles and schema in statement memory, preserving join
-depth and separate metadata-source capacity. Resumable checkpoints use the same
-capture order. Selected resident row bytes now own the startup heap allocation,
-so they survive table-slot reuse and Storage teardown without retaining a heap
-read guard. Appends remain independent. Reclamation can now copy live images
-into an unretained startup buffer while selected bytes keep their old buffer.
-Both buffers are reserved and counted at startup, each `memtable_bytes` in size.
-If readers retain both buffers, reclamation returns `54000` before changing
-bytes or row locations; releasing readers permits a retry.
+Executing statements and streaming `COPY FROM` retain their read position.
+Scans capture row identities, saved files, schema, and read position before
+callbacks. Selected object rows and resident row bytes own their startup
+sources through table removal or Storage teardown. Two heap buffers, each
+`memtable_bytes` in size, let reclamation preserve selected bytes while moving
+live images; retaining both returns `54000` until readers release one.
+
+Statistics readers now copy a coherent visible image from guarded state.
+Transaction-private column versions share a fixed guarded pool. Journal batches
+retain the exact relation-count revision they captured, so an older batch cannot
+clear a newer change or a reused table slot. Receipt workspaces are counted at
+startup and cover every configured table. Database filtering preserves changes
+until their own database journals them. PostgreSQL's different rollback rules
+for relation counts and column estimates remain intact.
+
+The [implementation guide](docs/implemented-baseline.md) owns the detailed
+contracts and limits; this sequence keeps the remaining acceptance gates.
 
 Still to do:
 
 - Complete table retirement for rows a scan has not selected yet and for
   deferred version lookups. Already selected row bytes survive retirement;
   preserving all unselected resident versions still needs coordination.
-- Finish shared-state protection for table creation/removal, statistics, and
-  engine-wide publication.
+- Finish shared-state protection for table creation/removal and engine-wide
+  publication.
 - Integrate bounded heap relocation with concurrent table publication and
   maintenance scheduling. Complete rewrites must preserve historical object
   versions needed by active readers.

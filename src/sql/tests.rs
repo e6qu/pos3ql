@@ -968,6 +968,8 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
             + dml_workspace_bytes)
             + Storage::extra_budget_bytes(&config)
             - Storage::extra_budget_bytes(&one)
+            + crate::storage::StatisticsReceiptPool::budget_bytes(&config)
+            - crate::storage::StatisticsReceiptPool::budget_bytes(&one)
     );
     let bytes = config.query_workspace_slots
         * (config.work_arena_bytes + core::mem::size_of::<QueryWorkspace>());

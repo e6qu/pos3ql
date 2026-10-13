@@ -1,6 +1,6 @@
 //! Table storage: the in-memory write path of the LSM.
 //!
-//! Row bytes live in one fixed heap (the memtable); each table maps rowid →
+//! Row bytes live in startup-sized heap buffers; each table maps rowid →
 //! location. Updates write a new copy and repoint the map. Compaction reclaims
 //! superseded bytes; object storage retains durable versions. All capacities
 //! are fixed at startup.
@@ -21,6 +21,9 @@ mod row_versions;
 mod row_walks;
 pub(crate) mod rowenc;
 mod snapshot_leases;
+mod statistics;
+pub(crate) use statistics::StatisticsReceiptPool;
+use statistics::{StatisticsVersions, TableStatisticsOwner};
 mod spill_generations;
 pub(crate) use snapshot_leases::StatementSnapshotLease;
 use snapshot_leases::{StatementSnapshot, snapshot_owner_bytes, statement_snapshot_capacity};
@@ -2529,20 +2532,8 @@ pub struct Table {
     pending_has_rules_txid: Option<u32>,
     /// Changed since the last checkpoint (drives delta checkpoints).
     publication: std::sync::Mutex<TablePublication>,
-    /// Planner statistics produced by ANALYZE. They are derived metadata:
-    /// query correctness never depends on them, and the authoritative rows
-    /// remain in immutable object-store generations.
-    pub(crate) statistics: TableStatistics,
-    pub(crate) statistics_dirty: bool,
-    /// The in-place relation-statistics half of ANALYZE has not yet been
-    /// included in a durable WAL commit. Unlike pg_statistic column rows,
-    /// PostgreSQL's pg_class reltuples/relpages update survives rollback.
-    statistics_wal_dirty: bool,
-    /// Transaction-private pg_statistic versions. The large images live in a
-    /// startup-sized storage slab; the table retains only slot handles so SQL
-    /// transaction/savepoint undo records stay compact.
-    pending_statistics_tail: Option<u32>,
-    pending_statistics_txid: Option<u32>,
+    /// Planner estimates, transaction-private column versions, and save markers.
+    statistics: TableStatisticsOwner,
     /// Per-column sequence state for serial/identity columns: the last value
     /// a *default* assignment handed out. PostgreSQL's sequence, not a max
     /// scan — explicit inserts do not advance it, deletes and TRUNCATE
@@ -2644,7 +2635,7 @@ pub(crate) struct TableStatistics {
 #[derive(Debug, Clone, Copy)]
 struct PendingTableStatisticsSlot {
     used: bool,
-    previous: Option<u32>,
+    previous: Option<usize>,
     depth: u32,
     statistics: TableStatistics,
 }
@@ -13547,7 +13538,7 @@ pub struct Storage {
     large_object_page_table: u32,
     max_catalog_versions_per_object: u32,
     pending_table_defs: DefinitionVersions,
-    pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
+    pending_table_statistics: StatisticsVersions,
     view_rule_catalog: std::sync::Mutex<ViewRuleCatalog>,
     view_catalog_capacity: usize,
     rule_catalog_capacity: usize,
@@ -16089,8 +16080,9 @@ impl Storage {
                 OnCommitAction::PreserveRows => {}
                 OnCommitAction::DeleteRows => {
                     self.clear_table_rows(slot);
-                    self.tables[slot].statistics = TableStatistics::EMPTY;
-                    self.tables[slot].statistics_wal_dirty = false;
+                    self.tables[slot]
+                        .statistics
+                        .set_image(TableStatistics::EMPTY, None, true);
                     self.set_spill_list(slot, &[]);
                     self.refresh_enforcers(slot)?;
                 }
@@ -16133,8 +16125,9 @@ impl Storage {
             }
             self.clear_table_rows(slot);
             self.install_table_serial_values(slot, [0; MAX_COLUMNS]);
-            self.tables[slot].statistics = TableStatistics::EMPTY;
-            self.tables[slot].statistics_wal_dirty = false;
+            self.tables[slot]
+                .statistics
+                .set_image(TableStatistics::EMPTY, None, true);
             self.set_spill_list(slot, &[]);
             self.tables[slot].mark_dirty();
             self.refresh_enforcers(slot)?;
@@ -17561,7 +17554,8 @@ impl Storage {
             + config.max_foreign_sessions * foreign_session_slot_bytes()
             + DefinitionVersions::control_bytes()
             + pending_table_definition_capacity(config) * size_of::<PendingTableDefSlot>()
-            + pending_table_statistics_capacity(config) * size_of::<PendingTableStatisticsSlot>()
+            + StatisticsVersions::budget_bytes(config)
+            + table_slot_capacity(config) * TableStatisticsOwner::allocation_bytes()
             + config.max_large_objects * size_of::<LargeObjectDef>()
             + pending_extended_statistics_capacity(config)
                 * size_of::<PendingExtendedStatisticsDataSlot>()
@@ -17654,11 +17648,7 @@ impl Storage {
         let query_roots = QueryRootPool::new(config, budget)?;
         let pending_table_defs =
             DefinitionVersions::new(budget, pending_table_definition_capacity(config))?;
-        let pending_table_statistics = FixedVec::new(
-            budget,
-            "pending_table_statistics",
-            pending_table_statistics_capacity(config),
-        )?;
+        let pending_table_statistics = StatisticsVersions::new(config, budget)?;
         for slot in 0..table_capacity {
             tables
                 .push(Table {
@@ -17683,11 +17673,7 @@ impl Storage {
                         generation: 1,
                         enforcers: [None; MAX_VALUE_ENFORCERS],
                     }),
-                    statistics: TableStatistics::EMPTY,
-                    statistics_dirty: false,
-                    statistics_wal_dirty: false,
-                    pending_statistics_tail: None,
-                    pending_statistics_txid: None,
+                    statistics: TableStatisticsOwner::new(budget)?,
                     serial: std::sync::Mutex::new(TableSerialState::EMPTY),
                     spill_generations: SpillGenerationRoster::new(
                         budget,
@@ -19991,14 +19977,14 @@ impl Storage {
                 }
                 let created_at = self.tables[source_slot].created_at();
                 let ownership = self.tables[source_slot].ownership().committed();
-                let statistics = self.tables[source_slot].statistics;
+                let statistics = self.tables[source_slot].statistics.committed();
                 let serial_values = self.table_serial_values(source_slot);
                 let target_slot = self.alloc_table(definition, Some(txid))?;
                 {
                     let target_table = &mut self.tables[target_slot];
                     target_table.identity_mut().created_at = created_at;
                     target_table.identity_mut().ownership = ownership;
-                    target_table.statistics = statistics;
+                    target_table.statistics.set_image(statistics, None, false);
                     *target_table
                         .serial
                         .get_mut()
@@ -30571,198 +30557,7 @@ impl Storage {
             };
         }
         self.write_table_statistics(table_slot, txid, statistics)?;
-        // PostgreSQL updates pg_class's relation statistics in place:
-        // reltuples/relpages remain changed even if the surrounding
-        // transaction rolls back. Column pg_statistic rows stay in the
-        // transaction-private version written above.
-        let committed = &mut self.tables[table_slot].statistics;
-        committed.valid = statistics.valid;
-        committed.rows = statistics.rows;
-        committed.average_row_width = statistics.average_row_width;
-        committed.analyzed_generation = statistics.analyzed_generation;
-        self.tables[table_slot].statistics_dirty = true;
-        self.tables[table_slot].statistics_wal_dirty = true;
         Ok(statistics)
-    }
-
-    pub(crate) fn table_statistics(&self, table_slot: usize, txid: u32) -> TableStatistics {
-        if self.tables[table_slot].pending_statistics_txid == Some(txid)
-            && let Some(slot) = self.tables[table_slot].pending_statistics_tail
-        {
-            return self.pending_table_statistics[slot as usize].statistics;
-        }
-        self.tables[table_slot].statistics
-    }
-
-    pub(crate) fn pending_table_statistics(
-        &self,
-        table_slot: usize,
-        txid: u32,
-    ) -> Option<TableStatistics> {
-        (self.tables[table_slot].pending_statistics_txid == Some(txid))
-            .then(|| self.tables[table_slot].pending_statistics_tail)
-            .flatten()
-            .map(|slot| self.pending_table_statistics[slot as usize].statistics)
-    }
-
-    fn write_table_statistics(
-        &mut self,
-        table_slot: usize,
-        txid: u32,
-        statistics: TableStatistics,
-    ) -> Result<(), SqlError> {
-        if let Some(owner) = self.tables[table_slot].pending_statistics_txid
-            && owner != txid
-        {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "could not serialize ANALYZE of relation \"{}\"",
-                {
-                    let definition = self.tables[table_slot].definition();
-                    definition.name
-                }
-                .as_str()
-            ));
-        }
-        let previous = self.tables[table_slot].pending_statistics_tail;
-        if previous.is_some_and(|slot| {
-            self.pending_table_statistics[slot as usize].depth
-                >= self.max_catalog_versions_per_object
-        }) {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "relation \"{}\" exceeds max_catalog_versions_per_object ({})",
-                {
-                    let definition = self.tables[table_slot].definition();
-                    definition.name
-                }
-                .as_str(),
-                self.max_catalog_versions_per_object
-            ));
-        }
-        let depth = previous.map_or(1, |slot| {
-            self.pending_table_statistics[slot as usize].depth + 1
-        });
-        let slot = match self
-            .pending_table_statistics
-            .iter()
-            .position(|entry| !entry.used)
-        {
-            Some(slot) => {
-                self.pending_table_statistics[slot] = PendingTableStatisticsSlot {
-                    used: true,
-                    previous,
-                    depth,
-                    statistics,
-                };
-                slot
-            }
-            None => {
-                let slot = self.pending_table_statistics.len();
-                self.pending_table_statistics
-                    .push(PendingTableStatisticsSlot {
-                        used: true,
-                        previous,
-                        depth,
-                        statistics,
-                    })
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "pending table-statistics pool is exhausted"
-                        )
-                    })?;
-                slot
-            }
-        };
-        self.tables[table_slot].pending_statistics_tail = Some(slot as u32);
-        self.tables[table_slot].pending_statistics_txid = Some(txid);
-        Ok(())
-    }
-
-    pub(crate) fn rollback_table_statistics(&mut self, table_slot: usize, txid: u32) {
-        if self.tables[table_slot].pending_statistics_txid != Some(txid) {
-            return;
-        }
-        let Some(slot) = self.tables[table_slot].pending_statistics_tail else {
-            return;
-        };
-        let previous = self.pending_table_statistics[slot as usize].previous;
-        self.pending_table_statistics[slot as usize].used = false;
-        self.tables[table_slot].pending_statistics_tail = previous;
-        if previous.is_none() {
-            self.tables[table_slot].pending_statistics_txid = None;
-        }
-    }
-
-    fn clear_pending_table_statistics(&mut self, table_slot: usize) {
-        let mut tail = self.tables[table_slot].pending_statistics_tail.take();
-        while let Some(slot) = tail {
-            let entry = &mut self.pending_table_statistics[slot as usize];
-            tail = entry.previous;
-            entry.used = false;
-        }
-        self.tables[table_slot].pending_statistics_txid = None;
-    }
-
-    pub(crate) fn commit_table_statistics(&mut self, table_slot: usize, txid: u32) {
-        let Some(statistics) = self.pending_table_statistics(table_slot, txid) else {
-            return;
-        };
-        self.tables[table_slot].statistics = statistics;
-        self.tables[table_slot].statistics_dirty = true;
-        self.clear_pending_table_statistics(table_slot);
-    }
-
-    /// Cardinality estimate that never performs object I/O. ANALYZE wins; an
-    /// unspilled table can otherwise use its complete resident map exactly,
-    /// while a spilled table uses a conservative floor until statistics are
-    /// collected.
-    pub(crate) fn planning_row_estimate(&self, table_slot: usize) -> u64 {
-        let table = &self.tables[table_slot];
-        if table.statistics.valid {
-            table.statistics.rows
-        } else if table.spill_generations().is_empty() {
-            table.rows.len() as u64
-        } else {
-            (table.rows.len() as u64).max(1_000)
-        }
-    }
-
-    pub(crate) fn statistics_dirty(&self) -> bool {
-        self.tables
-            .iter()
-            .any(|table| table.live() && table.statistics_dirty)
-    }
-
-    pub(crate) fn statistics_wal_dirty(&self, table_slot: usize) -> bool {
-        self.tables[table_slot].statistics_wal_dirty
-    }
-
-    pub(crate) fn clear_statistics_wal_dirty(&mut self, table_slot: usize) {
-        self.tables[table_slot].statistics_wal_dirty = false;
-    }
-
-    pub(crate) fn install_table_statistics(
-        &mut self,
-        table_slot: usize,
-        statistics: TableStatistics,
-    ) {
-        self.tables[table_slot].statistics = statistics;
-        self.tables[table_slot].statistics_dirty = false;
-        self.tables[table_slot].statistics_wal_dirty = false;
-        self.clear_pending_table_statistics(table_slot);
-    }
-
-    pub(crate) fn replay_table_statistics(
-        &mut self,
-        table_slot: usize,
-        statistics: TableStatistics,
-    ) {
-        self.tables[table_slot].statistics = statistics;
-        self.tables[table_slot].statistics_dirty = true;
-        self.tables[table_slot].statistics_wal_dirty = false;
-        self.clear_pending_table_statistics(table_slot);
     }
 
     /// Retained row bytes belong to the fixed statement arena; heap owners end
@@ -31495,8 +31290,7 @@ impl Storage {
                 }
             }
             drop(publication);
-            t.statistics_dirty = false;
-            t.statistics_wal_dirty = false;
+            t.statistics.clear_dirty();
         }
     }
 
@@ -34589,9 +34383,9 @@ impl Storage {
         }
         table.pending_has_rules_txid = None;
         table.mark_dirty();
-        table.statistics = TableStatistics::EMPTY;
-        table.statistics_dirty = false;
-        table.statistics_wal_dirty = false;
+        table
+            .statistics
+            .set_image(TableStatistics::EMPTY, Some(false), true);
         // A reused slot must not inherit the dropped table's sequences or
         // spilled rows.
         *table
@@ -34823,8 +34617,9 @@ impl Storage {
         self.set_table_def(index, def, &column_mapping);
         if !rewrite.preserve_rows {
             self.clear_table_rows(index);
-            self.tables[index].statistics = TableStatistics::EMPTY;
-            self.tables[index].statistics_wal_dirty = false;
+            self.tables[index]
+                .statistics
+                .set_image(TableStatistics::EMPTY, None, true);
             self.set_spill_list(index, &[]);
         }
         self.mark_value_bindings_dirty(index);
@@ -34967,7 +34762,7 @@ impl Storage {
         ));
         identity.existence = CatalogDdlState::Absent;
         self.clear_table_rows(index);
-        self.tables[index].statistics_wal_dirty = false;
+        self.tables[index].statistics.clear_wal();
         self.commit_triggers_for_table(index);
         self.commit_policies_for_table(index);
         self.commit_extended_statistics_for_table(index);
@@ -34986,7 +34781,7 @@ impl Storage {
         ));
         identity.existence = CatalogDdlState::Absent;
         self.clear_table_rows(index);
-        self.tables[index].statistics_wal_dirty = false;
+        self.tables[index].statistics.clear_wal();
     }
 
     /// Restores the prior existence and attached rules after an uncommitted DROP.

@@ -92,6 +92,9 @@ slots. `max_catalog_versions_per_object` bounds retained definition/undo version
 `max_row_versions_per_row` bounds pending writes and committed snapshot versions;
 each write retains an immutable image, including writes in the same command.
 Pending version identity exhaustion is a named program-limit error.
+Statistics journal receipts reserve one entry per physical table in each query
+workspace. They retain the captured relation-count revision through staging;
+full or already retained workspaces and revision exhaustion return `54000`.
 `checkpoint_manifest_bytes`, live-block, replay, merge, garbage-batch, and backup
 rosters are separate reservations. Deletion batches limit work per beat, not the
 number of objects cleanup may ultimately process.

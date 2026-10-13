@@ -1,0 +1,25 @@
+name: Statistics qualification
+on:
+  push:
+    branches: [codex/owned-table-statistics]
+concurrency:
+  group: statistics-qualification-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  statistics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Statistics visibility, journal receipts, recovery, and startup accounting
+        run: |
+          set -eu
+          cargo test --lib --locked statistics_ownership -- --nocapture
+          cargo test --lib --locked analyze_ -- --nocapture
+          cargo test --lib --locked startup_bounded -- --nocapture
+          cargo test --lib --locked table_state_row_map_controls -- --nocapture
+          cargo test --lib --locked query_workspaces -- --nocapture

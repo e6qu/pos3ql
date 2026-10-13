@@ -17500,6 +17500,11 @@ impl Storage {
         RowWalkPool::budget_bytes(config)
     }
 
+    #[cfg(test)]
+    pub(crate) fn row_heap_relocation_budget_bytes(config: &Config) -> usize {
+        RowHeap::relocation_budget_bytes(config.memtable_bytes)
+    }
+
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
             + snapshot_owner_bytes()

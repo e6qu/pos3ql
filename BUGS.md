@@ -6,7 +6,8 @@ finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 The heap-relocation review on 2026-10-13 checked retained byte readers during
 copying, historical and pending versions, empty aliases, busy buffers,
-generation exhaustion, failed preflight, retries, and exact startup accounting. No known defects meet this
+generation exhaustion, failed preflight, retries, exact startup accounting,
+and SQL fixture workspace headroom. No known defects meet this
 file's inclusion criteria. This does not mean all planned work is finished
 or that every possible bug has been ruled out.
 Resolved investigations are indexed in [history](docs/history/README.md).

@@ -73,6 +73,14 @@ impl RowHeap {
         size_of::<Self>() + 2 * (size_of::<RwLock<RowHeapState>>() + 2 * size_of::<usize>())
     }
 
+    #[cfg(test)]
+    pub(super) const fn relocation_budget_bytes(bytes: usize) -> usize {
+        bytes
+            + size_of::<Arc<RwLock<RowHeapState>>>()
+            + size_of::<RwLock<RowHeapState>>()
+            + 2 * size_of::<usize>()
+    }
+
     pub(super) fn new(budget: &mut Budget, bytes: usize) -> Result<Self, BudgetError> {
         if bytes > u32::MAX as usize {
             return Err(BudgetError {

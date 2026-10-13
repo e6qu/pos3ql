@@ -64883,7 +64883,11 @@ fn exported_replication_snapshot_pins_one_importable_sql_snapshot() {
         ),
     );
     assert!(
-        String::from_utf8_lossy(&expired).contains("snapshot identifier is no longer valid"),
+        String::from_utf8_lossy(&expired).contains("C42704")
+            && String::from_utf8_lossy(&expired).contains(&format!(
+                "snapshot \"{}\" does not exist",
+                exported.as_str()
+            )),
         "{}",
         String::from_utf8_lossy(&expired)
     );

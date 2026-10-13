@@ -1652,7 +1652,15 @@ def test_replication_snapshot_lifetime():
               not any(kind == b"E" for kind, _ in expired), expired)
         late = simple_query(setup, "BEGIN ISOLATION LEVEL REPEATABLE READ; "
                             f"SET TRANSACTION SNAPSHOT '{identifier}'")
-        check(f"snapshot {suffix}: next command expires new imports", has_sqlstate(late, "22023"), late)
+        expected_message = f'snapshot "{fields[2]}" does not exist'.encode()
+        check(f"snapshot {suffix}: next command expires new imports",
+              has_sqlstate(late, "42704")
+              and any(kind == b"E" and b"M" + expected_message + b"\x00" in payload
+                      for kind, payload in late), late)
+        malformed = simple_query(setup, "ROLLBACK; BEGIN ISOLATION LEVEL REPEATABLE READ; "
+                                 "SET TRANSACTION SNAPSHOT 'not-a-snapshot'")
+        check(f"snapshot {suffix}: malformed names use a distinct SQLSTATE",
+              has_sqlstate(malformed, "22023"), malformed)
         simple_query(setup, "ROLLBACK")
         retained = simple_query(importer, "SELECT id FROM wire_snapshot_source; COMMIT")
         check(f"snapshot {suffix}: successful import survives exporter expiration",

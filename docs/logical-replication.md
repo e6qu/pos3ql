@@ -45,8 +45,8 @@ Import before sending another command on the exporting replication connection.
 Any next command, including `IDENTIFY_SYSTEM` or ordinary SQL, expires the export;
 closing that connection also expires it. A successful import keeps its own
 history protection until its transaction ends. An expired identifier returns
-`22023`; importing from another database or into a serializable transaction
-returns `0A000`, matching PostgreSQL's replication snapshot rules.
+`42704` (a malformed identifier returns `22023`). Importing from another database
+or into a serializable transaction returns `0A000`, matching PostgreSQL's replication snapshot rules.
 
 Validity and history protection are updated under one short guard. Replacement
 cannot briefly release retained history; import checks capacity before changing

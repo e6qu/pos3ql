@@ -3572,6 +3572,17 @@ impl Engine {
             .import_replication_snapshot(connection, lsn, txn.txid, || {
                 txn.import_replication_snapshot(lsn)
             })
+            .map_err(|error| {
+                if error.sqlstate == sqlstate::UNDEFINED_OBJECT {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "snapshot \"{}\" does not exist",
+                        name
+                    )
+                } else {
+                    error
+                }
+            })
     }
 
     /// Creates a durable logical-replication resume point outside SQL

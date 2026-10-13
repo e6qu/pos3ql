@@ -167,7 +167,7 @@ impl Storage {
             .find(|snapshot| snapshot.connection == connection && snapshot.lsn == lsn)
         else {
             return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
+                sqlstate::UNDEFINED_OBJECT,
                 "snapshot identifier is no longer valid"
             ));
         };
@@ -400,7 +400,7 @@ mod tests {
                     })
                     .unwrap_err()
                     .sqlstate,
-                sqlstate::INVALID_PARAMETER_VALUE
+                sqlstate::UNDEFINED_OBJECT
             );
             assert!(!accepted);
             storage.invalidate_replication_snapshot(77);
@@ -412,7 +412,7 @@ mod tests {
                     })
                     .unwrap_err()
                     .sqlstate,
-                sqlstate::INVALID_PARAMETER_VALUE
+                sqlstate::UNDEFINED_OBJECT
             );
             assert!(!accepted);
             storage.export_replication_snapshot(99, 10).unwrap();
@@ -527,7 +527,7 @@ mod tests {
                             Ok(())
                         });
                         if let Err(error) = result {
-                            assert_eq!(error.sqlstate, sqlstate::INVALID_PARAMETER_VALUE);
+                            assert_eq!(error.sqlstate, sqlstate::UNDEFINED_OBJECT);
                             assert!(!imported.load(Ordering::Acquire));
                         }
                     });

@@ -23,5 +23,6 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --lib --locked transaction_identit -- --nocapture
       - run: cargo test --lib --locked transaction_exhaustion -- --nocapture
-      - run: cargo test --lib --locked unassigned_internal_transaction -- --nocapture
+      - run: cargo test --lib --locked unassigned_wal_transactions -- --nocapture
+      - run: cargo test --lib --locked prepared_transactions_survive_checkpoint -- --nocapture
       - run: cargo test --lib --locked startup_bounded -- --nocapture

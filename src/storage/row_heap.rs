@@ -66,9 +66,32 @@ impl HeapRowRead {
             .validate(location)?;
         Ok(self.bytes(location))
     }
+
+    pub(super) fn read_location(&self, location: RowLoc) -> Result<Self, SqlError> {
+        self.other(location)?;
+        Ok(Self {
+            state: Arc::clone(&self.state),
+            location,
+        })
+    }
 }
 
 impl RowHeap {
+    pub(super) fn retain_allocation(&self) -> HeapRowRead {
+        let generation = self
+            .state
+            .read()
+            .expect("row heap lock poisoned")
+            .generation;
+        HeapRowRead {
+            state: Arc::clone(&self.state),
+            location: RowLoc {
+                offset: 0,
+                len: 0,
+                generation,
+            },
+        }
+    }
     pub(super) const fn control_bytes() -> usize {
         size_of::<Self>() + 2 * (size_of::<RwLock<RowHeapState>>() + 2 * size_of::<usize>())
     }

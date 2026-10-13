@@ -450,6 +450,17 @@ impl QueryRootPool {
         })
     }
 
+    pub(super) fn retain_point_image(
+        self: &Arc<Self>,
+        storage: &Storage,
+        image: SpillGenerationImage,
+        generations: &SpillGenerationList,
+    ) -> Result<QueryRootLease, SqlError> {
+        self.reserve_in(self.slots_per_use, |snapshot| {
+            snapshot.capture_image(storage, image, generations)
+        })
+    }
+
     fn retain_source(
         self: &Arc<Self>,
         source: &SpillSourceView<'_>,
@@ -2441,6 +2452,54 @@ mod tests {
             registry.copy_roots(false, &mut copied).unwrap();
             assert!(copied.is_empty());
         });
+    }
+
+    #[test]
+    fn owned_row_lookup_keeps_object_sources_and_older_versions_after_retirement() {
+        use crate::sql::types::Datum;
+        use crate::storage::{RowHome, RowLoc, RowState};
+        let PointFixture {
+            mut storage,
+            table,
+            roots,
+            arena,
+            path,
+        } = point_fixture("owned_lookup");
+        let retained = crate::mem::guard::forbid_alloc(|| {
+            let length = crate::storage::rowenc::encoded_len(&[Datum::Int4(88)]) as u32;
+            let mut row = RowState::committed_only_at(RowLoc::test(0, length), 9);
+            row.committed = Some(RowHome::Spilled {
+                len: length,
+                sst: 1,
+                commit_lsn: 9,
+            });
+            storage.tables[table].rows.insert(1, row).unwrap();
+            storage.resident_row_state(table, 1).unwrap().unwrap()
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            storage.commit_drop(table);
+            let replacement = storage
+                .create_table(make_def(
+                    "lookup_replacement",
+                    &[("id", ColType::Text, false)],
+                ))
+                .unwrap();
+            assert_eq!(replacement, table);
+            storage.set_spill_list(table, &[roots[2]]);
+            drop(storage);
+            for (snapshot, expected) in [(7, 41), (9, 88)] {
+                let image = retained
+                    .select_owned(table, 1, 0, super::super::SNAPSHOT_ALL, snapshot)
+                    .unwrap()
+                    .unwrap();
+                let super::super::row_images::VisibleRowBytes::Spilled(source) = image.bytes else {
+                    panic!("object fixture")
+                };
+                assert_point_value(&source, &arena, expected);
+            }
+            drop(retained);
+        });
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

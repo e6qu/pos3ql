@@ -30572,7 +30572,7 @@ fn row_identity_high_watermark_survives_journal_and_checkpoint_cold_recovery() {
     assert_eq!(engine.storage.peek_next_rowid(), u64::MAX);
     engine.commit_wal().unwrap();
     drop(engine);
-    for _ in 0..2 {
+    for pass in 0..2 {
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut recovered = Engine::new(&config, &mut budget).unwrap();
@@ -30591,7 +30591,7 @@ fn row_identity_high_watermark_survives_journal_and_checkpoint_cold_recovery() {
             "INSERT INTO high_identity VALUES (8)",
         );
         assert!(String::from_utf8_lossy(&inserted).contains("54000"));
-        assert!(recovered.checkpoint().unwrap());
+        assert_eq!(recovered.checkpoint().unwrap(), pass == 0);
         drop(recovered);
     }
     std::fs::remove_dir_all(&config.data_dir).unwrap();

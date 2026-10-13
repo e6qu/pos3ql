@@ -30544,6 +30544,59 @@ fn row_identity_exhaustion_fails_before_heap_append_and_preserves_updates() {
 }
 
 #[test]
+fn row_identity_high_watermark_survives_journal_and_checkpoint_cold_recovery() {
+    let mut config = test_config("row-identity-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("row-identity-cold-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.block_cache_bytes = 512 * 1024;
+    config.disk_cache_bytes = 1 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE high_identity (id integer)",
+    );
+    engine.storage.observe_rowid(u64::MAX - 2);
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO high_identity VALUES (7)",
+    );
+    assert!(!String::from_utf8_lossy(&inserted).contains("ERROR"));
+    assert_eq!(engine.storage.peek_next_rowid(), u64::MAX);
+    engine.commit_wal().unwrap();
+    drop(engine);
+    for _ in 0..2 {
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut recovered = Engine::new(&config, &mut budget).unwrap();
+        assert_eq!(recovered.storage.peek_next_rowid(), u64::MAX);
+        assert_eq!(
+            data_rows(&run_with(
+                &mut recovered,
+                &mut budget,
+                "SELECT id FROM high_identity"
+            )),
+            ["7"]
+        );
+        let inserted = run_with(
+            &mut recovered,
+            &mut budget,
+            "INSERT INTO high_identity VALUES (8)",
+        );
+        assert!(String::from_utf8_lossy(&inserted).contains("54000"));
+        assert!(recovered.checkpoint().unwrap());
+        drop(recovered);
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn update_from_and_delete_using() {
     // Row images verified against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();

@@ -13,11 +13,21 @@ impl RowIdentities {
     }
 
     pub(super) fn reserve(&self) -> Result<u64, SqlError> {
-        self.0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                (next != u64::MAX).then(|| next + 1)
-            })
-            .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "row identities exhausted"))
+        let mut next = self.next();
+        loop {
+            let following = next.checked_add(1).ok_or_else(|| {
+                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "row identities exhausted")
+            })?;
+            match self.0.compare_exchange_weak(
+                next,
+                following,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(next),
+                Err(observed) => next = observed,
+            }
+        }
     }
 
     pub(super) fn next(&self) -> u64 {

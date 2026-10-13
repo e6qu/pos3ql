@@ -12986,6 +12986,57 @@ struct TransactionIdentityState {
     latest: u64,
 }
 
+impl TransactionIdentityState {
+    fn next(&self) -> Result<u32, SqlError> {
+        self.latest
+            .checked_add(1)
+            .and_then(|next| u32::try_from(next).ok())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "transaction identity space is exhausted"
+                )
+            })
+    }
+
+    fn preflight_active(&self) -> Result<(), SqlError> {
+        if self.active.len() == self.active.capacity() {
+            Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "transaction identity registry exhausted"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn register(&mut self, transaction_id: u32, connection_id: i32) -> Result<(), SqlError> {
+        if transaction_id == 0 {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "zero transaction identity"
+            ));
+        }
+        if self
+            .active
+            .iter()
+            .any(|identity| identity.transaction_id == transaction_id)
+        {
+            return Ok(());
+        }
+        self.preflight_active()?;
+        self.active
+            .push(ActiveTransactionIdentity {
+                transaction_id,
+                connection_id: (connection_id > 0).then_some(connection_id),
+                assigned: false,
+            })
+            .expect("transaction identity capacity was checked under its guard");
+        self.latest = self.latest.max(u64::from(transaction_id));
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SchemaLockBlocker {
     Transaction(u32),
@@ -47526,25 +47577,27 @@ impl Storage {
         self.snapshots.lock().expect("snapshot state lock poisoned")
     }
 
-    pub(crate) fn begin_transaction_identity(&self, transaction_id: u32) {
+    pub(crate) fn reserve_transaction_identity(&self) -> Result<u32, SqlError> {
+        let mut identities = self.transaction_identity_state();
+        let transaction_id = identities.next()?;
+        identities.latest = u64::from(transaction_id);
+        Ok(transaction_id)
+    }
+
+    /// Reservation and active registration succeed together. No caller can
+    /// observe an allocated SQL identity missing from the active registry.
+    pub(crate) fn start_transaction_identity(&self) -> Result<u32, SqlError> {
         let connection_id = self.current_connection_id();
         let mut identities = self.transaction_identity_state();
-        identities.latest = identities.latest.max(u64::from(transaction_id));
-        if identities
-            .active
-            .iter()
-            .any(|identity| identity.transaction_id == transaction_id)
-        {
-            return;
-        }
-        identities
-            .active
-            .push(ActiveTransactionIdentity {
-                transaction_id,
-                connection_id: (connection_id > 0).then_some(connection_id),
-                assigned: false,
-            })
-            .expect("transaction identity registry matches configured capacity");
+        identities.preflight_active()?;
+        let transaction_id = identities.next()?;
+        identities.register(transaction_id, connection_id)?;
+        Ok(transaction_id)
+    }
+
+    pub(crate) fn begin_transaction_identity(&self, transaction_id: u32) -> Result<(), SqlError> {
+        self.transaction_identity_state()
+            .register(transaction_id, self.current_connection_id())
     }
 
     fn transaction_wait_owner(&self, transaction_id: u32) -> crate::sql::lock::WaitOwner {
@@ -55865,6 +55918,104 @@ mod tests {
                 .iter()
                 .any(|status| status.transaction_id == 131 && !status.committed)
         );
+    }
+
+    #[test]
+    fn shared_transaction_identity_capacity_failure_is_atomic() {
+        let mut config = test_config();
+        config.max_connections = 1;
+        config.max_prepared_transactions = 1;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let first = storage.start_transaction_identity().unwrap();
+            storage.assign_transaction_identity(first);
+            storage.prepare_transaction_locks(first);
+            let second = storage.start_transaction_identity().unwrap();
+            let latest = storage.latest_transaction_identity();
+            let error = storage.start_transaction_identity().unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                error.message.as_str(),
+                "transaction identity registry exhausted"
+            );
+            assert_eq!(storage.latest_transaction_identity(), latest);
+            assert_eq!(
+                storage.assigned_transaction_identity(first),
+                Some(u64::from(first))
+            );
+            storage.begin_transaction_identity(first).unwrap();
+            assert!(storage.begin_transaction_identity(100).is_err());
+            assert!(storage.begin_transaction_identity(0).is_err());
+            assert_eq!(storage.latest_transaction_identity(), latest);
+            let maintenance = storage.reserve_transaction_identity().unwrap();
+            assert_eq!(maintenance, second + 1);
+            storage.finish_transaction_identity(second, false);
+            let replacement = storage.start_transaction_identity().unwrap();
+            assert_eq!(replacement, maintenance + 1);
+            storage.finish_transaction_identity(replacement, false);
+            storage.finish_transaction_identity(first, true);
+            assert_eq!(
+                storage.transaction_status(u64::from(first)).unwrap(),
+                Some("committed")
+            );
+            assert!(storage.transaction_identity_state().active.is_empty());
+            storage.observe_transaction_identity(u64::from(u32::MAX - 1));
+            assert_eq!(storage.reserve_transaction_identity().unwrap(), u32::MAX);
+            assert!(storage.start_transaction_identity().is_err());
+            assert!(storage.reserve_transaction_identity().is_err());
+            assert!(storage.transaction_identity_state().active.is_empty());
+            assert_eq!(storage.latest_transaction_identity(), u64::from(u32::MAX));
+        });
+    }
+
+    #[test]
+    fn shared_transaction_identity_sql_and_maintenance_reservations_are_unique() {
+        let mut config = test_config();
+        config.max_connections = 2;
+        config.max_prepared_transactions = 0;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(3);
+            for worker in 0..3 {
+                let storage = &storage;
+                workers.push(scope.spawn(move || {
+                    crate::sql::set_execution_connection_id(worker + 1);
+                    crate::mem::guard::forbid_alloc(|| {
+                        std::array::from_fn::<_, 64, _>(|_| {
+                            if worker == 2 {
+                                return storage.reserve_transaction_identity().unwrap();
+                            }
+                            let transaction = storage.start_transaction_identity().unwrap();
+                            storage.assign_transaction_identity(transaction);
+                            {
+                                let identities = storage.transaction_identity_state();
+                                let active = identities
+                                    .active
+                                    .iter()
+                                    .find(|entry| entry.transaction_id == transaction)
+                                    .unwrap();
+                                assert_eq!(active.connection_id, Some(worker + 1));
+                                assert!(active.assigned);
+                            }
+                            storage.finish_transaction_identity(transaction, worker == 0);
+                            transaction
+                        })
+                    })
+                }));
+            }
+            let mut ids = [0; 192];
+            for (worker, handle) in workers.into_iter().enumerate() {
+                ids[worker * 64..(worker + 1) * 64].copy_from_slice(&handle.join().unwrap());
+            }
+            crate::mem::guard::forbid_alloc(|| {
+                ids.sort_unstable();
+                assert_eq!(ids, std::array::from_fn(|index| index as u32 + 1));
+                assert!(storage.transaction_identity_state().active.is_empty());
+                assert_eq!(storage.latest_transaction_identity(), 192);
+            });
+        });
     }
 
     #[test]

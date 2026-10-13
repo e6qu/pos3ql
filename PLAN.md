@@ -121,9 +121,11 @@ was either saved or discarded.
 Row identities now have a shared, checked allocator. Inserts and partition moves
 reserve the identity used by deferred checks before storing bytes; recovery keeps
 the counter monotonic, and exhaustion fails explicitly rather than wrapping.
-This does not enable parallel statement execution.
+Transaction creation now reserves its identity and active-registry entry in one
+guarded operation. Maintenance and recovery use the same counter; capacity
+errors preserve existing owners. This does not enable parallel statement execution.
 
-- Protect transaction identities, journal staging, prepared
+- Protect journal staging, prepared
   transactions, commit order, and the responses waiting for durable storage.
 - Let execution progress without holding the whole engine locked while a
   commit waits on object storage.

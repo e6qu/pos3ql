@@ -2,6 +2,7 @@
 
 use core::mem::size_of;
 use core::num::NonZeroUsize;
+use core::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -405,6 +406,7 @@ impl QueryRootPool {
         }))
     }
 
+    #[cfg(test)]
     pub(super) fn retain(
         self: &Arc<Self>,
         storage: &Storage,
@@ -430,6 +432,36 @@ impl QueryRootPool {
         lsn: u64,
         start: usize,
     ) -> Result<QueryRootLease, SqlError> {
+        self.reserve_in(start, |snapshot| {
+            snapshot.capture(storage, table)?;
+            snapshot.commit_lsn = lsn;
+            Ok(())
+        })
+    }
+
+    fn retain_image(
+        self: &Arc<Self>,
+        storage: &Storage,
+        image: SpillGenerationImage,
+        generations: &SpillGenerationList,
+    ) -> Result<QueryRootLease, SqlError> {
+        self.reserve_in(0, |snapshot| {
+            snapshot.capture_image(storage, image, generations)
+        })
+    }
+
+    fn retain_source(
+        self: &Arc<Self>,
+        source: &SpillSourceView<'_>,
+    ) -> Result<QueryRootLease, SqlError> {
+        self.reserve_in(self.slots_per_use, |snapshot| snapshot.copy_source(source))
+    }
+
+    fn reserve_in(
+        self: &Arc<Self>,
+        start: usize,
+        capture: impl FnOnce(&mut SpillGenerationSnapshot) -> Result<(), SqlError>,
+    ) -> Result<QueryRootLease, SqlError> {
         for slot in start..start + self.slots_per_use {
             let candidate = &self.slots[slot];
             if candidate
@@ -449,8 +481,7 @@ impl QueryRootPool {
                     .snapshot
                     .write()
                     .expect("query SST roots poisoned");
-                snapshot.capture(storage, table)?;
-                snapshot.commit_lsn = lsn;
+                capture(&mut snapshot)?;
             }
             return Ok(lease);
         }
@@ -685,19 +716,240 @@ impl SpilledRowRead {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct SpillGenerationImage {
+    persistence: RelationPersistence,
+    schema: [ColType; MAX_COLUMNS],
+    n_columns: usize,
+    table_slot: usize,
+    pub(super) created_at: u64,
+    data_generation: u64,
+    pub(super) commit_lsn: u64,
+}
+
+impl SpillGenerationImage {
+    const EMPTY: Self = Self {
+        persistence: RelationPersistence::Permanent,
+        schema: [ColType::Bool; MAX_COLUMNS],
+        n_columns: 0,
+        table_slot: 0,
+        created_at: 0,
+        data_generation: 0,
+        commit_lsn: 0,
+    };
+
+    pub(super) fn capture(
+        definition: &super::table_definitions::DefinitionState,
+        generation: u64,
+        table_slot: usize,
+        commit_lsn: u64,
+    ) -> Self {
+        let mut image = Self::EMPTY;
+        image.persistence = definition.committed.persistence;
+        image.n_columns = definition.committed.schema(&mut image.schema);
+        image.table_slot = table_slot;
+        image.created_at = definition.identity.created_at;
+        image.data_generation = generation;
+        image.commit_lsn = commit_lsn;
+        image
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SpillGenerationMetadata {
+    persistence: RelationPersistence,
+    table_slot: usize,
+    created_at: u64,
+    data_generation: u64,
+    commit_lsn: u64,
+}
+
+impl SpillGenerationImage {
+    fn metadata(&self) -> SpillGenerationMetadata {
+        SpillGenerationMetadata {
+            persistence: self.persistence,
+            table_slot: self.table_slot,
+            created_at: self.created_at,
+            data_generation: self.data_generation,
+            commit_lsn: self.commit_lsn,
+        }
+    }
+}
+
+pub(super) struct SpillSourceView<'a> {
+    registry: &'a Arc<SpillRootRegistry>,
+    pub(super) reader: Option<&'a Arc<SpillReader>>,
+    handles: &'a [SstHandle],
+    metadata: SpillGenerationMetadata,
+    schema: &'a [ColType],
+}
+
+impl SpillSourceView<'_> {
+    fn image(&self) -> SpillGenerationImage {
+        let mut image = SpillGenerationImage::EMPTY;
+        image.persistence = self.metadata.persistence;
+        image.table_slot = self.metadata.table_slot;
+        image.created_at = self.metadata.created_at;
+        image.data_generation = self.metadata.data_generation;
+        image.commit_lsn = self.metadata.commit_lsn;
+        image.n_columns = self.schema.len();
+        image.schema[..self.schema.len()].copy_from_slice(self.schema);
+        image
+    }
+
+    pub(super) fn relation(&self) -> SpillRelation<'_> {
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        schema[..self.schema.len()].copy_from_slice(self.schema);
+        SpillRelation {
+            persistence: self.metadata.persistence,
+            schema,
+            n_columns: self.schema.len(),
+            handles: self.handles,
+        }
+    }
+
+    pub(super) fn commit_lsn(&self) -> u64 {
+        self.metadata.commit_lsn
+    }
+}
+
+pub(super) struct StatementSpillRoots<'a> {
+    registry: Arc<SpillRootRegistry>,
+    reader: Option<Arc<SpillReader>>,
+    metadata: SpillGenerationMetadata,
+    schema: &'a [ColType],
+    handles: &'a [SstHandle],
+}
+
+impl<'a> StatementSpillRoots<'a> {
+    fn capture(
+        storage: &Storage,
+        image: SpillGenerationImage,
+        generations: &SpillGenerationList,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<Self, SqlError> {
+        let metadata = image.metadata();
+        let schema = arena
+            .alloc_slice_with(image.n_columns, |index| image.schema[index])
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "retained scan schema exceeds the statement arena"
+                )
+            })?;
+        let handles = arena
+            .alloc_slice_with(generations.len(), |index| {
+                generations.handle(index).expect("complete generation list")
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "retained scan SST roots exceed the statement arena"
+                )
+            })?;
+        storage
+            .spill_roots
+            .pin(handles, image.persistence != RelationPersistence::Temporary)?;
+        Ok(Self {
+            registry: Arc::clone(&storage.spill_roots),
+            reader: storage.spill.as_ref().map(Arc::clone),
+            metadata,
+            schema,
+            handles,
+        })
+    }
+
+    fn view(&self) -> SpillSourceView<'_> {
+        SpillSourceView {
+            registry: &self.registry,
+            reader: self.reader.as_ref(),
+            handles: self.handles,
+            metadata: self.metadata,
+            schema: self.schema,
+        }
+    }
+}
+
+impl Drop for StatementSpillRoots<'_> {
+    fn drop(&mut self) {
+        self.registry.release(
+            self.handles,
+            self.metadata.persistence != RelationPersistence::Temporary,
+        );
+    }
+}
+
+pub(super) enum CapturedSpillRoots<'a> {
+    Empty,
+    Reserved(QueryRootLease),
+    Statement(StatementSpillRoots<'a>),
+}
+
+impl<'a> CapturedSpillRoots<'a> {
+    pub(super) fn capture(
+        storage: &Storage,
+        image: SpillGenerationImage,
+        generations: &SpillGenerationList,
+        arena: Option<&'a crate::mem::arena::Arena>,
+    ) -> Result<Self, SqlError> {
+        if generations.is_empty() {
+            return Ok(Self::Empty);
+        }
+        match arena {
+            Some(arena) => StatementSpillRoots::capture(storage, image, generations, arena)
+                .map(Self::Statement),
+            None => storage
+                .query_roots
+                .retain_image(storage, image, generations)
+                .map(Self::Reserved),
+        }
+    }
+
+    pub(super) fn with_view<T>(
+        &self,
+        read: impl FnOnce(&SpillSourceView<'_>) -> Result<T, SqlError>,
+    ) -> Result<Option<T>, SqlError> {
+        match self {
+            Self::Empty => Ok(None),
+            Self::Reserved(lease) => {
+                lease.with_snapshot(|snapshot| read(&snapshot.view()).map(Some))
+            }
+            Self::Statement(source) => read(&source.view()).map(Some),
+        }
+    }
+
+    pub(super) fn owned_source(
+        &self,
+        storage: &Storage,
+    ) -> Result<Option<QueryRootLease>, SqlError> {
+        match self {
+            Self::Empty => Ok(None),
+            Self::Reserved(lease) => lease.try_clone().map(Some),
+            Self::Statement(source) => storage.query_roots.retain_source(&source.view()).map(Some),
+        }
+    }
+}
+
 /// The buffers are constructed at startup. Capturing only clones existing Arc
 /// owners and copies handles; registry ownership never spans object I/O.
 pub(super) struct SpillGenerationSnapshot {
     registry: Option<Arc<SpillRootRegistry>>,
     pub(super) reader: Option<Arc<SpillReader>>,
     handles: Vec<SstHandle>,
-    persistence: RelationPersistence,
-    schema: [ColType; MAX_COLUMNS],
-    n_columns: usize,
-    table_slot: usize,
-    created_at: u64,
-    data_generation: u64,
-    pub(super) commit_lsn: u64,
+    image: SpillGenerationImage,
+}
+
+impl Deref for SpillGenerationSnapshot {
+    type Target = SpillGenerationImage;
+    fn deref(&self) -> &Self::Target {
+        &self.image
+    }
+}
+
+impl DerefMut for SpillGenerationSnapshot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.image
+    }
 }
 
 impl SpillGenerationSnapshot {
@@ -710,13 +962,7 @@ impl SpillGenerationSnapshot {
             registry: None,
             reader: None,
             handles: Vec::with_capacity(max_generations),
-            persistence: RelationPersistence::Permanent,
-            schema: [ColType::Bool; MAX_COLUMNS],
-            n_columns: 0,
-            table_slot: 0,
-            created_at: 0,
-            data_generation: 0,
-            commit_lsn: 0,
+            image: SpillGenerationImage::EMPTY,
         }
     }
 
@@ -724,17 +970,65 @@ impl SpillGenerationSnapshot {
         self.clear();
         let table = storage.table(table_slot);
         let definition = table.definition.read();
-        self.persistence = definition.committed.persistence;
-        self.n_columns = definition.committed.schema(&mut self.schema);
-        self.table_slot = table_slot;
-        self.created_at = definition.identity.created_at;
-        self.data_generation = table.generation();
-        self.commit_lsn = storage.lsn();
+        self.image = SpillGenerationImage::capture(
+            &definition,
+            table.generation(),
+            table_slot,
+            storage.lsn(),
+        );
         // Retain roots before releasing list ownership. Replacement cannot
         // retire a member between copying its handle and registering the read.
         let generations = table.spill_generations();
         self.retain_members(&generations, &storage.spill_roots)?;
         self.reader = storage.spill.as_ref().map(Arc::clone);
+        Ok(())
+    }
+
+    pub(super) fn capture_image(
+        &mut self,
+        storage: &Storage,
+        image: SpillGenerationImage,
+        generations: &SpillGenerationList,
+    ) -> Result<(), SqlError> {
+        self.clear();
+        self.image = image;
+        self.retain_members(generations, &storage.spill_roots)?;
+        self.reader = storage.spill.as_ref().map(Arc::clone);
+        Ok(())
+    }
+
+    pub(super) fn view(&self) -> SpillSourceView<'_> {
+        SpillSourceView {
+            registry: self.registry.as_ref().expect("captured source registry"),
+            reader: self.reader.as_ref(),
+            handles: &self.handles,
+            metadata: self.image.metadata(),
+            schema: &self.schema[..self.n_columns],
+        }
+    }
+
+    fn copy_source(&mut self, source: &SpillSourceView<'_>) -> Result<(), SqlError> {
+        self.clear();
+        if source.handles.len() > self.handles.capacity() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "retained SST members exceed startup capacity ({})",
+                self.handles.capacity()
+            ));
+        }
+        self.image = source.image();
+        for &handle in source.handles {
+            self.handles.push(handle);
+        }
+        if let Err(error) = source.registry.pin(
+            &self.handles,
+            self.persistence != RelationPersistence::Temporary,
+        ) {
+            self.handles.clear();
+            return Err(error);
+        }
+        self.registry = Some(Arc::clone(source.registry));
+        self.reader = source.reader.map(Arc::clone);
         Ok(())
     }
 
@@ -1084,6 +1378,449 @@ mod tests {
             arena,
             path,
         }
+    }
+
+    fn scan_fixture(label: &str) -> PointFixture {
+        use crate::sql::types::Datum;
+        use crate::store::SstWriter;
+        let mut fixture = point_fixture(label);
+        let mut encoded = [0u8; 128];
+        let mut writer = Box::new(SstWriter::new());
+        let spill = fixture.storage.spill.as_ref().unwrap();
+        let mut blocks = spill.relation_blocks_for(RelationPersistence::Temporary);
+        for (rowid, commit_lsn, value) in [
+            (1, 11, Some(111)),
+            (1, 9, Some(88)),
+            (1, 7, Some(41)),
+            (2, 9, None),
+            (2, 7, Some(17)),
+        ] {
+            if let Some(value) = value {
+                let values = [Datum::Int4(value)];
+                let len = crate::storage::rowenc::encoded_len(&values);
+                crate::storage::rowenc::encode(&values, &mut encoded[..len]);
+                writer
+                    .append_version(
+                        &mut *blocks,
+                        crate::store::SstKey::at(rowid, commit_lsn),
+                        &encoded[..len],
+                    )
+                    .unwrap();
+            } else {
+                writer
+                    .append_tombstone_version(
+                        &mut *blocks,
+                        crate::store::SstKey::at(rowid, commit_lsn),
+                    )
+                    .unwrap();
+            }
+        }
+        fixture.roots[2] = writer.finish(&mut *blocks).unwrap().unwrap();
+        drop(blocks);
+        let location = fixture.storage.heap.append_row(&[Datum::Int4(99)]).unwrap();
+        fixture.storage.tables[fixture.table]
+            .rows
+            .insert(0, super::super::RowState::committed_only_at(location, 7))
+            .unwrap();
+        fixture
+    }
+
+    #[test]
+    fn captured_row_scans_metadata_keeps_files_and_boundary_before_callbacks() {
+        use crate::sql::types::Datum;
+        let PointFixture {
+            storage,
+            table,
+            roots,
+            arena: _arena,
+            path,
+        } = scan_fixture("metadata-partition");
+        let mut seen = [u64::MAX; 3];
+        let mut copied = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_commit_snapshot(7);
+            let mut count = 0;
+            storage
+                .for_each_row_state(table, &mut |rowid, state| {
+                    seen[count] = rowid;
+                    count += 1;
+                    if rowid == 0 {
+                        drop(state);
+                        assert!(storage.tables[table].rows.test_write().is_ok());
+                        assert!(storage.row_versions.test_write().is_ok());
+                        storage
+                            .table(table)
+                            .spill_generations
+                            .write()
+                            .replace(1, [roots[2]].into_iter())?;
+                        storage.set_commit_snapshot(u64::MAX);
+                        storage.spill_roots.copy_roots(false, &mut copied)?;
+                        assert_eq!(copied, roots[..2]);
+                    } else {
+                        assert_eq!(state.committed_lsn, 7);
+                        let home = storage
+                            .visible_row_home_at(
+                                table,
+                                rowid,
+                                state,
+                                8,
+                                super::super::SNAPSHOT_ALL,
+                                7,
+                            )?
+                            .unwrap();
+                        storage.with_row_bytes(table, rowid, home, |bytes| {
+                            let mut values = [Datum::Null];
+                            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                            assert_eq!(values, [Datum::Int4(if rowid == 1 { 41 } else { 17 })]);
+                            Ok(())
+                        })?;
+                    }
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
+            assert_eq!(seen, [0, 1, 2]);
+            storage.spill_roots.copy_roots(false, &mut copied).unwrap();
+            assert!(copied.is_empty());
+            storage
+                .table(table)
+                .spill_generations
+                .write()
+                .replace(2, roots[..2].iter().copied())
+                .unwrap();
+            storage.set_commit_snapshot(7);
+            let error = storage
+                .for_each_row_state(table, &mut |_, state| {
+                    drop(state);
+                    Err(sql_err!(
+                        sqlstate::QUERY_CANCELED,
+                        "cancel captured overlay"
+                    ))
+                })
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::QUERY_CANCELED);
+            storage.spill_roots.copy_roots(false, &mut copied).unwrap();
+            assert!(copied.is_empty());
+            assert!(
+                storage
+                    .query_roots
+                    .slots
+                    .iter()
+                    .all(|slot| !slot.retained.load(Ordering::Acquire))
+            );
+            assert!(storage.row_scan(table).is_ok());
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn captured_row_scans_statement_bytes_keep_partition_through_replacement() {
+        use crate::sql::types::Datum;
+        let PointFixture {
+            storage,
+            table,
+            roots,
+            arena,
+            path,
+        } = scan_fixture("statement-partition");
+        let mut copied = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_commit_snapshot(7);
+            let scan = storage.row_scan_in(table, &arena).unwrap();
+            assert!(scan.rowids.contains(0));
+            let mut overlay = 0;
+            let completed = scan
+                .for_each_overlay(&mut |rowid, state| {
+                    assert_eq!(rowid, 0);
+                    drop(state);
+                    overlay += 1;
+                    storage
+                        .table(table)
+                        .spill_generations
+                        .write()
+                        .replace(1, [roots[2]].into_iter())?;
+                    storage.set_commit_snapshot(u64::MAX);
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
+            assert!(completed.is_continue());
+            assert_eq!(overlay, 1);
+            for columns in [None, Some(1)] {
+                let mut ids = [0u64; 2];
+                let mut count = 0;
+                scan.for_each_spilled_row_batch(&arena, true, columns, &mut |batch| {
+                    assert!(storage.tables[table].rows.test_write().is_ok());
+                    for row in batch {
+                        ids[count] = row.rowid;
+                        count += 1;
+                        let expected = Datum::Int4(if row.rowid == 1 { 41 } else { 17 });
+                        match row.representation {
+                            super::super::SpilledRowRepresentation::Encoded(bytes) => {
+                                let mut values = [Datum::Null];
+                                crate::storage::rowenc::decode(
+                                    bytes,
+                                    &[ColType::Int4],
+                                    &mut values,
+                                )?;
+                                assert_eq!(values, [expected]);
+                            }
+                            super::super::SpilledRowRepresentation::Values(values) => {
+                                assert_eq!(values, [expected])
+                            }
+                        }
+                    }
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
+                assert_eq!((count, ids), (2, [1, 2]));
+            }
+            let later = storage.row_scan_in(table, &arena).unwrap();
+            later
+                .roots
+                .with_view(|source| {
+                    assert_eq!(source.handles, [roots[2]]);
+                    assert_eq!(source.commit_lsn(), u64::MAX);
+                    Ok(())
+                })
+                .unwrap();
+            drop(later);
+            storage.spill_roots.copy_roots(false, &mut copied).unwrap();
+            assert_eq!(copied, roots[..2]);
+            let error = scan
+                .for_each_spilled_row_batch(&arena, true, None, &mut |_| {
+                    Err(sql_err!(sqlstate::QUERY_CANCELED, "cancel captured bytes"))
+                })
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::QUERY_CANCELED);
+            drop(scan);
+            storage.spill_roots.copy_roots(false, &mut copied).unwrap();
+            assert!(copied.is_empty());
+            assert!(
+                storage
+                    .query_roots
+                    .slots
+                    .iter()
+                    .all(|slot| !slot.retained.load(Ordering::Acquire))
+            );
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn captured_row_scans_point_source_survives_statement_memory_reset() {
+        let PointFixture {
+            storage,
+            table,
+            roots,
+            mut arena,
+            path,
+        } = scan_fixture("owned-overlay");
+        let mut state =
+            super::super::RowState::committed_only_at(super::super::RowLoc::test(0, 0), 7);
+        state.committed = Some(super::super::RowHome::Spilled {
+            len: 7,
+            sst: 0,
+            commit_lsn: 7,
+        });
+        state.checkpoint_change_lsn = 7;
+        storage.tables[table].rows.write().insert(2, state).unwrap();
+        let mut saved = None;
+        let mut copied = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_commit_snapshot(7);
+            let scan = storage.row_scan_in(table, &arena).unwrap();
+            assert!(scan.rowids.contains(2));
+            storage.tables[table].rows.write().remove(&2);
+            storage
+                .table(table)
+                .spill_generations
+                .write()
+                .replace(1, [roots[2]].into_iter())
+                .unwrap();
+            let completed = scan
+                .for_each_overlay(&mut |rowid, state| {
+                    if rowid == 2 {
+                        assert!(
+                            state.committed.is_none(),
+                            "captured newest deletion remains metadata"
+                        );
+                        let home = storage
+                            .visible_row_home_at(
+                                table,
+                                rowid,
+                                state,
+                                8,
+                                super::super::SNAPSHOT_ALL,
+                                7,
+                            )?
+                            .unwrap();
+                        let super::super::VisibleRowBytes::Spilled(source) = home.bytes else {
+                            unreachable!()
+                        };
+                        saved = Some(source);
+                    }
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
+            assert!(completed.is_continue());
+            drop(scan);
+            arena.reset();
+            let source = saved.take().unwrap();
+            assert_point_value(&source, &arena, 17);
+            storage.spill_roots.copy_roots(false, &mut copied).unwrap();
+            assert_eq!(copied, roots[..2]);
+            drop(source);
+            storage.spill_roots.copy_roots(false, &mut copied).unwrap();
+            assert!(copied.is_empty());
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn captured_row_scans_resident_spill_uses_captured_versions_after_remapping() {
+        use crate::sql::types::Datum;
+        let PointFixture {
+            storage,
+            table,
+            roots,
+            arena,
+            path,
+        } = scan_fixture("resident-spill");
+        let mut state =
+            super::super::RowState::committed_only_at(super::super::RowLoc::test(0, 0), 9);
+        state.committed = Some(super::super::RowHome::Spilled {
+            len: 7,
+            sst: 1,
+            commit_lsn: 9,
+        });
+        state.checkpoint_change_lsn = 9;
+        storage.tables[table].rows.write().insert(1, state).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_commit_snapshot(7);
+            let scan = storage.row_scan_in(table, &arena).unwrap();
+            {
+                let mut generations = storage.table(table).spill_generations.write();
+                let mut rows = storage.tables[table].rows.write();
+                generations.replace(1, [roots[2]].into_iter()).unwrap();
+                rows.get_mut(&1).unwrap().committed = Some(super::super::RowHome::Spilled {
+                    len: 7,
+                    sst: 0,
+                    commit_lsn: 9,
+                });
+            }
+            for latest in [false, true] {
+                let mut selected = 0;
+                let completed = scan
+                    .for_each_overlay(&mut |rowid, state| {
+                        if rowid != 1 {
+                            drop(state);
+                            return Ok(core::ops::ControlFlow::Continue(()));
+                        }
+                        let home = if latest {
+                            storage.committed_row_home(table, rowid, state)?
+                        } else {
+                            storage.visible_row_home_at(
+                                table,
+                                rowid,
+                                state,
+                                8,
+                                super::super::SNAPSHOT_ALL,
+                                7,
+                            )?
+                        }
+                        .unwrap();
+                        assert!(storage.row_versions.test_write().is_ok());
+                        selected += 1;
+                        storage.with_row_bytes(table, rowid, home, |bytes| {
+                            let mut values = [Datum::Null];
+                            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                            assert_eq!(values, [Datum::Int4(if latest { 88 } else { 41 })]);
+                            Ok(())
+                        })?;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })
+                    .unwrap();
+                assert!(completed.is_continue());
+                assert_eq!(selected, 1);
+            }
+            scan.roots
+                .with_view(|source| {
+                    assert_eq!(source.handles, &roots[..2]);
+                    Ok(())
+                })
+                .unwrap();
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn captured_row_scans_statement_depth_and_failed_capture_release_are_bounded() {
+        let PointFixture {
+            storage,
+            table,
+            roots,
+            arena,
+            path,
+        } = point_fixture("scan-capacity");
+        let count = super::super::MAX_ROW_WALK_NESTING + 1;
+        let mut scans = Vec::with_capacity(count);
+        let source_capacity = storage.query_roots.slots_per_use;
+        let mut leases = Vec::with_capacity(source_capacity);
+        let mut small_budget = Budget::new(size_of::<ColType>());
+        let small = crate::mem::arena::Arena::new(
+            &mut small_budget,
+            "partial scan source",
+            size_of::<ColType>(),
+        )
+        .unwrap();
+        let mut copied = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..count {
+                scans.push(storage.row_scan_in(table, &arena).unwrap());
+            }
+            assert!(
+                storage
+                    .query_roots
+                    .slots
+                    .iter()
+                    .all(|slot| !slot.retained.load(Ordering::Acquire)),
+                "statement sources must preserve metadata source capacity"
+            );
+            assert!(storage.row_scan(table).is_ok());
+            let error = storage.row_scan_in(table, &small).err().unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("SST roots"));
+            scans.clear();
+            storage.spill_roots.copy_roots(false, &mut copied).unwrap();
+            assert!(
+                copied.is_empty(),
+                "arena allocation failure cannot partially register roots"
+            );
+            for _ in 0..source_capacity {
+                leases.push(storage.query_roots.retain(&storage, table, 7).unwrap());
+            }
+            assert_eq!(
+                storage.row_scan(table).err().unwrap().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            leases.clear();
+            assert!(
+                storage.row_scan(table).is_ok(),
+                "failed source capture releases its row identity slot"
+            );
+            storage.spill_roots.copy_roots(false, &mut copied).unwrap();
+            assert!(copied.is_empty());
+            assert_eq!(
+                storage.table(table).spill_generations().handle(0),
+                Some(roots[0])
+            );
+        });
+        drop(scans);
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
     }
 
     fn assert_point_value(source: &SpilledRowRead, arena: &crate::mem::arena::Arena, value: i32) {
@@ -1541,12 +2278,11 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             storage.set_commit_snapshot(7);
             let scan = storage.row_scan(table).unwrap();
-            let RowScanIds::Reserved(rowids) = &scan.rowids else {
-                unreachable!()
-            };
+            assert!(matches!(&scan.rowids, RowScanIds::Reserved(_)));
+            let roots = scan.roots.owned_source(&storage).unwrap().unwrap();
             let mut metadata_rows = 0;
             storage
-                .spill_merged_walk(table, rowids, &mut |rowid, source| {
+                .spill_merged_walk(&roots, &scan.rowids, &mut |rowid, source| {
                     let lsn = source.version.commit_lsn;
                     assert_eq!((rowid, lsn), (1, 7));
                     storage.set_commit_snapshot(u64::MAX);
@@ -1560,11 +2296,13 @@ mod tests {
             );
             storage.set_commit_snapshot(7);
             let error = storage
-                .spill_merged_walk(table, rowids, &mut |_, _| {
+                .spill_merged_walk(&roots, &scan.rowids, &mut |_, _| {
                     Err(sql_err!(sqlstate::QUERY_CANCELED, "cancel retained scan"))
                 })
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::QUERY_CANCELED);
+            drop(roots);
+            drop(scan);
             assert!(
                 storage
                     .query_roots
@@ -1572,7 +2310,6 @@ mod tests {
                     .iter()
                     .all(|slot| !slot.retained.load(Ordering::Acquire))
             );
-            drop(scan);
             let lease = storage.query_roots.retain(&storage, table, 7).unwrap();
             let registry = lease
                 .with_snapshot(|snapshot| Ok(Arc::clone(snapshot.registry.as_ref().unwrap())))

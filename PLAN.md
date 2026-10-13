@@ -71,15 +71,19 @@ startup slots, preserving existing scan capacity. A table's saved-file list and
 its eviction boundaries now publish together. Capture retains every selected
 file before releasing list ownership; a rejected replacement preserves the
 previous list, and an append to a full list returns a capacity error. Database
-cloning preserves the same boundaries.
+cloning preserves the same boundaries. Scans now capture resident row identities,
+saved files, schema, and read position together before callbacks. Their metadata
+and byte phases keep those sources instead of recapturing the live file list.
+SQL scans retain file handles and schema in statement memory, preserving join
+depth and separate metadata-source capacity. Resumable checkpoints use the same
+capture order.
 
 Still to do:
 
-- Complete the table lifecycle transition for capturing row sources alongside
-  in-memory changes when a table is dropped, replaced, or publishes a new
-  storage generation. The saved-file list has its own capture/publication guard;
-  coordinating that list with resident overlays and table lifecycle changes
-  remains open.
+- Complete the table lifecycle transition for resident row images when a table
+  is dropped or replaced. Scan partitions now capture row identities and saved
+  sources together; preserving all resident versions through retirement still
+  needs coordination.
 - Finish shared-state protection for table creation/removal, statistics, and
   engine-wide publication.
 - Keep row bytes safe while memory is moved or reclaimed. Complete rewrites

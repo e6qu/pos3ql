@@ -9,7 +9,7 @@ use super::row_versions::{
     RowVersionPools, RowVersionState, committed_history_get, committed_version_at, pending_last,
     pending_version_at, pending_visible_at, retained_pending_home,
 };
-use super::spill_generations::SpilledRowState;
+use super::spill_generations::{CapturedSpillRoots, SpilledRowState};
 use super::{CommittedVersion, PendingChange, RowHome, RowLoc, RowState};
 use crate::mem::fixed_map::FixedMap;
 
@@ -18,6 +18,7 @@ use crate::mem::fixed_map::FixedMap;
 pub(crate) struct RowRead<'a> {
     state: RowState,
     versions: VersionOwner<'a>,
+    captured_roots: Option<&'a CapturedSpillRoots<'a>>,
 }
 
 pub(super) type RowReadVisitor<'a> = dyn for<'row> FnMut(
@@ -40,7 +41,7 @@ impl Deref for RowRead<'_> {
     }
 }
 
-impl RowRead<'_> {
+impl<'owner> RowRead<'owner> {
     fn versions(&self) -> Option<&RowVersionState> {
         match &self.versions {
             VersionOwner::Retained(owner) => Some(owner),
@@ -55,7 +56,26 @@ impl RowRead<'_> {
         Self {
             state,
             versions: VersionOwner::Immutable(source),
+            captured_roots: None,
         }
+    }
+
+    pub(super) fn with_captured_roots<'scan>(
+        self,
+        roots: &'scan CapturedSpillRoots<'scan>,
+    ) -> RowRead<'scan>
+    where
+        'owner: 'scan,
+    {
+        RowRead {
+            state: self.state,
+            versions: self.versions,
+            captured_roots: Some(roots),
+        }
+    }
+
+    pub(super) fn captured_roots(&self) -> Option<&'owner CapturedSpillRoots<'owner>> {
+        self.captured_roots
     }
 
     pub(super) fn spilled_source(&self) -> Option<&SpilledRowState> {
@@ -181,6 +201,7 @@ impl<'a> RowReadView<'a> {
         Some(RowRead {
             state,
             versions: VersionOwner::Retained(versions),
+            captured_roots: None,
         })
     }
 
@@ -191,6 +212,7 @@ impl<'a> RowReadView<'a> {
                 RowRead {
                     state,
                     versions: VersionOwner::Borrowed(&self.versions),
+                    captured_roots: None,
                 },
             )
         })

@@ -1,0 +1,26 @@
+name: Row identity qualification
+on:
+  push:
+    branches: [codex/shared-row-identities]
+concurrency:
+  group: row-identity-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --lib --locked row_identity_ -- --nocapture
+      - run: cargo test --lib --locked every_mutation_path_raises_deferred_row_obligations -- --nocapture
+      - run: cargo test --lib --locked startup_bounded -- --nocapture

@@ -37,6 +37,7 @@ next statement.
 | Shared state | Protection implemented | Work still needed for concurrent execution |
 |---|---|---|
 | Statement buffers | Startup-sized arenas, row-selection scratch, connection/database context, and ordered dispatcher leases; COPY and subscriptions have separate buffers | Run statements on workers and coordinate all remaining shared state |
+| Row identities | Shared allocation reserves unique IDs without runtime allocation. Inserts and partition moves attach deferred checks to the ID actually stored; exhaustion returns `54000` before appending bytes. | Transaction publication and execution workers remain unfinished. | `src/storage/row_identities.rs`, `src/sql/exec/constraints.rs` |
 | Catalogs and table definitions | Synchronized updates; readers retain the definition and table identity they selected; nested lookups release shared guards | Concurrent creation/removal and retirement of table state |
 | Sequence positions | Per-table synchronization, checked arithmetic, coherent journal/checkpoint images, and acknowledgement of unchanged staged positions | Preserve these rules through engine-wide concurrent publication |
 | Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state; selected images are retained before releasing metadata | Safe movement and reclamation while readers remain active |

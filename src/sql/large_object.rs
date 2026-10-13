@@ -705,8 +705,11 @@ fn write_page(
         Datum::Int4(page as i32),
         Datum::Bytea(data),
     ];
+    let rowid = match rowid {
+        Some(rowid) => rowid,
+        None => storage.next_rowid()?,
+    };
     let loc = storage.heap.append_row(&values)?;
-    let rowid = rowid.unwrap_or_else(|| storage.next_rowid());
     let table = storage.large_object_page_table();
     let prior = storage.write_pending(table, rowid, txn.txid, txn.command_id(), Some(loc))?;
     if let Err(error) = txn.touch(table as u32, rowid, prior) {

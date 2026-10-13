@@ -118,7 +118,12 @@ only after its change is recoverable from object storage. If the connection
 breaks during publication, the error must not falsely promise that the change
 was either saved or discarded.
 
-- Protect transaction identities, row identities, journal staging, prepared
+Row identities now have a shared, checked allocator. Inserts and partition moves
+reserve the identity used by deferred checks before storing bytes; recovery keeps
+the counter monotonic, and exhaustion fails explicitly rather than wrapping.
+This does not enable parallel statement execution.
+
+- Protect transaction identities, journal staging, prepared
   transactions, commit order, and the responses waiting for durable storage.
 - Let execution progress without holding the whole engine locked while a
   commit waits on object storage.

@@ -467,9 +467,9 @@ use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build
 
 pub(crate) mod constraints;
 use constraints::{
-    MAX_FK_CASCADE_DEPTH, ParsedChecks, apply_fk_parent_actions, check_index_tuple_sizes,
-    enforce_row_constraints, parse_checks, parse_generated, referenced_key_changed,
-    table_is_referenced,
+    ConstraintRow, MAX_FK_CASCADE_DEPTH, ParsedChecks, apply_fk_parent_actions,
+    check_index_tuple_sizes, enforce_row_constraints, parse_checks, parse_generated,
+    referenced_key_changed, table_is_referenced,
 };
 pub use constraints::{check_all_unique, check_unique, check_unique_indexes};
 pub(crate) use constraints::{coerce_domain_value, parse_defaults};
@@ -4837,7 +4837,7 @@ where
         def,
         schema,
         &new_values[..def.n_columns],
-        Some(rowid),
+        ConstraintRow::update(rowid),
         txn.txid,
         Some(txn),
         checks,
@@ -52054,13 +52054,18 @@ fn finish_copy_row<'a>(
     check_not_null(definition, values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
+    let row = if definition.kind == crate::storage::TableKind::Foreign {
+        ConstraintRow::Validation { excluded: None }
+    } else {
+        ConstraintRow::insert(storage.next_rowid()?)
+    };
     enforce_row_constraints(
         storage,
         target,
         definition,
         &schema[..definition.n_columns],
         &values[..definition.n_columns],
-        None,
+        row,
         txn.txid,
         Some(txn),
         checks,
@@ -52088,7 +52093,13 @@ fn finish_copy_row<'a>(
             tuple_id,
         }
     } else {
-        store_row_with_identity(storage, txn, target, None, &values[..definition.n_columns])?
+        store_row_with_identity(
+            storage,
+            txn,
+            target,
+            row.stored(),
+            &values[..definition.n_columns],
+        )?
     };
     inserted.push(stored).map_err(|_| {
         sql_err!(
@@ -52201,13 +52212,14 @@ pub(crate) fn apply_replication_insert(
     check_not_null(&definition, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
+    let rowid = storage.next_rowid()?;
     enforce_row_constraints(
         storage,
         target_table,
         &definition,
         &schema[..definition.n_columns],
         &values[..definition.n_columns],
-        None,
+        ConstraintRow::insert(rowid),
         txn.txid,
         Some(txn),
         &checks,
@@ -52218,7 +52230,7 @@ pub(crate) fn apply_replication_insert(
         storage,
         txn,
         target_table,
-        None,
+        Some(rowid),
         &values[..definition.n_columns],
     )?;
     fire_partition_row_triggers(
@@ -52708,13 +52720,21 @@ pub(crate) fn apply_replication_update(
     let target_table =
         storage.partition_target(table_index, &new_values[..definition.n_columns], txn.txid)?;
     check_not_null(&definition, &new_values)?;
+    let stored_rowid = if target_table == row_table {
+        row.rowid()
+    } else {
+        storage.next_rowid()?
+    };
     enforce_row_constraints(
         storage,
         target_table,
         &definition,
         &schema[..definition.n_columns],
         &new_values[..definition.n_columns],
-        (target_table == row_table).then_some(row.rowid()),
+        ConstraintRow::Stored {
+            excluded: (target_table == row_table).then_some(row.rowid()),
+            rowid: stored_rowid,
+        },
         txn.txid,
         Some(txn),
         &checks,
@@ -52734,7 +52754,7 @@ pub(crate) fn apply_replication_update(
             storage,
             txn,
             target_table,
-            None,
+            Some(stored_rowid),
             &new_values[..definition.n_columns],
         )?;
         let prior =
@@ -56517,13 +56537,28 @@ pub(crate) fn merge<'a>(
                         } else {
                             target_schema
                         };
+                        let stored_rowid = if foreign_target || updated_table == target_tables[j] {
+                            target_ids[j]
+                        } else {
+                            match storage.next_rowid() {
+                                Ok(rowid) => rowid,
+                                Err(error) => return sql_fail(error),
+                            }
+                        };
                         if let Err(e) = enforce_row_constraints(
                             storage,
                             updated_table,
                             def,
                             constraint_schema,
                             &new_values[..def.n_columns],
-                            (!foreign_target).then_some(target_ids[j]),
+                            if foreign_target {
+                                ConstraintRow::Validation { excluded: None }
+                            } else {
+                                ConstraintRow::Stored {
+                                    excluded: Some(target_ids[j]),
+                                    rowid: stored_rowid,
+                                }
+                            },
                             txn.txid,
                             Some(txn),
                             &checks,
@@ -56617,7 +56652,7 @@ pub(crate) fn merge<'a>(
                                     Err(e) => return sql_fail(e),
                                 }
                             } else {
-                                let inserted_rowid = storage.next_rowid();
+                                let inserted_rowid = stored_rowid;
                                 let prior = match storage.write_pending(
                                     updated_table,
                                     inserted_rowid,
@@ -57060,13 +57095,18 @@ fn merge_insert<'a>(
     check_not_null(def, &row_arr)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
+    let row = if def.kind == crate::storage::TableKind::Foreign {
+        ConstraintRow::Validation { excluded: None }
+    } else {
+        ConstraintRow::insert(storage.next_rowid()?)
+    };
     enforce_row_constraints(
         storage,
         target_table,
         def,
         &schema[..def.n_columns],
         &row_arr[..def.n_columns],
-        None,
+        row,
         txn.txid,
         Some(txn),
         checks,
@@ -57091,7 +57131,13 @@ fn merge_insert<'a>(
             ));
         }
     } else {
-        store_row(storage, txn, target_table, None, &row_arr[..def.n_columns])?;
+        store_row(
+            storage,
+            txn,
+            target_table,
+            row.stored(),
+            &row_arr[..def.n_columns],
+        )?;
     }
     fire_partition_row_triggers(
         storage,
@@ -57278,13 +57324,21 @@ where
             Err(error) => return Ok(Err(error)),
         }
     }
+    let row = if definition.kind == crate::storage::TableKind::Foreign {
+        ConstraintRow::Validation { excluded: None }
+    } else {
+        match storage.next_rowid() {
+            Ok(rowid) => ConstraintRow::insert(rowid),
+            Err(error) => return Ok(Err(error)),
+        }
+    };
     if let Err(error) = enforce_row_constraints(
         storage,
         table_index,
         definition,
         &schema[..definition.n_columns],
         &values[..definition.n_columns],
-        None,
+        row,
         txn.txid,
         Some(txn),
         checks,
@@ -57311,7 +57365,7 @@ where
         storage,
         txn,
         table_index,
-        None,
+        row.stored(),
         &values[..definition.n_columns],
     ) {
         return Ok(Err(error));
@@ -59864,6 +59918,8 @@ pub(crate) fn update<'a>(
         let mut row_schema = [ColType::Bool; MAX_COLUMNS];
         row_definition.schema(&mut row_schema);
         let row_schema = &row_schema[..row_definition.n_columns];
+        let mut target_table = row_table;
+        let mut stored_rowid = rowid;
         let new_bytes = {
             let mut values = [Datum::Null; MAX_COLUMNS];
             if let Err(e) = rowenc::decode(row_bytes, row_schema, &mut values) {
@@ -60180,13 +60236,36 @@ pub(crate) fn update<'a>(
             if let Err(e) = check_not_null(def, new_values) {
                 return sql_fail(e);
             }
+            if remote_tuple.is_none() && def.partition.is_partitioned() {
+                target_table = match storage.partition_target(
+                    table_index,
+                    &new_values[..def.n_columns],
+                    txn.txid,
+                ) {
+                    Ok(target) => target,
+                    Err(error) => return sql_fail(error),
+                };
+                if target_table != row_table {
+                    stored_rowid = match storage.next_rowid() {
+                        Ok(rowid) => rowid,
+                        Err(error) => return sql_fail(error),
+                    };
+                }
+            }
             if let Err(e) = enforce_row_constraints(
                 storage,
-                row_table,
+                target_table,
                 def,
                 schema,
                 &new_values[..def.n_columns],
-                remote_tuple.is_none().then_some(rowid),
+                if remote_tuple.is_some() {
+                    ConstraintRow::Validation { excluded: None }
+                } else {
+                    ConstraintRow::Stored {
+                        excluded: Some(rowid),
+                        rowid: stored_rowid,
+                    }
+                },
                 txn.txid,
                 Some(txn),
                 &checks,
@@ -60295,18 +60374,6 @@ pub(crate) fn update<'a>(
             updated += 1;
             continue;
         }
-        let target_table = if def.partition.is_partitioned() {
-            let mut target_values = [Datum::Null; MAX_COLUMNS];
-            if let Err(error) = rowenc::decode(new_bytes, row_schema, &mut target_values) {
-                return sql_fail(error);
-            }
-            match storage.partition_target(table_index, &target_values[..def.n_columns], txn.txid) {
-                Ok(target) => target,
-                Err(error) => return sql_fail(error),
-            }
-        } else {
-            row_table
-        };
         let new_loc = match storage.heap.append_bytes(new_bytes) {
             Ok(x) => x,
             Err(e) => return sql_fail(e),
@@ -60323,7 +60390,7 @@ pub(crate) fn update<'a>(
                 Err(e) => return sql_fail(e),
             }
         } else {
-            let inserted_rowid = storage.next_rowid();
+            let inserted_rowid = stored_rowid;
             let insert_prior = match storage.write_pending(
                 target_table,
                 inserted_rowid,
@@ -61513,7 +61580,9 @@ fn validate_all_rows(
                     new_def,
                     schema,
                     values,
-                    Some(rowid),
+                    ConstraintRow::Validation {
+                        excluded: Some(rowid),
+                    },
                     txid,
                     None,
                     &checks,
@@ -63317,7 +63386,9 @@ fn alter_partition_attachment(
                         &parent_def,
                         &schema[..parent_def.n_columns],
                         &values[..parent_def.n_columns],
-                        None,
+                        ConstraintRow::Validation {
+                            excluded: Some(rowid),
+                        },
                         txn.txid,
                         Some(txn),
                         &parent_checks,
@@ -67822,8 +67893,11 @@ fn store_row_with_identity(
     rowid: Option<u64>,
     values: &[Datum],
 ) -> Result<PhysicalRow, SqlError> {
+    let rowid = match rowid {
+        Some(rowid) => rowid,
+        None => storage.next_rowid()?,
+    };
     let loc = storage.heap.append_row(values)?;
-    let rowid = rowid.unwrap_or_else(|| storage.next_rowid());
     let prior = storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), Some(loc))?;
     if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
         storage.restore_pending(table_index, rowid, txn.txid, prior);

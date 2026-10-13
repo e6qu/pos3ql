@@ -50,7 +50,9 @@ returns `0A000`, matching PostgreSQL's replication snapshot rules.
 
 Validity and history protection are updated under one short guard. Replacement
 cannot briefly release retained history; import checks capacity before changing
-the importing transaction. Exports reserve `max_connections` entries at startup,
+the importing transaction. Expiration schedules history cleanup at the next
+statement boundary, so it does not walk every table under the validity guard.
+Exports reserve `max_connections` entries at startup,
 separately from transaction snapshot entries. Exhaustion returns `54000` without
 replacing a valid export or partly importing a snapshot. These protections do
 not enable parallel SQL execution.

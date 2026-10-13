@@ -143,7 +143,7 @@ impl Storage {
             return;
         };
         snapshots.exported.swap_remove(index);
-        self.prune_snapshot_versions(snapshots.oldest());
+        snapshots.statement_reclamation_pending = true;
         drop(snapshots);
         self.lock_state()
             .row
@@ -471,6 +471,46 @@ mod tests {
     }
 
     #[test]
+    fn replication_snapshot_expiration_does_not_wait_for_row_metadata() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let (storage, table) = fixture();
+        storage.export_replication_snapshot(77, 7).unwrap();
+        let finished = AtomicBool::new(false);
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let reader = storage.resident_row_state(table, 1).unwrap();
+            scope.spawn(|| {
+                start.wait();
+                crate::mem::guard::forbid_alloc(|| {
+                    storage.invalidate_replication_snapshot(77);
+                    finished.store(true, Ordering::Release);
+                });
+            });
+            start.wait();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            crate::mem::guard::forbid_alloc(|| {
+                while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+            });
+            let progressed = finished.load(Ordering::Acquire);
+            // Release even on failure, so a regression reports an assertion
+            // instead of leaving a blocked worker for the job deadline.
+            drop(reader);
+            assert!(
+                progressed,
+                "export expiration waited for row-version metadata"
+            );
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(storage.snapshot_state().statement_reclamation_pending);
+            storage.prune_released_statement_snapshots();
+            assert!(!storage.snapshot_state().statement_reclamation_pending);
+        });
+    }
+
+    #[test]
     fn replication_snapshot_import_and_expiration_are_atomic_with_writes() {
         use std::sync::atomic::{AtomicBool, Ordering};
         for _ in 0..12 {
@@ -506,6 +546,7 @@ mod tests {
                 });
             });
             crate::mem::guard::forbid_alloc(|| {
+                storage.prune_released_statement_snapshots();
                 if imported.load(Ordering::Acquire) {
                     assert_eq!(storage.oldest_snapshot(), Some(7));
                     assert_original_row(&storage, table, 99);

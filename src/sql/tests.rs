@@ -30548,6 +30548,8 @@ fn row_identity_high_watermark_survives_journal_and_checkpoint_cold_recovery() {
     let mut config = test_config("row-identity-cold-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
     config.object_store_bucket = format!("row-identity-cold-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.block_cache_bytes = 512 * 1024;

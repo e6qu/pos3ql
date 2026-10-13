@@ -276,6 +276,7 @@ impl Storage {
         state.committed
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_table_statistics(
         &self,
         table_slot: usize,

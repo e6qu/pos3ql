@@ -419,7 +419,6 @@ pub struct Engine {
     /// workspace identity; worker parallelism can use these slots without
     /// introducing runtime allocation.
     work: QueryWorkspaces,
-    next_txid: u32,
     max_connections: u32,
     max_prepared_transactions: usize,
     max_locks_per_transaction: usize,
@@ -2345,15 +2344,6 @@ fn cursor_result_too_large() -> SqlError {
     )
 }
 
-fn next_transaction_identity(current: u32) -> Result<u32, SqlError> {
-    current.checked_add(1).ok_or_else(|| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "transaction identity space is exhausted"
-        )
-    })
-}
-
 impl Engine {
     /// Selects one exclusively leased startup-reserved query workspace.
     pub(crate) fn select_query_workspace(&mut self, workspace: QueryWorkspaceId) {
@@ -3328,12 +3318,11 @@ impl Engine {
                 ));
             }
         }
-        let recovered_transaction_id = u32::try_from(storage.latest_transaction_identity())
-            .map_err(|_| {
-                EngineSetupError::Checkpoint(crate::checkpoint::CheckpointSetupError::Corrupt(
-                    "recovered transaction identity exceeds the internal counter",
-                ))
-            })?;
+        u32::try_from(storage.latest_transaction_identity()).map_err(|_| {
+            EngineSetupError::Checkpoint(crate::checkpoint::CheckpointSetupError::Corrupt(
+                "recovered transaction identity exceeds the internal counter",
+            ))
+        })?;
         // WAL carries catalog identities as names where runtime slots are not
         // durable. Rebind each recovered database only after every replayed
         // definition exists.
@@ -3376,20 +3365,18 @@ impl Engine {
             c.publish_commit_batch(first, &segment)?;
         }
         storage.ensure_no_pending_replay_table_rewrite()?;
-        let mut recovered_transaction_id = recovered_transaction_id;
         if clean_shutdown_lsn != Some(storage.lsn()) && storage.has_unlogged_relations() {
-            let transaction_id = next_transaction_identity(recovered_transaction_id)?;
+            let transaction_id = storage.reserve_transaction_identity()?;
             let provisional_lsn = storage.lsn().checked_add(1).ok_or_else(|| {
                 sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
             })?;
             storage.reset_unlogged_relations()?;
-            recovered_transaction_id = transaction_id;
             wal.stage(
-                recovered_transaction_id,
+                transaction_id,
                 provisional_lsn,
                 &WalOp::ResetUnloggedRelations,
             )?;
-            let commit_lsn = wal.commit_stage(recovered_transaction_id, storage.lsn())?;
+            let commit_lsn = wal.commit_stage(transaction_id, storage.lsn())?;
             wal.commit();
             storage.set_lsn(commit_lsn);
         }
@@ -3465,7 +3452,6 @@ impl Engine {
                 crate::storage::row_heap_image_capacity(config),
             )?,
             work,
-            next_txid: recovered_transaction_id,
             max_connections: config.max_connections,
             max_prepared_transactions: config.max_prepared_transactions,
             max_locks_per_transaction: config.max_locks_per_transaction,
@@ -4819,9 +4805,8 @@ impl Engine {
             }
             return Ok(());
         }
-        txn.txid = self.allocate_transaction_id()?;
+        txn.txid = self.storage.start_transaction_identity()?;
         txn.mode = mode;
-        self.storage.begin_transaction_identity(txn.txid);
         datetime::begin_transaction();
         guc.begin_transaction();
         let (isolation, read_only, deferrable) = guc.transaction_defaults();
@@ -4830,10 +4815,8 @@ impl Engine {
         Ok(())
     }
 
-    fn allocate_transaction_id(&mut self) -> Result<u32, SqlError> {
-        let transaction_id = next_transaction_identity(self.next_txid)?;
-        self.next_txid = transaction_id;
-        Ok(transaction_id)
+    fn allocate_transaction_id(&self) -> Result<u32, SqlError> {
+        self.storage.reserve_transaction_identity()
     }
 
     fn begin_command_snapshot(
@@ -19102,7 +19085,7 @@ fn replay_transaction_batches(
                     .slot_mut(slot)
                     .transaction
                     .restore_prepared_identity(transaction_id);
-                storage.begin_transaction_identity(transaction_id);
+                storage.begin_transaction_identity(transaction_id)?;
                 storage.assign_transaction_identity(transaction_id);
                 storage.select_database_for_recovery(database)?;
                 for (record_lsn, raw) in &batch[..batch.len() - 1] {
@@ -19314,7 +19297,7 @@ fn replay_transaction_batches(
                 if *lsn > apply_floor {
                     storage.observe_transaction_identity(u64::from(transaction_id));
                     if assigned_transaction_identity {
-                        storage.begin_transaction_identity(transaction_id);
+                        storage.begin_transaction_identity(transaction_id)?;
                         storage.assign_transaction_identity(transaction_id);
                         storage.finish_transaction_identity(transaction_id, true);
                     }

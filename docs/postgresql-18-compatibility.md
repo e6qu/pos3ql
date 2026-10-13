@@ -88,7 +88,11 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 
 Startup-sized catalogs have independent capacities; table count does not silently
 size unrelated classes. Transaction bounds also cover prepared and subscription
-slots. `max_catalog_versions_per_object` bounds retained definition/undo versions.
+slots. The active transaction identity registry reserves
+`max_connections + max_prepared_transactions` entries. Creating a transaction
+returns `54000` if none is free; existing transactions remain usable, and ending
+one releases its entry. SQL and maintenance share one checked identity counter.
+`max_catalog_versions_per_object` bounds retained definition/undo versions.
 `max_row_versions_per_row` bounds pending writes and committed snapshot versions;
 each write retains an immutable image, including writes in the same command.
 Pending version identity exhaustion is a named program-limit error.

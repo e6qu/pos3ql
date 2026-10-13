@@ -67,6 +67,14 @@ unknown, or mismatched completion record. The backup manifest itself is the
 retention pin, so an interrupted creation cannot expose a restorable name or
 lose blocks that its partial state may reference.
 
+The transaction identity counter has one guarded owner shared by SQL and
+maintenance. For example, two connections starting transactions cannot receive
+the same identity; a full active registry rejects the new transaction before
+changing its session. The existing `latest_transaction_id` manifest field and
+journal commit identities preserve the counter through recovery. Exhaustion
+of the 32-bit internal identity space returns `54000` before reuse. These
+changes preserve the existing encodings and startup reservation sizes.
+
 Current commit boundary records append PostgreSQL-epoch commit microseconds to
 the transaction identity fields. Readers retain the empty, identity-only, and
 identity-plus-assignment legacy forms. LSN recovery can use legacy records;

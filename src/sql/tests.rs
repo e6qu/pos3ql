@@ -331,9 +331,107 @@ fn visible_row_heap_ownership_command_exhaustion_allows_rollback() {
 }
 
 #[test]
+fn shared_transaction_identity_registry_exhaustion_preserves_sessions() {
+    let mut config = test_config("shared-transaction-identity-capacity");
+    config.max_connections = 1;
+    config.max_prepared_transactions = 0;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut first = TxnState::new(&mut budget, 8).unwrap();
+    let mut second = TxnState::new(&mut budget, 8).unwrap();
+    let guc = GucState::new();
+    crate::mem::guard::forbid_alloc(|| {
+        engine.storage.observe_transaction_identity(100);
+        engine
+            .ensure_txn(&mut first, TxnMode::Explicit, &guc)
+            .unwrap();
+        let original = first.txid;
+        assert_eq!(original, 101);
+        let latest = engine.storage.latest_transaction_identity();
+        let error = engine
+            .ensure_txn(&mut second, TxnMode::Implicit, &guc)
+            .unwrap_err();
+        assert_eq!(
+            error.message.as_str(),
+            "transaction identity registry exhausted"
+        );
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(!second.is_active());
+        assert_eq!(second.txid, 0);
+        assert_eq!(first.txid, original);
+        assert!(first.is_active());
+        assert_eq!(engine.storage.latest_transaction_identity(), latest);
+        let maintenance = engine.allocate_transaction_id().unwrap();
+        assert_eq!(u64::from(maintenance), latest + 1);
+        engine
+            .ensure_txn(&mut first, TxnMode::Explicit, &guc)
+            .unwrap();
+        engine.rollback_txn(&mut first, &guc);
+        engine
+            .ensure_txn(&mut second, TxnMode::Implicit, &guc)
+            .unwrap();
+        assert_eq!(second.txid, maintenance + 1);
+        engine.rollback_txn(&mut second, &guc);
+    });
+}
+
+#[test]
+fn shared_transaction_identity_exhaustion_survives_checkpoint_cold_recovery() {
+    let mut config = test_config("shared-transaction-identity-terminal");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("shared-transaction-terminal-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE terminal_identity (id integer)",
+    );
+    assert!(!message_types(&created).contains(&b'E'));
+    engine.commit_wal().unwrap();
+    engine
+        .storage
+        .observe_transaction_identity(u64::from(u32::MAX));
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        recovered.storage.latest_transaction_identity(),
+        u64::from(u32::MAX)
+    );
+    assert!(
+        recovered
+            .storage
+            .find_table("public", "terminal_identity")
+            .is_some()
+    );
+    let rejected = run_with_fixed_memory(&mut recovered, &budget, "SELECT 1", 1 << 20);
+    let rejected = String::from_utf8_lossy(&rejected);
+    assert!(
+        rejected.contains("54000") && rejected.contains("transaction identity space is exhausted"),
+        "{rejected}"
+    );
+    assert_eq!(
+        recovered.storage.latest_transaction_identity(),
+        u64::from(u32::MAX)
+    );
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn visible_row_heap_ownership_transaction_exhaustion_rejects_wire_statement() {
     let (mut engine, budget) = test_engine();
-    engine.next_txid = u32::MAX;
+    engine
+        .storage
+        .observe_transaction_identity(u64::from(u32::MAX));
     let output = run_with_fixed_memory(
         &mut engine,
         &budget,
@@ -349,7 +447,10 @@ fn visible_row_heap_ownership_transaction_exhaustion_rejects_wire_statement() {
             .find_table("public", "exhausted_identity")
             .is_none()
     );
-    assert_eq!(engine.next_txid, u32::MAX);
+    assert_eq!(
+        engine.storage.latest_transaction_identity(),
+        u64::from(u32::MAX)
+    );
 }
 
 #[test]
@@ -362,7 +463,9 @@ fn visible_row_heap_ownership_transaction_exhaustion_preserves_active_owners() {
         .ensure_txn(&mut first, TxnMode::Explicit, &guc)
         .unwrap();
     let active = first.txid;
-    engine.next_txid = u32::MAX;
+    engine
+        .storage
+        .observe_transaction_identity(u64::from(u32::MAX));
     crate::mem::guard::forbid_alloc(|| {
         let error = engine
             .ensure_txn(&mut second, TxnMode::Implicit, &guc)
@@ -372,7 +475,10 @@ fn visible_row_heap_ownership_transaction_exhaustion_preserves_active_owners() {
         assert!(!second.is_active());
         assert_eq!(first.txid, active);
         assert!(first.is_active());
-        assert_eq!(engine.next_txid, u32::MAX);
+        assert_eq!(
+            engine.storage.latest_transaction_identity(),
+            u64::from(u32::MAX)
+        );
         engine
             .ensure_txn(&mut first, TxnMode::Explicit, &guc)
             .unwrap();
@@ -6451,7 +6557,7 @@ fn unassigned_wal_transactions_stay_full_xid_gaps_after_cold_recovery() {
          COMMIT",
     );
     assert_eq!(data_rows(&prelogged_advance), ["t", "2", "t"]);
-    let gap = engine.next_txid;
+    let gap = engine.storage.latest_transaction_identity();
     assert_eq!(
         data_rows(&run_with(
             &mut engine,

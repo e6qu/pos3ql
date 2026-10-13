@@ -30181,7 +30181,7 @@ impl Storage {
         rowid: u64,
         state: RowRead<'_>,
         txid: u32,
-    ) -> Result<Option<VisibleRowHome<'_>>, SqlError> {
+    ) -> Result<Option<VisibleRowHome>, SqlError> {
         self.visible_row_home_at(
             table_slot,
             rowid,
@@ -30203,7 +30203,7 @@ impl Storage {
         txid: u32,
         command_snapshot: u32,
         commit_snapshot: u64,
-    ) -> Result<Option<VisibleRowHome<'_>>, SqlError> {
+    ) -> Result<Option<VisibleRowHome>, SqlError> {
         if let Some(source) = state.spilled_source() {
             source.validate_request(table_slot, rowid)?;
             let selected = source.visible_at(commit_snapshot)?;
@@ -30221,7 +30221,7 @@ impl Storage {
         table_slot: usize,
         rowid: u64,
         state: RowRead<'_>,
-    ) -> Result<Option<VisibleRowHome<'_>>, SqlError> {
+    ) -> Result<Option<VisibleRowHome>, SqlError> {
         if let Some(source) = state.spilled_source() {
             source.validate_request(table_slot, rowid)?;
             let selected = source.visible_at(u64::MAX)?;
@@ -30242,7 +30242,7 @@ impl Storage {
         state: RowRead<'_>,
         selected: Option<(RowVersionIdentity, Option<RowHome>)>,
         object_snapshot: Option<u64>,
-    ) -> Result<Option<VisibleRowHome<'_>>, SqlError> {
+    ) -> Result<Option<VisibleRowHome>, SqlError> {
         let roots = state.captured_roots();
         if let Some((version, home)) = selected {
             let Some(home) = home else { return Ok(None) };
@@ -30316,9 +30316,14 @@ impl Storage {
         rowid: u64,
         snapshot: RowSnapshot,
         home: RowHome,
-    ) -> Result<VisibleRowHome<'_>, SqlError> {
+    ) -> Result<VisibleRowHome, SqlError> {
         match home {
-            RowHome::Heap(location) => Ok(VisibleRowHome::heap(snapshot, self.heap.get(location)?)),
+            RowHome::Heap(location) => Ok(VisibleRowHome::heap(
+                snapshot,
+                self.heap.get(location)?,
+                table_slot,
+                rowid,
+            )),
             RowHome::Spilled {
                 len,
                 sst,
@@ -30343,7 +30348,7 @@ impl Storage {
         table_slot: usize,
         rowid: u64,
         snapshot: RowSnapshot,
-    ) -> Result<VisibleRowHome<'_>, SqlError> {
+    ) -> Result<VisibleRowHome, SqlError> {
         if self.tables[table_slot].created_at() != snapshot.created_at {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
@@ -30756,11 +30761,11 @@ impl Storage {
 
     /// Retained row bytes belong to the fixed statement arena; heap owners end
     /// before callers retain the image or invoke mutable callbacks.
-    pub(crate) fn row_bytes<'a, 'image>(
+    pub(crate) fn row_bytes<'a>(
         &self,
         table_slot: usize,
         rowid: u64,
-        home: impl Into<RowByteRead<'image>>,
+        home: impl Into<RowByteRead>,
         arena: &'a crate::mem::arena::Arena,
     ) -> Result<&'a [u8], SqlError> {
         match home.into().0 {
@@ -30781,9 +30786,10 @@ impl Storage {
         &self,
         table_slot: usize,
         rowid: u64,
-        image: VisibleRowHome<'_>,
+        image: VisibleRowHome,
         arena: &'a crate::mem::arena::Arena,
     ) -> Result<&'a [u8], SqlError> {
+        image.validate_request(table_slot, rowid)?;
         match image.bytes {
             VisibleRowBytes::Heap(row) => Self::copy_heap_row(row, arena),
             VisibleRowBytes::Spilled(source) => {
@@ -30794,7 +30800,7 @@ impl Storage {
     }
 
     fn copy_heap_row<'a>(
-        row: row_heap::HeapRowRead<'_>,
+        row: row_heap::HeapRowRead,
         arena: &'a Arena,
     ) -> Result<&'a [u8], SqlError> {
         arena
@@ -30828,16 +30834,16 @@ impl Storage {
     }
 
     /// Hands a visible row's bytes to `f` without arena residency: a heap row
-    /// borrows the heap; a spilled row is fetched into the spill reader's own
+    /// retains its startup allocation; a spilled row is fetched into the spill reader's own
     /// scratch for the duration of the call. For consume-in-place readers
     /// (constraint scans) whose decoded values do not outlive the closure.
     /// Nested fetches use independent startup scratch; exhaustion reports
     /// SQLSTATE 54000 instead of aliasing the outer callback's bytes.
-    pub(crate) fn with_row_bytes<'image, R>(
+    pub(crate) fn with_row_bytes<R>(
         &self,
         table_slot: usize,
         rowid: u64,
-        home: impl Into<RowByteRead<'image>>,
+        home: impl Into<RowByteRead>,
         f: impl FnOnce(&[u8]) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         match home.into().0 {
@@ -30858,9 +30864,10 @@ impl Storage {
         &self,
         table_slot: usize,
         rowid: u64,
-        image: VisibleRowHome<'_>,
+        image: VisibleRowHome,
         f: impl FnOnce(&[u8]) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
+        image.validate_request(table_slot, rowid)?;
         match image.bytes {
             VisibleRowBytes::Heap(row) => f(&row),
             VisibleRowBytes::Spilled(source) => {
@@ -31498,6 +31505,7 @@ impl Storage {
         &mut self,
         scratch: &mut FixedVec<(u32, u64, RowHeapImage, RowLoc)>,
     ) -> Result<(), SqlError> {
+        let heap = self.heap.exclusive()?;
         scratch.clear();
         let row_versions = self.row_versions.exclusive();
         for (index, table) in self.tables.iter().enumerate() {
@@ -31549,7 +31557,6 @@ impl Storage {
         scratch
             .as_mut_slice()
             .sort_unstable_by_key(|(_, _, _, loc)| (loc.offset, loc.len));
-        let heap = self.heap.exclusive();
         heap.validate_relocation(scratch.iter().map(|(_, _, _, location)| *location))?;
         let generation = heap.next_relocation_generation()?;
         let mut write_at = 0usize;
@@ -31964,11 +31971,11 @@ impl Storage {
     /// all non-NULL, writing `(enforcer_index, hash)` for each into `out`.
     /// NULL keys remain in durable ordered generations but cannot satisfy an
     /// equality probe, so the resident exact map deliberately omits them.
-    fn row_enforcer_hashes<'image>(
+    fn row_enforcer_hashes(
         &self,
         table_index: usize,
         rowid: u64,
-        home: impl Into<RowByteRead<'image>>,
+        home: impl Into<RowByteRead>,
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
         let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -32027,12 +32034,12 @@ impl Storage {
         Ok(n_out)
     }
 
-    fn with_value_binding_key<'image, R>(
+    fn with_value_binding_key<R>(
         &self,
         table_index: usize,
         binding: usize,
         rowid: u64,
-        home: impl Into<RowByteRead<'image>>,
+        home: impl Into<RowByteRead>,
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let table = &self.tables[table_index];
@@ -33473,12 +33480,12 @@ impl Storage {
 
     /// Encodes one binding's key followed by its included-column payload into
     /// caller-owned scratch. The returned lengths are the sole split point.
-    pub(crate) fn encode_value_binding_entry<'image>(
+    pub(crate) fn encode_value_binding_entry(
         &self,
         table_index: usize,
         binding: usize,
         rowid: u64,
-        home: impl Into<RowByteRead<'image>>,
+        home: impl Into<RowByteRead>,
         output: &mut [u8],
     ) -> Result<Option<(usize, usize, u64)>, SqlError> {
         self.with_value_binding_key(
@@ -59774,6 +59781,233 @@ mod tests {
             CatalogDdlState::Present.drop_by(1),
             CatalogDdlState::PendingDrop { txid: 1 }
         );
+    }
+
+    #[test]
+    fn owned_heap_rows_survive_table_slot_reuse_and_storage_teardown() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("old_heap", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        let arena = Arena::new(&mut budget, "owned heap rows", 4).unwrap();
+        let (old, created_at) = crate::mem::guard::forbid_alloc(|| {
+            let old_location = storage.heap.append_bytes(b"keep").unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, RowState::committed_only_at(old_location, 7))
+                .unwrap();
+            let old = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.row_state(table, 1).unwrap().unwrap(),
+                    0,
+                    SNAPSHOT_ALL,
+                    7,
+                )
+                .unwrap()
+                .unwrap();
+            let created_at = old.snapshot().created_at;
+            storage.commit_drop(table);
+            let replacement = storage
+                .create_table(make_def("new_heap", &[("id", ColType::Int4, true)]))
+                .unwrap();
+            assert_eq!(replacement, table);
+            assert_ne!(storage.tables[table].created_at(), created_at);
+            let new_location = storage.heap.append_bytes(b"next").unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, RowState::committed_only_at(new_location, 8))
+                .unwrap();
+            assert_eq!(
+                storage
+                    .row_bytes(table, 1, old.snapshot(), &arena)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let new = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.row_state(table, 1).unwrap().unwrap(),
+                    0,
+                    SNAPSHOT_ALL,
+                    8,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(storage.row_bytes(table, 1, new, &arena).unwrap(), b"next");
+            (old, created_at)
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            drop(storage);
+            assert_eq!(old.snapshot().created_at, created_at);
+            assert_eq!(old.snapshot().version, RowVersionIdentity::Committed(7));
+            let VisibleRowBytes::Heap(bytes) = old.bytes else {
+                panic!("expected heap bytes")
+            };
+            assert_eq!(&*bytes, b"keep");
+            drop(bytes);
+        });
+    }
+
+    #[test]
+    fn owned_heap_rows_compaction_rejection_preserves_versions_and_retry() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("pinned_heap", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        let mut scratch = FixedVec::new(&mut budget, "owned heap compaction", 4).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.heap.append_bytes(b"dead").unwrap();
+            let location = storage.heap.append_bytes(b"keep").unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, RowState::committed_only_at(location, 7))
+                .unwrap();
+            let image = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.row_state(table, 1).unwrap().unwrap(),
+                    0,
+                    SNAPSHOT_ALL,
+                    7,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.tables[table].rows.test_write().is_ok());
+            let later = storage.heap.append_bytes(b"next").unwrap();
+            storage
+                .write_pending_untracked(table, 1, 9, 1, Some(later))
+                .unwrap();
+            let error = storage.compact_heap(&mut scratch).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                error.message.as_str(),
+                "row heap reclamation is blocked by retained row bytes"
+            );
+            assert_eq!(storage.heap.used(), 12);
+            assert!(scratch.is_empty());
+            assert_eq!(
+                storage.tables[table].rows.get(&1).unwrap().committed,
+                Some(RowHome::Heap(location))
+            );
+            assert_eq!(
+                storage
+                    .row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .pending_last()
+                    .unwrap()
+                    .loc,
+                Some(later)
+            );
+            storage
+                .with_row_bytes(table, 1, image, |bytes| {
+                    assert_eq!(bytes, b"keep");
+                    Ok(())
+                })
+                .unwrap();
+            storage.compact_heap(&mut scratch).unwrap();
+            assert_eq!(storage.heap.used(), 8);
+            assert_eq!(
+                storage.tables[table]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .committed
+                    .unwrap()
+                    .heap_loc()
+                    .unwrap()
+                    .offset,
+                0
+            );
+            assert_eq!(
+                storage
+                    .row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .pending_last()
+                    .unwrap()
+                    .loc
+                    .unwrap()
+                    .offset,
+                4
+            );
+            assert_eq!(
+                storage.heap.get(location).err().unwrap().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+        });
+    }
+
+    #[test]
+    fn owned_heap_rows_failed_consumers_release_ownership_and_check_identity() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("error_heap", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        let tiny = Arena::new(&mut budget, "too small for heap row", 3).unwrap();
+        let mut scratch = FixedVec::new(&mut budget, "error heap compaction", 2).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let location = storage.heap.append_bytes(b"keep").unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, RowState::committed_only_at(location, 7))
+                .unwrap();
+            for failure in 0..4 {
+                let image = storage
+                    .visible_row_home_at(
+                        table,
+                        1,
+                        storage.row_state(table, 1).unwrap().unwrap(),
+                        0,
+                        SNAPSHOT_ALL,
+                        7,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let error = match failure {
+                    0 => storage
+                        .row_bytes(table, 1, image, &tiny)
+                        .map(|_| ())
+                        .unwrap_err(),
+                    1 => storage
+                        .with_row_bytes(table, 1, image, |_| {
+                            Err::<(), _>(sql_err!(sqlstate::QUERY_CANCELED, "cancelled consumer"))
+                        })
+                        .unwrap_err(),
+                    2 => storage
+                        .with_row_bytes(table, 2, image, |_| -> Result<(), SqlError> {
+                            panic!("wrong row accepted")
+                        })
+                        .unwrap_err(),
+                    _ => storage
+                        .row_bytes(table + 1, 1, image, &tiny)
+                        .map(|_| ())
+                        .unwrap_err(),
+                };
+                assert_eq!(
+                    error.sqlstate,
+                    match failure {
+                        0 => sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        1 => sqlstate::QUERY_CANCELED,
+                        _ => sqlstate::INTERNAL_ERROR,
+                    }
+                );
+                assert!(storage.heap.test_write().is_ok());
+                storage.compact_heap(&mut scratch).unwrap();
+            }
+        });
     }
 
     #[test]

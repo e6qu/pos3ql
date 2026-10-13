@@ -35,7 +35,7 @@ impl TableRowSnapshot {
     pub(crate) fn retain(
         &self,
         rowid: u64,
-        image: &VisibleRowHome<'_>,
+        image: &VisibleRowHome,
     ) -> Result<OrderedRowSnapshot, crate::sql::eval::SqlError> {
         if self.created_at != image.snapshot.created_at {
             return Err(crate::sql_err!(
@@ -76,12 +76,14 @@ pub(crate) enum RowReadSource {
     StagedHeap(RowLoc),
 }
 
-pub(crate) struct VisibleRowHome<'a> {
+pub(crate) struct VisibleRowHome {
     snapshot: RowSnapshot,
-    pub(super) bytes: VisibleRowBytes<'a>,
+    table_slot: usize,
+    rowid: u64,
+    pub(super) bytes: VisibleRowBytes,
 }
 
-impl core::fmt::Debug for VisibleRowHome<'_> {
+impl core::fmt::Debug for VisibleRowHome {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
             .debug_struct("VisibleRowHome")
@@ -91,15 +93,22 @@ impl core::fmt::Debug for VisibleRowHome<'_> {
     }
 }
 
-pub(super) enum VisibleRowBytes<'a> {
-    Heap(HeapRowRead<'a>),
+pub(super) enum VisibleRowBytes {
+    Heap(HeapRowRead),
     Spilled(SpilledRowRead),
 }
 
-impl<'a> VisibleRowHome<'a> {
-    pub(super) fn heap(snapshot: RowSnapshot, bytes: HeapRowRead<'a>) -> Self {
+impl VisibleRowHome {
+    pub(super) fn heap(
+        snapshot: RowSnapshot,
+        bytes: HeapRowRead,
+        table_slot: usize,
+        rowid: u64,
+    ) -> Self {
         Self {
             snapshot,
+            table_slot,
+            rowid,
             bytes: VisibleRowBytes::Heap(bytes),
         }
     }
@@ -107,8 +116,24 @@ impl<'a> VisibleRowHome<'a> {
     pub(super) fn spilled(source: SpilledRowRead) -> Self {
         Self {
             snapshot: source.snapshot(),
+            table_slot: source.table_slot,
+            rowid: source.rowid,
             bytes: VisibleRowBytes::Spilled(source),
         }
+    }
+
+    pub(super) fn validate_request(
+        &self,
+        table: usize,
+        rowid: u64,
+    ) -> Result<(), crate::sql::eval::SqlError> {
+        if table != self.table_slot || rowid != self.rowid {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                "retained row does not match the requested table and row"
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn snapshot(&self) -> RowSnapshot {
@@ -144,27 +169,27 @@ impl<'a> VisibleRowHome<'a> {
 
 /// The source is explicit: a pinned visible image, a frozen snapshot, or
 /// physical metadata used by exclusive publication and maintenance paths.
-pub(crate) struct RowByteRead<'a>(pub(super) RowByteSource<'a>);
+pub(crate) struct RowByteRead(pub(super) RowByteSource);
 
-pub(super) enum RowByteSource<'a> {
-    Visible(VisibleRowHome<'a>),
+pub(super) enum RowByteSource {
+    Visible(VisibleRowHome),
     Snapshot(RowSnapshot),
     Physical(RowHome),
 }
 
-impl<'a> From<VisibleRowHome<'a>> for RowByteRead<'a> {
-    fn from(image: VisibleRowHome<'a>) -> Self {
+impl From<VisibleRowHome> for RowByteRead {
+    fn from(image: VisibleRowHome) -> Self {
         Self(RowByteSource::Visible(image))
     }
 }
 
-impl From<RowSnapshot> for RowByteRead<'_> {
+impl From<RowSnapshot> for RowByteRead {
     fn from(snapshot: RowSnapshot) -> Self {
         Self(RowByteSource::Snapshot(snapshot))
     }
 }
 
-impl From<RowReadSource> for RowByteRead<'_> {
+impl From<RowReadSource> for RowByteRead {
     fn from(source: RowReadSource) -> Self {
         match source {
             RowReadSource::Snapshot(snapshot) => Self(RowByteSource::Snapshot(snapshot)),
@@ -175,7 +200,7 @@ impl From<RowReadSource> for RowByteRead<'_> {
     }
 }
 
-impl From<RowHome> for RowByteRead<'_> {
+impl From<RowHome> for RowByteRead {
     fn from(home: RowHome) -> Self {
         Self(RowByteSource::Physical(home))
     }
@@ -222,6 +247,8 @@ mod tests {
                 version: RowVersionIdentity::Pending(1),
             },
             heap.get(location).unwrap(),
+            slot,
+            1,
         );
         let spilled =
             VisibleRowHome::spilled(storage.retain_spilled_row(slot, u64::MAX, 4, 0, 4).unwrap());

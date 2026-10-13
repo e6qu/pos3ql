@@ -273,10 +273,10 @@ impl RowScan<'_> {
     }
 }
 
-type PendingRowVisitor<'a> = dyn for<'row> FnMut(
+type PendingRowVisitor<'a> = dyn FnMut(
         u64,
         PendingChange,
-        Option<VisibleRowHome<'row>>,
+        Option<VisibleRowHome>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError>
     + 'a;
 

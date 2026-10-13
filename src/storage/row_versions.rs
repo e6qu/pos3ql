@@ -702,6 +702,7 @@ mod tests {
         config.large_object_pages = 1;
         config.max_row_versions_per_row = 2;
         let bytes = RowVersionPools::control_bytes()
+            + RowVersionPools::metadata_budget_bytes(&config)
             + pending_row_version_capacity(&config) * size_of::<PendingVersionSlot>()
             + committed_row_version_capacity(&config) * size_of::<CommittedVersionSlot>();
         let mut budget = Budget::new(bytes);

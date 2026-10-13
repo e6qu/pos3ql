@@ -67224,7 +67224,7 @@ fn row_matches<'a>(
     def: &TableDef,
     alias: Option<&str>,
     _schema: &[ColType],
-    home: crate::storage::VisibleRowHome<'_>,
+    home: crate::storage::VisibleRowHome,
     where_clause: Option<&Expr<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],

@@ -40,7 +40,7 @@ next statement.
 | Catalogs and table definitions | Synchronized updates; readers retain the definition and table identity they selected; nested lookups release shared guards | Concurrent creation/removal and retirement of table state |
 | Sequence positions | Per-table synchronization, checked arithmetic, coherent journal/checkpoint images, and acknowledgement of unchanged staged positions | Preserve these rules through engine-wide concurrent publication |
 | Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state; selected images are retained before releasing metadata | Safe movement and reclamation while readers remain active |
-| Row bytes | Readers pin immutable published ranges; appends initialize separate tails before publishing them | Concurrent relocation of existing bytes |
+| Row bytes | Selected rows own the startup heap allocation through table removal or Storage teardown; appends initialize separate tails | Reclaiming other heap ranges while a selected row remains retained |
 | Deferred reads | Logical row identity, table identity, and exact version identity, rather than remembered heap addresses | Coherent table lifecycle changes across every read path |
 
 ### How long reads keep data alive
@@ -69,8 +69,18 @@ byte phases use that captured partition. Rows kept in the in-memory map also
 resolve saved versions from those files; changing a file's position in the live
 list cannot redirect a selected read. Version ownership ends before object I/O.
 Checkpoint cursors follow the same
-capture order. Preserving resident row images through table removal and memory
-relocation remains planned work before concurrent execution is enabled.
+capture order. Selected resident row bytes own the startup heap allocation;
+retaining them does not keep a heap read guard held. They remain readable after
+table removal, reuse of its slot, or Storage teardown. This ownership adds only
+fixed startup controls, not a row copy or an allocation per read. Heap
+reclamation returns `54000` before changing bytes or locations while any row
+bytes are retained, and can be retried after readers release them. Invalid row
+requests, cancellation, and statement-buffer exhaustion release ownership.
+
+**User example:** once a read has selected an order's in-memory contents,
+removing the table cannot replace those contents with a newly created table's
+row. Finishing the same guarantee for rows the scan has not selected yet, and
+reclaiming other memory while selected rows remain active, are still planned.
 
 Individual object-row lookups retain their full generation list, schema,
 table identity, and reader buffers through byte retrieval. Their metadata also

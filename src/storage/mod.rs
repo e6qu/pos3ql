@@ -30799,10 +30799,7 @@ impl Storage {
         }
     }
 
-    fn copy_heap_row<'a>(
-        row: row_heap::HeapRowRead,
-        arena: &'a Arena,
-    ) -> Result<&'a [u8], SqlError> {
+    fn copy_heap_row(row: row_heap::HeapRowRead, arena: &Arena) -> Result<&[u8], SqlError> {
         arena
             .alloc_slice_copy(&row)
             .map(|bytes| &*bytes)

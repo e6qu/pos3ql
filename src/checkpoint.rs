@@ -8754,17 +8754,18 @@ impl Checkpointer {
                     ),
                 )?;
             }
-            if table.statistics.valid {
+            let table_statistics = table.committed_statistics();
+            if table_statistics.valid {
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
                         "stats {slot} {} {} {}",
-                        table.statistics.rows,
-                        table.statistics.average_row_width,
-                        table.statistics.analyzed_generation
+                        table_statistics.rows,
+                        table_statistics.average_row_width,
+                        table_statistics.analyzed_generation
                     ),
                 )?;
-                for (column, statistics) in table.statistics.columns[..definition.n_columns]
+                for (column, statistics) in table_statistics.columns[..definition.n_columns]
                     .iter()
                     .enumerate()
                 {

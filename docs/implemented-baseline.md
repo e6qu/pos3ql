@@ -40,6 +40,7 @@ next statement.
 | Catalogs and table definitions | Synchronized updates; readers retain the definition and table identity they selected; nested lookups release shared guards | Concurrent creation/removal and retirement of table state |
 | Sequence positions | Per-table synchronization, checked arithmetic, coherent journal/checkpoint images, and acknowledgement of unchanged staged positions | Preserve these rules through engine-wide concurrent publication |
 | Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state; selected images are retained before releasing metadata | Safe movement and reclamation while readers remain active |
+| Planner statistics | Readers copy their visible estimates; private versions and saved-state markers use guarded cells and fixed pools | Integrate these captures with concurrent engine publication |
 | Row bytes | Selected rows own their startup heap allocation; reclamation can copy live rows into an unretained buffer | Integrate relocation with concurrent table publication and maintenance scheduling |
 | Deferred reads | Logical row identity, table identity, and exact version identity, rather than remembered heap addresses | Coherent table lifecycle changes across every read path |
 
@@ -135,6 +136,28 @@ files. Maintenance replaces those files while the report processes its first
 rows. The report continues with its original file set and read position; a new
 scan captures the replacement. Downloads and callbacks hold none of the table
 capture guards. Cancellation and failed capture release reader registrations.
+
+### How statistics reads and journal batches stay consistent
+
+`ANALYZE` collects estimates used to choose query plans. Relation counts and
+column estimates have different PostgreSQL lifetimes: rolling back can leave
+`pg_class.reltuples` changed while `pg_stats` column estimates revert. Reads
+copy the image visible to their transaction under short guards. The private
+version pool, rollback, commit, replay, and table reuse use the same ownership
+order. Readers retain their copied values without holding these guards.
+
+Journal capture copies the visible estimates and records the exact relation-count
+revision from the same cell. Acknowledgement clears that captured revision's
+pending marker; a newer revision remains pending. Reused table slots preserve
+revision identities, and an owned receipt cannot redirect to another Storage
+instance. Each query workspace reserves receipts for every physical table at
+startup. Full or already retained workspaces return `54000`; cancellation and
+staging errors release them. Guards end before journal encoding and object I/O.
+
+**User example:** an older journal batch has captured an order table's row count.
+A later `ANALYZE` changes that count before the older batch finishes. Finishing
+the old batch leaves the new count marked for a later journal batch. Changes in
+one database are captured only when that database journals them.
 
 ### What maintenance may change
 

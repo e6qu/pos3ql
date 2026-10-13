@@ -411,6 +411,7 @@ pub struct Engine {
     /// Kept separate from checkpoint sort entries because a logical
     /// partitioned relation needs its leaf owner alongside the row identifier.
     dml_scratch: DmlWorkspaces,
+    statistics_receipts: std::sync::Arc<crate::storage::StatisticsReceiptPool>,
     /// Scratch for heap compaction: every live row image across tables.
     compact_scratch: FixedVec<(u32, u64, crate::storage::RowHeapImage, RowLoc)>,
     /// Startup-bounded slot-private execution arenas. The reactor still
@@ -3142,6 +3143,7 @@ impl Engine {
     /// Bytes drawn beyond the row heap, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
         Storage::extra_budget_bytes(config)
+            + crate::storage::StatisticsReceiptPool::budget_bytes(config)
             + exec::record_shape_pool_bytes(config.max_composites)
             + config.query_workspace_slots.saturating_mul(
                 size_of::<exec::DmlScratch>().saturating_add(
@@ -3461,6 +3463,7 @@ impl Engine {
             wal_seg_buf: Vec::with_capacity(upload_buf),
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
             dml_scratch: DmlWorkspaces::new(config, budget)?,
+            statistics_receipts: crate::storage::StatisticsReceiptPool::new(config, budget)?,
             compact_scratch: FixedVec::new(
                 budget,
                 "compact_scratch",
@@ -5241,18 +5244,22 @@ impl Engine {
         // journals relation statistics left dirty by a rolled-back ANALYZE.
         // In either case the final image crosses the same provider-neutral
         // WAL/object-store durability boundary as every other catalog change.
+        let statistics_receipts = match self.statistics_receipts.retain() {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+        };
         for slot in 0..self.storage.table_count() {
-            if !self.storage.table(slot).visible_to(txn.txid) {
+            let Some(image) = self.storage.capture_statistics_for_wal(slot, txn.txid) else {
                 continue;
+            };
+            if let Err(error) = statistics_receipts.retain_image(&image) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
             }
-            let pending = self.storage.pending_table_statistics(slot, txn.txid);
-            if pending.is_none() && !self.storage.statistics_wal_dirty(slot) {
-                continue;
-            }
-            let statistics =
-                pending.unwrap_or_else(|| self.storage.table_statistics(slot, txn.txid));
-            let definition = *self.storage.table_def(slot, txn.txid);
-            if definition.persistence == crate::storage::RelationPersistence::Temporary {
+            if image.persistence == crate::storage::RelationPersistence::Temporary {
                 continue;
             }
             let lsn = self.storage.lsn() + 1;
@@ -5260,9 +5267,9 @@ impl Engine {
                 txn.txid,
                 lsn,
                 &WalOp::Analyze {
-                    schema: definition.schema.as_str(),
-                    table: definition.name.as_str(),
-                    statistics: crate::wal::WalTableStatistics::Captured(&statistics),
+                    schema: image.schema.as_str(),
+                    table: image.name.as_str(),
+                    statistics: crate::wal::WalTableStatistics::Captured(&image.statistics),
                 },
             ) {
                 self.rollback_txn(txn, guc);
@@ -5933,17 +5940,7 @@ impl Engine {
                 self.storage.clear_brin_maintenance_dirty(slot);
             }
         }
-        for slot in 0..self.storage.table_count() {
-            if self.storage.table(slot).visible_to(txn.txid)
-                && (self
-                    .storage
-                    .pending_table_statistics(slot, txn.txid)
-                    .is_some()
-                    || self.storage.statistics_wal_dirty(slot))
-            {
-                self.storage.clear_statistics_wal_dirty(slot);
-            }
-        }
+        statistics_receipts.acknowledge();
         // The local journal makes the batch crash-recoverable while it waits
         // for the protocol publication barrier.  The connection releases no
         // successful response until that barrier has published the immutable

@@ -968,6 +968,8 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
             + dml_workspace_bytes)
             + Storage::extra_budget_bytes(&config)
             - Storage::extra_budget_bytes(&one)
+            + crate::storage::StatisticsReceiptPool::budget_bytes(&config)
+            - crate::storage::StatisticsReceiptPool::budget_bytes(&one)
     );
     let bytes = config.query_workspace_slots
         * (config.work_arena_bytes + core::mem::size_of::<QueryWorkspace>());
@@ -43298,6 +43300,93 @@ fn vacuum_and_analyze() {
         ))
         .is_empty()
     );
+}
+
+#[test]
+fn analyze_statistics_journal_capture_preserves_database_isolation() {
+    let config = test_config("statistics-database-journal");
+    {
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        for sql in [
+            "CREATE TABLE shared_estimates (id int); INSERT INTO shared_estimates VALUES (1), (2); ANALYZE shared_estimates",
+            "CREATE DATABASE statistics_peer TEMPLATE template0",
+        ] {
+            let output = run_with(&mut engine, &mut budget, sql);
+            assert!(
+                !message_types(&output).contains(&b'E'),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        let peer = engine
+            .storage
+            .database_slot("statistics_peer", 0)
+            .map(|slot| engine.storage.database(slot).oid)
+            .unwrap();
+        engine.select_database(peer).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE shared_estimates (id int); INSERT INTO shared_estimates VALUES (10), (11), (12); ANALYZE shared_estimates",
+        );
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "BEGIN; INSERT INTO shared_estimates VALUES (NULL); ANALYZE shared_estimates",
+            true,
+        );
+        // Connection abort leaves the in-place counts pending without the
+        // SQL ROLLBACK statement's following implicit journal transaction.
+        engine.rollback_txn(&mut session.transaction, &session.guc);
+        let peer_table = engine
+            .storage
+            .find_table("public", "shared_estimates")
+            .unwrap();
+        assert!(engine.storage.statistics_wal_dirty(peer_table));
+        engine
+            .select_database(crate::storage::DatabaseOid::POSTGRES)
+            .unwrap();
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, "SELECT 1")),
+            ["1"]
+        );
+        assert!(
+            engine.storage.statistics_wal_dirty(peer_table),
+            "a different database cannot acknowledge these counts"
+        );
+        engine.select_database(peer).unwrap();
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, "SELECT 1")),
+            ["1"]
+        );
+        assert!(!engine.storage.statistics_wal_dirty(peer_table));
+    }
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    let query = "SELECT c.reltuples::integer, (SELECT count(*) FROM shared_estimates) FROM pg_class c WHERE c.relname = 'shared_estimates'";
+    assert_eq!(
+        data_rows(&run_with(&mut recovered, &mut budget, query)),
+        ["2|2"]
+    );
+    let peer = recovered
+        .storage
+        .database_slot("statistics_peer", 0)
+        .map(|slot| recovered.storage.database(slot).oid)
+        .unwrap();
+    recovered.select_database(peer).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut recovered, &mut budget, query)),
+        ["4|3"]
+    );
+    recovered
+        .select_database(crate::storage::DatabaseOid::POSTGRES)
+        .unwrap();
 }
 
 #[test]

@@ -51403,6 +51403,13 @@ pub fn copy_begin(
         target_columns,
         txid,
     )?;
+    if !statement.to && storage.matview_slot_for_table(table_index, txid).is_some() {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "cannot copy to materialized view \"{}\"",
+            def.name.as_str()
+        ));
+    }
     if statement.to {
         if !storage.row_security_applies(table_index, security_role, txid) {
             if def.partition.is_partitioned() {

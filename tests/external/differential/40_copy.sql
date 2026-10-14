@@ -137,6 +137,7 @@ COPY copy_export_sequence TO STDOUT;
 COPY copy_export_index TO STDOUT;
 COPY copy_export_empty TO STDOUT;
 COPY copy_export_saved TO STDOUT;
+COPY copy_export_saved FROM STDIN;
 CREATE ROLE copy_column_reader;
 GRANT SELECT (a) ON copy_export_view TO copy_column_reader;
 SET ROLE copy_column_reader;

@@ -23439,6 +23439,7 @@ fn copy_to_relation_kinds_and_column_privileges_fail_before_streaming() {
         ("COPY copy_kind_sequence TO STDOUT", "42809"),
         ("COPY copy_kind_index TO STDOUT", "42809"),
         ("COPY copy_kind_empty TO STDOUT", "0A000"),
+        ("COPY copy_kind_saved FROM STDIN", "42809"),
         (
             "SET ROLE copy_kind_reader; COPY copy_kind_view TO STDOUT",
             "42501",
@@ -23459,6 +23460,7 @@ fn copy_to_relation_kinds_and_column_privileges_fail_before_streaming() {
             String::from_utf8_lossy(&output)
         );
         assert!(!message_types(&output).contains(&b'H'));
+        assert!(!message_types(&output).contains(&b'G'));
     }
     run_with(&mut engine, &mut budget, "RESET ROLE");
     assert_eq!(

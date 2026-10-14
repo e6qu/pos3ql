@@ -153,6 +153,20 @@ before policy evaluation or writes. Later decoding uses those copies, including
 for inherited columns and partition moves. It no longer looks up a saved
 version stamp against a mutable row map.
 
+Index creation uses the same captured byte owners, but validates current
+committed rows and all earlier writes by the creating transaction. It does not
+change which versions ordinary transaction queries see.
+
+**User example:** inside `BEGIN`, inserting two orders with the same reference
+and then creating a unique index must fail with `23505`. Updating or deleting
+an order before creating the index checks the replacement values. A failed
+creation releases its row sources and pending catalog entry; rolling back to a
+savepoint allows a corrected creation with the same name. An older repeatable
+read transaction cannot create a unique index that misses later committed
+duplicates. The [PostgreSQL 18 index-build implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/heap/heapam_handler.c)
+is the upstream visibility reference; the differential suite checks actual
+PostgreSQL results.
+
 Internal metadata/byte scans also reserve 64 retention slots per workspace.
 Captured row identity lists own their startup pool slot, so their numbers remain
 available after the source map, table, or Storage owner is removed. Concurrent

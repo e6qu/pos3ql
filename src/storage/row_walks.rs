@@ -229,6 +229,7 @@ impl Storage {
         Ok(scan)
     }
 
+    #[cfg(test)]
     pub(crate) fn row_scan_in<'scan>(
         &'scan self,
         table_slot: usize,

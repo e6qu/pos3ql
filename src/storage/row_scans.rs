@@ -20,9 +20,35 @@ impl Storage {
         txid: u32,
         arena: &'arena Arena,
     ) -> Result<CapturedRowScan<'arena>, SqlError> {
+        self.capture_byte_scan(
+            table_slot,
+            txid,
+            self.read_snapshot(),
+            self.commit_snapshot(),
+            arena,
+        )
+    }
+
+    /// Index validation includes all own writes and current committed rows,
+    /// even when the creating transaction has an older read snapshot.
+    pub(crate) fn index_validation_scan_in<'arena>(
+        &self,
+        table_slot: usize,
+        txid: u32,
+        arena: &'arena Arena,
+    ) -> Result<CapturedRowScan<'arena>, SqlError> {
+        self.capture_byte_scan(table_slot, txid, super::SNAPSHOT_ALL, u64::MAX, arena)
+    }
+
+    fn capture_byte_scan<'arena>(
+        &self,
+        table_slot: usize,
+        txid: u32,
+        command: u32,
+        commit: u64,
+        arena: &'arena Arena,
+    ) -> Result<CapturedRowScan<'arena>, SqlError> {
         crate::sql::query::check_timeout()?;
-        let command = self.read_snapshot();
-        let commit = self.commit_snapshot();
         let (source, records) = {
             let table = &self.tables[table_slot];
             let definition = table.definition.read();
@@ -202,6 +228,7 @@ mod tests {
                     .0
             };
             let later = storage.captured_row_scan_in(table, 11, &arena).unwrap();
+            let index = storage.index_validation_scan_in(table, 11, &arena).unwrap();
             assert!(storage.row_versions.test_write().is_ok());
             assert!(storage.tables[table].rows.test_write().is_ok());
             storage.commit_drop(table);
@@ -227,6 +254,11 @@ mod tests {
                     &later,
                     &[(1, b"hist"), (2, b"pend")][..],
                     &[RowVersionIdentity::Committed(7), pending_version][..],
+                ),
+                (
+                    &index,
+                    &[(1, b"keep"), (2, b"pend")][..],
+                    &[RowVersionIdentity::Committed(9), pending_version][..],
                 ),
             ] {
                 let mut at = 0;

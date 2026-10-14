@@ -1500,22 +1500,24 @@ mod tests {
             ] {
                 let mut count = 0;
                 scan.for_each_overlay(&mut |rowid, home| {
-                    let mut decoded = [Datum::Null];
+                    let consume = |bytes: &[u8]| {
+                        let mut decoded = [Datum::Null];
+                        crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)?;
+                        assert_eq!(
+                            (rowid, decoded[0]),
+                            (
+                                expected_overlay[count].0,
+                                Datum::Int4(expected_overlay[count].1)
+                            )
+                        );
+                        Ok(())
+                    };
                     match home.bytes {
                         VisibleRowBytes::Heap(bytes) => {
-                            crate::storage::rowenc::decode(&bytes, &[ColType::Int4], &mut decoded)?
+                            consume(&bytes)?;
                         }
-                        VisibleRowBytes::Spilled(source) => source.with_bytes(|bytes| {
-                            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)
-                        })?,
+                        VisibleRowBytes::Spilled(source) => source.with_bytes(consume)?,
                     }
-                    assert_eq!(
-                        (rowid, decoded[0]),
-                        (
-                            expected_overlay[count].0,
-                            Datum::Int4(expected_overlay[count].1)
-                        )
-                    );
                     count += 1;
                     Ok(core::ops::ControlFlow::Continue(()))
                 })

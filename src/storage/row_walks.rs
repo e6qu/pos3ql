@@ -661,7 +661,7 @@ mod tests {
             let partition = RowScanIds::Reserved(retained);
             assert!(partition.contains(1));
             assert!(!partition.contains(2));
-            assert_eq!(&*partition.read(), &[1]);
+            assert!(partition.read().iter().eq([1]));
             drop(partition);
         });
     }

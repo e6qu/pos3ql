@@ -155,7 +155,9 @@ version stamp against a mutable row map.
 
 Index creation uses the same captured byte owners, but validates current
 committed rows and all earlier writes by the creating transaction. It does not
-change which versions ordinary transaction queries see.
+change which versions ordinary transaction queries see. Saved-index probes
+retain recent row bytes and release shared row-state guards before reading or
+returning each key.
 
 **User example:** inside `BEGIN`, inserting two orders with the same reference
 and then creating a unique index must fail with `23505`. Updating or deleting
@@ -164,9 +166,8 @@ creation releases its row sources and pending catalog entry; rolling back to a
 savepoint allows a corrected creation with the same name. Later uniqueness
 checks also use own replacements and deletions: deleting an order lets that
 transaction reuse its reference before commit, including through a saved index.
-An older repeatable
-read transaction cannot create a unique index that misses later committed
-duplicates. The [PostgreSQL 18 index-build implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/heap/heapam_handler.c)
+An older repeatable read transaction cannot create a unique index that misses
+later committed duplicates. The [PostgreSQL 18 index-build implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/heap/heapam_handler.c)
 is the upstream visibility reference; the differential suite checks actual
 PostgreSQL results.
 

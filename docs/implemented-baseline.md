@@ -105,9 +105,20 @@ position instead of treating that scan's selected row as the latest version.
 Captured sources remain readable after table replacement and Storage teardown.
 The last shared lease releases the roots and makes its slot reusable.
 
+Sorted scans retain one source for their selected heap allocation and saved
+files. Their copyable row records borrow that source, keeping physical order,
+version, and byte location together. Fetching a record uses its original owner
+directly, so removal, version-chain reuse, and heap relocation cannot redirect
+the read. Changed heap allocations or saved-file sources fail with `40001`
+before retention. Each optional row record uses 40 bytes in the fixed statement
+arena on the release target; source exhaustion retains the existing `54000`
+contract. Object rows no longer repeat a metadata lookup before fetching bytes.
+
 **User example:** a report scanning a table entirely from saved files keeps its
 earlier orders even if later versions delete them. Replacing the table cannot
 redirect the report's next unread row to the new table's schema or files.
+For a sorted read, collected rows keep their original bytes even if reclamation
+moves the current table's rows before those collected rows are fetched.
 
 Internal metadata/byte scans also reserve 64 retention slots per workspace.
 SQL byte scans keep their row identities, saved-file handles, and schema in the

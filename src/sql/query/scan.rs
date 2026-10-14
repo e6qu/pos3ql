@@ -6032,7 +6032,7 @@ fn scan_source_mode<'a>(
                 // nested loop's output order.
                 storage.record_relation_scan(txid, probe_slot, None, 0)?;
                 let probe_count = storage.visible_row_count(probe_slot, txid)?;
-                let probe_snapshot = storage.table_row_snapshot(probe_slot);
+                let probe_snapshot = storage.table_row_snapshot(probe_slot, Some(arena))?;
                 let probe_ordered = arena
                     .alloc_slice_with(probe_count.max(1), |_| {
                         None::<crate::storage::OrderedRowSnapshot>
@@ -6052,7 +6052,7 @@ fn scan_source_mode<'a>(
 
                 for row in probe_ordered[..probe_fill].iter().copied().flatten() {
                     let rowid = row.rowid();
-                    let home = probe_snapshot.row_snapshot(row);
+                    let home = row.read()?;
                     storage.record_relation_tuple_read(txid, probe_slot, None)?;
                     if !recycled(arena, recycle_rows, None, || {
                         let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
@@ -6779,7 +6779,7 @@ fn scan_source_mode<'a>(
                 Some(rowids) => rowids.len(),
                 None => storage.visible_row_count(slot, txid)?,
             };
-            let table_snapshot = storage.table_row_snapshot(slot);
+            let table_snapshot = storage.table_row_snapshot(slot, Some(arena))?;
             let ordered = arena
                 .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
                 .map_err(|_| arena_full())?;
@@ -6814,7 +6814,7 @@ fn scan_source_mode<'a>(
             }
             for (this, row) in ordered[..fill].iter().copied().flatten().enumerate() {
                 let rowid = row.rowid();
-                let home = table_snapshot.row_snapshot(row);
+                let home = row.read()?;
                 check_timeout()?;
                 storage.record_relation_tuple_read(
                     txid,

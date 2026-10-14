@@ -30263,10 +30263,19 @@ impl Storage {
         })
     }
 
-    pub(crate) fn table_row_snapshot(&self, table_slot: usize) -> TableRowSnapshot {
-        TableRowSnapshot {
-            created_at: self.tables[table_slot].created_at(),
-        }
+    pub(crate) fn table_row_snapshot<'arena>(
+        &self,
+        table_slot: usize,
+        arena: Option<&'arena crate::mem::arena::Arena>,
+    ) -> Result<TableRowSnapshot<'arena>, SqlError> {
+        self.capture_row_partition(table_slot, u64::MAX, |image, generations, rows| {
+            let heap = rows.iter().any(|(_, state)| {
+                matches!(state.committed, Some(RowHome::Heap(_)))
+                    || !state.pending.is_empty()
+                    || !state.history.is_empty()
+            });
+            TableRowSnapshot::capture(self, image, generations, heap, arena)
+        })
     }
 
     /// The single visibility choke point for heap and object-resident row

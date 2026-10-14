@@ -1,8 +1,13 @@
 //! Visible heap images retain byte ownership; deferred reads retain snapshots.
 
 use super::row_heap::HeapRowRead;
-use super::spill_generations::SpilledRowRead;
+use super::spill_generations::{
+    CapturedSpillRoots, QueryRootPool, SpillGenerationImage, SpillGenerationList, SpilledRowRead,
+};
 use super::{RowHome, RowLoc};
+use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql_err;
+use std::sync::Arc;
 
 /// A table incarnation and the exact row version selected by MVCC.
 #[derive(Clone, Copy, Debug)]
@@ -17,55 +22,165 @@ pub(super) enum RowVersionIdentity {
     Committed(u64),
 }
 
-/// One incarnation shared by all retained rows in a single-table scan.
-#[derive(Clone, Copy)]
-pub(crate) struct TableRowSnapshot {
+/// One byte owner shared by every deferred row in a sorted scan.
+pub(crate) struct TableRowSnapshot<'arena> {
     pub(super) created_at: u64,
+    table_slot: usize,
+    heap: Option<HeapRowRead>,
+    roots: CapturedSpillRoots<'arena>,
+    pool: Arc<QueryRootPool>,
 }
 
 /// Compact scan metadata keeps physical ordering separate from byte identity.
 #[derive(Clone, Copy)]
-pub(crate) struct OrderedRowSnapshot {
+pub(crate) struct OrderedRowSnapshot<'source, 'arena> {
+    source: &'source TableRowSnapshot<'arena>,
     rowid: u64,
-    version: RowVersionIdentity,
-    heap_offset: Option<u32>,
+    version: u64,
+    offset_or_member: u32,
+    len: u32,
+    kind: OrderedVersionKind,
 }
 
-impl TableRowSnapshot {
-    pub(crate) fn retain(
-        &self,
+#[derive(Clone, Copy)]
+enum OrderedVersionKind {
+    PendingHeap,
+    CommittedHeap,
+    CommittedSpilled,
+}
+
+impl<'arena> TableRowSnapshot<'arena> {
+    pub(super) fn capture(
+        storage: &super::Storage,
+        image: SpillGenerationImage,
+        generations: &SpillGenerationList,
+        retain_heap: bool,
+        arena: Option<&'arena crate::mem::arena::Arena>,
+    ) -> Result<Self, SqlError> {
+        Ok(Self {
+            created_at: image.created_at,
+            table_slot: image.table_slot,
+            heap: retain_heap.then(|| storage.heap.retain_allocation()),
+            roots: CapturedSpillRoots::capture(storage, image, generations, arena)?,
+            pool: Arc::clone(&storage.query_roots),
+        })
+    }
+
+    pub(crate) fn retain<'source>(
+        &'source self,
         rowid: u64,
         image: &VisibleRowHome,
-    ) -> Result<OrderedRowSnapshot, crate::sql::eval::SqlError> {
+    ) -> Result<OrderedRowSnapshot<'source, 'arena>, SqlError> {
         if self.created_at != image.snapshot.created_at {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                 "scan row belongs to a different table incarnation"
             ));
         }
+        image.validate_request(self.table_slot, rowid)?;
+        let (version, kind, offset_or_member, len) = match &image.bytes {
+            VisibleRowBytes::Heap(bytes) => {
+                let heap = self
+                    .heap
+                    .as_ref()
+                    .filter(|heap| heap.same_allocation(bytes))
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::SERIALIZATION_FAILURE,
+                            "ordered row heap allocation changed"
+                        )
+                    })?;
+                let location = bytes.location();
+                heap.other(location)?;
+                let (version, kind) = match image.snapshot.version {
+                    RowVersionIdentity::Pending(identity) => {
+                        (identity, OrderedVersionKind::PendingHeap)
+                    }
+                    RowVersionIdentity::Committed(lsn) => (lsn, OrderedVersionKind::CommittedHeap),
+                };
+                (version, kind, location.offset, location.len)
+            }
+            VisibleRowBytes::Spilled(read) => {
+                if !self.roots.matches_read(read)? {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "ordered row saved-file source changed"
+                    ));
+                }
+                (
+                    read.commit_lsn,
+                    OrderedVersionKind::CommittedSpilled,
+                    read.member,
+                    read.len,
+                )
+            }
+        };
         Ok(OrderedRowSnapshot {
+            source: self,
             rowid,
-            version: image.snapshot.version,
-            heap_offset: image.heap_loc().map(|location| location.offset),
+            version,
+            offset_or_member,
+            len,
+            kind,
         })
-    }
-
-    pub(crate) fn row_snapshot(&self, row: OrderedRowSnapshot) -> RowSnapshot {
-        RowSnapshot {
-            created_at: self.created_at,
-            version: row.version,
-        }
     }
 }
 
-impl OrderedRowSnapshot {
+impl OrderedRowSnapshot<'_, '_> {
     pub(crate) fn rowid(self) -> u64 {
         self.rowid
     }
 
     pub(crate) fn sort_key(self) -> (u8, u64, u32) {
-        self.heap_offset
-            .map_or((0, self.rowid, 0), |offset| (1, 0, offset))
+        match self.kind {
+            OrderedVersionKind::CommittedSpilled => (0, self.rowid, 0),
+            _ => (1, 0, self.offset_or_member),
+        }
+    }
+
+    pub(crate) fn read(self) -> Result<VisibleRowHome, SqlError> {
+        match self.kind {
+            OrderedVersionKind::PendingHeap | OrderedVersionKind::CommittedHeap => {
+                let heap = self
+                    .source
+                    .heap
+                    .as_ref()
+                    .expect("retained heap row has an owner");
+                let version = match self.kind {
+                    OrderedVersionKind::PendingHeap => RowVersionIdentity::Pending(self.version),
+                    _ => RowVersionIdentity::Committed(self.version),
+                };
+                let location = RowLoc {
+                    offset: self.offset_or_member,
+                    len: self.len,
+                    generation: heap.location().generation,
+                };
+                Ok(VisibleRowHome::heap(
+                    RowSnapshot {
+                        created_at: self.source.created_at,
+                        version,
+                    },
+                    heap.read_location(location)?,
+                    self.source.table_slot,
+                    self.rowid,
+                ))
+            }
+            OrderedVersionKind::CommittedSpilled => {
+                let roots = self
+                    .source
+                    .roots
+                    .owned_source_in(&self.source.pool)?
+                    .expect("retained object row has an owner");
+                SpilledRowRead::new(
+                    roots,
+                    self.rowid,
+                    self.len,
+                    self.offset_or_member,
+                    self.version,
+                )
+                .map(VisibleRowHome::spilled)
+            }
+        }
     }
 }
 
@@ -212,12 +327,153 @@ mod tests {
     use crate::mem::budget::Budget;
 
     #[test]
+    fn owned_ordered_rows_keep_heap_versions_after_retirement_and_relocation() {
+        use super::super::tests::{make_def, test_budget, test_config};
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = super::super::Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "ordered_old",
+                &[("id", super::super::ColType::Int4, true)],
+            ))
+            .unwrap();
+        let mut scratch =
+            crate::mem::fixed_vec::FixedVec::new(&mut budget, "ordered relocation", 8).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let locations = [
+                storage.heap.append_bytes(b"hist").unwrap(),
+                storage.heap.append_bytes(b"keep").unwrap(),
+                storage.heap.append_bytes(b"pend").unwrap(),
+            ];
+            storage.tables[table]
+                .rows
+                .insert(
+                    1,
+                    super::super::RowState::committed_only_at(locations[1], 7),
+                )
+                .unwrap();
+            let source = storage.table_row_snapshot(table, None).unwrap();
+            let versions = [
+                RowVersionIdentity::Committed(6),
+                RowVersionIdentity::Committed(7),
+                RowVersionIdentity::Pending(19),
+            ];
+            let records = core::array::from_fn::<_, 3, _>(|index| {
+                let image = VisibleRowHome::heap(
+                    RowSnapshot {
+                        created_at: source.created_at,
+                        version: versions[index],
+                    },
+                    storage.heap.get(locations[index]).unwrap(),
+                    table,
+                    1,
+                );
+                source.retain(1, &image).unwrap()
+            });
+            assert!(records[0].sort_key() < records[1].sort_key());
+            assert!(records[1].sort_key() < records[2].sort_key());
+            storage.commit_drop(table);
+            let replacement = storage
+                .create_table(make_def(
+                    "ordered_new",
+                    &[("id", super::super::ColType::Text, true)],
+                ))
+                .unwrap();
+            assert_eq!(replacement, table);
+            let location = storage.heap.append_bytes(b"next").unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, super::super::RowState::committed_only_at(location, 8))
+                .unwrap();
+            storage.compact_heap(&mut scratch).unwrap();
+            drop(storage);
+            for (index, expected) in [b"hist", b"keep", b"pend"].into_iter().enumerate() {
+                let image = records[index].read().unwrap();
+                assert_eq!(image.snapshot().version, versions[index]);
+                image.validate_request(table, 1).unwrap();
+                let VisibleRowBytes::Heap(bytes) = image.bytes else {
+                    panic!("heap fixture")
+                };
+                assert_eq!(&*bytes, expected);
+            }
+        });
+    }
+
+    #[test]
+    fn owned_ordered_rows_reject_changed_heap_owners_and_wrong_requests() {
+        use super::super::tests::{make_def, test_budget, test_config};
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = super::super::Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "ordered_owner",
+                &[("id", super::super::ColType::Int4, true)],
+            ))
+            .unwrap();
+        let location = storage.heap.append_bytes(b"keep").unwrap();
+        storage.tables[table]
+            .rows
+            .insert(1, super::super::RowState::committed_only_at(location, 7))
+            .unwrap();
+        let mut scratch =
+            crate::mem::fixed_vec::FixedVec::new(&mut budget, "ordered owner relocation", 8)
+                .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let source = storage.table_row_snapshot(table, None).unwrap();
+            let retained = VisibleRowHome::heap(
+                RowSnapshot {
+                    created_at: source.created_at,
+                    version: RowVersionIdentity::Committed(7),
+                },
+                storage.heap.get(location).unwrap(),
+                table,
+                1,
+            );
+            assert_eq!(
+                source.retain(2, &retained).err().unwrap().sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            storage.compact_heap(&mut scratch).unwrap();
+            let current = storage.tables[table]
+                .rows
+                .get(&1)
+                .unwrap()
+                .committed
+                .unwrap();
+            let RowHome::Heap(location) = current else {
+                panic!("heap fixture")
+            };
+            let moved = VisibleRowHome::heap(
+                RowSnapshot {
+                    created_at: source.created_at,
+                    version: RowVersionIdentity::Committed(7),
+                },
+                storage.heap.get(location).unwrap(),
+                table,
+                1,
+            );
+            assert_eq!(
+                source.retain(1, &moved).err().unwrap().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let record = source.retain(1, &retained).unwrap();
+            assert_eq!(
+                record.read().unwrap().snapshot().version,
+                RowVersionIdentity::Committed(7)
+            );
+        });
+    }
+
+    #[test]
     fn visible_row_heap_ownership_scan_metadata_preserves_budget_and_order() {
-        assert!(core::mem::size_of::<Option<OrderedRowSnapshot>>() <= 32);
+        assert_eq!(
+            core::mem::size_of::<Option<OrderedRowSnapshot<'_, '_>>>(),
+            40
+        );
         let mut budget = Budget::new(1024);
-        let mut heap = super::super::RowHeap::new(&mut budget, 32).unwrap();
-        let (location, bytes) = heap.append(4).unwrap();
-        bytes.copy_from_slice(b"row!");
+        let arena = crate::mem::arena::Arena::new(&mut budget, "ordered source", 1024).unwrap();
         let config = super::super::tests::test_config();
         let mut object_budget = super::super::tests::test_budget(&config);
         let mut storage = super::super::Storage::new(&config, &mut object_budget).unwrap();
@@ -226,6 +482,12 @@ mod tests {
                 "ordered_row",
                 &[("id", super::super::ColType::Int4, true)],
             ))
+            .unwrap();
+        let (location, bytes) = storage.heap.append(4).unwrap();
+        bytes.copy_from_slice(b"row!");
+        storage.tables[slot]
+            .rows
+            .insert(1, super::super::RowState::committed_only_at(location, 4))
             .unwrap();
         storage.set_spill_list(
             slot,
@@ -237,16 +499,15 @@ mod tests {
             }],
         );
         let created_at = storage.table(slot).created_at();
-        let table = TableRowSnapshot { created_at };
-        let other = TableRowSnapshot {
-            created_at: created_at + 1,
-        };
+        let table = storage.table_row_snapshot(slot, Some(&arena)).unwrap();
+        let mut other = storage.table_row_snapshot(slot, Some(&arena)).unwrap();
+        other.created_at += 1;
         let image = VisibleRowHome::heap(
             RowSnapshot {
                 created_at,
                 version: RowVersionIdentity::Pending(1),
             },
-            heap.get(location).unwrap(),
+            storage.heap.get(location).unwrap(),
             slot,
             1,
         );
@@ -258,7 +519,7 @@ mod tests {
             assert!(object.sort_key() < resident.sort_key());
             assert_eq!(object.rowid(), u64::MAX);
             assert_eq!(
-                table.row_snapshot(resident).version,
+                resident.read().unwrap().snapshot().version,
                 RowVersionIdentity::Pending(1)
             );
             assert_eq!(

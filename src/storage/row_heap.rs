@@ -44,6 +44,10 @@ impl Deref for HeapRowRead {
 }
 
 impl HeapRowRead {
+    pub(super) fn same_allocation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     pub(crate) fn location(&self) -> RowLoc {
         self.location
     }

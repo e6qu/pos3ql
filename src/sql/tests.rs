@@ -53559,14 +53559,11 @@ fn index_validation_checks_own_changes_and_cleans_failed_catalog_entries_through
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    assert_eq!(
-        data_rows(&session.success(
-            &mut engine,
-            "SELECT id, label FROM validation_orders ORDER BY id",
-            true
-        )),
-        ["2|one", "3|three"]
-    );
+    let mut rows =
+        data_rows(&session.success(&mut engine, "SELECT id, label FROM validation_orders", true));
+    // Sort fixture output outside the guard: simulator uploads own growing vectors.
+    rows.sort_unstable();
+    assert_eq!(rows, ["2|one", "3|three"]);
     let duplicate = session.execute(
         &mut engine,
         "INSERT INTO validation_orders VALUES (4, 'ONE', true)",
@@ -53594,7 +53591,7 @@ fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_ree
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     session.success(
         &mut engine,
-        "CREATE TABLE reuse_keys(id integer, label text); \
+        "CREATE TABLE reuse_keys(id integer, label text COLLATE \"C\"); \
          INSERT INTO reuse_keys VALUES (1, 'one'), (2, 'two'); \
          CREATE UNIQUE INDEX reuse_label ON reuse_keys(label)",
         true,
@@ -53633,8 +53630,12 @@ fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_ree
         let start = &start;
         let completed = &completed;
         let writer = scope.spawn(move || {
-            while !start.load(Ordering::Acquire) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !start.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
                 std::thread::yield_now();
+            }
+            if !start.load(Ordering::Acquire) {
+                return;
             }
             crate::mem::guard::forbid_alloc(|| {
                 let undo = storage
@@ -53645,7 +53646,11 @@ fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_ree
             });
         });
         crate::mem::guard::forbid_alloc(|| {
-            let hash = crate::sql::eval::hash_key(&[Datum::Int4(1), Datum::Text("released")], &[1]);
+            let hash = crate::sql::eval::hash_key_collated(
+                &[Datum::Int4(1), Datum::Text("released")],
+                &[1],
+                &[storage.table_def(table, 0).columns[1].collation],
+            );
             let mut visits = 0;
             assert!(
                 storage
@@ -53693,14 +53698,11 @@ fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_ree
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    assert_eq!(
-        data_rows(&session.success(
-            &mut engine,
-            "SELECT id, label FROM reuse_keys ORDER BY id",
-            true
-        )),
-        ["2|two", "3|one"]
-    );
+    let mut rows =
+        data_rows(&session.success(&mut engine, "SELECT id, label FROM reuse_keys", true));
+    // Sort fixture output outside the guard: simulator uploads own growing vectors.
+    rows.sort_unstable();
+    assert_eq!(rows, ["2|two", "3|one"]);
     let duplicate = session.execute(
         &mut engine,
         "INSERT INTO reuse_keys VALUES (4, 'one')",

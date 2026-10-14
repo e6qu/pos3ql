@@ -108,9 +108,7 @@ cleanup() {
 trap cleanup EXIT
 
 # --- psycopg venv (the differential/fuzz scripts need it) -------------------
-if [[ ! -x "$VENV/bin/python" ]]; then
-  python3 -m venv "$VENV" && "$VENV/bin/pip" install --quiet 'psycopg[binary]'
-fi
+python3 "$EXT/python_env.py" "$VENV" || exit 1
 PY="$VENV/bin/python"
 
 if "$PY" "$EXT/result_diff.py" >/dev/null; then

@@ -499,6 +499,10 @@ jobs:
       - name: Rebuild checked-out crate
         run: cargo clean -p pos3ql
 
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+
       - name: Differential conformance (corpora + fuzzer vs real PostgreSQL)
         env:
           PGHOST: 127.0.0.1

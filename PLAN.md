@@ -189,6 +189,10 @@ distinguishes PostgreSQL limits from smaller implementation limits and
 configurable startup reservations. A change to durable identities requires the
 [format migration procedure](docs/durable-format.md).
 
+Keep test dependencies reproducible and verify their installation before running
+comparisons. Fix interrupted downloads with bounded retries and verified caches;
+do not extend test timeouts or accept partial setup.
+
 The roadmap is finished when the steps above pass their stated checks and the
 supported SQL, formats, monitoring, credentials, packages, backup/restore, and
 replacement remain verified together. Keep current behavior in its

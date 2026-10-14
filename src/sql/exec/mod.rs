@@ -46055,8 +46055,9 @@ fn rewrite_enum_values(
             continue;
         }
         let count = storage.visible_row_count(table_index, txn.txid)?;
+        let source = storage.table_row_snapshot(table_index, Some(arena))?;
         let rows = arena
-            .alloc_slice_with(count, |_| None::<(u64, crate::storage::RowSnapshot)>)
+            .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -46066,7 +46067,7 @@ fn rewrite_enum_values(
         let mut n = 0;
         storage.for_each_row_state(table_index, &mut |rowid, state| {
             if let Some(home) = storage.visible_row_home(table_index, rowid, state, txn.txid)? {
-                rows[n] = Some((rowid, home.snapshot()));
+                rows[n] = Some(source.retain(rowid, &home)?);
                 n += 1;
             }
             Ok(core::ops::ControlFlow::Continue(()))
@@ -46074,8 +46075,8 @@ fn rewrite_enum_values(
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         def.schema(&mut schema);
         for entry in rows[..n].iter().copied().flatten() {
-            let (rowid, home) = entry;
-            let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
+            let rowid = entry.rowid();
+            let bytes = storage.row_bytes(table_index, rowid, entry.read()?, arena)?;
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
             let mut changed = false;

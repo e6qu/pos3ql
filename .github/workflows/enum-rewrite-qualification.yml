@@ -1,0 +1,63 @@
+name: Enum rewrite qualification
+
+on:
+  push:
+    branches: [retain-enum-rewrite-sources]
+
+concurrency:
+  group: enum-rewrite-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--locale-provider=libc --lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Enum rewrite ownership, failure cleanup, and recovery
+        run: cargo test --lib --locked owned_enum_rewrite_sources -- --nocapture
+      - name: Enum ordering and rollback
+        run: cargo test --lib --locked enum_float4_renumbering_and_new_value_safety -- --nocapture
+      - name: Original heap and saved-file row owners
+        run: cargo test --lib --locked owned_ordered -- --nocapture
+      - name: Startup memory accounting
+        run: cargo test --lib --locked startup -- --nocapture
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Enum transcript against vanilla PostgreSQL 18
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          RUN_FAST: "0"
+          RUN_CORE: "0"
+          RUN_CORPUS: "1"
+          RUN_AUX: "0"
+          RUN_SLT: "0"
+          RUN_FUZZ: "0"
+          FAST_CORPUS_SHARDS: "1"
+          FAST_CORPUS_ONLY: 63_enums
+        run: bash tests/external/ci_diff.sh

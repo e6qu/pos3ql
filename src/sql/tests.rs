@@ -50634,6 +50634,171 @@ fn enums_order_and_enforce() {
 }
 
 #[test]
+fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_recovery() {
+    let mut config = test_config("owned-enum-rewrite");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("owned-enum-rewrite-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TYPE rewrite_state AS ENUM ('old', 'ready'); \
+         CREATE TABLE rewrite_scalar (id integer PRIMARY KEY, state rewrite_state, states rewrite_state[]); \
+         CREATE INDEX rewrite_state_index ON rewrite_scalar(state); \
+         CREATE TABLE rewrite_array (id integer PRIMARY KEY, states rewrite_state[]); \
+         INSERT INTO rewrite_scalar VALUES \
+           (1, 'old', ARRAY['old', 'ready']::rewrite_state[]), \
+           (2, 'ready', ARRAY['ready']::rewrite_state[]), (3, NULL, NULL); \
+         INSERT INTO rewrite_array VALUES \
+           (10, ARRAY['old', NULL, 'ready']::rewrite_state[]), (11, NULL)",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let table = engine
+        .storage
+        .find_table("public", "rewrite_scalar")
+        .unwrap();
+    assert!(!engine.storage.table(table).spill_generations().is_empty());
+    session.success(
+        &mut engine,
+        "BEGIN; \
+         UPDATE rewrite_scalar SET state = 'old', states = ARRAY['old']::rewrite_state[] WHERE id = 2; \
+         INSERT INTO rewrite_scalar VALUES (4, 'old', ARRAY['ready', 'old']::rewrite_state[]); \
+         DELETE FROM rewrite_scalar WHERE id = 3; \
+         INSERT INTO rewrite_array VALUES (12, ARRAY['old']::rewrite_state[]); \
+         SAVEPOINT before_rename; \
+         ALTER TYPE rewrite_state RENAME VALUE 'old' TO 'new'",
+        true,
+    );
+    let query = "SELECT id, state, states FROM rewrite_scalar ORDER BY id; \
+                 SELECT id, states FROM rewrite_array ORDER BY id; \
+                 SELECT id FROM rewrite_scalar WHERE state = 'new' ORDER BY id";
+    let expected = [
+        "1|new|{new,ready}",
+        "2|new|{new}",
+        "4|new|{ready,new}",
+        "10|{new,NULL,ready}",
+        "11|NULL",
+        "12|{new}",
+        "1",
+        "2",
+        "4",
+    ];
+    assert_eq!(
+        data_rows(&session.success(&mut engine, query, true)),
+        expected
+    );
+    session.success(&mut engine, "ROLLBACK TO SAVEPOINT before_rename", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, state, states FROM rewrite_scalar ORDER BY id; \
+             SELECT id, states FROM rewrite_array ORDER BY id",
+            true,
+        )),
+        [
+            "1|old|{old,ready}",
+            "2|old|{old}",
+            "4|old|{ready,old}",
+            "10|{old,NULL,ready}",
+            "11|NULL",
+            "12|{old}",
+        ]
+    );
+    session.success(
+        &mut engine,
+        "ALTER TYPE rewrite_state RENAME VALUE 'old' TO 'new'; COMMIT",
+        true,
+    );
+    engine.commit_wal().unwrap();
+    drop(session);
+    drop(engine);
+
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(&mut engine, &budget, query, 1 << 20)),
+        expected
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(&mut engine, &budget, query, 1 << 20)),
+        expected
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn owned_enum_rewrite_sources_release_after_arena_exhaustion_and_retry() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE rewrite_limited AS ENUM ('old', 'ready'); \
+         CREATE TABLE rewrite_limited_rows (id integer PRIMARY KEY, state rewrite_limited, padding text); \
+         INSERT INTO rewrite_limited_rows \
+           SELECT id, 'old'::rewrite_limited, repeat('x', 64) FROM generate_series(1, 512) AS g(id)",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "ALTER TYPE rewrite_limited RENAME VALUE 'old' TO 'new'",
+        32 << 10,
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("54000"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*) FROM rewrite_limited_rows WHERE state = 'old'; \
+             SELECT enumlabel FROM pg_enum WHERE enumtypid = 'rewrite_limited'::regtype ORDER BY enumsortorder",
+            1 << 20,
+        )),
+        ["512", "old", "ready"]
+    );
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "ALTER TYPE rewrite_limited RENAME VALUE 'old' TO 'new'; \
+         SELECT count(*) FROM rewrite_limited_rows WHERE state = 'new'",
+        1 << 20,
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["512"]);
+}
+
+#[test]
 fn enum_float4_renumbering_and_new_value_safety() {
     let (mut engine, mut budget) = test_engine();
     run_with(

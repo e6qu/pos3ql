@@ -25,7 +25,7 @@ pub(super) enum RowVersionIdentity {
     Committed(u64),
 }
 
-/// One byte owner shared by every deferred row in a sorted scan.
+/// One byte owner shared by every deferred row in a scan or table rewrite.
 pub(crate) struct TableRowSnapshot<'arena> {
     pub(super) created_at: u64,
     table_slot: usize,

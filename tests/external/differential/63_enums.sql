@@ -95,6 +95,39 @@ SELECT 'green'::rainbow AS pick, 'red'::rainbow < 'blue'::rainbow AS ordered;
 DROP TYPE rainbow;
 SELECT typname FROM pg_type WHERE typname IN ('mood', 'rainbow') ORDER BY typname;
 
+-- Rewrites retain both committed and transaction-pending rows. Savepoint
+-- rollback restores scalar/array values and indexed lookups together.
+CREATE TYPE rewrite_state AS ENUM ('old', 'ready');
+CREATE TABLE rewrite_scalar (id integer PRIMARY KEY, state rewrite_state, states rewrite_state[]);
+CREATE INDEX rewrite_state_index ON rewrite_scalar(state);
+CREATE TABLE rewrite_array (id integer PRIMARY KEY, states rewrite_state[]);
+INSERT INTO rewrite_scalar VALUES
+  (1, 'old', ARRAY['old', 'ready']::rewrite_state[]),
+  (2, 'ready', ARRAY['ready']::rewrite_state[]), (3, NULL, NULL);
+INSERT INTO rewrite_array VALUES
+  (10, ARRAY['old', NULL, 'ready']::rewrite_state[]), (11, NULL);
+BEGIN;
+UPDATE rewrite_scalar SET state = 'old', states = ARRAY['old']::rewrite_state[] WHERE id = 2;
+INSERT INTO rewrite_scalar VALUES (4, 'old', ARRAY['ready', 'old']::rewrite_state[]);
+DELETE FROM rewrite_scalar WHERE id = 3;
+INSERT INTO rewrite_array VALUES (12, ARRAY['old']::rewrite_state[]);
+SAVEPOINT before_rename;
+ALTER TYPE rewrite_state RENAME VALUE 'old' TO 'new';
+SELECT id, state, states FROM rewrite_scalar ORDER BY id;
+SELECT id, states FROM rewrite_array ORDER BY id;
+SELECT id FROM rewrite_scalar WHERE state = 'new' ORDER BY id;
+ROLLBACK TO SAVEPOINT before_rename;
+SELECT id, state, states FROM rewrite_scalar ORDER BY id;
+SELECT id, states FROM rewrite_array ORDER BY id;
+ALTER TYPE rewrite_state RENAME VALUE 'old' TO 'new';
+COMMIT;
+SELECT id, state, states FROM rewrite_scalar ORDER BY id;
+SELECT id, states FROM rewrite_array ORDER BY id;
+SELECT id FROM rewrite_scalar WHERE state = 'new' ORDER BY id;
+DROP TABLE rewrite_scalar;
+DROP TABLE rewrite_array;
+DROP TYPE rewrite_state;
+
 -- The type namespace is shared by enums, domains, and named composites.
 CREATE TYPE enum_composite_name AS (id integer);
 ALTER TYPE feeling RENAME TO enum_composite_name;

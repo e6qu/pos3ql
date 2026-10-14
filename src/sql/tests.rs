@@ -23255,6 +23255,150 @@ fn partitioned_catalog_relations_expose_parent_and_leaf_identity() {
 }
 
 #[test]
+fn owned_copy_to_sources_preserve_partition_order_pending_rows_and_cold_recovery() {
+    let mut config = test_config("owned-copy-export");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("owned-copy-export-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE export_orders (id integer, note text) PARTITION BY RANGE (id); \
+         CREATE TABLE export_low PARTITION OF export_orders FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE export_middle PARTITION OF export_orders FOR VALUES FROM (10) TO (20); \
+         CREATE TABLE export_other PARTITION OF export_orders DEFAULT; \
+         INSERT INTO export_orders VALUES (15, 'middle'), (2, E'low\\trow'), (30, 'far, saved')",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for name in ["export_low", "export_middle", "export_other"] {
+        let slot = engine.storage.find_table("public", name).unwrap();
+        assert!(!engine.storage.table(slot).spill_generations().is_empty());
+    }
+    assert_eq!(
+        copy_data_rows(&session.success(&mut engine, "COPY export_orders TO STDOUT", true)),
+        ["15\tmiddle", "2\tlow\\trow", "30\tfar, saved"]
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; SAVEPOINT before_export_changes; \
+         UPDATE export_orders SET id = 3, note = 'moved' WHERE id = 15; \
+         DELETE FROM export_orders WHERE id = 2; \
+         INSERT INTO export_orders VALUES (31, 'added')",
+        true,
+    );
+    assert_eq!(
+        copy_data_rows(&session.success(
+            &mut engine,
+            "COPY export_orders TO STDOUT (FORMAT csv, HEADER true)",
+            true
+        )),
+        ["id,note", "30,\"far, saved\"", "3,moved", "31,added"]
+    );
+    assert_eq!(
+        copy_data_rows(&session.success(
+            &mut engine,
+            "COPY export_orders (note, id) TO STDOUT",
+            true
+        )),
+        ["far, saved\t30", "moved\t3", "added\t31"]
+    );
+    let binary = session.success(
+        &mut engine,
+        "COPY export_orders TO STDOUT (FORMAT binary)",
+        true,
+    );
+    assert_eq!(command_tags(&binary), ["COPY 3"]);
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT before_export_changes; COMMIT",
+        true,
+    );
+    assert_eq!(
+        copy_data_rows(&session.success(&mut engine, "COPY export_orders TO STDOUT", true)),
+        ["15\tmiddle", "2\tlow\\trow", "30\tfar, saved"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        copy_data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "COPY export_orders TO STDOUT",
+            4 << 20
+        )),
+        ["15\tmiddle", "2\tlow\\trow", "30\tfar, saved"]
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn owned_copy_to_arena_exhaustion_preserves_rows_and_releases_sources_for_retry() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE limited_export(id integer, note text); \
+         INSERT INTO limited_export SELECT i, 'kept' FROM generate_series(1, 256) AS g(i)",
+    );
+    assert!(!message_types(&setup).contains(&b'E'));
+    let small = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "COPY limited_export TO STDOUT",
+        4096,
+    );
+    assert!(
+        String::from_utf8_lossy(&small).contains("54000"),
+        "{}",
+        String::from_utf8_lossy(&small)
+    );
+    assert!(
+        !command_tags(&small)
+            .iter()
+            .any(|tag| tag.starts_with("COPY "))
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*), sum(id) FROM limited_export",
+            4 << 20
+        )),
+        ["256|32896"]
+    );
+    let copied = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "COPY limited_export TO STDOUT",
+        4 << 20,
+    );
+    assert_eq!(command_tags(&copied), ["COPY 256"]);
+    let rows = copy_data_rows(&copied);
+    assert_eq!(rows.len(), 256);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row, &format!("{}\tkept", index + 1));
+    }
+}
+
+#[test]
 fn copy_to_partitioned_parent_scans_every_leaf() {
     let (mut engine, mut budget) = test_engine();
     run_with(

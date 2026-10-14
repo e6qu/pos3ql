@@ -86,6 +86,37 @@ COPY copy_pk FROM STDIN;
 ROLLBACK;
 SELECT id, v FROM copy_pk ORDER BY id;
 
+-- Saved or resident partition rows keep transaction changes and rollback.
+-- Only the query form promises an explicit order across partitions.
+CREATE TABLE copy_export_parent (id integer, note text) PARTITION BY RANGE (id);
+CREATE TABLE copy_export_low PARTITION OF copy_export_parent FOR VALUES FROM (0) TO (10);
+CREATE TABLE copy_export_middle PARTITION OF copy_export_parent FOR VALUES FROM (10) TO (20);
+CREATE TABLE copy_export_other PARTITION OF copy_export_parent DEFAULT;
+INSERT INTO copy_export_parent VALUES (1, 'low'), (11, 'middle'), (21, 'other, saved');
+BEGIN;
+SAVEPOINT export_changes;
+UPDATE copy_export_parent SET id = 2, note = 'moved' WHERE id = 11;
+DELETE FROM copy_export_parent WHERE id = 1;
+INSERT INTO copy_export_parent VALUES (22, 'added');
+COPY copy_export_low TO STDOUT;
+COPY copy_export_middle TO STDOUT;
+COPY copy_export_other TO STDOUT (FORMAT csv, HEADER true);
+COPY (SELECT note, id FROM copy_export_parent ORDER BY id) TO STDOUT;
+ROLLBACK TO SAVEPOINT export_changes;
+COPY copy_export_low TO STDOUT;
+COPY copy_export_middle TO STDOUT;
+COPY copy_export_other (note, id) TO STDOUT;
+COMMIT;
+CREATE ROLE copy_export_reader;
+GRANT SELECT ON copy_export_parent TO copy_export_reader;
+ALTER TABLE copy_export_parent ENABLE ROW LEVEL SECURITY;
+CREATE POLICY copy_export_visible ON copy_export_parent USING (id >= 20);
+SET ROLE copy_export_reader;
+COPY copy_export_parent TO STDOUT;
+RESET ROLE;
+DROP TABLE copy_export_parent;
+DROP ROLE copy_export_reader;
+
 DROP TABLE copy_basic;
 DROP TABLE copy_echo;
 DROP TABLE copy_typed;

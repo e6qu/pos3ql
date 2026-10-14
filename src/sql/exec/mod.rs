@@ -54043,9 +54043,9 @@ pub fn copy_out(
         responder.copy_done().map_err(wire_to_sql)?;
         return Ok(count);
     }
-    // Rowid order is insertion order (rowids are monotonic), which is the
-    // order PostgreSQL's COPY TO emits for a freshly-loaded table. Snapshot
-    // the visible tokens first, sort, then stream.
+    // Preserve the export's row-ID order across partitions. SQL only promises
+    // an order for COPY (SELECT ... ORDER BY ...). Capture the visible sources
+    // first, sort their records, then stream.
     let leaves = arena
         .alloc_slice_with(storage.table_count(), |_| usize::MAX)
         .map_err(|_| {
@@ -54055,24 +54055,48 @@ pub fn copy_out(
             )
         })?;
     let n_leaves = storage.relation_leaf_slots(setup.table_index, txid, leaves)?;
-    let mut visible = 0usize;
+    struct CopyRowSource<'arena> {
+        table: usize,
+        scan: crate::storage::CapturedRowScan<'arena>,
+        schema: [ColType; MAX_COLUMNS],
+        n_columns: usize,
+    }
+    let mut sources = arena.alloc_owned_slice(n_leaves).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "COPY TO sources exceed the statement arena"
+        )
+    })?;
     for &leaf in &leaves[..n_leaves] {
         storage.record_relation_scan(txid, leaf, None, 0)?;
-        storage.for_each_row_state(leaf, &mut |rowid, state| {
-            if storage
-                .visible_row_home(leaf, rowid, state, txid)?
-                .is_some()
-            {
-                visible += 1;
-            }
+        let physical = storage.table_def(leaf, txid);
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        physical.schema(&mut schema);
+        sources
+            .push(CopyRowSource {
+                table: leaf,
+                scan: storage.captured_row_scan_in(leaf, txid, arena)?,
+                schema,
+                n_columns: physical.n_columns,
+            })
+            .map_err(|_| sql_err!(sqlstate::INTERNAL_ERROR, "COPY TO source count changed"))?;
+    }
+    let mut visible = 0usize;
+    for source in sources.iter() {
+        let _ = source.scan.for_each_home(&mut |_, _| {
+            visible = visible.checked_add(1).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "COPY TO row count exceeds the statement boundary"
+                )
+            })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
     }
     let tokens = arena
-        .alloc_slice_with(
-            visible,
-            |_| None::<(usize, u64, crate::storage::RowSnapshot)>,
-        )
+        .alloc_slice_with(visible, |_| {
+            None::<(usize, crate::storage::OrderedRowSnapshot)>
+        })
         .map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -54080,25 +54104,41 @@ pub fn copy_out(
             )
         })?;
     let mut fill = 0usize;
-    for &leaf in &leaves[..n_leaves] {
-        storage.for_each_row_state(leaf, &mut |rowid, state| {
-            if let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? {
-                tokens[fill] = Some((leaf, rowid, home.snapshot()));
-                fill += 1;
-            }
+    for (index, source) in sources.iter().enumerate() {
+        let _ = source.scan.for_each_home(&mut |rowid, home| {
+            let token = tokens.get_mut(fill).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "COPY TO captured row count changed"
+                )
+            })?;
+            *token = Some((index, source.scan.retain(rowid, &home)?));
+            fill += 1;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
     }
-    tokens.sort_unstable_by_key(|token| token.as_ref().expect("COPY tokens are initialized").1);
+    if fill != visible {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "COPY TO captured row count changed"
+        ));
+    }
+    tokens.sort_unstable_by_key(|token| {
+        token
+            .as_ref()
+            .expect("COPY tokens are initialized")
+            .1
+            .rowid()
+    });
     let mut count = 0u64;
-    for (leaf, rowid, home) in tokens.iter().copied().flatten() {
+    for (index, token) in tokens.iter().copied().flatten() {
+        let source = &sources[index];
+        let leaf = source.table;
+        let rowid = token.rowid();
         storage.record_relation_tuple_read(txid, leaf, None)?;
-        let emitted = storage.with_row_bytes(leaf, rowid, home, |bytes| {
+        let emitted = storage.with_row_bytes(leaf, rowid, token.read()?, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
-            let physical = storage.table_def(leaf, txid);
-            let mut physical_schema = [ColType::Bool; MAX_COLUMNS];
-            physical.schema(&mut physical_schema);
-            rowenc::decode(bytes, &physical_schema[..physical.n_columns], &mut values)?;
+            rowenc::decode(bytes, &source.schema[..source.n_columns], &mut values)?;
             emit_copy_out_row(
                 storage,
                 def,

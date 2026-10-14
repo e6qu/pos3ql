@@ -78,7 +78,26 @@ impl Storage {
     }
 }
 
-impl CapturedRowScan<'_> {
+impl<'source_arena> CapturedRowScan<'source_arena> {
+    pub(crate) fn retain<'source>(
+        &'source self,
+        rowid: u64,
+        home: &VisibleRowHome,
+    ) -> Result<super::OrderedRowSnapshot<'source, 'source_arena>, SqlError> {
+        self.source.retain(rowid, home)
+    }
+
+    pub(crate) fn for_each_home(
+        &self,
+        each: &mut dyn FnMut(u64, VisibleRowHome) -> Result<ControlFlow<()>, SqlError>,
+    ) -> Result<ControlFlow<()>, SqlError> {
+        if self.for_each_overlay(each)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        self.source
+            .for_each_saved_home(&RowScanIds::Captured(self.rows), each)
+    }
+
     pub(crate) fn for_each_overlay(
         &self,
         each: &mut dyn FnMut(u64, VisibleRowHome) -> Result<ControlFlow<()>, SqlError>,

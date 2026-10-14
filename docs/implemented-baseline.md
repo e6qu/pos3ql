@@ -60,6 +60,21 @@ schedule pruning.
 Streaming `COPY FROM` keeps its lease in the connection's setup until completion
 or abort and restores the captured read position for each chunk. `COPY TO`,
 buffered portals, and SQL cursors finish their storage reads before suspension.
+Table `COPY TO` captures visible resident versions, partition schemas, and saved
+files before ordering its output records. It fetches original bytes through those
+owners, without consulting live version chains or table schemas during output.
+Scoped source owners live in the fixed statement arena and release heap/files
+on completion or error, including partial capture. Saved row payloads are fetched
+when emitted; the export does not copy every payload before starting output.
+An output record uses 40 bytes on the release target, plus the scan's resident
+records, captured schemas, and file lists. Exhaustion returns `54000`.
+
+**User example:** `COPY orders (id, note) TO STDOUT (FORMAT csv)` exports the
+versions collected for that statement, including its visible pending changes.
+A savepoint rollback restores earlier rows for the next export. Use
+`COPY (SELECT id, note FROM orders ORDER BY id) TO STDOUT` when a particular
+row order is required; physical scan order is not a PostgreSQL SQL guarantee.
+
 Checkpoint and vacuum keep data through their own maintenance sources.
 
 Query walks over immutable sorted tables (SSTs) retain the selected objects,

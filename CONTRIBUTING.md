@@ -125,6 +125,8 @@ runner is a scheduling delay, not evidence of an execution timeout.
 
 CI also exercises shared heap publication with Miri to check the disjoint-range
 memory invariant alongside allocation-forbidden concurrent regressions.
+Scoped statement owners and ordered source pointers also pass Miri; check partial
+initialization and error release when a reader keeps resources in the arena.
 
 PostgreSQL service and client containers use Docker's official image from
 [Google's Docker Hub cache](https://docs.cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images),

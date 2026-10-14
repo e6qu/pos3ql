@@ -358,6 +358,33 @@ impl<'arena> TableRowSnapshot<'arena> {
     pub(super) fn roots(&self) -> &CapturedSpillRoots<'arena> {
         &self.roots
     }
+
+    pub(super) fn for_each_saved_home(
+        &self,
+        rowids: &super::RowScanIds<'_>,
+        each: &mut dyn FnMut(u64, VisibleRowHome) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<core::ops::ControlFlow<()>, SqlError> {
+        let Some(roots) = self.roots.owned_source_in(&self.pool)? else {
+            return Ok(core::ops::ControlFlow::Continue(()));
+        };
+        let mut stopped = false;
+        super::Storage::spill_merged_walk(&roots, rowids, &mut |rowid, state| {
+            let home = state.visible_at(u64::MAX)?.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "merged saved row has no selected bytes"
+                )
+            })?;
+            let result = each(rowid, VisibleRowHome::spilled(home))?;
+            stopped = result.is_break();
+            Ok(result)
+        })?;
+        Ok(if stopped {
+            core::ops::ControlFlow::Break(())
+        } else {
+            core::ops::ControlFlow::Continue(())
+        })
+    }
 }
 
 impl OrderedRowSnapshot<'_, '_> {
@@ -575,22 +602,33 @@ mod tests {
             roots: CapturedSpillRoots::Empty,
             pool,
         };
+        let mut arena_budget = Budget::new(512);
+        let arena =
+            crate::mem::arena::Arena::new(&mut arena_budget, "owned source tags", 512).unwrap();
         crate::mem::guard::forbid_alloc(|| {
+            let mut owners = arena.alloc_owned_slice(1).unwrap();
+            assert!(owners.push(source).is_ok());
+            let moved = owners;
+            let source = &moved[0];
             for kind in [
                 OrderedVersionKind::PendingHeap,
                 OrderedVersionKind::CommittedHeap,
                 OrderedVersionKind::CommittedSpilled,
             ] {
-                let tagged = OrderedRowSource::new(&source, kind);
+                let tagged = OrderedRowSource::new(source, kind);
                 let copied = tagged;
                 assert_eq!(copied.kind(), kind);
-                assert!(core::ptr::eq(copied.owner(), &source));
+                assert!(core::ptr::eq(copied.owner(), source));
                 assert_eq!(copied.owner().created_at, u64::MAX);
                 assert_eq!(copied.owner().table_slot, 17);
             }
             assert_eq!(
                 core::mem::size_of::<Option<OrderedRowSnapshot<'_, '_>>>(),
                 32
+            );
+            assert_eq!(
+                core::mem::size_of::<Option<(usize, OrderedRowSnapshot<'_, '_>)>>(),
+                40
             );
         });
     }

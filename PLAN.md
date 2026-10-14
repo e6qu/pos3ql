@@ -65,6 +65,8 @@ sequential SQL byte scans, sorted row records, enum rewrites, and MERGE target c
 their original data without later version-chain lookups. Captured row identity
 lists own their startup buffers. Shared statistics and journal acknowledgements
 also retain the exact state they captured.
+`COPY TO` retains its partition sources and schemas before ordering export rows;
+output fetches those original bytes instead of rechecking version numbers.
 
 The [implementation guide](docs/implemented-baseline.md) owns the detailed
 contracts and limits; this sequence keeps the remaining acceptance gates.
@@ -73,8 +75,8 @@ Still to do:
 
 - Complete reader protection for authoritative metadata walks and remaining
   executor reads that retain only a version stamp. Sequential SQL byte scans
-  now capture resident version choices before fetching bytes and keep their
-  original heap and saved files. Metadata walks still consult live row state;
+  and `COPY TO` now capture resident version choices before fetching bytes and
+  keep their original heap and saved files. Metadata walks still consult live row state;
   their retirement and update rules need coordination.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.

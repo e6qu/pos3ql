@@ -1493,11 +1493,55 @@ mod tests {
             registry.copy_roots(false, &mut retained).unwrap();
             assert_eq!(retained.len(), 2);
             assert!(retained.contains(&roots[0]) && retained.contains(&roots[1]));
-            for (scan, expected_overlay, expected_saved) in [
-                (&old, &[(1, 41), (3, 30)][..], &[(2, 17)][..]),
-                (&current, &[(1, 88), (3, 30)][..], &[][..]),
-                (&own, &[(1, 55)][..], &[][..]),
+            let mut scans = arena.alloc_owned_slice(3).unwrap();
+            assert!(scans.push(old).is_ok());
+            assert!(scans.push(current).is_ok());
+            assert!(scans.push(own).is_ok());
+            for (scan, expected_overlay, expected_saved, expected_all) in [
+                (
+                    &scans[0],
+                    &[(1, 41), (3, 30)][..],
+                    &[(2, 17)][..],
+                    &[(1, 41), (2, 17), (3, 30)][..],
+                ),
+                (
+                    &scans[1],
+                    &[(1, 88), (3, 30)][..],
+                    &[][..],
+                    &[(1, 88), (3, 30)][..],
+                ),
+                (&scans[2], &[(1, 55)][..], &[][..], &[(1, 55)][..]),
             ] {
+                let records = arena
+                    .alloc_slice_with(expected_all.len(), |_| None)
+                    .unwrap();
+                let mut filled = 0;
+                let done = scan
+                    .for_each_home(&mut |rowid, home| {
+                        records[filled] = Some(scan.retain(rowid, &home)?);
+                        filled += 1;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })
+                    .unwrap();
+                assert!(done.is_continue());
+                assert_eq!(filled, records.len());
+                records.sort_unstable_by_key(|row| row.unwrap().rowid());
+                for (record, expected) in records.iter().zip(expected_all) {
+                    let record = record.unwrap();
+                    let consume = |bytes: &[u8]| {
+                        let mut decoded = [Datum::Null];
+                        crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)?;
+                        assert_eq!(
+                            (record.rowid(), decoded[0]),
+                            (expected.0, Datum::Int4(expected.1))
+                        );
+                        Ok(())
+                    };
+                    match record.read().unwrap().bytes {
+                        VisibleRowBytes::Heap(bytes) => consume(&bytes).unwrap(),
+                        VisibleRowBytes::Spilled(source) => source.with_bytes(consume).unwrap(),
+                    }
+                }
                 let mut count = 0;
                 let done = scan
                     .for_each_overlay(&mut |rowid, home| {
@@ -1556,9 +1600,7 @@ mod tests {
                     assert_eq!(count, expected_saved.len());
                 }
             }
-            drop(old);
-            drop(current);
-            drop(own);
+            drop(scans);
             registry.copy_roots(false, &mut retained).unwrap();
             assert!(retained.is_empty());
         });
@@ -1608,6 +1650,43 @@ mod tests {
             assert!(storage.heap.test_write().is_ok());
             let scan = storage.captured_row_scan_in(table, 0, &arena).unwrap();
             let nested = storage.captured_row_scan_in(table, 0, &arena).unwrap();
+            let mut count = 0;
+            assert!(
+                scan.for_each_home(&mut |_, _| {
+                    count += 1;
+                    let mut other_count = 0;
+                    let done = nested.for_each_home(&mut |_, _| {
+                        other_count += 1;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })?;
+                    assert!(done.is_continue());
+                    assert_eq!(other_count, 3);
+                    Ok(if count == 2 {
+                        core::ops::ControlFlow::Break(())
+                    } else {
+                        core::ops::ControlFlow::Continue(())
+                    })
+                })
+                .unwrap()
+                .is_break()
+            );
+            assert_eq!(count, 2);
+            let mut count = 0;
+            assert_eq!(
+                scan.for_each_home(&mut |_, _| {
+                    count += 1;
+                    if count == 2 {
+                        return Err(sql_err!(
+                            sqlstate::QUERY_CANCELED,
+                            "cancel saved metadata walk"
+                        ));
+                    }
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap_err()
+                .sqlstate,
+                sqlstate::QUERY_CANCELED
+            );
             scan.for_each_spilled_row_batch(&arena, true, None, &mut |rows| {
                 assert_eq!(rows.len(), 2);
                 assert!(storage.tables[table].rows.test_write().is_ok());

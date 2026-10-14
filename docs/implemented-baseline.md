@@ -69,7 +69,11 @@ table or Storage owner is retired. Capturing or releasing a source holds shared
 registry state briefly; object I/O and scan callbacks do not hold that registry.
 Scans capture resident row identities, the saved-file list, schema, and read
 position under one ordered transition before running callbacks. Metadata and
-byte phases use that captured partition. Rows kept in the in-memory map also
+byte phases use that captured partition. Scans admitted with no resident overlay
+own their schema, read position, files, and reader without borrowing Storage;
+unread saved rows remain available after table replacement or Storage shutdown.
+A table with a resident overlay is rejected before scan memory is reserved.
+Rows kept in the in-memory map also
 resolve saved versions from those files; changing a file's position in the live
 list cannot redirect a selected read. Version ownership ends before object I/O.
 Checkpoint cursors follow the same
@@ -89,7 +93,7 @@ requests, cancellation, and statement-buffer exhaustion release ownership.
 removing the table cannot replace those contents with a newly created table's
 row. Reclamation can free space for new rows while that read keeps its old
 bytes. With `memtable_bytes = 64MiB`, heap bytes reserve 128 MiB before other
-startup controls. Finishing the same guarantee for rows the scan has not selected
+startup controls. Finishing the same guarantee for resident rows the scan has not selected
 yet and coordinating table publication with concurrent maintenance are planned.
 
 Individual object-row lookups retain their full generation list, schema,
@@ -101,9 +105,9 @@ position instead of treating that scan's selected row as the latest version.
 Captured sources remain readable after table replacement and Storage teardown.
 The last shared lease releases the roots and makes its slot reusable.
 
-**User example:** a report keeps an order's earlier status even if a later
-saved version deletes the order. Replacing the table's storage list cannot make
-that already selected read fetch the replacement table's row instead.
+**User example:** a report scanning a table entirely from saved files keeps its
+earlier orders even if later versions delete them. Replacing the table cannot
+redirect the report's next unread row to the new table's schema or files.
 
 Internal metadata/byte scans also reserve 64 retention slots per workspace.
 SQL byte scans keep their row identities, saved-file handles, and schema in the

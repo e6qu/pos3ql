@@ -1391,6 +1391,232 @@ mod tests {
         }
     }
 
+    #[test]
+    fn owned_immutable_scan_keeps_saved_rows_after_retirement() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<super::super::row_walks::ImmutableRowScan<'static>>();
+        for statement in [false, true] {
+            let PointFixture {
+                mut storage,
+                table,
+                roots,
+                arena,
+                path,
+            } = point_fixture(if statement {
+                "owned-scan-arena"
+            } else {
+                "owned-scan-pool"
+            });
+            let registry = Arc::clone(&storage.spill_roots);
+            let mut retained = Vec::with_capacity(3);
+            crate::mem::guard::forbid_alloc(|| {
+                storage.set_commit_snapshot(7);
+                let old = if statement {
+                    storage.immutable_row_scan_in(table, &arena)
+                } else {
+                    storage.immutable_row_scan(table)
+                }
+                .unwrap()
+                .unwrap();
+                storage.set_commit_snapshot(9);
+                let current = if statement {
+                    storage.immutable_row_scan_in(table, &arena)
+                } else {
+                    storage.immutable_row_scan(table)
+                }
+                .unwrap()
+                .unwrap();
+                storage.commit_drop(table);
+                let mut definition = make_def("reused_scan", &[("id", ColType::Text, true)]);
+                definition.persistence = RelationPersistence::Temporary;
+                let replacement = storage.create_table(definition).unwrap();
+                assert_eq!(replacement, table);
+                storage.set_spill_list(replacement, &[roots[2]]);
+                drop(storage);
+                registry.copy_roots(false, &mut retained).unwrap();
+                assert_eq!(retained.len(), 2);
+                assert!(retained.contains(&roots[0]) && retained.contains(&roots[1]));
+                for mask in [None, Some(1)] {
+                    for (scan, expected) in
+                        [(&old, &[(1, 41), (2, 17)][..]), (&current, &[(1, 88)][..])]
+                    {
+                        let mut count = 0;
+                        scan.for_each_spilled_row_batch(&arena, true, mask, &mut |rows| {
+                            for row in rows {
+                                let mut decoded = [crate::sql::types::Datum::Null];
+                                let values = match row.representation {
+                                    super::super::SpilledRowRepresentation::Encoded(bytes) => {
+                                        crate::storage::rowenc::decode(
+                                            bytes,
+                                            &[ColType::Int4],
+                                            &mut decoded,
+                                        )?;
+                                        &decoded[..]
+                                    }
+                                    super::super::SpilledRowRepresentation::Values(values) => {
+                                        values
+                                    }
+                                };
+                                assert_eq!(
+                                    (row.rowid, values[0]),
+                                    (
+                                        expected[count].0,
+                                        crate::sql::types::Datum::Int4(expected[count].1)
+                                    )
+                                );
+                                count += 1;
+                            }
+                            Ok(core::ops::ControlFlow::Continue(()))
+                        })
+                        .unwrap();
+                        assert_eq!(count, expected.len());
+                    }
+                }
+                drop(old);
+                drop(current);
+                registry.copy_roots(false, &mut retained).unwrap();
+                assert!(retained.is_empty());
+            });
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn owned_immutable_scan_callbacks_release_contexts_and_keep_admission() {
+        let PointFixture {
+            storage,
+            table,
+            roots,
+            arena,
+            path,
+        } = point_fixture("owned-scan-callbacks");
+        let registry = Arc::clone(&storage.spill_roots);
+        let mut retained = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_commit_snapshot(7);
+            let scan = storage.immutable_row_scan(table).unwrap().unwrap();
+            let nested = storage
+                .immutable_row_scan_in(table, &arena)
+                .unwrap()
+                .unwrap();
+            storage.set_spill_list(table, &[roots[2]]);
+            let location = storage
+                .heap
+                .append_row(&[crate::sql::types::Datum::Int4(99)])
+                .unwrap();
+            let undo = storage
+                .write_pending(table, 3, 7, 1, Some(location))
+                .unwrap();
+            let used = arena.used();
+            assert!(
+                storage
+                    .immutable_row_scan_in(table, &arena)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                arena.used(),
+                used,
+                "rejected admission must not reserve scan memory"
+            );
+            let mut count = 0;
+            scan.for_each_spilled_row_batch(&arena, true, None, &mut |rows| {
+                assert!(storage.tables[table].rows.test_write().is_ok());
+                assert!(storage.row_versions.test_write().is_ok());
+                count += rows.len();
+                storage.restore_pending(table, 3, 7, undo);
+                nested.for_each_spilled_row_batch(&arena, true, Some(1), &mut |other| {
+                    assert_eq!(other.len(), 2);
+                    Ok(core::ops::ControlFlow::Break(()))
+                })?;
+                Ok(core::ops::ControlFlow::Break(()))
+            })
+            .unwrap();
+            assert_eq!(
+                count, 2,
+                "later rows and replacement files cannot change admission"
+            );
+            let error = scan
+                .for_each_spilled_row_batch(&arena, true, None, &mut |_| {
+                    Err(sql_err!(
+                        sqlstate::QUERY_CANCELED,
+                        "cancel owned immutable scan"
+                    ))
+                })
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::QUERY_CANCELED);
+            let reader = storage.spill.as_ref().unwrap();
+            assert!(
+                reader
+                    .cursor_contexts
+                    .iter()
+                    .all(|slot| slot.try_lock().is_ok())
+            );
+            assert!(
+                reader
+                    .scan_contexts
+                    .iter()
+                    .all(|slot| slot.try_lock().is_ok())
+            );
+            drop(scan);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert_eq!(retained.len(), 2, "nested source still owns the old files");
+            drop(nested);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert!(retained.is_empty());
+            assert!(
+                storage
+                    .query_roots
+                    .slots
+                    .iter()
+                    .all(|slot| !slot.retained.load(Ordering::Acquire))
+            );
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn owned_immutable_scan_capacity_failures_do_not_pin_files() {
+        let PointFixture {
+            storage,
+            table,
+            roots: _,
+            arena: _,
+            path,
+        } = point_fixture("owned-scan-capacity");
+        let mut budget = Budget::new(4);
+        let arena = crate::mem::arena::Arena::new(&mut budget, "small scan", 4).unwrap();
+        let mut scans = Vec::with_capacity(super::super::MAX_ROW_WALK_NESTING);
+        let mut retained = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            let error = storage.immutable_row_scan_in(table, &arena).err().unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            storage
+                .spill_roots
+                .copy_roots(false, &mut retained)
+                .unwrap();
+            assert!(retained.is_empty());
+            for _ in 0..super::super::MAX_ROW_WALK_NESTING {
+                scans.push(storage.immutable_row_scan(table).unwrap().unwrap());
+            }
+            assert_eq!(
+                storage.immutable_row_scan(table).err().unwrap().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            drop(scans.pop());
+            scans.push(storage.immutable_row_scan(table).unwrap().unwrap());
+            scans.clear();
+            storage
+                .spill_roots
+                .copy_roots(false, &mut retained)
+                .unwrap();
+            assert!(retained.is_empty());
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
     fn scan_fixture(label: &str) -> PointFixture {
         use crate::sql::types::Datum;
         use crate::store::SstWriter;
@@ -2292,25 +2518,23 @@ mod tests {
             assert!(matches!(&scan.rowids, RowScanIds::Reserved(_)));
             let roots = scan.roots.owned_source(&storage).unwrap().unwrap();
             let mut metadata_rows = 0;
-            storage
-                .spill_merged_walk(&roots, &scan.rowids, &mut |rowid, source| {
-                    let lsn = source.version.commit_lsn;
-                    assert_eq!((rowid, lsn), (1, 7));
-                    storage.set_commit_snapshot(u64::MAX);
-                    metadata_rows += 1;
-                    Ok(core::ops::ControlFlow::Continue(()))
-                })
-                .unwrap();
+            Storage::spill_merged_walk(&roots, &scan.rowids, &mut |rowid, source| {
+                let lsn = source.version.commit_lsn;
+                assert_eq!((rowid, lsn), (1, 7));
+                storage.set_commit_snapshot(u64::MAX);
+                metadata_rows += 1;
+                Ok(core::ops::ControlFlow::Continue(()))
+            })
+            .unwrap();
             assert_eq!(
                 metadata_rows, 1,
                 "nested callbacks cannot advance the outer read boundary"
             );
             storage.set_commit_snapshot(7);
-            let error = storage
-                .spill_merged_walk(&roots, &scan.rowids, &mut |_, _| {
-                    Err(sql_err!(sqlstate::QUERY_CANCELED, "cancel retained scan"))
-                })
-                .unwrap_err();
+            let error = Storage::spill_merged_walk(&roots, &scan.rowids, &mut |_, _| {
+                Err(sql_err!(sqlstate::QUERY_CANCELED, "cancel retained scan"))
+            })
+            .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::QUERY_CANCELED);
             drop(roots);
             drop(scan);

@@ -63,7 +63,30 @@ pub(crate) struct RowScan<'storage> {
     created_at: u64,
     pub(super) rowids: RowScanIds<'storage>,
     pub(super) roots: super::spill_generations::CapturedSpillRoots<'storage>,
-    immutable_only: bool,
+}
+
+/// An admitted scan with no resident overlay needs only its saved-file owners.
+pub(crate) struct ImmutableRowScan<'arena> {
+    roots: super::spill_generations::CapturedSpillRoots<'arena>,
+}
+
+impl ImmutableRowScan<'_> {
+    pub(crate) fn for_each_spilled_row_batch<'arena, 'callback>(
+        &self,
+        arena: &'arena crate::mem::arena::Arena,
+        recycle_rows: bool,
+        decoded_columns: Option<u64>,
+        each: &mut super::SpilledRowBatchVisitor<'arena, 'callback>,
+    ) -> Result<(), SqlError> {
+        Storage::for_each_spilled_row_batch(
+            &self.roots,
+            &RowScanIds::Statement(&[]),
+            arena,
+            recycle_rows,
+            decoded_columns,
+            each,
+        )
+    }
 }
 
 impl Storage {
@@ -111,7 +134,7 @@ impl Storage {
             table_slot,
             self.commit_snapshot(),
             |image, generations, rows| {
-                let (rowids, immutable_only) = self.row_walks.retain_from(rows, skip_redundant)?;
+                let (rowids, _) = self.row_walks.retain_from(rows, skip_redundant)?;
                 let roots = super::spill_generations::CapturedSpillRoots::capture(
                     self,
                     image,
@@ -124,7 +147,6 @@ impl Storage {
                     created_at: image.created_at,
                     rowids: RowScanIds::Reserved(rowids),
                     roots,
-                    immutable_only,
                 })
             },
         )?;
@@ -139,11 +161,10 @@ impl Storage {
         table_slot: usize,
         arena: &'scan crate::mem::arena::Arena,
     ) -> Result<RowScan<'scan>, SqlError> {
-        let (image, rowids, roots, immutable_only) = self.capture_row_partition(
+        let (image, rowids, roots) = self.capture_row_partition(
             table_slot,
             self.commit_snapshot(),
             |image, generations, rows| {
-                let immutable_only = rows.is_empty();
                 let count = rows
                     .iter()
                     .filter(|(_, state)| !Self::redundant_spilled_row_state(state))
@@ -167,7 +188,7 @@ impl Storage {
                     generations,
                     Some(arena),
                 )?;
-                Ok((image, rowids, roots, immutable_only))
+                Ok((image, rowids, roots))
             },
         )?;
         rowids.sort_unstable();
@@ -177,23 +198,46 @@ impl Storage {
             created_at: image.created_at,
             rowids: RowScanIds::Statement(rowids),
             roots,
-            immutable_only,
         })
     }
 
     pub(crate) fn immutable_row_scan_in<'scan>(
-        &'scan self,
+        &self,
         table_slot: usize,
         arena: &'scan crate::mem::arena::Arena,
-    ) -> Result<Option<RowScan<'scan>>, SqlError> {
-        let scan = self.row_scan_in(table_slot, arena)?;
-        Ok(scan.immutable_only.then_some(scan))
+    ) -> Result<Option<ImmutableRowScan<'scan>>, SqlError> {
+        self.capture_immutable_row_scan(table_slot, Some(arena))
+    }
+
+    fn capture_immutable_row_scan<'scan>(
+        &self,
+        table_slot: usize,
+        arena: Option<&'scan crate::mem::arena::Arena>,
+    ) -> Result<Option<ImmutableRowScan<'scan>>, SqlError> {
+        self.capture_row_partition(
+            table_slot,
+            self.commit_snapshot(),
+            |image, generations, rows| {
+                if !rows.is_empty() {
+                    return Ok(None);
+                }
+                let roots = super::spill_generations::CapturedSpillRoots::capture(
+                    self,
+                    image,
+                    generations,
+                    arena,
+                )?;
+                Ok(Some(ImmutableRowScan { roots }))
+            },
+        )
     }
 
     #[cfg(test)]
-    fn immutable_row_scan(&self, table_slot: usize) -> Result<Option<RowScan<'_>>, SqlError> {
-        let scan = self.row_scan(table_slot)?;
-        Ok(scan.immutable_only.then_some(scan))
+    pub(super) fn immutable_row_scan(
+        &self,
+        table_slot: usize,
+    ) -> Result<Option<ImmutableRowScan<'static>>, SqlError> {
+        self.capture_immutable_row_scan(table_slot, None)
     }
 }
 
@@ -248,10 +292,9 @@ impl RowScan<'_> {
         let Some(roots) = self.roots.owned_source(self.storage)? else {
             return Ok(());
         };
-        self.storage
-            .spill_merged_walk(&roots, &self.rowids, &mut |rowid, source| {
-                each(rowid, super::RowRead::immutable(source))
-            })
+        Storage::spill_merged_walk(&roots, &self.rowids, &mut |rowid, source| {
+            each(rowid, super::RowRead::immutable(source))
+        })
     }
 
     pub(crate) fn for_each_spilled_row_batch<'arena, 'callback>(
@@ -262,7 +305,7 @@ impl RowScan<'_> {
         each: &mut super::SpilledRowBatchVisitor<'arena, 'callback>,
     ) -> Result<(), SqlError> {
         self.validate_identity()?;
-        self.storage.for_each_spilled_row_batch(
+        Storage::for_each_spilled_row_batch(
             &self.roots,
             &self.rowids,
             arena,
@@ -1151,6 +1194,8 @@ mod tests {
     fn retained_byte_scan_keeps_immutable_admission_after_a_later_insert() {
         let (mut storage, table) = fixture();
         storage.tables[table].rows.remove(&1);
+        let mut budget = Budget::new(64 << 10);
+        let arena = crate::mem::arena::Arena::new(&mut budget, "empty scan", 64 << 10).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let scan = storage.immutable_row_scan(table).unwrap().unwrap();
             let location = storage.heap.append_row(&[Datum::Int4(2)]).unwrap();
@@ -1159,13 +1204,11 @@ mod tests {
                 .unwrap();
             assert!(storage.immutable_row_scan(table).unwrap().is_none());
             let mut count = 0;
-            let overlay = scan
-                .for_each_overlay(&mut |_, _| {
-                    count += 1;
-                    Ok(core::ops::ControlFlow::Continue(()))
-                })
-                .unwrap();
-            assert!(overlay.is_continue());
+            scan.for_each_spilled_row_batch(&arena, true, None, &mut |rows| {
+                count += rows.len();
+                Ok(core::ops::ControlFlow::Continue(()))
+            })
+            .unwrap();
             assert_eq!(count, 0, "later overlays cannot alter an admitted scan");
             storage.restore_pending(table, 2, 7, undo);
         });

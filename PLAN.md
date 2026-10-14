@@ -64,9 +64,14 @@ row identities, saved files, and schema before callbacks. Selected rows own
 their sources through table removal. Point metadata reads copy their version
 chains into startup-reserved slots, so keeping metadata no longer holds the
 shared version lock. Captured point metadata also owns its table identity and
-byte sources; later selection survives table reuse and Storage shutdown. Two fixed heap buffers let reclamation
-preserve selected bytes. Statistics and journal acknowledgements now retain
+byte sources; later selection survives table reuse and Storage shutdown. Two
+fixed heap buffers let reclamation preserve selected bytes. Statistics and
+journal acknowledgements now retain
 the exact image they captured.
+
+Scans admitted with no in-memory row overlay own their saved files, schema,
+read position, and reader. They can select previously unread rows after table
+replacement or Storage shutdown, without consulting a reused table slot.
 
 Replication snapshot validity and history protection share one guarded registry.
 Imports retain history before the exporter can expire, and failed imports leave
@@ -79,7 +84,8 @@ contracts and limits; this sequence keeps the remaining acceptance gates.
 Still to do:
 
 - Complete table retirement for rows a scan has not selected yet and for
-  deferred version lookups. Already selected row bytes survive retirement;
+  reads that retain only a version stamp. Selected bytes, captured point metadata,
+  and scans entirely over saved files survive retirement;
   preserving all unselected resident versions still needs coordination.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.

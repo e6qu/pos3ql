@@ -15,9 +15,7 @@ KEEP=${1:-}
 VENV=${POS3QL_VENV:-$ROOT/target/external-venv}
 
 ensure_psycopg_venv() {
-  if [[ ! -x "$VENV/bin/python" ]]; then
-    python3 -m venv "$VENV" && "$VENV/bin/pip" install --quiet 'psycopg[binary]'
-  fi
+  python3 "$EXT/python_env.py" "$VENV"
 }
 
 PSQL=${POS3QL_PSQL:-/opt/homebrew/opt/libpq/bin/psql}

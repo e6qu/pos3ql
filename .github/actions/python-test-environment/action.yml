@@ -1,0 +1,21 @@
+name: Python test environment
+description: Install pinned, verified SQL test clients from a reusable wheel cache
+inputs:
+  venv:
+    description: Virtual environment directory
+    default: venv
+runs:
+  using: composite
+  steps:
+    - id: python-cache
+      shell: bash
+      run: echo "key=$(python3 tests/external/python_env.py --cache-key)" >> "$GITHUB_OUTPUT"
+    - uses: actions/cache@v5
+      with:
+        path: ${{ runner.temp }}/pos3ql-test-wheels
+        key: ${{ runner.os }}-${{ runner.arch }}-python-wheels-${{ steps.python-cache.outputs.key }}
+    - shell: bash
+      env:
+        POS3QL_TEST_VENV: ${{ inputs.venv }}
+        POS3QL_PYTHON_WHEELHOUSE: ${{ runner.temp }}/pos3ql-test-wheels
+      run: python3 tests/external/python_env.py "$POS3QL_TEST_VENV"

@@ -17560,7 +17560,8 @@ impl Storage {
 
     #[cfg(test)]
     pub(crate) fn retained_row_metadata_budget_bytes(config: &Config) -> usize {
-        RowVersionPools::metadata_budget_bytes(config) + size_of::<row_reads::RowMetadataPool>()
+        RowVersionPools::metadata_budget_bytes(config)
+            + size_of::<std::sync::Arc<row_reads::RowMetadataPool>>()
     }
 
     #[cfg(test)]
@@ -30216,10 +30217,8 @@ impl Storage {
         &self,
         table_slot: usize,
         rowid: u64,
-    ) -> Result<Option<RowRead<'_>>, SqlError> {
-        if let Some(state) =
-            RowReadView::point(&self.row_versions, &self.tables[table_slot].rows, rowid)?
-        {
+    ) -> Result<Option<RowRead<'static>>, SqlError> {
+        if let Some(state) = self.resident_row_state(table_slot, rowid)? {
             return Ok(Some(state));
         }
         Ok(self
@@ -30235,8 +30234,37 @@ impl Storage {
         &self,
         table_slot: usize,
         rowid: u64,
-    ) -> Result<Option<RowRead<'_>>, SqlError> {
-        RowReadView::point(&self.row_versions, &self.tables[table_slot].rows, rowid)
+    ) -> Result<Option<RowRead<'static>>, SqlError> {
+        let table = &self.tables[table_slot];
+        let definition = table.definition.read();
+        let publication = table.publication();
+        let generations = table.spill_generations();
+        let image = spill_generations::SpillGenerationImage::capture(
+            &definition,
+            publication.generation,
+            table_slot,
+            u64::MAX,
+        );
+        RowReadView::point_with(&self.row_versions, &table.rows, rowid, |state, captured| {
+            let heap = captured
+                .has_heap(state)
+                .then(|| self.heap.retain_allocation());
+            let objects = if generations.is_empty() {
+                None
+            } else {
+                Some(
+                    self.query_roots
+                        .retain_point_image(self, image, &generations)?,
+                )
+            };
+            Ok(Some(row_reads::CapturedRowSources {
+                table: table_slot,
+                rowid,
+                created_at: image.created_at,
+                heap,
+                objects,
+            }))
+        })
     }
 
     pub(crate) fn table_row_snapshot(&self, table_slot: usize) -> TableRowSnapshot {
@@ -30284,6 +30312,9 @@ impl Storage {
             drop(state);
             return Ok(selected.map(VisibleRowHome::spilled));
         }
+        if state.has_owned_sources() {
+            return state.select_owned(table_slot, rowid, txid, command_snapshot, commit_snapshot);
+        }
         let visible = state.visible_version_at(txid, command_snapshot, commit_snapshot);
         self.pin_row_selection(table_slot, rowid, state, visible, Some(commit_snapshot))
     }
@@ -30317,6 +30348,15 @@ impl Storage {
         selected: Option<(RowVersionIdentity, Option<RowHome>)>,
         object_snapshot: Option<u64>,
     ) -> Result<Option<VisibleRowHome>, SqlError> {
+        if state.has_owned_sources() && state.spilled_source().is_none() {
+            return match selected {
+                Some(_) => state.pin_owned(table_slot, rowid, selected),
+                None => match object_snapshot {
+                    Some(snapshot) => state.lookup_owned_objects(table_slot, rowid, snapshot),
+                    None => Ok(None),
+                },
+            };
+        }
         let roots = state.captured_roots();
         if let Some((version, home)) = selected {
             let Some(home) = home else { return Ok(None) };
@@ -59801,6 +59841,97 @@ mod tests {
             CatalogDdlState::Present.drop_by(1),
             CatalogDdlState::PendingDrop { txid: 1 }
         );
+    }
+
+    #[test]
+    fn owned_row_lookup_selects_pending_history_and_current_after_retirement() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("lookup_old", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        let created_at = storage.tables[table].created_at();
+        let mut scratch = FixedVec::new(&mut budget, "owned lookup relocation", 4).unwrap();
+        let retained = crate::mem::guard::forbid_alloc(|| {
+            let history = storage.heap.append_bytes(b"hist").unwrap();
+            let committed = storage.heap.append_bytes(b"keep").unwrap();
+            let pending = storage.heap.append_bytes(b"pend").unwrap();
+            let mut row = RowState::committed_only_at(committed, 7);
+            {
+                let versions = storage.row_versions.exclusive();
+                push_committed_version(
+                    &mut versions.committed_row_versions,
+                    &mut row.history,
+                    8,
+                    CommittedVersion {
+                        lsn: 6,
+                        home: Some(RowHome::Heap(history)),
+                    },
+                )
+                .unwrap();
+                push_pending_version(
+                    &mut versions.pending_row_versions,
+                    &mut row.pending,
+                    8,
+                    PendingChange {
+                        txid: 7,
+                        cid: 1,
+                        loc: Some(pending),
+                        changed_columns: ColumnSet::EMPTY,
+                        changes_existence: false,
+                    },
+                )
+                .unwrap();
+            }
+            storage.tables[table].rows.insert(1, row).unwrap();
+            storage.resident_row_state(table, 1).unwrap().unwrap()
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            storage.commit_drop(table);
+            let replacement = storage
+                .create_table(make_def("lookup_new", &[("id", ColType::Text, false)]))
+                .unwrap();
+            assert_eq!(replacement, table);
+            assert_ne!(storage.tables[table].created_at(), created_at);
+            let location = storage.heap.append_bytes(b"next").unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, RowState::committed_only_at(location, 8))
+                .unwrap();
+            storage.compact_heap(&mut scratch).unwrap();
+            drop(storage);
+            for (transaction, snapshot, expected) in
+                [(7, 0, b"pend"), (8, 6, b"hist"), (8, 7, b"keep")]
+            {
+                let image = retained
+                    .select_owned(table, 1, transaction, SNAPSHOT_ALL, snapshot)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(image.snapshot().created_at, created_at);
+                let VisibleRowBytes::Heap(bytes) = image.bytes else {
+                    panic!("heap fixture")
+                };
+                assert_eq!(&*bytes, expected);
+            }
+            assert_eq!(
+                retained
+                    .select_owned(table, 2, 7, SNAPSHOT_ALL, 7)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            assert_eq!(
+                retained
+                    .select_owned(table + 1, 1, 7, SNAPSHOT_ALL, 7)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            drop(retained);
+        });
     }
 
     #[test]

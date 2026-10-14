@@ -67,7 +67,7 @@ pub(super) struct RowVersionState {
 
 pub(super) struct RowVersionPools {
     state: RwLock<RowVersionState>,
-    pub(super) metadata: super::row_reads::RowMetadataPool,
+    pub(super) metadata: std::sync::Arc<super::row_reads::RowMetadataPool>,
 }
 
 impl RowVersionPools {

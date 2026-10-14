@@ -58,7 +58,7 @@ jobs:
       # the crash-torture and fuzz harnesses, which use its API directly.
       - name: Python venv for the differential harnesses
         if: ${{ !startsWith(matrix.shards, 'lib:') }}
-        run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary 'psycopg[binary]'
+        uses: ./.github/actions/python-test-environment
       - name: Measure
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
@@ -107,7 +107,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Python venv for crash torture
-        run: python3 -m venv venv && ./venv/bin/pip install --quiet 'psycopg[binary]'
+        uses: ./.github/actions/python-test-environment
       - name: Run crash torture against the PostgreSQL 18 service
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
@@ -232,7 +232,7 @@ jobs:
           docker exec "$postgres_container" mkdir -p /tmp/pos3ql-extensions
           docker cp tests/external/extensions/. "$postgres_container":/tmp/pos3ql-extensions/
       - name: Python venv for differential oracles
-        run: python3 -m venv venv && ./venv/bin/pip install --quiet 'psycopg[binary]'
+        uses: ./.github/actions/python-test-environment
       - name: Run forced-spill differential
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
@@ -324,7 +324,7 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Python venv for the differential harnesses
-        run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary 'psycopg[binary]'
+        uses: ./.github/actions/python-test-environment
       - name: Measure
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv

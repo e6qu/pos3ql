@@ -63,7 +63,8 @@ Statements and streaming `COPY FROM` retain their read position. Scans capture
 row identities, saved files, and schema before callbacks. Selected rows own
 their sources through table removal. Point metadata reads copy their version
 chains into startup-reserved slots, so keeping metadata no longer holds the
-shared version lock. Two fixed heap buffers let reclamation
+shared version lock. Captured point metadata also owns its table identity and
+byte sources; later selection survives table reuse and Storage shutdown. Two fixed heap buffers let reclamation
 preserve selected bytes. Statistics and journal acknowledgements now retain
 the exact image they captured.
 
@@ -187,6 +188,10 @@ and empty-cache recovery correct in every step. The
 distinguishes PostgreSQL limits from smaller implementation limits and
 configurable startup reservations. A change to durable identities requires the
 [format migration procedure](docs/durable-format.md).
+
+Keep test dependencies reproducible and verify their installation before running
+comparisons. Fix interrupted downloads with bounded retries and verified caches;
+do not extend test timeouts or accept partial setup.
 
 The roadmap is finished when the steps above pass their stated checks and the
 supported SQL, formats, monitoring, credentials, packages, backup/restore, and

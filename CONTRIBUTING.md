@@ -63,6 +63,14 @@ the workflow that owns the check. The release target is Linux x86-64; the event
 loop also contains macOS support. See `Cargo.toml`, `examples/dev.conf`, and
 `.github/workflows/` for the actual build and environment definitions.
 
+SQL test harnesses prepare their Python clients with
+`tests/external/python_env.py VENV`. Dependencies and wheel hashes are pinned in
+`tests/external/requirements.lock`, with links to their PyPI release metadata.
+For example, an interrupted download retries up to three times with the same
+15-second request timeout; a failed installation never marks the environment
+ready. Verified wheels are cached and installed without network access. CI
+shares that cache through `.github/actions/python-test-environment`.
+
 Protect the interactive machine. Full builds, full test gates, and large
 benchmark/evidence regeneration run on GitHub runners. Local work is serial,
 low priority, and monitored: preserve at least 64 GiB free disk, keep generated

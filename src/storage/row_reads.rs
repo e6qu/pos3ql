@@ -6,15 +6,19 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use core::ops::Deref;
-use std::sync::{Mutex, MutexGuard, RwLockReadGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
+use super::row_heap::HeapRowRead;
 use super::row_images::RowVersionIdentity;
 use super::row_map::RowMap;
 use super::row_versions::{
     RowVersionPools, RowVersionState, committed_history_get, committed_version_at, pending_last,
     pending_version_at, pending_visible_at, retained_pending_home,
 };
-use super::spill_generations::{CapturedSpillRoots, SpilledRowState};
+use super::spill_generations::{
+    CapturedSpillRoots, QueryRootLease, SpilledRowRead, SpilledRowState,
+};
 use super::{CommittedVersion, PendingChange, RowHome, RowLoc, RowState};
 use crate::mem::fixed_map::FixedMap;
 
@@ -23,10 +27,51 @@ const METADATA_READS_PER_WORKSPACE: usize = 64;
 pub(super) struct CapturedRowMetadata {
     pending: FixedVec<(u64, PendingChange)>,
     history: FixedVec<CommittedVersion>,
+    sources: Option<CapturedRowSources>,
+}
+
+pub(super) struct CapturedRowSources {
+    pub(super) table: usize,
+    pub(super) rowid: u64,
+    pub(super) created_at: u64,
+    pub(super) heap: Option<HeapRowRead>,
+    pub(super) objects: Option<QueryRootLease>,
+}
+
+struct MetadataSlot {
+    retained: AtomicBool,
+    image: RwLock<CapturedRowMetadata>,
 }
 
 pub(super) struct RowMetadataPool {
-    slots: FixedVec<Mutex<CapturedRowMetadata>>,
+    slots: FixedVec<MetadataSlot>,
+}
+
+struct MetadataLease {
+    pool: Arc<RowMetadataPool>,
+    slot: usize,
+}
+
+impl MetadataLease {
+    fn read(&self) -> RwLockReadGuard<'_, CapturedRowMetadata> {
+        self.pool.slots[self.slot]
+            .image
+            .read()
+            .expect("row metadata slot poisoned")
+    }
+}
+
+impl Drop for MetadataLease {
+    fn drop(&mut self) {
+        let slot = &self.pool.slots[self.slot];
+        {
+            let mut image = slot.image.write().expect("row metadata slot poisoned");
+            image.pending.clear();
+            image.history.clear();
+            image.sources = None;
+        }
+        slot.retained.store(false, Ordering::Release);
+    }
 }
 
 impl RowMetadataPool {
@@ -34,44 +79,53 @@ impl RowMetadataPool {
         let slots = config
             .query_workspace_slots
             .saturating_mul(METADATA_READS_PER_WORKSPACE);
-        slots.saturating_mul(
-            size_of::<Mutex<CapturedRowMetadata>>().saturating_add(
+        (size_of::<Self>() + 2 * size_of::<usize>()).saturating_add(slots.saturating_mul(
+            size_of::<MetadataSlot>().saturating_add(
                 config.max_row_versions_per_row.saturating_mul(
                     size_of::<(u64, PendingChange)>() + size_of::<CommittedVersion>(),
                 ),
             ),
-        )
+        ))
     }
 
-    pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+    pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Arc<Self>, BudgetError> {
+        budget.draw(
+            size_of::<Self>() + 2 * size_of::<usize>(),
+            "row metadata pool owner",
+        )?;
         let count = config
             .query_workspace_slots
             .saturating_mul(METADATA_READS_PER_WORKSPACE);
         let mut slots = FixedVec::new(budget, "row metadata read slots", count)?;
         for _ in 0..count {
             slots
-                .push(Mutex::new(CapturedRowMetadata {
-                    pending: FixedVec::new(
-                        budget,
-                        "captured pending row versions",
-                        config.max_row_versions_per_row,
-                    )?,
-                    history: FixedVec::new(
-                        budget,
-                        "captured committed row versions",
-                        config.max_row_versions_per_row,
-                    )?,
-                }))
+                .push(MetadataSlot {
+                    retained: AtomicBool::new(false),
+                    image: RwLock::new(CapturedRowMetadata {
+                        pending: FixedVec::new(
+                            budget,
+                            "captured pending row versions",
+                            config.max_row_versions_per_row,
+                        )?,
+                        history: FixedVec::new(
+                            budget,
+                            "captured committed row versions",
+                            config.max_row_versions_per_row,
+                        )?,
+                        sources: None,
+                    }),
+                })
                 .expect("sized to row metadata read slots");
         }
-        Ok(Self { slots })
+        Ok(Arc::new(Self { slots }))
     }
 
     fn capture(
-        &self,
+        self: &Arc<Self>,
         versions: &RowVersionState,
         state: RowState,
-    ) -> Result<MutexGuard<'_, CapturedRowMetadata>, SqlError> {
+        sources: impl FnOnce(&CapturedRowMetadata) -> Result<Option<CapturedRowSources>, SqlError>,
+    ) -> Result<MetadataLease, SqlError> {
         let workspace = crate::sql::execution_query_workspace().index();
         let slots = workspace
             .checked_mul(METADATA_READS_PER_WORKSPACE)
@@ -86,16 +140,31 @@ impl RowMetadataPool {
                     "row metadata workspace is outside its startup reservation"
                 )
             })?;
-        let mut image =
-            super::try_mutex_pool(slots, "row metadata read slots").ok_or_else(|| {
+        let local = slots
+            .iter()
+            .position(|slot| {
+                slot.retained
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            })
+            .ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "row metadata read slots exhausted ({})",
                     slots.len()
                 )
             })?;
+        let lease = MetadataLease {
+            pool: Arc::clone(self),
+            slot: workspace * METADATA_READS_PER_WORKSPACE + local,
+        };
+        let mut image = self.slots[lease.slot]
+            .image
+            .write()
+            .expect("row metadata slot poisoned");
         image.pending.clear();
         image.history.clear();
+        image.sources = None;
         let capacity = || {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -117,7 +186,20 @@ impl RowMetadataPool {
             image.history.push(entry.version).map_err(|_| capacity())?;
             slot = entry.previous;
         }
-        Ok(image)
+        image.sources = sources(&image)?;
+        drop(image);
+        Ok(lease)
+    }
+}
+
+impl CapturedRowMetadata {
+    pub(super) fn has_heap(&self, state: RowState) -> bool {
+        matches!(state.committed, Some(RowHome::Heap(_)))
+            || self.pending.iter().any(|(_, change)| change.loc.is_some())
+            || self
+                .history
+                .iter()
+                .any(|version| matches!(version.home, Some(RowHome::Heap(_))))
     }
 }
 
@@ -136,7 +218,7 @@ pub(super) type RowReadVisitor<'a> = dyn for<'row> FnMut(
     + 'a;
 
 enum VersionOwner<'a> {
-    Retained(MutexGuard<'a, CapturedRowMetadata>),
+    Retained(MetadataLease),
     Borrowed(&'a RowVersionState),
     Immutable(SpilledRowState),
 }
@@ -150,6 +232,156 @@ impl Deref for RowRead<'_> {
 }
 
 impl<'owner> RowRead<'owner> {
+    pub(super) fn has_owned_sources(&self) -> bool {
+        match &self.versions {
+            VersionOwner::Retained(lease) => lease.read().sources.is_some(),
+            VersionOwner::Immutable(_) => true,
+            VersionOwner::Borrowed(_) => false,
+        }
+    }
+
+    pub(crate) fn select_owned(
+        &self,
+        table: usize,
+        rowid: u64,
+        transaction: u32,
+        command_snapshot: u32,
+        commit_snapshot: u64,
+    ) -> Result<Option<super::VisibleRowHome>, SqlError> {
+        if let VersionOwner::Immutable(source) = &self.versions {
+            source.validate_request(table, rowid)?;
+            return source
+                .visible_at(commit_snapshot)
+                .map(|home| home.map(super::VisibleRowHome::spilled));
+        }
+        let selected = self.visible_version_at(transaction, command_snapshot, commit_snapshot);
+        if selected.is_none() {
+            return self.lookup_owned_objects(table, rowid, commit_snapshot);
+        }
+        self.pin_owned(table, rowid, selected)
+    }
+
+    pub(super) fn lookup_owned_objects(
+        &self,
+        table: usize,
+        rowid: u64,
+        snapshot: u64,
+    ) -> Result<Option<super::VisibleRowHome>, SqlError> {
+        let VersionOwner::Retained(lease) = &self.versions else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "row metadata has no owned source"
+            ));
+        };
+        let (created_at, roots) = {
+            let image = lease.read();
+            let source = image.sources.as_ref().ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "row metadata has no owned source")
+            })?;
+            if source.table != table || source.rowid != rowid {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained row metadata does not match the requested table and row"
+                ));
+            }
+            (
+                source.created_at,
+                source
+                    .objects
+                    .as_ref()
+                    .map(QueryRootLease::try_clone)
+                    .transpose()?,
+            )
+        };
+        let Some(roots) = roots else { return Ok(None) };
+        let version = roots.with_snapshot(|source| {
+            super::Storage::probe_spill_snapshot(source, rowid, snapshot)
+        })?;
+        let Some(version) = version else {
+            return Ok(None);
+        };
+        let source = SpilledRowState::new(roots, rowid, version);
+        let selected = source.visible_at(snapshot)?;
+        if selected
+            .as_ref()
+            .is_some_and(|read| read.snapshot().created_at != created_at)
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "retained object row belongs to a different table or version"
+            ));
+        }
+        Ok(selected.map(super::VisibleRowHome::spilled))
+    }
+
+    pub(super) fn pin_owned(
+        &self,
+        table: usize,
+        rowid: u64,
+        selected: Option<(RowVersionIdentity, Option<RowHome>)>,
+    ) -> Result<Option<super::VisibleRowHome>, SqlError> {
+        let VersionOwner::Retained(lease) = &self.versions else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "row metadata has no owned source"
+            ));
+        };
+        let image = lease.read();
+        let source = image.sources.as_ref().ok_or_else(|| {
+            sql_err!(sqlstate::INTERNAL_ERROR, "row metadata has no owned source")
+        })?;
+        if source.table != table || source.rowid != rowid {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "retained row metadata does not match the requested table and row"
+            ));
+        }
+        let Some((version, Some(home))) = selected else {
+            return Ok(None);
+        };
+        let snapshot = super::RowSnapshot {
+            created_at: source.created_at,
+            version,
+        };
+        match home {
+            RowHome::Heap(location) => {
+                let heap = source.heap.as_ref().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "retained row metadata has no heap source"
+                    )
+                })?;
+                Ok(Some(super::VisibleRowHome::heap(
+                    snapshot,
+                    heap.read_location(location)?,
+                    table,
+                    rowid,
+                )))
+            }
+            RowHome::Spilled {
+                len,
+                sst,
+                commit_lsn,
+            } => {
+                let roots = source.objects.as_ref().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "retained row metadata has no object source"
+                    )
+                })?;
+                let read = SpilledRowRead::new(roots.try_clone()?, rowid, len, sst, commit_lsn)?;
+                if read.snapshot().created_at != snapshot.created_at
+                    || read.snapshot().version != snapshot.version
+                {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "retained object row belongs to a different table or version"
+                    ));
+                }
+                Ok(Some(super::VisibleRowHome::spilled(read)))
+            }
+        }
+    }
     fn versions(&self) -> Option<&RowVersionState> {
         match &self.versions {
             VersionOwner::Retained(_) => None,
@@ -194,14 +426,16 @@ impl<'owner> RowRead<'owner> {
     }
 
     pub(crate) fn pending_last(&self) -> Option<PendingChange> {
-        if let VersionOwner::Retained(image) = &self.versions {
+        if let VersionOwner::Retained(lease) = &self.versions {
+            let image = lease.read();
             return image.pending.first().map(|(_, change)| *change);
         }
         pending_last(&self.versions()?.pending_row_versions, self.state.pending)
     }
 
     pub(super) fn pending_head_identity(&self) -> Option<u64> {
-        if let VersionOwner::Retained(image) = &self.versions {
+        if let VersionOwner::Retained(lease) = &self.versions {
+            let image = lease.read();
             return image.pending.first().map(|(identity, _)| *identity);
         }
         self.state.pending.tail.map(|slot| {
@@ -213,7 +447,8 @@ impl<'owner> RowRead<'owner> {
     }
 
     pub(crate) fn history_get(&self, index: usize) -> Option<CommittedVersion> {
-        if let VersionOwner::Retained(image) = &self.versions {
+        if let VersionOwner::Retained(lease) = &self.versions {
+            let image = lease.read();
             return image.history.get(index).copied();
         }
         committed_history_get(
@@ -230,7 +465,8 @@ impl<'owner> RowRead<'owner> {
     }
 
     pub(super) fn has_visible_pending(&self, txid: u32, snapshot: u32) -> bool {
-        if let VersionOwner::Retained(image) = &self.versions {
+        if let VersionOwner::Retained(lease) = &self.versions {
+            let image = lease.read();
             return image
                 .pending
                 .iter()
@@ -248,7 +484,8 @@ impl<'owner> RowRead<'owner> {
     }
 
     pub(super) fn retained_pending_home(&self, identity: u64) -> Option<Option<RowLoc>> {
-        if let VersionOwner::Retained(image) = &self.versions {
+        if let VersionOwner::Retained(lease) = &self.versions {
+            let image = lease.read();
             return image
                 .pending
                 .iter()
@@ -268,7 +505,8 @@ impl<'owner> RowRead<'owner> {
         command_snapshot: u32,
         commit_snapshot: u64,
     ) -> Option<(RowVersionIdentity, Option<RowHome>)> {
-        if let VersionOwner::Retained(image) = &self.versions {
+        if let VersionOwner::Retained(lease) = &self.versions {
+            let image = lease.read();
             if let Some((identity, change)) = image
                 .pending
                 .iter()
@@ -344,16 +582,31 @@ impl<'a> RowReadView<'a> {
         Self { rows, versions }
     }
 
+    #[cfg(test)]
     pub(super) fn point(
-        versions: &'a RowVersionPools,
+        versions: &RowVersionPools,
         rows: &RowMap,
         rowid: u64,
-    ) -> Result<Option<RowRead<'a>>, SqlError> {
+    ) -> Result<Option<RowRead<'static>>, SqlError> {
+        Self::point_with(versions, rows, rowid, |_, _| Ok(None))
+    }
+
+    pub(super) fn point_with(
+        versions: &RowVersionPools,
+        rows: &RowMap,
+        rowid: u64,
+        sources: impl FnOnce(
+            RowState,
+            &CapturedRowMetadata,
+        ) -> Result<Option<CapturedRowSources>, SqlError>,
+    ) -> Result<Option<RowRead<'static>>, SqlError> {
         let owner = versions.read();
         let Some(state) = rows.read().get(&rowid).copied() else {
             return Ok(None);
         };
-        let image = versions.metadata.capture(&owner, state)?;
+        let image = versions
+            .metadata
+            .capture(&owner, state, |image| sources(state, image))?;
         drop(owner);
         Ok(Some(RowRead {
             state,
@@ -539,10 +792,27 @@ mod tests {
         assert_eq!(budget.remaining(), 0);
         assert_eq!(pool.slots.len(), 2 * METADATA_READS_PER_WORKSPACE);
         for slot in pool.slots.iter() {
-            let image = slot.lock().unwrap();
+            let image = slot.image.read().unwrap();
             assert_eq!(image.pending.capacity(), 3);
             assert_eq!(image.history.capacity(), 3);
         }
+    }
+
+    #[test]
+    fn owned_row_lookup_metadata_lease_outlives_its_pool_owner() {
+        let (versions, rows) = owners();
+        install(
+            &mut versions.test_write().unwrap(),
+            &mut rows.test_write().unwrap(),
+            1,
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            let retained = RowReadView::point(&versions, &rows, 2).unwrap().unwrap();
+            drop(rows);
+            drop(versions);
+            observe(&retained);
+            drop(retained);
+        });
     }
 
     #[test]

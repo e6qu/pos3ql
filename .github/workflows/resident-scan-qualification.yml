@@ -1,0 +1,37 @@
+name: Resident scan qualification
+
+on:
+  push:
+    branches: [retain-resident-byte-scans]
+  workflow_dispatch:
+
+concurrency:
+  group: resident-scan-qualification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resident-scans:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Lint and focused regressions
+        run: |
+          set -euo pipefail
+          cargo clippy --lib --bins -- -D warnings
+          for filter in \
+            captured_resident_byte_scans captured_byte_scan captured_row_scan \
+            retained_row_walk owned_ordered startup \
+            external_windows_spill_through_the_provider_neutral_block_store \
+            wide_join_trees_execute_without_allocation joins_are_not_capped_at_eight_edges; do
+            cargo test --lib --locked "$filter" -- --nocapture
+          done

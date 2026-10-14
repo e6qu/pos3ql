@@ -1427,6 +1427,241 @@ mod tests {
     }
 
     #[test]
+    fn captured_resident_byte_scans_keep_mixed_saved_versions_after_retirement() {
+        use super::super::row_images::VisibleRowBytes;
+        use super::super::{RowHome, RowLoc, RowState};
+        use crate::sql::types::Datum;
+        let PointFixture {
+            mut storage,
+            table,
+            roots,
+            arena,
+            path,
+        } = point_fixture("captured-mixed");
+        let registry = Arc::clone(&storage.spill_roots);
+        let mut retained = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            let old_command = storage.read_snapshot();
+            let old_commit = storage.commit_snapshot();
+            let future = storage.heap.append_row(&[Datum::Int4(99)]).unwrap();
+            let resident = storage.heap.append_row(&[Datum::Int4(30)]).unwrap();
+            let pending = storage.heap.append_row(&[Datum::Int4(55)]).unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, RowState::committed_only_at(future, 11))
+                .unwrap();
+            storage.tables[table]
+                .rows
+                .insert(3, RowState::committed_only_at(resident, 7))
+                .unwrap();
+            let undo = storage
+                .write_pending(table, 1, 11, 1, Some(pending))
+                .unwrap();
+            storage.set_read_snapshot(1);
+            storage.set_commit_snapshot(7);
+            let old = storage.captured_row_scan_in(table, 11, &arena).unwrap();
+            storage.set_commit_snapshot(9);
+            let current = storage.captured_row_scan_in(table, 11, &arena).unwrap();
+            let length = crate::storage::rowenc::encoded_len(&[Datum::Int4(17)]) as u32;
+            let mut saved = RowState::committed_only_at(RowLoc::test(0, length), 7);
+            saved.committed = Some(RowHome::Spilled {
+                len: length,
+                sst: 0,
+                commit_lsn: 7,
+            });
+            storage.tables[table].rows.insert(2, saved).unwrap();
+            let deleted = storage.write_pending(table, 2, 11, 1, None).unwrap();
+            let removed = storage.write_pending(table, 3, 11, 1, None).unwrap();
+            storage.set_read_snapshot(2);
+            storage.set_commit_snapshot(7);
+            let own = storage.captured_row_scan_in(table, 11, &arena).unwrap();
+            storage.restore_pending(table, 1, 11, undo);
+            storage.restore_pending(table, 2, 11, deleted);
+            storage.restore_pending(table, 3, 11, removed);
+            storage.commit_drop(table);
+            let replacement = storage
+                .create_table(make_def(
+                    "captured_replacement",
+                    &[("id", ColType::Text, true)],
+                ))
+                .unwrap();
+            assert_eq!(replacement, table);
+            storage.set_spill_list(table, &[roots[2]]);
+            storage.set_read_snapshot(old_command);
+            storage.set_commit_snapshot(old_commit);
+            drop(storage);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert_eq!(retained.len(), 2);
+            assert!(retained.contains(&roots[0]) && retained.contains(&roots[1]));
+            for (scan, expected_overlay, expected_saved) in [
+                (&old, &[(1, 41), (3, 30)][..], &[(2, 17)][..]),
+                (&current, &[(1, 88), (3, 30)][..], &[][..]),
+                (&own, &[(1, 55)][..], &[][..]),
+            ] {
+                let mut count = 0;
+                scan.for_each_overlay(&mut |rowid, home| {
+                    let mut decoded = [Datum::Null];
+                    match home.bytes {
+                        VisibleRowBytes::Heap(bytes) => {
+                            crate::storage::rowenc::decode(&bytes, &[ColType::Int4], &mut decoded)?
+                        }
+                        VisibleRowBytes::Spilled(source) => source.with_bytes(|bytes| {
+                            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)
+                        })?,
+                    }
+                    assert_eq!(
+                        (rowid, decoded[0]),
+                        (
+                            expected_overlay[count].0,
+                            Datum::Int4(expected_overlay[count].1)
+                        )
+                    );
+                    count += 1;
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap();
+                assert_eq!(count, expected_overlay.len());
+                for mask in [None, Some(1)] {
+                    let mut count = 0;
+                    scan.for_each_spilled_row_batch(&arena, true, mask, &mut |rows| {
+                        for row in rows {
+                            let mut decoded = [Datum::Null];
+                            let values = match row.representation {
+                                super::super::SpilledRowRepresentation::Encoded(bytes) => {
+                                    crate::storage::rowenc::decode(
+                                        bytes,
+                                        &[ColType::Int4],
+                                        &mut decoded,
+                                    )?;
+                                    &decoded[..]
+                                }
+                                super::super::SpilledRowRepresentation::Values(values) => values,
+                            };
+                            assert_eq!(
+                                (row.rowid, values[0]),
+                                (
+                                    expected_saved[count].0,
+                                    Datum::Int4(expected_saved[count].1)
+                                )
+                            );
+                            count += 1;
+                        }
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })
+                    .unwrap();
+                    assert_eq!(count, expected_saved.len());
+                }
+            }
+            drop(old);
+            drop(current);
+            drop(own);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert!(retained.is_empty());
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn captured_resident_byte_scans_release_saved_sources_after_capacity_and_callback_errors() {
+        use super::super::RowState;
+        use crate::sql::types::Datum;
+        let PointFixture {
+            mut storage,
+            table,
+            roots: _,
+            arena,
+            path,
+        } = point_fixture("captured-release");
+        let alignment = core::mem::align_of::<SstHandle>();
+        let schema_bytes = (core::mem::size_of::<ColType>() + alignment - 1) & !(alignment - 1);
+        let capacity = schema_bytes + 2 * core::mem::size_of::<SstHandle>();
+        let mut budget = Budget::new(capacity);
+        let small =
+            crate::mem::arena::Arena::new(&mut budget, "captured metadata only", capacity).unwrap();
+        let mut retained = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            let old_commit = storage.commit_snapshot();
+            storage.set_commit_snapshot(7);
+            let location = storage.heap.append_row(&[Datum::Int4(30)]).unwrap();
+            storage.tables[table]
+                .rows
+                .insert(3, RowState::committed_only_at(location, 7))
+                .unwrap();
+            let error = storage
+                .captured_row_scan_in(table, 0, &small)
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("captured resident rows"));
+            storage
+                .spill_roots
+                .copy_roots(false, &mut retained)
+                .unwrap();
+            assert!(
+                retained.is_empty(),
+                "failed capture must release files already registered"
+            );
+            assert!(storage.heap.test_write().is_ok());
+            let scan = storage.captured_row_scan_in(table, 0, &arena).unwrap();
+            let nested = storage.captured_row_scan_in(table, 0, &arena).unwrap();
+            scan.for_each_spilled_row_batch(&arena, true, None, &mut |rows| {
+                assert_eq!(rows.len(), 2);
+                assert!(storage.tables[table].rows.test_write().is_ok());
+                assert!(storage.row_versions.test_write().is_ok());
+                nested.for_each_spilled_row_batch(&arena, true, Some(1), &mut |other| {
+                    assert_eq!(other.len(), 2);
+                    Ok(core::ops::ControlFlow::Break(()))
+                })?;
+                Ok(core::ops::ControlFlow::Break(()))
+            })
+            .unwrap();
+            assert_eq!(
+                scan.for_each_spilled_row_batch(&arena, true, None, &mut |_| {
+                    Err(sql_err!(
+                        sqlstate::QUERY_CANCELED,
+                        "cancel captured saved scan"
+                    ))
+                })
+                .unwrap_err()
+                .sqlstate,
+                sqlstate::QUERY_CANCELED
+            );
+            let reader = storage.spill.as_ref().unwrap();
+            assert!(
+                reader
+                    .cursor_contexts
+                    .iter()
+                    .all(|slot| slot.try_lock().is_ok())
+            );
+            assert!(
+                reader
+                    .scan_contexts
+                    .iter()
+                    .all(|slot| slot.try_lock().is_ok())
+            );
+            drop(scan);
+            drop(nested);
+            storage
+                .spill_roots
+                .copy_roots(false, &mut retained)
+                .unwrap();
+            assert!(retained.is_empty());
+            assert!(
+                storage
+                    .query_roots
+                    .slots
+                    .iter()
+                    .all(|slot| !slot.retained.load(Ordering::Acquire))
+            );
+            let retry = storage.captured_row_scan_in(table, 0, &arena).unwrap();
+            drop(retry);
+            storage.set_commit_snapshot(old_commit);
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn owned_immutable_scan_keeps_saved_rows_after_retirement() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<super::super::row_walks::ImmutableRowScan<'static>>();

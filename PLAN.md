@@ -61,7 +61,7 @@ an already running read following reused memory or deleted objects.
 
 Statements, transactions, streaming `COPY FROM`, and imported replication
 snapshots retain their read position. Selected bytes, captured point metadata,
-saved-file scans, sorted row records, enum rewrites, and MERGE target copies keep
+sequential SQL byte scans, sorted row records, enum rewrites, and MERGE target copies keep
 their original data without later version-chain lookups. Captured row identity
 lists own their startup buffers. Shared statistics and journal acknowledgements
 also retain the exact state they captured.
@@ -71,11 +71,11 @@ contracts and limits; this sequence keeps the remaining acceptance gates.
 
 Still to do:
 
-- Complete table retirement for rows a scan has not selected yet and for
-  remaining executor reads that retain only a version stamp. Selected bytes,
-  captured point metadata, sorted and enum-rewrite row sources, and scans
-  entirely over saved files survive retirement. Preserving all unselected
-  resident versions still needs coordination.
+- Complete reader protection for authoritative metadata walks and remaining
+  executor reads that retain only a version stamp. Sequential SQL byte scans
+  now capture resident version choices before fetching bytes and keep their
+  original heap and saved files. Metadata walks still consult live row state;
+  their retirement and update rules need coordination.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.
 - Integrate bounded heap relocation with concurrent table publication and

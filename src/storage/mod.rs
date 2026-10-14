@@ -18,6 +18,7 @@ mod row_images;
 mod row_map;
 mod row_publication;
 mod row_reads;
+mod row_scans;
 mod row_versions;
 mod row_walks;
 pub(crate) mod rowenc;

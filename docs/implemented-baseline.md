@@ -68,6 +68,8 @@ on completion or error, including partial capture. Saved row payloads are fetche
 when emitted; the export does not copy every payload before starting output.
 An output record uses 40 bytes on the release target, plus the scan's resident
 records, captured schemas, and file lists. Exhaustion returns `54000`.
+Capture, row iteration, and output check the statement deadline; expiration
+returns `57014` and releases the export's sources.
 
 **User example:** `COPY orders (id, note) TO STDOUT (FORMAT csv)` exports the
 versions collected for that statement, including its visible pending changes.

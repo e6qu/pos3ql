@@ -23329,6 +23329,15 @@ fn owned_copy_to_sources_preserve_partition_order_pending_rows_and_cold_recovery
         copy_data_rows(&session.success(&mut engine, "COPY export_orders TO STDOUT", true)),
         ["15\tmiddle", "2\tlow\\trow", "30\tfar, saved"]
     );
+    session.success(
+        &mut engine,
+        "UPDATE export_orders SET note = 'committed' WHERE id = 15",
+        true,
+    );
+    assert_eq!(
+        copy_data_rows(&session.success(&mut engine, "COPY export_orders TO STDOUT", true)),
+        ["15\tcommitted", "2\tlow\\trow", "30\tfar, saved"]
+    );
     assert!(engine.checkpoint().unwrap());
     drop(session);
     drop(engine);
@@ -23342,7 +23351,7 @@ fn owned_copy_to_sources_preserve_partition_order_pending_rows_and_cold_recovery
             "COPY export_orders TO STDOUT",
             4 << 20
         )),
-        ["15\tmiddle", "2\tlow\\trow", "30\tfar, saved"]
+        ["15\tcommitted", "2\tlow\\trow", "30\tfar, saved"]
     );
     drop(engine);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

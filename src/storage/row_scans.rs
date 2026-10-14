@@ -20,6 +20,7 @@ impl Storage {
         txid: u32,
         arena: &'arena Arena,
     ) -> Result<CapturedRowScan<'arena>, SqlError> {
+        crate::sql::query::check_timeout()?;
         let command = self.read_snapshot();
         let commit = self.commit_snapshot();
         let (source, records) = {
@@ -57,6 +58,7 @@ impl Storage {
                 })?;
             let mut at = 0;
             for (&rowid, &state) in rows.iter() {
+                crate::sql::query::check_timeout()?;
                 if Self::redundant_spilled_row_state(&state) {
                     continue;
                 }
@@ -68,6 +70,7 @@ impl Storage {
             (source, records)
         };
         for record in records.iter_mut() {
+            crate::sql::query::check_timeout()?;
             source.resolve_saved(record, commit)?;
         }
         records.sort_unstable_by_key(|record| record.rowid);
@@ -91,6 +94,7 @@ impl<'source_arena> CapturedRowScan<'source_arena> {
         &self,
         each: &mut dyn FnMut(u64, VisibleRowHome) -> Result<ControlFlow<()>, SqlError>,
     ) -> Result<ControlFlow<()>, SqlError> {
+        crate::sql::query::check_timeout()?;
         if self.for_each_overlay(each)?.is_break() {
             return Ok(ControlFlow::Break(()));
         }
@@ -103,6 +107,7 @@ impl<'source_arena> CapturedRowScan<'source_arena> {
         each: &mut dyn FnMut(u64, VisibleRowHome) -> Result<ControlFlow<()>, SqlError>,
     ) -> Result<ControlFlow<()>, SqlError> {
         for &record in self.rows {
+            crate::sql::query::check_timeout()?;
             if let Some(home) = self.source.read_record(record)?
                 && each(record.rowid, home)?.is_break()
             {
@@ -335,6 +340,83 @@ mod tests {
         });
         storage.set_read_snapshot(old_command);
         storage.set_commit_snapshot(old_commit);
+    }
+
+    #[test]
+    fn captured_resident_byte_scans_timeout_releases_capture_and_allows_retry() {
+        struct ClearDeadline;
+        impl Drop for ClearDeadline {
+            fn drop(&mut self) {
+                crate::sql::query::disarm_timeout();
+            }
+        }
+        let _clear = ClearDeadline;
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "captured_deadline",
+                &[("id", ColType::Int4, true)],
+            ))
+            .unwrap();
+        let mut arena_budget = Budget::new(16 << 10);
+        let arena = Arena::new(&mut arena_budget, "captured deadline", 16 << 10).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let old_commit = storage.commit_snapshot();
+            storage.set_commit_snapshot(7);
+            let location = storage.heap.append_bytes(b"keep").unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, RowState::committed_only_at(location, 7))
+                .unwrap();
+            storage.tables[table]
+                .rows
+                .insert(2, RowState::committed_only_at(location, 7))
+                .unwrap();
+            crate::sql::query::arm_timeout(1);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let error = storage
+                .captured_row_scan_in(table, 0, &arena)
+                .err()
+                .unwrap();
+            crate::sql::query::disarm_timeout();
+            assert_eq!(error.sqlstate, sqlstate::QUERY_CANCELED);
+            assert_eq!(arena.used(), 0);
+            assert!(storage.heap.test_write().is_ok());
+            let scan = storage.captured_row_scan_in(table, 0, &arena).unwrap();
+            let mut count = 0;
+            let error = scan
+                .for_each_home(&mut |_, _| {
+                    count += 1;
+                    crate::sql::query::arm_timeout(1);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    Ok(ControlFlow::Continue(()))
+                })
+                .unwrap_err();
+            crate::sql::query::disarm_timeout();
+            assert_eq!(error.sqlstate, sqlstate::QUERY_CANCELED);
+            assert_eq!(count, 1);
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.tables[table].rows.test_write().is_ok());
+            drop(scan);
+            assert!(storage.heap.test_write().is_ok());
+            let retry = storage.captured_row_scan_in(table, 0, &arena).unwrap();
+            let mut count = 0;
+            assert!(
+                retry
+                    .for_each_home(&mut |_, _| {
+                        count += 1;
+                        Ok(ControlFlow::Continue(()))
+                    })
+                    .unwrap()
+                    .is_continue()
+            );
+            assert_eq!(count, 2);
+            drop(retry);
+            assert!(storage.heap.test_write().is_ok());
+            storage.set_commit_snapshot(old_commit);
+        });
     }
 
     #[test]

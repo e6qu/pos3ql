@@ -6,7 +6,8 @@ finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 The export-reader review on 2026-10-14 covers `COPY TO` source and schema
 retention, partial owner initialization, nested saved-row callbacks, pending
-partition changes, cancellation, fixed-arena exhaustion, retry, and recovery.
+partition changes, statement deadlines, cancellation, fixed-arena exhaustion,
+retry, and recovery.
 Remaining metadata-walk and executor lifetime work is tracked in PLAN.md.
 No known defects meet this file's inclusion criteria. This does not mean all
 planned work is finished or that every possible bug has been ruled out.

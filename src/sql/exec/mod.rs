@@ -53841,6 +53841,7 @@ fn emit_copy_out_row<'a>(
     security: Option<super::query::RowSecurityPlan<'a>>,
     values: &mut [Datum<'a>; MAX_COLUMNS],
 ) -> Result<bool, SqlError> {
+    super::query::check_timeout()?;
     if let Some(plan) = security {
         let row = RowCtx {
             def: definition,
@@ -54084,6 +54085,7 @@ pub fn copy_out(
     let mut visible = 0usize;
     for source in sources.iter() {
         let _ = source.scan.for_each_home(&mut |_, _| {
+            super::query::check_timeout()?;
             visible = visible.checked_add(1).ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -54106,6 +54108,7 @@ pub fn copy_out(
     let mut fill = 0usize;
     for (index, source) in sources.iter().enumerate() {
         let _ = source.scan.for_each_home(&mut |rowid, home| {
+            super::query::check_timeout()?;
             let token = tokens.get_mut(fill).ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -54132,6 +54135,7 @@ pub fn copy_out(
     });
     let mut count = 0u64;
     for (index, token) in tokens.iter().copied().flatten() {
+        super::query::check_timeout()?;
         let source = &sources[index];
         let leaf = source.table;
         let rowid = token.rowid();

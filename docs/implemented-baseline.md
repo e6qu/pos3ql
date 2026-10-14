@@ -67,12 +67,11 @@ schema, read position, and reader buffers. The 64 source slots per workspace
 are reserved at startup. An already captured source remains valid after its
 table or Storage owner is retired. Capturing or releasing a source holds shared
 registry state briefly; object I/O and scan callbacks do not hold that registry.
-Scans capture resident row identities, the saved-file list, schema, and read
-position under one ordered transition before running callbacks. Metadata and
-byte phases use that captured partition. Scans admitted with no resident overlay
-own their schema, read position, files, and reader without borrowing Storage;
-unread saved rows remain available after table replacement or Storage shutdown.
-A table with a resident overlay is rejected before scan memory is reserved.
+Scans capture their saved-file list, schema, and read position before running
+callbacks. The fast path for tables entirely in saved files owns its source
+without borrowing Storage; it rejects a resident overlay before reserving scan
+memory. Unread saved rows remain available after table replacement or Storage
+shutdown. The sequential SQL path described below also owns resident selections.
 Rows kept in the in-memory map also
 resolve saved versions from those files; changing a file's position in the live
 list cannot redirect a selected read. Version ownership ends before object I/O.
@@ -93,8 +92,9 @@ requests, cancellation, and statement-buffer exhaustion release ownership.
 removing the table cannot replace those contents with a newly created table's
 row. Reclamation can free space for new rows while that read keeps its old
 bytes. With `memtable_bytes = 64MiB`, heap bytes reserve 128 MiB before other
-startup controls. Finishing the same guarantee for resident rows the scan has not selected
-yet and coordinating table publication with concurrent maintenance are planned.
+startup controls. Sequential SQL byte scans select resident versions during
+capture, before fetching those bytes. Authoritative metadata walks, remaining
+executor snapshot reads, and concurrent table publication still need coordination.
 
 Individual object-row lookups retain their full generation list, schema,
 table identity, and reader buffers through byte retrieval. Their metadata also
@@ -134,13 +134,31 @@ Captured row identity lists own their startup pool slot, so their numbers remain
 available after the source map, table, or Storage owner is removed. Concurrent
 captures reserve distinct slots; failed capture and final release clear a slot
 before reuse. Iteration and nested reads use only that slot's private guards.
-This preserves the list's memory; unselected resident row versions still need
-table-retirement coordination.
-SQL byte scans keep their row identities, saved-file handles, and schema in the
-statement arena, copying only used columns, so wide joins do not spend one
-metadata source slot per join edge. The scan releases registered files before its statement memory is reset;
-an object-row source selected from it copies ownership into a startup slot. Checked reader identities and full pools return SQLSTATE
-`54000` before reuse or partial registration. These are separate reservations;
+This preserves the list's memory; authoritative metadata walks still consult
+live resident versions.
+
+Sequential SQL byte scans capture each resident row's visible version, byte
+location, and deletion status during one metadata transition. A shared source
+owns the original heap allocation, saved-file handles, schema, and read position.
+Fetching an unread row does not revisit mutable version chains, even after
+rollback, table replacement, relocation, or Storage teardown. Saved rows outside
+that resident overlay continue streaming through the existing merged file reader,
+including selected-column decoding. Saved-history lookups, downloads, and callbacks
+run after the table and version guards are released.
+
+**User example:** a report can pause after its first in-memory order while a
+writer changes another order. The report's next row still uses the version it
+captured, even if cleanup reuses that version's old metadata slot.
+
+Resident scan records use 32 bytes each in the fixed statement arena, replacing
+the former 8-byte identity list; saved rows are not copied into that list.
+Exhaustion returns `54000` and releases captured heap/file ownership. No startup
+pool or statement limit grows to rescue the query. Nested wide joins continue
+using arena-owned metadata rather than one scan-source slot per join edge.
+Registered files release before statement memory is reset; an object-row source
+selected from the scan copies ownership into a startup slot. Checked reader
+identities and full pools return `54000` before reuse or partial registration.
+These are separate reservations;
 the [capacity inventory](postgresql-18-compatibility.md#capacity-boundaries)
 records their limits.
 

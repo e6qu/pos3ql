@@ -232,6 +232,13 @@ impl Deref for RowRead<'_> {
 }
 
 impl<'owner> RowRead<'owner> {
+    pub(super) fn borrowed(state: RowState, versions: &'owner RowVersionState) -> Self {
+        Self {
+            state,
+            versions: VersionOwner::Borrowed(versions),
+            captured_roots: None,
+        }
+    }
     pub(super) fn has_owned_sources(&self) -> bool {
         match &self.versions {
             VersionOwner::Retained(lease) => lease.read().sources.is_some(),
@@ -616,16 +623,9 @@ impl<'a> RowReadView<'a> {
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, RowRead<'_>)> {
-        self.rows.iter().map(|(&rowid, &state)| {
-            (
-                rowid,
-                RowRead {
-                    state,
-                    versions: VersionOwner::Borrowed(&self.versions),
-                    captured_roots: None,
-                },
-            )
-        })
+        self.rows
+            .iter()
+            .map(|(&rowid, &state)| (rowid, RowRead::borrowed(state, &self.versions)))
     }
 }
 

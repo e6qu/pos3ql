@@ -44,6 +44,50 @@ pub(crate) struct OrderedRowSnapshot<'source, 'arena> {
     len: u32,
 }
 
+/// Private scan records remain valid when their containing source is moved.
+#[derive(Clone, Copy)]
+pub(super) struct CapturedRowRecord {
+    pub(super) rowid: u64,
+    version: u64,
+    offset_or_member: u32,
+    len: u32,
+    kind: CapturedRowKind,
+}
+
+#[derive(Clone, Copy)]
+enum CapturedRowKind {
+    PendingHeap,
+    CommittedHeap,
+    CommittedSpilled,
+    Invisible,
+    LookupSaved,
+}
+
+impl CapturedRowRecord {
+    pub(super) const EMPTY: Self = Self {
+        rowid: 0,
+        version: 0,
+        offset_or_member: 0,
+        len: 0,
+        kind: CapturedRowKind::Invisible,
+    };
+    fn empty(rowid: u64, kind: CapturedRowKind) -> Self {
+        Self {
+            rowid,
+            version: 0,
+            offset_or_member: 0,
+            len: 0,
+            kind,
+        }
+    }
+
+    pub(super) fn needs_saved_lookup(&self) -> bool {
+        matches!(self.kind, CapturedRowKind::LookupSaved)
+    }
+}
+
+const _: () = assert!(size_of::<CapturedRowRecord>() == 32);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 enum OrderedVersionKind {
@@ -178,6 +222,141 @@ impl<'arena> TableRowSnapshot<'arena> {
             offset_or_member,
             len,
         })
+    }
+
+    pub(super) fn capture_selection(
+        &self,
+        rowid: u64,
+        selected: Option<(RowVersionIdentity, Option<RowHome>)>,
+    ) -> Result<CapturedRowRecord, SqlError> {
+        let Some((version, home)) = selected else {
+            return Ok(CapturedRowRecord::empty(
+                rowid,
+                CapturedRowKind::LookupSaved,
+            ));
+        };
+        let Some(home) = home else {
+            return Ok(CapturedRowRecord::empty(rowid, CapturedRowKind::Invisible));
+        };
+        let visible = match home {
+            RowHome::Heap(location) => VisibleRowHome::heap(
+                RowSnapshot {
+                    created_at: self.created_at,
+                    version,
+                },
+                self.heap
+                    .as_ref()
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::INTERNAL_ERROR, "captured scan has no heap source")
+                    })?
+                    .read_location(location)?,
+                self.table_slot,
+                rowid,
+            ),
+            RowHome::Spilled {
+                len,
+                sst,
+                commit_lsn,
+            } => {
+                if version != RowVersionIdentity::Committed(commit_lsn) {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "captured scan saved-file version changed"
+                    ));
+                }
+                VisibleRowHome::spilled(SpilledRowRead::new(
+                    self.roots.owned_source_in(&self.pool)?.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "captured scan has no saved-file source"
+                        )
+                    })?,
+                    rowid,
+                    len,
+                    sst,
+                    commit_lsn,
+                )?)
+            }
+        };
+        self.capture_image(rowid, &visible)
+    }
+
+    fn capture_image(
+        &self,
+        rowid: u64,
+        visible: &VisibleRowHome,
+    ) -> Result<CapturedRowRecord, SqlError> {
+        let row = self.retain(rowid, visible)?;
+        Ok(CapturedRowRecord {
+            rowid,
+            version: row.version,
+            offset_or_member: row.offset_or_member,
+            len: row.len,
+            kind: match row.source.kind() {
+                OrderedVersionKind::PendingHeap => CapturedRowKind::PendingHeap,
+                OrderedVersionKind::CommittedHeap => CapturedRowKind::CommittedHeap,
+                OrderedVersionKind::CommittedSpilled => CapturedRowKind::CommittedSpilled,
+            },
+        })
+    }
+
+    pub(super) fn resolve_saved(
+        &self,
+        row: &mut CapturedRowRecord,
+        snapshot: u64,
+    ) -> Result<(), SqlError> {
+        if !row.needs_saved_lookup() {
+            return Ok(());
+        }
+        let Some(roots) = self.roots.owned_source_in(&self.pool)? else {
+            row.kind = CapturedRowKind::Invisible;
+            return Ok(());
+        };
+        let selected = roots.with_snapshot(|source| {
+            super::Storage::probe_spill_snapshot(source, row.rowid, snapshot)
+        })?;
+        let Some(selected) = selected else {
+            row.kind = CapturedRowKind::Invisible;
+            return Ok(());
+        };
+        let visible = super::spill_generations::SpilledRowState::new(roots, row.rowid, selected)
+            .visible_at(snapshot)?;
+        *row = match visible {
+            Some(visible) => self.capture_image(row.rowid, &VisibleRowHome::spilled(visible))?,
+            None => CapturedRowRecord::empty(row.rowid, CapturedRowKind::Invisible),
+        };
+        Ok(())
+    }
+
+    pub(super) fn read_record(
+        &self,
+        row: CapturedRowRecord,
+    ) -> Result<Option<VisibleRowHome>, SqlError> {
+        let kind = match row.kind {
+            CapturedRowKind::PendingHeap => OrderedVersionKind::PendingHeap,
+            CapturedRowKind::CommittedHeap => OrderedVersionKind::CommittedHeap,
+            CapturedRowKind::CommittedSpilled => OrderedVersionKind::CommittedSpilled,
+            CapturedRowKind::Invisible => return Ok(None),
+            CapturedRowKind::LookupSaved => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "captured row metadata is incomplete"
+                ));
+            }
+        };
+        OrderedRowSnapshot {
+            source: OrderedRowSource::new(self, kind),
+            rowid: row.rowid,
+            version: row.version,
+            offset_or_member: row.offset_or_member,
+            len: row.len,
+        }
+        .read()
+        .map(Some)
+    }
+
+    pub(super) fn roots(&self) -> &CapturedSpillRoots<'arena> {
+        &self.roots
     }
 }
 

@@ -6387,15 +6387,12 @@ fn scan_source_mode<'a>(
         macro_rules! visit_sequential_physical_rows {
             ($slot:expr) => {{
                 storage.record_relation_scan(txid, $slot, None, 0)?;
-                let scan = storage.row_scan_in($slot, arena)?;
+                let scan = storage.captured_row_scan_in($slot, txid, arena)?;
                 let mut index = 0usize;
                 let mut aborted = false;
-                let _ = scan.for_each_overlay(&mut |rowid, state| {
+                let _ = scan.for_each_overlay(&mut |rowid, home| {
                     use core::ops::ControlFlow;
                     check_timeout()?;
-                    let Some(home) = storage.visible_row_home($slot, rowid, state, txid)? else {
-                        return Ok(ControlFlow::Continue(()));
-                    };
                     storage.record_relation_tuple_read(txid, $slot, None)?;
                     let this = index;
                     index += 1;

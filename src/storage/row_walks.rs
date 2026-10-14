@@ -1,7 +1,6 @@
 //! Startup-bounded row identity retention for authoritative metadata walks.
 
 use core::mem::size_of;
-use core::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
@@ -88,21 +87,27 @@ impl Iterator for RowIdIter<'_> {
 pub(super) enum RowScanIds<'scan> {
     Reserved(RetainedRowIds),
     Statement(&'scan [u64]),
+    Captured(&'scan [super::row_images::CapturedRowRecord]),
 }
 
 enum RowScanIdView<'a> {
     Reserved(RwLockReadGuard<'a, FixedVec<u64>>),
     Statement(&'a [u64]),
+    Captured(&'a [super::row_images::CapturedRowRecord]),
 }
 
-impl Deref for RowScanIdView<'_> {
-    type Target = [u64];
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Reserved(rowids) => rowids,
-            Self::Statement(rowids) => rowids,
-        }
+impl RowScanIdView<'_> {
+    fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        let len = match self {
+            Self::Reserved(rowids) => rowids.len(),
+            Self::Statement(rowids) => rowids.len(),
+            Self::Captured(rows) => rows.len(),
+        };
+        (0..len).map(|index| match self {
+            Self::Reserved(rowids) => rowids[index],
+            Self::Statement(rowids) => rowids[index],
+            Self::Captured(rows) => rows[index].rowid,
+        })
     }
 }
 
@@ -111,11 +116,16 @@ impl RowScanIds<'_> {
         match self {
             Self::Reserved(rowids) => RowScanIdView::Reserved(rowids.read()),
             Self::Statement(rowids) => RowScanIdView::Statement(rowids),
+            Self::Captured(rows) => RowScanIdView::Captured(rows),
         }
     }
 
     pub(super) fn contains(&self, rowid: u64) -> bool {
-        self.read().binary_search(&rowid).is_ok()
+        match self {
+            Self::Reserved(rowids) => rowids.read().binary_search(&rowid).is_ok(),
+            Self::Statement(rowids) => rowids.binary_search(&rowid).is_ok(),
+            Self::Captured(rows) => rows.binary_search_by_key(&rowid, |row| row.rowid).is_ok(),
+        }
     }
 }
 
@@ -320,7 +330,7 @@ impl RowScan<'_> {
         each: &mut super::RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
         self.validate_identity()?;
-        for &rowid in self.rowids.read().iter() {
+        for rowid in self.rowids.read().iter() {
             self.validate_identity()?;
             let state = match self.storage.resident_row_state(self.table_slot, rowid)? {
                 Some(state) => Some(state.with_captured_roots(&self.roots)),
@@ -651,7 +661,7 @@ mod tests {
             let partition = RowScanIds::Reserved(retained);
             assert!(partition.contains(1));
             assert!(!partition.contains(2));
-            assert_eq!(&*partition.read(), &[1]);
+            assert!(partition.read().iter().eq([1]));
             drop(partition);
         });
     }

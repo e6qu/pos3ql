@@ -1499,29 +1499,31 @@ mod tests {
                 (&own, &[(1, 55)][..], &[][..]),
             ] {
                 let mut count = 0;
-                scan.for_each_overlay(&mut |rowid, home| {
-                    let consume = |bytes: &[u8]| {
-                        let mut decoded = [Datum::Null];
-                        crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)?;
-                        assert_eq!(
-                            (rowid, decoded[0]),
-                            (
-                                expected_overlay[count].0,
-                                Datum::Int4(expected_overlay[count].1)
-                            )
-                        );
-                        Ok(())
-                    };
-                    match home.bytes {
-                        VisibleRowBytes::Heap(bytes) => {
-                            consume(&bytes)?;
+                let done = scan
+                    .for_each_overlay(&mut |rowid, home| {
+                        let consume = |bytes: &[u8]| {
+                            let mut decoded = [Datum::Null];
+                            crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)?;
+                            assert_eq!(
+                                (rowid, decoded[0]),
+                                (
+                                    expected_overlay[count].0,
+                                    Datum::Int4(expected_overlay[count].1)
+                                )
+                            );
+                            Ok(())
+                        };
+                        match home.bytes {
+                            VisibleRowBytes::Heap(bytes) => {
+                                consume(&bytes)?;
+                            }
+                            VisibleRowBytes::Spilled(source) => source.with_bytes(consume)?,
                         }
-                        VisibleRowBytes::Spilled(source) => source.with_bytes(consume)?,
-                    }
-                    count += 1;
-                    Ok(core::ops::ControlFlow::Continue(()))
-                })
-                .unwrap();
+                        count += 1;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })
+                    .unwrap();
+                assert!(done.is_continue());
                 assert_eq!(count, expected_overlay.len());
                 for mask in [None, Some(1)] {
                     let mut count = 0;

@@ -206,17 +206,19 @@ mod tests {
                 ),
             ] {
                 let mut at = 0;
-                scan.for_each_overlay(&mut |rowid, home| {
-                    assert_eq!(rowid, expected[at].0);
-                    assert_eq!(home.snapshot().version, versions[at]);
-                    let VisibleRowBytes::Heap(bytes) = home.bytes else {
-                        panic!("heap fixture")
-                    };
-                    assert_eq!(&*bytes, expected[at].1);
-                    at += 1;
-                    Ok(ControlFlow::Continue(()))
-                })
-                .unwrap();
+                let done = scan
+                    .for_each_overlay(&mut |rowid, home| {
+                        assert_eq!(rowid, expected[at].0);
+                        assert_eq!(home.snapshot().version, versions[at]);
+                        let VisibleRowBytes::Heap(bytes) = home.bytes else {
+                            panic!("heap fixture")
+                        };
+                        assert_eq!(&*bytes, expected[at].1);
+                        at += 1;
+                        Ok(ControlFlow::Continue(()))
+                    })
+                    .unwrap();
+                assert!(done.is_continue());
                 assert_eq!(at, expected.len());
             }
         });
@@ -224,6 +226,7 @@ mod tests {
 
     #[test]
     fn captured_resident_byte_scans_allow_version_release_while_a_callback_waits() {
+        use crate::sql::types::Datum;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
         let config = test_config();
@@ -237,9 +240,9 @@ mod tests {
             .unwrap();
         let mut arena_budget = Budget::new(16 << 10);
         let arena = Arena::new(&mut arena_budget, "captured progress", 16 << 10).unwrap();
-        let first = storage.heap.append_bytes(b"one!").unwrap();
-        let old = storage.heap.append_bytes(b"old!").unwrap();
-        let pending = storage.heap.append_bytes(b"new!").unwrap();
+        let first = storage.heap.append_row(&[Datum::Int4(0)]).unwrap();
+        let old = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+        let pending = storage.heap.append_row(&[Datum::Int4(2)]).unwrap();
         storage.tables[table]
             .rows
             .insert(1, RowState::committed_only_at(first, 7))
@@ -271,7 +274,7 @@ mod tests {
                 }
                 crate::mem::guard::forbid_alloc(|| {
                     storage.restore_pending(table, 2, 11, undo);
-                    let replacement = storage.heap.append_bytes(b"next").unwrap();
+                    let replacement = storage.heap.append_row(&[Datum::Int4(3)]).unwrap();
                     let next = storage
                         .write_pending(table, 2, 12, 1, Some(replacement))
                         .unwrap();
@@ -281,23 +284,27 @@ mod tests {
             });
             crate::mem::guard::forbid_alloc(|| {
                 let mut count = 0;
-                scan.for_each_overlay(&mut |rowid, home| {
-                    if rowid == 1 {
-                        start.store(true, Ordering::Release);
-                        let deadline = Instant::now() + Duration::from_secs(5);
-                        while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
-                            std::thread::yield_now();
+                let done = scan
+                    .for_each_overlay(&mut |rowid, home| {
+                        if rowid == 1 {
+                            start.store(true, Ordering::Release);
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
+                                std::thread::yield_now();
+                            }
+                            progressed = completed.load(Ordering::Acquire);
                         }
-                        progressed = completed.load(Ordering::Acquire);
-                    }
-                    let VisibleRowBytes::Heap(bytes) = home.bytes else {
-                        panic!("heap fixture")
-                    };
-                    assert_eq!(&*bytes, if rowid == 1 { b"one!" } else { b"new!" });
-                    count += 1;
-                    Ok(ControlFlow::Continue(()))
-                })
-                .unwrap();
+                        let VisibleRowBytes::Heap(bytes) = home.bytes else {
+                            panic!("heap fixture")
+                        };
+                        let mut values = [Datum::Null];
+                        super::super::rowenc::decode(&bytes, &[ColType::Int4], &mut values)?;
+                        assert_eq!(values[0], Datum::Int4(if rowid == 1 { 0 } else { 2 }));
+                        count += 1;
+                        Ok(ControlFlow::Continue(()))
+                    })
+                    .unwrap();
+                assert!(done.is_continue());
                 assert_eq!(count, 2);
             });
             let undo = writer.join().unwrap();

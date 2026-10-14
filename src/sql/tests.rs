@@ -50832,6 +50832,8 @@ fn owned_merge_target_bytes_preserve_spilled_pending_and_moved_rows() {
         "CREATE TABLE capture_parent (id integer, value integer) PARTITION BY RANGE (id); \
          CREATE TABLE capture_low PARTITION OF capture_parent FOR VALUES FROM (0) TO (10); \
          CREATE TABLE capture_high PARTITION OF capture_parent FOR VALUES FROM (10) TO (20); \
+         CREATE TABLE capture_source (id integer, next_id integer, value integer); \
+         INSERT INTO capture_source VALUES (1, 13, 999), (2, 2, 201), (20, 4, 40); \
          INSERT INTO capture_parent VALUES (1, 10), (2, 20), (11, 110), (12, 120)",
         true,
     );
@@ -50850,8 +50852,11 @@ fn owned_merge_target_bytes_preserve_spilled_pending_and_moved_rows() {
          DELETE FROM capture_parent WHERE id = 12; SAVEPOINT before_merge",
         true,
     );
+    // Multi-row VALUES uses external set materialization in object-store
+    // mode, which grows the simulator's fixture vectors. A saved source table
+    // keeps both source and target reads inside this allocation guard.
     let merge = "MERGE INTO capture_parent AS target \
-                 USING (VALUES (1, 13, 999), (2, 2, 201), (20, 4, 40)) AS source(id, next_id, value) \
+                 USING capture_source AS source \
                  ON target.id = source.id \
                  WHEN MATCHED THEN UPDATE SET id = source.next_id, value = source.value \
                  WHEN NOT MATCHED BY TARGET THEN INSERT (id, value) VALUES (source.next_id, source.value) \

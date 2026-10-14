@@ -100,6 +100,11 @@ SQLSTATEs, types, result shape, and values.
 
 Required PR workflows are:
 
+The object-store simulator models remote storage with growing fixture vectors.
+Keep simulator uploads outside allocation-forbidden scopes when checking client
+execution. For example, a guarded MERGE can read a saved source table; use the
+external object-store checks for a VALUES source that writes temporary files.
+
 | Workflow | Verification |
 |---|---|
 | CI | Architecture/bug/vendor guards, tool tests, all-target build, formatting, lint, library shards, object-store qualification, recovery/fault simulation, release install, and performance smoke |

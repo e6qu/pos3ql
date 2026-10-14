@@ -53611,6 +53611,76 @@ fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_ree
     assert!(engine.storage.value_durable_complete(table, &[1]));
     session.success(
         &mut engine,
+        "UPDATE reuse_keys SET label = 'released' WHERE id = 1",
+        true,
+    );
+    let (rowid, location) = engine
+        .storage
+        .table(table)
+        .rows
+        .iter()
+        .find_map(|(rowid, state)| match state.committed {
+            Some(crate::storage::RowHome::Heap(location)) => Some((rowid, location)),
+            _ => None,
+        })
+        .unwrap();
+    let start = std::sync::atomic::AtomicBool::new(false);
+    let completed = std::sync::atomic::AtomicBool::new(false);
+    let mut progressed = false;
+    std::thread::scope(|scope| {
+        use std::sync::atomic::Ordering;
+        let storage = &engine.storage;
+        let start = &start;
+        let completed = &completed;
+        let writer = scope.spawn(move || {
+            while !start.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            crate::mem::guard::forbid_alloc(|| {
+                let undo = storage
+                    .write_pending(table, rowid, 99, 1, Some(location))
+                    .unwrap();
+                storage.restore_pending(table, rowid, 99, undo);
+                completed.store(true, Ordering::Release);
+            });
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            let hash = crate::sql::eval::hash_key(&[Datum::Int4(1), Datum::Text("released")], &[1]);
+            let mut visits = 0;
+            assert!(
+                storage
+                    .probe_value(table, &[1], hash, |candidate, encoded| {
+                        assert_eq!(candidate, rowid);
+                        assert!(encoded.is_some());
+                        visits += 1;
+                        start.store(true, Ordering::Release);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        while !completed.load(Ordering::Acquire)
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::yield_now();
+                        }
+                        progressed = completed.load(Ordering::Acquire);
+                        Ok(())
+                    })
+                    .unwrap()
+            );
+            assert_eq!(visits, 1);
+        });
+        writer.join().unwrap();
+    });
+    assert!(
+        progressed,
+        "a pending writer must progress while a durable-index delta callback waits"
+    );
+    session.success(
+        &mut engine,
+        "UPDATE reuse_keys SET label = 'one' WHERE id = 1",
+        true,
+    );
+    session.success(
+        &mut engine,
         "BEGIN; SAVEPOINT before_reuse; UPDATE reuse_keys SET label = 'released' WHERE id = 1; \
          INSERT INTO reuse_keys VALUES (3, 'one'); ROLLBACK TO SAVEPOINT before_reuse; \
          DELETE FROM reuse_keys WHERE id = 1; INSERT INTO reuse_keys VALUES (3, 'one'); COMMIT",

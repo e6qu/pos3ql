@@ -42,7 +42,7 @@ jobs:
           for filter in index_validation captured_resident_byte_scans create_index_and_unique \
             uncommitted_create_index_is_invisible_to_other_sessions unique_expression_indexes_are_transactional_and_durable \
             expression_index_tuple_limits_follow_partial_membership reindex_ startup; do
-            cargo test --lib --locked "$filter" -- --nocapture --test-threads=2
+            cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/index-validation-test.log"
           done
       - uses: ./.github/actions/python-test-environment
         with:
@@ -91,3 +91,16 @@ jobs:
             sleep 0.1
           done
           target/external-venv/bin/python tests/external/mvcc_diff.py
+      - name: Symbolicate allocation failures in one batch
+        if: failure()
+        run: |
+          python3 - <<'PYCODE'
+          import os, re, subprocess
+          from pathlib import Path
+          log = Path(os.environ["RUNNER_TEMP"]) / "index-validation-test.log"
+          if log.exists():
+              frames = re.findall(r"(\S*/target/debug/deps/pos3ql-[0-9a-f]+)\(\+(0x[0-9a-f]+)\)", log.read_text(errors="replace"))
+              for binary in sorted({binary for binary, _ in frames}):
+                  addresses = [address for owner, address in frames if owner == binary]
+                  subprocess.run(["addr2line", "-C", "-f", "-e", binary, *addresses], check=True)
+          PYCODE

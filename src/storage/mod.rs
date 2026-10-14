@@ -32176,28 +32176,24 @@ impl Storage {
             // The published generation is a complete base. Every later
             // committed change remains in the bounded resident overlay
             // until its replacement generation publishes.
-            let mut hashes = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
-            for (rowid, state) in self.tables[table_index].rows.iter() {
+            let _ = self.for_each_resident_row_state(table_index, &mut |rowid, state| {
                 if state.committed_lsn <= handle.published_lsn {
-                    continue;
+                    return Ok(core::ops::ControlFlow::Continue(()));
                 }
-                let Some(home) = state.committed else {
-                    continue;
+                let Some(home) = self.committed_row_home(table_index, rowid, state)? else {
+                    return Ok(core::ops::ControlFlow::Continue(()));
                 };
-                let n = self.row_enforcer_hashes(table_index, rowid, home, &mut hashes)?;
-                if hashes[..n]
-                    .iter()
-                    .any(|(binding, candidate)| *binding == i && *candidate == hash)
-                {
-                    let key_buffer = &mut scratch.roster;
-                    let Some((key_len, _, _)) =
-                        self.encode_value_binding_entry(table_index, i, rowid, home, key_buffer)?
-                    else {
-                        continue;
-                    };
+                let key_buffer = &mut scratch.roster;
+                let Some((key_len, _, candidate)) =
+                    self.encode_value_binding_entry(table_index, i, rowid, home, key_buffer)?
+                else {
+                    return Ok(core::ops::ControlFlow::Continue(()));
+                };
+                if candidate == hash {
                     visit(rowid, Some(&key_buffer[..key_len]))?;
                 }
-            }
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
             return Ok(true);
         }
         Ok(false)

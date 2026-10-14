@@ -67,12 +67,11 @@ schema, read position, and reader buffers. The 64 source slots per workspace
 are reserved at startup. An already captured source remains valid after its
 table or Storage owner is retired. Capturing or releasing a source holds shared
 registry state briefly; object I/O and scan callbacks do not hold that registry.
-Scans capture resident row identities, the saved-file list, schema, and read
-position under one ordered transition before running callbacks. Metadata and
-byte phases use that captured partition. Scans admitted with no resident overlay
-own their schema, read position, files, and reader without borrowing Storage;
-unread saved rows remain available after table replacement or Storage shutdown.
-A table with a resident overlay is rejected before scan memory is reserved.
+Scans capture their saved-file list, schema, and read position before running
+callbacks. The fast path for tables entirely in saved files owns its source
+without borrowing Storage; it rejects a resident overlay before reserving scan
+memory. Unread saved rows remain available after table replacement or Storage
+shutdown. The sequential SQL path described below also owns resident selections.
 Rows kept in the in-memory map also
 resolve saved versions from those files; changing a file's position in the live
 list cannot redirect a selected read. Version ownership ends before object I/O.

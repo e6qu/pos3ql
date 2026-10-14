@@ -144,7 +144,6 @@ pub(crate) struct ImmutableRowScan<'arena> {
 }
 
 impl ImmutableRowScan<'_> {
-    #[cfg(test)]
     pub(crate) fn for_each_spilled_row_batch<'arena, 'callback>(
         &self,
         arena: &'arena crate::mem::arena::Arena,
@@ -372,6 +371,7 @@ impl RowScan<'_> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn for_each_spilled_row_batch<'arena, 'callback>(
         &self,
         arena: &'arena crate::mem::arena::Arena,

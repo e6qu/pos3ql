@@ -76,7 +76,8 @@ later byte retrieval does not look up a possibly reused version chain again.
 Enum label changes and ordering rewrites use the same retained sources for
 their collected rows, including pending rows and rows read from saved files.
 MERGE copies target bytes from their selected owners before evaluating
-policies or writing rows, so later decoding no longer follows live version chains.
+policies or writing rows, so later decoding no longer follows live version
+chains.
 Captured row identity lists own their startup pool slot through table reuse and
 Storage shutdown. Their buffer lifetime no longer depends on a borrowed guard
 from Storage; the resident versions behind those identities still need ownership.
@@ -94,8 +95,8 @@ Still to do:
 - Complete table retirement for rows a scan has not selected yet and for
   remaining executor reads that retain only a version stamp. Selected bytes,
   captured point metadata, sorted and enum-rewrite row sources, and scans
-  entirely over saved files survive retirement. Preserving all unselected resident versions still
-  needs coordination.
+  entirely over saved files survive retirement. Preserving all unselected
+  resident versions still needs coordination.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.
 - Integrate bounded heap relocation with concurrent table publication and

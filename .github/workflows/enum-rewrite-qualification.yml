@@ -37,7 +37,9 @@ jobs:
       - run: cargo clean -p pos3ql
       - run: cargo clippy --all-targets --locked -- -D warnings
       - name: Enum rewrite ownership, failure cleanup, and recovery
-        run: cargo test --lib --locked owned_enum_rewrite_sources -- --nocapture 2>&1 | tee "$RUNNER_TEMP/deferred-ownership.log"
+        run: |
+          set -o pipefail
+          cargo test --lib --locked owned_enum_rewrite_sources -- --nocapture 2>&1 | tee "$RUNNER_TEMP/deferred-ownership.log"
       - name: Resolve allocation failure stack
         if: failure()
         run: |

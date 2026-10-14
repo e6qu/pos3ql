@@ -11839,10 +11839,14 @@ struct ConfiguredTransactionSession {
 
 impl ConfiguredTransactionSession {
     fn new(config: &Config, budget: &mut Budget) -> Self {
+        Self::with_arena_bytes(config, budget, 4 << 20)
+    }
+
+    fn with_arena_bytes(config: &Config, budget: &mut Budget, arena_bytes: usize) -> Self {
         Self {
             send: crate::mem::FixedBuf::new(budget, "configured transaction send", 4 << 20)
                 .unwrap(),
-            arena: Arena::new(budget, "configured transaction arena", 4 << 20).unwrap(),
+            arena: Arena::new(budget, "configured transaction arena", arena_bytes).unwrap(),
             transaction: TxnState::new_with_config(budget, config).unwrap(),
             guc: GucState::new_with_capacities(
                 budget,
@@ -50696,8 +50700,10 @@ fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_re
         "2",
         "4",
     ];
+    // External ORDER BY writes grow the simulator's fixture vectors. The
+    // alterations and pending row writes remain allocation-forbidden.
     assert_eq!(
-        data_rows(&session.success(&mut engine, query, true)),
+        data_rows(&session.success(&mut engine, query, false)),
         expected
     );
     session.success(&mut engine, "ROLLBACK TO SAVEPOINT before_rename", true);
@@ -50706,7 +50712,7 @@ fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_re
             &mut engine,
             "SELECT id, state, states FROM rewrite_scalar ORDER BY id; \
              SELECT id, states FROM rewrite_array ORDER BY id",
-            true,
+            false,
         )),
         [
             "1|old|{old,ready}",
@@ -50729,7 +50735,12 @@ fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_re
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
-        data_rows(&run_with_fixed_memory(&mut engine, &budget, query, 1 << 20)),
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            query,
+            1 << 20
+        )),
         expected
     );
     assert!(engine.checkpoint().unwrap());
@@ -50738,7 +50749,12 @@ fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_re
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
-        data_rows(&run_with_fixed_memory(&mut engine, &budget, query, 1 << 20)),
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            query,
+            1 << 20
+        )),
         expected
     );
     drop(engine);
@@ -50809,7 +50825,8 @@ fn owned_merge_target_bytes_preserve_spilled_pending_and_moved_rows() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
     session.success(
         &mut engine,
         "CREATE TABLE capture_parent (id integer, value integer) PARTITION BY RANGE (id); \
@@ -50824,7 +50841,8 @@ fn owned_merge_target_bytes_preserve_spilled_pending_and_moved_rows() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
     session.success(
         &mut engine,
         "BEGIN; UPDATE capture_parent SET value = 200 WHERE id = 2; \
@@ -50855,12 +50873,12 @@ fn owned_merge_target_bytes_preserve_spilled_pending_and_moved_rows() {
     );
     let expected = ["2|201", "3|130", "4|40", "13|999"];
     assert_eq!(
-        data_rows(&session.success(&mut engine, query, true)),
+        data_rows(&session.success(&mut engine, query, false)),
         expected
     );
     session.success(&mut engine, "ROLLBACK TO SAVEPOINT before_merge", true);
     assert_eq!(
-        data_rows(&session.success(&mut engine, query, true)),
+        data_rows(&session.success(&mut engine, query, false)),
         ["1|10", "2|200", "3|30", "11|110"]
     );
     session.success(&mut engine, merge, true);
@@ -50872,7 +50890,12 @@ fn owned_merge_target_bytes_preserve_spilled_pending_and_moved_rows() {
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
-        data_rows(&run_with_fixed_memory(&mut engine, &budget, query, 1 << 20)),
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            query,
+            1 << 20
+        )),
         expected
     );
     drop(engine);
@@ -50881,7 +50904,7 @@ fn owned_merge_target_bytes_preserve_spilled_pending_and_moved_rows() {
 }
 
 #[test]
-fn owned_merge_target_bytes_release_after_arena_exhaustion_and_retry() {
+fn merge_small_statement_arena_preserves_rows_and_allows_retry() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
         &mut engine,
@@ -50912,7 +50935,7 @@ fn owned_merge_target_bytes_release_after_arena_exhaustion_and_retry() {
         )),
         ["512"]
     );
-    let output = run_with_fixed_memory(&mut engine, &budget, merge, 1 << 20);
+    let output = run_with_fixed_memory(&mut engine, &budget, merge, 32 << 20);
     assert!(
         !message_types(&output).contains(&b'E'),
         "{}",

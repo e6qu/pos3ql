@@ -44,15 +44,21 @@ jobs:
         if: failure()
         run: |
           python3 - <<'PY'
-          import os, pathlib, re, subprocess
+          import collections, os, pathlib, re, subprocess
           log = pathlib.Path(os.environ['RUNNER_TEMP']) / 'deferred-ownership.log'
           if log.exists():
               frames = re.findall(r'(\S*/target/debug/deps/pos3ql-[0-9a-f]+)\(\+(0x[0-9a-f]+)\)', log.read_text())
+              grouped = collections.defaultdict(list)
               for binary, address in frames:
-                  subprocess.run(['addr2line', '-C', '-f', '-i', '-e', binary, address], check=True)
+                  grouped[binary].append(address)
+              for binary, addresses in grouped.items():
+                  subprocess.run(['addr2line', '-C', '-f', '-i', '-e', binary, *addresses], check=True)
           PY
       - name: Enum ordering and rollback
-        run: cargo test --lib --locked enum_float4_renumbering_and_new_value_safety -- --nocapture
+        run: |
+          cargo test --lib --locked enum_float4_renumbering_and_new_value_safety -- --nocapture
+          cargo test --lib --locked enums_order_and_enforce -- --nocapture
+          cargo test --lib --locked enums_survive_restart -- --nocapture
       - name: MERGE selected bytes, partition moves, and failure cleanup
         run: cargo test --lib --locked merge -- --nocapture
       - name: Original heap and saved-file row owners
@@ -78,3 +84,22 @@ jobs:
         run: |
           bash tests/external/ci_diff.sh
           FAST_CORPUS_ONLY=58_merge bash tests/external/ci_diff.sh
+
+  baseline-memory-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Use the merged executor with the same regression fixtures
+        run: git show 40508af498942c4d7f7df1161414e611627f3fa7:src/sql/exec/mod.rs > src/sql/exec/mod.rs
+      - run: cargo clean -p pos3ql
+      - name: Baseline small-arena rejection and standard-arena retry
+        run: cargo test --lib --locked merge_small_statement_arena_preserves_rows_and_allows_retry -- --nocapture

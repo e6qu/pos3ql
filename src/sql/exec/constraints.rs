@@ -553,7 +553,7 @@ fn enforce_expression_index_uniqueness<'a>(
         if Some(rowid) == self_rowid {
             return Ok(ControlFlow::Continue(()));
         }
-        let Some(home) = storage.committed_row_home(table_index, rowid, state)? else {
+        let Some(home) = storage.uniqueness_row_home(table_index, rowid, state, txid)? else {
             return Ok(ControlFlow::Continue(()));
         };
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
@@ -663,6 +663,12 @@ fn enforce_key_uniqueness(
             if result.is_err() || Some(rowid) == self_rowid {
                 return Ok(());
             }
+            // Own writes supersede the cached committed key. The pending
+            // pass below compares their current key without reentering the
+            // object reader while a durable index block is borrowed.
+            if storage.row_has_own_pending(table_index, rowid, txid) {
+                return Ok(());
+            }
             let matched = match encoded_key {
                 Some(encoded) => {
                     encoded_key_equal(storage, def, columns, values, encoded, nulls_not_distinct)
@@ -735,15 +741,7 @@ fn committed_scan_uniqueness(
         if Some(rowid) == self_rowid {
             return Ok(ControlFlow::Continue(()));
         }
-        let Some(home) = storage.visible_row_home_at(
-            table_index,
-            rowid,
-            state,
-            txid,
-            crate::storage::SNAPSHOT_ALL,
-            u64::MAX,
-        )?
-        else {
+        let Some(home) = storage.uniqueness_row_home(table_index, rowid, state, txid)? else {
             return Ok(ControlFlow::Continue(()));
         };
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
@@ -844,7 +842,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
         if Some(rowid) == self_rowid {
             return Ok(ControlFlow::Continue(()));
         }
-        let Some(home) = storage.committed_row_home(table_index, rowid, state)? else {
+        let Some(home) = storage.uniqueness_row_home(table_index, rowid, state, txid)? else {
             return Ok(ControlFlow::Continue(()));
         };
         let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {

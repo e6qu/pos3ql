@@ -161,7 +161,10 @@ change which versions ordinary transaction queries see.
 and then creating a unique index must fail with `23505`. Updating or deleting
 an order before creating the index checks the replacement values. A failed
 creation releases its row sources and pending catalog entry; rolling back to a
-savepoint allows a corrected creation with the same name. An older repeatable
+savepoint allows a corrected creation with the same name. Later uniqueness
+checks also use own replacements and deletions: deleting an order lets that
+transaction reuse its reference before commit, including through a saved index.
+An older repeatable
 read transaction cannot create a unique index that misses later committed
 duplicates. The [PostgreSQL 18 index-build implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/heap/heapam_handler.c)
 is the upstream visibility reference; the differential suite checks actual

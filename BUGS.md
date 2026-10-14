@@ -6,7 +6,8 @@ finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 The index-reader review covers original byte ownership, current committed
 rows, earlier transaction writes, duplicate and NULL-key checks, savepoint
-rollback, fixed-arena exhaustion, retry, and cold recovery. Remaining
+rollback, reuse of keys after own updates/deletes, durable index probes,
+fixed-arena exhaustion, retry, and cold recovery. Remaining
 metadata-walk and executor lifetime work is tracked in PLAN.md.
 No known defects meet this file's inclusion criteria. This does not mean all
 planned work is finished or that every possible bug has been ruled out.

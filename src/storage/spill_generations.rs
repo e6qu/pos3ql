@@ -1484,7 +1484,7 @@ mod tests {
     #[test]
     fn owned_immutable_scan_callbacks_release_contexts_and_keep_admission() {
         let PointFixture {
-            storage,
+            mut storage,
             table,
             roots,
             arena,

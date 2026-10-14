@@ -107,12 +107,13 @@ The last shared lease releases the roots and makes its slot reusable.
 
 Sorted scans and enum rewrites retain one source for their selected heap
 allocation and saved files. Their copyable row records borrow that source,
-keeping physical order, version, and byte location together. Fetching a record uses its original owner
-directly, so removal, version-chain reuse, and heap relocation cannot redirect
+keeping physical order, version, and byte location together. Fetching a record
+uses its original owner directly, so removal, version-chain reuse, and heap relocation cannot redirect
 the read. Changed heap allocations or saved-file sources fail with `40001`
 before retention. Each optional row record keeps the existing 32-byte size in
 the fixed statement arena on the release target; source exhaustion retains the
-existing `54000` contract. Object rows no longer repeat a metadata lookup before fetching bytes.
+existing `54000` contract. Object rows no longer repeat a metadata lookup before
+fetching bytes.
 
 **User example:** a report scanning a table entirely from saved files keeps its
 earlier orders even if later versions delete them. Replacing the table cannot

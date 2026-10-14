@@ -98,12 +98,12 @@ rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
 SQL and wire behavior needs comparison with actual PostgreSQL, including
 SQLSTATEs, types, result shape, and values.
 
-Required PR workflows are:
-
 The object-store simulator models remote storage with growing fixture vectors.
 Keep simulator uploads outside allocation-forbidden scopes when checking client
 execution. For example, a guarded MERGE can read a saved source table; use the
 external object-store checks for a VALUES source that writes temporary files.
+
+Required PR workflows are:
 
 | Workflow | Verification |
 |---|---|

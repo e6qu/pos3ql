@@ -60,7 +60,23 @@ jobs:
           cargo test --lib --locked enums_order_and_enforce -- --nocapture
           cargo test --lib --locked enums_survive_restart -- --nocapture
       - name: MERGE selected bytes, partition moves, and failure cleanup
-        run: cargo test --lib --locked merge -- --nocapture
+        run: |
+          set -o pipefail
+          cargo test --lib --locked merge -- --nocapture 2>&1 | tee "$RUNNER_TEMP/merge-ownership.log"
+      - name: Resolve MERGE allocation failure stack
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import collections, os, pathlib, re, subprocess
+          log = pathlib.Path(os.environ['RUNNER_TEMP']) / 'merge-ownership.log'
+          if log.exists():
+              frames = re.findall(r'(\S*/target/debug/deps/pos3ql-[0-9a-f]+)\(\+(0x[0-9a-f]+)\)', log.read_text())
+              grouped = collections.defaultdict(list)
+              for binary, address in frames:
+                  grouped[binary].append(address)
+              for binary, addresses in grouped.items():
+                  subprocess.run(['addr2line', '-C', '-f', '-i', '-e', binary, *addresses], check=True)
+          PY
       - name: Original heap and saved-file row owners
         run: cargo test --lib --locked owned_ordered -- --nocapture
       - name: Startup memory accounting
@@ -99,7 +115,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - name: Use the merged executor with the same regression fixtures
-        run: git show 40508af498942c4d7f7df1161414e611627f3fa7:src/sql/exec/mod.rs > src/sql/exec/mod.rs
+        run: |
+          git fetch --no-tags --depth=1 origin 40508af498942c4d7f7df1161414e611627f3fa7
+          git show 40508af498942c4d7f7df1161414e611627f3fa7:src/sql/exec/mod.rs > src/sql/exec/mod.rs
       - run: cargo clean -p pos3ql
       - name: Baseline small-arena rejection and standard-arena retry
         run: cargo test --lib --locked merge_small_statement_arena_preserves_rows_and_allows_retry -- --nocapture

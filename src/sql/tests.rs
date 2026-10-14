@@ -11839,10 +11839,14 @@ struct ConfiguredTransactionSession {
 
 impl ConfiguredTransactionSession {
     fn new(config: &Config, budget: &mut Budget) -> Self {
+        Self::with_arena_bytes(config, budget, 4 << 20)
+    }
+
+    fn with_arena_bytes(config: &Config, budget: &mut Budget, arena_bytes: usize) -> Self {
         Self {
             send: crate::mem::FixedBuf::new(budget, "configured transaction send", 4 << 20)
                 .unwrap(),
-            arena: Arena::new(budget, "configured transaction arena", 4 << 20).unwrap(),
+            arena: Arena::new(budget, "configured transaction arena", arena_bytes).unwrap(),
             transaction: TxnState::new_with_config(budget, config).unwrap(),
             guc: GucState::new_with_capacities(
                 budget,
@@ -50630,6 +50634,326 @@ fn enums_order_and_enforce() {
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP TYPE array_only"))
             .contains("2BP01")
+    );
+}
+
+#[test]
+fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_recovery() {
+    let mut config = test_config("owned-enum-rewrite");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("owned-enum-rewrite-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TYPE rewrite_state AS ENUM ('old', 'ready'); \
+         CREATE TABLE rewrite_scalar (id integer PRIMARY KEY, state rewrite_state, states rewrite_state[]); \
+         CREATE INDEX rewrite_state_index ON rewrite_scalar(state); \
+         CREATE TABLE rewrite_array (id integer PRIMARY KEY, states rewrite_state[]); \
+         INSERT INTO rewrite_scalar VALUES \
+           (1, 'old', ARRAY['old', 'ready']::rewrite_state[]), \
+           (2, 'ready', ARRAY['ready']::rewrite_state[]), (3, NULL, NULL); \
+         INSERT INTO rewrite_array VALUES \
+           (10, ARRAY['old', NULL, 'ready']::rewrite_state[]), (11, NULL)",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let table = engine
+        .storage
+        .find_table("public", "rewrite_scalar")
+        .unwrap();
+    assert!(!engine.storage.table(table).spill_generations().is_empty());
+    session.success(
+        &mut engine,
+        "BEGIN; \
+         UPDATE rewrite_scalar SET state = 'old', states = ARRAY['old']::rewrite_state[] WHERE id = 2; \
+         INSERT INTO rewrite_scalar VALUES (4, 'old', ARRAY['ready', 'old']::rewrite_state[]); \
+         DELETE FROM rewrite_scalar WHERE id = 3; \
+         INSERT INTO rewrite_array VALUES (12, ARRAY['old']::rewrite_state[]); \
+         SAVEPOINT before_rename; \
+         ALTER TYPE rewrite_state RENAME VALUE 'old' TO 'new'",
+        true,
+    );
+    let query = "SELECT id, state, states FROM rewrite_scalar ORDER BY id; \
+                 SELECT id, states FROM rewrite_array ORDER BY id; \
+                 SELECT id FROM rewrite_scalar WHERE state = 'new' ORDER BY id";
+    let expected = [
+        "1|new|{new,ready}",
+        "2|new|{new}",
+        "4|new|{ready,new}",
+        "10|{new,NULL,ready}",
+        "11|NULL",
+        "12|{new}",
+        "1",
+        "2",
+        "4",
+    ];
+    // External ORDER BY writes grow the simulator's fixture vectors. The
+    // alterations and pending row writes remain allocation-forbidden.
+    assert_eq!(
+        data_rows(&session.success(&mut engine, query, false)),
+        expected
+    );
+    session.success(&mut engine, "ROLLBACK TO SAVEPOINT before_rename", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, state, states FROM rewrite_scalar ORDER BY id; \
+             SELECT id, states FROM rewrite_array ORDER BY id",
+            false,
+        )),
+        [
+            "1|old|{old,ready}",
+            "2|old|{old}",
+            "4|old|{ready,old}",
+            "10|{old,NULL,ready}",
+            "11|NULL",
+            "12|{old}",
+        ]
+    );
+    session.success(
+        &mut engine,
+        "ALTER TYPE rewrite_state RENAME VALUE 'old' TO 'new'; COMMIT",
+        true,
+    );
+    engine.commit_wal().unwrap();
+    drop(session);
+    drop(engine);
+
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            query,
+            1 << 20
+        )),
+        expected
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            query,
+            1 << 20
+        )),
+        expected
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn owned_enum_rewrite_sources_release_after_arena_exhaustion_and_retry() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE rewrite_limited AS ENUM ('old', 'ready'); \
+         CREATE TABLE rewrite_limited_rows (id integer PRIMARY KEY, state rewrite_limited, padding text); \
+         INSERT INTO rewrite_limited_rows \
+           SELECT id, 'old'::rewrite_limited, repeat('x', 64) FROM generate_series(1, 512) AS g(id)",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "ALTER TYPE rewrite_limited RENAME VALUE 'old' TO 'new'",
+        32 << 10,
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("54000"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*) FROM rewrite_limited_rows WHERE state = 'old'; \
+             SELECT enumlabel FROM pg_enum WHERE enumtypid = 'rewrite_limited'::regtype ORDER BY enumsortorder",
+            1 << 20,
+        )),
+        ["512", "old", "ready"]
+    );
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "ALTER TYPE rewrite_limited RENAME VALUE 'old' TO 'new'; \
+         SELECT count(*) FROM rewrite_limited_rows WHERE state = 'new'",
+        1 << 20,
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["512"]);
+}
+
+#[test]
+fn owned_merge_target_bytes_preserve_spilled_pending_and_moved_rows() {
+    let mut config = test_config("owned-merge-target-bytes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("owned-merge-target-bytes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
+    session.success(
+        &mut engine,
+        "CREATE TABLE capture_parent (id integer, value integer) PARTITION BY RANGE (id); \
+         CREATE TABLE capture_low PARTITION OF capture_parent FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE capture_high PARTITION OF capture_parent FOR VALUES FROM (10) TO (20); \
+         CREATE TABLE capture_source (id integer, next_id integer, value integer); \
+         INSERT INTO capture_source VALUES (1, 13, 999), (2, 2, 201), (20, 4, 40); \
+         INSERT INTO capture_parent VALUES (1, 10), (2, 20), (11, 110), (12, 120)",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
+    session.success(
+        &mut engine,
+        "BEGIN; UPDATE capture_parent SET value = 200 WHERE id = 2; \
+         INSERT INTO capture_parent VALUES (3, 30); \
+         DELETE FROM capture_parent WHERE id = 12; SAVEPOINT before_merge",
+        true,
+    );
+    // Multi-row VALUES uses external set materialization in object-store
+    // mode, which grows the simulator's fixture vectors. A saved source table
+    // keeps both source and target reads inside this allocation guard.
+    let merge = "MERGE INTO capture_parent AS target \
+                 USING capture_source AS source \
+                 ON target.id = source.id \
+                 WHEN MATCHED THEN UPDATE SET id = source.next_id, value = source.value \
+                 WHEN NOT MATCHED BY TARGET THEN INSERT (id, value) VALUES (source.next_id, source.value) \
+                 WHEN NOT MATCHED BY SOURCE AND target.id = 11 THEN DELETE \
+                 WHEN NOT MATCHED BY SOURCE THEN UPDATE SET value = target.value + 100 \
+                 RETURNING merge_action(), target.id, target.value";
+    let query = "SELECT id, value FROM capture_parent ORDER BY id";
+    let mut actions = data_rows(&session.success(&mut engine, merge, true));
+    actions.sort_unstable();
+    assert_eq!(
+        actions,
+        [
+            "DELETE|11|110",
+            "INSERT|4|40",
+            "UPDATE|13|999",
+            "UPDATE|2|201",
+            "UPDATE|3|130"
+        ]
+    );
+    let expected = ["2|201", "3|130", "4|40", "13|999"];
+    assert_eq!(
+        data_rows(&session.success(&mut engine, query, false)),
+        expected
+    );
+    session.success(&mut engine, "ROLLBACK TO SAVEPOINT before_merge", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, query, false)),
+        ["1|10", "2|200", "3|30", "11|110"]
+    );
+    session.success(&mut engine, merge, true);
+    session.success(&mut engine, "COMMIT", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            query,
+            1 << 20
+        )),
+        expected
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn merge_small_statement_arena_preserves_rows_and_allows_retry() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE capture_limited (id integer PRIMARY KEY, padding text); \
+         INSERT INTO capture_limited SELECT id, repeat('x', 64) FROM generate_series(1, 512) AS g(id)",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let merge = "MERGE INTO capture_limited AS target USING (VALUES (1)) AS source(id) \
+                 ON target.id = source.id WHEN MATCHED THEN UPDATE SET padding = 'changed' \
+                 WHEN NOT MATCHED BY SOURCE THEN DELETE";
+    let output = run_with_fixed_memory(&mut engine, &budget, merge, 32 << 10);
+    assert!(
+        String::from_utf8_lossy(&output).contains("54000"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*) FROM capture_limited WHERE padding = repeat('x', 64)",
+            1 << 20,
+        )),
+        ["512"]
+    );
+    let output = run_with_fixed_memory(&mut engine, &budget, merge, 32 << 20);
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT id, padding FROM capture_limited",
+            1 << 20,
+        )),
+        ["1|changed"]
     );
 }
 

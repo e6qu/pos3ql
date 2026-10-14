@@ -59,28 +59,12 @@ and linked PRs preserve the investigations; this file keeps only current work.
 appropriate to its transaction. Dropping or rebuilding a table must not leave
 an already running read following reused memory or deleted objects.
 
-Statements and streaming `COPY FROM` retain their read position. Scans capture
-row identities, saved files, and schema before callbacks. Selected rows own
-their sources through table removal. Point metadata reads copy their version
-chains into startup-reserved slots, so keeping metadata no longer holds the
-shared version lock. Captured point metadata also owns its table identity and
-byte sources; later selection survives table reuse and Storage shutdown. Two
-fixed heap buffers let reclamation preserve selected bytes. Statistics and
-journal acknowledgements now retain the exact image they captured.
-
-Scans admitted with no in-memory row overlay own their saved files, schema,
-read position, and reader. They can select previously unread rows after table
-replacement or Storage shutdown, without consulting a reused table slot.
-Sorted reads also retain one byte source and copy row records that refer to it;
-later byte retrieval does not look up a possibly reused version chain again.
-Captured row identity lists own their startup pool slot through table reuse and
-Storage shutdown. Their buffer lifetime no longer depends on a borrowed guard
-from Storage; the resident versions behind those identities still need ownership.
-
-Replication snapshot validity and history protection share one guarded registry.
-Imports retain history before the exporter can expire, and failed imports leave
-the transaction unchanged. Every new command on the replication connection
-expires its export; successful imports survive until their transaction ends.
+Statements, transactions, streaming `COPY FROM`, and imported replication
+snapshots retain their read position. Selected bytes, captured point metadata,
+saved-file scans, sorted row records, enum rewrites, and MERGE target copies keep
+their original data without later version-chain lookups. Captured row identity
+lists own their startup buffers. Shared statistics and journal acknowledgements
+also retain the exact state they captured.
 
 The [implementation guide](docs/implemented-baseline.md) owns the detailed
 contracts and limits; this sequence keeps the remaining acceptance gates.
@@ -89,9 +73,9 @@ Still to do:
 
 - Complete table retirement for rows a scan has not selected yet and for
   remaining executor reads that retain only a version stamp. Selected bytes,
-  captured point metadata, sorted row sources, and scans entirely over saved
-  files survive retirement. Preserving all unselected resident versions still
-  needs coordination.
+  captured point metadata, sorted and enum-rewrite row sources, and scans
+  entirely over saved files survive retirement. Preserving all unselected
+  resident versions still needs coordination.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.
 - Integrate bounded heap relocation with concurrent table publication and
@@ -132,15 +116,12 @@ only after its change is recoverable from object storage. If the connection
 breaks during publication, the error must not falsely promise that the change
 was either saved or discarded.
 
-Row identities now have a shared, checked allocator. Inserts and partition moves
-reserve the identity used by deferred checks before storing bytes; recovery keeps
-the counter monotonic, and exhaustion fails explicitly rather than wrapping.
-Transaction creation now reserves its identity and active-registry entry in one
-guarded operation. Maintenance and recovery use the same counter; capacity
-errors preserve existing owners. This does not enable parallel statement execution.
+SQL, maintenance, and recovery share checked row and transaction identity
+counters. Creating a transaction reserves its identity and active-registry entry
+together; full capacities fail explicitly and leave existing owners intact.
 
-- Protect journal staging, prepared
-  transactions, commit order, and the responses waiting for durable storage.
+- Protect journal staging, prepared transactions, commit order, and the
+  responses waiting for durable storage.
 - Let execution progress without holding the whole engine locked while a
   commit waits on object storage.
 - Preserve transaction visibility, lock ordering, shared commit uploads,

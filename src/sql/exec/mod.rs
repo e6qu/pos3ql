@@ -46055,8 +46055,9 @@ fn rewrite_enum_values(
             continue;
         }
         let count = storage.visible_row_count(table_index, txn.txid)?;
+        let source = storage.table_row_snapshot(table_index, Some(arena))?;
         let rows = arena
-            .alloc_slice_with(count, |_| None::<(u64, crate::storage::RowSnapshot)>)
+            .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -46066,7 +46067,7 @@ fn rewrite_enum_values(
         let mut n = 0;
         storage.for_each_row_state(table_index, &mut |rowid, state| {
             if let Some(home) = storage.visible_row_home(table_index, rowid, state, txn.txid)? {
-                rows[n] = Some((rowid, home.snapshot()));
+                rows[n] = Some(source.retain(rowid, &home)?);
                 n += 1;
             }
             Ok(core::ops::ControlFlow::Continue(()))
@@ -46074,8 +46075,8 @@ fn rewrite_enum_values(
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         def.schema(&mut schema);
         for entry in rows[..n].iter().copied().flatten() {
-            let (rowid, home) = entry;
-            let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
+            let rowid = entry.rowid();
+            let bytes = storage.row_bytes(table_index, rowid, entry.read()?, arena)?;
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
             let mut changed = false;
@@ -55974,14 +55975,14 @@ pub(crate) fn merge<'a>(
         }
     } else {
         use core::ops::ControlFlow;
-        // Retain logical rows at their original MVCC boundaries, then decode.
+        // Copy selected bytes before policy evaluation or target writes can
+        // change their version chains. These copies use the existing arena.
         let ids: &mut [u64] = target_ids;
         let tables: &mut [usize] = target_tables;
-        let hms: &mut [Option<crate::storage::RowSnapshot>] =
-            match arena.alloc_slice_with(n_target, |_| None) {
-                Ok(s) => s,
-                Err(_) => return sql_fail(super::query::arena_full_pub()),
-            };
+        let target_bytes: &mut [&[u8]] = match arena.alloc_slice_with(n_target, |_| &[][..]) {
+            Ok(s) => s,
+            Err(_) => return sql_fail(super::query::arena_full_pub()),
+        };
         let mut k = 0usize;
         for &leaf in leaves {
             if let Err(error) = storage.record_relation_scan(txn.txid, leaf, None, 0) {
@@ -55994,7 +55995,7 @@ pub(crate) fn merge<'a>(
                     storage.record_relation_tuple_read(txn.txid, leaf, None)?;
                     ids[k] = rowid;
                     tables[k] = leaf;
-                    hms[k] = Some(home.snapshot());
+                    target_bytes[k] = storage.row_bytes(leaf, rowid, home, arena)?;
                     k += 1;
                 }
                 Ok(ControlFlow::Continue(()))
@@ -56006,16 +56007,7 @@ pub(crate) fn merge<'a>(
         for j in 0..k {
             let row_table = tables[j];
             let row_id = ids[j];
-            let fetched = match storage.row_bytes(
-                row_table,
-                row_id,
-                hms[j].expect("MERGE snapshots are initialized"),
-                arena,
-            ) {
-                Ok(b) => b,
-                Err(e) => return sql_fail(e),
-            };
-            let bytes = fetched;
+            let bytes = target_bytes[j];
             let row_definition = match definitions.definition(storage, row_table, txn.txid) {
                 Ok(definition) => definition,
                 Err(error) => return sql_fail(error),

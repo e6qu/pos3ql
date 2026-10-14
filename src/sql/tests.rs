@@ -50799,6 +50799,137 @@ fn owned_enum_rewrite_sources_release_after_arena_exhaustion_and_retry() {
 }
 
 #[test]
+fn owned_merge_target_bytes_preserve_spilled_pending_and_moved_rows() {
+    let mut config = test_config("owned-merge-target-bytes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("owned-merge-target-bytes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE capture_parent (id integer, value integer) PARTITION BY RANGE (id); \
+         CREATE TABLE capture_low PARTITION OF capture_parent FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE capture_high PARTITION OF capture_parent FOR VALUES FROM (10) TO (20); \
+         INSERT INTO capture_parent VALUES (1, 10), (2, 20), (11, 110), (12, 120)",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "BEGIN; UPDATE capture_parent SET value = 200 WHERE id = 2; \
+         INSERT INTO capture_parent VALUES (3, 30); \
+         DELETE FROM capture_parent WHERE id = 12; SAVEPOINT before_merge",
+        true,
+    );
+    let merge = "MERGE INTO capture_parent AS target \
+                 USING (VALUES (1, 13, 999), (2, 2, 201), (20, 4, 40)) AS source(id, next_id, value) \
+                 ON target.id = source.id \
+                 WHEN MATCHED THEN UPDATE SET id = source.next_id, value = source.value \
+                 WHEN NOT MATCHED BY TARGET THEN INSERT (id, value) VALUES (source.next_id, source.value) \
+                 WHEN NOT MATCHED BY SOURCE AND target.id = 11 THEN DELETE \
+                 WHEN NOT MATCHED BY SOURCE THEN UPDATE SET value = target.value + 100 \
+                 RETURNING merge_action(), target.id, target.value";
+    let query = "SELECT id, value FROM capture_parent ORDER BY id";
+    let mut actions = data_rows(&session.success(&mut engine, merge, true));
+    actions.sort_unstable();
+    assert_eq!(
+        actions,
+        [
+            "DELETE|11|110",
+            "INSERT|4|40",
+            "UPDATE|13|999",
+            "UPDATE|2|201",
+            "UPDATE|3|130"
+        ]
+    );
+    let expected = ["2|201", "3|130", "4|40", "13|999"];
+    assert_eq!(
+        data_rows(&session.success(&mut engine, query, true)),
+        expected
+    );
+    session.success(&mut engine, "ROLLBACK TO SAVEPOINT before_merge", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, query, true)),
+        ["1|10", "2|200", "3|30", "11|110"]
+    );
+    session.success(&mut engine, merge, true);
+    session.success(&mut engine, "COMMIT", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(&mut engine, &budget, query, 1 << 20)),
+        expected
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn owned_merge_target_bytes_release_after_arena_exhaustion_and_retry() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE capture_limited (id integer PRIMARY KEY, padding text); \
+         INSERT INTO capture_limited SELECT id, repeat('x', 64) FROM generate_series(1, 512) AS g(id)",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let merge = "MERGE INTO capture_limited AS target USING (VALUES (1)) AS source(id) \
+                 ON target.id = source.id WHEN MATCHED THEN UPDATE SET padding = 'changed' \
+                 WHEN NOT MATCHED BY SOURCE THEN DELETE";
+    let output = run_with_fixed_memory(&mut engine, &budget, merge, 32 << 10);
+    assert!(
+        String::from_utf8_lossy(&output).contains("54000"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*) FROM capture_limited WHERE padding = repeat('x', 64)",
+            1 << 20,
+        )),
+        ["512"]
+    );
+    let output = run_with_fixed_memory(&mut engine, &budget, merge, 1 << 20);
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT id, padding FROM capture_limited",
+            1 << 20,
+        )),
+        ["1|changed"]
+    );
+}
+
+#[test]
 fn enum_float4_renumbering_and_new_value_safety() {
     let (mut engine, mut budget) = test_engine();
     run_with(

@@ -75,6 +75,38 @@ MERGE INTO mg_tgt t USING (VALUES (2, 'star returned')) s(id, v) ON t.id = s.id
 DROP TABLE mg_tgt;
 DROP TABLE mg_src;
 
+-- Capture saved and pending candidates before actions, including a partition
+-- move, target-only actions, and savepoint rollback of the complete statement.
+CREATE TABLE capture_parent (id integer, value integer) PARTITION BY RANGE (id);
+CREATE TABLE capture_low PARTITION OF capture_parent FOR VALUES FROM (0) TO (10);
+CREATE TABLE capture_high PARTITION OF capture_parent FOR VALUES FROM (10) TO (20);
+INSERT INTO capture_parent VALUES (1, 10), (2, 20), (11, 110), (12, 120);
+BEGIN;
+UPDATE capture_parent SET value = 200 WHERE id = 2;
+INSERT INTO capture_parent VALUES (3, 30);
+DELETE FROM capture_parent WHERE id = 12;
+SAVEPOINT before_merge;
+MERGE INTO capture_parent AS target
+USING (VALUES (1, 13, 999), (2, 2, 201), (20, 4, 40)) AS source(id, next_id, value)
+ON target.id = source.id
+WHEN MATCHED THEN UPDATE SET id = source.next_id, value = source.value
+WHEN NOT MATCHED BY TARGET THEN INSERT (id, value) VALUES (source.next_id, source.value)
+WHEN NOT MATCHED BY SOURCE AND target.id = 11 THEN DELETE
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET value = target.value + 100;
+SELECT id, value FROM capture_parent ORDER BY id;
+ROLLBACK TO SAVEPOINT before_merge;
+SELECT id, value FROM capture_parent ORDER BY id;
+MERGE INTO capture_parent AS target
+USING (VALUES (1, 13, 999), (2, 2, 201), (20, 4, 40)) AS source(id, next_id, value)
+ON target.id = source.id
+WHEN MATCHED THEN UPDATE SET id = source.next_id, value = source.value
+WHEN NOT MATCHED BY TARGET THEN INSERT (id, value) VALUES (source.next_id, source.value)
+WHEN NOT MATCHED BY SOURCE AND target.id = 11 THEN DELETE
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET value = target.value + 100;
+COMMIT;
+SELECT id, value FROM capture_parent ORDER BY id;
+DROP TABLE capture_parent CASCADE;
+
 CREATE TABLE mg_transition_target (id integer PRIMARY KEY, value integer);
 CREATE TABLE mg_transition_source (id integer, value integer);
 CREATE TABLE mg_transition_audit (kind text, id integer, value integer);

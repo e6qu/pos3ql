@@ -75,6 +75,8 @@ Sorted reads also retain one byte source and copy row records that refer to it;
 later byte retrieval does not look up a possibly reused version chain again.
 Enum label changes and ordering rewrites use the same retained sources for
 their collected rows, including pending rows and rows read from saved files.
+MERGE copies target bytes from their selected owners before evaluating
+policies or writing rows, so later decoding no longer follows live version chains.
 Captured row identity lists own their startup pool slot through table reuse and
 Storage shutdown. Their buffer lifetime no longer depends on a borrowed guard
 from Storage; the resident versions behind those identities still need ownership.

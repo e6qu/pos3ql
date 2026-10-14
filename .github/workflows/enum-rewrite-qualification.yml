@@ -40,6 +40,8 @@ jobs:
         run: cargo test --lib --locked owned_enum_rewrite_sources -- --nocapture
       - name: Enum ordering and rollback
         run: cargo test --lib --locked enum_float4_renumbering_and_new_value_safety -- --nocapture
+      - name: MERGE selected bytes, partition moves, and failure cleanup
+        run: cargo test --lib --locked merge -- --nocapture
       - name: Original heap and saved-file row owners
         run: cargo test --lib --locked owned_ordered -- --nocapture
       - name: Startup memory accounting
@@ -60,4 +62,6 @@ jobs:
           RUN_FUZZ: "0"
           FAST_CORPUS_SHARDS: "1"
           FAST_CORPUS_ONLY: 63_enums
-        run: bash tests/external/ci_diff.sh
+        run: |
+          bash tests/external/ci_diff.sh
+          FAST_CORPUS_ONLY=58_merge bash tests/external/ci_diff.sh

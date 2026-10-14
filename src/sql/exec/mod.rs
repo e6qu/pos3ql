@@ -55975,14 +55975,14 @@ pub(crate) fn merge<'a>(
         }
     } else {
         use core::ops::ControlFlow;
-        // Retain logical rows at their original MVCC boundaries, then decode.
+        // Copy selected bytes before policy evaluation or target writes can
+        // change their version chains. These copies use the existing arena.
         let ids: &mut [u64] = target_ids;
         let tables: &mut [usize] = target_tables;
-        let hms: &mut [Option<crate::storage::RowSnapshot>] =
-            match arena.alloc_slice_with(n_target, |_| None) {
-                Ok(s) => s,
-                Err(_) => return sql_fail(super::query::arena_full_pub()),
-            };
+        let target_bytes: &mut [&[u8]] = match arena.alloc_slice_with(n_target, |_| &[][..]) {
+            Ok(s) => s,
+            Err(_) => return sql_fail(super::query::arena_full_pub()),
+        };
         let mut k = 0usize;
         for &leaf in leaves {
             if let Err(error) = storage.record_relation_scan(txn.txid, leaf, None, 0) {
@@ -55995,7 +55995,7 @@ pub(crate) fn merge<'a>(
                     storage.record_relation_tuple_read(txn.txid, leaf, None)?;
                     ids[k] = rowid;
                     tables[k] = leaf;
-                    hms[k] = Some(home.snapshot());
+                    target_bytes[k] = storage.row_bytes(leaf, rowid, home, arena)?;
                     k += 1;
                 }
                 Ok(ControlFlow::Continue(()))
@@ -56007,16 +56007,7 @@ pub(crate) fn merge<'a>(
         for j in 0..k {
             let row_table = tables[j];
             let row_id = ids[j];
-            let fetched = match storage.row_bytes(
-                row_table,
-                row_id,
-                hms[j].expect("MERGE snapshots are initialized"),
-                arena,
-            ) {
-                Ok(b) => b,
-                Err(e) => return sql_fail(e),
-            };
-            let bytes = fetched;
+            let bytes = target_bytes[j];
             let row_definition = match definitions.definition(storage, row_table, txn.txid) {
                 Ok(definition) => definition,
                 Err(error) => return sql_fail(error),

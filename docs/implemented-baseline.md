@@ -123,6 +123,10 @@ For example, `ALTER TYPE order_state RENAME VALUE 'pending' TO 'waiting'`
 retains the rows it collected while rewriting scalar and array values. A
 savepoint rollback restores their earlier labels and indexed lookups; an
 exhausted statement arena returns `54000` and rolls back the alteration.
+MERGE copies each target row's selected bytes into the existing statement arena
+before policy evaluation or writes. Later decoding uses those copies, including
+for inherited columns and partition moves. It no longer looks up a saved
+version stamp against a mutable row map.
 
 Internal metadata/byte scans also reserve 64 retention slots per workspace.
 Captured row identity lists own their startup pool slot, so their numbers remain

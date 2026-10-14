@@ -28938,7 +28938,6 @@ impl Storage {
     /// through the sparse index; only keys are parsed here — row bytes are
     /// fetched later, by `row_bytes`, exactly as for any spilled row.
     fn spill_merged_walk(
-        &self,
         roots: &QueryRootLease,
         overlay_rowids: &RowScanIds<'_>,
         emit: &mut dyn FnMut(u64, SpilledRowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
@@ -29062,7 +29061,6 @@ impl Storage {
     /// execution still uses the normal bounded reader pool.
     #[expect(clippy::too_many_arguments, reason = "merged row decoder state")]
     fn spill_merged_walk_bytes<'a>(
-        &self,
         roots: &CapturedSpillRoots<'_>,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
@@ -29517,7 +29515,6 @@ impl Storage {
     /// cursor. Mutable overlay rows stay in the row-state seam; redundant
     /// committed spill metadata does not force a second object read.
     fn for_each_spilled_row_batch<'a, 'callback>(
-        &self,
         roots: &CapturedSpillRoots<'_>,
         rowids: &RowScanIds<'_>,
         arena: &'a crate::mem::arena::Arena,
@@ -29545,41 +29542,40 @@ impl Storage {
         let batch_mark = recycle_rows.then(|| arena.mark());
         let mut len = 0usize;
         let mut stopped = false;
-        let mut result = self
-            .spill_merged_walk_bytes(
-                roots,
-                arena,
-                false,
-                decoded_columns.as_ref(),
-                decoded_columns.is_none(),
-                SpillOverlayMode::VisibleScan(rowids),
-                None,
-                &mut |rowid, _commit_lsn, representation| {
-                    rows[len] = SpilledRow {
-                        rowid,
-                        representation,
-                    };
-                    len += 1;
-                    if len != rows.len() {
-                        return Ok(core::ops::ControlFlow::Continue(()));
-                    }
-                    match each(&rows[..len])? {
-                        core::ops::ControlFlow::Continue(()) => {
-                            if let Some(mark) = batch_mark {
-                                // SAFETY: `each` consumed this batch synchronously.
-                                unsafe { arena.rewind_to(mark) };
-                            }
-                            len = 0;
-                            Ok(core::ops::ControlFlow::Continue(()))
+        let mut result = Self::spill_merged_walk_bytes(
+            roots,
+            arena,
+            false,
+            decoded_columns.as_ref(),
+            decoded_columns.is_none(),
+            SpillOverlayMode::VisibleScan(rowids),
+            None,
+            &mut |rowid, _commit_lsn, representation| {
+                rows[len] = SpilledRow {
+                    rowid,
+                    representation,
+                };
+                len += 1;
+                if len != rows.len() {
+                    return Ok(core::ops::ControlFlow::Continue(()));
+                }
+                match each(&rows[..len])? {
+                    core::ops::ControlFlow::Continue(()) => {
+                        if let Some(mark) = batch_mark {
+                            // SAFETY: `each` consumed this batch synchronously.
+                            unsafe { arena.rewind_to(mark) };
                         }
-                        core::ops::ControlFlow::Break(()) => {
-                            stopped = true;
-                            Ok(core::ops::ControlFlow::Break(()))
-                        }
+                        len = 0;
+                        Ok(core::ops::ControlFlow::Continue(()))
                     }
-                },
-            )
-            .map(|_| ());
+                    core::ops::ControlFlow::Break(()) => {
+                        stopped = true;
+                        Ok(core::ops::ControlFlow::Break(()))
+                    }
+                }
+            },
+        )
+        .map(|_| ());
         if result.is_ok() && !stopped && len != 0 {
             result = each(&rows[..len]).map(|_| ());
         }
@@ -30618,7 +30614,7 @@ impl Storage {
             })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
-        self.spill_merged_walk_bytes(
+        Self::spill_merged_walk_bytes(
             &scan.roots,
             arena,
             true,
@@ -34004,7 +34000,7 @@ impl Storage {
                 .index_arena
                 .lock()
                 .expect("index expression arena lock poisoned");
-            self.spill_merged_walk_bytes(
+            Self::spill_merged_walk_bytes(
                 &scan.roots,
                 &arena,
                 true,

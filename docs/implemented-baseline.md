@@ -60,6 +60,30 @@ schedule pruning.
 Streaming `COPY FROM` keeps its lease in the connection's setup until completion
 or abort and restores the captured read position for each chunk. `COPY TO`,
 buffered portals, and SQL cursors finish their storage reads before suspension.
+Table `COPY TO` captures visible resident versions, its schema, and saved
+files before ordering its output records. It fetches original bytes through those
+owners, without consulting live version chains or table schemas during output.
+Its source owner releases heap/files on completion or error. Saved row payloads are fetched
+when emitted; the export does not copy every payload before starting output.
+An output record uses 32 bytes on the release target, plus the scan's resident
+records and file list. Exhaustion returns `54000`.
+Capture, row iteration, and output check the statement deadline; expiration
+returns `57014` and releases the export's sources.
+
+**User example:** `COPY orders (id, note) TO STDOUT (FORMAT csv)` exports the
+versions collected for that statement, including its visible pending changes.
+A savepoint rollback restores earlier rows for the next export. Use
+`COPY (SELECT id, note FROM orders ORDER BY id) TO STDOUT` when a particular
+row order is required; physical scan order is not a PostgreSQL SQL guarantee.
+Table-form exports read only the named table. To include partitions or inherited
+children, use the query form. A partitioned parent without applicable row security
+returns `42809`; PostgreSQL's row-security rewrite instead exports its own empty
+row set. Plain views and foreign tables require the query form. Populated
+materialized views can be copied directly; unpopulated ones return `0A000`.
+These relation boundaries follow [PostgreSQL 18 COPY](https://www.postgresql.org/docs/18/sql-copy.html)
+and its [row-security rewrite](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/copy.c).
+Direct catalog-table COPY is an explicit implementation limit; use the query form.
+
 Checkpoint and vacuum keep data through their own maintenance sources.
 
 Query walks over immutable sorted tables (SSTs) retain the selected objects,

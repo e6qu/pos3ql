@@ -358,6 +358,29 @@ impl<'arena> TableRowSnapshot<'arena> {
     pub(super) fn roots(&self) -> &CapturedSpillRoots<'arena> {
         &self.roots
     }
+
+    pub(super) fn for_each_saved_home(
+        &self,
+        rowids: &super::RowScanIds<'_>,
+        each: &mut dyn FnMut(u64, VisibleRowHome) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<core::ops::ControlFlow<()>, SqlError> {
+        let Some(roots) = self.roots.owned_source_in(&self.pool)? else {
+            return Ok(core::ops::ControlFlow::Continue(()));
+        };
+        let mut stopped = false;
+        super::Storage::spill_merged_walk(&roots, rowids, &mut |rowid, state| {
+            crate::sql::query::check_timeout()?;
+            let home = state.into_captured_read()?;
+            let result = each(rowid, VisibleRowHome::spilled(home))?;
+            stopped = result.is_break();
+            Ok(result)
+        })?;
+        Ok(if stopped {
+            core::ops::ControlFlow::Break(())
+        } else {
+            core::ops::ControlFlow::Continue(())
+        })
+    }
 }
 
 impl OrderedRowSnapshot<'_, '_> {

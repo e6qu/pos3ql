@@ -571,11 +571,11 @@ if printf '6\tCOPY from pos3ql\n' | psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER"
   -X -v ON_ERROR_STOP=1 -c 'COPY pos3ql_fdw_source (id, note) FROM STDIN' \
   > "$WORK/foreign_copy_in.out" 2>&1; then
   foreign_copy=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
-    -X -Atq -v ON_ERROR_STOP=1 -c 'COPY pos3ql_fdw_source (id, note) TO STDOUT' 2>/dev/null)
+    -X -Atq -v ON_ERROR_STOP=1 -c 'COPY (SELECT id, note FROM pos3ql_fdw_source ORDER BY id) TO STDOUT' 2>/dev/null)
   foreign_copy_reference=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
-    -X -Atq -v ON_ERROR_STOP=1 -c 'COPY public.pos3ql_fdw_source (id, note) TO STDOUT' 2>/dev/null)
+    -X -Atq -v ON_ERROR_STOP=1 -c 'COPY (SELECT id, note FROM public.pos3ql_fdw_source ORDER BY id) TO STDOUT' 2>/dev/null)
   if [[ "$foreign_copy" == "$foreign_copy_reference" ]]; then
-    ok "foreign COPY FROM and TO keep remote rows and text framing"
+    ok "foreign COPY FROM and query-form export keep remote rows and text framing"
   else
     bad "foreign COPY row parity"
     printf 'pos3ql:\n%s\nreference:\n%s\n' "$foreign_copy" "$foreign_copy_reference"
@@ -630,13 +630,36 @@ with psycopg.connect(**p3) as connection:
 def copy_bytes(connection_info):
     with psycopg.connect(**connection_info) as connection:
         with connection.cursor() as cursor:
-            with cursor.copy("COPY public.pos3ql_fdw_source (id, note) TO STDOUT WITH (FORMAT BINARY)") as copy:
+            with cursor.copy("COPY (SELECT id, note FROM public.pos3ql_fdw_source ORDER BY id) TO STDOUT WITH (FORMAT BINARY)") as copy:
                 return b"".join(bytes(part) for part in iter(copy.read, b""))
 
 assert copy_bytes(p3) == copy_bytes(reference)
+
+with psycopg.connect(**reference, autocommit=True) as connection:
+    with connection.cursor() as cursor:
+        cursor.execute("CREATE FOREIGN DATA WRAPPER copy_export_oracle")
+        cursor.execute("CREATE SERVER copy_export_oracle FOREIGN DATA WRAPPER copy_export_oracle")
+        cursor.execute("CREATE FOREIGN TABLE copy_export_oracle (id integer, note text) SERVER copy_export_oracle")
+    try:
+        for settings, table in [(reference, "copy_export_oracle"), (p3, "public.pos3ql_fdw_source")]:
+            with psycopg.connect(**settings, autocommit=True) as target:
+                with target.cursor() as cursor:
+                    try:
+                        with cursor.copy("COPY " + table + " TO STDOUT") as copy:
+                            for _ in copy:
+                                pass
+                    except psycopg.Error as error:
+                        assert error.sqlstate == "42809", (table, error.sqlstate)
+                    else:
+                        raise AssertionError((table, "foreign table-form export was accepted"))
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute("DROP FOREIGN TABLE copy_export_oracle")
+            cursor.execute("DROP SERVER copy_export_oracle")
+            cursor.execute("DROP FOREIGN DATA WRAPPER copy_export_oracle")
 PY
 then
-  ok "foreign binary COPY uses raw v3 framing without local rows"
+  ok "foreign binary query export and table-form rejection match PostgreSQL"
 else
   bad "foreign binary COPY framing"
   cat "$WORK/foreign_copy_binary.out"

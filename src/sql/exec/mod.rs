@@ -51350,13 +51350,23 @@ pub fn copy_begin(
     statement: &crate::sql::ast::CopyStmt,
     txid: u32,
 ) -> Result<CopySetup, SqlError> {
-    let table_index = resolve_dml_table(storage, &statement.table, txid)?;
     let security_role = storage.current_role_slot(txid).ok_or_else(|| {
         sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "current role is not present in the role catalog"
         )
     })?;
+    let table_index = if statement.to {
+        copy_export_table(
+            storage,
+            &statement.table,
+            statement.columns,
+            security_role,
+            txid,
+        )?
+    } else {
+        resolve_dml_table(storage, &statement.table, txid)?
+    };
     let def = storage.table_def(table_index, txid);
     let mut targets = [0usize; MAX_COLUMNS];
     let n_targets = if statement.columns.is_empty() {
@@ -51393,6 +51403,40 @@ pub fn copy_begin(
         target_columns,
         txid,
     )?;
+    if !statement.to && storage.matview_slot_for_table(table_index, txid).is_some() {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "cannot copy to materialized view \"{}\"",
+            def.name.as_str()
+        ));
+    }
+    if statement.to {
+        if !storage.row_security_applies(table_index, security_role, txid) {
+            if def.partition.is_partitioned() {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "cannot copy from partitioned table \"{}\"",
+                    def.name.as_str()
+                ));
+            }
+            if def.kind == crate::storage::TableKind::Foreign {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "cannot copy from foreign table \"{}\"",
+                    def.name.as_str()
+                ));
+            }
+        }
+        if let Some(slot) = storage.matview_slot_for_table(table_index, txid)
+            && !storage.matview(slot).populated
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot copy from unpopulated materialized view \"{}\"",
+                def.name.as_str()
+            ));
+        }
+    }
     // Direction-only options are refused as PostgreSQL does.
     let opts = &statement.options;
     if !statement.to && (opts.force_quote_all || !opts.force_quote.is_empty()) {
@@ -51465,6 +51509,87 @@ pub fn copy_begin(
             )
         })?),
     })
+}
+
+fn copy_export_table(
+    storage: &Storage,
+    name: &QualName,
+    columns: &[&str],
+    role: usize,
+    txid: u32,
+) -> Result<usize, SqlError> {
+    use crate::storage::{AccessClass, StoredRelKind};
+    let Some((schema, kind)) = storage.classify_relation(name.schema, name.name, txid) else {
+        return match storage.resolve_relation(name.schema, name.name, txid) {
+            Some(crate::storage::ResolvedRelation::Catalog) => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "catalog COPY requires the query form"
+            )),
+            _ => Err(undefined_qual(name)),
+        };
+    };
+    storage.require_schema_usage_as(schema.as_str(), role, txid)?;
+    let (class, description) = match kind {
+        StoredRelKind::Table | StoredRelKind::ForeignTable | StoredRelKind::Matview => {
+            return storage
+                .find_visible(schema.as_str(), name.name, txid)
+                .ok_or_else(|| undefined_qual(name));
+        }
+        StoredRelKind::View => (AccessClass::View, "view"),
+        StoredRelKind::Sequence => (AccessClass::Sequence, "sequence"),
+        StoredRelKind::Index => (AccessClass::Index, "non-table relation"),
+    };
+    let object = storage
+        .resolve_access_object(class, schema.as_str(), name.name, txid)
+        .ok_or_else(|| undefined_qual(name))?;
+    let mut requested = ColumnSet::EMPTY;
+    if kind == StoredRelKind::View {
+        let view = storage.view(usize::from(object.slot));
+        let names = view.columns_for(txid).names();
+        if columns.is_empty() {
+            for column in 0..names.len() {
+                requested.insert(column);
+            }
+        } else {
+            for name_column in columns {
+                let column = names
+                    .iter()
+                    .position(|candidate| candidate.as_str() == *name_column)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            name_column,
+                            name.name
+                        )
+                    })?;
+                requested.insert(column);
+            }
+        }
+    }
+    let select = crate::storage::PrivilegeSet::SELECT;
+    let permitted = storage.has_object_privilege(object, role, select, txid)
+        || (!requested.is_empty()
+            && (0..MAX_COLUMNS)
+                .filter(|column| requested.contains(*column))
+                .all(|column| {
+                    crate::storage::ColumnPrivilegeTarget::new(object, column as u16).is_ok_and(
+                        |target| storage.has_column_privilege(target, role, select, txid),
+                    )
+                }));
+    if !permitted {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for table {}",
+            name.name
+        ));
+    }
+    Err(sql_err!(
+        sqlstate::WRONG_OBJECT_TYPE,
+        "cannot copy from {} \"{}\"",
+        description,
+        name.name
+    ))
 }
 
 pub(crate) fn subscription_copy_setup(
@@ -53841,6 +53966,7 @@ fn emit_copy_out_row<'a>(
     security: Option<super::query::RowSecurityPlan<'a>>,
     values: &mut [Datum<'a>; MAX_COLUMNS],
 ) -> Result<bool, SqlError> {
+    super::query::check_timeout()?;
     if let Some(plan) = security {
         let row = RowCtx {
             def: definition,
@@ -54043,36 +54169,25 @@ pub fn copy_out(
         responder.copy_done().map_err(wire_to_sql)?;
         return Ok(count);
     }
-    // Rowid order is insertion order (rowids are monotonic), which is the
-    // order PostgreSQL's COPY TO emits for a freshly-loaded table. Snapshot
-    // the visible tokens first, sort, then stream.
-    let leaves = arena
-        .alloc_slice_with(storage.table_count(), |_| usize::MAX)
-        .map_err(|_| {
+    // Table-form COPY exports ONLY the named relation. The query form
+    // supplies descendant scans and an explicit order when requested.
+    let table = setup.table_index;
+    let scan = storage.captured_row_scan_in(table, txid, arena)?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    def.schema(&mut schema);
+    storage.record_relation_scan(txid, table, None, 0)?;
+    let mut visible = 0usize;
+    let _ = scan.for_each_home(&mut |_, _| {
+        visible = visible.checked_add(1).ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "COPY TO partition scan exceeds the statement arena"
+                "COPY TO row count exceeds the statement boundary"
             )
         })?;
-    let n_leaves = storage.relation_leaf_slots(setup.table_index, txid, leaves)?;
-    let mut visible = 0usize;
-    for &leaf in &leaves[..n_leaves] {
-        storage.record_relation_scan(txid, leaf, None, 0)?;
-        storage.for_each_row_state(leaf, &mut |rowid, state| {
-            if storage
-                .visible_row_home(leaf, rowid, state, txid)?
-                .is_some()
-            {
-                visible += 1;
-            }
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?;
-    }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
     let tokens = arena
-        .alloc_slice_with(
-            visible,
-            |_| None::<(usize, u64, crate::storage::RowSnapshot)>,
-        )
+        .alloc_slice_with(visible, |_| None::<crate::storage::OrderedRowSnapshot>)
         .map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -54080,25 +54195,33 @@ pub fn copy_out(
             )
         })?;
     let mut fill = 0usize;
-    for &leaf in &leaves[..n_leaves] {
-        storage.for_each_row_state(leaf, &mut |rowid, state| {
-            if let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? {
-                tokens[fill] = Some((leaf, rowid, home.snapshot()));
-                fill += 1;
-            }
-            Ok(core::ops::ControlFlow::Continue(()))
+    let _ = scan.for_each_home(&mut |rowid, home| {
+        let token = tokens.get_mut(fill).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "COPY TO captured row count changed"
+            )
         })?;
+        *token = Some(scan.retain(rowid, &home)?);
+        fill += 1;
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    if fill != visible {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "COPY TO captured row count changed"
+        ));
     }
-    tokens.sort_unstable_by_key(|token| token.as_ref().expect("COPY tokens are initialized").1);
+    tokens
+        .sort_unstable_by_key(|token| token.as_ref().expect("COPY tokens are initialized").rowid());
     let mut count = 0u64;
-    for (leaf, rowid, home) in tokens.iter().copied().flatten() {
-        storage.record_relation_tuple_read(txid, leaf, None)?;
-        let emitted = storage.with_row_bytes(leaf, rowid, home, |bytes| {
+    for token in tokens.iter().copied().flatten() {
+        super::query::check_timeout()?;
+        let rowid = token.rowid();
+        storage.record_relation_tuple_read(txid, table, None)?;
+        let emitted = storage.with_row_bytes(table, rowid, token.read()?, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
-            let physical = storage.table_def(leaf, txid);
-            let mut physical_schema = [ColType::Bool; MAX_COLUMNS];
-            physical.schema(&mut physical_schema);
-            rowenc::decode(bytes, &physical_schema[..physical.n_columns], &mut values)?;
+            rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
             emit_copy_out_row(
                 storage,
                 def,

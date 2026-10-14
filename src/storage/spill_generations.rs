@@ -585,6 +585,36 @@ impl SpilledRowState {
         }
     }
 
+    /// Converts a verdict admitted by the captured file walk into its exact
+    /// byte owner. Validate the selected position before publishing the read.
+    pub(super) fn into_captured_read(self) -> Result<SpilledRowRead, SqlError> {
+        let len = self.version.len.ok_or_else(|| {
+            sql_err!(sqlstate::INTERNAL_ERROR, "captured saved row is a deletion")
+        })?;
+        self.roots.with_snapshot(|source| {
+            if self.version.commit_lsn > source.commit_lsn {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "saved row exceeds the captured read position"
+                ));
+            }
+            if self.version.member as usize >= source.handles.len() {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "captured saved row has no file member"
+                ));
+            }
+            Ok(())
+        })?;
+        SpilledRowRead::new(
+            self.roots,
+            self.rowid,
+            len,
+            self.version.member,
+            self.version.commit_lsn,
+        )
+    }
+
     pub(super) fn validate_request(&self, table: usize, rowid: u64) -> Result<(), SqlError> {
         self.roots.with_snapshot(|source| {
             if source.table_slot != table || self.rowid != rowid {
@@ -1427,6 +1457,79 @@ mod tests {
     }
 
     #[test]
+    fn captured_saved_verdict_conversion_rejects_invalid_positions_and_releases_roots() {
+        let PointFixture {
+            storage,
+            table,
+            roots: _,
+            arena,
+            path,
+        } = point_fixture("captured-verdict");
+        let mut retained = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            let length =
+                crate::storage::rowenc::encoded_len(&[crate::sql::types::Datum::Int4(41)]) as u32;
+            for version in [
+                super::super::SpillVersion {
+                    len: None,
+                    member: 0,
+                    commit_lsn: 7,
+                },
+                super::super::SpillVersion {
+                    len: Some(length),
+                    member: 0,
+                    commit_lsn: 9,
+                },
+                super::super::SpillVersion {
+                    len: Some(length),
+                    member: 2,
+                    commit_lsn: 7,
+                },
+            ] {
+                let roots = storage.query_roots.retain(&storage, table, 7).unwrap();
+                let state = SpilledRowState::new(roots, 1, version);
+                assert_eq!(
+                    state.into_captured_read().err().unwrap().sqlstate,
+                    sqlstate::INTERNAL_ERROR
+                );
+                storage
+                    .spill_roots
+                    .copy_roots(false, &mut retained)
+                    .unwrap();
+                assert!(retained.is_empty());
+                assert!(
+                    storage
+                        .query_roots
+                        .slots
+                        .iter()
+                        .all(|slot| !slot.retained.load(Ordering::Acquire))
+                );
+            }
+            let roots = storage.query_roots.retain(&storage, table, 7).unwrap();
+            let read = SpilledRowState::new(
+                roots,
+                1,
+                super::super::SpillVersion {
+                    len: Some(length),
+                    member: 0,
+                    commit_lsn: 7,
+                },
+            )
+            .into_captured_read()
+            .unwrap();
+            assert_point_value(&read, &arena, 41);
+            drop(read);
+            storage
+                .spill_roots
+                .copy_roots(false, &mut retained)
+                .unwrap();
+            assert!(retained.is_empty());
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn captured_resident_byte_scans_keep_mixed_saved_versions_after_retirement() {
         use super::super::row_images::VisibleRowBytes;
         use super::super::{RowHome, RowLoc, RowState};
@@ -1493,11 +1596,51 @@ mod tests {
             registry.copy_roots(false, &mut retained).unwrap();
             assert_eq!(retained.len(), 2);
             assert!(retained.contains(&roots[0]) && retained.contains(&roots[1]));
-            for (scan, expected_overlay, expected_saved) in [
-                (&old, &[(1, 41), (3, 30)][..], &[(2, 17)][..]),
-                (&current, &[(1, 88), (3, 30)][..], &[][..]),
-                (&own, &[(1, 55)][..], &[][..]),
+            for (scan, expected_overlay, expected_saved, expected_all) in [
+                (
+                    &old,
+                    &[(1, 41), (3, 30)][..],
+                    &[(2, 17)][..],
+                    &[(1, 41), (2, 17), (3, 30)][..],
+                ),
+                (
+                    &current,
+                    &[(1, 88), (3, 30)][..],
+                    &[][..],
+                    &[(1, 88), (3, 30)][..],
+                ),
+                (&own, &[(1, 55)][..], &[][..], &[(1, 55)][..]),
             ] {
+                let records = arena
+                    .alloc_slice_with(expected_all.len(), |_| None)
+                    .unwrap();
+                let mut filled = 0;
+                let done = scan
+                    .for_each_home(&mut |rowid, home| {
+                        records[filled] = Some(scan.retain(rowid, &home)?);
+                        filled += 1;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })
+                    .unwrap();
+                assert!(done.is_continue());
+                assert_eq!(filled, records.len());
+                records.sort_unstable_by_key(|row| row.unwrap().rowid());
+                for (record, expected) in records.iter().zip(expected_all) {
+                    let record = record.unwrap();
+                    let consume = |bytes: &[u8]| {
+                        let mut decoded = [Datum::Null];
+                        crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut decoded)?;
+                        assert_eq!(
+                            (record.rowid(), decoded[0]),
+                            (expected.0, Datum::Int4(expected.1))
+                        );
+                        Ok(())
+                    };
+                    match record.read().unwrap().bytes {
+                        VisibleRowBytes::Heap(bytes) => consume(&bytes).unwrap(),
+                        VisibleRowBytes::Spilled(source) => source.with_bytes(consume).unwrap(),
+                    }
+                }
                 let mut count = 0;
                 let done = scan
                     .for_each_overlay(&mut |rowid, home| {
@@ -1608,6 +1751,43 @@ mod tests {
             assert!(storage.heap.test_write().is_ok());
             let scan = storage.captured_row_scan_in(table, 0, &arena).unwrap();
             let nested = storage.captured_row_scan_in(table, 0, &arena).unwrap();
+            let mut count = 0;
+            assert!(
+                scan.for_each_home(&mut |_, _| {
+                    count += 1;
+                    let mut other_count = 0;
+                    let done = nested.for_each_home(&mut |_, _| {
+                        other_count += 1;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })?;
+                    assert!(done.is_continue());
+                    assert_eq!(other_count, 3);
+                    Ok(if count == 2 {
+                        core::ops::ControlFlow::Break(())
+                    } else {
+                        core::ops::ControlFlow::Continue(())
+                    })
+                })
+                .unwrap()
+                .is_break()
+            );
+            assert_eq!(count, 2);
+            let mut count = 0;
+            assert_eq!(
+                scan.for_each_home(&mut |_, _| {
+                    count += 1;
+                    if count == 2 {
+                        return Err(sql_err!(
+                            sqlstate::QUERY_CANCELED,
+                            "cancel saved metadata walk"
+                        ));
+                    }
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })
+                .unwrap_err()
+                .sqlstate,
+                sqlstate::QUERY_CANCELED
+            );
             scan.for_each_spilled_row_batch(&arena, true, None, &mut |rows| {
                 assert_eq!(rows.len(), 2);
                 assert!(storage.tables[table].rows.test_write().is_ok());

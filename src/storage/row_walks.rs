@@ -1,12 +1,13 @@
 //! Startup-bounded row identity retention for authoritative metadata walks.
 
 use core::mem::size_of;
-use std::sync::{Mutex, MutexGuard};
+use core::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use super::row_images::RowVersionIdentity;
 use super::{
     MAX_ROW_WALK_NESTING, PendingChange, RowHome, RowMap, RowSnapshot, Storage, VisibleRowHome,
-    try_mutex_pool,
 };
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
@@ -14,45 +15,107 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
-#[derive(Debug)]
-pub(super) struct RetainedRowIds<'a> {
-    rowids: MutexGuard<'a, FixedVec<u64>>,
+pub(super) struct RetainedRowIds {
+    pool: Arc<RowWalkPool>,
+    slot: usize,
 }
 
-impl RetainedRowIds<'_> {
+impl core::fmt::Debug for RetainedRowIds {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("RetainedRowIds")
+            .field("slot", &self.slot)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedRowIds {
+    fn read(&self) -> RwLockReadGuard<'_, FixedVec<u64>> {
+        self.pool.slots[self.slot]
+            .rowids
+            .read()
+            .expect("row walk slot lock poisoned")
+    }
+
     pub(super) fn iter(&self) -> impl Iterator<Item = u64> + '_ {
-        self.rowids.iter().copied()
+        RowIdIter {
+            rowids: self.read(),
+            next: 0,
+        }
     }
 
     #[cfg(test)]
     pub(super) fn contains(&self, rowid: u64) -> bool {
-        self.rowids.binary_search(&rowid).is_ok()
+        self.read().binary_search(&rowid).is_ok()
     }
 
     fn sort(&mut self) {
-        self.rowids.as_mut_slice().sort_unstable();
+        self.pool.slots[self.slot]
+            .rowids
+            .write()
+            .expect("row walk slot lock poisoned")
+            .as_mut_slice()
+            .sort_unstable();
     }
+}
 
-    fn as_slice(&self) -> &[u64] {
-        &self.rowids
+impl Drop for RetainedRowIds {
+    fn drop(&mut self) {
+        let slot = &self.pool.slots[self.slot];
+        slot.rowids
+            .write()
+            .expect("row walk slot lock poisoned")
+            .clear();
+        slot.retained.store(false, Ordering::Release);
+    }
+}
+
+struct RowIdIter<'a> {
+    rowids: RwLockReadGuard<'a, FixedVec<u64>>,
+    next: usize,
+}
+
+impl Iterator for RowIdIter<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rowid = self.rowids.get(self.next).copied()?;
+        self.next += 1;
+        Some(rowid)
     }
 }
 
 pub(super) enum RowScanIds<'scan> {
-    Reserved(RetainedRowIds<'scan>),
+    Reserved(RetainedRowIds),
     Statement(&'scan [u64]),
 }
 
-impl RowScanIds<'_> {
-    fn as_slice(&self) -> &[u64] {
+enum RowScanIdView<'a> {
+    Reserved(RwLockReadGuard<'a, FixedVec<u64>>),
+    Statement(&'a [u64]),
+}
+
+impl Deref for RowScanIdView<'_> {
+    type Target = [u64];
+
+    fn deref(&self) -> &Self::Target {
         match self {
-            Self::Reserved(rowids) => rowids.as_slice(),
+            Self::Reserved(rowids) => rowids,
             Self::Statement(rowids) => rowids,
+        }
+    }
+}
+
+impl RowScanIds<'_> {
+    fn read(&self) -> RowScanIdView<'_> {
+        match self {
+            Self::Reserved(rowids) => RowScanIdView::Reserved(rowids.read()),
+            Self::Statement(rowids) => RowScanIdView::Statement(rowids),
         }
     }
 
     pub(super) fn contains(&self, rowid: u64) -> bool {
-        self.as_slice().binary_search(&rowid).is_ok()
+        self.read().binary_search(&rowid).is_ok()
     }
 }
 
@@ -257,7 +320,7 @@ impl RowScan<'_> {
         each: &mut super::RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
         self.validate_identity()?;
-        for &rowid in self.rowids.as_slice() {
+        for &rowid in self.rowids.read().iter() {
             self.validate_identity()?;
             let state = match self.storage.resident_row_state(self.table_slot, rowid)? {
                 Some(state) => Some(state.with_captured_roots(&self.roots)),
@@ -324,7 +387,12 @@ type PendingRowVisitor<'a> = dyn FnMut(
     + 'a;
 
 pub(super) struct RowWalkPool {
-    slots: FixedVec<Mutex<FixedVec<u64>>>,
+    slots: FixedVec<RowWalkSlot>,
+}
+
+struct RowWalkSlot {
+    retained: AtomicBool,
+    rowids: RwLock<FixedVec<u64>>,
 }
 
 impl Storage {
@@ -369,9 +437,9 @@ impl Storage {
 impl RowWalkPool {
     pub(super) fn budget_bytes(config: &Config) -> usize {
         size_of::<Self>()
+            + 2 * size_of::<usize>()
             + Self::slot_count(config)
-                * (size_of::<Mutex<FixedVec<u64>>>()
-                    + Self::row_capacity(config) * size_of::<u64>())
+                * (size_of::<RowWalkSlot>() + Self::row_capacity(config) * size_of::<u64>())
     }
 
     fn slot_count(config: &Config) -> usize {
@@ -385,80 +453,106 @@ impl RowWalkPool {
             .max(config.value_index_rows)
     }
 
-    pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
-        budget.draw(size_of::<Self>(), "row walk controls")?;
+    pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Arc<Self>, BudgetError> {
+        budget.draw(size_of::<Self>() + 2 * size_of::<usize>(), "row walk owner")?;
         let count = Self::slot_count(config);
         let mut slots = FixedVec::new(budget, "row walk slots", count)?;
         for _ in 0..count {
             slots
-                .push(Mutex::new(FixedVec::new(
-                    budget,
-                    "retained row walk identities",
-                    Self::row_capacity(config),
-                )?))
+                .push(RowWalkSlot {
+                    retained: AtomicBool::new(false),
+                    rowids: RwLock::new(FixedVec::new(
+                        budget,
+                        "retained row walk identities",
+                        Self::row_capacity(config),
+                    )?),
+                })
                 .expect("sized to row walk slots");
         }
-        Ok(Self { slots })
+        Ok(Arc::new(Self { slots }))
     }
 
     #[cfg(test)]
-    fn retain_scan(&self, rows: &RowMap) -> Result<(RetainedRowIds<'_>, bool), SqlError> {
+    fn retain_scan(self: &Arc<Self>, rows: &RowMap) -> Result<(RetainedRowIds, bool), SqlError> {
         let (mut rowids, immutable_only) = self.retain_from(&rows.read(), true)?;
         rowids.sort();
         Ok((rowids, immutable_only))
     }
 
     fn retain_from(
-        &self,
+        self: &Arc<Self>,
         rows: &crate::mem::fixed_map::FixedMap<u64, super::RowState>,
         skip_redundant: bool,
-    ) -> Result<(RetainedRowIds<'_>, bool), SqlError> {
-        let mut rowids = try_mutex_pool(&self.slots, "row walk slots").ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "row walk retention slots are exhausted ({})",
-                self.slots.len()
-            )
-        })?;
-        rowids.clear();
-        for (&rowid, state) in rows.iter() {
-            if !skip_redundant || !Storage::redundant_spilled_row_state(state) {
-                rowids
-                    .push(rowid)
-                    .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+    ) -> Result<(RetainedRowIds, bool), SqlError> {
+        let retained = self.capture(|rowids| {
+            for (&rowid, state) in rows.iter() {
+                if !skip_redundant || !Storage::redundant_spilled_row_state(state) {
+                    rowids
+                        .push(rowid)
+                        .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+                }
             }
+            Ok(())
+        })?;
+        Ok((retained, rows.is_empty()))
+    }
+
+    fn capture(
+        self: &Arc<Self>,
+        fill: impl FnOnce(&mut FixedVec<u64>) -> Result<(), SqlError>,
+    ) -> Result<RetainedRowIds, SqlError> {
+        let slot = self
+            .slots
+            .iter()
+            .position(|slot| {
+                slot.retained
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "row walk retention slots are exhausted ({})",
+                    self.slots.len()
+                )
+            })?;
+        let retained = RetainedRowIds {
+            pool: Arc::clone(self),
+            slot,
+        };
+        {
+            let mut rowids = self.slots[slot]
+                .rowids
+                .write()
+                .expect("row walk slot lock poisoned");
+            rowids.clear();
+            fill(&mut rowids)?;
         }
-        Ok((RetainedRowIds { rowids }, rows.is_empty()))
+        Ok(retained)
     }
 
     pub(super) fn retain_value_probe(
-        &self,
+        self: &Arc<Self>,
         index: &crate::mem::value_index::ValueIndex,
         hash: u64,
-    ) -> Result<RetainedRowIds<'_>, SqlError> {
-        let mut rowids = try_mutex_pool(&self.slots, "row walk slots").ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "row walk retention slots are exhausted ({})",
-                self.slots.len()
-            )
-        })?;
-        rowids.clear();
-        let mut error = None;
-        index.probe(hash, |rowid| {
-            if error.is_none()
-                && let Err(full) = rowids.push(rowid)
-            {
-                error = Some(full);
+    ) -> Result<RetainedRowIds, SqlError> {
+        self.capture(|rowids| {
+            let mut error = None;
+            index.probe(hash, |rowid| {
+                if error.is_none()
+                    && let Err(full) = rowids.push(rowid)
+                {
+                    error = Some(full);
+                }
+            });
+            if let Some(error) = error {
+                return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error));
             }
-        });
-        if let Some(error) = error {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error));
-        }
-        Ok(RetainedRowIds { rowids })
+            Ok(())
+        })
     }
 
-    pub(super) fn retain(&self, rows: &RowMap) -> Result<RetainedRowIds<'_>, SqlError> {
+    pub(super) fn retain(self: &Arc<Self>, rows: &RowMap) -> Result<RetainedRowIds, SqlError> {
         let (mut rowids, _) = self.retain_from(&rows.read(), false)?;
         rowids.sort();
         Ok(rowids)
@@ -487,6 +581,136 @@ mod tests {
             .insert(1, RowState::committed_only_at(location, 7))
             .unwrap();
         (storage, table)
+    }
+
+    #[test]
+    fn owned_row_walk_identities_outlive_map_and_pool_owners() {
+        let mut config = test_config();
+        config.table_rows = 3;
+        config.large_object_pages = 3;
+        config.value_index_rows = 3;
+        let mut budget = Budget::new(RowWalkPool::budget_bytes(&config));
+        let pool = RowWalkPool::new(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        let mut row_budget = Budget::new(4096);
+        let mut rows = RowMap::new(&mut row_budget, "owned walk rows", 3).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for rowid in [3, 1, 2] {
+                rows.insert(
+                    rowid,
+                    RowState::committed_only_at(super::super::RowLoc::test(0, 4), 7),
+                )
+                .unwrap();
+            }
+            let retained = pool.retain(&rows).unwrap();
+            rows.clear();
+            rows.insert(
+                9,
+                RowState::committed_only_at(super::super::RowLoc::test(0, 4), 8),
+            )
+            .unwrap();
+            drop(rows);
+            drop(pool);
+            let mut iterator = retained.iter();
+            for expected in [1, 2, 3] {
+                assert_eq!(iterator.next(), Some(expected));
+                assert!(
+                    retained.contains(expected),
+                    "nested reads share an immutable slot"
+                );
+            }
+            assert_eq!(iterator.next(), None);
+            drop(iterator);
+            assert_eq!(retained.iter().count(), 3);
+            drop(retained);
+        });
+    }
+
+    #[test]
+    fn owned_row_walk_identities_survive_table_reuse_and_storage_shutdown() {
+        let (mut storage, table) = fixture();
+        crate::mem::guard::forbid_alloc(|| {
+            let retained = storage
+                .row_walks
+                .retain(&storage.tables[table].rows)
+                .unwrap();
+            storage.commit_drop(table);
+            let replacement = storage
+                .create_table(make_def(
+                    "owned_walk_replacement",
+                    &[("id", ColType::Text, true)],
+                ))
+                .unwrap();
+            assert_eq!(replacement, table);
+            let location = storage.heap.append_row(&[Datum::Text("new")]).unwrap();
+            storage.tables[table]
+                .rows
+                .insert(2, RowState::committed_only_at(location, 8))
+                .unwrap();
+            drop(storage);
+            let partition = RowScanIds::Reserved(retained);
+            assert!(partition.contains(1));
+            assert!(!partition.contains(2));
+            assert_eq!(&*partition.read(), &[1]);
+            drop(partition);
+        });
+    }
+
+    #[test]
+    fn owned_row_walk_identities_parallel_capture_and_release_keep_slots_distinct() {
+        let mut config = test_config();
+        config.table_rows = 2;
+        config.large_object_pages = 2;
+        config.value_index_rows = 2;
+        let mut budget = Budget::new(RowWalkPool::budget_bytes(&config));
+        let pool = RowWalkPool::new(&config, &mut budget).unwrap();
+        let mut row_budget = Budget::new(8192);
+        let mut left = RowMap::new(&mut row_budget, "left owned walk", 2).unwrap();
+        let mut right = RowMap::new(&mut row_budget, "right owned walk", 2).unwrap();
+        for rowid in [1, 2] {
+            left.insert(
+                rowid,
+                RowState::committed_only_at(super::super::RowLoc::test(0, 4), 7),
+            )
+            .unwrap();
+            right
+                .insert(
+                    rowid + 6,
+                    RowState::committed_only_at(super::super::RowLoc::test(0, 4), 7),
+                )
+                .unwrap();
+        }
+        let together = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let worker = |rows: &RowMap, first| {
+                crate::mem::guard::forbid_alloc(|| {
+                    let retained = pool.retain(rows).unwrap();
+                    together.wait();
+                    let slot = retained.slot;
+                    for _ in 0..100 {
+                        let mut iterator = retained.iter();
+                        assert_eq!(iterator.next(), Some(first));
+                        assert!(retained.contains(first + 1));
+                        assert_eq!(iterator.next(), Some(first + 1));
+                        assert_eq!(iterator.next(), None);
+                    }
+                    together.wait();
+                    slot
+                })
+            };
+            let left = scope.spawn(|| worker(&left, 1));
+            let right = scope.spawn(|| worker(&right, 7));
+            assert_ne!(left.join().unwrap(), right.join().unwrap());
+        });
+        assert!(
+            pool.slots
+                .iter()
+                .all(|slot| !slot.retained.load(Ordering::Acquire))
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            let retained = pool.retain(&left).unwrap();
+            assert_eq!(retained.iter().count(), 2);
+        });
     }
 
     #[test]

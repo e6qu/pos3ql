@@ -73,6 +73,9 @@ read position, and reader. They can select previously unread rows after table
 replacement or Storage shutdown, without consulting a reused table slot.
 Sorted reads also retain one byte source and copy row records that refer to it;
 later byte retrieval does not look up a possibly reused version chain again.
+Captured row identity lists own their startup pool slot through table reuse and
+Storage shutdown. Their buffer lifetime no longer depends on a borrowed guard
+from Storage; the resident versions behind those identities still need ownership.
 
 Replication snapshot validity and history protection share one guarded registry.
 Imports retain history before the exporter can expire, and failed imports leave

@@ -13596,7 +13596,7 @@ pub struct Storage {
     table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
     row_versions: RowVersionPools,
-    row_walks: RowWalkPool,
+    row_walks: std::sync::Arc<RowWalkPool>,
     query_roots: std::sync::Arc<QueryRootPool>,
     spill_roots: std::sync::Arc<SpillRootRegistry>,
     large_objects: std::sync::Mutex<LargeObjectCatalog>,

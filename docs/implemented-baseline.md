@@ -121,6 +121,12 @@ For a sorted read, collected rows keep their original bytes even if reclamation
 moves the current table's rows before those collected rows are fetched.
 
 Internal metadata/byte scans also reserve 64 retention slots per workspace.
+Captured row identity lists own their startup pool slot, so their numbers remain
+available after the source map, table, or Storage owner is removed. Concurrent
+captures reserve distinct slots; failed capture and final release clear a slot
+before reuse. Iteration and nested reads use only that slot's private guards.
+This preserves the list's memory; unselected resident row versions still need
+table-retirement coordination.
 SQL byte scans keep their row identities, saved-file handles, and schema in the
 statement arena, copying only used columns, so wide joins do not spend one
 metadata source slot per join edge. The scan releases registered files before its statement memory is reset;

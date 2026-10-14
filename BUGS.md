@@ -8,6 +8,8 @@ The sorted-read review on 2026-10-14 checked pending, historical, and committed
 byte retention through heap relocation, table replacement, and Storage shutdown.
 Deferred sorted rows refer directly to their original source rather than
 looking up reusable version chains again. Changed byte owners are rejected.
+The full window-query gate caught a record-size regression; records retain their
+original 32-byte size, without increasing the statement arena.
 No known defects meet this file's inclusion criteria. This does not mean all
 planned work is finished or that every possible bug has been ruled out.
 Resolved investigations are indexed in [history](docs/history/README.md).

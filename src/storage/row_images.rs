@@ -7,6 +7,9 @@ use super::spill_generations::{
 use super::{RowHome, RowLoc};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
+use core::marker::PhantomData;
+use core::num::NonZeroUsize;
+use core::ptr::NonNull;
 use std::sync::Arc;
 
 /// A table incarnation and the exact row version selected by MVCC.
@@ -34,19 +37,72 @@ pub(crate) struct TableRowSnapshot<'arena> {
 /// Compact scan metadata keeps physical ordering separate from byte identity.
 #[derive(Clone, Copy)]
 pub(crate) struct OrderedRowSnapshot<'source, 'arena> {
-    source: &'source TableRowSnapshot<'arena>,
+    source: OrderedRowSource<'source, 'arena>,
     rowid: u64,
     version: u64,
     offset_or_member: u32,
     len: u32,
-    kind: OrderedVersionKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
 enum OrderedVersionKind {
     PendingHeap,
     CommittedHeap,
     CommittedSpilled,
+}
+
+/// The source's alignment leaves two address bits for the version kind.
+/// Keep the complete identity and location widths in the 32-byte row record.
+#[derive(Clone, Copy)]
+struct OrderedRowSource<'source, 'arena> {
+    tagged: NonNull<TableRowSnapshot<'arena>>,
+    borrowed: PhantomData<&'source TableRowSnapshot<'arena>>,
+}
+
+const _: () = assert!(core::mem::align_of::<TableRowSnapshot<'static>>() >= 4);
+
+impl<'source, 'arena> OrderedRowSource<'source, 'arena> {
+    fn new(source: &'source TableRowSnapshot<'arena>, kind: OrderedVersionKind) -> Self {
+        let tagged = NonNull::from(source).map_addr(|address| {
+            NonZeroUsize::new(address.get() | kind as usize).expect("non-null source")
+        });
+        Self {
+            tagged,
+            borrowed: PhantomData,
+        }
+    }
+
+    fn kind(self) -> OrderedVersionKind {
+        match self.tagged.addr().get() & 3 {
+            0 => OrderedVersionKind::PendingHeap,
+            1 => OrderedVersionKind::CommittedHeap,
+            2 => OrderedVersionKind::CommittedSpilled,
+            _ => unreachable!("only checked version kinds are encoded"),
+        }
+    }
+
+    fn owner(self) -> &'source TableRowSnapshot<'arena> {
+        let pointer = self
+            .tagged
+            .map_addr(|address| NonZeroUsize::new(address.get() & !3).expect("non-null source"));
+        // SAFETY: construction borrows this aligned source for 'source. Both
+        // map_addr calls preserve provenance; clearing the two kind bits
+        // restores its original address. Access is immutable, never as_mut.
+        unsafe { pointer.as_ref() }
+    }
+}
+
+// SAFETY: the marker retains an immutable source borrow. Copying the tagged
+// pointer cannot mutate its owner; decoding yields only that shared reference.
+unsafe impl<'source, 'arena> Send for OrderedRowSource<'source, 'arena> where
+    TableRowSnapshot<'arena>: Sync
+{
+}
+// SAFETY: identical to Send; shared access requires a Sync source owner.
+unsafe impl<'source, 'arena> Sync for OrderedRowSource<'source, 'arena> where
+    TableRowSnapshot<'arena>: Sync
+{
 }
 
 impl<'arena> TableRowSnapshot<'arena> {
@@ -116,12 +172,11 @@ impl<'arena> TableRowSnapshot<'arena> {
             }
         };
         Ok(OrderedRowSnapshot {
-            source: self,
+            source: OrderedRowSource::new(self, kind),
             rowid,
             version,
             offset_or_member,
             len,
-            kind,
         })
     }
 }
@@ -132,21 +187,21 @@ impl OrderedRowSnapshot<'_, '_> {
     }
 
     pub(crate) fn sort_key(self) -> (u8, u64, u32) {
-        match self.kind {
+        match self.source.kind() {
             OrderedVersionKind::CommittedSpilled => (0, self.rowid, 0),
             _ => (1, 0, self.offset_or_member),
         }
     }
 
     pub(crate) fn read(self) -> Result<VisibleRowHome, SqlError> {
-        match self.kind {
+        let source = self.source.owner();
+        match self.source.kind() {
             OrderedVersionKind::PendingHeap | OrderedVersionKind::CommittedHeap => {
-                let heap = self
-                    .source
+                let heap = source
                     .heap
                     .as_ref()
                     .expect("retained heap row has an owner");
-                let version = match self.kind {
+                let version = match self.source.kind() {
                     OrderedVersionKind::PendingHeap => RowVersionIdentity::Pending(self.version),
                     _ => RowVersionIdentity::Committed(self.version),
                 };
@@ -157,19 +212,18 @@ impl OrderedRowSnapshot<'_, '_> {
                 };
                 Ok(VisibleRowHome::heap(
                     RowSnapshot {
-                        created_at: self.source.created_at,
+                        created_at: source.created_at,
                         version,
                     },
                     heap.read_location(location)?,
-                    self.source.table_slot,
+                    source.table_slot,
                     self.rowid,
                 ))
             }
             OrderedVersionKind::CommittedSpilled => {
-                let roots = self
-                    .source
+                let roots = source
                     .roots
-                    .owned_source_in(&self.source.pool)?
+                    .owned_source_in(&source.pool)?
                     .expect("retained object row has an owner");
                 SpilledRowRead::new(
                     roots,
@@ -327,6 +381,42 @@ mod tests {
     use crate::mem::budget::Budget;
 
     #[test]
+    fn owned_ordered_source_tags_preserve_pointer_provenance() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<OrderedRowSnapshot<'static, 'static>>();
+        let mut config = super::super::tests::test_config();
+        // This heap-only fixture never requests an object source slot.
+        config.query_workspace_slots = 0;
+        let mut budget = Budget::new(QueryRootPool::budget_bytes(&config));
+        let pool = QueryRootPool::new(&config, &mut budget).unwrap();
+        let source = TableRowSnapshot {
+            created_at: u64::MAX,
+            table_slot: 17,
+            heap: None,
+            roots: CapturedSpillRoots::Empty,
+            pool,
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            for kind in [
+                OrderedVersionKind::PendingHeap,
+                OrderedVersionKind::CommittedHeap,
+                OrderedVersionKind::CommittedSpilled,
+            ] {
+                let tagged = OrderedRowSource::new(&source, kind);
+                let copied = tagged;
+                assert_eq!(copied.kind(), kind);
+                assert!(core::ptr::eq(copied.owner(), &source));
+                assert_eq!(copied.owner().created_at, u64::MAX);
+                assert_eq!(copied.owner().table_slot, 17);
+            }
+            assert_eq!(
+                core::mem::size_of::<Option<OrderedRowSnapshot<'_, '_>>>(),
+                32
+            );
+        });
+    }
+
+    #[test]
     fn owned_ordered_rows_keep_heap_versions_after_retirement_and_relocation() {
         use super::super::tests::{make_def, test_budget, test_config};
         let config = test_config();
@@ -470,7 +560,7 @@ mod tests {
     fn visible_row_heap_ownership_scan_metadata_preserves_budget_and_order() {
         assert_eq!(
             core::mem::size_of::<Option<OrderedRowSnapshot<'_, '_>>>(),
-            40
+            32
         );
         let mut budget = Budget::new(1024);
         let arena = crate::mem::arena::Arena::new(&mut budget, "ordered source", 1024).unwrap();

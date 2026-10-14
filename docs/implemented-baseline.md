@@ -110,7 +110,7 @@ files. Their copyable row records borrow that source, keeping physical order,
 version, and byte location together. Fetching a record uses its original owner
 directly, so removal, version-chain reuse, and heap relocation cannot redirect
 the read. Changed heap allocations or saved-file sources fail with `40001`
-before retention. Each optional row record uses 40 bytes in the fixed statement
+before retention. Each optional row record keeps the existing 32-byte size in the fixed statement
 arena on the release target; source exhaustion retains the existing `54000`
 contract. Object rows no longer repeat a metadata lookup before fetching bytes.
 

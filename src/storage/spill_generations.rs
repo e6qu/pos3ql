@@ -776,6 +776,10 @@ struct SpillGenerationMetadata {
 }
 
 impl SpillGenerationImage {
+    pub(super) fn table_slot(&self) -> usize {
+        self.table_slot
+    }
+
     fn metadata(&self) -> SpillGenerationMetadata {
         SpillGenerationMetadata {
             persistence: self.persistence,
@@ -933,11 +937,42 @@ impl<'a> CapturedSpillRoots<'a> {
         &self,
         storage: &Storage,
     ) -> Result<Option<QueryRootLease>, SqlError> {
+        self.owned_source_in(&storage.query_roots)
+    }
+
+    pub(super) fn owned_source_in(
+        &self,
+        pool: &Arc<QueryRootPool>,
+    ) -> Result<Option<QueryRootLease>, SqlError> {
         match self {
             Self::Empty => Ok(None),
             Self::Reserved(lease) => lease.try_clone().map(Some),
-            Self::Statement(source) => storage.query_roots.retain_source(&source.view()).map(Some),
+            Self::Statement(source) => pool.retain_source(&source.view()).map(Some),
         }
+    }
+
+    pub(super) fn matches_read(&self, read: &SpilledRowRead) -> Result<bool, SqlError> {
+        self.with_view(|source| {
+            read.roots.with_snapshot(|other| {
+                let Some(handle) = source.handles.get(read.member as usize) else {
+                    return Ok(false);
+                };
+                let readers_match = match (source.reader, other.reader.as_ref()) {
+                    (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                    (None, None) => true,
+                    _ => false,
+                };
+                Ok(readers_match
+                    && source.metadata.persistence == other.persistence
+                    && source.schema == &other.schema[..other.n_columns]
+                    && Arc::ptr_eq(
+                        source.registry,
+                        other.registry.as_ref().expect("retained registry"),
+                    )
+                    && Some(handle) == other.handles.get(read.member as usize))
+            })
+        })
+        .map(|matches| matches.unwrap_or(false))
     }
 }
 
@@ -1615,6 +1650,72 @@ mod tests {
         });
         drop(storage);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn owned_ordered_rows_keep_saved_versions_without_live_metadata() {
+        for statement in [false, true] {
+            let PointFixture {
+                mut storage,
+                table,
+                roots,
+                arena,
+                path,
+            } = point_fixture(if statement {
+                "ordered-saved-arena"
+            } else {
+                "ordered-saved-pool"
+            });
+            let registry = Arc::clone(&storage.spill_roots);
+            let mut retained = Vec::with_capacity(3);
+            crate::mem::guard::forbid_alloc(|| {
+                let source = storage
+                    .table_row_snapshot(table, statement.then_some(&arena))
+                    .unwrap();
+                let state = storage
+                    .spill_row_state_at(table, 1, u64::MAX)
+                    .unwrap()
+                    .unwrap();
+                let old = state.visible_at(7).unwrap().unwrap();
+                let current = state.visible_at(9).unwrap().unwrap();
+                let old_image = super::super::VisibleRowHome::spilled(old);
+                let current_image = super::super::VisibleRowHome::spilled(current);
+                let old = source.retain(1, &old_image).unwrap();
+                let current = source.retain(1, &current_image).unwrap();
+                drop(old_image);
+                drop(current_image);
+                drop(state);
+                storage.set_spill_list(table, &[roots[2]]);
+                let changed = super::super::VisibleRowHome::spilled(
+                    storage.retain_spilled_row(table, 1, 18, 0, 11).unwrap(),
+                );
+                assert_eq!(
+                    source.retain(1, &changed).err().unwrap().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                drop(changed);
+                storage.commit_drop(table);
+                let mut definition =
+                    make_def("ordered_replacement", &[("id", ColType::Text, true)]);
+                definition.persistence = RelationPersistence::Temporary;
+                assert_eq!(storage.create_table(definition).unwrap(), table);
+                storage.set_spill_list(table, &[roots[2]]);
+                drop(storage);
+                for (record, expected) in [(old, 41), (current, 88)] {
+                    let image = record.read().unwrap();
+                    let super::super::VisibleRowBytes::Spilled(read) = image.bytes else {
+                        panic!("object fixture")
+                    };
+                    assert_point_value(&read, &arena, expected);
+                }
+                // The copyable records borrow their source; it cannot be
+                // released or replaced until their final use above.
+                drop(source);
+                registry.copy_roots(false, &mut retained).unwrap();
+                assert!(retained.is_empty());
+            });
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     fn scan_fixture(label: &str) -> PointFixture {

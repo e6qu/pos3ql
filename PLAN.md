@@ -79,8 +79,9 @@ Still to do:
 - Complete reader protection for authoritative metadata walks and remaining
   executor reads that retain only a version stamp. Sequential SQL byte scans
   and `COPY TO`, together with index validation, capture resident version choices
-  before fetching bytes and keep their original heap and saved files. Metadata walks still consult live
-  row state; their retirement and update rules need coordination.
+  before fetching bytes and keep their original heap and saved files. Metadata
+  walks still consult live row state; their retirement and update rules need
+  coordination.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.
 - Integrate bounded heap relocation with concurrent table publication and

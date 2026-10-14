@@ -36,14 +36,23 @@ def index_validation_transcript(reader, writer) -> list[str]:
             ("INSERT INTO index_validation_diff VALUES (2, 10)", None),
         ]:
             reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
-            before = reader.execute("SELECT value FROM index_validation_diff WHERE id = 2").fetchone()
+            before = reader.execute(
+                "SELECT value FROM index_validation_diff WHERE id = 2"
+            ).fetchone()
             assert before == (None if expected_old is None else (expected_old,)), before
             writer.execute(change)
             reader.execute("SAVEPOINT before_validation")
-            result = sqlstate(reader, "CREATE UNIQUE INDEX index_validation_key ON index_validation_diff(value)")
+            result = sqlstate(
+                reader,
+                "CREATE UNIQUE INDEX index_validation_key ON index_validation_diff(value)",
+            )
             reader.execute("ROLLBACK TO SAVEPOINT before_validation")
-            after = reader.execute("SELECT value FROM index_validation_diff WHERE id = 2").fetchone()
-            results.append(f"index_new_commits={result},snapshot_unchanged={before == after}")
+            after = reader.execute(
+                "SELECT value FROM index_validation_diff WHERE id = 2"
+            ).fetchone()
+            results.append(
+                f"index_new_commits={result},snapshot_unchanged={before == after}"
+            )
             reader.execute("ROLLBACK")
             writer.execute("DELETE FROM index_validation_diff WHERE id = 2")
         writer.execute("INSERT INTO index_validation_diff VALUES (2, 20)")
@@ -55,7 +64,8 @@ def index_validation_transcript(reader, writer) -> list[str]:
         results.append(f"index_valid_current=ok,snapshot_unchanged={before == after}")
         reader.execute("ROLLBACK")
         writer.execute("CREATE UNIQUE INDEX index_validation_key ON index_validation_diff(value)")
-        results.append(f"index_enforces_current={sqlstate(writer, 'INSERT INTO index_validation_diff VALUES (3, 30)')}")
+        enforced = sqlstate(writer, "INSERT INTO index_validation_diff VALUES (3, 30)")
+        results.append(f"index_enforces_current={enforced}")
         return results
     finally:
         reader.execute("ROLLBACK")

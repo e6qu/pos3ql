@@ -698,8 +698,10 @@ mod tests {
                     slot
                 })
             };
-            let left = scope.spawn(|| worker(&left, 1));
-            let right = scope.spawn(|| worker(&right, 7));
+            let left_rows = &left;
+            let right_rows = &right;
+            let left = scope.spawn(move || worker(left_rows, 1));
+            let right = scope.spawn(move || worker(right_rows, 7));
             assert_ne!(left.join().unwrap(), right.join().unwrap());
         });
         assert!(

@@ -370,12 +370,7 @@ impl<'arena> TableRowSnapshot<'arena> {
         let mut stopped = false;
         super::Storage::spill_merged_walk(&roots, rowids, &mut |rowid, state| {
             crate::sql::query::check_timeout()?;
-            let home = state.visible_at(u64::MAX)?.ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "merged saved row has no selected bytes"
-                )
-            })?;
+            let home = state.into_captured_read()?;
             let result = each(rowid, VisibleRowHome::spilled(home))?;
             stopped = result.is_break();
             Ok(result)

@@ -585,6 +585,36 @@ impl SpilledRowState {
         }
     }
 
+    /// Converts a verdict admitted by the captured file walk into its exact
+    /// byte owner. Validate the selected position before publishing the read.
+    pub(super) fn into_captured_read(self) -> Result<SpilledRowRead, SqlError> {
+        let len = self.version.len.ok_or_else(|| {
+            sql_err!(sqlstate::INTERNAL_ERROR, "captured saved row is a deletion")
+        })?;
+        self.roots.with_snapshot(|source| {
+            if self.version.commit_lsn > source.commit_lsn {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "saved row exceeds the captured read position"
+                ));
+            }
+            if self.version.member as usize >= source.handles.len() {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "captured saved row has no file member"
+                ));
+            }
+            Ok(())
+        })?;
+        SpilledRowRead::new(
+            self.roots,
+            self.rowid,
+            len,
+            self.version.member,
+            self.version.commit_lsn,
+        )
+    }
+
     pub(super) fn validate_request(&self, table: usize, rowid: u64) -> Result<(), SqlError> {
         self.roots.with_snapshot(|source| {
             if source.table_slot != table || self.rowid != rowid {
@@ -1424,6 +1454,79 @@ mod tests {
             arena,
             path,
         }
+    }
+
+    #[test]
+    fn captured_saved_verdict_conversion_rejects_invalid_positions_and_releases_roots() {
+        let PointFixture {
+            storage,
+            table,
+            roots: _,
+            arena,
+            path,
+        } = point_fixture("captured-verdict");
+        let mut retained = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            let length =
+                crate::storage::rowenc::encoded_len(&[crate::sql::types::Datum::Int4(41)]) as u32;
+            for version in [
+                super::super::SpillVersion {
+                    len: None,
+                    member: 0,
+                    commit_lsn: 7,
+                },
+                super::super::SpillVersion {
+                    len: Some(length),
+                    member: 0,
+                    commit_lsn: 9,
+                },
+                super::super::SpillVersion {
+                    len: Some(length),
+                    member: 2,
+                    commit_lsn: 7,
+                },
+            ] {
+                let roots = storage.query_roots.retain(&storage, table, 7).unwrap();
+                let state = SpilledRowState::new(roots, 1, version);
+                assert_eq!(
+                    state.into_captured_read().err().unwrap().sqlstate,
+                    sqlstate::INTERNAL_ERROR
+                );
+                storage
+                    .spill_roots
+                    .copy_roots(false, &mut retained)
+                    .unwrap();
+                assert!(retained.is_empty());
+                assert!(
+                    storage
+                        .query_roots
+                        .slots
+                        .iter()
+                        .all(|slot| !slot.retained.load(Ordering::Acquire))
+                );
+            }
+            let roots = storage.query_roots.retain(&storage, table, 7).unwrap();
+            let read = SpilledRowState::new(
+                roots,
+                1,
+                super::super::SpillVersion {
+                    len: Some(length),
+                    member: 0,
+                    commit_lsn: 7,
+                },
+            )
+            .into_captured_read()
+            .unwrap();
+            assert_point_value(&read, &arena, 41);
+            drop(read);
+            storage
+                .spill_roots
+                .copy_roots(false, &mut retained)
+                .unwrap();
+            assert!(retained.is_empty());
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

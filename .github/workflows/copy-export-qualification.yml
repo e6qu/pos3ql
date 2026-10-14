@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo clippy --all-targets --locked -- -D warnings
-          for filter in copy_ arena_owned_slices captured_resident_byte_scans owned_ordered startup \
+          for filter in copy_ arena_owned_slices captured_resident_byte_scans captured_saved_verdict_conversion owned_ordered startup \
             external_windows_spill_through_the_provider_neutral_block_store wide_join_trees_execute_without_allocation; do
             cargo test --lib --locked "$filter" -- --nocapture --test-threads=2
           done

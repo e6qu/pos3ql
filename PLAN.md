@@ -42,6 +42,8 @@ machine do not establish production availability or speed.
 - Comparing exports with PostgreSQL exposed a wrong assumption about child
   tables. A table-form export reads only its named relation; the query form
   selects a complete partition or inheritance tree.
+- A report and a uniqueness check can need different views of the same rows.
+  Keeping a report stable must not let an index miss a later committed duplicate.
 - A safe storage layout needs to keep older versions until every reader and
   backup has finished with them. Copying only today's logical rows is not
   sufficient when an older transaction still needs historical object data.
@@ -67,6 +69,9 @@ lists own their startup buffers. Shared statistics and journal acknowledgements
 also retain the exact state they captured.
 `COPY TO` retains its named table's source and schema before ordering export rows;
 output fetches those original bytes instead of rechecking version numbers.
+Index validation captures current committed rows and all earlier writes by its
+creating transaction, while keeping ordinary transaction reads at their original
+snapshot. Its unread bytes keep their original owners.
 
 The [implementation guide](docs/implemented-baseline.md) owns the detailed
 contracts and limits; this sequence keeps the remaining acceptance gates.
@@ -75,9 +80,10 @@ Still to do:
 
 - Complete reader protection for authoritative metadata walks and remaining
   executor reads that retain only a version stamp. Sequential SQL byte scans
-  and `COPY TO` now capture resident version choices before fetching bytes and
-  keep their original heap and saved files. Metadata walks still consult live
-  row state; their retirement and update rules need coordination.
+  and `COPY TO`, together with index validation, capture resident version choices
+  before fetching bytes and keep their original heap and saved files. Metadata
+  walks still consult live row state; their retirement and update rules need
+  coordination.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.
 - Integrate bounded heap relocation with concurrent table publication and

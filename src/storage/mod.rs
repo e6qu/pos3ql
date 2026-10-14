@@ -30325,8 +30325,32 @@ impl Storage {
         self.pin_row_selection(table_slot, rowid, state, visible, Some(commit_snapshot))
     }
 
-    /// Uniqueness validation checks the latest committed image regardless of
-    /// the transaction's snapshot, without observing a pending replacement.
+    /// Cache probes need only this verdict while their saved block is borrowed;
+    /// copy no row bytes or root owners and release metadata guards immediately.
+    pub(crate) fn row_has_own_pending(&self, table_slot: usize, rowid: u64, txid: u32) -> bool {
+        let versions = self.row_versions.read();
+        let rows = self.tables[table_slot].rows.read();
+        rows.get(&rowid).is_some_and(|&state| {
+            RowRead::borrowed(state, &versions)
+                .pending_last()
+                .is_some_and(|pending| pending.txid == txid)
+        })
+    }
+
+    /// A uniqueness check includes own replacements and deletions plus the
+    /// latest committed data, independently of the transaction's read snapshot.
+    pub(crate) fn uniqueness_row_home(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+        state: RowRead<'_>,
+        txid: u32,
+    ) -> Result<Option<VisibleRowHome>, SqlError> {
+        self.visible_row_home_at(table_slot, rowid, state, txid, SNAPSHOT_ALL, u64::MAX)
+    }
+
+    /// Committed-only consumers ignore pending replacements and the
+    /// transaction's read snapshot.
     pub(crate) fn committed_row_home(
         &self,
         table_slot: usize,
@@ -32152,28 +32176,24 @@ impl Storage {
             // The published generation is a complete base. Every later
             // committed change remains in the bounded resident overlay
             // until its replacement generation publishes.
-            let mut hashes = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
-            for (rowid, state) in self.tables[table_index].rows.iter() {
+            let _ = self.for_each_resident_row_state(table_index, &mut |rowid, state| {
                 if state.committed_lsn <= handle.published_lsn {
-                    continue;
+                    return Ok(core::ops::ControlFlow::Continue(()));
                 }
-                let Some(home) = state.committed else {
-                    continue;
+                let Some(home) = self.committed_row_home(table_index, rowid, state)? else {
+                    return Ok(core::ops::ControlFlow::Continue(()));
                 };
-                let n = self.row_enforcer_hashes(table_index, rowid, home, &mut hashes)?;
-                if hashes[..n]
-                    .iter()
-                    .any(|(binding, candidate)| *binding == i && *candidate == hash)
-                {
-                    let key_buffer = &mut scratch.roster;
-                    let Some((key_len, _, _)) =
-                        self.encode_value_binding_entry(table_index, i, rowid, home, key_buffer)?
-                    else {
-                        continue;
-                    };
+                let key_buffer = &mut scratch.roster;
+                let Some((key_len, _, candidate)) =
+                    self.encode_value_binding_entry(table_index, i, rowid, home, key_buffer)?
+                else {
+                    return Ok(core::ops::ControlFlow::Continue(()));
+                };
+                if candidate == hash {
                     visit(rowid, Some(&key_buffer[..key_len]))?;
                 }
-            }
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
             return Ok(true);
         }
         Ok(false)

@@ -25,6 +25,53 @@ def sqlstate(connection, statement: str) -> str:
     return "ok"
 
 
+def index_validation_transcript(reader, writer) -> list[str]:
+    writer.execute("DROP TABLE IF EXISTS index_validation_diff")
+    writer.execute("CREATE TABLE index_validation_diff (id integer, value integer)")
+    writer.execute("INSERT INTO index_validation_diff VALUES (1, 10), (2, 20)")
+    results = []
+    try:
+        for change, expected_old in [
+            ("UPDATE index_validation_diff SET value = 10 WHERE id = 2", 20),
+            ("INSERT INTO index_validation_diff VALUES (2, 10)", None),
+        ]:
+            reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            before = reader.execute(
+                "SELECT value FROM index_validation_diff WHERE id = 2"
+            ).fetchone()
+            assert before == (None if expected_old is None else (expected_old,)), before
+            writer.execute(change)
+            reader.execute("SAVEPOINT before_validation")
+            result = sqlstate(
+                reader,
+                "CREATE UNIQUE INDEX index_validation_key ON index_validation_diff(value)",
+            )
+            reader.execute("ROLLBACK TO SAVEPOINT before_validation")
+            after = reader.execute(
+                "SELECT value FROM index_validation_diff WHERE id = 2"
+            ).fetchone()
+            results.append(
+                f"index_new_commits={result},snapshot_unchanged={before == after}"
+            )
+            reader.execute("ROLLBACK")
+            writer.execute("DELETE FROM index_validation_diff WHERE id = 2")
+        writer.execute("INSERT INTO index_validation_diff VALUES (2, 20)")
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        before = reader.execute("SELECT value FROM index_validation_diff WHERE id = 2").fetchone()
+        writer.execute("UPDATE index_validation_diff SET value = 30 WHERE id = 2")
+        reader.execute("CREATE UNIQUE INDEX index_validation_key ON index_validation_diff(value)")
+        after = reader.execute("SELECT value FROM index_validation_diff WHERE id = 2").fetchone()
+        results.append(f"index_valid_current=ok,snapshot_unchanged={before == after}")
+        reader.execute("ROLLBACK")
+        writer.execute("CREATE UNIQUE INDEX index_validation_key ON index_validation_diff(value)")
+        enforced = sqlstate(writer, "INSERT INTO index_validation_diff VALUES (3, 30)")
+        results.append(f"index_enforces_current={enforced}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE index_validation_diff")
+
+
 def exercise(port: int) -> list[str]:
     reader = connect(port)
     writer = connect(port)
@@ -63,7 +110,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ]
+        ] + index_validation_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

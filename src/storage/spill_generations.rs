@@ -1530,6 +1530,115 @@ mod tests {
     }
 
     #[test]
+    fn index_validation_sources_keep_latest_saved_and_own_pending_rows_after_retirement() {
+        use super::super::RowState;
+        use super::super::row_images::VisibleRowBytes;
+        use crate::sql::types::Datum;
+        use core::ops::ControlFlow;
+        let PointFixture {
+            mut storage,
+            table,
+            roots,
+            arena,
+            path,
+        } = point_fixture("index-validation-sources");
+        let registry = Arc::clone(&storage.spill_roots);
+        let mut retained = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            let command = storage.read_snapshot();
+            let commit = storage.commit_snapshot();
+            for (rowid, value) in [(3, 30), (4, 40), (5, 50)] {
+                let location = storage.heap.append_row(&[Datum::Int4(value)]).unwrap();
+                storage.tables[table]
+                    .rows
+                    .insert(rowid, RowState::committed_only_at(location, 11))
+                    .unwrap();
+            }
+            let pending = storage.heap.append_row(&[Datum::Int4(55)]).unwrap();
+            let own = storage
+                .write_pending(table, 3, 11, 9, Some(pending))
+                .unwrap();
+            let foreign = storage
+                .write_pending(table, 4, 12, 9, Some(pending))
+                .unwrap();
+            let deleted = storage.write_pending(table, 5, 11, 9, None).unwrap();
+            storage.set_read_snapshot(1);
+            storage.set_commit_snapshot(7);
+            let scan = storage.index_validation_scan_in(table, 11, &arena).unwrap();
+            assert_eq!(storage.read_snapshot(), 1);
+            assert_eq!(storage.commit_snapshot(), 7);
+            assert!(
+                scan.for_each_home(&mut |_, _| {
+                    assert!(storage.row_versions.test_write().is_ok());
+                    assert!(storage.tables[table].rows.test_write().is_ok());
+                    Ok(ControlFlow::Break(()))
+                })
+                .unwrap()
+                .is_break()
+            );
+            assert_eq!(
+                scan.for_each_home(&mut |_, _| Err(sql_err!(
+                    sqlstate::QUERY_CANCELED,
+                    "cancel index validation"
+                )))
+                .unwrap_err()
+                .sqlstate,
+                sqlstate::QUERY_CANCELED
+            );
+            storage.restore_pending(table, 3, 11, own);
+            storage.restore_pending(table, 4, 12, foreign);
+            storage.restore_pending(table, 5, 11, deleted);
+            storage.commit_drop(table);
+            assert_eq!(
+                storage
+                    .create_table(make_def(
+                        "index_replacement",
+                        &[("id", ColType::Text, true)]
+                    ))
+                    .unwrap(),
+                table
+            );
+            storage.set_spill_list(table, &[roots[2]]);
+            storage.set_read_snapshot(command);
+            storage.set_commit_snapshot(commit);
+            drop(storage);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert_eq!(retained.len(), 2);
+            assert!(retained.contains(&roots[0]) && retained.contains(&roots[1]));
+            let mut found = [(0, 0); 3];
+            let mut count = 0;
+            assert!(
+                scan.for_each_home(&mut |rowid, home| {
+                    let mut decode = |bytes: &[u8]| {
+                        let mut values = [Datum::Null];
+                        crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                        let Datum::Int4(value) = values[0] else {
+                            panic!("integer fixture")
+                        };
+                        found[count] = (rowid, value);
+                        count += 1;
+                        Ok(())
+                    };
+                    match home.bytes {
+                        VisibleRowBytes::Heap(bytes) => decode(&bytes)?,
+                        VisibleRowBytes::Spilled(source) => source.with_bytes(decode)?,
+                    }
+                    Ok(ControlFlow::Continue(()))
+                })
+                .unwrap()
+                .is_continue()
+            );
+            assert_eq!(count, 3);
+            found.sort_unstable();
+            assert_eq!(found, [(1, 88), (3, 55), (4, 40)]);
+            drop(scan);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert!(retained.is_empty());
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn captured_resident_byte_scans_keep_mixed_saved_versions_after_retirement() {
         use super::super::row_images::VisibleRowBytes;
         use super::super::{RowHome, RowLoc, RowState};

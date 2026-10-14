@@ -53472,6 +53472,362 @@ fn bool_aggregates() {
 }
 
 #[test]
+fn index_validation_checks_own_changes_and_cleans_failed_catalog_entries_through_cold_recovery() {
+    let mut config = test_config("owned-index-validation");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("owned-index-validation-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE validation_orders(id integer, label text, active boolean); \
+         INSERT INTO validation_orders VALUES (1, 'one', true), (2, 'two', false)",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for (change, definition) in [
+        (
+            "INSERT INTO validation_orders VALUES (3, 'fresh', true), (4, 'fresh', true)",
+            "(label)",
+        ),
+        (
+            "UPDATE validation_orders SET label = 'one' WHERE id = 2",
+            "(label)",
+        ),
+        (
+            "INSERT INTO validation_orders VALUES (3, 'ONE', true)",
+            "(lower(label)) WHERE active",
+        ),
+        (
+            "INSERT INTO validation_orders VALUES (3, NULL, true), (4, NULL, true)",
+            "(label) NULLS NOT DISTINCT",
+        ),
+    ] {
+        session.success(&mut engine, "BEGIN; SAVEPOINT before_index", true);
+        session.success(&mut engine, change, true);
+        let output = session.execute(
+            &mut engine,
+            &format!("CREATE UNIQUE INDEX validated_label ON validation_orders {definition}"),
+            true,
+        );
+        assert!(
+            output.windows(5).any(|field| field == b"23505"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        session.success(&mut engine, "ROLLBACK TO SAVEPOINT before_index", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_indexes WHERE indexname = 'validated_label'",
+                true
+            )),
+            ["0"]
+        );
+        session.success(
+            &mut engine,
+            "CREATE UNIQUE INDEX validated_label ON validation_orders(label); ROLLBACK",
+            true,
+        );
+    }
+    session.success(&mut engine,
+        "BEGIN; DELETE FROM validation_orders WHERE id = 1; \
+         UPDATE validation_orders SET label = 'one', active = true WHERE id = 2; \
+         INSERT INTO validation_orders VALUES (3, 'three', true); \
+         CREATE UNIQUE INDEX validated_label ON validation_orders(lower(label)) WHERE active; COMMIT", true);
+    let duplicate = session.execute(
+        &mut engine,
+        "INSERT INTO validation_orders VALUES (4, 'ONE', true)",
+        true,
+    );
+    assert!(duplicate.windows(5).any(|field| field == b"23505"));
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut rows =
+        data_rows(&session.success(&mut engine, "SELECT id, label FROM validation_orders", true));
+    // Sort fixture output outside the guard: simulator uploads own growing vectors.
+    rows.sort_unstable();
+    assert_eq!(rows, ["2|one", "3|three"]);
+    let duplicate = session.execute(
+        &mut engine,
+        "INSERT INTO validation_orders VALUES (4, 'ONE', true)",
+        true,
+    );
+    assert!(duplicate.windows(5).any(|field| field == b"23505"));
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_reentry() {
+    let mut config = test_config("owned-unique-cache-keys");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.value_index_rows = 1;
+    config.object_store_bucket = format!("owned-unique-cache-keys-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE reuse_keys(id integer, label text COLLATE \"C\"); \
+         INSERT INTO reuse_keys VALUES (1, 'one'), (2, 'two'); \
+         CREATE UNIQUE INDEX reuse_label ON reuse_keys(label)",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let table = engine.storage.find_table("public", "reuse_keys").unwrap();
+    assert!(!engine.storage.value_cache_complete(table, &[1]));
+    assert!(engine.storage.value_durable_complete(table, &[1]));
+    session.success(
+        &mut engine,
+        "UPDATE reuse_keys SET label = 'released' WHERE id = 1",
+        true,
+    );
+    let (rowid, location) = engine
+        .storage
+        .table(table)
+        .rows
+        .iter()
+        .find_map(|(rowid, state)| match state.committed {
+            Some(crate::storage::RowHome::Heap(location)) => Some((rowid, location)),
+            _ => None,
+        })
+        .unwrap();
+    let start = std::sync::atomic::AtomicBool::new(false);
+    let completed = std::sync::atomic::AtomicBool::new(false);
+    let mut progressed = false;
+    std::thread::scope(|scope| {
+        use std::sync::atomic::Ordering;
+        let storage = &engine.storage;
+        let start = &start;
+        let completed = &completed;
+        let writer = scope.spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !start.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            if !start.load(Ordering::Acquire) {
+                return;
+            }
+            crate::mem::guard::forbid_alloc(|| {
+                let undo = storage
+                    .write_pending(table, rowid, 99, 1, Some(location))
+                    .unwrap();
+                storage.restore_pending(table, rowid, 99, undo);
+                completed.store(true, Ordering::Release);
+            });
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            let hash = crate::sql::eval::hash_key_collated(
+                &[Datum::Int4(1), Datum::Text("released")],
+                &[1],
+                &[storage.table_def(table, 0).columns[1].collation],
+            );
+            let mut visits = 0;
+            assert!(
+                storage
+                    .probe_value(table, &[1], hash, |candidate, encoded| {
+                        assert_eq!(candidate, rowid);
+                        assert!(encoded.is_some());
+                        visits += 1;
+                        start.store(true, Ordering::Release);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        while !completed.load(Ordering::Acquire)
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::yield_now();
+                        }
+                        progressed = completed.load(Ordering::Acquire);
+                        Ok(())
+                    })
+                    .unwrap()
+            );
+            assert_eq!(visits, 1);
+        });
+        writer.join().unwrap();
+    });
+    assert!(
+        progressed,
+        "a pending writer must progress while a durable-index delta callback waits"
+    );
+    session.success(
+        &mut engine,
+        "UPDATE reuse_keys SET label = 'one' WHERE id = 1",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; SAVEPOINT before_reuse; UPDATE reuse_keys SET label = 'released' WHERE id = 1; \
+         INSERT INTO reuse_keys VALUES (3, 'one'); ROLLBACK TO SAVEPOINT before_reuse; \
+         DELETE FROM reuse_keys WHERE id = 1; INSERT INTO reuse_keys VALUES (3, 'one'); COMMIT",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut rows =
+        data_rows(&session.success(&mut engine, "SELECT id, label FROM reuse_keys", true));
+    // Sort fixture output outside the guard: simulator uploads own growing vectors.
+    rows.sort_unstable();
+    assert_eq!(rows, ["2|two", "3|one"]);
+    let duplicate = session.execute(
+        &mut engine,
+        "INSERT INTO reuse_keys VALUES (4, 'one')",
+        true,
+    );
+    assert!(duplicate.windows(5).any(|field| field == b"23505"));
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn index_validation_uses_current_commits_without_changing_repeatable_read_visibility() {
+    let (mut engine, mut budget) = test_engine();
+    let mut reader = TxnState::new(&mut budget, 256).unwrap();
+    let mut writer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE TABLE validation_current(id integer, value integer); INSERT INTO validation_current VALUES (1, 10), (2, 20)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT value FROM validation_current ORDER BY id"
+        )),
+        ["10", "20"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "UPDATE validation_current SET value = 10 WHERE id = 2",
+    );
+    let duplicate = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "SAVEPOINT before_validation; CREATE UNIQUE INDEX validation_current_key ON validation_current(value)",
+    );
+    assert!(duplicate.contains("23505"), "{duplicate}");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "ROLLBACK TO SAVEPOINT before_validation",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT value FROM validation_current ORDER BY id"
+        )),
+        ["10", "20"]
+    );
+    run_txn(&mut engine, &mut budget, &mut reader, "ROLLBACK");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "UPDATE validation_current SET value = 30 WHERE id = 2",
+    );
+    let created = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE UNIQUE INDEX validation_current_key ON validation_current(value)",
+    );
+    assert!(created.contains("CREATE INDEX"), "{created}");
+}
+
+#[test]
+fn index_validation_arena_exhaustion_preserves_rows_catalog_and_retry() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE validation_capacity(id integer); INSERT INTO validation_capacity SELECT i FROM generate_series(1, 256) AS g(i)",
+    );
+    let limited = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX validation_capacity_key ON validation_capacity(id)",
+        4096,
+    );
+    assert!(
+        limited.windows(5).any(|field| field == b"54000"),
+        "{}",
+        String::from_utf8_lossy(&limited)
+    );
+    assert!(
+        !command_tags(&limited)
+            .iter()
+            .any(|tag| tag == "CREATE INDEX")
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*), sum(id) FROM validation_capacity; SELECT count(*) FROM pg_indexes WHERE indexname = 'validation_capacity_key'",
+            4 << 20
+        )),
+        ["256|32896", "0"]
+    );
+    let retry = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE INDEX validation_capacity_key ON validation_capacity(id)",
+        4 << 20,
+    );
+    assert_eq!(command_tags(&retry), ["CREATE INDEX"]);
+}
+
+#[test]
 fn create_index_and_unique() {
     // Validated against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();

@@ -229,6 +229,7 @@ impl Storage {
         Ok(scan)
     }
 
+    #[cfg(test)]
     pub(crate) fn row_scan_in<'scan>(
         &'scan self,
         table_slot: usize,
@@ -370,6 +371,7 @@ impl RowScan<'_> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn for_each_spilled_row_batch<'arena, 'callback>(
         &self,
         arena: &'arena crate::mem::arena::Arena,

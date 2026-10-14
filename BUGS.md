@@ -4,11 +4,11 @@ This file records only defects whose repair is prevented by an external blocker
 or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
-The export-reader review on 2026-10-14 covers `COPY TO` source and schema
-retention, relation-kind and descendant boundaries, nested saved-row callbacks, pending
-partition changes, statement deadlines, cancellation, fixed-arena exhaustion,
-retry, and recovery.
-Remaining metadata-walk and executor lifetime work is tracked in PLAN.md.
+The index-reader review covers original byte ownership, current committed
+rows, earlier transaction writes, duplicate and NULL-key checks, savepoint
+rollback, reuse of keys after own updates/deletes, durable index probes,
+fixed-arena exhaustion, retry, and cold recovery. Remaining
+metadata-walk and executor lifetime work is tracked in PLAN.md.
 No known defects meet this file's inclusion criteria. This does not mean all
 planned work is finished or that every possible bug has been ruled out.
 Resolved investigations are indexed in [history](docs/history/README.md).

@@ -37,7 +37,18 @@ jobs:
       - run: cargo clean -p pos3ql
       - run: cargo clippy --all-targets --locked -- -D warnings
       - name: Enum rewrite ownership, failure cleanup, and recovery
-        run: cargo test --lib --locked owned_enum_rewrite_sources -- --nocapture
+        run: cargo test --lib --locked owned_enum_rewrite_sources -- --nocapture 2>&1 | tee "$RUNNER_TEMP/deferred-ownership.log"
+      - name: Resolve allocation failure stack
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, subprocess
+          log = pathlib.Path(os.environ['RUNNER_TEMP']) / 'deferred-ownership.log'
+          if log.exists():
+              frames = re.findall(r'(\S*/target/debug/deps/pos3ql-[0-9a-f]+)\(\+(0x[0-9a-f]+)\)', log.read_text())
+              for binary, address in frames:
+                  subprocess.run(['addr2line', '-C', '-f', '-i', '-e', binary, address], check=True)
+          PY
       - name: Enum ordering and rollback
         run: cargo test --lib --locked enum_float4_renumbering_and_new_value_safety -- --nocapture
       - name: MERGE selected bytes, partition moves, and failure cleanup

@@ -97,6 +97,9 @@ implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
 SQL and wire behavior needs comparison with actual PostgreSQL, including
 SQLSTATEs, types, result shape, and values.
+Use the same relation kind on both sides when checking accepted commands. For
+example, a PostgreSQL plain table cannot establish whether a command is accepted
+on a foreign table; use a PostgreSQL foreign table for that boundary.
 
 The object-store simulator models remote storage with growing fixture vectors.
 Keep simulator uploads outside allocation-forbidden scopes when checking client

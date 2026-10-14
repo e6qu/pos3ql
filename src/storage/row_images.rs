@@ -59,7 +59,7 @@ impl<'arena> TableRowSnapshot<'arena> {
     ) -> Result<Self, SqlError> {
         Ok(Self {
             created_at: image.created_at,
-            table_slot: image.table_slot,
+            table_slot: image.table_slot(),
             heap: retain_heap.then(|| storage.heap.retain_allocation()),
             roots: CapturedSpillRoots::capture(storage, image, generations, arena)?,
             pool: Arc::clone(&storage.query_roots),

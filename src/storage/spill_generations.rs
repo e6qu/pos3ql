@@ -776,6 +776,10 @@ struct SpillGenerationMetadata {
 }
 
 impl SpillGenerationImage {
+    pub(super) fn table_slot(&self) -> usize {
+        self.table_slot
+    }
+
     fn metadata(&self) -> SpillGenerationMetadata {
         SpillGenerationMetadata {
             persistence: self.persistence,

@@ -30271,7 +30271,7 @@ impl Storage {
         self.capture_row_partition(table_slot, u64::MAX, |image, generations, rows| {
             let heap = rows.iter().any(|(_, state)| {
                 matches!(state.committed, Some(RowHome::Heap(_)))
-                    || !state.pending.is_empty()
+                    || state.pending.len() != 0
                     || !state.history.is_empty()
             });
             TableRowSnapshot::capture(self, image, generations, heap, arena)

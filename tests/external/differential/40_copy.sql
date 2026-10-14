@@ -93,6 +93,7 @@ CREATE TABLE copy_export_low PARTITION OF copy_export_parent FOR VALUES FROM (0)
 CREATE TABLE copy_export_middle PARTITION OF copy_export_parent FOR VALUES FROM (10) TO (20);
 CREATE TABLE copy_export_other PARTITION OF copy_export_parent DEFAULT;
 INSERT INTO copy_export_parent VALUES (1, 'low'), (11, 'middle'), (21, 'other, saved');
+COPY copy_export_parent TO STDOUT;
 BEGIN;
 SAVEPOINT export_changes;
 UPDATE copy_export_parent SET id = 2, note = 'moved' WHERE id = 11;
@@ -113,9 +114,40 @@ ALTER TABLE copy_export_parent ENABLE ROW LEVEL SECURITY;
 CREATE POLICY copy_export_visible ON copy_export_parent USING (id >= 20);
 SET ROLE copy_export_reader;
 COPY copy_export_parent TO STDOUT;
+COPY (SELECT * FROM copy_export_parent ORDER BY id) TO STDOUT;
 RESET ROLE;
 DROP TABLE copy_export_parent;
 DROP ROLE copy_export_reader;
+
+CREATE TABLE copy_inherited (id integer);
+CREATE TABLE copy_inherited_child (note text) INHERITS (copy_inherited);
+INSERT INTO copy_inherited VALUES (7);
+INSERT INTO copy_inherited_child VALUES (8, 'child');
+COPY copy_inherited TO STDOUT;
+COPY (SELECT id FROM copy_inherited ORDER BY id) TO STDOUT;
+DROP TABLE copy_inherited CASCADE;
+
+CREATE VIEW copy_export_view AS SELECT a, b FROM copy_basic;
+CREATE MATERIALIZED VIEW copy_export_saved AS SELECT a, b FROM copy_basic;
+CREATE MATERIALIZED VIEW copy_export_empty AS SELECT a, b FROM copy_basic WITH NO DATA;
+CREATE SEQUENCE copy_export_sequence;
+CREATE INDEX copy_export_index ON copy_basic(a);
+COPY copy_export_view TO STDOUT;
+COPY copy_export_sequence TO STDOUT;
+COPY copy_export_index TO STDOUT;
+COPY copy_export_empty TO STDOUT;
+COPY copy_export_saved TO STDOUT;
+CREATE ROLE copy_column_reader;
+GRANT SELECT (a) ON copy_export_view TO copy_column_reader;
+SET ROLE copy_column_reader;
+COPY copy_export_view TO STDOUT;
+COPY copy_export_view (a) TO STDOUT;
+COPY copy_export_view (missing) TO STDOUT;
+RESET ROLE;
+DROP VIEW copy_export_view;
+DROP MATERIALIZED VIEW copy_export_saved, copy_export_empty;
+DROP SEQUENCE copy_export_sequence;
+DROP ROLE copy_column_reader;
 
 DROP TABLE copy_basic;
 DROP TABLE copy_echo;

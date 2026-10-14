@@ -23255,7 +23255,7 @@ fn partitioned_catalog_relations_expose_parent_and_leaf_identity() {
 }
 
 #[test]
-fn owned_copy_to_sources_preserve_partition_order_pending_rows_and_cold_recovery() {
+fn owned_copy_to_sources_preserve_saved_leaf_rows_pending_changes_and_cold_recovery() {
     let mut config = test_config("owned-copy-export");
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -23287,7 +23287,11 @@ fn owned_copy_to_sources_preserve_partition_order_pending_rows_and_cold_recovery
         assert!(!engine.storage.table(slot).spill_generations().is_empty());
     }
     assert_eq!(
-        copy_data_rows(&session.success(&mut engine, "COPY export_orders TO STDOUT", true)),
+        copy_data_rows(&session.success(
+            &mut engine,
+            "COPY export_middle TO STDOUT; COPY export_low TO STDOUT; COPY export_other TO STDOUT",
+            true
+        )),
         ["15\tmiddle", "2\tlow\\trow", "30\tfar, saved"]
     );
     session.success(
@@ -23301,32 +23305,36 @@ fn owned_copy_to_sources_preserve_partition_order_pending_rows_and_cold_recovery
     assert_eq!(
         copy_data_rows(&session.success(
             &mut engine,
-            "COPY export_orders TO STDOUT (FORMAT csv, HEADER true)",
+            "COPY export_low TO STDOUT (FORMAT csv, HEADER true); COPY export_other TO STDOUT (FORMAT csv)",
             true
         )),
-        ["id,note", "30,\"far, saved\"", "3,moved", "31,added"]
+        ["id,note", "3,moved", "30,\"far, saved\"", "31,added"]
     );
     assert_eq!(
         copy_data_rows(&session.success(
             &mut engine,
-            "COPY export_orders (note, id) TO STDOUT",
+            "COPY export_low (note, id) TO STDOUT; COPY export_other (note, id) TO STDOUT",
             true
         )),
-        ["far, saved\t30", "moved\t3", "added\t31"]
+        ["moved\t3", "far, saved\t30", "added\t31"]
     );
     let binary = session.success(
         &mut engine,
-        "COPY export_orders TO STDOUT (FORMAT binary)",
+        "COPY export_other TO STDOUT (FORMAT binary)",
         true,
     );
-    assert_eq!(command_tags(&binary), ["COPY 3"]);
+    assert_eq!(command_tags(&binary), ["COPY 2"]);
     session.success(
         &mut engine,
         "ROLLBACK TO SAVEPOINT before_export_changes; COMMIT",
         true,
     );
     assert_eq!(
-        copy_data_rows(&session.success(&mut engine, "COPY export_orders TO STDOUT", true)),
+        copy_data_rows(&session.success(
+            &mut engine,
+            "COPY export_middle TO STDOUT; COPY export_low TO STDOUT; COPY export_other TO STDOUT",
+            true
+        )),
         ["15\tmiddle", "2\tlow\\trow", "30\tfar, saved"]
     );
     session.success(
@@ -23335,7 +23343,11 @@ fn owned_copy_to_sources_preserve_partition_order_pending_rows_and_cold_recovery
         true,
     );
     assert_eq!(
-        copy_data_rows(&session.success(&mut engine, "COPY export_orders TO STDOUT", true)),
+        copy_data_rows(&session.success(
+            &mut engine,
+            "COPY export_middle TO STDOUT; COPY export_low TO STDOUT; COPY export_other TO STDOUT",
+            true
+        )),
         ["15\tcommitted", "2\tlow\\trow", "30\tfar, saved"]
     );
     assert!(engine.checkpoint().unwrap());
@@ -23348,7 +23360,7 @@ fn owned_copy_to_sources_preserve_partition_order_pending_rows_and_cold_recovery
         copy_data_rows(&run_with_fixed_memory(
             &mut engine,
             &budget,
-            "COPY export_orders TO STDOUT",
+            "COPY export_middle TO STDOUT; COPY export_low TO STDOUT; COPY export_other TO STDOUT",
             4 << 20
         )),
         ["15\tcommitted", "2\tlow\\trow", "30\tfar, saved"]
@@ -23408,7 +23420,59 @@ fn owned_copy_to_arena_exhaustion_preserves_rows_and_releases_sources_for_retry(
 }
 
 #[test]
-fn copy_to_partitioned_parent_scans_every_leaf() {
+fn copy_to_relation_kinds_and_column_privileges_fail_before_streaming() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copy_kind_rows (id integer, note text); \
+         INSERT INTO copy_kind_rows VALUES (7, 'saved'); \
+         CREATE VIEW copy_kind_view AS SELECT * FROM copy_kind_rows; \
+         CREATE SEQUENCE copy_kind_sequence; CREATE INDEX copy_kind_index ON copy_kind_rows(id); \
+         CREATE MATERIALIZED VIEW copy_kind_saved AS SELECT * FROM copy_kind_rows; \
+         CREATE MATERIALIZED VIEW copy_kind_empty AS SELECT * FROM copy_kind_rows WITH NO DATA; \
+         CREATE ROLE copy_kind_reader; GRANT SELECT (id) ON copy_kind_view TO copy_kind_reader",
+    );
+    assert!(!message_types(&setup).contains(&b'E'));
+    for (statement, state) in [
+        ("COPY copy_kind_view TO STDOUT", "42809"),
+        ("COPY copy_kind_sequence TO STDOUT", "42809"),
+        ("COPY copy_kind_index TO STDOUT", "42809"),
+        ("COPY copy_kind_empty TO STDOUT", "0A000"),
+        (
+            "SET ROLE copy_kind_reader; COPY copy_kind_view TO STDOUT",
+            "42501",
+        ),
+        (
+            "SET ROLE copy_kind_reader; COPY copy_kind_view (id) TO STDOUT",
+            "42809",
+        ),
+        (
+            "SET ROLE copy_kind_reader; COPY copy_kind_view (missing) TO STDOUT",
+            "42703",
+        ),
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains(state),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(!message_types(&output).contains(&b'H'));
+    }
+    run_with(&mut engine, &mut budget, "RESET ROLE");
+    assert_eq!(
+        copy_data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "COPY copy_kind_saved TO STDOUT"
+        )),
+        ["7\tsaved"]
+    );
+}
+
+#[test]
+fn copy_to_named_relation_matches_partition_and_inheritance_boundaries() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
@@ -23419,8 +23483,39 @@ fn copy_to_partitioned_parent_scans_every_leaf() {
          INSERT INTO copy_parent VALUES (1), (20)",
     );
     let output = run_with(&mut engine, &mut budget, "COPY copy_parent TO STDOUT");
-    let text = String::from_utf8_lossy(&output);
-    assert!(text.contains("1\n") && text.contains("20\n"), "{text}");
+    assert!(String::from_utf8_lossy(&output).contains("42809"));
+    assert!(!message_types(&output).contains(&b'H'));
+    assert_eq!(
+        copy_data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "COPY (SELECT * FROM copy_parent ORDER BY id) TO STDOUT"
+        )),
+        ["1", "20"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE copy_inherited (id integer); \
+         CREATE TABLE copy_child (note text) INHERITS (copy_inherited); \
+         INSERT INTO copy_inherited VALUES (7); INSERT INTO copy_child VALUES (8, 'child')",
+    );
+    assert_eq!(
+        copy_data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "COPY copy_inherited TO STDOUT"
+        )),
+        ["7"]
+    );
+    assert_eq!(
+        copy_data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "COPY (SELECT id FROM copy_inherited ORDER BY id) TO STDOUT"
+        )),
+        ["7", "8"]
+    );
 }
 
 #[test]
@@ -62736,7 +62831,15 @@ fn table_inheritance_is_durable_typed_and_visible_to_parent_dml() {
             &mut budget,
             "COPY inheritance_parent_rows TO STDOUT",
         )),
-        ["2\tparent", "1\tchild"]
+        ["2\tparent"]
+    );
+    assert_eq!(
+        copy_data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "COPY (SELECT id, payload FROM inheritance_parent_rows ORDER BY id) TO STDOUT"
+        )),
+        ["1\tchild", "2\tparent"]
     );
     let output = run_with(
         &mut engine,

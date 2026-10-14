@@ -5,7 +5,7 @@ or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 The export-reader review on 2026-10-14 covers `COPY TO` source and schema
-retention, partial owner initialization, nested saved-row callbacks, pending
+retention, relation-kind and descendant boundaries, nested saved-row callbacks, pending
 partition changes, statement deadlines, cancellation, fixed-arena exhaustion,
 retry, and recovery.
 Remaining metadata-walk and executor lifetime work is tracked in PLAN.md.

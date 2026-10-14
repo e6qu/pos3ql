@@ -19,7 +19,6 @@ mod row_map;
 mod row_publication;
 mod row_reads;
 mod row_scans;
-pub(crate) use row_scans::CapturedRowScan;
 mod row_versions;
 mod row_walks;
 pub(crate) mod rowenc;

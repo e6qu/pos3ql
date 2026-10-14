@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo clippy --all-targets --locked -- -D warnings
-          for filter in copy_ arena_owned_slices captured_resident_byte_scans captured_saved_verdict_conversion owned_ordered startup \
+          for filter in copy_ table_inheritance_is_durable_typed_and_visible_to_parent_dml captured_resident_byte_scans captured_saved_verdict_conversion owned_ordered startup \
             external_windows_spill_through_the_provider_neutral_block_store wide_join_trees_execute_without_allocation; do
             cargo test --lib --locked "$filter" -- --nocapture --test-threads=2
           done
@@ -61,7 +61,7 @@ jobs:
           FAST_CORPUS_ONLY: 40_copy
         run: bash tests/external/ci_diff.sh
 
-  scoped-owners:
+  row-source-tags:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -70,5 +70,4 @@ jobs:
         with:
           components: miri
       - run: cargo miri setup
-      - run: cargo miri test --lib --locked arena_owned_slices -- --test-threads=1
       - run: cargo miri test --lib --locked owned_ordered_source_tags -- --test-threads=1

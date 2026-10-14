@@ -25,8 +25,6 @@ jobs:
         run: cargo miri test --lib --locked shared_heap_append -- --test-threads=1
       - name: Ordered row source pointer provenance
         run: cargo miri test --lib --locked owned_ordered_source_tags -- --test-threads=1
-      - name: Scoped statement owner initialization and release
-        run: cargo miri test --lib --locked arena_owned_slices -- --test-threads=1
 
   release-package:
     runs-on: ubuntu-latest

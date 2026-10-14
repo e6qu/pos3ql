@@ -39,9 +39,9 @@ machine do not establish production availability or speed.
 - Protecting a reader's selected data and releasing it at the right time is
   necessary before allowing concurrent writes. A running statement, a
   transaction, and a streaming upload can keep data alive for different periods.
-- Adding a constraint or changing a default should preserve existing rows
-  when their stored representation is unchanged. The recent ALTER fix does this
-  and still checks uniqueness against existing and transaction-modified rows.
+- Comparing exports with PostgreSQL exposed a wrong assumption about child
+  tables. A table-form export reads only its named relation; the query form
+  selects a complete partition or inheritance tree.
 - A safe storage layout needs to keep older versions until every reader and
   backup has finished with them. Copying only today's logical rows is not
   sufficient when an older transaction still needs historical object data.
@@ -65,7 +65,7 @@ sequential SQL byte scans, sorted row records, enum rewrites, and MERGE target c
 their original data without later version-chain lookups. Captured row identity
 lists own their startup buffers. Shared statistics and journal acknowledgements
 also retain the exact state they captured.
-`COPY TO` retains its partition sources and schemas before ordering export rows;
+`COPY TO` retains its named table's source and schema before ordering export rows;
 output fetches those original bytes instead of rechecking version numbers.
 
 The [implementation guide](docs/implemented-baseline.md) owns the detailed
@@ -76,8 +76,8 @@ Still to do:
 - Complete reader protection for authoritative metadata walks and remaining
   executor reads that retain only a version stamp. Sequential SQL byte scans
   and `COPY TO` now capture resident version choices before fetching bytes and
-  keep their original heap and saved files. Metadata walks still consult live row state;
-  their retirement and update rules need coordination.
+  keep their original heap and saved files. Metadata walks still consult live
+  row state; their retirement and update rules need coordination.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.
 - Integrate bounded heap relocation with concurrent table publication and

@@ -598,33 +598,22 @@ mod tests {
             roots: CapturedSpillRoots::Empty,
             pool,
         };
-        let mut arena_budget = Budget::new(512);
-        let arena =
-            crate::mem::arena::Arena::new(&mut arena_budget, "owned source tags", 512).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let mut owners = arena.alloc_owned_slice(1).unwrap();
-            assert!(owners.push(source).is_ok());
-            let moved = owners;
-            let source = &moved[0];
             for kind in [
                 OrderedVersionKind::PendingHeap,
                 OrderedVersionKind::CommittedHeap,
                 OrderedVersionKind::CommittedSpilled,
             ] {
-                let tagged = OrderedRowSource::new(source, kind);
+                let tagged = OrderedRowSource::new(&source, kind);
                 let copied = tagged;
                 assert_eq!(copied.kind(), kind);
-                assert!(core::ptr::eq(copied.owner(), source));
+                assert!(core::ptr::eq(copied.owner(), &source));
                 assert_eq!(copied.owner().created_at, u64::MAX);
                 assert_eq!(copied.owner().table_slot, 17);
             }
             assert_eq!(
                 core::mem::size_of::<Option<OrderedRowSnapshot<'_, '_>>>(),
                 32
-            );
-            assert_eq!(
-                core::mem::size_of::<Option<(usize, OrderedRowSnapshot<'_, '_>)>>(),
-                40
             );
         });
     }

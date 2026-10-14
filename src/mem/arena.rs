@@ -2,14 +2,11 @@
 //! happens wholesale via `reset`. Backs per-request state (SQL ASTs,
 //! row scratch) that lives exactly as long as one request.
 //!
-//! Ordinary allocations hold `Copy` values. Scoped owned slices run their
-//! destructors before the arena can be reset.
+//! Values are restricted to `Copy` because the arena never runs
+//! destructors: `reset` just rewinds the offset.
 
 use core::cell::Cell;
 use core::fmt;
-use core::marker::PhantomData;
-use core::ops::Deref;
-use core::ptr::NonNull;
 use std::alloc::Layout;
 
 use super::budget::{Budget, BudgetError};
@@ -29,53 +26,6 @@ pub struct Arena {
 pub(crate) struct ArenaMark {
     arena: *const Arena,
     offset: usize,
-}
-
-/// Only initialized entries are exposed or dropped. The owner borrows its
-/// arena, and its stable tail storage survives front scratch rewinds.
-pub(crate) struct ArenaOwnedSlice<'arena, T> {
-    entries: NonNull<T>,
-    len: usize,
-    capacity: usize,
-    arena: PhantomData<&'arena Arena>,
-}
-
-impl<T> ArenaOwnedSlice<'_, T> {
-    pub(crate) fn push(&mut self, value: T) -> Result<(), T> {
-        if self.len == self.capacity {
-            return Err(value);
-        }
-        // SAFETY: reservation owns this uninitialized, aligned entry. The
-        // mutable owner borrow excludes references obtained through Deref.
-        unsafe {
-            self.entries.as_ptr().add(self.len).write(value);
-        }
-        self.len += 1;
-        Ok(())
-    }
-}
-
-impl<T> Deref for ArenaOwnedSlice<'_, T> {
-    type Target = [T];
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: push initializes precisely the prefix, which cannot change
-        // while this shared owner borrow is live.
-        unsafe { core::slice::from_raw_parts(self.entries.as_ptr(), self.len) }
-    }
-}
-
-impl<T> Drop for ArenaOwnedSlice<'_, T> {
-    fn drop(&mut self) {
-        // SAFETY: this owner drops its initialized prefix exactly once. Its
-        // arena borrow keeps storage alive and excludes reset until release.
-        unsafe {
-            core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
-                self.entries.as_ptr(),
-                self.len,
-            ));
-        }
-    }
 }
 
 // The arena owns its buffer; the raw pointer is not shared outside the
@@ -244,21 +194,6 @@ impl Arena {
             }
             Ok(core::slice::from_raw_parts_mut(ptr, len))
         }
-    }
-
-    pub(crate) fn alloc_owned_slice<T>(
-        &self,
-        capacity: usize,
-    ) -> Result<ArenaOwnedSlice<'_, T>, ArenaFull> {
-        let layout = Layout::array::<T>(capacity).map_err(|_| self.full(usize::MAX))?;
-        let entries = NonNull::new(self.alloc_raw_tail(layout)?.cast::<T>())
-            .expect("arena allocation is non-null");
-        Ok(ArenaOwnedSlice {
-            entries,
-            len: 0,
-            capacity,
-            arena: PhantomData,
-        })
     }
 
     /// Rewinds the arena. Requires `&mut self`, so the borrow checker
@@ -542,111 +477,6 @@ pub fn stable_sort_via<T>(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn arena_owned_slices_release_partial_initialization_and_rejected_entries() {
-        use std::sync::Arc;
-        let mut budget = Budget::new(256);
-        let arena = Arena::new(&mut budget, "owned partial", 256).unwrap();
-        let payload = Arc::new(());
-        fn failed_capture<'a>(
-            arena: &'a Arena,
-            payload: &Arc<()>,
-        ) -> Result<ArenaOwnedSlice<'a, Arc<()>>, ()> {
-            let mut owners = arena.alloc_owned_slice(4).map_err(|_| ())?;
-            for index in 0..4 {
-                if index == 2 {
-                    return Err(());
-                }
-                owners.push(Arc::clone(payload)).map_err(drop)?;
-            }
-            Ok(owners)
-        }
-        crate::mem::guard::forbid_alloc(|| {
-            assert!(failed_capture(&arena, &payload).is_err());
-            assert_eq!(Arc::strong_count(&payload), 1);
-            let mut owners = arena.alloc_owned_slice(2).unwrap();
-            owners.push(Arc::clone(&payload)).unwrap();
-            owners.push(Arc::clone(&payload)).unwrap();
-            let rejected = owners.push(Arc::clone(&payload)).unwrap_err();
-            assert_eq!(Arc::strong_count(&payload), 4);
-            drop(rejected);
-            assert_eq!(owners.len(), 2);
-            drop(owners);
-            assert_eq!(Arc::strong_count(&payload), 1);
-        });
-    }
-
-    #[test]
-    fn arena_owned_slices_survive_front_rewinds_and_owner_moves() {
-        use std::sync::Arc;
-        let mut budget = Budget::new(256);
-        let mut arena = Arena::new(&mut budget, "owned stable", 256).unwrap();
-        let payload = Arc::new(41u64);
-        crate::mem::guard::forbid_alloc(|| {
-            let mark = arena.mark();
-            let mut owners = arena.alloc_owned_slice(1).unwrap();
-            owners.push(Arc::clone(&payload)).unwrap();
-            let address = owners.as_ptr();
-            let moved = owners;
-            arena.alloc([0u8; 128]).unwrap();
-            // SAFETY: the front allocation is no longer used. Owned entries
-            // occupy the tail and cannot be overwritten by this rewind.
-            unsafe {
-                arena.rewind_to(mark);
-            }
-            arena.alloc([7u8; 128]).unwrap();
-            assert_eq!(moved.as_ptr(), address);
-            assert_eq!(*moved[0], 41);
-            assert_eq!(Arc::strong_count(&payload), 2);
-            drop(moved);
-            assert_eq!(Arc::strong_count(&payload), 1);
-        });
-        arena.reset();
-        assert_eq!(arena.used(), 0);
-    }
-
-    #[test]
-    fn arena_owned_slices_exhaustion_empty_and_zero_sized_drops_are_exact() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static DROPS: AtomicUsize = AtomicUsize::new(0);
-        struct EmptyOwner;
-        impl Drop for EmptyOwner {
-            fn drop(&mut self) {
-                DROPS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        let mut budget = Budget::new(32);
-        let arena = Arena::new(&mut budget, "owned small", 32).unwrap();
-        crate::mem::guard::forbid_alloc(|| {
-            let used = arena.used();
-            assert_eq!(
-                arena
-                    .alloc_owned_slice::<u64>(usize::MAX)
-                    .err()
-                    .unwrap()
-                    .what,
-                "owned small"
-            );
-            assert_eq!(
-                arena.alloc_owned_slice::<u64>(5).err().unwrap().requested,
-                40
-            );
-            assert_eq!(arena.used(), used);
-            let mut empty = arena.alloc_owned_slice::<EmptyOwner>(0).unwrap();
-            assert!(empty.is_empty());
-            assert!(empty.push(EmptyOwner).is_err());
-            drop(empty);
-            assert_eq!(DROPS.load(Ordering::Relaxed), 1);
-            let mut owners = arena.alloc_owned_slice(4).unwrap();
-            for _ in 0..4 {
-                assert!(owners.push(EmptyOwner).is_ok());
-            }
-            drop(owners);
-            assert_eq!(DROPS.load(Ordering::Relaxed), 5);
-            assert_eq!(arena.used(), used);
-        });
-    }
-
     #[test]
     fn stable_sort_via_matches_the_standard_stable_sort() {
         // Duplicate keys in scrambled order: the arena-staged sort must keep

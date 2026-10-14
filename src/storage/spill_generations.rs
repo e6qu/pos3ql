@@ -1596,24 +1596,20 @@ mod tests {
             registry.copy_roots(false, &mut retained).unwrap();
             assert_eq!(retained.len(), 2);
             assert!(retained.contains(&roots[0]) && retained.contains(&roots[1]));
-            let mut scans = arena.alloc_owned_slice(3).unwrap();
-            assert!(scans.push(old).is_ok());
-            assert!(scans.push(current).is_ok());
-            assert!(scans.push(own).is_ok());
             for (scan, expected_overlay, expected_saved, expected_all) in [
                 (
-                    &scans[0],
+                    &old,
                     &[(1, 41), (3, 30)][..],
                     &[(2, 17)][..],
                     &[(1, 41), (2, 17), (3, 30)][..],
                 ),
                 (
-                    &scans[1],
+                    &current,
                     &[(1, 88), (3, 30)][..],
                     &[][..],
                     &[(1, 88), (3, 30)][..],
                 ),
-                (&scans[2], &[(1, 55)][..], &[][..], &[(1, 55)][..]),
+                (&own, &[(1, 55)][..], &[][..], &[(1, 55)][..]),
             ] {
                 let records = arena
                     .alloc_slice_with(expected_all.len(), |_| None)
@@ -1703,7 +1699,9 @@ mod tests {
                     assert_eq!(count, expected_saved.len());
                 }
             }
-            drop(scans);
+            drop(old);
+            drop(current);
+            drop(own);
             registry.copy_roots(false, &mut retained).unwrap();
             assert!(retained.is_empty());
         });

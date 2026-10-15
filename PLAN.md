@@ -71,7 +71,9 @@ also retain the exact state they captured.
 output fetches those original bytes instead of rechecking version numbers.
 Index validation captures current committed rows and all earlier writes by its
 creating transaction, while keeping ordinary transaction reads at their original
-snapshot. Its unread bytes keep their original owners.
+snapshot. Ordinary, copied, and generated partition indexes share creation and
+failure cleanup. Validation reuses its fixed buffer between rows and tables;
+unread bytes keep their original owners.
 ANALYZE retains original row sources and uses one current read position for base
 and extended statistics, restoring the caller's query snapshot on every exit.
 

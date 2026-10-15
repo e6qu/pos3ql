@@ -33717,6 +33717,19 @@ impl Storage {
         table_index: usize,
         txid: Option<u32>,
     ) -> Result<(), SqlError> {
+        let result = self.build_enforcers_visible(table_index, txid);
+        if result.is_err() {
+            // A partial population cannot advertise complete lookup results.
+            self.release_enforcers(table_index);
+        }
+        result
+    }
+
+    fn build_enforcers_visible(
+        &mut self,
+        table_index: usize,
+        txid: Option<u32>,
+    ) -> Result<(), SqlError> {
         let new_dirty_lsn = self.lsn.saturating_add(1);
         // DDL reshapes the cache slots, but an unchanged column tuple keeps
         // its manifest-published object generation.

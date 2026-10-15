@@ -53824,6 +53824,314 @@ fn bool_aggregates() {
 }
 
 #[test]
+fn partition_index_validation_checks_own_changes_rollback_and_cold_recovery() {
+    let mut config = test_config("partition-index-validation");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("partition-index-validation-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE partition_validation(bucket integer, label text, active boolean, divisor integer) \
+           PARTITION BY RANGE (bucket); \
+         CREATE TABLE partition_validation_low PARTITION OF partition_validation FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE partition_validation_high PARTITION OF partition_validation FOR VALUES FROM (10) TO (20); \
+         INSERT INTO partition_validation VALUES (1, 'one', true, 10), (1, 'two', false, 20), \
+                                                (11, 'eleven', true, 10), (11, 'twelve', true, 20)", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for (change, definition, error) in [
+        (
+            "INSERT INTO partition_validation VALUES (11, 'fresh', true, 30), (11, 'fresh', true, 40)",
+            "UNIQUE INDEX partition_validated ON partition_validation(bucket, label)",
+            "23505",
+        ),
+        (
+            "UPDATE partition_validation SET label = 'eleven' WHERE label = 'twelve'",
+            "UNIQUE INDEX partition_validated ON partition_validation(bucket, label)",
+            "23505",
+        ),
+        (
+            "INSERT INTO partition_validation VALUES (1, 'ONE', true, 30)",
+            "UNIQUE INDEX partition_validated ON partition_validation(bucket, lower(label)) WHERE active",
+            "23505",
+        ),
+        (
+            "INSERT INTO partition_validation VALUES (11, NULL, true, 30), (11, NULL, true, 40)",
+            "UNIQUE INDEX partition_validated ON partition_validation(bucket, label) NULLS NOT DISTINCT",
+            "23505",
+        ),
+        (
+            "UPDATE partition_validation SET divisor = 0 WHERE label = 'twelve'",
+            "INDEX partition_validated ON partition_validation(bucket, (100 / divisor))",
+            "22012",
+        ),
+    ] {
+        session.success(&mut engine, "BEGIN; SAVEPOINT before_partition_index", true);
+        session.success(&mut engine, change, true);
+        let output = session.execute(&mut engine, &format!("CREATE {definition}"), true);
+        assert!(
+            output.windows(5).any(|field| field == error.as_bytes()),
+            "{change}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        session.success(
+            &mut engine,
+            "ROLLBACK TO SAVEPOINT before_partition_index",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_indexes WHERE tablename IN \
+             ('partition_validation', 'partition_validation_low', 'partition_validation_high')",
+                true
+            )),
+            ["0"]
+        );
+        session.success(&mut engine,
+            "CREATE UNIQUE INDEX partition_validated ON partition_validation(bucket, label); ROLLBACK", true);
+    }
+    session.success(&mut engine,
+        "BEGIN; DELETE FROM partition_validation WHERE label = 'one'; \
+         UPDATE partition_validation SET label = 'one', active = true WHERE label = 'two'; \
+         INSERT INTO partition_validation VALUES (11, 'thirteen', true, 30); \
+         CREATE UNIQUE INDEX partition_validated ON partition_validation(bucket, lower(label)) WHERE active; COMMIT", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut rows = data_rows(&session.success(
+        &mut engine,
+        "SELECT bucket, label FROM partition_validation",
+        true,
+    ));
+    rows.sort_unstable();
+    assert_eq!(rows, ["11|eleven", "11|thirteen", "11|twelve", "1|one"]);
+    let duplicate = session.execute(
+        &mut engine,
+        "INSERT INTO partition_validation VALUES (11, 'ELEVEN', true, 40)",
+        true,
+    );
+    assert!(duplicate.windows(5).any(|field| field == b"23505"));
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM pg_indexes WHERE tablename IN \
+         ('partition_validation', 'partition_validation_low', 'partition_validation_high')",
+            true
+        )),
+        ["3"]
+    );
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn partition_index_validation_reclaims_sources_between_tables_in_a_fixed_arena() {
+    let config = test_config("partition-index-fixed-arena");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut setup = ConfiguredTransactionSession::new(&config, &mut budget);
+    setup.success(&mut engine,
+        "CREATE TABLE partition_capacity(bucket integer, value integer) PARTITION BY RANGE (bucket); \
+         CREATE TABLE partition_capacity_a PARTITION OF partition_capacity FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE partition_capacity_b PARTITION OF partition_capacity FOR VALUES FROM (10) TO (20); \
+         CREATE TABLE partition_capacity_c PARTITION OF partition_capacity FOR VALUES FROM (20) TO (30)", true);
+    for value in 0..256 {
+        setup.success(
+            &mut engine,
+            &format!(
+                "INSERT INTO partition_capacity VALUES (1, {value}), (11, {value}), (21, {value})"
+            ),
+            true,
+        );
+    }
+    let mut limited =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 16 << 10);
+    limited.success(&mut engine, "CREATE UNIQUE INDEX partition_capacity_key ON partition_capacity(bucket, (value + 1)) WHERE value >= 0", true);
+    assert_eq!(data_rows(&setup.success(&mut engine,
+        "SELECT count(*) FROM pg_indexes WHERE tablename IN \
+         ('partition_capacity', 'partition_capacity_a', 'partition_capacity_b', 'partition_capacity_c')", true)), ["4"]);
+    assert_eq!(
+        data_rows(&setup.success(
+            &mut engine,
+            "SELECT count(*), sum(value) FROM partition_capacity",
+            true
+        )),
+        ["768|97920"]
+    );
+}
+
+#[test]
+fn partition_index_validation_failed_undo_reservation_releases_every_child() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE partition_undo(bucket integer) PARTITION BY RANGE (bucket); \
+         CREATE TABLE partition_undo_low PARTITION OF partition_undo FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE partition_undo_high PARTITION OF partition_undo FOR VALUES FROM (10) TO (20); \
+         INSERT INTO partition_undo VALUES (1), (11)",
+    );
+    let failed = run_with_fixed_memory_and_ddl_capacity(
+        &mut engine,
+        &budget,
+        "CREATE INDEX partition_undo_key ON partition_undo(bucket)",
+        4 << 20,
+        1,
+    );
+    assert!(
+        failed.windows(5).any(|field| field == b"54000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*) FROM pg_indexes WHERE tablename IN \
+         ('partition_undo', 'partition_undo_low', 'partition_undo_high')",
+            4 << 20
+        )),
+        ["0"]
+    );
+    let retry = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE INDEX partition_undo_key ON partition_undo(bucket)",
+        4 << 20,
+    );
+    assert_eq!(command_tags(&retry), ["CREATE INDEX"]);
+}
+
+#[test]
+fn index_creation_cache_failure_releases_partial_bindings_and_preserves_prior_index() {
+    let mut config = test_config("index-create-cache-cleanup");
+    config.max_value_indexes = 1;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE cache_creation(a integer, b integer); \
+         INSERT INTO cache_creation VALUES (1, 10), (2, 20); \
+         BEGIN; CREATE UNIQUE INDEX cache_creation_a ON cache_creation(a); \
+         SAVEPOINT before_second_index",
+        true,
+    );
+    let table = engine
+        .storage
+        .find_table("public", "cache_creation")
+        .unwrap();
+    let txid = session.transaction.txid;
+    crate::mem::guard::forbid_alloc(|| {
+        let mut second = engine
+            .storage
+            .indexes_for("public", "cache_creation", txid)
+            .next()
+            .unwrap();
+        second.created_at = 0;
+        second.name = crate::storage::SqlName::parse("cache_creation_b").unwrap();
+        second.columns[0] = 1;
+        let slot = engine.storage.create_index(second, txid).unwrap();
+        let error = engine
+            .storage
+            .prepare_index_enforcers(table, txid)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(engine.storage.table(table).n_enforcers, 0);
+        engine.storage.rollback_index_create(slot);
+        engine.storage.prepare_index_enforcers(table, txid).unwrap();
+        assert_eq!(engine.storage.table(table).n_enforcers, 1);
+        assert!(engine.storage.value_cache_complete(table, &[0]));
+    });
+    let failed = session.execute(
+        &mut engine,
+        "CREATE UNIQUE INDEX cache_creation_b ON cache_creation(b)",
+        true,
+    );
+    assert!(failed.windows(5).any(|field| field == b"54000"));
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT before_second_index",
+        true,
+    );
+    assert_eq!(engine.storage.table(table).n_enforcers, 1);
+    assert!(engine.storage.value_cache_complete(table, &[0]));
+    let duplicate = session.execute(
+        &mut engine,
+        "INSERT INTO cache_creation VALUES (1, 30)",
+        true,
+    );
+    assert!(duplicate.windows(5).any(|field| field == b"23505"));
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(engine.storage.table(table).n_enforcers, 0);
+}
+
+#[test]
+fn index_creation_copied_indexes_release_failed_undo_reservations() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE index_copy_source(id integer); CREATE INDEX index_copy_source_key ON index_copy_source(id)",
+    );
+    let failed = run_with_fixed_memory_and_ddl_capacity(
+        &mut engine,
+        &budget,
+        "CREATE TABLE index_copy_target(LIKE index_copy_source INCLUDING INDEXES)",
+        4 << 20,
+        1,
+    );
+    assert!(
+        failed.windows(5).any(|field| field == b"54000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*) FROM pg_class WHERE relname = 'index_copy_target'; \
+         SELECT count(*) FROM pg_indexes WHERE tablename = 'index_copy_target'; \
+         SELECT count(*) FROM pg_indexes WHERE tablename = 'index_copy_source'",
+            4 << 20
+        )),
+        ["0", "0", "1"]
+    );
+    let retry = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE TABLE index_copy_target(LIKE index_copy_source INCLUDING INDEXES)",
+        4 << 20,
+    );
+    assert_eq!(command_tags(&retry), ["CREATE TABLE"]);
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*) FROM pg_indexes WHERE tablename = 'index_copy_target'",
+            4 << 20
+        )),
+        ["1"]
+    );
+}
+#[test]
 fn index_validation_checks_own_changes_and_cleans_failed_catalog_entries_through_cold_recovery() {
     let mut config = test_config("owned-index-validation");
     config.object_store_on = true;

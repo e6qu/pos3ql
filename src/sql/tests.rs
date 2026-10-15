@@ -68073,6 +68073,39 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
             "UPDATE|replicated_partition_low|2|changed:U|109",
         ]
     );
+    receive(&mut apply, &mut engine, 120, &begin(120, 5));
+    receive(&mut apply, &mut engine, 120, &insert);
+    let mut high_insert = vec![b'I'];
+    high_insert.extend_from_slice(&7_u32.to_be_bytes());
+    high_insert.push(b'N');
+    high_insert.extend_from_slice(&tuple(&[b"11", b"again"]));
+    receive(&mut apply, &mut engine, 120, &high_insert);
+    receive(&mut apply, &mut engine, 121, &commit(120, 121));
+    let truncate = [b'T', 0, 0, 0, 1, 0, 0, 0, 0, 7];
+    receive(&mut apply, &mut engine, 140, &begin(140, 6));
+    receive(&mut apply, &mut engine, 140, &truncate);
+    assert_eq!(apply.confirmed_lsn(), 121);
+    crate::mem::guard::forbid_alloc(|| apply.stop(&mut engine));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM replicated_partition ORDER BY id"
+        )),
+        ["1", "11"]
+    );
+    receive(&mut apply, &mut engine, 140, &begin(140, 6));
+    receive(&mut apply, &mut engine, 140, &truncate);
+    receive(&mut apply, &mut engine, 141, &commit(140, 141));
+    assert_eq!(apply.confirmed_lsn(), 141);
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM replicated_partition"
+        ))
+        .is_empty()
+    );
 }
 
 #[test]
@@ -81088,8 +81121,9 @@ fn dml_target_reordered_partition_writes_and_constraints_survive_cold_recovery()
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
+            // This sort uploads a temporary run into the simulator's fixture vectors.
             "SELECT id, label, seed, result FROM partition_order_parent ORDER BY id",
-            true
+            false
         )),
         [
             "3|merged|4|50",
@@ -81102,7 +81136,7 @@ fn dml_target_reordered_partition_writes_and_constraints_survive_cold_recovery()
         data_rows(&session.success(
             &mut engine,
             "SELECT id FROM partition_order_parent ORDER BY id LIMIT 2 OFFSET 1",
-            true
+            false
         )),
         ["9", "11"]
     );

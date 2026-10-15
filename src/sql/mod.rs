@@ -3017,6 +3017,10 @@ impl Engine {
         true
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "replication truncate uses its worker arena for the complete local target set"
+    )]
     pub(crate) fn apply_subscription_truncate(
         &mut self,
         txn: &mut TxnState,
@@ -3024,6 +3028,7 @@ impl Engine {
         tables: &[usize],
         cascade: bool,
         restart_identity: bool,
+        arena: &Arena,
     ) -> Result<(), SqlError> {
         if tables.is_empty() {
             return Err(sql_err!(
@@ -3037,10 +3042,61 @@ impl Engine {
                 "subscription TRUNCATE exceeds its fixed table capacity"
             ));
         }
-        for &table in tables {
+        if tables
+            .iter()
+            .enumerate()
+            .any(|(index, table)| tables[..index].contains(table))
+        {
+            return Err(sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "subscription TRUNCATE repeats a local table"
+            ));
+        }
+        let capacity = self
+            .storage
+            .table_count()
+            .min(txn.truncate_table_capacity());
+        let targets = arena
+            .alloc_slice_with(capacity, |_| 0usize)
+            .map_err(|_| eval::arena_full())?;
+        targets[..tables.len()].copy_from_slice(tables);
+        let mut count = tables.len();
+        // PostgreSQL expands local partitions, but not ordinary inheritance.
+        // Validate the entire bounded set before deleting its first row.
+        for child in 0..self.storage.table_count() {
+            if targets[..count].contains(&child)
+                || !self
+                    .storage
+                    .relation_visible_to_current_session(child, txn.txid)
+                || !tables.iter().any(|&root| {
+                    self.storage
+                        .table_def(root, txn.txid)
+                        .partition
+                        .is_partitioned()
+                        && self.storage.partition_descends_from(child, root, txn.txid)
+                })
+            {
+                continue;
+            }
+            if count == targets.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "subscription TRUNCATE exceeds its fixed table capacity"
+                ));
+            }
+            targets[count] = child;
+            count += 1;
+        }
+        for &table in &targets[..count] {
             self.subscription_apply_role(stream, table, txn.txid)?;
         }
-        exec::apply_replication_truncate(&mut self.storage, txn, tables, cascade, restart_identity)
+        exec::apply_replication_truncate(
+            &mut self.storage,
+            txn,
+            &targets[..count],
+            cascade,
+            restart_identity,
+        )
     }
 
     fn subscription_apply_role(

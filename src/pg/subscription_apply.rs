@@ -986,6 +986,7 @@ impl SubscriptionApply {
                     &tables[..truncate.relation_ids().len()],
                     truncate.cascade,
                     truncate.restart_identity,
+                    &self.arena,
                 )?;
                 Ok(ApplyResult::None)
             }

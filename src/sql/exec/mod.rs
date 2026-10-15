@@ -394,10 +394,10 @@ impl<'a, 'response> ReplicationTriggerContext<'a, 'response> {
 
 /// Each replicated action ends its row-trigger query before the next action
 /// can reset scratch. Subscription apply never fires statement triggers here.
-pub(crate) fn finish_replication_row<'arena>(
+pub(crate) fn finish_replication_row(
     storage: &mut Storage,
     txn: &mut TxnState,
-    arena: &'arena Arena,
+    arena: &Arena,
     context: &mut ReplicationTriggerContext<'_, '_>,
 ) -> Result<(), SqlError> {
     let depth = txn.trigger_depth();

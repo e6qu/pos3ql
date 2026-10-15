@@ -12823,6 +12823,11 @@ impl From<RuleTarget> for RelationLockTarget {
     }
 }
 
+fn relation_lock_capacity(config: &Config) -> usize {
+    (config.max_connections as usize + config.max_prepared_transactions)
+        * (table_slot_capacity(config) + config.max_views)
+}
+
 #[derive(Clone, Copy)]
 struct TableLock {
     owner: u32,
@@ -17742,9 +17747,7 @@ impl Storage {
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * config.max_routines
                 * size_of::<FunctionTransactionStatistics>()
-            + (config.max_connections as usize + config.max_prepared_transactions)
-                * table_slot_capacity(config)
-                * size_of::<TableLock>()
+            + relation_lock_capacity(config) * size_of::<TableLock>()
             + crate::sql::lock::LockManager::budget_bytes(
                 (config.max_connections as usize + config.max_prepared_transactions)
                     * config.txn_rows,
@@ -18497,11 +18500,7 @@ impl Storage {
             "function_transaction_statistics",
             transaction_capacity * config.max_routines,
         )?;
-        let table_locks = FixedVec::new(
-            budget,
-            "table_locks",
-            transaction_capacity * (table_capacity + config.max_views),
-        )?;
+        let table_locks = FixedVec::new(budget, "table_locks", relation_lock_capacity(config))?;
         let row_locks = crate::sql::lock::LockManager::new(
             budget,
             transaction_capacity * config.txn_rows,
@@ -37181,8 +37180,7 @@ impl Storage {
         publication.ddl_state = publication.ddl_state.rollback_drop(txid);
     }
 
-    /// The stored SELECT text of a view visible to `txid`, if `name` names one
-    /// (own uncommitted CREATE/DROP included; another transaction's excluded).
+    /// Resolves one qualified view name within the transaction's database.
     pub(crate) fn view_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.view_rule_catalog().views.iter().position(|view| {
             view.database == current_database()
@@ -37192,6 +37190,7 @@ impl Storage {
         })
     }
 
+    /// An owned catalog image, including this transaction's pending changes.
     pub fn find_view(&self, schema: &str, name: &str, txid: u32) -> Option<ViewDef> {
         self.view_rule_catalog()
             .views
@@ -48198,7 +48197,13 @@ impl Storage {
             crate::sql::ast::TableLockMode,
         ),
     ) {
-        for lock in self.lock_state().table.iter() {
+        // Monitoring visits detached entries; callbacks cannot retain the
+        // registry while reading relation metadata or other catalogs.
+        let capacity = self.lock_state().table.capacity();
+        for index in 0..capacity {
+            let Some(lock) = self.lock_state().table.get(index).copied() else {
+                break;
+            };
             for (mode, acquired_at) in lock.modes.iter().enumerate() {
                 if *acquired_at == 0 {
                     continue;
@@ -56460,6 +56465,12 @@ mod tests {
                     .sqlstate,
                 sqlstate::LOCK_NOT_AVAILABLE
             );
+            let mut visited = 0;
+            storage.visit_table_locks(|_, _, _, _| {
+                assert!(storage.locks.try_lock().is_ok());
+                visited += 1;
+            });
+            assert_eq!(visited, 2);
             storage.release_table_locks(7);
             storage.release_table_locks(8);
             let capacity = storage.lock_state().table.capacity();

@@ -161,6 +161,10 @@ cleanup() {
   if [[ -n "${SUB_POS3QL_PID:-}" ]]; then
     stop_pos3ql "$SUB_POS3QL_PID"
   fi
+  if [[ "${SUB_PG_STARTED:-false}" == true ]]; then
+    "$SUB_PGBIN/pg_ctl" -D "$WORK/subscription-pgdata" stop -m immediate >/dev/null 2>&1 || true
+    rm -rf "$SUB_PG_SOCK"
+  fi
   if [[ -n "${PG_SUBSCRIBER_DATA:-}" && -x "${SUB_PGBIN:-}/pg_ctl" ]]; then
     "$SUB_PGBIN/pg_ctl" -D "$PG_SUBSCRIBER_DATA" stop -m immediate >/dev/null 2>&1 || true
   fi
@@ -847,6 +851,7 @@ fi # torture
 if want subscription; then
 
 step "logical subscription apply from a real PostgreSQL publisher"
+SUB_PG_STARTED=false
 SUB_PGBIN="${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}"
 if [[ -x "$SUB_PGBIN/postgres" ]]; then
   if ! "$SUB_PGBIN/initdb" -D "$WORK/subscription-pgdata" -U postgres -A trust \
@@ -862,6 +867,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     tail -20 "$WORK/subscription-pg.log"
     rm -rf "$SUB_PG_SOCK"
   else
+  SUB_PG_STARTED=true
   SUB_PSQL="$SUB_PGBIN/psql"
   if ! "$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -q \
     -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'subscription_apply%' OR slot_name LIKE 'pos3ql_%_sync'" \
@@ -1072,8 +1078,6 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
       || bad "managed subscription cleanup (publisher $publisher_slot_count, local $local_subscription_count)"
   fi
   fi
-  "$SUB_PGBIN/pg_ctl" -D "$WORK/subscription-pgdata" stop -m immediate >/dev/null
-  rm -rf "$SUB_PG_SOCK"
   fi
   fi
 else
@@ -1379,6 +1383,22 @@ if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
       bad "PostgreSQL subscriber drop"
     fi
   fi
+fi
+if [[ "$PG_SUBSCRIBER_AVAILABLE" == true && "$SUB_PG_STARTED" == true ]]; then
+  step "reordered partition subscribers compared with PostgreSQL 18"
+  if ensure_psycopg_venv && "$VENV/bin/python" "$EXT/subscription_partition_diff.py" \
+    --publisher "$SUB_PG_PORT" --control "$SUBSCRIBER_PG_PORT" --candidate "$SUB_POS3QL_PORT"; then
+    ok "reordered subscriber COPY, generated values, UPDATE moves and DELETE match PostgreSQL"
+  else
+    bad "reordered partition subscriber comparison"
+    postgresql_subscriber_log
+    tail -80 "$WORK/subscription-pos3ql.log"
+  fi
+fi
+if [[ "$SUB_PG_STARTED" == true ]]; then
+  "$SUB_PGBIN/pg_ctl" -D "$WORK/subscription-pgdata" stop -m immediate >/dev/null
+  rm -rf "$SUB_PG_SOCK"
+  SUB_PG_STARTED=false
 fi
 if [[ "$PG_SUBSCRIBER_STARTED" == true ]]; then
   "$SUB_PGBIN/pg_ctl" -D "$PG_SUBSCRIBER_DATA" stop -m immediate >/dev/null

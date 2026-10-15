@@ -19,7 +19,7 @@ pub(super) fn prepare_move<'arena>(
     responder: &mut Responder,
     scratch: *mut DmlScratch,
 ) -> Result<bool, SqlError> {
-    let (old_table, rowid) = selected.identity();
+    let (old_table, rowid, _) = selected.local_parts();
     if !fire_partition_row_triggers(
         storage,
         txn,

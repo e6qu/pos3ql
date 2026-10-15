@@ -36,27 +36,7 @@ impl<'arena> RelationColumnMap<'arena> {
             .alloc_slice_with(logical.n_columns, |_| 0u16)
             .map_err(|_| arena_full())?;
         for (column, expected) in logical.columns().iter().enumerate() {
-            let target = physical
-                .column_index(expected.name.as_str())
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::SERIALIZATION_FAILURE,
-                        "selected relation is missing column \"{}\"",
-                        expected.name.as_str()
-                    )
-                })?;
-            let actual = &physical.columns()[target];
-            if expected.ctype != actual.ctype
-                || expected.type_mod != actual.type_mod
-                || expected.collation != actual.collation
-                || expected.user_type != actual.user_type
-            {
-                return Err(sql_err!(
-                    sqlstate::SERIALIZATION_FAILURE,
-                    "selected relation has a different type for column \"{}\"",
-                    expected.name.as_str()
-                ));
-            }
+            let target = physical_column(expected, physical)?;
             columns[column] = target as u16;
         }
         Ok(Self { columns })
@@ -106,6 +86,84 @@ impl<'arena> RelationColumnMap<'arena> {
     }
 }
 
+fn physical_column(expected: &super::ColumnMeta, physical: &TableDef) -> Result<usize, SqlError> {
+    let target = physical
+        .column_index(expected.name.as_str())
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "selected relation is missing column \"{}\"",
+                expected.name.as_str()
+            )
+        })?;
+    let actual = &physical.columns()[target];
+    if expected.ctype != actual.ctype
+        || expected.type_mod != actual.type_mod
+        || expected.collation != actual.collation
+        || expected.user_type != actual.user_type
+    {
+        return Err(sql_err!(
+            sqlstate::SERIALIZATION_FAILURE,
+            "selected relation has a different type for column \"{}\"",
+            expected.name.as_str()
+        ));
+    }
+    Ok(target)
+}
+
+/// A stack-owned decoder projects stored bytes into a constraint's logical
+/// column order. No row value or metadata guard outlives the byte callback.
+pub(crate) struct RelationRowDecoder {
+    schema: [crate::sql::types::ColType; super::MAX_COLUMNS],
+    columns: [u16; super::MAX_COLUMNS],
+    logical_width: usize,
+    physical_width: usize,
+    same_order: bool,
+}
+
+impl RelationRowDecoder {
+    pub(crate) fn new(logical: &TableDef, physical: &TableDef) -> Result<Self, SqlError> {
+        let mut decoder = Self {
+            schema: [crate::sql::types::ColType::Bool; super::MAX_COLUMNS],
+            columns: [0; super::MAX_COLUMNS],
+            logical_width: logical.n_columns,
+            physical_width: physical.n_columns,
+            same_order: logical.n_columns == physical.n_columns,
+        };
+        physical.schema(&mut decoder.schema);
+        for (column, expected) in logical.columns().iter().enumerate() {
+            let position = physical_column(expected, physical)?;
+            decoder.columns[column] = position as u16;
+            decoder.same_order &= column == position;
+        }
+        Ok(decoder)
+    }
+
+    pub(crate) fn decode<'bytes>(
+        &self,
+        bytes: &'bytes [u8],
+        output: &mut [Datum<'bytes>],
+    ) -> Result<(), SqlError> {
+        if output.len() < self.logical_width {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "logical row decoder output is too short"
+            ));
+        }
+        let schema = &self.schema[..self.physical_width];
+        if self.same_order {
+            super::rowenc::decode(bytes, schema, output)?;
+        } else {
+            let mut physical = [Datum::Null; super::MAX_COLUMNS];
+            super::rowenc::decode(bytes, schema, &mut physical)?;
+            for (column, &source) in self.columns[..self.logical_width].iter().enumerate() {
+                output[column] = physical[usize::from(source)];
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +202,16 @@ mod tests {
             let mut stored = [Datum::Bool(true), Datum::Text("original"), Datum::Int4(7)];
             let mut selected = [Datum::Null; 2];
             mapping.project(&stored, &mut selected);
+            let decoder = RelationRowDecoder::new(&logical, &physical).unwrap();
+            let mut encoded = [0u8; 128];
+            let width = super::super::rowenc::encode(&stored, &mut encoded);
+            let mut decoded = [Datum::Null; 2];
+            decoder.decode(&encoded[..width], &mut decoded).unwrap();
+            assert_eq!(decoded, selected);
+            let error = decoder
+                .decode(&encoded[..width], &mut decoded[..1])
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
             assert_eq!(selected, [Datum::Int4(7), Datum::Text("original")]);
             mapping.overlay(&[Datum::Int4(8), Datum::Text("changed")], &mut stored);
             assert_eq!(

@@ -6,7 +6,7 @@
 //! are fixed at startup.
 
 mod column_maps;
-pub(crate) use column_maps::RelationColumnMap;
+pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
 mod table_definitions;
 pub(crate) use table_definitions::TableDefinitionRead;

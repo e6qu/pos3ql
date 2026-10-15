@@ -81008,39 +81008,94 @@ fn dml_target_inherited_layouts_preserve_child_values_after_cold_recovery() {
 }
 
 #[test]
-fn dml_target_reordered_partition_attachment_is_explicitly_unsupported() {
-    let config = test_config("dml-target-partition-order");
+fn dml_target_reordered_partition_writes_and_constraints_survive_cold_recovery() {
+    let mut config = test_config("dml-target-partition-order");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("dml-partition-order-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(
-        &mut engine,
-        "CREATE TABLE partition_order_parent(id integer, amount integer) PARTITION BY RANGE(id); \
-         CREATE TABLE partition_order_child(amount integer, id integer)",
-        true,
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
+    session.success(&mut engine,
+        "CREATE TABLE partition_order_parent(id integer PRIMARY KEY, label text DEFAULT 'parent', seed integer DEFAULT 2, result integer GENERATED ALWAYS AS (100 / seed) STORED) PARTITION BY RANGE(id); \
+         CREATE TABLE partition_order_low(label text DEFAULT 'child' UNIQUE, result integer GENERATED ALWAYS AS (200 / seed) STORED, seed integer DEFAULT 4, id integer NOT NULL); \
+         CREATE TABLE partition_order_high(seed integer DEFAULT 6, id integer NOT NULL, label text DEFAULT 'high', result integer GENERATED ALWAYS AS (300 / seed) STORED); \
+         INSERT INTO partition_order_low(label, seed, id) VALUES ('pre', 2, 9)", true);
+    session.success(&mut engine,
+        "ALTER TABLE partition_order_parent ATTACH PARTITION partition_order_low FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE partition_order_parent ATTACH PARTITION partition_order_high FOR VALUES FROM (10) TO (20)", true);
+    session.success(&mut engine,
+        "CREATE FUNCTION partition_order_before() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN IF NEW.seed = 0 THEN NEW.seed := 4; END IF; NEW.label := upper(NEW.label); RETURN NEW; END'; \
+         CREATE TRIGGER partition_order_before BEFORE INSERT ON partition_order_parent FOR EACH ROW EXECUTE FUNCTION partition_order_before()", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "INSERT INTO partition_order_parent(id) VALUES (1) RETURNING id, label, seed, result",
+            true
+        )),
+        ["1|PARENT|2|100"]
     );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "INSERT INTO partition_order_low(id, label) VALUES (2, 'second') RETURNING id, label, seed, result", true)), ["2|SECOND|4|50"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "INSERT INTO partition_order_parent(id, label, seed) SELECT 3, 'third', 0 RETURNING id, label, seed, result", true)), ["3|THIRD|4|50"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "INSERT INTO partition_order_parent(id, label, seed) VALUES (1, 'updated', 0) ON CONFLICT(id) DO UPDATE SET label = excluded.label, seed = DEFAULT RETURNING id, label, seed, result", true)), ["1|UPDATED|2|100"]);
     let failed = session.execute(&mut engine,
-        "ALTER TABLE partition_order_parent ATTACH PARTITION partition_order_child FOR VALUES FROM (0) TO (10)", true);
-    let text = String::from_utf8_lossy(&failed);
+        "INSERT INTO partition_order_parent(id, label) VALUES (1, 'bad move') ON CONFLICT(id) DO UPDATE SET id = 11", true);
     assert!(
-        text.contains("0A000") && text.contains("physical order"),
-        "{text}"
+        String::from_utf8_lossy(&failed).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
     );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "MERGE INTO partition_order_parent t USING (VALUES (3, 'merged')) AS s(id, label) ON t.id = s.id WHEN MATCHED THEN UPDATE SET label = s.label RETURNING t.id, t.label, t.seed, t.result", true)), ["3|merged|4|50"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "UPDATE partition_order_parent SET id = 12 WHERE id = 2 RETURNING id, label, seed, result", true)), ["12|SECOND|4|75"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "MERGE INTO partition_order_parent t USING (VALUES (1, 11)) AS s(old_id, new_id) ON t.id = s.old_id WHEN MATCHED THEN UPDATE SET id = s.new_id RETURNING t.id, t.label, t.seed, t.result", true)), ["11|UPDATED|2|150"]);
     session.success(
         &mut engine,
-        "INSERT INTO partition_order_child VALUES (30, 1)",
+        "BEGIN; UPDATE partition_order_parent SET id = id + 1 WHERE id = 9; ROLLBACK",
         true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, label, seed, result FROM partition_order_parent ORDER BY id",
+            true
+        )),
+        [
+            "3|merged|4|50",
+            "9|pre|2|100",
+            "11|UPDATED|2|150",
+            "12|SECOND|4|75"
+        ]
     );
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
-            "SELECT count(*) FROM partition_order_parent",
+            "DELETE FROM partition_order_parent WHERE id = 3 RETURNING id, label, seed, result",
             true
         )),
-        ["0"]
+        ["3|merged|4|50"]
     );
     drop(session);
     drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 

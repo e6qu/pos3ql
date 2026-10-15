@@ -5416,21 +5416,16 @@ where
             seq_session,
         },
     )?;
-    let mut logical_table = table_index;
-    while let Some(attachment) = storage
-        .table_def(logical_table, txn.txid)
-        .partition
-        .attachment
+    if let Err(error) =
+        storage.validate_partition_target(table_index, def, &new_values[..def.n_columns], txn.txid)
     {
-        logical_table = usize::from(attachment.parent);
-    }
-    if storage.partition_target(logical_table, def, &new_values[..def.n_columns], txn.txid)?
-        != table_index
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "invalid ON UPDATE specification"
-        ));
+        if error.sqlstate == sqlstate::CHECK_VIOLATION {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "invalid ON UPDATE specification"
+            ));
+        }
+        return Err(error);
     }
     check_not_null(def, &new_values)?;
     enforce_row_constraints(
@@ -26200,6 +26195,7 @@ fn fire_row_trigger_slot<'a>(
         return Ok(Some(false));
     }
     if before
+        && event == TriggerEvents::INSERT
         && let (Some(leaf), crate::storage::TriggerTarget::Table(declaring_table), Some(values)) =
             (clone_table, target, new.as_deref())
         && usize::from(declaring_table) != leaf
@@ -57382,43 +57378,6 @@ pub(crate) fn merge<'a>(
                             return sql_fail(e);
                         }
                         row_layout.project(&physical_new, &mut new_values);
-                        if let Some(plan) = update_check {
-                            let policy_row = RowCtx {
-                                def,
-                                values: &new_values[..def.n_columns],
-                                alias: None,
-                            };
-                            let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                            let sequences =
-                                crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                            let hooks = EvalHooks {
-                                catalog: Some(&catalog),
-                                sequences: Some(&sequences),
-                                ..NO_HOOKS
-                            };
-                            match super::query::row_security_passes(
-                                plan,
-                                &policy_row,
-                                storage,
-                                txn.txid,
-                                arena,
-                                params,
-                                &hooks,
-                            ) {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    return sql_fail(sql_err!(
-                                        sqlstate::INSUFFICIENT_PRIVILEGE,
-                                        "new row violates row-level security policy for table \"{}\"",
-                                        def.name.as_str()
-                                    ));
-                                }
-                                Err(error) => return sql_fail(error),
-                            }
-                        }
-                        if let Err(e) = check_not_null(def, &new_values) {
-                            return sql_fail(e);
-                        }
                         let updated_table = if foreign_target {
                             target_tables[j]
                         } else if def.partition.scheme.is_some() {
@@ -57482,6 +57441,41 @@ pub(crate) fn merge<'a>(
                         ) {
                             return sql_fail(error);
                         }
+                        new_layout.project(&persisted, &mut new_values);
+                        if let Some(plan) = update_check {
+                            let policy_row = RowCtx {
+                                def,
+                                values: &new_values[..def.n_columns],
+                                alias: None,
+                            };
+                            let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                            let sequences =
+                                crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                            let hooks = EvalHooks {
+                                catalog: Some(&catalog),
+                                sequences: Some(&sequences),
+                                ..NO_HOOKS
+                            };
+                            match super::query::row_security_passes(
+                                plan,
+                                &policy_row,
+                                storage,
+                                txn.txid,
+                                arena,
+                                params,
+                                &hooks,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    return sql_fail(sql_err!(
+                                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                                        "new row violates row-level security policy for table \"{}\"",
+                                        def.name.as_str()
+                                    ));
+                                }
+                                Err(error) => return sql_fail(error),
+                            }
+                        }
                         if let Err(error) = check_not_null(new_definition, &persisted) {
                             return sql_fail(error);
                         }
@@ -57541,6 +57535,7 @@ pub(crate) fn merge<'a>(
                                     "foreign row changed before MERGE could update it"
                                 ));
                             }
+                            new_layout.overlay(&new_values, &mut persisted);
                         } else {
                             if updated_table == target_tables[j] {
                                 match dml_row_available(
@@ -61294,54 +61289,6 @@ pub(crate) fn update<'a>(
             let mut logical_after = [Datum::Null; MAX_COLUMNS];
             row_layout.project(new_physical, &mut logical_after);
             let new_values = &mut logical_after[..def.n_columns];
-            if let Some(plan) = row_security_check {
-                let context = RowCtx {
-                    def,
-                    values: &new_values[..def.n_columns],
-                    alias: None,
-                };
-                let policy_catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                let policy_sequences =
-                    crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                let policy_hooks = EvalHooks {
-                    catalog: Some(&policy_catalog),
-                    sequences: Some(&policy_sequences),
-                    ..NO_HOOKS
-                };
-                match super::query::row_security_passes(
-                    plan,
-                    &context,
-                    storage,
-                    txn.txid,
-                    arena,
-                    params,
-                    &policy_hooks,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::INSUFFICIENT_PRIVILEGE,
-                            "new row violates row-level security policy for table \"{}\"",
-                            def.name.as_str()
-                        ));
-                    }
-                    Err(error) => return sql_fail(error),
-                }
-            }
-            if let Err(error) = enforce_view_check(
-                view_check,
-                def,
-                &new_values[..def.n_columns],
-                ViewCheckContext {
-                    storage,
-                    txid: txn.txid,
-                    arena,
-                    params,
-                    seq_session,
-                },
-            ) {
-                return sql_fail(error);
-            }
             if remote_tuple.is_none() && def.partition.is_partitioned() {
                 target_table = match storage.partition_target(
                     table_index,
@@ -61398,6 +61345,55 @@ pub(crate) fn update<'a>(
                 new_definition,
                 &persisted[..new_definition.n_columns],
                 txn.txid,
+            ) {
+                return sql_fail(error);
+            }
+            new_layout.project(&persisted, new_values);
+            if let Some(plan) = row_security_check {
+                let context = RowCtx {
+                    def,
+                    values: &new_values[..def.n_columns],
+                    alias: None,
+                };
+                let policy_catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                let policy_sequences =
+                    crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let policy_hooks = EvalHooks {
+                    catalog: Some(&policy_catalog),
+                    sequences: Some(&policy_sequences),
+                    ..NO_HOOKS
+                };
+                match super::query::row_security_passes(
+                    plan,
+                    &context,
+                    storage,
+                    txn.txid,
+                    arena,
+                    params,
+                    &policy_hooks,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::INSUFFICIENT_PRIVILEGE,
+                            "new row violates row-level security policy for table \"{}\"",
+                            def.name.as_str()
+                        ));
+                    }
+                    Err(error) => return sql_fail(error),
+                }
+            }
+            if let Err(error) = enforce_view_check(
+                view_check,
+                def,
+                &new_values[..def.n_columns],
+                ViewCheckContext {
+                    storage,
+                    txid: txn.txid,
+                    arena,
+                    params,
+                    seq_session,
+                },
             ) {
                 return sql_fail(error);
             }
@@ -64459,14 +64455,6 @@ fn alter_partition_attachment(
             return sql_fail(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "ROW triggers with transition tables are not supported on partitions"
-            ));
-        }
-        if parent_def.n_columns == child_def.n_columns
-            && !crate::storage::RelationColumnMap::same_order(&parent_def, &child_def)
-        {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "partition columns must currently use the parent's physical order"
             ));
         }
         if let Err(error) =

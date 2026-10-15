@@ -230,8 +230,19 @@ Foreign tables keep their remote tuple-identity contract. A plain DELETE avoids
 copying old values when no projection, trigger, or referencing key needs them.
 Query predicates and `RETURNING` use the named table's column order; stored
 bytes, row triggers, generated columns, and constraints use each child's
-physical column order. Foreign-key actions map referenced columns by name and
-retain matching child bytes in one scan.
+physical column order, including attached partitions with reordered columns.
+Foreign-key actions map referenced columns by name and retain matching child
+bytes in one scan. MERGE retains each selected row's schema and values; a
+trigger cannot silently replace that row before the outer change writes it.
+
+SQL UPDATE and MERGE moves run BEFORE UPDATE on the original partition, then
+DELETE and INSERT row triggers on the old and new partitions. Generated values
+are computed after BEFORE triggers from the destination definition. Constraints,
+`RETURNING`, and statement-trigger input rows see the resulting values.
+For example, a destination partition may calculate a stored total differently
+from its parent; inserting through the parent still uses that destination's
+calculation. See [column-order examples](postgresql-18-compatibility.md#partition-column-order)
+and [replication behavior](logical-replication.md#subscriber).
 
 **User example:** `UPDATE parent SET amount = amount + 1` preserves a child's
 extra columns after `ALTER TABLE parent ADD COLUMN`, or after attaching an

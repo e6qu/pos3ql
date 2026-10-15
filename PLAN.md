@@ -63,30 +63,17 @@ and linked PRs preserve the investigations; this file keeps only current work.
 appropriate to its transaction. Dropping or rebuilding a table must not leave
 an already running read following reused memory or deleted objects.
 
-Statements, transactions, streaming uploads, and imported snapshots retain
-which committed data they may read. Captured reads and selected UPDATE, DELETE,
-and MERGE targets keep their original bytes. Metadata walks validate the
-original table when acquiring a row and release shared guards before callbacks.
-DML output descriptions retain their target definition and share view rewriting
-between client descriptions and data-changing WITH queries, preserving the
-view's output names. Prepared WITH descriptions analyze RETURNING without
-running the change. Prepared-statement cleanup releases names while bound
-portals keep their original statement bytes. Validation checks
-current rows without changing ordinary query snapshots.
-COPY keeps the inserted values needed by statement triggers in a fixed buffer
-across network messages. Exhaustion names `copy_transition_bytes` and rolls back
-the COPY; no later row lookup supplies its trigger inputs.
-Table rewrites choose their row identities from an already retained byte source;
-metadata-only changes do not build a list of all rows.
-Reader cleanup uses a separate startup workspace and rechecks active readers
-in each small batch. The [implementation guide](docs/implemented-baseline.md)
-owns the detailed contracts, completed work, and limits.
+Statements, transactions, uploads, and imported snapshots retain the versions
+they need. Selected rows, table definitions, and statement-trigger inputs stay
+valid through nested changes and table replacement. Reader cleanup rechecks
+active readers in small batches. Metadata-only ALTER does not reserve a rewrite
+record for every saved row. Attached partitions map matching columns by name
+through reads, constraints, writes, and replication; subscription descriptors
+recheck local tables after schema changes. The [implementation guide](docs/implemented-baseline.md)
+owns the detailed completed contracts, examples, and capacity limits.
 
 Still to do:
 
-- Map reordered partition columns consistently in routing, query pruning,
-  attachment, triggers, constraints, every write path and replication. Keep
-  the current explicit rejection until those paths agree.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.
 - Integrate bounded heap relocation with concurrent table publication and

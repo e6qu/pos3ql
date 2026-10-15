@@ -131,6 +131,13 @@ def dml_target_transcript(reader, _writer) -> list[str]:
         results.append(f"dml_target_self_join=changed:{changed},rows:{rows}")
         reader.execute("DROP TABLE dml_target_rows")
         reader.execute("CREATE TABLE dml_target_rows(id integer PRIMARY KEY, value integer)")
+        reader.execute("INSERT INTO dml_target_rows VALUES (1, 10), (2, 20)")
+        changed = reader.execute("UPDATE dml_target_rows SET value = value + 1 RETURNING id, value, (SELECT sum(value) FROM dml_target_rows)").fetchall()
+        results.append(f"dml_target_update_returning_snapshot={sorted(changed)}")
+        deleted = reader.execute("DELETE FROM dml_target_rows RETURNING id, value, (SELECT sum(value) FROM dml_target_rows)").fetchall()
+        results.append(f"dml_target_delete_returning_snapshot={sorted(deleted)}")
+        reader.execute("DROP TABLE dml_target_rows")
+        reader.execute("CREATE TABLE dml_target_rows(id integer PRIMARY KEY, value integer)")
         reader.execute("CREATE FUNCTION dml_target_action() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.value < 100 THEN INSERT INTO dml_target_rows VALUES (NEW.id, 101); END IF; RETURN NEW; END $$")
         reader.execute("CREATE TRIGGER dml_target_trigger BEFORE INSERT ON dml_target_rows FOR EACH ROW EXECUTE FUNCTION dml_target_action()")
         for label, clause in [

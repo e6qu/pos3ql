@@ -174,6 +174,9 @@ the same UPDATE. PostgreSQL returns `27000` and rolls back that statement;
 silently overwriting the trigger's change would be wrong. AFTER triggers remain
 queued until the main changes finish. When an UPDATE joins the orders table to
 itself, a later order reads its source values from the statement's earlier view.
+Likewise, `UPDATE orders SET amount = amount + 1 RETURNING amount,
+(SELECT sum(amount) FROM orders)` returns the changed row amount while its
+ordinary subquery reads the statement's earlier data.
 
 Nested trigger SQL receives a checked command identity and read scope. The
 caller regains its command and read view after success or failure, while issued

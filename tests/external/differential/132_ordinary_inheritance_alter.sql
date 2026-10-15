@@ -66,7 +66,8 @@ CREATE TABLE inheritance_dml_child
 ALTER TABLE inheritance_dml_child INHERIT inheritance_dml_parent;
 INSERT INTO inheritance_dml_child (extra, amount, id) VALUES ('retained', 10, 1);
 CREATE FUNCTION inheritance_dml_touch() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN NEW.extra = NEW.extra || ':changed'; RETURN NEW; END $$;
+DECLARE suffix text := ':changed';
+BEGIN suffix=suffix || ''; NEW.extra = NEW.extra || suffix; RETURN NEW; END $$;
 CREATE TRIGGER inheritance_dml_touch BEFORE UPDATE OF amount ON inheritance_dml_child
   FOR EACH ROW EXECUTE FUNCTION inheritance_dml_touch();
 UPDATE inheritance_dml_parent SET amount = amount + 1 WHERE id = 1

@@ -16715,13 +16715,11 @@ fn split_trigger_statements<'a>(
     Ok(statements.as_slice())
 }
 
-fn parse_trigger_assignment<'a>(
-    statement: &'a str,
-    arena: &'a Arena,
-) -> Result<Option<TriggerAssignment<'a>>, SqlError> {
+/// Locate the PL/pgSQL assignment operator outside strings and subscripts.
+/// SQL/control statements are dispatched before this target parser.
+fn trigger_assignment_operator(statement: &str) -> Option<(usize, usize)> {
     let mut quote = None;
     let mut depth = 0usize;
-    let mut assignment = None;
     for (offset, character) in statement.char_indices() {
         if let Some(delimiter) = quote {
             if character == delimiter {
@@ -16731,19 +16729,24 @@ fn parse_trigger_assignment<'a>(
         }
         match character {
             '\'' | '"' => quote = Some(character),
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
-            ':' if depth == 0 && statement[offset..].starts_with(":=") => {
-                assignment = Some(offset);
-                break;
-            }
+            '(' | '[' => depth += 1,
+            ')' | ']' if depth > 0 => depth -= 1,
+            ':' if depth == 0 && statement[offset..].starts_with(":=") => return Some((offset, 2)),
+            '=' if depth == 0 => return Some((offset, 1)),
             _ => {}
         }
     }
-    let Some(offset) = assignment else {
+    None
+}
+
+fn parse_trigger_assignment<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<TriggerAssignment<'a>>, SqlError> {
+    let Some((offset, width)) = trigger_assignment_operator(statement) else {
         return Ok(None);
     };
-    let (target, expression) = (&statement[..offset], &statement[offset + 2..]);
+    let (target, expression) = (&statement[..offset], &statement[offset + width..]);
     let target = target.trim();
     let expression = expression.trim();
     if target.is_empty() || expression.is_empty() {
@@ -16816,11 +16819,11 @@ fn parse_trigger_local_assignment<'a>(
     statement: &'a str,
     arena: &'a Arena,
 ) -> Result<Option<TriggerLocalAssignment<'a>>, SqlError> {
-    let Some(offset) = trigger_top_level_keyword(statement, ":=") else {
+    let Some((offset, width)) = trigger_assignment_operator(statement) else {
         return Ok(None);
     };
     let name = statement[..offset].trim();
-    let expression = statement[offset + 2..].trim();
+    let expression = statement[offset + width..].trim();
     if name.is_empty() || expression.is_empty() {
         return Ok(None);
     }
@@ -18242,12 +18245,6 @@ fn parse_trigger_statement<'a>(
     if let Some(variable) = parse_plpgsql_cursor_close(segment)? {
         return Ok(TriggerStatement::CursorClose(variable));
     }
-    if let Some(assignment) = parse_trigger_assignment(segment, arena)? {
-        return Ok(TriggerStatement::Assign(assignment));
-    }
-    if let Some(assignment) = parse_trigger_local_assignment(segment, arena)? {
-        return Ok(TriggerStatement::LocalAssign(assignment));
-    }
     if let Some(dynamic) = parse_trigger_dynamic_execute(segment, arena)? {
         return Ok(dynamic);
     }
@@ -18282,6 +18279,12 @@ fn parse_trigger_statement<'a>(
         || strip_trigger_keyword(segment, "delete").is_some()
     {
         return Ok(TriggerStatement::Dml(parse_trigger_dml(segment, arena)?));
+    }
+    if let Some(assignment) = parse_trigger_assignment(segment, arena)? {
+        return Ok(TriggerStatement::Assign(assignment));
+    }
+    if let Some(assignment) = parse_trigger_local_assignment(segment, arena)? {
+        return Ok(TriggerStatement::LocalAssign(assignment));
     }
     Err(unsupported_trigger_body())
 }
@@ -60986,6 +60989,7 @@ pub(crate) fn update<'a>(
                     return sql_fail(error);
                 }
             }
+            let _snapshot = storage.dml_expression_snapshot(txn.command_id());
             if !statement.returning.is_empty()
                 && let Err(error) = emit_projected(
                     storage,
@@ -61143,6 +61147,7 @@ pub(crate) fn update<'a>(
                 return sql_fail(error);
             }
         }
+        let _snapshot = storage.dml_expression_snapshot(txn.command_id());
         if !statement.returning.is_empty()
             && let Err(error) = emit_projected(
                 storage,

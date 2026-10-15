@@ -65,21 +65,11 @@ an already running read following reused memory or deleted objects.
 
 Statements, transactions, streaming uploads, and imported snapshots retain
 which committed data they may read. Captured reads and selected UPDATE, DELETE,
-and MERGE targets keep their original bytes; sorting, nested SQL, and table
-replacement cannot redirect those reads. Trigger-side changes preserve
-PostgreSQL's command boundaries. Internal metadata walks check the captured
-table identity during point admission. Definition and shared row/version guards
-release before callbacks. Pending-change walks retain original byte owners
-through heap relocation. Saved-row rereads and commit key encoding use those
-same owners; publication uses the current location of the validated version.
-Inherited targets map query columns to stored columns
-and enforce each physical table's constraints.
-
-Validation and maintenance use current committed and earlier own changes while
-preserving ordinary transaction query snapshots. Their row buffers remain
-bounded and are reused. Reader cleanup retains row identities in a separate
-startup workspace and releases registry, version, and map guards between small
-batches. Each batch rechecks active readers before deleting history. The [implementation guide](docs/implemented-baseline.md)
+and MERGE targets keep their original bytes. Metadata walks validate the
+original table when acquiring a row and release shared guards before callbacks.
+Validation checks current rows without changing ordinary query snapshots.
+Reader cleanup uses a separate startup workspace and rechecks active readers
+in each small batch. The [implementation guide](docs/implemented-baseline.md)
 owns the detailed contracts, completed work, and limits.
 
 Still to do:

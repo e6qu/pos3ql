@@ -53824,6 +53824,210 @@ fn bool_aggregates() {
 }
 
 #[test]
+fn constraint_validation_reuses_fixed_arena_between_rows_and_inherited_tables() {
+    let config = test_config("constraint-validation-fixed-arena");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut setup = ConfiguredTransactionSession::new(&config, &mut budget);
+    setup.success(
+        &mut engine,
+        "CREATE TABLE constraint_capacity(id integer, value integer); \
+         CREATE TABLE constraint_capacity_a() INHERITS (constraint_capacity); \
+         CREATE TABLE constraint_capacity_b() INHERITS (constraint_capacity); \
+         CREATE TABLE constraint_capacity_c() INHERITS (constraint_capacity)",
+        true,
+    );
+    for value in 0..256 {
+        setup.success(
+            &mut engine,
+            &format!(
+                "INSERT INTO constraint_capacity_a VALUES ({value}, {value}); \
+             INSERT INTO constraint_capacity_b VALUES ({value}, {value}); \
+             INSERT INTO constraint_capacity_c VALUES ({value}, {value})"
+            ),
+            true,
+        );
+    }
+    let mut limited =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 16 << 10);
+    limited.success(
+        &mut engine,
+        "ALTER TABLE constraint_capacity ADD CONSTRAINT nonnegative_values CHECK (value >= 0)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&setup.success(
+            &mut engine,
+            "SELECT count(*), sum(value) FROM constraint_capacity; \
+         SELECT count(*) FROM pg_constraint WHERE conname = 'nonnegative_values'",
+            true
+        )),
+        ["768|97920", "4"]
+    );
+}
+
+#[test]
+fn constraint_validation_exhaustion_preserves_definition_rows_and_retry() {
+    let config = test_config("constraint-validation-exhaustion");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut setup = ConfiguredTransactionSession::new(&config, &mut budget);
+    setup.success(
+        &mut engine,
+        "CREATE TABLE constraint_limited(value integer)",
+        true,
+    );
+    for value in 0..256 {
+        setup.success(
+            &mut engine,
+            &format!("INSERT INTO constraint_limited VALUES ({value})"),
+            true,
+        );
+    }
+    let mut limited = ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 8 << 10);
+    let failed = limited.execute(
+        &mut engine,
+        "ALTER TABLE constraint_limited ADD CONSTRAINT limited_values CHECK (value >= 0)",
+        true,
+    );
+    assert!(
+        failed.windows(5).any(|field| field == b"54000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert!(
+        String::from_utf8_lossy(&failed).contains("captured resident rows"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&setup.success(
+            &mut engine,
+            "SELECT count(*), sum(value) FROM constraint_limited; \
+         SELECT count(*) FROM pg_constraint WHERE conname = 'limited_values'",
+            true
+        )),
+        ["256|32640", "0"]
+    );
+    setup.success(
+        &mut engine,
+        "ALTER TABLE constraint_limited ADD CONSTRAINT limited_values CHECK (value >= 0)",
+        true,
+    );
+}
+
+#[test]
+fn constraint_validation_own_changes_rollback_and_rules_survive_cold_recovery() {
+    let mut config = test_config("constraint-validation-cold");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("constraint-validation-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE DOMAIN validation_amount AS integer; \
+         CREATE TABLE validation_parent(id integer PRIMARY KEY); \
+         INSERT INTO validation_parent VALUES (1), (2); \
+         CREATE TABLE validation_orders(id integer, parent_id integer, value validation_amount, label text); \
+         INSERT INTO validation_orders VALUES (1, 1, 10, 'one'), (2, 2, 20, 'two')", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for (change, command, error) in [
+        (
+            "UPDATE validation_orders SET value = -1 WHERE id = 2",
+            "ALTER TABLE validation_orders ADD CONSTRAINT valid_amount CHECK (value > 0)",
+            "23514",
+        ),
+        (
+            "INSERT INTO validation_orders VALUES (3, 99, 30, 'three')",
+            "ALTER TABLE validation_orders ADD CONSTRAINT valid_parent FOREIGN KEY (parent_id) REFERENCES validation_parent(id)",
+            "23503",
+        ),
+        (
+            "UPDATE validation_orders SET value = NULL WHERE id = 2",
+            "ALTER DOMAIN validation_amount SET NOT NULL",
+            "23502",
+        ),
+        (
+            "CREATE TABLE validation_extra(value validation_amount); INSERT INTO validation_extra VALUES (-1)",
+            "ALTER DOMAIN validation_amount ADD CONSTRAINT positive_domain CHECK (VALUE > 0)",
+            "23514",
+        ),
+    ] {
+        session.success(&mut engine, "BEGIN; SAVEPOINT before_validation", true);
+        session.success(&mut engine, change, true);
+        let failed = session.execute(&mut engine, command, true);
+        assert!(
+            failed.windows(5).any(|field| field == error.as_bytes()),
+            "{command}: {}",
+            String::from_utf8_lossy(&failed)
+        );
+        session.success(&mut engine, "ROLLBACK TO SAVEPOINT before_validation", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT count(*), sum(value::integer) FROM validation_orders; \
+             SELECT count(*) FROM pg_constraint WHERE conname IN ('valid_amount', 'valid_parent', 'positive_domain')", true)), ["2|30", "0"]);
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+    session.success(&mut engine,
+        "BEGIN; UPDATE validation_orders SET value = 30 WHERE id = 2; \
+         INSERT INTO validation_parent VALUES (3); \
+         INSERT INTO validation_orders VALUES (3, 3, 40, 'three'); \
+         ALTER TABLE validation_orders ADD CONSTRAINT valid_amount CHECK (value > 0); \
+         ALTER TABLE validation_orders ADD CONSTRAINT valid_parent FOREIGN KEY (parent_id) REFERENCES validation_parent(id); \
+         ALTER DOMAIN validation_amount SET NOT NULL; \
+         ALTER DOMAIN validation_amount ADD CONSTRAINT positive_domain CHECK (VALUE > 0); COMMIT", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*), sum(value::integer) FROM validation_orders",
+            true
+        )),
+        ["3|80"]
+    );
+    for (sql, error) in [
+        (
+            "INSERT INTO validation_orders VALUES (4, 1, NULL, 'null')",
+            "23502",
+        ),
+        (
+            "INSERT INTO validation_orders VALUES (4, 1, -1, 'bad')",
+            "23514",
+        ),
+        (
+            "INSERT INTO validation_orders VALUES (4, 99, 1, 'unknown')",
+            "23503",
+        ),
+    ] {
+        let failed = session.execute(&mut engine, sql, true);
+        assert!(
+            failed.windows(5).any(|field| field == error.as_bytes()),
+            "{sql}: {}",
+            String::from_utf8_lossy(&failed)
+        );
+    }
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn constraint_validation_checks_current_commits_without_changing_repeatable_read() {
     let config = test_config("constraint-current-snapshot");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));

@@ -366,6 +366,18 @@ mod tests {
                     .for_each_overlay(&mut |rowid, home| {
                         assert_eq!(rowid, expected[at].0);
                         assert_eq!(home.snapshot().version, versions[at]);
+                        let snapshot = home.snapshot();
+                        let reread = scan.read_snapshot(rowid, snapshot).unwrap();
+                        let VisibleRowBytes::Heap(original) = reread.bytes else {
+                            panic!("retained rewrite source is heap-backed")
+                        };
+                        assert_eq!(&*original, expected[at].1);
+                        let mut replaced = snapshot;
+                        replaced.created_at = replaced.created_at.wrapping_add(1);
+                        assert_eq!(
+                            scan.read_snapshot(rowid, replaced).err().unwrap().sqlstate,
+                            sqlstate::SERIALIZATION_FAILURE
+                        );
                         let VisibleRowBytes::Heap(bytes) = home.bytes else {
                             panic!("heap fixture")
                         };

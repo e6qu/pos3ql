@@ -39,6 +39,12 @@ jobs:
         run: |
           set -euo pipefail
           cargo clippy --all-targets --locked -- -D warnings
+      - name: Constraint validation fixed-memory regressions
+        run: |
+          set -euo pipefail
+          for filter in constraint_validation captured_resident_byte_scans add_constraint domain_; do
+            cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/constraint-validation-test.log"
+          done
       - name: Build reference-comparison executable
         run: cargo build --release --locked
       - uses: ./.github/actions/python-test-environment
@@ -74,10 +80,23 @@ jobs:
             sleep 0.1
           done
           target/external-venv/bin/python tests/external/mvcc_diff.py
-      - name: Constraint validation fixed-memory regressions
+      - name: Constraint, domain, and partition SQL against PostgreSQL 18
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          RUN_FAST: "0"
+          RUN_CORE: "0"
+          RUN_CORPUS: "1"
+          RUN_AUX: "0"
+          RUN_SLT: "0"
+          RUN_FUZZ: "0"
+          FAST_CORPUS_SHARDS: "1"
         run: |
           set -euo pipefail
-          cargo test --lib --locked constraint_validation -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/constraint-validation-test.log"
+          for corpus in 100_constraint_lifecycle 91_domain_lifecycle 103_partitioned_tables; do
+            FAST_CORPUS_ONLY="$corpus" bash tests/external/ci_diff.sh
+          done
       - name: Symbolicate allocation failures in one batch
         if: failure()
         run: |

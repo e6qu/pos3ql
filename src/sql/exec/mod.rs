@@ -2529,6 +2529,12 @@ fn build_partitioned_table_def(
             subpartition,
         } => {
             let parent_slot = resolve_dml_table(storage, &parent, txid)?;
+            storage.lock_table(
+                txid,
+                parent_slot,
+                crate::sql::ast::TableLockMode::AccessExclusive,
+                false,
+            )?;
             let parent_def = *storage.table_def(parent_slot, txid);
             let child_is_temporary =
                 statement.persistence == crate::sql::ast::RelationPersistence::Temporary;
@@ -2608,6 +2614,7 @@ fn build_partitioned_table_def(
                 arena,
             )?;
             validate_partition_bound(storage, parent_slot, resolved_bound, txid)?;
+            validate_default_partition_rows(storage, parent_slot, resolved_bound, txid, arena)?;
             def.partition = PartitionDef::child(
                 u16::try_from(parent_slot)
                     .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many tables"))?,
@@ -2932,6 +2939,96 @@ fn validate_partition_bound(
             storage.table_def(parent, txid).name.as_str(),
             storage.table_def(slot, txid).name.as_str()
         ));
+    }
+    Ok(())
+}
+
+/// Adding a bound also narrows the default partition's allowed rows. Lock its
+/// tree before scanning; no current row may silently acquire the wrong home.
+fn validate_default_partition_rows(
+    storage: &Storage,
+    parent: usize,
+    bound: StoredPartitionBound,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if matches!(bound, StoredPartitionBound::Default) {
+        return Ok(());
+    }
+    let parent_def = *storage.table_def(parent, txid);
+    let scheme = parent_def
+        .partition
+        .scheme
+        .expect("partition parent has a scheme");
+    for default in 0..storage.table_count() {
+        if !storage.table(default).visible_to(txid) {
+            continue;
+        }
+        let definition = *storage.table_def(default, txid);
+        if !definition.partition.attachment.is_some_and(|attachment| {
+            usize::from(attachment.parent) == parent
+                && attachment.state.routable()
+                && matches!(attachment.bound, StoredPartitionBound::Default)
+        }) {
+            continue;
+        }
+        for candidate in 0..storage.table_count() {
+            if storage.table(candidate).visible_to(txid)
+                && (candidate == default
+                    || storage.partition_descends_from(candidate, default, txid))
+            {
+                storage.lock_table(
+                    txid,
+                    candidate,
+                    crate::sql::ast::TableLockMode::AccessExclusive,
+                    false,
+                )?;
+            }
+        }
+        let read = storage.validation_read();
+        for candidate in 0..storage.table_count() {
+            if !storage.table(candidate).visible_to(txid)
+                || storage
+                    .table_def(candidate, txid)
+                    .partition
+                    .is_partitioned()
+                || !(candidate == default
+                    || storage.partition_descends_from(candidate, default, txid))
+            {
+                continue;
+            }
+            let physical = *storage.table_def(candidate, txid);
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            physical.schema(&mut schema);
+            // SAFETY: bound comparison consumes each row and returns only an
+            // owned error; no front-arena or row value escapes.
+            unsafe {
+                constraints::for_each_validation_row(
+                    storage,
+                    candidate,
+                    txid,
+                    read,
+                    &schema[..physical.n_columns],
+                    arena,
+                    &mut |_, values| {
+                        if crate::storage::partition_bound_matches(
+                            scheme.strategy,
+                            scheme.keys,
+                            scheme.n_keys,
+                            bound,
+                            values,
+                        )? {
+                            return Err(sql_err!(
+                                sqlstate::CHECK_VIOLATION,
+                                "updated partition constraint for default partition \"{}\" would be violated by some row",
+                                definition.name.as_str()
+                            ));
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -61471,11 +61568,6 @@ pub(crate) fn truncate(
     sql_ok()
 }
 
-/// ALTER TABLE, autocommit-only: rewrites are journaled as DROP, CREATE,
-/// full re-UPSERT within one WAL batch, so replay reproduces the new
-/// shape atomically. Two-phase in memory: all new row images are prepared
-/// first, then the definition and row map swap; a failure part-way leaves
-/// the table untouched (only heap bytes leak until compaction).
 /// Whether `ALTER COLUMN ... TYPE` may cast `from` to `to` without a `USING`
 /// clause — i.e. PostgreSQL has an assignment (or implicit) cast for the pair.
 /// Mirrors `pg_cast` (castcontext in {'a','i'}) over this engine's types, plus
@@ -63324,6 +63416,11 @@ fn alter_partition_attachment(
         if let Err(error) = validate_partition_bound(storage, parent, resolved, txn.txid) {
             return sql_fail(error);
         }
+        if let Err(error) =
+            validate_default_partition_rows(storage, parent, resolved, txn.txid, arena)
+        {
+            return sql_fail(error);
+        }
         let read = storage.validation_read();
         let leaves = match arena.alloc_slice_with(storage.table_count(), |_| usize::MAX) {
             Ok(leaves) => leaves,
@@ -64752,7 +64849,7 @@ fn alter_table_relation(
         return sql_ok();
     }
 
-    // Collect every committed row up front: the row count decides whether an
+    // Collect current committed and own row identities: the count decides whether an
     // added NOT NULL column needs a fill (a spilled table has rows even when
     // the overlay map has evicted them, so `rows.is_empty()` cannot answer
     // this), and the same list drives the rewrite below.

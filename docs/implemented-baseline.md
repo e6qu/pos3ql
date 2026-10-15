@@ -192,7 +192,10 @@ chains again.
 **User example:** a report sees two valid orders, then another session commits
 an invalid third order. Adding a CHECK constraint must reject the third order
 with `23514`, while the report still sees its original two. A foreign key must
-also accept a new valid parent committed before validation. A failed check or
+also accept a new valid parent committed before validation, including one in a
+partitioned parent's leaf. Deleting through that leaf still enforces its foreign
+keys. Adding a partition checks the default partition's existing rows before
+narrowing its allowed range. A failed check or
 savepoint rollback keeps the prior table definition and data.
 The [PostgreSQL 18 table validation implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c)
 uses a fresh snapshot for these stored-row scans; the reference tests compare

@@ -364,7 +364,7 @@ impl<'arena> TableRowSnapshot<'arena> {
         rowid: u64,
         snapshot: RowSnapshot,
     ) -> Result<VisibleRowHome, SqlError> {
-        let RowVersionIdentity::Committed(lsn) = snapshot.version else {
+        let RowVersionIdentity::Committed(_) = snapshot.version else {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
                 "captured pending row is absent from its resident source"
@@ -376,8 +376,17 @@ impl<'arena> TableRowSnapshot<'arena> {
                 "captured row belongs to a different table incarnation"
             ));
         }
+        let read_position = self
+            .roots
+            .with_view(|source| Ok(source.commit_lsn()))?
+            .ok_or_else(|| {
+                sql_err!(
+                    crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                    "captured row has no saved-file source"
+                )
+            })?;
         let mut row = CapturedRowRecord::empty(rowid, CapturedRowKind::LookupSaved);
-        self.resolve_saved(&mut row, lsn)?;
+        self.resolve_saved(&mut row, read_position)?;
         let home = self.read_record(row)?.ok_or_else(|| {
             sql_err!(
                 crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,

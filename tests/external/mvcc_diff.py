@@ -227,6 +227,102 @@ def constraint_validation_transcript(reader, writer) -> list[str]:
         writer.execute("DROP DOMAIN IF EXISTS constraint_domain CASCADE")
 
 
+def constraint_partition_transcript(reader, writer) -> list[str]:
+    results = []
+    try:
+        writer.execute("CREATE TABLE validation_fk_parent(id integer PRIMARY KEY) PARTITION BY RANGE (id)")
+        writer.execute("CREATE TABLE validation_fk_leaf PARTITION OF validation_fk_parent FOR VALUES FROM (0) TO (10)")
+        writer.execute("INSERT INTO validation_fk_parent VALUES (1)")
+        writer.execute("CREATE TABLE validation_fk_child(id integer, parent_id integer)")
+        writer.execute("INSERT INTO validation_fk_child VALUES (1, 1)")
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        before = reader.execute("SELECT count(*) FROM validation_fk_child").fetchone()[0]
+        writer.execute("INSERT INTO validation_fk_parent VALUES (2)")
+        writer.execute("INSERT INTO validation_fk_child VALUES (2, 2)")
+        reader.execute("SAVEPOINT before_validation")
+        command = "ALTER TABLE validation_fk_child ADD CONSTRAINT partition_parent FOREIGN KEY (parent_id) REFERENCES validation_fk_parent(id)"
+        error = sqlstate(reader, command)
+        reader.execute("ROLLBACK TO SAVEPOINT before_validation")
+        after = reader.execute("SELECT count(*) FROM validation_fk_child").fetchone()[0]
+        results.append(f"constraint_partition_parent={error},before:{before},after:{after}")
+        reader.execute("ROLLBACK")
+        results.append(f"constraint_partition_fk_created={sqlstate(writer, command)}")
+        for label, command in [
+            ("valid_insert", "INSERT INTO validation_fk_child VALUES (3, 2)"),
+            ("invalid_insert", "INSERT INTO validation_fk_child VALUES (3, 99)"),
+            ("root_delete", "DELETE FROM validation_fk_parent WHERE id = 2"),
+            ("leaf_delete", "DELETE FROM validation_fk_leaf WHERE id = 2"),
+        ]:
+            writer.execute("BEGIN")
+            error = sqlstate(writer, command)
+            writer.execute("ROLLBACK")
+            results.append(f"constraint_partition_fk_{label}={error}")
+        writer.execute("DROP TABLE validation_fk_child")
+        writer.execute("DROP TABLE validation_fk_parent CASCADE")
+        for label, nested, attaching in [("create", False, False), ("attach", False, True), ("nested_attach", True, True)]:
+            writer.execute("CREATE TABLE validation_default_root(id integer) PARTITION BY RANGE (id)")
+            suffix = " PARTITION BY RANGE (id)" if nested else ""
+            writer.execute(f"CREATE TABLE validation_default PARTITION OF validation_default_root DEFAULT{suffix}")
+            if nested:
+                writer.execute("CREATE TABLE validation_default_leaf PARTITION OF validation_default FOR VALUES FROM (MINVALUE) TO (MAXVALUE)")
+            if attaching:
+                writer.execute("CREATE TABLE validation_new_partition(id integer)")
+            writer.execute("INSERT INTO validation_default_root VALUES (99)")
+            reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            before = reader.execute("SELECT count(*) FROM validation_default").fetchone()[0]
+            writer.execute("INSERT INTO validation_default_root VALUES (5)")
+            reader.execute("SAVEPOINT before_validation")
+            command = (
+                "ALTER TABLE validation_default_root ATTACH PARTITION validation_new_partition FOR VALUES FROM (0) TO (10)"
+                if attaching else
+                "CREATE TABLE validation_new_partition PARTITION OF validation_default_root FOR VALUES FROM (0) TO (10)"
+            )
+            error = sqlstate(reader, command)
+            reader.execute("ROLLBACK TO SAVEPOINT before_validation")
+            after = reader.execute("SELECT count(*) FROM validation_default").fetchone()[0]
+            results.append(f"constraint_default_{label}={error},before:{before},after:{after}")
+            reader.execute("ROLLBACK")
+            writer.execute("DELETE FROM validation_default WHERE id = 5")
+            corrected = sqlstate(writer, command)
+            writer.execute("INSERT INTO validation_default_root VALUES (5)")
+            default_rows = writer.execute("SELECT count(*) FROM validation_default").fetchone()[0]
+            new_rows = writer.execute("SELECT count(*) FROM validation_new_partition").fetchone()[0]
+            results.append(f"constraint_default_{label}_retry={corrected},default:{default_rows},new:{new_rows}")
+            writer.execute("DROP TABLE validation_default_root CASCADE")
+        writer.execute("CREATE TABLE validation_expression_lookup(value integer)")
+        writer.execute("INSERT INTO validation_expression_lookup VALUES (100)")
+        writer.execute("CREATE FUNCTION validation_expression_value() RETURNS integer LANGUAGE sql STABLE AS $$SELECT max(value) FROM validation_expression_lookup$$")
+        writer.execute("CREATE TABLE validation_expression_rows(value integer)")
+        writer.execute("INSERT INTO validation_expression_rows VALUES (10), (20)")
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        before = reader.execute("SELECT validation_expression_value()").fetchone()[0]
+        writer.execute("UPDATE validation_expression_lookup SET value = 0")
+        reader.execute("SAVEPOINT before_validation")
+        error = sqlstate(reader, "ALTER TABLE validation_expression_rows ADD CONSTRAINT expression_rule CHECK (value < validation_expression_value())")
+        reader.execute("ROLLBACK TO SAVEPOINT before_validation")
+        after = reader.execute("SELECT validation_expression_value()").fetchone()[0]
+        results.append(f"constraint_expression={error},before:{before},after:{after}")
+        reader.execute("ROLLBACK")
+        writer.execute("CREATE TABLE validation_exclusion(id integer, value int4range)")
+        writer.execute("INSERT INTO validation_exclusion VALUES (1, '[1,5)'), (2, '[10,20)')")
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        before = reader.execute("SELECT count(*) FROM validation_exclusion").fetchone()[0]
+        writer.execute("INSERT INTO validation_exclusion VALUES (3, '[30,40)'), (4, '[35,45)')")
+        reader.execute("SAVEPOINT before_validation")
+        error = sqlstate(reader, "ALTER TABLE validation_exclusion ADD CONSTRAINT exclusion_rule EXCLUDE USING gist (value WITH &&)")
+        reader.execute("ROLLBACK TO SAVEPOINT before_validation")
+        after = reader.execute("SELECT count(*) FROM validation_exclusion").fetchone()[0]
+        results.append(f"constraint_exclusion={error},before:{before},after:{after}")
+        reader.execute("ROLLBACK")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        for relation in ("validation_fk_child", "validation_fk_parent", "validation_default_root", "validation_new_partition", "validation_expression_rows", "validation_expression_lookup", "validation_exclusion"):
+            writer.execute(f"DROP TABLE IF EXISTS {relation} CASCADE")
+        writer.execute("DROP FUNCTION IF EXISTS validation_expression_value()")
+
+
 def analyze_snapshot_transcript(reader, writer) -> list[str]:
     writer.execute("DROP TABLE IF EXISTS analyze_snapshot_diff CASCADE")
     writer.execute("CREATE TABLE analyze_snapshot_diff (id integer, a integer, b integer, label text)")
@@ -320,7 +416,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

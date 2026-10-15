@@ -1818,7 +1818,7 @@ fn enforce_exclusion_constraint(
     if !predicate_holds(values)? {
         return Ok(());
     }
-    let mut visit = |rowid, state| {
+    let mut visit = |rowid: u64, state: crate::storage::RowRead<'_>| {
         use core::ops::ControlFlow;
         if self_rowid == Some(rowid) {
             return Ok(ControlFlow::Continue(()));
@@ -2434,47 +2434,53 @@ fn parent_has_key(
     txid: u32,
     read: Option<ValidationRead>,
 ) -> Result<bool, SqlError> {
-    let parent_definition = storage.table_def(parent_index, txid);
+    let parent_definition = *storage.table_def(parent_index, txid);
     let mut found = false;
-    let mut visit = |rowid, state| {
-        use core::ops::ControlFlow;
-        let home = match read {
-            Some(read) => read.visible_row_home(storage, parent_index, rowid, state, txid)?,
-            None => storage.visible_row_home(parent_index, rowid, state, txid)?,
-        };
-        let Some(home) = home else {
-            return Ok(ControlFlow::Continue(()));
-        };
-        let all_eq = storage.with_row_bytes(parent_index, rowid, home, |bytes| {
-            let mut prow = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, parent_schema, &mut prow)?;
-            for (&parent_column, &child_column) in parent_cols.iter().zip(child_cols) {
-                let parent = &prow[parent_column as usize];
-                let child = &child_values[child_column as usize];
-                if parent.is_null()
-                    || !compare_datums_collated(
-                        storage,
-                        parent_definition.columns()[parent_column as usize].collation,
-                        child,
-                        parent,
-                    )?
-                    .is_eq()
-                {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        })?;
-        if all_eq {
-            found = true;
-            return Ok(ControlFlow::Break(()));
+    constraint_row_tables(storage, parent_index, txid, |row_table| {
+        if found {
+            return Ok(());
         }
-        Ok(ControlFlow::Continue(()))
-    };
-    match read {
-        Some(read) => read.for_each_row_state(storage, parent_index, &mut visit)?,
-        None => storage.for_each_row_state(parent_index, &mut visit)?,
-    }
+        let mut visit = |rowid: u64, state: crate::storage::RowRead<'_>| {
+            use core::ops::ControlFlow;
+            let home = match read {
+                Some(read) => read.visible_row_home(storage, row_table, rowid, state, txid)?,
+                None => storage.visible_row_home(row_table, rowid, state, txid)?,
+            };
+            let Some(home) = home else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let all_eq = storage.with_row_bytes(row_table, rowid, home, |bytes| {
+                let mut prow = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, parent_schema, &mut prow)?;
+                for (&parent_column, &child_column) in parent_cols.iter().zip(child_cols) {
+                    let parent = &prow[parent_column as usize];
+                    let child = &child_values[child_column as usize];
+                    if parent.is_null()
+                        || !compare_datums_collated(
+                            storage,
+                            parent_definition.columns()[parent_column as usize].collation,
+                            child,
+                            parent,
+                        )?
+                        .is_eq()
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
+            if all_eq {
+                found = true;
+                return Ok(ControlFlow::Break(()));
+            }
+            Ok(ControlFlow::Continue(()))
+        };
+        match read {
+            Some(read) => read.for_each_row_state(storage, row_table, &mut visit)?,
+            None => storage.for_each_row_state(row_table, &mut visit)?,
+        }
+        Ok(())
+    })?;
     Ok(found)
 }
 
@@ -2523,7 +2529,7 @@ pub(crate) fn apply_fk_parent_actions(
             if !fk.validation.enforced() {
                 continue;
             }
-            if fk.parent_schema.as_str() != parent_schema || fk.parent.as_str() != parent_name {
+            if !references_parent(storage, &fk, parent_schema, parent_name, txn.txid) {
                 continue;
             }
             // An update triggers this key's action only when the key changed.
@@ -2809,6 +2815,32 @@ pub(crate) fn apply_fk_parent_actions(
     Ok(())
 }
 
+/// A key referencing a partitioned relation also protects mutations directed
+/// at one of its leaves. Ordinary inheritance does not extend REFERENCES.
+fn references_parent(
+    storage: &Storage,
+    foreign_key: &crate::storage::ForeignKey,
+    schema: &str,
+    name: &str,
+    txid: u32,
+) -> bool {
+    if foreign_key.parent_schema.as_str() == schema && foreign_key.parent.as_str() == name {
+        return true;
+    }
+    let Some(actual) = storage.find_visible(schema, name, txid) else {
+        return false;
+    };
+    let Some(parent) = storage.find_visible(
+        foreign_key.parent_schema.as_str(),
+        foreign_key.parent.as_str(),
+        txid,
+    ) else {
+        return false;
+    };
+    let partitioned = storage.table_def(parent, txid).partition.is_partitioned();
+    partitioned && storage.partition_descends_from(actual, parent, txid)
+}
+
 /// Whether any visible table has a foreign key referencing `name`.
 pub(crate) fn table_is_referenced(storage: &Storage, schema: &str, name: &str, txid: u32) -> bool {
     for column_index in 0..storage.table_count() {
@@ -2819,7 +2851,7 @@ pub(crate) fn table_is_referenced(storage: &Storage, schema: &str, name: &str, t
             .table_def(column_index, txid)
             .fkeys()
             .iter()
-            .any(|fk| fk.parent_schema.as_str() == schema && fk.parent.as_str() == name)
+            .any(|fk| references_parent(storage, fk, schema, name, txid))
         {
             return true;
         }
@@ -2843,7 +2875,7 @@ pub(crate) fn referenced_key_changed(
         }
         let cdef = *storage.table_def(column_index, txid);
         for fk in cdef.fkeys() {
-            if fk.parent_schema.as_str() != parent_schema || fk.parent.as_str() != parent_name {
+            if !references_parent(storage, fk, parent_schema, parent_name, txid) {
                 continue;
             }
             for (&child_column, &pc) in fk.columns().iter().zip(fk.parent_cols()) {

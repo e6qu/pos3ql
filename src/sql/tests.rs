@@ -43742,12 +43742,20 @@ fn analyze_reclaims_each_target_capture_within_the_fixed_work_arena() {
     session.success(
         &mut engine,
         "CREATE TABLE analyze_budget_a(id integer); CREATE TABLE analyze_budget_b(id integer); \
-         CREATE TABLE analyze_budget_c(id integer); \
-         INSERT INTO analyze_budget_a SELECT i FROM generate_series(1, 256) AS g(i); \
-         INSERT INTO analyze_budget_b SELECT i FROM generate_series(1, 256) AS g(i); \
-         INSERT INTO analyze_budget_c SELECT i FROM generate_series(1, 256) AS g(i)",
+         CREATE TABLE analyze_budget_c(id integer)",
         true,
     );
+    for value in 1..=256 {
+        session.success(
+            &mut engine,
+            &format!(
+                "INSERT INTO analyze_budget_a VALUES ({value}); \
+             INSERT INTO analyze_budget_b VALUES ({value}); \
+             INSERT INTO analyze_budget_c VALUES ({value})"
+            ),
+            true,
+        );
+    }
     session.success(&mut engine, "ANALYZE", true);
     session.success(
         &mut engine,

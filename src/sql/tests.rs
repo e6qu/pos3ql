@@ -80583,9 +80583,10 @@ fn dml_target_bytes_survive_rollback_table_reuse_and_storage_removal() {
         })
         .collect();
     assert_eq!(keys.len(), 71);
+    session.success(&mut engine, "ROLLBACK; DROP TABLE dml_owned", true);
     session.success(
         &mut engine,
-        "ROLLBACK; DROP TABLE dml_owned; CREATE TABLE dml_replacement(unrelated boolean)",
+        "CREATE TABLE dml_replacement(unrelated boolean)",
         true,
     );
     assert_eq!(

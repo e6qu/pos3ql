@@ -8,13 +8,16 @@ import psycopg
 
 
 def connect(port: int):
-    return psycopg.connect(
+    connection = psycopg.connect(
         host=os.environ.get("PGHOST", "127.0.0.1"),
         port=port,
         user=os.environ.get("PGUSER", "postgres"),
         dbname="postgres",
         autocommit=True,
     )
+    # The shared test server reserves 16 plans; bound the driver's LRU cache.
+    connection.prepared_max = 8
+    return connection
 
 
 def sqlstate(connection, statement: str) -> str:

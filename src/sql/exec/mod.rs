@@ -61719,8 +61719,8 @@ pub(crate) fn delete<'a>(
         {
             return sql_fail(error);
         }
-        if !statement.returning.is_empty() {
-            if let Err(error) = emit_projected(
+        if !statement.returning.is_empty()
+            && let Err(error) = emit_projected(
                 storage,
                 txn,
                 def,
@@ -61733,9 +61733,9 @@ pub(crate) fn delete<'a>(
                 params,
                 responder,
                 &mut capture,
-            )? {
-                return sql_fail(error);
-            }
+            )?
+        {
+            return sql_fail(error);
         }
         deleted += 1;
     }

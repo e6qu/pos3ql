@@ -191,22 +191,29 @@ impl Storage {
     }
 
     pub(crate) fn row_scan(&self, table_slot: usize) -> Result<RowScan<'_>, SqlError> {
-        self.reserved_row_scan(table_slot, true)
+        self.reserved_row_scan(table_slot, true, self.commit_snapshot())
     }
 
     pub(super) fn metadata_row_scan(&self, table_slot: usize) -> Result<RowScan<'_>, SqlError> {
-        self.reserved_row_scan(table_slot, false)
+        self.metadata_row_scan_at(table_slot, self.commit_snapshot())
+    }
+
+    pub(super) fn metadata_row_scan_at(
+        &self,
+        table_slot: usize,
+        commit_lsn: u64,
+    ) -> Result<RowScan<'_>, SqlError> {
+        self.reserved_row_scan(table_slot, false, commit_lsn)
     }
 
     fn reserved_row_scan(
         &self,
         table_slot: usize,
         skip_redundant: bool,
+        commit_lsn: u64,
     ) -> Result<RowScan<'_>, SqlError> {
-        let mut scan = self.capture_row_partition(
-            table_slot,
-            self.commit_snapshot(),
-            |image, generations, rows| {
+        let mut scan =
+            self.capture_row_partition(table_slot, commit_lsn, |image, generations, rows| {
                 let (rowids, _) = self.row_walks.retain_from(rows, skip_redundant)?;
                 let roots = super::spill_generations::CapturedSpillRoots::capture(
                     self,
@@ -221,8 +228,7 @@ impl Storage {
                     rowids: RowScanIds::Reserved(rowids),
                     roots,
                 })
-            },
-        )?;
+            })?;
         if let RowScanIds::Reserved(rowids) = &mut scan.rowids {
             rowids.sort();
         }

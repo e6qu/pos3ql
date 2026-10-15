@@ -181,6 +181,23 @@ later committed duplicates. The [PostgreSQL 18 index-build implementation](https
 is the upstream visibility reference; the differential suite checks actual
 PostgreSQL results.
 
+Schema validation uses a current read position for the rows being checked,
+including earlier changes by the same transaction. CHECK, NOT NULL, uniqueness,
+foreign-key and domain rules, and partition attachment retain their original row
+sources. Saved validation rows stream through the merged reader; expression
+scratch is reused after each row and capture space after each table. Schema
+rewrites fetch original captured bytes rather than consulting mutable version
+chains again.
+
+**User example:** a report sees two valid orders, then another session commits
+an invalid third order. Adding a CHECK constraint must reject the third order
+with `23514`, while the report still sees its original two. A foreign key must
+also accept a new valid parent committed before validation. A failed check or
+savepoint rollback keeps the prior table definition and data.
+The [PostgreSQL 18 table validation implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c)
+uses a fresh snapshot for these stored-row scans; the reference tests compare
+actual PostgreSQL behavior without moving the caller's query snapshot.
+
 ANALYZE captures resident row choices and retains the original heap and saved
 files. Saved rows continue streaming through the merged reader. Base and
 extended statistics share a current read position for the operation, including

@@ -76,6 +76,9 @@ failure cleanup. Validation reuses its fixed buffer between rows and tables;
 unread bytes keep their original owners.
 ANALYZE retains original row sources and uses one current read position for base
 and extended statistics, restoring the caller's query snapshot on every exit.
+Table and domain constraints validate current committed and own changes through
+retained sources without changing ordinary query snapshots. Partition attachment
+streams its validation rows, and schema rewrites fetch original captured bytes.
 
 The [implementation guide](docs/implemented-baseline.md) owns the detailed
 contracts and limits; this sequence keeps the remaining acceptance gates.

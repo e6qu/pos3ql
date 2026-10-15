@@ -43,7 +43,9 @@ machine do not establish production availability or speed.
   tables. A table-form export reads only its named relation; the query form
   selects a complete partition or inheritance tree.
 - A report and a uniqueness check can need different views of the same rows.
-  Keeping a report stable must not let an index miss a later committed duplicate.
+  Keeping a report stable must not let an index miss a later committed duplicate. A new
+  table CHECK can inspect current rows while a STABLE SQL function inside that
+  check still sees the transaction's earlier data.
 - A safe storage layout needs to keep older versions until every reader and
   backup has finished with them. Copying only today's logical rows is not
   sufficient when an older transaction still needs historical object data.

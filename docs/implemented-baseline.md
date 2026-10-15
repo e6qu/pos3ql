@@ -173,8 +173,7 @@ savepoint allows a corrected creation with the same name. With orders partitione
 by month, a unique index on `(month, reference)` must also reject duplicate
 references inserted earlier in the same transaction into a leaf partition.
 A later partition's failure removes the root and any child indexes already
-created by that statement. Later uniqueness
-checks also use own replacements and deletions: deleting an order lets that
+created by that statement. Later uniqueness checks also use own replacements and deletions: deleting an order lets that
 transaction reuse its reference before commit, including through a saved index.
 An older repeatable read transaction cannot create a unique index that misses
 later committed duplicates. The [PostgreSQL 18 index-build implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/heap/heapam_handler.c)
@@ -191,12 +190,18 @@ chains again.
 
 **User example:** a report sees two valid orders, then another session commits
 an invalid third order. Adding a CHECK constraint must reject the third order
-with `23514`, while the report still sees its original two. A foreign key must
-also accept a new valid parent committed before validation, including one in a
+with `23514`, while the report still sees its original two. A failed check or
+savepoint rollback keeps the prior table definition and data.
+
+A foreign key must also accept a new valid parent committed before validation,
+including one in a
 partitioned parent's leaf. Deleting through that leaf still enforces its foreign
 keys. Adding a partition checks the default partition's existing rows before
-narrowing its allowed range. A failed check or
-savepoint rollback keeps the prior table definition and data.
+narrowing its allowed range.
+
+SQL functions declared `STABLE` promise consistent results within a statement. Their queries keep the transaction's ordinary
+snapshot in a table CHECK: a function can see an earlier lookup value while the
+check examines a new order.
 The [PostgreSQL 18 table validation implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c)
 uses a fresh snapshot for these stored-row scans; the reference tests compare
 actual PostgreSQL behavior without moving the caller's query snapshot.

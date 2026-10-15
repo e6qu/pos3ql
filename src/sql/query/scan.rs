@@ -6610,47 +6610,62 @@ fn scan_source_mode<'a>(
                 };
                 let mut index = 0usize;
                 let mut aborted = false;
+                let definitions = storage.table_definition_images();
+                let logical = scope
+                    .defs
+                    .get(order[depth])
+                    .expect("resolved logical relation");
                 for &leaf in &leaves[..n_leaves] {
                     storage.record_relation_scan(txid, leaf, None, 0)?;
-                    storage.for_each_row_state(leaf, &mut |rowid, state| {
-                        use core::ops::ControlFlow;
-                        check_timeout()?;
-                        let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? else {
-                            return Ok(ControlFlow::Continue(()));
-                        };
-                        storage.record_relation_tuple_read(txid, leaf, None)?;
-                        let this = index;
-                        index += 1;
-                        let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
-                            let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
-                            if leaf == slot {
-                                visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
-                            } else {
-                                let physical = storage.table_def(leaf, txid);
+                    let physical = definitions.definition(storage, leaf, txid)?;
+                    let mapping = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
+                    let mut schema = [ColType::Bool; MAX_COLUMNS];
+                    physical.schema(&mut schema);
+                    let schema = &schema[..physical.n_columns];
+                    let scan = storage.captured_row_scan_in(leaf, txid, arena)?;
+                    let mut visit =
+                        |rowid, physical_values: &[Datum<'a>]| -> Result<bool, SqlError> {
+                            check_timeout()?;
+                            storage.record_relation_tuple_read(txid, leaf, None)?;
+                            let this = index;
+                            index += 1;
+                            recycled(arena, recycle_rows, retain_match, || {
                                 let values = arena
-                                    .alloc_slice_with(physical.n_columns, |_| Datum::Null)
+                                    .alloc_slice_with(logical.n_columns, |_| Datum::Null)
                                     .map_err(|_| arena_full())?;
-                                let mut schema = [ColType::Bool; MAX_COLUMNS];
-                                physical.schema(&mut schema);
-                                rowenc::decode(bytes, &schema[..physical.n_columns], values)?;
+                                mapping.project(physical_values, values);
                                 refresh_catalog_object_names(storage, txid, values, arena)?;
-                                let logical_width = scope
-                                    .defs
-                                    .get(order[depth])
-                                    .expect("resolved logical relation")
-                                    .n_columns;
-                                visit_candidate!(
-                                    this,
-                                    BoundRow::Values(&values[..logical_width]),
-                                    Some(rowid)
-                                )
-                            }
-                        })?;
-                        if !keep_scanning {
-                            aborted = true;
-                            return Ok(ControlFlow::Break(()));
+                                visit_candidate!(this, BoundRow::Values(values), Some(rowid))
+                            })
+                        };
+                    let flow = scan.for_each_overlay(&mut |rowid, home| {
+                        let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
+                        let mut values = [Datum::Null; MAX_COLUMNS];
+                        rowenc::decode(bytes, schema, &mut values)?;
+                        if !visit(rowid, &values[..physical.n_columns])? {
+                            return Ok(core::ops::ControlFlow::Break(()));
                         }
-                        Ok(ControlFlow::Continue(()))
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    })?;
+                    if flow.is_break() {
+                        return Ok(false);
+                    }
+                    scan.for_each_spilled_row_batch(arena, recycle_rows, None, &mut |rows| {
+                        for row in rows {
+                            let mut decoded = [Datum::Null; MAX_COLUMNS];
+                            let values = match row.representation {
+                                crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                                    rowenc::decode(bytes, schema, &mut decoded)?;
+                                    &decoded[..physical.n_columns]
+                                }
+                                crate::storage::SpilledRowRepresentation::Values(values) => values,
+                            };
+                            if !visit(row.rowid, values)? {
+                                aborted = true;
+                                return Ok(core::ops::ControlFlow::Break(()));
+                            }
+                        }
+                        Ok(core::ops::ControlFlow::Continue(()))
                     })?;
                     if aborted {
                         return Ok(false);

@@ -54,16 +54,24 @@ jobs:
           CONFIG
           cat tests/external/differential-capacities.conf >> "$RUNNER_TEMP/partition-order.conf"
       - name: Lint all targets
+        id: lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Column mapping and partition regression tests
         run: |
           set -euo pipefail
+          qualification_status=0
           for filter in relation_column_maps dml_target partition copy_ pgoutput metadata_alter; do
-            cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee -a "$RUNNER_TEMP/partition-order-tests.log"
+            if ! cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee -a "$RUNNER_TEMP/partition-order-tests.log"; then
+              qualification_status=1
+            fi
           done
+          exit "$qualification_status"
       - name: Build candidate reference executable
+        id: build
+        if: ${{ !cancelled() && steps.lint.conclusion == 'success' }}
         run: cargo build --locked
       - name: Compare transaction behavior with PostgreSQL 18
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
         env:
           PGHOST: 127.0.0.1
           PGPORT: "5432"
@@ -84,6 +92,7 @@ jobs:
           done
           target/external-venv/bin/python tests/external/mvcc_diff.py
       - name: Compare actual PostgreSQL and pos3ql partition subscribers
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
         run: |
           set -euo pipefail
           psql -h 127.0.0.1 -p 5432 -U postgres -c "ALTER SYSTEM SET wal_level = logical"

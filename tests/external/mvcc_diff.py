@@ -181,6 +181,10 @@ def partition_move_transcript(reader, writer, reordered=False) -> list[str]:
         reader.execute("INSERT INTO move_low_diff(id) VALUES (7)")
         changed = reader.execute("INSERT INTO move_write_diff(id, label) VALUES (1, 'upsert') ON CONFLICT(id) DO UPDATE SET label = excluded.label RETURNING id, label, computed").fetchall()
         results.append(f"leaf_upsert={changed}")
+        changed = reader.execute("INSERT INTO move_write_diff(id, label) SELECT 8, 'selected' RETURNING id, label, computed").fetchall()
+        results.append(f"leaf_insert_select={changed}")
+        changed = reader.execute("INSERT INTO move_write_diff(id, label) SELECT 8, 'selected conflict' ON CONFLICT(id) DO UPDATE SET label = excluded.label RETURNING id, label, computed").fetchall()
+        results.append(f"leaf_select_conflict={changed}")
         for label, command in [
             ("update_move", "UPDATE move_write_diff SET id = 11, label = 'moved' WHERE id = 1 RETURNING id, label, computed"),
             ("merge_skip_delete", "MERGE INTO move_write_diff t USING (VALUES (2, 12)) AS s(old_id, new_id) ON t.id = s.old_id WHEN MATCHED THEN UPDATE SET id = s.new_id RETURNING t.id, t.label, t.computed"),

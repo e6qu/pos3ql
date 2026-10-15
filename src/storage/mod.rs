@@ -10,9 +10,7 @@ pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
 mod table_definitions;
 pub(crate) use table_definitions::TableDefinitionRead;
-use table_definitions::{
-    DefinitionVersions, PendingDefinitionHead, PendingDefinitionRead, TableDefinition,
-};
+use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
 pub(crate) mod foreign;
 mod partition_rows;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
@@ -3760,7 +3758,6 @@ struct PendingTableDef {
 
 #[derive(Debug, Clone, Copy)]
 struct PendingTableDefSlot {
-    used: bool,
     previous: Option<u32>,
     depth: u32,
     version: PendingTableDef,
@@ -17650,8 +17647,7 @@ impl Storage {
                 * size_of::<SubscriptionRelation>()
             + foreign::ForeignCatalog::budget_bytes(config)
             + config.max_foreign_sessions * foreign_session_slot_bytes()
-            + DefinitionVersions::control_bytes()
-            + pending_table_definition_capacity(config) * size_of::<PendingTableDefSlot>()
+            + DefinitionVersions::budget_bytes(pending_table_definition_capacity(config))
             + StatisticsVersions::budget_bytes(config)
             + table_slot_capacity(config) * TableStatisticsOwner::allocation_bytes()
             + config.max_large_objects * size_of::<LargeObjectDef>()
@@ -27357,8 +27353,7 @@ impl Storage {
             rename_table_sql_identity(&mut definition, prior, name)?;
             let mut tail = table.pending_definition_tail();
             while let Some(pending_slot) = tail {
-                let pending_versions = self.pending_table_defs.read();
-                let pending = &pending_versions[pending_slot as usize];
+                let pending = self.pending_table_defs.exclusive(pending_slot as usize);
                 let mut definition = pending.version.def;
                 rename_table_sql_identity(&mut definition, prior, name)?;
                 tail = pending.previous;
@@ -27421,7 +27416,7 @@ impl Storage {
             table.mark_dirty();
             let mut tail = table.pending_definition_tail();
             while let Some(pending_slot) = tail {
-                let entry = &mut self.pending_table_defs.exclusive()[pending_slot as usize];
+                let entry = &mut *self.pending_table_defs.exclusive(pending_slot as usize);
                 let pending = &mut entry.version;
                 rename_schema_name(&mut pending.def.schema, prior, name);
                 for column in pending.def.columns.iter_mut().take(pending.def.n_columns) {
@@ -34346,18 +34341,9 @@ impl Storage {
         PendingDefinitionRead::current(&self.tables[index].definition, &self.pending_table_defs)
     }
 
-    fn clear_pending_table_defs(&mut self, index: usize) {
-        let mut tail = self.tables[index]
-            .definition
-            .exclusive()
-            .pending
-            .take()
-            .map(|head| head.tail);
-        while let Some(slot) = tail {
-            let entry = &mut self.pending_table_defs.exclusive()[slot as usize];
-            tail = entry.previous;
-            entry.used = false;
-        }
+    fn clear_pending_table_defs(&self, index: usize) {
+        self.pending_table_defs
+            .clear(&self.tables[index].definition);
     }
 
     /// Installs the next transaction-owned table shape. `column_mapping`
@@ -34415,82 +34401,22 @@ impl Storage {
             rewrites_rows: rewrites_rows
                 || prior.is_some_and(|version| version.txid == txid && version.rewrites_rows),
         };
-        let previous = self.tables[index].pending_definition_tail();
-        if previous.is_some_and(|slot| {
-            self.pending_table_defs.exclusive()[slot as usize].depth
-                >= self.max_catalog_versions_per_object
-        }) {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "relation \"{}\" exceeds max_catalog_versions_per_object ({})",
-                {
-                    let definition = self.tables[index].definition();
-                    definition.name
-                }
-                .as_str(),
-                self.max_catalog_versions_per_object
-            ));
-        }
-        let depth = previous.map_or(1, |slot| {
-            self.pending_table_defs.exclusive()[slot as usize].depth + 1
-        });
-        let slot = match self
-            .pending_table_defs
-            .exclusive()
-            .iter()
-            .position(|entry| !entry.used)
-        {
-            Some(slot) => {
-                self.pending_table_defs.exclusive()[slot] = PendingTableDefSlot {
-                    used: true,
-                    previous,
-                    depth,
-                    version,
-                };
-                slot
-            }
-            None => {
-                let slot = self.pending_table_defs.exclusive().len();
-                self.pending_table_defs
-                    .exclusive()
-                    .push(PendingTableDefSlot {
-                        used: true,
-                        previous,
-                        depth,
-                        version,
-                    })
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "pending table-definition pool is exhausted"
-                        )
-                    })?;
-                slot
-            }
-        };
-        self.tables[index].definition.exclusive().pending = Some(PendingDefinitionHead {
-            tail: slot as u32,
-            transaction: txid,
-        });
+        self.pending_table_defs.stage(
+            &self.tables[index].definition,
+            version,
+            self.max_catalog_versions_per_object,
+        )?;
         self.refresh_table_comment_identity(index, txid);
         Ok(())
     }
 
     pub fn rollback_table_def(&mut self, index: usize, txid: u32) {
-        if self.tables[index].pending_definition_transaction() != Some(txid) {
-            return;
+        if self
+            .pending_table_defs
+            .rollback(&self.tables[index].definition, txid)
+        {
+            self.refresh_table_comment_identity(index, txid);
         }
-        let Some(slot) = self.tables[index].pending_definition_tail() else {
-            return;
-        };
-        let previous = self.pending_table_defs.exclusive()[slot as usize].previous;
-        self.pending_table_defs.exclusive()[slot as usize].used = false;
-        self.tables[index].definition.exclusive().pending =
-            previous.map(|tail| PendingDefinitionHead {
-                tail,
-                transaction: txid,
-            });
-        self.refresh_table_comment_identity(index, txid);
     }
 
     fn refresh_table_comment_identity(&mut self, index: usize, txid: u32) {

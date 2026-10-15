@@ -163,6 +163,15 @@ progress and leaves later release notifications pending for the next attempt.
 
 **User example:** finishing a report can reclaim its old order versions without
 keeping an unrelated customer update waiting for every table to be visited.
+
+Pending table definitions retain their table and one reserved version slot.
+A reader releases the pool's allocation control before returning the definition;
+another table can publish, roll back, or retire its own versions while that reader
+keeps its selection. Slot controls and version capacity are charged at startup.
+A full pool or version history returns `54000` before changing the published
+head. Rolling back or removing a table releases only its own chain of versions.
+This protection does not enable parallel SQL execution; fixed workers and the
+remaining table creation/removal coordination are still in [PLAN.md](../PLAN.md).
 A new report admitted between cleanup batches still keeps the versions it needs.
 
 Client descriptions and data-changing WITH queries use the same DML output

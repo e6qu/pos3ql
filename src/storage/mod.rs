@@ -29948,15 +29948,28 @@ impl Storage {
         table_slot: usize,
         each: &mut RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        let rowids = self.row_walks.retain(&self.tables[table_slot].rows)?;
+        let (target, rowids) = self.retain_metadata_walk_rows(table_slot)?;
         for rowid in rowids.iter() {
-            if let Some(state) = self.resident_row_state(table_slot, rowid)?
+            if let Some(state) = self.capture_resident_row_metadata(target, rowid)?
                 && each(rowid, state)?.is_break()
             {
                 return Ok(core::ops::ControlFlow::Break(()));
             }
         }
         Ok(core::ops::ControlFlow::Continue(()))
+    }
+
+    fn retain_metadata_walk_rows(
+        &self,
+        table_slot: usize,
+    ) -> Result<(row_walks::RowMetadataTarget, row_walks::RetainedRowIds), SqlError> {
+        let table = &self.tables[table_slot];
+        let definition = table.definition.read();
+        let target = row_walks::RowMetadataTarget::Captured {
+            table: table_slot,
+            created_at: definition.identity.created_at,
+        };
+        Ok((target, self.row_walks.retain(&table.rows)?))
     }
 
     fn retain_checkpoint_rowids(
@@ -30247,8 +30260,18 @@ impl Storage {
         table_slot: usize,
         rowid: u64,
     ) -> Result<Option<RowRead<'static>>, SqlError> {
+        self.capture_resident_row_metadata(row_walks::RowMetadataTarget::Current(table_slot), rowid)
+    }
+
+    fn capture_resident_row_metadata(
+        &self,
+        target: row_walks::RowMetadataTarget,
+        rowid: u64,
+    ) -> Result<Option<RowRead<'static>>, SqlError> {
+        let table_slot = target.table();
         let table = &self.tables[table_slot];
         let definition = table.definition.read();
+        target.validate(definition.identity.created_at)?;
         let publication = table.publication();
         let generations = table.spill_generations();
         let image = spill_generations::SpillGenerationImage::capture(

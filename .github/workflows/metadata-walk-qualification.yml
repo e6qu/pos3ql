@@ -1,0 +1,94 @@
+name: Metadata walk qualification
+
+on:
+  push:
+    branches: [guard-metadata-walk-incarnations]
+
+concurrency:
+  group: metadata-walk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Reproduce legacy pending-byte selection after relocation
+        run: |
+          set -euo pipefail
+          cp src/storage/row_walks.rs "$RUNNER_TEMP/row_walks.original"
+          trap 'cp "$RUNNER_TEMP/row_walks.original" src/storage/row_walks.rs' EXIT
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          path = Path('src/storage/row_walks.rs')
+          source = path.read_text()
+          begin = source.index('fn pending_row_image(')
+          end = source.index('\nimpl RowWalkPool {', begin)
+          legacy = '''fn pending_row_image(
+              storage: &Storage, table: usize, rowid: u64, state: super::RowRead<'_>,
+          ) -> Result<Option<PendingRowRead>, SqlError> {
+              let Some(change) = state.pending_last() else { return Ok(None); };
+              let image = change.loc.map(|location| storage.pin_visible_home(
+                  table, rowid, super::RowSnapshot {
+                      created_at: storage.tables[table].created_at(),
+                      version: super::row_images::RowVersionIdentity::Pending(
+                          state.pending_head_identity().expect("pending head")),
+                  }, RowHome::Heap(location),
+              )).transpose()?;
+              Ok(Some(PendingRowRead { change, image }))
+          }
+          '''
+          source = source[:begin] + legacy + source[end:]
+          assert source.count('pending_row_image(table, rowid, state)') == 1
+          source = source.replace('pending_row_image(table, rowid, state)', 'pending_row_image(self, table, rowid, state)')
+          assert source.count('pending_row_image(table, 1, state)') == 1
+          source = source.replace('pending_row_image(table, 1, state)', 'pending_row_image(&storage, table, 1, state)')
+          path.write_text(source)
+          PYCODE
+          set +e
+          cargo test --lib --locked metadata_walk_pending_bytes_keep_the_original_heap_after_relocation -- --nocapture --test-threads=1 > "$RUNNER_TEMP/legacy-metadata.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/legacy-metadata.log"
+          test "$result" -ne 0
+          python3 - <<'PYCODE'
+          import os
+          from pathlib import Path
+          log = (Path(os.environ['RUNNER_TEMP']) / 'legacy-metadata.log').read_text(errors='replace')
+          assert 'metadata_walk_pending_bytes_keep_the_original_heap_after_relocation ... FAILED' in log
+          assert 'row heap location was invalidated by relocation' in log
+          print('Legacy heap selection reproduces the captured-location failure')
+          PYCODE
+      - name: Verify the candidate source is restored
+        run: git diff --exit-code
+      - name: Lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Metadata walks and retained row owners
+        run: |
+          set -euo pipefail
+          for filter in row_walks row_read_ownership; do
+            cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/metadata-tests.log"
+          done
+      - name: Symbolicate allocation failures in one batch
+        if: failure()
+        run: |
+          python3 - <<'PYCODE'
+          import os, re, subprocess
+          from pathlib import Path
+          log = Path(os.environ['RUNNER_TEMP']) / 'metadata-tests.log'
+          if log.exists():
+              frames = re.findall(r'(\S*/target/debug/deps/pos3ql-[0-9a-f]+)\(\+(0x[0-9a-f]+)\)', log.read_text(errors='replace'))
+              for binary in sorted({binary for binary, _ in frames}):
+                  addresses = [address for owner, address in frames if owner == binary]
+                  subprocess.run(['addr2line', '-C', '-f', '-e', binary, *addresses], check=True)
+          PYCODE

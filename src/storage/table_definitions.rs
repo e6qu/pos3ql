@@ -67,6 +67,13 @@ impl TableDefinition {
         self.state.read().expect("table definition lock poisoned")
     }
 
+    #[cfg(test)]
+    pub(super) fn test_write(
+        &self,
+    ) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, DefinitionState>> {
+        self.state.try_write()
+    }
+
     pub(super) fn exclusive(&mut self) -> &mut DefinitionState {
         self.state
             .get_mut()

@@ -674,6 +674,7 @@ fn sql_fail(e: SqlError) -> Outcome {
 }
 
 mod copy_transition;
+mod partition_insert;
 pub(crate) use copy_transition::CopyTransitionRows;
 
 mod describe;
@@ -52571,141 +52572,178 @@ fn finish_copy_row<'a>(
     values: &mut [Datum<'a>; MAX_COLUMNS],
     arena: &'a Arena,
 ) -> Result<CopyRowOutcome, SqlError> {
-    let initial_target = storage.partition_target(
-        logical_table,
-        definition,
-        &values[..definition.n_columns],
-        txn.txid,
-    )?;
-    if !fire_partition_row_triggers(
-        storage,
-        txn,
-        arena,
-        seq_session,
-        responder,
-        scratch as *mut _,
-        initial_target,
-        definition,
-        TriggerEvents::INSERT,
-        true,
-        false,
-        ColumnSet::EMPTY,
-        None,
-        Some(&mut values[..definition.n_columns]),
-    )? {
-        return Ok(CopyRowOutcome::Filtered);
-    }
-    compute_generated(definition, generated, values, storage, txn.txid, arena)?;
-    storage.validate_partition_target(
-        initial_target,
-        definition,
-        &values[..definition.n_columns],
-        txn.txid,
-    )?;
-    let target = initial_target;
-    if let Some(role) = security_role
-        && let Some(plan) = super::query::plan_row_security(
-            storage,
-            logical_table,
-            usize::from(role),
-            PolicyCommandKind::Insert,
-            super::query::RowSecurityExpression::WithCheck,
-            txn.txid,
-            arena,
-        )?
-    {
-        let row = RowCtx {
-            def: definition,
-            values: &values[..definition.n_columns],
-            alias: None,
-        };
-        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-        let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            sequences: Some(&sequences),
-            ..NO_HOOKS
-        };
-        if !super::query::row_security_passes(plan, &row, storage, txn.txid, arena, &[], &hooks)? {
-            return Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "new row violates row-level security policy for table \"{}\"",
-                definition.name.as_str()
-            ));
-        }
-    }
-    check_not_null(definition, values)?;
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
-    definition.schema(&mut schema);
-    let row = if definition.kind == crate::storage::TableKind::Foreign {
-        ConstraintRow::Validation { excluded: None }
-    } else {
-        ConstraintRow::insert(storage.next_rowid()?)
-    };
-    enforce_row_constraints(
-        storage,
-        target,
-        definition,
-        &schema[..definition.n_columns],
-        &values[..definition.n_columns],
-        row,
-        txn.txid,
-        Some(txn),
-        checks,
-        arena,
-        &[],
-    )?;
-    if definition.kind == crate::storage::TableKind::Foreign {
-        crate::sql::foreign::insert_row(
-            storage,
-            target,
-            txn.txid,
-            &mut values[..definition.n_columns],
-            false,
-            responder.render_context(),
-            arena,
-        )?
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "foreign COPY INSERT unexpectedly returned no row"
-            )
-        })?;
-    } else {
-        store_row(
-            storage,
-            txn,
-            target,
-            row.stored(),
-            &values[..definition.n_columns],
-        )?;
-    }
-    if transition_capture_required(
+    partition_insert::with_partition_insert_row(
         storage,
         logical_table,
-        txn.txid,
-        txn.replication_apply,
-        TriggerEvents::INSERT,
-    ) {
-        inserted.capture(&values[..definition.n_columns])?;
-    }
-    fire_partition_row_triggers(
-        storage,
-        txn,
-        arena,
-        seq_session,
-        responder,
-        scratch,
-        target,
         definition,
-        TriggerEvents::INSERT,
-        false,
-        false,
-        ColumnSet::EMPTY,
-        None,
-        Some(&mut values[..definition.n_columns]),
-    )?;
-    Ok(CopyRowOutcome::Stored)
+        values,
+        txn.txid,
+        arena,
+        |storage, target, physical, values, mapping| {
+            let leaf_checks;
+            let checks = if target == logical_table {
+                checks
+            } else {
+                leaf_checks = parse_checks(physical, arena)?;
+                &leaf_checks
+            };
+            let leaf_generated;
+            let generated = if target == logical_table {
+                generated
+            } else {
+                leaf_generated = parse_generated(physical, arena)?;
+                &leaf_generated
+            };
+            if !fire_partition_row_triggers(
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch as *mut _,
+                target,
+                physical,
+                TriggerEvents::INSERT,
+                true,
+                false,
+                ColumnSet::EMPTY,
+                None,
+                Some(&mut values[..physical.n_columns]),
+            )? {
+                return Ok(CopyRowOutcome::Filtered);
+            }
+            compute_generated(physical, generated, values, storage, txn.txid, arena)?;
+            storage.validate_partition_target(
+                target,
+                physical,
+                &values[..physical.n_columns],
+                txn.txid,
+            )?;
+            if let Some(role) = security_role
+                && let Some(plan) = super::query::plan_row_security(
+                    storage,
+                    logical_table,
+                    usize::from(role),
+                    PolicyCommandKind::Insert,
+                    super::query::RowSecurityExpression::WithCheck,
+                    txn.txid,
+                    arena,
+                )?
+            {
+                let logical_values = partition_insert::logical_insert_values(
+                    mapping,
+                    definition.n_columns,
+                    &values[..physical.n_columns],
+                    arena,
+                )?;
+                let row = RowCtx {
+                    def: definition,
+                    values: logical_values,
+                    alias: None,
+                };
+                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let hooks = EvalHooks {
+                    catalog: Some(&catalog),
+                    sequences: Some(&sequences),
+                    ..NO_HOOKS
+                };
+                if !super::query::row_security_passes(
+                    plan,
+                    &row,
+                    storage,
+                    txn.txid,
+                    arena,
+                    &[],
+                    &hooks,
+                )? {
+                    return Err(sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "new row violates row-level security policy for table \"{}\"",
+                        definition.name.as_str()
+                    ));
+                }
+            }
+            check_not_null(physical, values)?;
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            physical.schema(&mut schema);
+            let row = if physical.kind == crate::storage::TableKind::Foreign {
+                ConstraintRow::Validation { excluded: None }
+            } else {
+                ConstraintRow::insert(storage.next_rowid()?)
+            };
+            enforce_row_constraints(
+                storage,
+                target,
+                physical,
+                &schema[..physical.n_columns],
+                &values[..physical.n_columns],
+                row,
+                txn.txid,
+                Some(txn),
+                checks,
+                arena,
+                &[],
+            )?;
+            if physical.kind == crate::storage::TableKind::Foreign {
+                crate::sql::foreign::insert_row(
+                    storage,
+                    target,
+                    txn.txid,
+                    &mut values[..physical.n_columns],
+                    false,
+                    responder.render_context(),
+                    arena,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "foreign COPY INSERT unexpectedly returned no row"
+                    )
+                })?;
+            } else {
+                store_row(
+                    storage,
+                    txn,
+                    target,
+                    row.stored(),
+                    &values[..physical.n_columns],
+                )?;
+            }
+            if transition_capture_required(
+                storage,
+                logical_table,
+                txn.txid,
+                txn.replication_apply,
+                TriggerEvents::INSERT,
+            ) {
+                let logical_values = partition_insert::logical_insert_values(
+                    mapping,
+                    definition.n_columns,
+                    &values[..physical.n_columns],
+                    arena,
+                )?;
+                inserted.capture(logical_values)?;
+            }
+            fire_partition_row_triggers(
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch,
+                target,
+                physical,
+                TriggerEvents::INSERT,
+                false,
+                false,
+                ColumnSet::EMPTY,
+                None,
+                Some(&mut values[..physical.n_columns]),
+            )?;
+            Ok(CopyRowOutcome::Stored)
+        },
+    )?
 }
 
 /// Applies one pgoutput INSERT tuple through the ordinary row core. Omitted

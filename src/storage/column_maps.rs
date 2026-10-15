@@ -12,6 +12,21 @@ pub(crate) struct RelationColumnMap<'arena> {
 }
 
 impl<'arena> RelationColumnMap<'arena> {
+    pub(crate) fn same_order(logical: &TableDef, physical: &TableDef) -> bool {
+        logical.n_columns == physical.n_columns
+            && logical
+                .columns()
+                .iter()
+                .zip(physical.columns())
+                .all(|(left, right)| {
+                    left.name == right.name
+                        && left.ctype == right.ctype
+                        && left.type_mod == right.type_mod
+                        && left.collation == right.collation
+                        && left.user_type == right.user_type
+                })
+    }
+
     pub(crate) fn new(
         logical: &TableDef,
         physical: &TableDef,

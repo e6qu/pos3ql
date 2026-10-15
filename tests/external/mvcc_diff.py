@@ -67,12 +67,20 @@ def generated_write_transcript(reader, writer) -> list[str]:
         writer.execute("DROP FUNCTION generated_write_before_diff()")
 
 
-def partition_move_transcript(reader, writer) -> list[str]:
+def partition_move_transcript(reader, writer, reordered=False) -> list[str]:
     writer.execute("CREATE TABLE move_write_diff(id integer PRIMARY KEY, label text, computed integer GENERATED ALWAYS AS (length(label)) STORED) PARTITION BY RANGE(id)")
-    writer.execute("CREATE TABLE move_low_diff PARTITION OF move_write_diff FOR VALUES FROM (0) TO (10)")
-    writer.execute("CREATE TABLE move_high_diff PARTITION OF move_write_diff FOR VALUES FROM (10) TO (20)")
-    writer.execute("ALTER TABLE move_low_diff ALTER COLUMN computed SET EXPRESSION AS (length(label) + 100)")
-    writer.execute("ALTER TABLE move_high_diff ALTER COLUMN computed SET EXPRESSION AS (length(label) + 200)")
+    if reordered:
+        writer.execute("CREATE TABLE move_low_diff(computed integer GENERATED ALWAYS AS (length(label) + 100) STORED, label text, id integer NOT NULL)")
+        writer.execute("CREATE TABLE move_high_diff(label text, id integer NOT NULL, computed integer GENERATED ALWAYS AS (length(label) + 200) STORED)")
+        writer.execute("ALTER TABLE move_write_diff ATTACH PARTITION move_low_diff FOR VALUES FROM (0) TO (10)")
+        writer.execute("ALTER TABLE move_write_diff ATTACH PARTITION move_high_diff FOR VALUES FROM (10) TO (20)")
+    else:
+        writer.execute("CREATE TABLE move_low_diff PARTITION OF move_write_diff FOR VALUES FROM (0) TO (10)")
+        writer.execute("CREATE TABLE move_high_diff PARTITION OF move_write_diff FOR VALUES FROM (10) TO (20)")
+        writer.execute("ALTER TABLE move_low_diff ALTER COLUMN computed SET EXPRESSION AS (length(label) + 100)")
+        writer.execute("ALTER TABLE move_high_diff ALTER COLUMN computed SET EXPRESSION AS (length(label) + 200)")
+    writer.execute("ALTER TABLE move_write_diff ALTER COLUMN label SET DEFAULT 'parent default'")
+    writer.execute("ALTER TABLE move_low_diff ALTER COLUMN label SET DEFAULT 'child default'")
     writer.execute("CREATE TABLE move_audit_diff(event text, leaf text, id integer, label text, computed integer)")
     writer.execute("""CREATE FUNCTION move_before_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
         IF TG_OP = 'DELETE' THEN
@@ -96,6 +104,15 @@ def partition_move_transcript(reader, writer) -> list[str]:
     writer.execute("TRUNCATE move_audit_diff")
     results = []
     try:
+        with reader.cursor().copy("COPY move_write_diff(id, label) FROM STDIN") as copied:
+            copied.write(b"4\tcopy text\n")
+        with reader.cursor().copy("COPY move_write_diff(id, label) FROM STDIN (FORMAT binary)") as copied:
+            copied.set_types(["int4", "text"])
+            copied.write_row((5, "copy binary"))
+        reader.execute("INSERT INTO move_write_diff(id) VALUES (6)")
+        reader.execute("INSERT INTO move_low_diff(id) VALUES (7)")
+        changed = reader.execute("INSERT INTO move_write_diff(id, label) VALUES (1, 'upsert') ON CONFLICT(id) DO UPDATE SET label = excluded.label RETURNING id, label, computed").fetchall()
+        results.append(f"leaf_upsert={changed}")
         for label, command in [
             ("update_move", "UPDATE move_write_diff SET id = 11, label = 'moved' WHERE id = 1 RETURNING id, label, computed"),
             ("merge_skip_delete", "MERGE INTO move_write_diff t USING (VALUES (2, 12)) AS s(old_id, new_id) ON t.id = s.old_id WHEN MATCHED THEN UPDATE SET id = s.new_id RETURNING t.id, t.label, t.computed"),
@@ -116,7 +133,7 @@ def partition_move_transcript(reader, writer) -> list[str]:
         rows = reader.execute("SELECT id, label, computed FROM move_write_diff ORDER BY id").fetchall()
         audit = reader.execute("SELECT event, leaf, id, label, computed FROM move_audit_diff ORDER BY event, id, label").fetchall()
         results.append(f"move_rollback=rows:{rows},audit:{audit}")
-        return results
+        return [("reordered_" if reordered else "ordered_") + result for result in results]
     finally:
         reader.execute("ROLLBACK")
         writer.execute("DROP TABLE move_write_diff CASCADE")
@@ -860,7 +877,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + merge_write_transcript(reader, writer) + partition_move_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + merge_write_transcript(reader, writer) + partition_move_transcript(reader, writer) + partition_move_transcript(reader, writer, reordered=True) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

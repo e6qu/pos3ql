@@ -67928,12 +67928,10 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         &mut engine,
         &mut budget,
         "CREATE TABLE replicated_partition (id int PRIMARY KEY, body text, computed integer GENERATED ALWAYS AS (length(body)) STORED) PARTITION BY RANGE (id); \
-         CREATE TABLE replicated_partition_low PARTITION OF replicated_partition \
-           FOR VALUES FROM (0) TO (10); \
-         CREATE TABLE replicated_partition_high PARTITION OF replicated_partition \
-           FOR VALUES FROM (10) TO (20); \
-         ALTER TABLE replicated_partition_low ALTER COLUMN computed SET EXPRESSION AS (length(body) + 100); \
-         ALTER TABLE replicated_partition_high ALTER COLUMN computed SET EXPRESSION AS (length(body) + 200); \
+         CREATE TABLE replicated_partition_low(body text, computed integer GENERATED ALWAYS AS (length(body) + 100) STORED, id integer NOT NULL); \
+         CREATE TABLE replicated_partition_high(computed integer GENERATED ALWAYS AS (length(body) + 200) STORED, id integer NOT NULL, body text); \
+         ALTER TABLE replicated_partition ATTACH PARTITION replicated_partition_low FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE replicated_partition ATTACH PARTITION replicated_partition_high FOR VALUES FROM (10) TO (20); \
          CREATE TABLE replicated_partition_audit(event text, leaf text, id integer, body text, computed integer); \
          CREATE FUNCTION replicated_partition_before() RETURNS trigger LANGUAGE plpgsql AS \
            'BEGIN IF TG_OP = ''INSERT'' THEN NEW.body := upper(NEW.body); ELSE NEW.body := NEW.body || '':U''; END IF; RETURN NEW; END'; \

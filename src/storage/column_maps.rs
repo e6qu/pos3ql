@@ -204,7 +204,8 @@ mod tests {
             mapping.project(&stored, &mut selected);
             let decoder = RelationRowDecoder::new(&logical, &physical).unwrap();
             let mut encoded = [0u8; 128];
-            let width = super::super::rowenc::encode(&stored, &mut encoded);
+            let width = super::super::rowenc::encoded_len(&stored);
+            super::super::rowenc::encode(&stored, &mut encoded);
             let mut decoded = [Datum::Null; 2];
             decoder.decode(&encoded[..width], &mut decoded).unwrap();
             assert_eq!(decoded, selected);

@@ -49,8 +49,8 @@ def setup_subscriber(connection):
             RETURN NEW;
         END$$""",
         """CREATE FUNCTION subscription_layout_after_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
-            IF TG_OP = 'DELETE' THEN INSERT INTO subscription_layout_audit_diff VALUES (TG_OP, TG_TABLE_NAME, OLD.id, OLD.label, OLD.computed);
-            ELSE INSERT INTO subscription_layout_audit_diff VALUES (TG_OP, TG_TABLE_NAME, NEW.id, NEW.label, NEW.computed); END IF;
+            IF TG_OP = 'DELETE' THEN INSERT INTO public.subscription_layout_audit_diff VALUES (TG_OP, TG_TABLE_NAME, OLD.id, OLD.label, OLD.computed);
+            ELSE INSERT INTO public.subscription_layout_audit_diff VALUES (TG_OP, TG_TABLE_NAME, NEW.id, NEW.label, NEW.computed); END IF;
             RETURN NULL;
         END$$""",
         "CREATE TRIGGER subscription_layout_before_diff BEFORE INSERT OR UPDATE ON subscription_layout_diff FOR EACH ROW EXECUTE FUNCTION subscription_layout_before_diff()",
@@ -96,7 +96,7 @@ def main():
             for connection, name in subscriptions:
                 deadline = time.monotonic() + 10
                 while True:
-                    states = connection.execute("SELECT r.srsubstate FROM pg_subscription_rel r JOIN pg_subscription s ON s.oid = r.srsubid WHERE s.subname = %s", (name,), prepare=False).fetchall()
+                    states = connection.execute("SELECT r.srsubstate::text FROM pg_subscription_rel r JOIN pg_subscription s ON s.oid = r.srsubid WHERE s.subname = %s", (name,), prepare=False).fetchall()
                     if states == [("r",)]:
                         break
                     if time.monotonic() >= deadline:

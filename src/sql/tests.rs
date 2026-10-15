@@ -67243,11 +67243,11 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         "CREATE TABLE replicated (id int PRIMARY KEY, body text, retained text DEFAULT 'local'); \
          CREATE TABLE replication_trigger_audit (note text); \
          CREATE FUNCTION audit_replication_insert() RETURNS trigger LANGUAGE plpgsql AS \
-         'BEGIN INSERT INTO replication_trigger_audit VALUES (''replica insert''); RETURN NEW; END'; \
+         'BEGIN INSERT INTO public.replication_trigger_audit VALUES (''replica insert''); RETURN NEW; END'; \
          CREATE FUNCTION audit_replication_statement() RETURNS trigger LANGUAGE plpgsql AS \
-         'BEGIN INSERT INTO replication_trigger_audit VALUES (''replica statement''); RETURN NULL; END'; \
+         'BEGIN INSERT INTO public.replication_trigger_audit VALUES (''replica statement''); RETURN NULL; END'; \
          CREATE FUNCTION audit_replication_truncate() RETURNS trigger LANGUAGE plpgsql AS \
-         'BEGIN INSERT INTO replication_trigger_audit VALUES (''replica truncate''); RETURN NULL; END'; \
+         'BEGIN INSERT INTO public.replication_trigger_audit VALUES (''replica truncate''); RETURN NULL; END'; \
          CREATE TRIGGER replicated_replica_insert BEFORE INSERT ON replicated \
          FOR EACH ROW EXECUTE FUNCTION audit_replication_insert(); \
          CREATE TRIGGER replicated_replica_statement AFTER INSERT ON replicated \
@@ -67924,7 +67924,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
     let config = test_config("pgoutput-partition-root-apply");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    run_with(
+    let setup = run_with(
         &mut engine,
         &mut budget,
         "CREATE TABLE replicated_partition (id int PRIMARY KEY, body text, computed integer GENERATED ALWAYS AS (length(body)) STORED) PARTITION BY RANGE (id); \
@@ -67936,7 +67936,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
          CREATE FUNCTION replicated_partition_before() RETURNS trigger LANGUAGE plpgsql AS \
            'BEGIN IF TG_OP = ''INSERT'' THEN NEW.body := upper(NEW.body); ELSE NEW.body := NEW.body || '':U''; END IF; RETURN NEW; END'; \
          CREATE FUNCTION replicated_partition_after() RETURNS trigger LANGUAGE plpgsql AS \
-           'BEGIN IF TG_OP = ''DELETE'' THEN INSERT INTO replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, OLD.id, OLD.body, OLD.computed); RETURN OLD; ELSE INSERT INTO replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, NEW.id, NEW.body, NEW.computed); RETURN NEW; END IF; END'; \
+           'BEGIN IF TG_OP = ''DELETE'' THEN INSERT INTO public.replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, OLD.id, OLD.body, OLD.computed); RETURN OLD; ELSE INSERT INTO public.replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, NEW.id, NEW.body, NEW.computed); RETURN NEW; END IF; END'; \
          CREATE TRIGGER replica_partition_before BEFORE INSERT OR UPDATE ON replicated_partition FOR EACH ROW EXECUTE FUNCTION replicated_partition_before(); \
          CREATE TRIGGER replica_partition_after AFTER INSERT OR UPDATE OR DELETE ON replicated_partition FOR EACH ROW EXECUTE FUNCTION replicated_partition_after(); \
          ALTER TABLE replicated_partition_low ENABLE REPLICA TRIGGER replica_partition_before; \
@@ -67950,6 +67950,11 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
          CREATE SUBSCRIPTION partition_apply CONNECTION \
            'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
            PUBLICATION partition_changes WITH (connect = false, slot_name = NONE)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
     );
     let mut apply = SubscriptionApply::new(
         &mut budget,
@@ -81022,7 +81027,9 @@ fn dml_target_reordered_partition_writes_and_constraints_survive_cold_recovery()
         "CREATE TABLE partition_order_parent(id integer PRIMARY KEY, label text DEFAULT 'parent', seed integer DEFAULT 2, result integer GENERATED ALWAYS AS (100 / seed) STORED) PARTITION BY RANGE(id); \
          CREATE TABLE partition_order_low(label text DEFAULT 'child' UNIQUE, result integer GENERATED ALWAYS AS (200 / seed) STORED, seed integer DEFAULT 4, id integer NOT NULL); \
          CREATE TABLE partition_order_high(seed integer DEFAULT 6, id integer NOT NULL, label text DEFAULT 'high', result integer GENERATED ALWAYS AS (300 / seed) STORED); \
-         INSERT INTO partition_order_low(label, seed, id) VALUES ('pre', 2, 9)", true);
+         INSERT INTO partition_order_low(label, seed, id) VALUES ('pre', 2, 9); \
+         CREATE TABLE partition_order_source(old_id integer, new_id integer, label text); \
+         INSERT INTO partition_order_source VALUES (3, 3, 'merged'), (1, 11, 'unused')", true);
     session.success(&mut engine,
         "ALTER TABLE partition_order_parent ATTACH PARTITION partition_order_low FOR VALUES FROM (0) TO (10); \
          ALTER TABLE partition_order_parent ATTACH PARTITION partition_order_high FOR VALUES FROM (10) TO (20)", true);
@@ -81052,11 +81059,11 @@ fn dml_target_reordered_partition_writes_and_constraints_survive_cold_recovery()
         String::from_utf8_lossy(&failed)
     );
     assert_eq!(data_rows(&session.success(&mut engine,
-        "MERGE INTO partition_order_parent t USING (VALUES (3, 'merged')) AS s(id, label) ON t.id = s.id WHEN MATCHED THEN UPDATE SET label = s.label RETURNING t.id, t.label, t.seed, t.result", true)), ["3|merged|4|50"]);
+        "MERGE INTO partition_order_parent t USING partition_order_source s ON t.id = s.old_id AND s.old_id = 3 WHEN MATCHED THEN UPDATE SET label = s.label RETURNING t.id, t.label, t.seed, t.result", true)), ["3|merged|4|50"]);
     assert_eq!(data_rows(&session.success(&mut engine,
         "UPDATE partition_order_parent SET id = 12 WHERE id = 2 RETURNING id, label, seed, result", true)), ["12|SECOND|4|75"]);
     assert_eq!(data_rows(&session.success(&mut engine,
-        "MERGE INTO partition_order_parent t USING (VALUES (1, 11)) AS s(old_id, new_id) ON t.id = s.old_id WHEN MATCHED THEN UPDATE SET id = s.new_id RETURNING t.id, t.label, t.seed, t.result", true)), ["11|UPDATED|2|150"]);
+        "MERGE INTO partition_order_parent t USING partition_order_source s ON t.id = s.old_id AND s.old_id = 1 WHEN MATCHED THEN UPDATE SET id = s.new_id RETURNING t.id, t.label, t.seed, t.result", true)), ["11|UPDATED|2|150"]);
     session.success(
         &mut engine,
         "BEGIN; UPDATE partition_order_parent SET id = id + 1 WHERE id = 9; ROLLBACK",
@@ -81572,9 +81579,9 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
          CREATE FUNCTION worker_copy_before() RETURNS trigger LANGUAGE plpgsql AS \
          'BEGIN NEW.label := upper(NEW.label); RETURN NEW; END'; \
          CREATE FUNCTION worker_copy_after() RETURNS trigger LANGUAGE plpgsql AS \
-         'BEGIN UPDATE worker_copy_values SET label = label || ''+'' WHERE id < NEW.id; RETURN NEW; END'; \
+         'BEGIN UPDATE public.worker_copy_values SET label = label || ''+'' WHERE id < NEW.id; RETURN NEW; END'; \
          CREATE FUNCTION worker_copy_statement() RETURNS trigger LANGUAGE plpgsql AS \
-         'BEGIN INSERT INTO worker_copy_audit SELECT string_agg(label, '','' ORDER BY id) FROM inserted; RETURN NULL; END'; \
+         'BEGIN INSERT INTO public.worker_copy_audit SELECT string_agg(label, '','' ORDER BY id) FROM inserted; RETURN NULL; END'; \
          CREATE TRIGGER worker_copy_before BEFORE INSERT ON worker_copy_values \
          FOR EACH ROW EXECUTE FUNCTION worker_copy_before(); \
          CREATE TRIGGER worker_copy_after AFTER INSERT ON worker_copy_values \

@@ -7640,6 +7640,7 @@ impl Engine {
                         .relation_visible_to_current_session(slot, txn.txid)
                 {
                     txn.record_statistics(slot as u32)?;
+                    self.work.reset();
                     let started = datetime::now_micros();
                     let statistics = self
                         .storage
@@ -7687,6 +7688,7 @@ impl Engine {
                 }
                 drop(definition);
                 txn.record_statistics(slot as u32)?;
+                self.work.reset();
                 let started = datetime::now_micros();
                 let statistics = self.storage.analyze_table(
                     slot,

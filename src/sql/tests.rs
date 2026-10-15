@@ -43730,6 +43730,37 @@ fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statisti
 }
 
 #[test]
+fn analyze_reclaims_each_target_capture_within_the_fixed_work_arena() {
+    let mut config = test_config("analysis-target-recycling");
+    config.work_arena_bytes = 12 << 10;
+    config.max_tables = 4;
+    config.table_rows = 512;
+    config.value_index_rows = 512;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE analyze_budget_a(id integer); CREATE TABLE analyze_budget_b(id integer); \
+         CREATE TABLE analyze_budget_c(id integer); \
+         INSERT INTO analyze_budget_a SELECT i FROM generate_series(1, 256) AS g(i); \
+         INSERT INTO analyze_budget_b SELECT i FROM generate_series(1, 256) AS g(i); \
+         INSERT INTO analyze_budget_c SELECT i FROM generate_series(1, 256) AS g(i)",
+        true,
+    );
+    session.success(&mut engine, "ANALYZE", true);
+    session.success(
+        &mut engine,
+        "ANALYZE analyze_budget_a, analyze_budget_b, analyze_budget_c",
+        true,
+    );
+    for name in ["analyze_budget_a", "analyze_budget_b", "analyze_budget_c"] {
+        let table = engine.storage.find_table("public", name).unwrap();
+        assert_eq!(engine.storage.table_statistics(table, 0).rows, 256);
+    }
+}
+
+#[test]
 fn analyze_expression_error_restores_the_read_snapshot_and_allows_retry() {
     let (mut engine, mut budget) = test_engine();
     let mut reader = TxnState::new(&mut budget, 256).unwrap();

@@ -67,6 +67,74 @@ def generated_write_transcript(reader, writer) -> list[str]:
         writer.execute("DROP FUNCTION generated_write_before_diff()")
 
 
+def partition_attachment_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE attach_root_diff(id integer, group_id integer, label text) PARTITION BY RANGE(id)")
+    writer.execute("CREATE TABLE attach_middle_diff(label text, id integer, group_id integer) PARTITION BY LIST(group_id)")
+    writer.execute("CREATE TABLE attach_leaf_diff(group_id integer, label text, id integer)")
+    writer.execute("CREATE TABLE attach_default_diff(label text, id integer, group_id integer)")
+    writer.execute("CREATE TABLE attach_high_diff(group_id integer, id integer, label text)")
+    writer.execute("INSERT INTO attach_leaf_diff VALUES (1, 'existing', 1)")
+    writer.execute("INSERT INTO attach_default_diff VALUES ('default', 50, 9)")
+    writer.execute("ALTER TABLE attach_middle_diff ATTACH PARTITION attach_leaf_diff FOR VALUES IN(1)")
+    writer.execute("ALTER TABLE attach_root_diff ATTACH PARTITION attach_middle_diff FOR VALUES FROM (0) TO (10)")
+    writer.execute("ALTER TABLE attach_root_diff ATTACH PARTITION attach_default_diff DEFAULT")
+    results = []
+    try:
+        reader.execute("INSERT INTO attach_root_diff VALUES (2, 1, 'nested')")
+        rows = reader.execute("SELECT id, group_id, label FROM attach_root_diff ORDER BY id").fetchall()
+        selected = reader.execute("SELECT label FROM attach_root_diff WHERE id = 2 AND group_id = 1").fetchall()
+        error = sqlstate(reader, "INSERT INTO attach_root_diff VALUES (3, 2, 'unmatched nested')")
+        results.append(f"attach_nested=rows:{rows},selected:{selected},missing:{error}")
+        error = sqlstate(reader, "ALTER TABLE attach_root_diff ATTACH PARTITION attach_high_diff FOR VALUES FROM (40) TO (60)")
+        rows = reader.execute("SELECT id, group_id, label FROM attach_root_diff ORDER BY id").fetchall()
+        results.append(f"attach_default_conflict={error},rows:{rows}")
+        reader.execute("DELETE FROM attach_default_diff WHERE id = 50")
+        reader.execute("ALTER TABLE attach_root_diff ATTACH PARTITION attach_high_diff FOR VALUES FROM (40) TO (60)")
+        reader.execute("INSERT INTO attach_root_diff VALUES (45, 2, 'high')")
+        reader.execute("ALTER TABLE attach_root_diff ADD CONSTRAINT attachment_label_check CHECK(label <> 'bad')")
+        error = sqlstate(reader, "UPDATE attach_root_diff SET label = 'bad' WHERE id = 2")
+        results.append(f"attach_inherited_check={error}")
+        reader.execute("ALTER TABLE attach_root_diff ALTER COLUMN group_id SET NOT NULL")
+        error = sqlstate(reader, "UPDATE attach_root_diff SET group_id = NULL WHERE id = 45")
+        results.append(f"attach_inherited_not_null={error}")
+        reader.execute("ALTER TABLE attach_root_diff ALTER COLUMN group_id DROP NOT NULL")
+        reader.execute("ALTER TABLE attach_root_diff DROP CONSTRAINT attachment_label_check")
+        reader.execute("ALTER TABLE attach_middle_diff DETACH PARTITION attach_leaf_diff CONCURRENTLY")
+        error = sqlstate(reader, "INSERT INTO attach_leaf_diff VALUES (2, 'outside saved bound', 3)")
+        remaining = reader.execute("SELECT id, group_id, label FROM attach_root_diff ORDER BY id").fetchall()
+        results.append(f"attach_detached_bound={error},remaining:{remaining}")
+        reader.execute("ALTER TABLE attach_middle_diff ATTACH PARTITION attach_leaf_diff FOR VALUES IN(1)")
+        rows = reader.execute("SELECT id, group_id, label FROM attach_root_diff ORDER BY id").fetchall()
+        results.append(f"attach_again={rows}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE attach_root_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS attach_middle_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS attach_leaf_diff")
+        writer.execute("DROP TABLE IF EXISTS attach_high_diff")
+
+
+def wide_partition_transcript(reader, writer) -> list[str]:
+    columns = [f"c{column} integer" for column in range(80)]
+    writer.execute(f"CREATE TABLE wide_partition_diff({','.join(columns)}) PARTITION BY RANGE(c0)")
+    writer.execute(f"CREATE TABLE wide_leaf_diff({','.join(reversed(columns))})")
+    writer.execute("ALTER TABLE wide_partition_diff ATTACH PARTITION wide_leaf_diff DEFAULT")
+    try:
+        reader.execute("ALTER TABLE wide_partition_diff ADD CONSTRAINT wide_positive CHECK(c79 > 0)")
+        reader.execute("INSERT INTO wide_partition_diff(c0, c79) VALUES (1, 2)")
+        error = sqlstate(reader, "UPDATE wide_partition_diff SET c79 = -1")
+        rows = reader.execute("SELECT c0, c79 FROM wide_partition_diff").fetchall()
+        results = [f"wide_partition_check={error},rows:{rows}"]
+        reader.execute("ALTER TABLE wide_partition_diff DROP CONSTRAINT wide_positive")
+        reader.execute("UPDATE wide_partition_diff SET c79 = -1")
+        rows = reader.execute("SELECT c0, c79 FROM wide_partition_diff").fetchall()
+        return results + [f"wide_partition_drop={rows}"]
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE wide_partition_diff CASCADE")
+
+
 def partition_move_transcript(reader, writer, reordered=False) -> list[str]:
     writer.execute("CREATE TABLE move_write_diff(id integer PRIMARY KEY, label text, computed integer GENERATED ALWAYS AS (length(label)) STORED) PARTITION BY RANGE(id)")
     if reordered:
@@ -877,7 +945,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + merge_write_transcript(reader, writer) + partition_move_transcript(reader, writer) + partition_move_transcript(reader, writer, reordered=True) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + merge_write_transcript(reader, writer) + partition_move_transcript(reader, writer) + partition_move_transcript(reader, writer, reordered=True) + partition_attachment_transcript(reader, writer) + wide_partition_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

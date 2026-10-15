@@ -82269,3 +82269,55 @@ fn pgoutput_descriptors_refresh_after_local_ddl_without_new_relation_frames() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn dml_target_partition_constraint_flags_cover_columns_past_sixty_four() {
+    let config = test_config("dml-target-wide-partition-flags");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
+    let columns = (0..80)
+        .map(|column| format!("c{column} integer"))
+        .collect::<Vec<_>>();
+    let reversed = columns
+        .iter()
+        .rev()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    session.success(
+        &mut engine,
+        &format!(
+            "CREATE TABLE wide_partition({}) PARTITION BY RANGE(c0); \
+         CREATE TABLE wide_partition_leaf({reversed}); \
+         ALTER TABLE wide_partition ATTACH PARTITION wide_partition_leaf DEFAULT",
+            columns.join(",")
+        ),
+        true,
+    );
+    session.success(
+        &mut engine,
+        "ALTER TABLE wide_partition ADD CONSTRAINT wide_positive CHECK(c79 > 0); \
+         INSERT INTO wide_partition(c0, c79) VALUES (1, 2)",
+        true,
+    );
+    let failed = session.execute(&mut engine, "UPDATE wide_partition SET c79 = -1", true);
+    assert!(
+        String::from_utf8_lossy(&failed).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT c0, c79 FROM wide_partition", true)),
+        ["1|2"]
+    );
+    session.success(&mut engine, "ALTER TABLE wide_partition DROP CONSTRAINT wide_positive; UPDATE wide_partition SET c79 = -1", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT c0, c79 FROM wide_partition", true)),
+        ["1|-1"]
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

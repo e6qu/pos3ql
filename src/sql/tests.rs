@@ -80998,3 +80998,30 @@ fn dml_target_reordered_partition_attachment_is_explicitly_unsupported() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn dml_target_returning_subqueries_keep_old_new_values_and_statement_reads() {
+    let config = test_config("dml-target-returning-snapshots");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE returning_target(id integer PRIMARY KEY, value integer); \
+         INSERT INTO returning_target VALUES (1, 10), (2, 20)",
+        true,
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "UPDATE returning_target AS target SET value = value + 1 RETURNING id, value, \
+         (SELECT sum(value) FROM returning_target), (SELECT target.value), \
+         (SELECT old.value), (SELECT new.value), ARRAY(SELECT id FROM returning_target ORDER BY id)", true)),
+        ["1|11|30|11|10|11|{1,2}", "2|21|30|21|20|21|{1,2}"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "DELETE FROM returning_target AS target RETURNING id, value, \
+         (SELECT sum(value) FROM returning_target), (SELECT target.value), \
+         (SELECT old.value), (SELECT new.value), ARRAY(SELECT id FROM returning_target ORDER BY id)", true)),
+        ["1|11|32|11|11|NULL|{1,2}", "2|21|32|21|21|NULL|{1,2}"]);
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

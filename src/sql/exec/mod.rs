@@ -59717,12 +59717,13 @@ fn emit_projected(
             expression_count += 1;
         }
     }
-    let subqueries = match super::query::subquery_hooks(
+    let subqueries = match super::query::subquery_hooks_outer(
         &expressions[..expression_count],
         storage,
         txid,
         arena,
         params,
+        &context,
     ) {
         Ok(subqueries) => subqueries,
         Err(error) => return Ok(Err(error)),

@@ -286,8 +286,8 @@ impl Storage {
         {
             statement.lsn = None;
         }
-        self.prune_snapshot_versions(snapshots.oldest());
         drop(snapshots);
+        self.prune_snapshot_versions();
         let owner = self.transaction_wait_owner(transaction);
         self.lock_state().row.resource_released(owner);
     }

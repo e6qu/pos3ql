@@ -69,7 +69,8 @@ and MERGE targets keep their original bytes. Metadata walks validate the
 original table when acquiring a row and release shared guards before callbacks.
 DML output descriptions retain their target definition and share view rewriting
 between client descriptions and data-changing WITH queries, preserving the
-view's output names. Validation checks
+view's output names. Prepared WITH descriptions analyze RETURNING without
+running the change. Validation checks
 current rows without changing ordinary query snapshots.
 Reader cleanup uses a separate startup workspace and rechecks active readers
 in each small batch. The [implementation guide](docs/implemented-baseline.md)

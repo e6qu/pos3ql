@@ -310,6 +310,78 @@ fn describe_items_with_output_aliases<'q>(
     Ok(n)
 }
 
+/// Analyze RETURNING without executing its statement or retaining catalog guards.
+pub(crate) fn describe_data_modification_columns<'a>(
+    storage: &'a crate::storage::Storage,
+    statement: &'a crate::sql::ast::Stmt<'a>,
+    arena: &'a crate::mem::arena::Arena,
+    txid: u32,
+    columns: &mut [ColDesc<'a>],
+) -> Result<usize, SqlError> {
+    use crate::sql::ast::Stmt;
+    if let Stmt::Merge(merge) = statement {
+        if merge.returning.is_empty() {
+            return Ok(0);
+        }
+        return crate::sql::exec::describe_merge_returning(storage, txid, merge, arena, columns);
+    }
+    let (target, returning, target_alias) = match statement {
+        Stmt::Insert(insert) => {
+            let insert = *insert;
+            (insert.table, insert.returning, None)
+        }
+        Stmt::Update(update) => {
+            let update = *update;
+            (update.table, update.returning, update.alias)
+        }
+        Stmt::Delete(delete) => {
+            let delete = *delete;
+            (delete.table, delete.returning, delete.alias)
+        }
+        _ => return Ok(0),
+    };
+    if returning.is_empty() {
+        return Ok(0);
+    }
+    let (target, returning, target_alias) =
+        match crate::sql::query::resolve_view_for_dml(storage, target, txid, arena) {
+            Ok(Some(view)) => {
+                let rewritten = crate::sql::query::rewrite_view_dml(
+                    statement,
+                    target.name,
+                    view.base.name,
+                    view.base.schema.expect("view base is qualified"),
+                    view.columns,
+                    view.base_columns,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+                let (returning, target_alias) = match rewritten {
+                    Stmt::Insert(insert) => (insert.returning, None),
+                    Stmt::Update(update) => (update.returning, update.alias),
+                    Stmt::Delete(delete) => (delete.returning, delete.alias),
+                    _ => unreachable!("view rewrite keeps its statement kind"),
+                };
+                (view.base, returning, target_alias)
+            }
+            Ok(None) => (target, returning, target_alias),
+            Err(error) => return Err(error),
+        };
+    let table_index = crate::sql::exec::resolve_dml_table(storage, &target, txid)?;
+    storage.with_retained_table_definition(table_index, txid, |definition| {
+        crate::sql::exec::describe_returning_items(
+            returning,
+            Some(definition),
+            target_alias,
+            Some(storage),
+            txid,
+            arena,
+            columns,
+        )
+    })
+}
+
 /// Describe a single DML target's `RETURNING` list, including the names that
 /// PostgreSQL adds only to the output scope.
 pub(crate) fn describe_returning_items<'q, 'storage: 'q>(

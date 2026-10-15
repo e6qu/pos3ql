@@ -81063,6 +81063,28 @@ fn retained_dml_descriptions_rewrite_view_columns_in_data_changing_ctes() {
             "2|20|second",
         ),
     ] {
+        let before = data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, amount, label FROM described_orders ORDER BY id",
+        ));
+        let described = describe_with(&mut engine, &mut budget, query);
+        assert_eq!(
+            row_description_names(&described),
+            ["order_id", "total", "note"]
+        );
+        assert_eq!(
+            row_description_type_oids(&described),
+            [types::oid::INT4, types::oid::INT8, types::oid::TEXT]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT id, amount, label FROM described_orders ORDER BY id"
+            )),
+            before
+        );
         let output = run_with(&mut engine, &mut budget, query);
         assert!(
             !String::from_utf8_lossy(&output).contains("ERROR"),

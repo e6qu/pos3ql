@@ -159,6 +159,7 @@ within the same startup budget.
 
 For a view that calls an order's `amount` column `total`, an update inside a
 WITH query returning `total` reports that name and the original numeric type.
+Preparing or describing that query determines its columns without updating an order.
 
 **User example:** a storage check started for an old orders table cannot start
 reading the replacement orders table through the reused internal slot. Bytes

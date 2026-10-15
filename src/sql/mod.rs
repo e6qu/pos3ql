@@ -10208,68 +10208,7 @@ impl Engine {
         txn: &TxnState,
         columns: &mut [ColDesc<'a>],
     ) -> Result<usize, SqlError> {
-        if let Stmt::Merge(merge) = statement {
-            if merge.returning.is_empty() {
-                return Ok(0);
-            }
-            return exec::describe_merge_returning(&self.storage, txn.txid, merge, arena, columns);
-        }
-        let (target, returning, target_alias) = match statement {
-            Stmt::Insert(insert) => {
-                let insert = *insert;
-                (insert.table, insert.returning, None)
-            }
-            Stmt::Update(update) => {
-                let update = *update;
-                (update.table, update.returning, update.alias)
-            }
-            Stmt::Delete(delete) => {
-                let delete = *delete;
-                (delete.table, delete.returning, delete.alias)
-            }
-            _ => return Ok(0),
-        };
-        if returning.is_empty() {
-            return Ok(0);
-        }
-        let (target, returning, target_alias) =
-            match query::resolve_view_for_dml(&self.storage, target, txn.txid, arena) {
-                Ok(Some(view)) => {
-                    let rewritten = query::rewrite_view_dml(
-                        statement,
-                        target.name,
-                        view.base.name,
-                        view.base.schema.expect("view base is qualified"),
-                        view.columns,
-                        view.base_columns,
-                        &self.storage,
-                        txn.txid,
-                        arena,
-                    )?;
-                    let (returning, target_alias) = match rewritten {
-                        Stmt::Insert(insert) => (insert.returning, None),
-                        Stmt::Update(update) => (update.returning, update.alias),
-                        Stmt::Delete(delete) => (delete.returning, delete.alias),
-                        _ => unreachable!("view rewrite keeps its statement kind"),
-                    };
-                    (view.base, returning, target_alias)
-                }
-                Ok(None) => (target, returning, target_alias),
-                Err(error) => return Err(error),
-            };
-        let table_index = exec::resolve_dml_table(&self.storage, &target, txn.txid)?;
-        self.storage
-            .with_retained_table_definition(table_index, txn.txid, |definition| {
-                exec::describe_returning_items(
-                    returning,
-                    Some(definition),
-                    target_alias,
-                    Some(&self.storage),
-                    txn.txid,
-                    arena,
-                    columns,
-                )
-            })
+        exec::describe_data_modification_columns(&self.storage, statement, arena, txn.txid, columns)
     }
 
     fn describe_data_modification<'a>(

@@ -81462,6 +81462,8 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
     use crate::storage::SqlName;
 
     let mut config = test_config("subscription-copy-transition-values");
+    // Nested trigger queries use the same fixed statement budget as this harness.
+    config.subscription_arena_bytes = config.work_arena_bytes;
     config.copy_transition_bytes = 32;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();

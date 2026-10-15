@@ -98,6 +98,36 @@ def on_conflict_snapshot_transcript(reader, writer) -> list[str]:
         writer.execute("DROP TABLE conflict_snapshot")
 
 
+def dml_target_transcript(reader, _writer) -> list[str]:
+    results = []
+    cases = [
+        ("before_update_changes_other", "BEFORE UPDATE", "UPDATE dml_target_rows SET value = value + 100 WHERE id = 2", "UPDATE dml_target_rows SET value = value + 1"),
+        ("before_update_deletes_other", "BEFORE UPDATE", "DELETE FROM dml_target_rows WHERE id = 2", "UPDATE dml_target_rows SET value = value + 1"),
+        ("before_delete_changes_other", "BEFORE DELETE", "UPDATE dml_target_rows SET value = value + 100 WHERE id = 2", "DELETE FROM dml_target_rows"),
+        ("before_delete_deletes_other", "BEFORE DELETE", "DELETE FROM dml_target_rows WHERE id = 2", "DELETE FROM dml_target_rows"),
+        ("after_update_changes_other", "AFTER UPDATE", "UPDATE dml_target_rows SET value = value + 100 WHERE id = 2", "UPDATE dml_target_rows SET value = value + 1"),
+        ("joined_update_changes_other", "BEFORE UPDATE", "UPDATE dml_target_rows SET value = value + 100 WHERE id = 2", "UPDATE dml_target_rows SET value = dml_target_rows.value + 1 FROM (VALUES (1), (2)) AS source(id) WHERE source.id = dml_target_rows.id"),
+        ("joined_delete_changes_other", "BEFORE DELETE", "UPDATE dml_target_rows SET value = value + 100 WHERE id = 2", "DELETE FROM dml_target_rows USING (VALUES (1), (2)) AS source(id) WHERE source.id = dml_target_rows.id"),
+    ]
+    try:
+        for label, event, mutation, command in cases:
+            reader.execute("CREATE TABLE dml_target_rows(id integer PRIMARY KEY, value integer)")
+            reader.execute("INSERT INTO dml_target_rows VALUES (1, 10), (2, 20)")
+            returned = "OLD" if "DELETE" in event else "NEW"
+            reader.execute(f"CREATE FUNCTION dml_target_action() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.id = 1 THEN {mutation}; END IF; RETURN {returned}; END $$")
+            reader.execute(f"CREATE TRIGGER dml_target_trigger {event} ON dml_target_rows FOR EACH ROW EXECUTE FUNCTION dml_target_action()")
+            error = sqlstate(reader, command)
+            rows = reader.execute("SELECT id, value FROM dml_target_rows ORDER BY id").fetchall()
+            results.append(f"dml_target_{label}={error},rows:{rows}")
+            reader.execute("DROP TABLE dml_target_rows")
+            reader.execute("DROP FUNCTION dml_target_action()")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        reader.execute("DROP TABLE IF EXISTS dml_target_rows CASCADE")
+        reader.execute("DROP FUNCTION IF EXISTS dml_target_action() CASCADE")
+
+
 def index_validation_transcript(reader, writer) -> list[str]:
     writer.execute("DROP TABLE IF EXISTS index_validation_diff")
     writer.execute("CREATE TABLE index_validation_diff (id integer, value integer)")
@@ -518,7 +548,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

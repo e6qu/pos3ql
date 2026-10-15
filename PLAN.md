@@ -63,45 +63,24 @@ and linked PRs preserve the investigations; this file keeps only current work.
 appropriate to its transaction. Dropping or rebuilding a table must not leave
 an already running read following reused memory or deleted objects.
 
-Statements, transactions, streaming `COPY FROM`, and imported replication
-snapshots retain their read position. Selected bytes, captured point metadata,
-sequential SQL byte scans, sorted row records, enum rewrites, and MERGE target copies keep
-their original data without later version-chain lookups. Captured row identity
-lists own their startup buffers. Shared statistics and journal acknowledgements
-also retain the exact state they captured.
-`COPY TO` retains its named table's source and schema before ordering export rows;
-output fetches those original bytes instead of rechecking version numbers.
-Index validation captures current committed rows and all earlier writes by its
-creating transaction, while keeping ordinary transaction reads at their original
-snapshot. Ordinary, copied, and generated partition indexes share creation and
-failure cleanup. Validation reuses its fixed buffer between rows and tables;
-unread bytes keep their original owners.
-ANALYZE retains original row sources and uses one current read position for base
-and extended statistics, restoring the caller's query snapshot on every exit.
-Table and domain constraints validate current committed and own changes through
-retained sources without changing ordinary query snapshots. Partition attachment
-streams its validation rows, and schema rewrites fetch original captured bytes.
-`ON CONFLICT` captures the matched current row before releasing its source.
-Older repeatable-read transactions reject a newer conflicting commit, and
-skipped conflict updates retain PostgreSQL's row locks until rollback or end.
-Local UPDATE and DELETE retain selected bytes through ordering and nested SQL.
-Trigger-side statements use checked, separate command identities and restore
-the caller's read context; conflicting BEFORE-trigger changes abort the statement. Inherited and partitioned
-targets map query columns to each stored row layout, preserving child-only values
-and enforcing the physical table's constraints. Foreign-key cascades retain
-matching child bytes in one scan.
+Statements, transactions, streaming uploads, and imported snapshots retain
+which committed data they may read. Captured reads and selected UPDATE, DELETE,
+and MERGE targets keep their original bytes; sorting, nested SQL, and table
+replacement cannot redirect those reads. Trigger-side changes preserve
+PostgreSQL's command boundaries. Inherited targets map query columns to stored
+columns and enforce each physical table's constraints.
 
-The [implementation guide](docs/implemented-baseline.md) owns the detailed
-contracts and limits; this sequence keeps the remaining acceptance gates.
+Validation and maintenance use current committed and earlier own changes while
+preserving ordinary transaction query snapshots. Their row buffers remain
+bounded and are reused. The [implementation guide](docs/implemented-baseline.md)
+owns the detailed contracts, completed work, and limits.
 
 Still to do:
 
 - Complete reader protection for authoritative metadata walks and remaining
   executor reads that retain only a version stamp. Sequential SQL byte scans
-  and `COPY TO`, together with index validation and ANALYZE, capture resident
-  version choices before fetching bytes and keep their original heap and saved
-  files. Metadata walks still consult live row state; their retirement and update rules need
-  coordination.
+  and exports already keep selected versions and their source files. Metadata
+  walks still consult live row state; coordinate their updates and retirement.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.
 - Integrate bounded heap relocation with concurrent table publication and

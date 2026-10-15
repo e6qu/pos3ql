@@ -80905,7 +80905,7 @@ fn dml_target_inherited_layouts_preserve_child_values_after_cold_recovery() {
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     session.success(&mut engine,
         "CREATE TABLE layout_parent(id integer PRIMARY KEY, amount integer); \
-         CREATE TABLE layout_child(extra text, amount integer CHECK (amount < 100), id integer UNIQUE); \
+         CREATE TABLE layout_child(extra text, amount integer CHECK (amount < 100), id integer NOT NULL UNIQUE); \
          ALTER TABLE layout_child INHERIT layout_parent; \
          INSERT INTO layout_child VALUES ('kept', 10, 1); \
          CREATE TABLE layout_ref(id integer REFERENCES layout_child(id) ON UPDATE CASCADE ON DELETE CASCADE); \

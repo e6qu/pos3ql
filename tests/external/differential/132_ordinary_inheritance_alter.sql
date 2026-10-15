@@ -61,7 +61,7 @@ DROP TABLE ordinary_inheritance_alter_parent CASCADE;
 -- DML uses names to project reordered child columns and checks child constraints.
 CREATE TABLE inheritance_dml_parent (id integer PRIMARY KEY, amount integer);
 CREATE TABLE inheritance_dml_child
-  (extra text, amount integer, id integer UNIQUE,
+  (extra text, amount integer, id integer NOT NULL UNIQUE,
    derived integer GENERATED ALWAYS AS (amount * 2) STORED, CHECK (amount < 100));
 ALTER TABLE inheritance_dml_child INHERIT inheritance_dml_parent;
 INSERT INTO inheritance_dml_child (extra, amount, id) VALUES ('retained', 10, 1);

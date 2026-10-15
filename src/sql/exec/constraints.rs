@@ -300,12 +300,15 @@ fn committed_key_matches(
     storage: &Storage,
     table_index: usize,
     def: &TableDef,
-    schema: &[ColType],
+    _schema: &[ColType],
     columns: &[u16],
     values: &[Datum],
     nulls_not_distinct: bool,
     rowid: u64,
+    txid: u32,
 ) -> Result<bool, SqlError> {
+    let decoder =
+        crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
     let Some(state) = storage.row_state(table_index, rowid)? else {
         return Ok(false);
     };
@@ -314,7 +317,7 @@ fn committed_key_matches(
     };
     storage.with_row_bytes(table_index, rowid, home, |bytes| {
         let mut other = [Datum::Null; MAX_COLUMNS];
-        rowenc::decode(bytes, schema, &mut other)?;
+        decoder.decode(bytes, &mut other)?;
         key_equal(storage, def, columns, values, &other, nulls_not_distinct)
     })
 }
@@ -571,7 +574,7 @@ fn enforce_expression_index_uniqueness<'a>(
     storage: &Storage,
     table_index: usize,
     def: &TableDef,
-    schema: &[ColType],
+    _schema: &[ColType],
     values: &[Datum<'a>],
     self_rowid: Option<u64>,
     txid: u32,
@@ -584,6 +587,8 @@ fn enforce_expression_index_uniqueness<'a>(
     predicate: Option<&'a Expr<'a>>,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
+    let decoder =
+        crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
     if let Some(predicate) = predicate
         && !index_predicate_matches(storage, txid, def, values, predicate, arena)?
     {
@@ -625,7 +630,7 @@ fn enforce_expression_index_uniqueness<'a>(
             };
             let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 let mut other = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut other)?;
+                decoder.decode(bytes, &mut other)?;
                 matches(&other)
             })?;
             if matched {
@@ -643,7 +648,7 @@ fn enforce_expression_index_uniqueness<'a>(
         };
         let matched = storage.with_row_bytes(table_index, rowid, image, |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut other)?;
+            decoder.decode(bytes, &mut other)?;
             matches(&other)
         })?;
         if !matched {
@@ -726,38 +731,51 @@ fn enforce_key_uniqueness(
             collations[index] = def.columns()[*column as usize].collation;
         }
         let hash = hash_key_collated(values, columns, &collations[..columns.len()]);
-        storage.probe_value(table_index, columns, hash, |rowid, encoded_key| {
-            if result.is_err() || Some(rowid) == self_rowid {
-                return Ok(());
-            }
-            // Own writes supersede the cached committed key. The pending
-            // pass below compares their current key without reentering the
-            // object reader while a durable index block is borrowed.
-            if storage.row_has_own_pending(table_index, rowid, txid) {
-                return Ok(());
-            }
-            let matched = match encoded_key {
-                Some(encoded) => {
-                    encoded_key_equal(storage, def, columns, values, encoded, nulls_not_distinct)
+        let physical_columns =
+            super::remap_columns(&storage.table_def(table_index, txid), def, columns)?;
+        storage.probe_value(
+            table_index,
+            &physical_columns[..columns.len()],
+            hash,
+            |rowid, encoded_key| {
+                if result.is_err() || Some(rowid) == self_rowid {
+                    return Ok(());
                 }
-                None => committed_key_matches(
-                    storage,
-                    table_index,
-                    def,
-                    schema,
-                    columns,
-                    values,
-                    nulls_not_distinct,
-                    rowid,
-                ),
-            };
-            match matched {
-                Ok(true) => result = Err(unique_violation(def, name)),
-                Ok(false) => {}
-                Err(e) => result = Err(e),
-            }
-            Ok(())
-        })?
+                // Own writes supersede the cached committed key. The pending
+                // pass below compares their current key without reentering the
+                // object reader while a durable index block is borrowed.
+                if storage.row_has_own_pending(table_index, rowid, txid) {
+                    return Ok(());
+                }
+                let matched = match encoded_key {
+                    Some(encoded) => encoded_key_equal(
+                        storage,
+                        def,
+                        columns,
+                        values,
+                        encoded,
+                        nulls_not_distinct,
+                    ),
+                    None => committed_key_matches(
+                        storage,
+                        table_index,
+                        def,
+                        schema,
+                        columns,
+                        values,
+                        nulls_not_distinct,
+                        rowid,
+                        txid,
+                    ),
+                };
+                match matched {
+                    Ok(true) => result = Err(unique_violation(def, name)),
+                    Ok(false) => {}
+                    Err(e) => result = Err(e),
+                }
+                Ok(())
+            },
+        )?
     };
     result?;
     if !served {
@@ -794,7 +812,7 @@ fn enforce_key_uniqueness(
 fn committed_scan_uniqueness(
     storage: &Storage,
     table_index: usize,
-    schema: &[ColType],
+    _schema: &[ColType],
     columns: &[u16],
     nulls_not_distinct: bool,
     values: &[Datum],
@@ -803,6 +821,8 @@ fn committed_scan_uniqueness(
     def: &TableDef,
     name: &ConstraintName,
 ) -> Result<(), SqlError> {
+    let decoder =
+        crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
     storage
         .validation_read()
         .for_each_row_state(storage, table_index, &mut |rowid, state| {
@@ -815,7 +835,7 @@ fn committed_scan_uniqueness(
             };
             let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 let mut other = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut other)?;
+                decoder.decode(bytes, &mut other)?;
                 key_equal(storage, def, columns, values, &other, nulls_not_distinct)
             })?;
             if matched {
@@ -835,7 +855,7 @@ fn committed_scan_uniqueness(
 fn pending_scan_uniqueness(
     storage: &Storage,
     table_index: usize,
-    schema: &[ColType],
+    _schema: &[ColType],
     columns: &[u16],
     nulls_not_distinct: bool,
     values: &[Datum],
@@ -844,6 +864,8 @@ fn pending_scan_uniqueness(
     def: &TableDef,
     name: &ConstraintName,
 ) -> Result<(), SqlError> {
+    let decoder =
+        crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
     storage.for_each_pending_row_change(table_index, &mut |rowid, pending, image| {
         use core::ops::ControlFlow;
         if Some(rowid) == self_rowid {
@@ -854,7 +876,7 @@ fn pending_scan_uniqueness(
         };
         let matched = storage.with_row_bytes(table_index, rowid, image, |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut other)?;
+            decoder.decode(bytes, &mut other)?;
             key_equal(storage, def, columns, values, &other, nulls_not_distinct)
         })?;
         if matched {
@@ -882,7 +904,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
     storage: &Storage,
     table_index: usize,
     def: &TableDef,
-    schema: &[ColType],
+    _schema: &[ColType],
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
@@ -892,6 +914,8 @@ pub(crate) fn enforce_partial_index_uniqueness(
     predicate: &Expr,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    let decoder =
+        crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
     if !index_predicate_matches(storage, txid, def, values, predicate, arena)?
         || (!nulls_not_distinct
             && columns
@@ -918,7 +942,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
             };
             let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 let mut other = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut other)?;
+                decoder.decode(bytes, &mut other)?;
                 matches(&other)
             })?;
             if matched {
@@ -936,7 +960,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
         };
         let matched = storage.with_row_bytes(table_index, rowid, image, |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut other)?;
+            decoder.decode(bytes, &mut other)?;
             matches(&other)
         })?;
         if !matched {
@@ -1802,7 +1826,7 @@ fn enforce_exclusion_constraint(
     storage: &Storage,
     table_index: usize,
     def: &TableDef,
-    schema: &[ColType],
+    _schema: &[ColType],
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
@@ -1811,6 +1835,8 @@ fn enforce_exclusion_constraint(
     arena: &Arena,
     read: Option<ValidationRead>,
 ) -> Result<(), SqlError> {
+    let decoder =
+        crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
     let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         catalog: Some(&catalog),
@@ -1847,7 +1873,7 @@ fn enforce_exclusion_constraint(
         };
         let conflicts = storage.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut other)?;
+            decoder.decode(bytes, &mut other)?;
             let other = &other[..def.n_columns];
             if !predicate_holds(other)? {
                 return Ok(false);
@@ -2036,9 +2062,13 @@ pub(crate) fn validate_constraint_obligation(
         let Some(home) = storage.visible_row_home(row_table, rowid, state, txid)? else {
             return Ok(());
         };
+        let decoder = crate::storage::RelationRowDecoder::new(
+            &definition,
+            &storage.table_def(row_table, txid),
+        )?;
         storage.with_row_bytes(row_table, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut values)?;
+            decoder.decode(bytes, &mut values)?;
             let values = &values[..definition.n_columns];
             if let Some(key) = key {
                 enforce_key_uniqueness(

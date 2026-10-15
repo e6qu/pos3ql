@@ -393,6 +393,38 @@ std::thread_local! {
     };
 }
 
+/// A background callback restores the frontend's published session state.
+pub(crate) struct SessionEvaluationScope {
+    settings: SessionSettings,
+    schemas: SessionSchemas,
+    session_user: crate::util::StackStr<64>,
+    current_user: crate::util::StackStr<64>,
+    database: crate::util::StackStr<64>,
+    timezone: crate::sql::timezone::Timezone,
+}
+
+pub(crate) fn retain_session_evaluation() -> SessionEvaluationScope {
+    SessionEvaluationScope {
+        settings: SESSION_SETTINGS.with(|value| *value.borrow()),
+        schemas: session_schemas(),
+        session_user: session_user_owned(),
+        current_user: current_user_owned(),
+        database: CURRENT_DATABASE.with(|value| *value.borrow()),
+        timezone: crate::sql::timezone::session(),
+    }
+}
+
+impl Drop for SessionEvaluationScope {
+    fn drop(&mut self) {
+        SESSION_SETTINGS.with(|value| *value.borrow_mut() = self.settings);
+        set_session_schemas(self.schemas);
+        set_session_user(self.session_user.as_str());
+        set_current_user(self.current_user.as_str());
+        set_current_database(self.database.as_str());
+        crate::sql::timezone::set_session(self.timezone);
+    }
+}
+
 /// Publishes the readable settings for the statement about to evaluate. Each
 /// pair is `(static name, current value)`; more than `MAX_SESSION_SETTINGS` is a
 /// loud error, never silent truncation.

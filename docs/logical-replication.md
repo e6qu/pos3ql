@@ -70,6 +70,40 @@ crashes and restarts, it must not claim to have saved a transaction it lost.
 Definition generations prevent a delayed worker from advancing a replaced
 stream. Managed slot cleanup remains durable work across crashes.
 
+Workers use their own session settings and an empty `search_path`, as
+PostgreSQL does. Schema-qualify tables used inside replica-enabled trigger
+functions, for example `INSERT INTO public.order_audit ...`. Worker callbacks
+restore the frontend's settings and name lookup path on success and failure.
+
+Subscribers accept ordinary and partitioned local tables. A view, materialized
+view, foreign table, or other relation kind returns `42809`.
+The publisher and subscriber may store matching columns in different orders.
+Initial COPY and subsequent changes run row triggers and compute stored
+generated values using the actual local partition's definition.
+A replicated TRUNCATE of a partitioned table also clears its local partitions;
+ordinary inheritance children are not added implicitly. An interrupted apply
+rolls the whole local change back without advancing its acknowledgement.
+
+**User example:** an incoming order update moves the order from one local
+partition to another. Replication runs DELETE triggers on the old partition and
+INSERT triggers on the new one. An update that stays in its partition runs
+UPDATE triggers. SQL UPDATE and MERGE also run BEFORE UPDATE before deciding
+whether a move is needed.
+
+Each worker keeps exact publisher table and column names in its fixed
+`subscription_relation_capacity` cache. Before applying data it checks the local
+table again and rebuilds column positions after local schema changes. Reusing
+an old table slot cannot redirect incoming rows to another table. A missing
+published column or a published column that became locally generated returns
+`55000`; the failed change cannot advance the durable acknowledgement.
+Failed descriptor replacement and a full cache preserve earlier valid entries.
+The complete descriptor cache is charged at startup alongside worker memory.
+Keeping exact names adds about 6.5 MiB per worker at the default 64 relation
+entries, or about 104 MiB across the default 16 subscription workers. Reducing
+`subscription_relation_capacity` reduces that reservation after restart.
+Selected UPDATE and DELETE rows retain their original bytes and schema through
+triggers; selection copies matching rows without copying every row scanned.
+
 ## SQL and monitoring
 
 The SQL control surface includes `pg_create_logical_replication_slot`, `pg_copy_logical_replication_slot`, `pg_drop_replication_slot`, and `pg_replication_slot_advance`. Only `pgoutput` logical slots are accepted. Temporary slots and two-phase decoding reject atomically; failover is retained as typed slot state. Slot operations require a superuser or a role with `REPLICATION`.
@@ -94,3 +128,12 @@ The upstream lifetime and import restrictions were checked on 2026-10-13 against
 [PostgreSQL's snapshot manager](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/time/snapmgr.c).
 
 The external suite uses PostgreSQL 18's own subscriber worker and `pg_recvlogical`, not a pos3ql-specific stand-in. Raw-wire tests retain exact frame assertions for options, logical-message order and binary content, keepalives, feedback, and rejection paths.
+
+Partition apply, generated-column timing, and accepted target kinds are checked
+against PostgreSQL 18.6 in native and external tests. The implementation contract
+comes from the pinned upstream [replication executor](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/executor/execReplication.c),
+[subscription worker](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/replication/logical/worker.c),
+and [generated-column rules](https://www.postgresql.org/docs/18/ddl-generated-columns.html).
+The external comparison uses one PostgreSQL publisher and both PostgreSQL and
+pos3ql subscribers, checking concrete expected rows and trigger events after
+initial COPY, later changes, and moves between reordered partitions.

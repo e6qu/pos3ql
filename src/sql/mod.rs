@@ -2571,6 +2571,136 @@ impl Engine {
             .and_then(|(slot, _)| self.storage.subscription_stream(slot, 0))
     }
 
+    fn publish_session_context(
+        &self,
+        guc: &GucState,
+        txn: &TxnState,
+        current_role: &str,
+    ) -> Result<crate::storage::PathContext, SqlError> {
+        let raw_path = guc.search_path();
+        let path = self
+            .storage
+            .compute_path(raw_path.as_str(), current_role, txn.txid);
+        let prior_path = self.storage.swap_path(path);
+        // Publish the path's schema names for current_schema/current_schemas.
+        {
+            use core::fmt::Write as _;
+            let mut published = eval::funcs::system::SessionSchemas {
+                names: [crate::util::StackStr::new(); crate::storage::MAX_PATH_ENTRIES],
+                n: 0,
+                catalog_pos: usize::MAX,
+            };
+            for entry in path.entries() {
+                match entry {
+                    crate::storage::PathEntry::Catalog => {
+                        // An *explicit* pg_catalog is a real path element
+                        // (current_schema can be pg_catalog); the implicit
+                        // one only surfaces in current_schemas(true).
+                        if path.explicit_catalog() {
+                            let _ = write!(published.names[published.n], "pg_catalog");
+                            published.n += 1;
+                        } else if published.catalog_pos == usize::MAX {
+                            published.catalog_pos = published.n;
+                        }
+                    }
+                    crate::storage::PathEntry::Schema(slot) => {
+                        let _ = write!(
+                            published.names[published.n],
+                            "{}",
+                            self.storage.schema_def(*slot as usize).name.as_str()
+                        );
+                        published.n += 1;
+                    }
+                }
+            }
+            eval::funcs::system::set_session_schemas(published);
+        }
+        // Publish this statement's readable settings for `current_setting()`,
+        // the exact values `SHOW` reports (fixed server params + session GUCs).
+        {
+            let mut names = [""; SETTING_NAMES.len()];
+            let mut values = [crate::util::StackStr::<256>::new(); SETTING_NAMES.len()];
+            let mut reset_values = [crate::util::StackStr::<256>::new(); SETTING_NAMES.len()];
+            let mut sources = ["default"; SETTING_NAMES.len()];
+            let mut setting_count = 0;
+            for &name in SETTING_NAMES {
+                if let Some(value) = self.fixed_setting_for(name, txn) {
+                    names[setting_count] = name;
+                    values[setting_count] = value;
+                    reset_values[setting_count] =
+                        guc.transaction_reset_owned(name).unwrap_or(value);
+                    sources[setting_count] = txn.setting_source(name).unwrap_or("default");
+                    setting_count += 1;
+                } else if let Some(value) = guc.get_owned(name) {
+                    names[setting_count] = name;
+                    values[setting_count] = value;
+                    reset_values[setting_count] = guc.reset_owned(name).unwrap_or(value);
+                    sources[setting_count] = guc.source(name);
+                    setting_count += 1;
+                }
+            }
+            if let Err(e) = eval::funcs::system::set_session_settings(
+                &names[..setting_count],
+                &values[..setting_count],
+                &reset_values[..setting_count],
+                &sources[..setting_count],
+            ) {
+                self.storage.swap_path(prior_path);
+                return Err(e);
+            }
+        }
+        Ok(prior_path)
+    }
+
+    pub(crate) fn subscription_session_user(
+        &self,
+        stream: crate::storage::SubscriptionStream,
+        txid: u32,
+    ) -> Result<SqlName, SqlError> {
+        let subscription = self
+            .storage
+            .subscriptions_with_slots_visible_to(txid)
+            .find(|(slot, subscription)| {
+                *slot == stream.slot()
+                    && subscription.created_at == stream.created_at()
+                    && subscription.definition_generation == stream.definition_generation()
+            })
+            .map(|(_, subscription)| subscription)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "subscription session targets a replaced stream"
+                )
+            })?;
+        Ok(self
+            .storage
+            .role(subscription.ownership.owner_to(txid) as usize)
+            .name_to(txid))
+    }
+
+    pub(crate) fn enter_subscription_session(
+        &mut self,
+        stream: crate::storage::SubscriptionStream,
+        guc: &GucState,
+        txn: &TxnState,
+    ) -> Result<crate::storage::PathContext, SqlError> {
+        self.select_database(stream.database_oid())?;
+        self.work.bind_connection(0);
+        eval::funcs::system::set_current_database(
+            self.storage.current_database_name(txn.txid).as_str(),
+        );
+        let user = guc.session_user();
+        eval::funcs::system::set_session_user(user.as_str());
+        let role = guc.current_role();
+        eval::funcs::system::set_current_user(role.as_str());
+        timezone::set_session(guc.timezone());
+        self.publish_session_context(guc, txn, role.as_str())
+    }
+
+    pub(crate) fn restore_subscription_path(&self, path: crate::storage::PathContext) {
+        self.storage.swap_path(path);
+    }
+
     /// Opens the local transaction that will receive one publisher commit.
     /// The worker uses the ordinary engine transaction and durability path;
     /// replication cannot create a second, weaker write path.
@@ -2762,6 +2892,15 @@ impl Engine {
         relations.register(&self.storage, txn.txid, relation)
     }
 
+    pub(crate) fn resolve_subscription_relation(
+        &self,
+        relations: &mut crate::pg::subscription_apply::RelationMap,
+        txn: &TxnState,
+        relation_id: u32,
+    ) -> Result<crate::pg::subscription_apply::RelationBinding, SqlError> {
+        relations.binding(&self.storage, txn.txid, relation_id)
+    }
+
     pub(crate) fn apply_subscription_insert(
         &mut self,
         txn: &mut TxnState,
@@ -2782,6 +2921,9 @@ impl Engine {
             arena,
             trigger_context,
         );
+        let result = result.and_then(|()| {
+            exec::finish_replication_row(&mut self.storage, txn, arena, trigger_context)
+        });
         eval::funcs::system::set_current_user(prior.as_str());
         result
     }
@@ -2806,6 +2948,9 @@ impl Engine {
             arena,
             trigger_context,
         );
+        let result = result.and_then(|()| {
+            exec::finish_replication_row(&mut self.storage, txn, arena, trigger_context)
+        });
         eval::funcs::system::set_current_user(prior.as_str());
         result
     }
@@ -2830,6 +2975,9 @@ impl Engine {
             arena,
             trigger_context,
         );
+        let result = result.and_then(|()| {
+            exec::finish_replication_row(&mut self.storage, txn, arena, trigger_context)
+        });
         eval::funcs::system::set_current_user(prior.as_str());
         result
     }
@@ -2876,6 +3024,7 @@ impl Engine {
         tables: &[usize],
         cascade: bool,
         restart_identity: bool,
+        arena: &Arena,
     ) -> Result<(), SqlError> {
         if tables.is_empty() {
             return Err(sql_err!(
@@ -2889,10 +3038,61 @@ impl Engine {
                 "subscription TRUNCATE exceeds its fixed table capacity"
             ));
         }
-        for &table in tables {
+        if tables
+            .iter()
+            .enumerate()
+            .any(|(index, table)| tables[..index].contains(table))
+        {
+            return Err(sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "subscription TRUNCATE repeats a local table"
+            ));
+        }
+        let capacity = self
+            .storage
+            .table_count()
+            .min(txn.truncate_table_capacity());
+        let targets = arena
+            .alloc_slice_with(capacity, |_| 0usize)
+            .map_err(|_| eval::arena_full())?;
+        targets[..tables.len()].copy_from_slice(tables);
+        let mut count = tables.len();
+        // PostgreSQL expands local partitions, but not ordinary inheritance.
+        // Validate the entire bounded set before deleting its first row.
+        for child in 0..self.storage.table_count() {
+            if targets[..count].contains(&child)
+                || !self
+                    .storage
+                    .relation_visible_to_current_session(child, txn.txid)
+                || !tables.iter().any(|&root| {
+                    self.storage
+                        .table_def(root, txn.txid)
+                        .partition
+                        .is_partitioned()
+                        && self.storage.partition_descends_from(child, root, txn.txid)
+                })
+            {
+                continue;
+            }
+            if count == targets.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "subscription TRUNCATE exceeds its fixed table capacity"
+                ));
+            }
+            targets[count] = child;
+            count += 1;
+        }
+        for &table in &targets[..count] {
             self.subscription_apply_role(stream, table, txn.txid)?;
         }
-        exec::apply_replication_truncate(&mut self.storage, txn, tables, cascade, restart_identity)
+        exec::apply_replication_truncate(
+            &mut self.storage,
+            txn,
+            &targets[..count],
+            cascade,
+            restart_identity,
+        )
     }
 
     fn subscription_apply_role(
@@ -14179,76 +14379,8 @@ impl Engine {
         } else {
             eval::funcs::system::current_user_owned()
         };
-        let raw_path = guc.search_path();
-        let path = self
-            .storage
-            .compute_path(raw_path.as_str(), current_role.as_str(), txn.txid);
-        self.storage.swap_path(path);
-        // Publish the path's schema names for current_schema/current_schemas.
-        {
-            use core::fmt::Write as _;
-            let mut published = eval::funcs::system::SessionSchemas {
-                names: [crate::util::StackStr::new(); crate::storage::MAX_PATH_ENTRIES],
-                n: 0,
-                catalog_pos: usize::MAX,
-            };
-            for entry in path.entries() {
-                match entry {
-                    crate::storage::PathEntry::Catalog => {
-                        // An *explicit* pg_catalog is a real path element
-                        // (current_schema can be pg_catalog); the implicit
-                        // one only surfaces in current_schemas(true).
-                        if path.explicit_catalog() {
-                            let _ = write!(published.names[published.n], "pg_catalog");
-                            published.n += 1;
-                        } else if published.catalog_pos == usize::MAX {
-                            published.catalog_pos = published.n;
-                        }
-                    }
-                    crate::storage::PathEntry::Schema(slot) => {
-                        let _ = write!(
-                            published.names[published.n],
-                            "{}",
-                            self.storage.schema_def(*slot as usize).name.as_str()
-                        );
-                        published.n += 1;
-                    }
-                }
-            }
-            eval::funcs::system::set_session_schemas(published);
-        }
-        // Publish this statement's readable settings for `current_setting()`,
-        // the exact values `SHOW` reports (fixed server params + session GUCs).
-        {
-            let mut names = [""; SETTING_NAMES.len()];
-            let mut values = [crate::util::StackStr::<256>::new(); SETTING_NAMES.len()];
-            let mut reset_values = [crate::util::StackStr::<256>::new(); SETTING_NAMES.len()];
-            let mut sources = ["default"; SETTING_NAMES.len()];
-            let mut setting_count = 0;
-            for &name in SETTING_NAMES {
-                if let Some(value) = self.fixed_setting_for(name, txn) {
-                    names[setting_count] = name;
-                    values[setting_count] = value;
-                    reset_values[setting_count] =
-                        guc.transaction_reset_owned(name).unwrap_or(value);
-                    sources[setting_count] = txn.setting_source(name).unwrap_or("default");
-                    setting_count += 1;
-                } else if let Some(value) = guc.get_owned(name) {
-                    names[setting_count] = name;
-                    values[setting_count] = value;
-                    reset_values[setting_count] = guc.reset_owned(name).unwrap_or(value);
-                    sources[setting_count] = guc.source(name);
-                    setting_count += 1;
-                }
-            }
-            if let Err(e) = eval::funcs::system::set_session_settings(
-                &names[..setting_count],
-                &values[..setting_count],
-                &reset_values[..setting_count],
-                &sources[..setting_count],
-            ) {
-                return Ok(Err(e));
-            }
+        if let Err(error) = self.publish_session_context(guc, txn, current_role.as_str()) {
+            return Ok(Err(error));
         }
         // Arm this statement's `statement_timeout` deadline (0 clears it); each
         // statement re-arms, so no explicit disarm is needed.

@@ -7685,6 +7685,8 @@ impl<'a> Parser<'a> {
                     | "asc"
                     | "desc"
                     | "offset"
+                    | "returning"
+                    | "on"
             );
             if !reserved {
                 self.advance()?;

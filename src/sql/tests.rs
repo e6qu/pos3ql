@@ -23953,7 +23953,7 @@ fn parent_for_update_locks_the_physical_leaf_row() {
 }
 
 #[test]
-fn parent_before_update_trigger_cannot_move_a_row_to_another_leaf() {
+fn partition_parent_before_update_trigger_routes_to_its_chosen_leaf() {
     let (mut engine, mut budget) = test_engine();
     let moved = run_with(
         &mut engine,
@@ -23966,10 +23966,13 @@ fn parent_before_update_trigger_cannot_move_a_row_to_another_leaf() {
          CREATE TRIGGER parent_update_route BEFORE UPDATE ON update_trigger_parent \
            FOR EACH ROW EXECUTE FUNCTION move_updated_partition(); \
          INSERT INTO update_trigger_parent VALUES (1); \
-         UPDATE update_trigger_parent SET id = 2 WHERE id = 1",
+         UPDATE update_trigger_parent SET id = 2 WHERE id = 1 RETURNING id; \
+         SELECT id FROM update_trigger_low; \
+         SELECT id FROM update_trigger_high",
     );
-    assert!(
-        String::from_utf8_lossy(&moved).contains("0A000"),
+    assert_eq!(
+        data_rows(&moved),
+        ["11", "11"],
         "{}",
         String::from_utf8_lossy(&moved)
     );
@@ -67243,11 +67246,11 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         "CREATE TABLE replicated (id int PRIMARY KEY, body text, retained text DEFAULT 'local'); \
          CREATE TABLE replication_trigger_audit (note text); \
          CREATE FUNCTION audit_replication_insert() RETURNS trigger LANGUAGE plpgsql AS \
-         'BEGIN INSERT INTO replication_trigger_audit VALUES (''replica insert''); RETURN NEW; END'; \
+         'BEGIN INSERT INTO public.replication_trigger_audit VALUES (''replica insert''); RETURN NEW; END'; \
          CREATE FUNCTION audit_replication_statement() RETURNS trigger LANGUAGE plpgsql AS \
-         'BEGIN INSERT INTO replication_trigger_audit VALUES (''replica statement''); RETURN NULL; END'; \
+         'BEGIN INSERT INTO public.replication_trigger_audit VALUES (''replica statement''); RETURN NULL; END'; \
          CREATE FUNCTION audit_replication_truncate() RETURNS trigger LANGUAGE plpgsql AS \
-         'BEGIN INSERT INTO replication_trigger_audit VALUES (''replica truncate''); RETURN NULL; END'; \
+         'BEGIN INSERT INTO public.replication_trigger_audit VALUES (''replica truncate''); RETURN NULL; END'; \
          CREATE TRIGGER replicated_replica_insert BEFORE INSERT ON replicated \
          FOR EACH ROW EXECUTE FUNCTION audit_replication_insert(); \
          CREATE TRIGGER replicated_replica_statement AFTER INSERT ON replicated \
@@ -67579,7 +67582,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     );
     // An ALTER replaces the publisher stream before this worker can process
     // its next raw pgoutput transaction. Authority is checked before the
-    // first row mutation, so stale work never reaches the local write path.
+    // next transaction begins, so stale work never reaches the local write path.
     run_with(
         &mut engine,
         &mut budget,
@@ -67587,11 +67590,8 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     );
     begin[8] = 130;
     begin[20] = 7;
-    receive(&mut apply, &mut engine, 130, &begin);
-    let mut stale_insert = durable_insert;
-    stale_insert[13] = b'3';
-    let bytes = frame(130, &stale_insert);
-    let parsed = copy_data(&bytes[..25 + stale_insert.len()]).unwrap();
+    let bytes = frame(130, &begin);
+    let parsed = copy_data(&bytes[..25 + begin.len()]).unwrap();
     let error = apply.receive(&mut engine, parsed).unwrap_err();
     assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
     assert_eq!(apply.confirmed_lsn(), 121);
@@ -67875,7 +67875,18 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         frame[9..17].copy_from_slice(&end_lsn.to_be_bytes());
         frame[25..25 + plugin.len()].copy_from_slice(plugin);
         let parsed = copy_data(&frame[..25 + plugin.len()]).expect("valid pgoutput frame");
-        apply.receive(engine, parsed).unwrap()
+        let setting = super::eval::funcs::system::session_setting("search_path");
+        let path = engine.storage.path();
+        let result = crate::mem::guard::forbid_alloc(|| apply.receive(engine, parsed).unwrap());
+        assert_eq!(
+            super::eval::funcs::system::session_setting("search_path"),
+            setting
+        );
+        assert!(
+            engine.storage.path().entries() == path.entries(),
+            "worker restores frontend lookup path"
+        );
+        result
     }
 
     fn relation() -> Vec<u8> {
@@ -67924,14 +67935,25 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
     let config = test_config("pgoutput-partition-root-apply");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    run_with(
+    let setup = run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE replicated_partition (id int PRIMARY KEY, body text) PARTITION BY RANGE (id); \
-         CREATE TABLE replicated_partition_low PARTITION OF replicated_partition \
-           FOR VALUES FROM (0) TO (10); \
-         CREATE TABLE replicated_partition_high PARTITION OF replicated_partition \
-           FOR VALUES FROM (10) TO (20); \
+        "CREATE TABLE replicated_partition (id int PRIMARY KEY, body text, computed integer GENERATED ALWAYS AS (length(body)) STORED) PARTITION BY RANGE (id); \
+         CREATE TABLE replicated_partition_low(body text, computed integer GENERATED ALWAYS AS (length(body) + 100) STORED, id integer NOT NULL); \
+         CREATE TABLE replicated_partition_high(computed integer GENERATED ALWAYS AS (length(body) + 200) STORED, id integer NOT NULL, body text); \
+         ALTER TABLE replicated_partition ATTACH PARTITION replicated_partition_low FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE replicated_partition ATTACH PARTITION replicated_partition_high FOR VALUES FROM (10) TO (20); \
+         CREATE TABLE replicated_partition_audit(event text, leaf text, id integer, body text, computed integer); \
+         CREATE FUNCTION replicated_partition_before() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN IF current_setting(''search_path'') <> '''' THEN RAISE EXCEPTION ''worker inherited a frontend path''; END IF; IF TG_OP = ''INSERT'' THEN NEW.body := upper(NEW.body); ELSE NEW.body := NEW.body || '':U''; END IF; RETURN NEW; END'; \
+         CREATE FUNCTION replicated_partition_after() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN IF TG_OP = ''DELETE'' THEN INSERT INTO public.replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, OLD.id, OLD.body, OLD.computed); ELSE INSERT INTO public.replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, NEW.id, NEW.body, NEW.computed); END IF; RETURN NULL; END'; \
+         CREATE TRIGGER replica_partition_before BEFORE INSERT OR UPDATE ON replicated_partition FOR EACH ROW EXECUTE FUNCTION replicated_partition_before(); \
+         CREATE TRIGGER replica_partition_after AFTER INSERT OR UPDATE OR DELETE ON replicated_partition FOR EACH ROW EXECUTE FUNCTION replicated_partition_after(); \
+         ALTER TABLE replicated_partition_low ENABLE REPLICA TRIGGER replica_partition_before; \
+         ALTER TABLE replicated_partition_low ENABLE REPLICA TRIGGER replica_partition_after; \
+         ALTER TABLE replicated_partition_high ENABLE REPLICA TRIGGER replica_partition_before; \
+         ALTER TABLE replicated_partition_high ENABLE REPLICA TRIGGER replica_partition_after; \
          ALTER TABLE replicated_partition ENABLE ROW LEVEL SECURITY; \
          ALTER TABLE replicated_partition FORCE ROW LEVEL SECURITY; \
          CREATE POLICY reject_local_writes ON replicated_partition FOR ALL \
@@ -67939,6 +67961,11 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
          CREATE SUBSCRIPTION partition_apply CONNECTION \
            'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
            PUBLICATION partition_changes WITH (connect = false, slot_name = NONE)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
     );
     let mut apply = SubscriptionApply::new(
         &mut budget,
@@ -67970,16 +67997,34 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT id, body FROM replicated_partition_low",
+            "SELECT id, body, computed FROM replicated_partition_low",
         )),
-        ["1|first"]
+        ["1|FIRST|105"]
     );
 
-    receive(&mut apply, &mut engine, 80, &begin(80, 2));
+    receive(&mut apply, &mut engine, 60, &begin(60, 2));
+    let mut same_leaf = vec![b'U'];
+    same_leaf.extend_from_slice(&7_u32.to_be_bytes());
+    same_leaf.push(b'K');
+    same_leaf.extend_from_slice(&tuple(&[b"1", b"first"]));
+    same_leaf.push(b'N');
+    same_leaf.extend_from_slice(&tuple(&[b"2", b"changed"]));
+    receive(&mut apply, &mut engine, 60, &same_leaf);
+    receive(&mut apply, &mut engine, 61, &commit(60, 61));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, body, computed FROM replicated_partition_low"
+        )),
+        ["2|changed:U|109"]
+    );
+
+    receive(&mut apply, &mut engine, 80, &begin(80, 3));
     let mut update = vec![b'U'];
     update.extend_from_slice(&7_u32.to_be_bytes());
     update.push(b'K');
-    update.extend_from_slice(&tuple(&[b"1", b"first"]));
+    update.extend_from_slice(&tuple(&[b"2", b"changed"]));
     update.push(b'N');
     update.extend_from_slice(&tuple(&[b"11", b"moved"]));
     receive(&mut apply, &mut engine, 80, &update);
@@ -67988,9 +68033,9 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT id, body FROM replicated_partition_high",
+            "SELECT id, body, computed FROM replicated_partition_high",
         )),
-        ["11|moved"]
+        ["11|MOVED|205"]
     );
     assert!(
         data_rows(&run_with(
@@ -68001,7 +68046,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         .is_empty()
     );
 
-    receive(&mut apply, &mut engine, 100, &begin(100, 3));
+    receive(&mut apply, &mut engine, 100, &begin(100, 4));
     let mut delete = vec![b'D'];
     delete.extend_from_slice(&7_u32.to_be_bytes());
     delete.push(b'K');
@@ -68017,6 +68062,53 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         .is_empty()
     );
     assert_eq!(apply.confirmed_lsn(), 101);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT event, leaf, id, body, computed FROM replicated_partition_audit ORDER BY event, id"
+        )),
+        [
+            "DELETE|replicated_partition_low|2|changed:U|109",
+            "DELETE|replicated_partition_high|11|MOVED|205",
+            "INSERT|replicated_partition_low|1|FIRST|105",
+            "INSERT|replicated_partition_high|11|MOVED|205",
+            "UPDATE|replicated_partition_low|2|changed:U|109",
+        ]
+    );
+    receive(&mut apply, &mut engine, 120, &begin(120, 5));
+    receive(&mut apply, &mut engine, 120, &insert);
+    let mut high_insert = vec![b'I'];
+    high_insert.extend_from_slice(&7_u32.to_be_bytes());
+    high_insert.push(b'N');
+    high_insert.extend_from_slice(&tuple(&[b"11", b"again"]));
+    receive(&mut apply, &mut engine, 120, &high_insert);
+    receive(&mut apply, &mut engine, 121, &commit(120, 121));
+    let truncate = [b'T', 0, 0, 0, 1, 0, 0, 0, 0, 7];
+    receive(&mut apply, &mut engine, 140, &begin(140, 6));
+    receive(&mut apply, &mut engine, 140, &truncate);
+    assert_eq!(apply.confirmed_lsn(), 121);
+    crate::mem::guard::forbid_alloc(|| apply.stop(&mut engine));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM replicated_partition ORDER BY id"
+        )),
+        ["1", "11"]
+    );
+    receive(&mut apply, &mut engine, 140, &begin(140, 6));
+    receive(&mut apply, &mut engine, 140, &truncate);
+    receive(&mut apply, &mut engine, 141, &commit(140, 141));
+    assert_eq!(apply.confirmed_lsn(), 141);
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM replicated_partition"
+        ))
+        .is_empty()
+    );
 }
 
 #[test]
@@ -80963,39 +81055,113 @@ fn dml_target_inherited_layouts_preserve_child_values_after_cold_recovery() {
 }
 
 #[test]
-fn dml_target_reordered_partition_attachment_is_explicitly_unsupported() {
-    let config = test_config("dml-target-partition-order");
+fn dml_target_reordered_partition_writes_and_constraints_survive_cold_recovery() {
+    let mut config = test_config("dml-target-partition-order");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("dml-partition-order-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(
-        &mut engine,
-        "CREATE TABLE partition_order_parent(id integer, amount integer) PARTITION BY RANGE(id); \
-         CREATE TABLE partition_order_child(amount integer, id integer)",
-        true,
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
+    session.success(&mut engine,
+        "CREATE TABLE partition_order_parent(id integer PRIMARY KEY, label text DEFAULT 'parent', seed integer DEFAULT 2, result integer GENERATED ALWAYS AS (100 / seed) STORED) PARTITION BY RANGE(id); \
+         CREATE TABLE partition_order_low(label text DEFAULT 'child' UNIQUE, result integer GENERATED ALWAYS AS (200 / seed) STORED, seed integer DEFAULT 4, id integer NOT NULL); \
+         CREATE TABLE partition_order_high(seed integer DEFAULT 6, id integer NOT NULL, label text DEFAULT 'high', result integer GENERATED ALWAYS AS (300 / seed) STORED); \
+         INSERT INTO partition_order_low(label, seed, id) VALUES ('pre', 2, 9); \
+         CREATE TABLE partition_order_source(old_id integer, new_id integer, label text); \
+         INSERT INTO partition_order_source VALUES (3, 3, 'merged'), (1, 11, 'unused')", true);
+    session.success(&mut engine,
+        "ALTER TABLE partition_order_parent ATTACH PARTITION partition_order_low FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE partition_order_parent ATTACH PARTITION partition_order_high FOR VALUES FROM (10) TO (20)", true);
+    session.success(&mut engine,
+        "CREATE FUNCTION partition_order_before() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN IF NEW.seed = 0 THEN NEW.seed := 4; END IF; NEW.label := upper(NEW.label); RETURN NEW; END'; \
+         CREATE TRIGGER partition_order_before BEFORE INSERT ON partition_order_parent FOR EACH ROW EXECUTE FUNCTION partition_order_before()", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "INSERT INTO partition_order_parent(id) VALUES (1) RETURNING id, label, seed, result",
+            true
+        )),
+        ["1|PARENT|2|100"]
     );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "INSERT INTO partition_order_low(id, label) VALUES (2, 'second') RETURNING id, label, seed, result", true)), ["2|SECOND|4|50"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "INSERT INTO partition_order_parent(id, label, seed) SELECT 3, 'third', 0 RETURNING id, label, seed, result", true)), ["3|THIRD|4|50"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "INSERT INTO partition_order_parent(id, label, seed) VALUES (1, 'updated', 0) ON CONFLICT(id) DO UPDATE SET label = excluded.label, seed = DEFAULT RETURNING id, label, seed, result", true)), ["1|UPDATED|2|100"]);
     let failed = session.execute(&mut engine,
-        "ALTER TABLE partition_order_parent ATTACH PARTITION partition_order_child FOR VALUES FROM (0) TO (10)", true);
-    let text = String::from_utf8_lossy(&failed);
+        "INSERT INTO partition_order_parent(id, label) VALUES (1, 'bad move') ON CONFLICT(id) DO UPDATE SET id = 11", true);
     assert!(
-        text.contains("0A000") && text.contains("physical order"),
-        "{text}"
+        String::from_utf8_lossy(&failed).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
     );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "MERGE INTO partition_order_parent t USING partition_order_source s ON t.id = s.old_id AND s.old_id = 3 WHEN MATCHED THEN UPDATE SET label = s.label RETURNING t.id, t.label, t.seed, t.result", true)), ["3|merged|4|50"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "UPDATE partition_order_parent SET id = 12 WHERE id = 2 RETURNING id, label, seed, result", true)), ["12|SECOND|4|75"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "MERGE INTO partition_order_parent t USING partition_order_source s ON t.id = s.old_id AND s.old_id = 1 WHEN MATCHED THEN UPDATE SET id = s.new_id RETURNING t.id, t.label, t.seed, t.result", true)), ["11|UPDATED|2|150"]);
     session.success(
         &mut engine,
-        "INSERT INTO partition_order_child VALUES (30, 1)",
+        "BEGIN; UPDATE partition_order_parent SET id = id + 1 WHERE id = 9; ROLLBACK",
         true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            // This sort uploads a temporary run into the simulator's fixture vectors.
+            "SELECT id, label, seed, result FROM partition_order_parent ORDER BY id",
+            false
+        )),
+        [
+            "3|merged|4|50",
+            "9|pre|2|100",
+            "11|UPDATED|2|150",
+            "12|SECOND|4|75"
+        ]
     );
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
-            "SELECT count(*) FROM partition_order_parent",
+            "SELECT id FROM partition_order_parent ORDER BY id LIMIT 2 OFFSET 1",
+            false
+        )),
+        ["9", "11"]
+    );
+    assert!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id FROM ONLY partition_order_parent ORDER BY id",
+            true
+        ))
+        .is_empty()
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "DELETE FROM partition_order_parent WHERE id = 3 RETURNING id, label, seed, result",
             true
         )),
-        ["0"]
+        ["3|merged|4|50"]
     );
     drop(session);
     drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -81474,9 +81640,9 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
          CREATE FUNCTION worker_copy_before() RETURNS trigger LANGUAGE plpgsql AS \
          'BEGIN NEW.label := upper(NEW.label); RETURN NEW; END'; \
          CREATE FUNCTION worker_copy_after() RETURNS trigger LANGUAGE plpgsql AS \
-         'BEGIN UPDATE worker_copy_values SET label = label || ''+'' WHERE id < NEW.id; RETURN NEW; END'; \
+         'BEGIN UPDATE public.worker_copy_values SET label = label || ''+'' WHERE id < NEW.id; RETURN NEW; END'; \
          CREATE FUNCTION worker_copy_statement() RETURNS trigger LANGUAGE plpgsql AS \
-         'BEGIN INSERT INTO worker_copy_audit SELECT string_agg(label, '','' ORDER BY id) FROM inserted; RETURN NULL; END'; \
+         'BEGIN INSERT INTO public.worker_copy_audit SELECT string_agg(label, '','' ORDER BY id) FROM inserted; RETURN NULL; END'; \
          CREATE TRIGGER worker_copy_before BEFORE INSERT ON worker_copy_values \
          FOR EACH ROW EXECUTE FUNCTION worker_copy_before(); \
          CREATE TRIGGER worker_copy_after AFTER INSERT ON worker_copy_values \
@@ -81577,6 +81743,648 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         ["ONE,TWO"]
     );
     drop(apply);
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn dml_target_upsert_applies_referenced_key_actions() {
+    let config = test_config("dml-target-upsert-referenced-key");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE upsert_key_target(id integer PRIMARY KEY, amount integer); \
+         CREATE TABLE upsert_key_reference(id integer REFERENCES upsert_key_target(id) ON UPDATE CASCADE); \
+         INSERT INTO upsert_key_target VALUES (1, 10); \
+         INSERT INTO upsert_key_reference VALUES (1)", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "INSERT INTO upsert_key_target VALUES (1, 20) ON CONFLICT(id) \
+         DO UPDATE SET id = 2, amount = excluded.amount RETURNING id, amount",
+            true
+        )),
+        ["2|20"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id FROM upsert_key_reference", true)),
+        ["2"]
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn dml_target_upsert_rejects_triggered_rewrites_and_repeated_updates() {
+    let config = test_config("dml-target-upsert-triggered-rewrite");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE upsert_trigger_target(id integer PRIMARY KEY, amount integer); \
+         INSERT INTO upsert_trigger_target VALUES (2, 20); \
+         CREATE FUNCTION upsert_trigger_rewrite() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN IF NEW.amount = 30 THEN UPDATE upsert_trigger_target SET amount = 99 WHERE id = OLD.id; END IF; RETURN NEW; END'; \
+         CREATE TRIGGER upsert_trigger_rewrite BEFORE UPDATE ON upsert_trigger_target \
+         FOR EACH ROW EXECUTE FUNCTION upsert_trigger_rewrite()", true);
+    let failed = session.execute(
+        &mut engine,
+        "INSERT INTO upsert_trigger_target VALUES (2, 30) ON CONFLICT(id) \
+         DO UPDATE SET amount = excluded.amount",
+        true,
+    );
+    assert!(
+        String::from_utf8_lossy(&failed).contains("27000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, amount FROM upsert_trigger_target",
+            true
+        )),
+        ["2|20"]
+    );
+    let failed = session.execute(
+        &mut engine,
+        "INSERT INTO upsert_trigger_target VALUES (2, 21), (2, 22) ON CONFLICT(id) \
+         DO UPDATE SET amount = excluded.amount",
+        true,
+    );
+    assert!(
+        String::from_utf8_lossy(&failed).contains("21000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, amount FROM upsert_trigger_target",
+            true
+        )),
+        ["2|20"]
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn pgoutput_row_selection_copies_only_matches_and_owns_original_schema() {
+    use crate::pg::pginput::{CopyData, Message};
+    use crate::pg::subscription_apply::RelationMap;
+    use crate::storage::MAX_COLUMNS;
+
+    fn frame(plugin: &[u8]) -> Vec<u8> {
+        let mut out = vec![0; 25];
+        out[0] = b'w';
+        out.extend_from_slice(plugin);
+        out
+    }
+    fn deletion(id: &[u8]) -> Vec<u8> {
+        let mut plugin = vec![b'D', 0, 0, 0, 1, b'K', 0, 2, b't'];
+        plugin.extend_from_slice(&(id.len() as u32).to_be_bytes());
+        plugin.extend_from_slice(id);
+        plugin.push(b'n');
+        frame(&plugin)
+    }
+    let config = test_config("pgoutput-owned-row-selection");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut relations = RelationMap::new(&mut budget, 1).unwrap();
+    let arena = Arena::new(&mut budget, "replication_selection", 256).unwrap();
+    session.success(&mut engine,
+        "CREATE TABLE replica_selection(id integer PRIMARY KEY, label text); \
+         INSERT INTO replica_selection SELECT value, repeat('x', 512) FROM generate_series(1, 100) AS series(value); \
+         INSERT INTO replica_selection VALUES (101, 'kept')", true);
+    session.success(&mut engine, "BEGIN", true);
+    let mut relation = vec![b'R', 0, 0, 0, 1];
+    relation.extend_from_slice(b"public\0replica_selection\0");
+    relation.extend_from_slice(&[b'd', 0, 2, 1]);
+    relation.extend_from_slice(b"id\0");
+    relation.extend_from_slice(&23u32.to_be_bytes());
+    relation.extend_from_slice(&(-1i32).to_be_bytes());
+    relation.push(0);
+    relation.extend_from_slice(b"label\0");
+    relation.extend_from_slice(&25u32.to_be_bytes());
+    relation.extend_from_slice(&(-1i32).to_be_bytes());
+    let relation = frame(&relation);
+    let large = deletion(b"1");
+    let small = deletion(b"101");
+    let selected = crate::mem::guard::forbid_alloc(|| {
+        let CopyData::XLogData {
+            message: Message::Relation { relation, .. },
+            ..
+        } = crate::pg::pginput::copy_data(&relation).unwrap()
+        else {
+            panic!("relation frame");
+        };
+        relations
+            .register(&engine.storage, session.transaction.txid, relation)
+            .unwrap();
+        let binding = relations
+            .binding(&engine.storage, session.transaction.txid, 1)
+            .unwrap();
+        let CopyData::XLogData {
+            message: Message::Delete { old, .. },
+            ..
+        } = crate::pg::pginput::copy_data(&large).unwrap()
+        else {
+            panic!("delete frame");
+        };
+        let error = super::exec::locate_replication_row(
+            &engine.storage,
+            &session.transaction,
+            binding,
+            old,
+            &arena,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("subscription row image"));
+        let CopyData::XLogData {
+            message: Message::Delete { old, .. },
+            ..
+        } = crate::pg::pginput::copy_data(&small).unwrap()
+        else {
+            panic!("delete frame");
+        };
+        super::exec::locate_replication_row(
+            &engine.storage,
+            &session.transaction,
+            binding,
+            old,
+            &arena,
+        )
+        .unwrap()
+    });
+    let table = selected.table_slot();
+    session.success(&mut engine, "ROLLBACK", true);
+    session.success(&mut engine, "DROP TABLE replica_selection", true);
+    session.success(&mut engine, "CREATE TABLE replica_selection(replacement text); INSERT INTO replica_selection VALUES ('new table')", true);
+    assert_eq!(
+        engine.storage.find_table("public", "replica_selection"),
+        Some(table)
+    );
+    drop(session);
+    drop(engine);
+    crate::mem::guard::forbid_alloc(|| {
+        let definition = selected.definition();
+        assert_eq!(definition.n_columns, 2);
+        assert_eq!(definition.columns()[0].name.as_str(), "id");
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        definition.schema(&mut schema);
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        crate::storage::rowenc::decode(selected.bytes(), &schema[..2], &mut values).unwrap();
+        assert_eq!(&values[..2], &[Datum::Int4(101), Datum::Text("kept")]);
+    });
+    drop(selected);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn pgoutput_targets_reject_foreign_tables_views_and_other_relation_kinds() {
+    let config = test_config("pgoutput-target-kinds");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE subscription_local(id integer); \
+         CREATE TABLE subscription_parent(id integer) PARTITION BY RANGE(id); \
+         CREATE TABLE subscription_leaf PARTITION OF subscription_parent FOR VALUES FROM (0) TO (10); \
+         CREATE VIEW subscription_view AS SELECT 1 AS id; \
+         CREATE MATERIALIZED VIEW subscription_matview AS SELECT 1 AS id; \
+         CREATE SEQUENCE subscription_sequence; \
+         CREATE FOREIGN DATA WRAPPER postgres_fdw HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         CREATE SERVER subscription_upstream FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host '127.0.0.1', port '1', sslmode 'disable'); \
+         CREATE FOREIGN TABLE subscription_foreign(id integer) SERVER subscription_upstream", true);
+    let schema = crate::storage::SqlName::parse("public").unwrap();
+    let columns = [crate::storage::SqlName::parse("id").unwrap()];
+    crate::mem::guard::forbid_alloc(|| {
+        for name in [
+            "subscription_local",
+            "subscription_parent",
+            "subscription_leaf",
+        ] {
+            let table = engine
+                .storage
+                .resolve_subscription_target("public", name, 0)
+                .unwrap();
+            engine
+                .storage
+                .require_subscription_target(table, 0)
+                .unwrap();
+        }
+        for name in [
+            "subscription_foreign",
+            "subscription_view",
+            "subscription_matview",
+            "subscription_sequence",
+        ] {
+            let error = engine
+                .storage
+                .resolve_subscription_target("public", name, 0)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::WRONG_OBJECT_TYPE);
+            let table = crate::storage::SqlName::parse(name).unwrap();
+            let error = engine
+                .subscription_copy_setup(schema, table, &columns, 0)
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::WRONG_OBJECT_TYPE);
+        }
+        let error = engine
+            .storage
+            .resolve_subscription_target("public", "subscription_missing", 0)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    });
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn dml_target_generates_after_before_triggers_and_accepts_upsert_defaults() {
+    let config = test_config("dml-target-generated-timing");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
+    session.success(&mut engine,
+        "CREATE TABLE generated_timing(id integer PRIMARY KEY, seed integer DEFAULT 4, result integer GENERATED ALWAYS AS (100 / seed) STORED); \
+         CREATE FUNCTION generated_timing_before() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN NEW.seed := 2; RETURN NEW; END'; \
+         CREATE TRIGGER generated_timing_before BEFORE INSERT ON generated_timing FOR EACH ROW EXECUTE FUNCTION generated_timing_before(); \
+         INSERT INTO generated_timing(id, seed) VALUES (1, 0)", true);
+    session.success(
+        &mut engine,
+        "MERGE INTO generated_timing t USING (VALUES (2, 0)) AS s(id, seed) ON t.id = s.id \
+         WHEN NOT MATCHED THEN INSERT(id, seed) VALUES (s.id, s.seed)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, seed, result FROM generated_timing ORDER BY id",
+            true
+        )),
+        ["1|2|50", "2|2|50"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "INSERT INTO generated_timing(id, seed) VALUES (1, 0) ON CONFLICT(id) \
+         DO UPDATE SET seed = DEFAULT, result = DEFAULT RETURNING id, seed, result",
+            true
+        )),
+        ["1|4|25"]
+    );
+    let failed = session.execute(&mut engine,
+        "INSERT INTO generated_timing(id, seed) VALUES (3, 1) ON CONFLICT(id) DO UPDATE SET result = 99", true);
+    assert!(
+        String::from_utf8_lossy(&failed).contains("428C9"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM generated_timing", true)),
+        ["2"]
+    );
+    let failed = session.execute(&mut engine,
+        "CREATE TABLE generated_partition_key(seed integer, result integer GENERATED ALWAYS AS (seed + 1) STORED) PARTITION BY RANGE(result)", true);
+    assert!(
+        String::from_utf8_lossy(&failed).contains("42P17"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    session.success(
+        &mut engine,
+        "CREATE TABLE upsert_default_serial(id serial PRIMARY KEY, label text UNIQUE); \
+         INSERT INTO upsert_default_serial VALUES (10, 'kept')",
+        true,
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "INSERT INTO upsert_default_serial(label) VALUES ('kept') ON CONFLICT(label) DO UPDATE SET id = DEFAULT RETURNING id, label", true)), ["2|kept"]);
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn dml_target_merge_applies_key_actions_and_rejects_triggered_rewrites() {
+    let config = test_config("dml-target-merge-key-actions");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
+    session.success(&mut engine,
+        "CREATE TABLE merge_key_target(id integer PRIMARY KEY, amount integer); \
+         CREATE TABLE merge_key_reference(id integer REFERENCES merge_key_target(id) ON UPDATE CASCADE ON DELETE CASCADE); \
+         INSERT INTO merge_key_target VALUES (1, 10); \
+         INSERT INTO merge_key_reference VALUES (1)", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "MERGE INTO merge_key_target t USING (VALUES (1, 20)) AS s(id, amount) ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET id = 2, amount = s.amount RETURNING t.id, t.amount",
+            true
+        )),
+        ["2|20"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id FROM merge_key_reference", true)),
+        ["2"]
+    );
+    session.success(&mut engine,
+        "CREATE FUNCTION merge_key_rewrite() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN IF NEW.amount = 30 THEN UPDATE merge_key_target SET amount = 99 WHERE id = OLD.id; END IF; RETURN NEW; END'; \
+         CREATE TRIGGER merge_key_rewrite BEFORE UPDATE ON merge_key_target FOR EACH ROW EXECUTE FUNCTION merge_key_rewrite()", true);
+    let failed = session.execute(&mut engine,
+        "MERGE INTO merge_key_target t USING (VALUES (2, 30)) AS s(id, amount) ON t.id = s.id WHEN MATCHED THEN UPDATE SET amount = s.amount", true);
+    assert!(
+        String::from_utf8_lossy(&failed).contains("27000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, amount FROM merge_key_target", true)),
+        ["2|20"]
+    );
+    session.success(&mut engine,
+        "MERGE INTO merge_key_target t USING (VALUES (2)) AS s(id) ON t.id = s.id WHEN MATCHED THEN DELETE", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM merge_key_reference",
+            true
+        )),
+        ["0"]
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn pgoutput_descriptors_refresh_after_local_ddl_without_new_relation_frames() {
+    use crate::pg::pginput::copy_data;
+    use crate::pg::subscription_apply::{ApplyResult, RelationMap, SubscriptionApply};
+
+    fn receive(
+        apply: &mut SubscriptionApply,
+        engine: &mut Engine,
+        end: u64,
+        message: &[u8],
+    ) -> Result<ApplyResult, super::eval::SqlError> {
+        let mut frame = vec![0; 25];
+        frame[0] = b'w';
+        frame[9..17].copy_from_slice(&end.to_be_bytes());
+        frame.extend_from_slice(message);
+        let parsed = copy_data(&frame).unwrap();
+        crate::mem::guard::forbid_alloc(|| apply.receive(engine, parsed))
+    }
+    fn relation(id: u32, name: &str, label: &str) -> Vec<u8> {
+        let mut message = vec![b'R'];
+        message.extend_from_slice(&id.to_be_bytes());
+        message.extend_from_slice(b"public\0");
+        message.extend_from_slice(name.as_bytes());
+        message.extend_from_slice(&[0, b'd', 0, 2]);
+        for (key, name, oid) in [(1, "id", 23_u32), (0, label, 25)] {
+            message.push(key);
+            message.extend_from_slice(name.as_bytes());
+            message.push(0);
+            message.extend_from_slice(&oid.to_be_bytes());
+            message.extend_from_slice(&(-1_i32).to_be_bytes());
+        }
+        message
+    }
+    fn begin(lsn: u64) -> [u8; 21] {
+        let mut message = [0; 21];
+        message[0] = b'B';
+        message[1..9].copy_from_slice(&lsn.to_be_bytes());
+        message[17..21].copy_from_slice(&(lsn as u32).to_be_bytes());
+        message
+    }
+    fn commit(lsn: u64) -> [u8; 26] {
+        let mut message = [0; 26];
+        message[0] = b'C';
+        message[2..10].copy_from_slice(&lsn.to_be_bytes());
+        message[10..18].copy_from_slice(&(lsn + 1).to_be_bytes());
+        message
+    }
+    fn insert(id: &[u8], label: &[u8]) -> Vec<u8> {
+        let mut message = vec![b'I', 0, 0, 0, 7, b'N', 0, 2];
+        for value in [id, label] {
+            message.push(b't');
+            message.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            message.extend_from_slice(value);
+        }
+        message
+    }
+
+    let mut map_budget = Budget::new(RelationMap::budget_bytes(1));
+    let map = RelationMap::new(&mut map_budget, 1).unwrap();
+    assert_eq!(map_budget.remaining(), 0);
+    drop(map);
+    let mut config = test_config("pgoutput-local-ddl-descriptors");
+    config.subscription_relation_capacity = 1;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE replica_descriptor(id integer PRIMARY KEY, unused integer, label text); \
+         CREATE SUBSCRIPTION descriptor_apply CONNECTION 'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+         PUBLICATION descriptor_changes WITH (connect = false, slot_name = NONE)", true);
+    let original_slot = engine
+        .storage
+        .find_table("public", "replica_descriptor")
+        .unwrap();
+    let mut apply = SubscriptionApply::new(
+        &mut budget,
+        engine.subscription_stream("descriptor_apply").unwrap(),
+        &config,
+        0,
+        crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+    )
+    .unwrap();
+    receive(
+        &mut apply,
+        &mut engine,
+        1,
+        &relation(7, "replica_descriptor", "label"),
+    )
+    .unwrap();
+    session.success(
+        &mut engine,
+        "ALTER TABLE replica_descriptor DROP COLUMN unused",
+        true,
+    );
+    receive(&mut apply, &mut engine, 40, &begin(40)).unwrap();
+    receive(&mut apply, &mut engine, 40, &insert(b"1", b"after drop")).unwrap();
+    assert_eq!(
+        receive(&mut apply, &mut engine, 41, &commit(40)).unwrap(),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 41,
+            reply_requested: false
+        }
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, label FROM replica_descriptor",
+            true
+        )),
+        ["1|after drop"]
+    );
+
+    session.success(&mut engine, "DROP TABLE replica_descriptor", true);
+    session.success(
+        &mut engine,
+        "CREATE TABLE descriptor_filler(id integer, label text)",
+        true,
+    );
+    assert_eq!(
+        engine.storage.find_table("public", "descriptor_filler"),
+        Some(original_slot)
+    );
+    session.success(
+        &mut engine,
+        "CREATE TABLE replica_descriptor(label text, id integer PRIMARY KEY)",
+        true,
+    );
+    receive(&mut apply, &mut engine, 60, &begin(60)).unwrap();
+    receive(
+        &mut apply,
+        &mut engine,
+        60,
+        &insert(b"2", b"after recreate"),
+    )
+    .unwrap();
+    receive(&mut apply, &mut engine, 61, &commit(60)).unwrap();
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, label FROM replica_descriptor",
+            true
+        )),
+        ["2|after recreate"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM descriptor_filler", true)),
+        ["0"]
+    );
+
+    session.success(
+        &mut engine,
+        "ALTER TABLE replica_descriptor RENAME COLUMN label TO other",
+        true,
+    );
+    receive(&mut apply, &mut engine, 80, &begin(80)).unwrap();
+    let error = receive(&mut apply, &mut engine, 80, &insert(b"3", b"renamed")).unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    assert_eq!(apply.confirmed_lsn(), 61);
+    session.success(
+        &mut engine,
+        "ALTER TABLE replica_descriptor RENAME COLUMN other TO label",
+        true,
+    );
+    let error = receive(
+        &mut apply,
+        &mut engine,
+        80,
+        &relation(7, "replica_descriptor", "missing"),
+    )
+    .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    let error = receive(
+        &mut apply,
+        &mut engine,
+        80,
+        &relation(8, "descriptor_filler", "label"),
+    )
+    .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    session.success(&mut engine, "ALTER TABLE replica_descriptor ADD COLUMN computed integer GENERATED ALWAYS AS (id + 1) STORED", true);
+    let error = receive(
+        &mut apply,
+        &mut engine,
+        80,
+        &relation(7, "replica_descriptor", "computed"),
+    )
+    .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    receive(&mut apply, &mut engine, 80, &begin(80)).unwrap();
+    receive(&mut apply, &mut engine, 80, &insert(b"3", b"retry")).unwrap();
+    receive(&mut apply, &mut engine, 81, &commit(80)).unwrap();
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, label, computed FROM replica_descriptor ORDER BY id",
+            true
+        )),
+        ["2|after recreate|3", "3|retry|4"]
+    );
+    assert_eq!(apply.confirmed_lsn(), 81);
+    drop(apply);
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn dml_target_partition_constraint_flags_cover_columns_past_sixty_four() {
+    let config = test_config("dml-target-wide-partition-flags");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
+    let columns = (0..80)
+        .map(|column| format!("c{column} integer"))
+        .collect::<Vec<_>>();
+    let reversed = columns
+        .iter()
+        .rev()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    session.success(
+        &mut engine,
+        &format!(
+            "CREATE TABLE wide_partition({}) PARTITION BY RANGE(c0); \
+         CREATE TABLE wide_partition_leaf({reversed}); \
+         ALTER TABLE wide_partition ATTACH PARTITION wide_partition_leaf DEFAULT",
+            columns.join(",")
+        ),
+        true,
+    );
+    session.success(
+        &mut engine,
+        "ALTER TABLE wide_partition ADD CONSTRAINT wide_positive CHECK(c79 > 0); \
+         INSERT INTO wide_partition(c0, c79) VALUES (1, 2)",
+        true,
+    );
+    let failed = session.execute(&mut engine, "UPDATE wide_partition SET c79 = -1", true);
+    assert!(
+        String::from_utf8_lossy(&failed).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT c0, c79 FROM wide_partition", true)),
+        ["1|2"]
+    );
+    session.success(&mut engine, "ALTER TABLE wide_partition DROP CONSTRAINT wide_positive; UPDATE wide_partition SET c79 = -1", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT c0, c79 FROM wide_partition", true)),
+        ["1|-1"]
+    );
     drop(session);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

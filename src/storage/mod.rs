@@ -5,6 +5,8 @@
 //! superseded bytes; object storage retains durable versions. All capacities
 //! are fixed at startup.
 
+mod column_maps;
+pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
 mod table_definitions;
 pub(crate) use table_definitions::TableDefinitionRead;
@@ -12,6 +14,8 @@ use table_definitions::{
     DefinitionVersions, PendingDefinitionHead, PendingDefinitionRead, TableDefinition,
 };
 pub(crate) mod foreign;
+mod partition_rows;
+pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
 mod row_heap;
 mod row_identities;
 mod row_images;
@@ -26,6 +30,7 @@ mod snapshot_leases;
 mod snapshot_reclamation;
 use snapshot_reclamation::SnapshotReclamation;
 mod statistics;
+mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
 use statistics::{StatisticsVersions, TableStatisticsOwner};
 mod spill_generations;
@@ -31120,61 +31125,59 @@ impl Storage {
     pub fn partition_target(
         &self,
         table: usize,
+        definition: &TableDef,
         values: &[crate::sql::types::Datum],
         txid: u32,
     ) -> Result<usize, SqlError> {
+        let row = PartitionRow::new(definition, values)?;
         let mut current = table;
         loop {
-            let definition = self.table_def(current, txid);
-            let Some(PartitionScheme {
-                strategy,
-                keys,
-                n_keys,
-            }) = definition.partition.scheme
-            else {
-                if let Some(PartitionAttachment { parent, bound, .. }) =
-                    definition.partition.attachment
-                    && !self.partition_attachment_accepts(
+            let partition = self.table_def(current, txid).partition;
+            let Some(scheme) = partition.scheme else {
+                if let Some(PartitionAttachment { parent, bound, .. }) = partition.attachment
+                    && !self.partition_attachment_accepts_row(
                         usize::from(parent),
                         current,
                         bound,
-                        values,
+                        row,
                         txid,
                     )?
                 {
                     return Err(sql_err!(
-                        crate::sql::eval::sqlstate::CHECK_VIOLATION,
+                        sqlstate::CHECK_VIOLATION,
                         "new row for relation \"{}\" violates partition constraint",
-                        definition.name.as_str()
+                        self.table_def(current, txid).name.as_str()
                     ));
                 }
                 return Ok(current);
             };
-            current = self.partition_child_target(current, strategy, keys, n_keys, values, txid)?;
+            let keys = row.keys(&self.table_def(current, txid), scheme)?;
+            current = self.partition_child_target(current, keys, txid)?;
         }
     }
 
-    /// Verifies the complete attachment chain of a leaf after `BEFORE ROW`
-    /// triggers have had an opportunity to rewrite its partition keys.
+    /// Checks each attachment using the row's own physical column definition.
     pub(crate) fn validate_partition_target(
         &self,
         leaf: usize,
+        definition: &TableDef,
         values: &[crate::sql::types::Datum],
         txid: u32,
     ) -> Result<(), SqlError> {
+        let row = PartitionRow::new(definition, values)?;
         let mut child = leaf;
         while let Some(PartitionAttachment { parent, bound, .. }) =
             self.table_def(child, txid).partition.attachment
         {
-            if !self.partition_attachment_accepts(
+            if !self.partition_attachment_accepts_row(
                 usize::from(parent),
                 child,
                 bound,
-                values,
+                row,
                 txid,
             )? {
                 return Err(sql_err!(
-                    crate::sql::eval::sqlstate::CHECK_VIOLATION,
+                    sqlstate::CHECK_VIOLATION,
                     "new row for relation \"{}\" violates partition constraint",
                     self.table_def(child, txid).name.as_str()
                 ));
@@ -31187,10 +31190,7 @@ impl Storage {
     pub(crate) fn partition_child_target(
         &self,
         parent_slot: usize,
-        strategy: PartitionStrategy,
-        keys: [u16; MAX_PARTITION_KEYS],
-        n_keys: u8,
-        values: &[crate::sql::types::Datum],
+        row: PartitionKeyRow<'_, '_>,
         txid: u32,
     ) -> Result<usize, SqlError> {
         let mut default = None;
@@ -31212,11 +31212,9 @@ impl Storage {
             }
             if matches!(bound, PartitionBound::Default) {
                 default = Some(child);
-            } else if partition_bound_matches(strategy, keys, n_keys, bound, values)?
-                && match_slot.replace(child).is_some()
-            {
+            } else if row.matches(bound)? && match_slot.replace(child).is_some() {
                 return Err(sql_err!(
-                    crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                    sqlstate::INTERNAL_ERROR,
                     "overlapping partition bounds in relation \"{}\"",
                     self.table_def(parent_slot, txid).name.as_str()
                 ));
@@ -31224,7 +31222,7 @@ impl Storage {
         }
         match_slot.or(default).ok_or_else(|| {
             sql_err!(
-                crate::sql::eval::sqlstate::CHECK_VIOLATION,
+                sqlstate::CHECK_VIOLATION,
                 "no partition of relation \"{}\" found for row",
                 self.table_def(parent_slot, txid).name.as_str()
             )
@@ -31236,22 +31234,39 @@ impl Storage {
         parent: usize,
         child: usize,
         bound: PartitionBound,
+        definition: &TableDef,
         values: &[crate::sql::types::Datum],
         txid: u32,
     ) -> Result<bool, SqlError> {
-        let Some(PartitionScheme {
-            strategy,
-            keys,
-            n_keys,
-        }) = self.table_def(parent, txid).partition.scheme
-        else {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::INTERNAL_ERROR,
-                "partition parent is not partitioned"
-            ));
+        self.partition_attachment_accepts_row(
+            parent,
+            child,
+            bound,
+            PartitionRow::new(definition, values)?,
+            txid,
+        )
+    }
+
+    fn partition_attachment_accepts_row(
+        &self,
+        parent: usize,
+        child: usize,
+        bound: PartitionBound,
+        row: PartitionRow<'_, '_>,
+        txid: u32,
+    ) -> Result<bool, SqlError> {
+        let keys = {
+            let definition = self.table_def(parent, txid);
+            let scheme = definition.partition.scheme.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "partition parent is not partitioned"
+                )
+            })?;
+            row.keys(&definition, scheme)?
         };
         if !matches!(bound, PartitionBound::Default) {
-            return partition_bound_matches(strategy, keys, n_keys, bound, values);
+            return keys.matches(bound);
         }
         for sibling in 0..self.table_count() {
             if sibling == child || !self.table(sibling).visible_to(txid) {
@@ -31267,7 +31282,7 @@ impl Storage {
             };
             if usize::from(sibling_parent) == parent
                 && !matches!(bound, PartitionBound::Default)
-                && partition_bound_matches(strategy, keys, n_keys, bound, values)?
+                && keys.matches(bound)?
             {
                 return Ok(false);
             }

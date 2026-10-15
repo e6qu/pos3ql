@@ -14,7 +14,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::guc::GucState;
 use crate::sql::txn::TxnState;
 use crate::sql_err;
-use crate::storage::{MAX_COLUMNS, Storage};
+use crate::storage::{MAX_COLUMNS, SqlName, Storage};
 
 /// Internal trigger execution never exposes query output to the publisher.
 /// This fixed buffer only retains protocol framing required by the shared
@@ -56,12 +56,24 @@ impl RelationBinding {
     }
 }
 
-/// Fixed, connection-local relation bindings for one apply worker.
+struct RelationEntry {
+    binding: RelationBinding,
+    schema: SqlName,
+    name: SqlName,
+    columns: [SqlName; MAX_COLUMNS],
+}
+
+/// Fixed, connection-local publisher descriptors for one apply worker. Exact
+/// names permit rebuilding local positions after DDL without another R frame.
 pub struct RelationMap {
-    bindings: FixedVec<RelationBinding>,
+    bindings: FixedVec<RelationEntry>,
 }
 
 impl RelationMap {
+    pub const fn budget_bytes(capacity: usize) -> usize {
+        capacity * core::mem::size_of::<RelationEntry>()
+    }
+
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
         Ok(Self {
             bindings: FixedVec::new(budget, "subscription_relations", capacity)?,
@@ -78,20 +90,12 @@ impl RelationMap {
         txid: u32,
         relation: Relation<'_>,
     ) -> Result<(), SqlError> {
-        let table_slot = storage
-            .find_visible(relation.namespace, relation.name, txid)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "subscription relation \"{}.{}\" does not exist locally",
-                    relation.namespace,
-                    relation.name
-                )
-            })?;
+        let table_slot =
+            storage.resolve_subscription_target(relation.namespace, relation.name, txid)?;
         let definition = storage.table_def(table_slot, txid);
         if relation.columns().len() > definition.n_columns {
             return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "subscription relation \"{}.{}\" has {} columns, local table has {}",
                 relation.namespace,
                 relation.name,
@@ -100,12 +104,13 @@ impl RelationMap {
             ));
         }
         let mut remote_to_local = [usize::MAX; MAX_COLUMNS];
+        let mut published = [SqlName::EMPTY; MAX_COLUMNS];
         let mut key_remote_to_local = [usize::MAX; MAX_COLUMNS];
         let mut key_count = 0;
         for (remote, column) in relation.columns().enumerate() {
             let local = definition.column_index(column.name).ok_or_else(|| {
                 sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                     "subscription relation \"{}.{}\" has no local column \"{}\"",
                     relation.namespace,
                     relation.name,
@@ -121,6 +126,14 @@ impl RelationMap {
                     column.name
                 ));
             }
+            if definition.columns()[local].default.is_generated() {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "logical replication target column \"{}\" is generated",
+                    column.name
+                ));
+            }
+            published[remote] = definition.columns()[local].name;
             remote_to_local[remote] = local;
             if column.key {
                 key_remote_to_local[key_count] = local;
@@ -135,15 +148,21 @@ impl RelationMap {
             key_remote_to_local,
             key_count,
         };
+        let entry = RelationEntry {
+            binding,
+            schema: definition.schema,
+            name: definition.name,
+            columns: published,
+        };
         if let Some(existing) = self
             .bindings
             .iter_mut()
-            .find(|existing| existing.relation_id == relation.id)
+            .find(|existing| existing.binding.relation_id == relation.id)
         {
-            *existing = binding;
+            *existing = entry;
             return Ok(());
         }
-        self.bindings.push(binding).map_err(|_| {
+        self.bindings.push(entry).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "subscription relation cache exceeds {} entries",
@@ -152,18 +171,81 @@ impl RelationMap {
         })
     }
 
-    pub fn binding(&self, relation_id: u32) -> Result<RelationBinding, SqlError> {
-        self.bindings
-            .iter()
-            .copied()
-            .find(|binding| binding.relation_id == relation_id)
+    pub fn binding(
+        &mut self,
+        storage: &Storage,
+        txid: u32,
+        relation_id: u32,
+    ) -> Result<RelationBinding, SqlError> {
+        let entry = self
+            .bindings
+            .iter_mut()
+            .find(|entry| entry.binding.relation_id == relation_id)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROTOCOL_VIOLATION,
                     "subscription data references unknown relation {}",
                     relation_id
                 )
-            })
+            })?;
+        let table = storage.resolve_subscription_target(
+            entry.schema.as_str(),
+            entry.name.as_str(),
+            txid,
+        )?;
+        storage.lock_table(
+            txid,
+            table,
+            crate::sql::ast::TableLockMode::RowExclusive,
+            false,
+        )?;
+        let definition = storage.table_def(table, txid);
+        let binding = entry.binding;
+        if binding.table_slot == table
+            && binding
+                .remote_to_local()
+                .iter()
+                .enumerate()
+                .all(|(remote, &local)| {
+                    definition.columns().get(local).is_some_and(|column| {
+                        column.name == entry.columns[remote] && !column.default.is_generated()
+                    })
+                })
+        {
+            return Ok(binding);
+        }
+        let mut replacement = binding;
+        replacement.table_slot = table;
+        for remote in 0..binding.column_count {
+            let name = entry.columns[remote];
+            let local = definition.column_index(name.as_str()).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "logical replication target relation \"{}.{}\" is missing column \"{}\"",
+                    entry.schema.as_str(),
+                    entry.name.as_str(),
+                    name.as_str()
+                )
+            })?;
+            if definition.columns()[local].default.is_generated() {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "logical replication target column \"{}\" is generated",
+                    name.as_str()
+                ));
+            }
+            replacement.remote_to_local[remote] = local;
+        }
+        for (key, &old_local) in binding.key_local_columns().iter().enumerate() {
+            let remote = binding
+                .remote_to_local()
+                .iter()
+                .position(|&column| column == old_local)
+                .expect("registered identity key belongs to the published columns");
+            replacement.key_remote_to_local[key] = replacement.remote_to_local[remote];
+        }
+        entry.binding = replacement;
+        Ok(replacement)
     }
 
     pub fn clear(&mut self) {
@@ -210,7 +292,7 @@ pub struct SubscriptionApply {
 
 impl SubscriptionApply {
     pub const fn budget_bytes(config: &crate::config::Config) -> usize {
-        config.subscription_relation_capacity * core::mem::size_of::<RelationBinding>()
+        RelationMap::budget_bytes(config.subscription_relation_capacity)
             + TxnState::budget_bytes_with_config(config)
             + GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction)
             + config.subscription_arena_bytes
@@ -227,14 +309,17 @@ impl SubscriptionApply {
         confirmed_lsn: u64,
         behavior: crate::storage::SubscriptionBehavior,
     ) -> Result<Self, BudgetError> {
+        let guc = GucState::new_with_capacities(
+            budget,
+            config.max_sequences,
+            config.max_savepoints_per_transaction,
+        )?;
+        guc.set("search_path", "", false)
+            .expect("empty worker search path is valid");
         Ok(Self {
             stream,
             txn: TxnState::new_with_config(budget, config)?,
-            guc: GucState::new_with_capacities(
-                budget,
-                config.max_sequences,
-                config.max_savepoints_per_transaction,
-            )?,
+            guc,
             relations: RelationMap::new(budget, config.subscription_relation_capacity)?,
             arena: Arena::new(
                 budget,
@@ -262,6 +347,26 @@ impl SubscriptionApply {
         })
     }
 
+    fn with_context<R>(
+        &mut self,
+        engine: &mut crate::sql::Engine,
+        operation: impl FnOnce(&mut Self, &mut crate::sql::Engine) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        let _published = crate::sql::eval::funcs::system::retain_session_evaluation();
+        engine.select_database(self.stream.database_oid())?;
+        if !self.txn.is_active() {
+            let owner = engine.subscription_session_user(self.stream, self.txn.txid)?;
+            self.guc.set_session_user(owner.as_str());
+        }
+        // The worker's GUC and transaction fields stay in place throughout
+        // this private callback, including bootstrap and failure cleanup.
+        let _evaluation = crate::sql::guc::enter_eval_scope(&self.guc, &mut self.txn);
+        let prior_path = engine.enter_subscription_session(self.stream, &self.guc, &self.txn)?;
+        let result = operation(self, engine);
+        engine.restore_subscription_path(prior_path);
+        result
+    }
+
     pub fn confirmed_lsn(&self) -> u64 {
         self.confirmed_lsn
     }
@@ -277,33 +382,45 @@ impl SubscriptionApply {
         engine: &mut crate::sql::Engine,
         confirmed_lsn: u64,
     ) -> Result<(), SqlError> {
-        engine.begin_subscription_apply(self.stream.database_oid(), &mut self.txn, &self.guc)?;
-        let result = engine
-            .stage_subscription_advance(&mut self.txn, self.stream, confirmed_lsn)
-            .and_then(|advanced| {
-                if !advanced {
-                    return Err(Self::protocol_error(
-                        "subscription bootstrap frontier did not advance",
-                    ));
-                }
-                self.commit(engine)
-            });
-        if result.is_err() && self.txn.is_active() {
-            engine.rollback_txn(&mut self.txn, &self.guc);
-        }
-        if result.is_ok() {
-            self.confirmed_lsn = confirmed_lsn;
-        }
-        result
+        self.with_context(engine, |worker, engine| {
+            engine.begin_subscription_apply(
+                worker.stream.database_oid(),
+                &mut worker.txn,
+                &worker.guc,
+            )?;
+            let result = engine
+                .stage_subscription_advance(&mut worker.txn, worker.stream, confirmed_lsn)
+                .and_then(|advanced| {
+                    if !advanced {
+                        return Err(Self::protocol_error(
+                            "subscription bootstrap frontier did not advance",
+                        ));
+                    }
+                    worker.commit(engine)
+                });
+            if result.is_err() && worker.txn.is_active() {
+                engine.rollback_txn(&mut worker.txn, &worker.guc);
+            }
+            if result.is_ok() {
+                worker.confirmed_lsn = confirmed_lsn;
+            }
+            result
+        })
     }
 
     pub(crate) fn begin_bootstrap(
         &mut self,
         engine: &mut crate::sql::Engine,
     ) -> Result<(), SqlError> {
-        engine.begin_subscription_apply(self.stream.database_oid(), &mut self.txn, &self.guc)?;
-        self.txn.mode = crate::sql::txn::TxnMode::Explicit;
-        engine.begin_subscription_relation_refresh(&mut self.txn, self.stream)
+        self.with_context(engine, |worker, engine| {
+            engine.begin_subscription_apply(
+                worker.stream.database_oid(),
+                &mut worker.txn,
+                &worker.guc,
+            )?;
+            worker.txn.mode = crate::sql::txn::TxnMode::Explicit;
+            engine.begin_subscription_relation_refresh(&mut worker.txn, worker.stream)
+        })
     }
 
     pub(crate) fn register_bootstrap_relation(
@@ -312,12 +429,14 @@ impl SubscriptionApply {
         schema: crate::storage::SqlName,
         table: crate::storage::SqlName,
     ) -> Result<(), SqlError> {
-        engine.stage_subscription_relation(
-            &mut self.txn,
-            self.stream,
-            schema.as_str(),
-            table.as_str(),
-        )
+        self.with_context(engine, |worker, engine| {
+            engine.stage_subscription_relation(
+                &mut worker.txn,
+                worker.stream,
+                schema.as_str(),
+                table.as_str(),
+            )
+        })
     }
 
     pub(crate) fn start_copy_table(
@@ -327,20 +446,22 @@ impl SubscriptionApply {
         table: crate::storage::SqlName,
         columns: &[crate::storage::SqlName],
     ) -> Result<crate::sql::exec::CopySetup, SqlError> {
-        let setup = engine.subscription_copy_setup(schema, table, columns, self.txn.txid)?;
-        self.copy_transition_scratch.clear();
-        self.trigger_response.clear();
-        self.trigger_scratch.clear();
-        let mut responder = Responder::new(&mut self.trigger_response);
-        engine.subscription_copy_start(
-            &setup,
-            &mut self.txn,
-            self.guc.seq_session(),
-            &self.arena,
-            &mut responder,
-            &mut self.trigger_scratch,
-        )?;
-        Ok(setup)
+        self.with_context(engine, |worker, engine| {
+            let setup = engine.subscription_copy_setup(schema, table, columns, worker.txn.txid)?;
+            worker.copy_transition_scratch.clear();
+            worker.trigger_response.clear();
+            worker.trigger_scratch.clear();
+            let mut responder = Responder::new(&mut worker.trigger_response);
+            engine.subscription_copy_start(
+                &setup,
+                &mut worker.txn,
+                worker.guc.seq_session(),
+                &worker.arena,
+                &mut responder,
+                &mut worker.trigger_scratch,
+            )?;
+            Ok(setup)
+        })
     }
 
     pub(crate) fn copy_line(
@@ -349,25 +470,27 @@ impl SubscriptionApply {
         setup: &crate::sql::exec::CopySetup,
         line: &[u8],
     ) -> Result<(), SqlError> {
-        let mark = self.arena.mark();
-        self.trigger_response.clear();
-        let mut responder = Responder::new(&mut self.trigger_response);
-        let result = engine
-            .copy_row_line(
-                setup,
-                line,
-                crate::sql::CopyRowContext::for_subscription_worker(
-                    &mut self.txn,
-                    self.guc.seq_session(),
-                    &self.arena,
-                    &mut responder,
-                    &mut self.trigger_scratch,
-                    &mut self.copy_transition_scratch,
-                ),
-            )
-            .map(|_| ());
-        unsafe { self.arena.rewind_to(mark) };
-        result
+        self.with_context(engine, |worker, engine| {
+            let mark = worker.arena.mark();
+            worker.trigger_response.clear();
+            let mut responder = Responder::new(&mut worker.trigger_response);
+            let result = engine
+                .copy_row_line(
+                    setup,
+                    line,
+                    crate::sql::CopyRowContext::for_subscription_worker(
+                        &mut worker.txn,
+                        worker.guc.seq_session(),
+                        &worker.arena,
+                        &mut responder,
+                        &mut worker.trigger_scratch,
+                        &mut worker.copy_transition_scratch,
+                    ),
+                )
+                .map(|_| ());
+            unsafe { worker.arena.rewind_to(mark) };
+            result
+        })
     }
 
     pub(crate) fn copy_binary_row(
@@ -376,25 +499,27 @@ impl SubscriptionApply {
         setup: &crate::sql::exec::CopySetup,
         row: &[u8],
     ) -> Result<(), SqlError> {
-        let mark = self.arena.mark();
-        self.trigger_response.clear();
-        let mut responder = Responder::new(&mut self.trigger_response);
-        let result = engine
-            .copy_row_binary(
-                setup,
-                row,
-                crate::sql::CopyRowContext::for_subscription_worker(
-                    &mut self.txn,
-                    self.guc.seq_session(),
-                    &self.arena,
-                    &mut responder,
-                    &mut self.trigger_scratch,
-                    &mut self.copy_transition_scratch,
-                ),
-            )
-            .map(|_| ());
-        unsafe { self.arena.rewind_to(mark) };
-        result
+        self.with_context(engine, |worker, engine| {
+            let mark = worker.arena.mark();
+            worker.trigger_response.clear();
+            let mut responder = Responder::new(&mut worker.trigger_response);
+            let result = engine
+                .copy_row_binary(
+                    setup,
+                    row,
+                    crate::sql::CopyRowContext::for_subscription_worker(
+                        &mut worker.txn,
+                        worker.guc.seq_session(),
+                        &worker.arena,
+                        &mut responder,
+                        &mut worker.trigger_scratch,
+                        &mut worker.copy_transition_scratch,
+                    ),
+                )
+                .map(|_| ());
+            unsafe { worker.arena.rewind_to(mark) };
+            result
+        })
     }
 
     pub(crate) fn finish_copy_table(
@@ -402,21 +527,23 @@ impl SubscriptionApply {
         engine: &mut crate::sql::Engine,
         setup: &crate::sql::exec::CopySetup,
     ) -> Result<(), SqlError> {
-        self.trigger_response.clear();
-        let mut responder = Responder::new(&mut self.trigger_response);
-        let result = engine.subscription_copy_finish(
-            setup,
-            &mut self.txn,
-            &self.guc,
-            &mut responder,
-            crate::sql::SubscriptionCopyWorkspace::new(
-                &mut self.arena,
-                &mut self.trigger_scratch,
-                &self.copy_transition_scratch,
-            ),
-        );
-        self.copy_transition_scratch.clear();
-        result
+        self.with_context(engine, |worker, engine| {
+            worker.trigger_response.clear();
+            let mut responder = Responder::new(&mut worker.trigger_response);
+            let result = engine.subscription_copy_finish(
+                setup,
+                &mut worker.txn,
+                &worker.guc,
+                &mut responder,
+                crate::sql::SubscriptionCopyWorkspace::new(
+                    &mut worker.arena,
+                    &mut worker.trigger_scratch,
+                    &worker.copy_transition_scratch,
+                ),
+            );
+            worker.copy_transition_scratch.clear();
+            result
+        })
     }
 
     pub(crate) fn finish_bootstrap(
@@ -424,18 +551,20 @@ impl SubscriptionApply {
         engine: &mut crate::sql::Engine,
         confirmed_lsn: u64,
     ) -> Result<(), SqlError> {
-        let advanced =
-            engine.stage_subscription_advance(&mut self.txn, self.stream, confirmed_lsn)?;
-        if !advanced {
-            return Err(Self::protocol_error(
-                "subscription bootstrap frontier did not advance",
-            ));
-        }
-        let result = self.commit(engine);
-        if result.is_ok() {
-            self.confirmed_lsn = confirmed_lsn;
-        }
-        result
+        self.with_context(engine, |worker, engine| {
+            let advanced =
+                engine.stage_subscription_advance(&mut worker.txn, worker.stream, confirmed_lsn)?;
+            if !advanced {
+                return Err(Self::protocol_error(
+                    "subscription bootstrap frontier did not advance",
+                ));
+            }
+            let result = worker.commit(engine);
+            if result.is_ok() {
+                worker.confirmed_lsn = confirmed_lsn;
+            }
+            result
+        })
     }
 
     /// Rebinds a preallocated worker after its former transport has stopped.
@@ -693,10 +822,15 @@ impl SubscriptionApply {
                         &mut responder,
                         &mut self.trigger_scratch,
                     );
+                    let binding = engine.resolve_subscription_relation(
+                        &mut self.relations,
+                        &self.txn,
+                        relation_id,
+                    )?;
                     engine.apply_subscription_insert(
                         &mut self.txn,
                         self.stream,
-                        self.relations.binding(relation_id)?,
+                        binding,
                         new,
                         &self.arena,
                         &mut trigger_context,
@@ -738,10 +872,15 @@ impl SubscriptionApply {
                         &mut responder,
                         &mut self.trigger_scratch,
                     );
+                    let binding = engine.resolve_subscription_relation(
+                        &mut self.relations,
+                        &self.txn,
+                        relation_id,
+                    )?;
                     engine.apply_subscription_update(
                         &mut self.txn,
                         self.stream,
-                        self.relations.binding(relation_id)?,
+                        binding,
                         crate::sql::exec::ReplicationUpdate { identity, new },
                         &self.arena,
                         &mut trigger_context,
@@ -782,10 +921,15 @@ impl SubscriptionApply {
                         &mut responder,
                         &mut self.trigger_scratch,
                     );
+                    let binding = engine.resolve_subscription_relation(
+                        &mut self.relations,
+                        &self.txn,
+                        relation_id,
+                    )?;
                     engine.apply_subscription_delete(
                         &mut self.txn,
                         self.stream,
-                        self.relations.binding(relation_id)?,
+                        binding,
                         old,
                         &self.arena,
                         &mut trigger_context,
@@ -832,7 +976,9 @@ impl SubscriptionApply {
                         )
                     })?;
                 for (index, relation_id) in truncate.relation_ids().enumerate() {
-                    tables[index] = self.relations.binding(relation_id)?.table_slot();
+                    tables[index] = engine
+                        .resolve_subscription_relation(&mut self.relations, &self.txn, relation_id)?
+                        .table_slot();
                 }
                 engine.apply_subscription_truncate(
                     &mut self.txn,
@@ -840,6 +986,7 @@ impl SubscriptionApply {
                     &tables[..truncate.relation_ids().len()],
                     truncate.cascade,
                     truncate.restart_identity,
+                    &self.arena,
                 )?;
                 Ok(ApplyResult::None)
             }
@@ -981,21 +1128,23 @@ impl SubscriptionApply {
         engine: &mut crate::sql::Engine,
         frame: CopyData<'_>,
     ) -> Result<ApplyResult, SqlError> {
-        let result = match frame {
-            CopyData::XLogData {
-                end_lsn, message, ..
-            } => self.apply_message(engine, end_lsn, message),
-            CopyData::PrimaryKeepalive {
-                end_lsn: _,
-                reply_requested,
-            } => Ok(ApplyResult::Acknowledge {
-                flushed_lsn: self.confirmed_lsn,
-                reply_requested,
-            }),
-        };
-        if result.is_err() {
-            self.abort(engine);
-        }
-        result
+        self.with_context(engine, |worker, engine| {
+            let result = match frame {
+                CopyData::XLogData {
+                    end_lsn, message, ..
+                } => worker.apply_message(engine, end_lsn, message),
+                CopyData::PrimaryKeepalive {
+                    end_lsn: _,
+                    reply_requested,
+                } => Ok(ApplyResult::Acknowledge {
+                    flushed_lsn: worker.confirmed_lsn,
+                    reply_requested,
+                }),
+            };
+            if result.is_err() {
+                worker.abort(engine);
+            }
+            result
+        })
     }
 }

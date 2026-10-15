@@ -55,11 +55,23 @@ layouts and custom native callbacks are not implemented.
 
 ### Partition column order
 
-An existing table attached as a partition must currently store its columns in
-the parent's order. Reordered columns return `0A000`; PostgreSQL accepts those
-layouts. Ordinary inheritance supports matching columns in different orders.
-For example, attaching `(amount integer, id integer)` beneath a partitioned
-parent `(id integer, amount integer)` is not yet supported.
+An attached table can store matching columns in a different order. SQL
+expressions and `RETURNING` follow the table named in the command; stored rows,
+row triggers, generated values, and constraints follow the destination table.
+
+For example, this inserts `(1, 30)` into a child that stores `amount` first:
+
+```sql
+CREATE TABLE orders (id integer, amount integer) PARTITION BY RANGE (id);
+CREATE TABLE early_orders (amount integer, id integer);
+ALTER TABLE orders ATTACH PARTITION early_orders FOR VALUES FROM (0) TO (10);
+INSERT INTO orders VALUES (1, 30) RETURNING id, amount;
+```
+
+Defaults come from the table named in the command. Stored generated columns
+use the destination table's expression after its BEFORE row triggers. A
+generated column cannot be a partition key (`42P17`). `ON CONFLICT DO UPDATE`
+cannot move the conflicting row to another partition (`0A000`).
 
 ## Capacity boundaries
 

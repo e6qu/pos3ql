@@ -886,6 +886,8 @@ pub(super) fn plan_select<'a>(
             storage,
             scope.as_ref().expect("checked"),
             txid,
+            statement.from.as_ref().expect("checked").base.inheritance
+                == crate::sql::ast::RelationInheritance::Descendants,
             statement.where_clause,
             statement.items,
             statement.order_by,

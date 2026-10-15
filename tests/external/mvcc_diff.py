@@ -28,6 +28,276 @@ def sqlstate(connection, statement: str) -> str:
     return "ok"
 
 
+def generated_write_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE generated_write_diff(id integer PRIMARY KEY, seed integer DEFAULT 4, result integer GENERATED ALWAYS AS (100 / seed) STORED)")
+    writer.execute("CREATE FUNCTION generated_write_before_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.seed := 2; RETURN NEW; END$$")
+    writer.execute("CREATE TRIGGER generated_write_before_diff BEFORE INSERT ON generated_write_diff FOR EACH ROW EXECUTE FUNCTION generated_write_before_diff()")
+    writer.execute("CREATE TABLE generated_serial_diff(id serial PRIMARY KEY, label text UNIQUE)")
+    results = []
+    try:
+        reader.execute("INSERT INTO generated_write_diff(id, seed) VALUES (1, 0)")
+        reader.execute("MERGE INTO generated_write_diff t USING (VALUES (2, 0)) AS s(id, seed) ON t.id = s.id WHEN NOT MATCHED THEN INSERT(id, seed) VALUES (s.id, s.seed)")
+        with reader.cursor().copy("COPY generated_write_diff(id, seed) FROM STDIN") as copied:
+            copied.write(b"3\t0\n")
+        with reader.cursor().copy("COPY generated_write_diff(id, seed) FROM STDIN (FORMAT binary)") as copied:
+            copied.set_types(["int4", "int4"])
+            copied.write_row((4, 0))
+        reader.execute("DROP TRIGGER generated_write_before_diff ON generated_write_diff")
+        with reader.cursor().copy("COPY generated_write_diff(id, seed) FROM STDIN WHERE id < 0") as copied:
+            copied.write(b"5\t0\n")
+        rows = reader.execute("SELECT id, seed, result FROM generated_write_diff ORDER BY id").fetchall()
+        results.append(f"generated_after_before={rows}")
+        changed = reader.execute("INSERT INTO generated_write_diff(id, seed) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET seed = DEFAULT, result = DEFAULT RETURNING id, seed, result").fetchall()
+        results.append(f"upsert_default_generated={changed}")
+        for label, statement in [
+            ("generated_assignment", "INSERT INTO generated_write_diff(id, seed) VALUES (5, 1) ON CONFLICT(id) DO UPDATE SET result = 99"),
+            ("merge_generated_assignment", "MERGE INTO generated_write_diff t USING (VALUES (-1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET result = 99"),
+            ("generated_partition_key", "CREATE TABLE generated_key_diff(seed integer, result integer GENERATED ALWAYS AS (seed + 1) STORED) PARTITION BY RANGE(result)"),
+        ]:
+            error = sqlstate(reader, statement)
+            rows = reader.execute("SELECT id, seed, result FROM generated_write_diff ORDER BY id").fetchall()
+            results.append(f"{label}={error},rows:{rows}")
+        reader.execute("INSERT INTO generated_serial_diff VALUES (10, 'kept')")
+        changed = reader.execute("INSERT INTO generated_serial_diff(label) VALUES ('kept') ON CONFLICT(label) DO UPDATE SET id = DEFAULT RETURNING id, label").fetchall()
+        results.append(f"upsert_default_serial={changed}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE generated_write_diff")
+        writer.execute("DROP TABLE generated_serial_diff")
+        writer.execute("DROP FUNCTION generated_write_before_diff()")
+
+
+def partition_attachment_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE attach_root_diff(id integer, group_id integer, label text) PARTITION BY RANGE(id)")
+    writer.execute("CREATE TABLE attach_middle_diff(label text, id integer, group_id integer) PARTITION BY LIST(group_id)")
+    writer.execute("CREATE TABLE attach_leaf_diff(group_id integer, label text, id integer)")
+    writer.execute("CREATE TABLE attach_default_diff(label text, id integer, group_id integer)")
+    writer.execute("CREATE TABLE attach_high_diff(group_id integer, id integer, label text)")
+    writer.execute("INSERT INTO attach_leaf_diff VALUES (1, 'existing', 1)")
+    writer.execute("INSERT INTO attach_default_diff VALUES ('default', 50, 9)")
+    writer.execute("ALTER TABLE attach_middle_diff ATTACH PARTITION attach_leaf_diff FOR VALUES IN(1)")
+    writer.execute("ALTER TABLE attach_root_diff ATTACH PARTITION attach_middle_diff FOR VALUES FROM (0) TO (10)")
+    writer.execute("ALTER TABLE attach_root_diff ATTACH PARTITION attach_default_diff DEFAULT")
+    results = []
+    try:
+        reader.execute("INSERT INTO attach_root_diff VALUES (2, 1, 'nested')")
+        rows = reader.execute("SELECT id, group_id, label FROM attach_root_diff ORDER BY id").fetchall()
+        selected = reader.execute("SELECT label FROM attach_root_diff WHERE id = 2 AND group_id = 1").fetchall()
+        error = sqlstate(reader, "INSERT INTO attach_root_diff VALUES (3, 2, 'unmatched nested')")
+        results.append(f"attach_nested=rows:{rows},selected:{selected},missing:{error}")
+        error = sqlstate(reader, "ALTER TABLE attach_root_diff ATTACH PARTITION attach_high_diff FOR VALUES FROM (40) TO (60)")
+        rows = reader.execute("SELECT id, group_id, label FROM attach_root_diff ORDER BY id").fetchall()
+        results.append(f"attach_default_conflict={error},rows:{rows}")
+        reader.execute("DELETE FROM attach_default_diff WHERE id = 50")
+        reader.execute("ALTER TABLE attach_root_diff ATTACH PARTITION attach_high_diff FOR VALUES FROM (40) TO (60)")
+        reader.execute("INSERT INTO attach_root_diff VALUES (45, 2, 'high')")
+        reader.execute("ALTER TABLE attach_root_diff ADD CONSTRAINT attachment_label_check CHECK(label <> 'bad')")
+        error = sqlstate(reader, "UPDATE attach_root_diff SET label = 'bad' WHERE id = 2")
+        results.append(f"attach_inherited_check={error}")
+        reader.execute("ALTER TABLE attach_root_diff ALTER COLUMN group_id SET NOT NULL")
+        error = sqlstate(reader, "UPDATE attach_root_diff SET group_id = NULL WHERE id = 45")
+        results.append(f"attach_inherited_not_null={error}")
+        reader.execute("ALTER TABLE attach_root_diff ALTER COLUMN group_id DROP NOT NULL")
+        reader.execute("ALTER TABLE attach_root_diff DROP CONSTRAINT attachment_label_check")
+        reader.execute("ALTER TABLE attach_middle_diff DETACH PARTITION attach_leaf_diff CONCURRENTLY")
+        error = sqlstate(reader, "INSERT INTO attach_leaf_diff VALUES (2, 'outside saved bound', 3)")
+        remaining = reader.execute("SELECT id, group_id, label FROM attach_root_diff ORDER BY id").fetchall()
+        results.append(f"attach_detached_bound={error},remaining:{remaining}")
+        reader.execute("ALTER TABLE attach_middle_diff ATTACH PARTITION attach_leaf_diff FOR VALUES IN(1)")
+        rows = reader.execute("SELECT id, group_id, label FROM attach_root_diff ORDER BY id").fetchall()
+        results.append(f"attach_again={rows}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE attach_root_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS attach_middle_diff CASCADE")
+        writer.execute("DROP TABLE IF EXISTS attach_leaf_diff")
+        writer.execute("DROP TABLE IF EXISTS attach_high_diff")
+
+
+def wide_partition_transcript(reader, writer) -> list[str]:
+    columns = [f"c{column} integer" for column in range(80)]
+    writer.execute(f"CREATE TABLE wide_partition_diff({','.join(columns)}) PARTITION BY RANGE(c0)")
+    writer.execute(f"CREATE TABLE wide_leaf_diff({','.join(reversed(columns))})")
+    writer.execute("ALTER TABLE wide_partition_diff ATTACH PARTITION wide_leaf_diff DEFAULT")
+    try:
+        reader.execute("ALTER TABLE wide_partition_diff ADD CONSTRAINT wide_positive CHECK(c79 > 0)")
+        reader.execute("INSERT INTO wide_partition_diff(c0, c79) VALUES (1, 2)")
+        error = sqlstate(reader, "UPDATE wide_partition_diff SET c79 = -1")
+        rows = reader.execute("SELECT c0, c79 FROM wide_partition_diff").fetchall()
+        results = [f"wide_partition_check={error},rows:{rows}"]
+        reader.execute("ALTER TABLE wide_partition_diff DROP CONSTRAINT wide_positive")
+        reader.execute("UPDATE wide_partition_diff SET c79 = -1")
+        rows = reader.execute("SELECT c0, c79 FROM wide_partition_diff").fetchall()
+        return results + [f"wide_partition_drop={rows}"]
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE wide_partition_diff CASCADE")
+
+
+def partition_move_transcript(reader, writer, reordered=False) -> list[str]:
+    writer.execute("CREATE TABLE move_write_diff(id integer PRIMARY KEY, label text, computed integer GENERATED ALWAYS AS (length(label)) STORED) PARTITION BY RANGE(id)")
+    if reordered:
+        writer.execute("CREATE TABLE move_low_diff(computed integer GENERATED ALWAYS AS (length(label) + 100) STORED, label text, id integer NOT NULL)")
+        writer.execute("CREATE TABLE move_high_diff(label text, id integer NOT NULL, computed integer GENERATED ALWAYS AS (length(label) + 200) STORED)")
+        writer.execute("ALTER TABLE move_write_diff ATTACH PARTITION move_low_diff FOR VALUES FROM (0) TO (10)")
+        writer.execute("ALTER TABLE move_write_diff ATTACH PARTITION move_high_diff FOR VALUES FROM (10) TO (20)")
+    else:
+        writer.execute("CREATE TABLE move_low_diff PARTITION OF move_write_diff FOR VALUES FROM (0) TO (10)")
+        writer.execute("CREATE TABLE move_high_diff PARTITION OF move_write_diff FOR VALUES FROM (10) TO (20)")
+        writer.execute("ALTER TABLE move_low_diff ALTER COLUMN computed SET EXPRESSION AS (length(label) + 100)")
+        writer.execute("ALTER TABLE move_high_diff ALTER COLUMN computed SET EXPRESSION AS (length(label) + 200)")
+    writer.execute("ALTER TABLE move_write_diff ALTER COLUMN label SET DEFAULT 'parent default'")
+    writer.execute("ALTER TABLE move_low_diff ALTER COLUMN label SET DEFAULT 'child default'")
+    writer.execute("CREATE TABLE move_audit_diff(event text, leaf text, id integer, label text, computed integer)")
+    writer.execute("""CREATE FUNCTION move_before_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
+        IF TG_OP = 'DELETE' THEN
+            IF OLD.label = 'SKIP_DELETE' THEN RETURN NULL; END IF;
+            RETURN OLD;
+        ELSIF TG_OP = 'UPDATE' THEN
+            NEW.label := NEW.label || ':U';
+            IF NEW.label = 'trigger_move:U' THEN NEW.id := 14; END IF;
+        ELSE
+            IF NEW.label = 'skip_insert:U' THEN RETURN NULL; END IF;
+            NEW.label := upper(NEW.label);
+        END IF;
+        RETURN NEW;
+    END$$""")
+    writer.execute("""CREATE FUNCTION move_after_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
+        IF TG_OP = 'DELETE' THEN INSERT INTO move_audit_diff VALUES (TG_OP, TG_TABLE_NAME, OLD.id, OLD.label, OLD.computed);
+        ELSE INSERT INTO move_audit_diff VALUES (TG_OP, TG_TABLE_NAME, NEW.id, NEW.label, NEW.computed); END IF;
+        RETURN NULL;
+    END$$""")
+    writer.execute("CREATE TRIGGER move_before_diff BEFORE INSERT OR UPDATE OR DELETE ON move_write_diff FOR EACH ROW EXECUTE FUNCTION move_before_diff()")
+    writer.execute("CREATE TRIGGER move_after_diff AFTER INSERT OR UPDATE OR DELETE ON move_write_diff FOR EACH ROW EXECUTE FUNCTION move_after_diff()")
+    writer.execute("INSERT INTO move_write_diff(id, label) VALUES (1, 'first'), (2, 'skip_delete'), (3, 'skip_insert')")
+    writer.execute("TRUNCATE move_audit_diff")
+    results = []
+    try:
+        with reader.cursor().copy("COPY move_write_diff(id, label) FROM STDIN") as copied:
+            copied.write(b"4\tcopy text\n")
+        with reader.cursor().copy("COPY move_write_diff(id, label) FROM STDIN (FORMAT binary)") as copied:
+            copied.set_types(["int4", "text"])
+            copied.write_row((5, "copy binary"))
+        reader.execute("INSERT INTO move_write_diff(id) VALUES (6)")
+        reader.execute("INSERT INTO move_low_diff(id) VALUES (7)")
+        changed = reader.execute("INSERT INTO move_write_diff(id, label) VALUES (1, 'upsert') ON CONFLICT(id) DO UPDATE SET label = excluded.label RETURNING id, label, computed").fetchall()
+        results.append(f"leaf_upsert={changed}")
+        changed = reader.execute("INSERT INTO move_write_diff(id, label) SELECT 8, 'selected' RETURNING id, label, computed").fetchall()
+        results.append(f"leaf_insert_select={changed}")
+        changed = reader.execute("INSERT INTO move_write_diff(id, label) SELECT 8, 'selected conflict' ON CONFLICT(id) DO UPDATE SET label = excluded.label RETURNING id, label, computed").fetchall()
+        results.append(f"leaf_select_conflict={changed}")
+        for label, command in [
+            ("update_move", "UPDATE move_write_diff SET id = 11, label = 'moved' WHERE id = 1 RETURNING id, label, computed"),
+            ("merge_skip_delete", "MERGE INTO move_write_diff t USING (VALUES (2, 12)) AS s(old_id, new_id) ON t.id = s.old_id WHEN MATCHED THEN UPDATE SET id = s.new_id RETURNING t.id, t.label, t.computed"),
+            ("merge_skip_insert", "MERGE INTO move_write_diff t USING (VALUES (3, 13)) AS s(old_id, new_id) ON t.id = s.old_id WHEN MATCHED THEN UPDATE SET id = s.new_id, label = 'skip_insert' RETURNING t.id, t.label, t.computed"),
+            ("same_leaf", "UPDATE move_write_diff SET label = 'same' WHERE id = 11 RETURNING id, label, computed"),
+            ("before_update_chosen_leaf", "UPDATE move_write_diff SET id = 9, label = 'trigger_move' WHERE id = 6 RETURNING id, label, computed"),
+        ]:
+            cursor = reader.execute(command)
+            changed = cursor.fetchall()
+            rows = reader.execute("SELECT id, label, computed FROM move_write_diff ORDER BY id").fetchall()
+            audit = reader.execute("SELECT event, leaf, id, label, computed FROM move_audit_diff ORDER BY event, id, label").fetchall()
+            results.append(f"{label}=changed:{changed},rows:{rows},audit:{audit}")
+        error = sqlstate(reader, "UPDATE move_high_diff SET id = 1 WHERE id = 11")
+        rows = reader.execute("SELECT id, label, computed FROM move_write_diff ORDER BY id").fetchall()
+        results.append(f"direct_leaf_move={error},rows:{rows}")
+        reader.execute("BEGIN")
+        reader.execute("UPDATE move_write_diff SET id = 1, label = 'rollback' WHERE id = 11")
+        reader.execute("ROLLBACK")
+        rows = reader.execute("SELECT id, label, computed FROM move_write_diff ORDER BY id").fetchall()
+        audit = reader.execute("SELECT event, leaf, id, label, computed FROM move_audit_diff ORDER BY event, id, label").fetchall()
+        results.append(f"move_rollback=rows:{rows},audit:{audit}")
+        return [("reordered_" if reordered else "ordered_") + result for result in results]
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE move_write_diff CASCADE")
+        writer.execute("DROP TABLE move_audit_diff")
+        writer.execute("DROP FUNCTION move_before_diff()")
+        writer.execute("DROP FUNCTION move_after_diff()")
+
+
+def merge_lock_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE merge_lock_diff(id integer PRIMARY KEY, amount integer)")
+    writer.execute("INSERT INTO merge_lock_diff VALUES (1, 10)")
+    try:
+        writer.execute("BEGIN")
+        writer.execute("SELECT id FROM merge_lock_diff WHERE id = 1 FOR KEY SHARE")
+        reader.execute("SET lock_timeout = '50ms'")
+        changed = reader.execute("MERGE INTO merge_lock_diff t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET amount = 11 RETURNING t.id, t.amount").fetchall()
+        results = [f"merge_key_share_compatible={changed}"]
+        for label, action in [("key", "UPDATE SET id = 2"), ("delete", "DELETE")]:
+            error = sqlstate(reader, f"MERGE INTO merge_lock_diff t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN {action}")
+            results.append(f"merge_key_share_{label}={error}")
+        writer.execute("ROLLBACK")
+        rows = reader.execute("SELECT id, amount FROM merge_lock_diff").fetchall()
+        results.append(f"merge_locked_rows={rows}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        reader.execute("RESET lock_timeout")
+        writer.execute("DROP TABLE merge_lock_diff")
+
+
+def merge_write_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE merge_write_diff(id integer PRIMARY KEY, amount integer)")
+    writer.execute("CREATE TABLE merge_reference_diff(id integer REFERENCES merge_write_diff(id) ON UPDATE CASCADE ON DELETE CASCADE)")
+    writer.execute("INSERT INTO merge_write_diff VALUES (1, 10)")
+    writer.execute("INSERT INTO merge_reference_diff VALUES (1)")
+    try:
+        changed = reader.execute("MERGE INTO merge_write_diff t USING (VALUES (1, 20)) AS s(id, amount) ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = 2, amount = s.amount RETURNING t.id, t.amount").fetchall()
+        referenced = reader.execute("SELECT id FROM merge_reference_diff").fetchall()
+        results = [f"merge_key_actions=rows:{changed},references:{referenced}"]
+        writer.execute("CREATE FUNCTION merge_rewrite_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN IF NEW.amount = 30 THEN UPDATE merge_write_diff SET amount = 99 WHERE id = OLD.id; END IF; RETURN NEW; END$$")
+        writer.execute("CREATE TRIGGER merge_rewrite_diff BEFORE UPDATE ON merge_write_diff FOR EACH ROW EXECUTE FUNCTION merge_rewrite_diff()")
+        error = sqlstate(reader, "MERGE INTO merge_write_diff t USING (VALUES (2, 30)) AS s(id, amount) ON t.id = s.id WHEN MATCHED THEN UPDATE SET amount = s.amount")
+        rows = reader.execute("SELECT id, amount FROM merge_write_diff").fetchall()
+        results.append(f"merge_triggered_rewrite={error},rows:{rows}")
+        reader.execute("MERGE INTO merge_write_diff t USING (VALUES (2)) AS s(id) ON t.id = s.id WHEN MATCHED THEN DELETE")
+        referenced = reader.execute("SELECT id FROM merge_reference_diff").fetchall()
+        results.append(f"merge_delete_actions={referenced}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE merge_reference_diff")
+        writer.execute("DROP TABLE merge_write_diff")
+        writer.execute("DROP FUNCTION IF EXISTS merge_rewrite_diff()")
+
+
+def upsert_write_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE upsert_write_target(id integer PRIMARY KEY, amount integer)")
+    writer.execute("CREATE TABLE upsert_write_reference(id integer REFERENCES upsert_write_target(id) ON UPDATE CASCADE)")
+    writer.execute("INSERT INTO upsert_write_target VALUES (1, 10)")
+    writer.execute("INSERT INTO upsert_write_reference VALUES (1)")
+    try:
+        changed = reader.execute("INSERT INTO upsert_write_target VALUES (1, 20) ON CONFLICT(id) DO UPDATE SET id = 2, amount = excluded.amount RETURNING id, amount").fetchall()
+        referenced = reader.execute("SELECT id FROM upsert_write_reference").fetchall()
+        result = [f"upsert_key_actions=rows:{changed},references:{referenced}"]
+        writer.execute("""CREATE FUNCTION upsert_write_rewrite() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.amount = 30 THEN
+                    UPDATE upsert_write_target SET amount = 99 WHERE id = OLD.id;
+                END IF;
+                RETURN NEW;
+            END$$""")
+        writer.execute("CREATE TRIGGER upsert_write_rewrite BEFORE UPDATE ON upsert_write_target FOR EACH ROW EXECUTE FUNCTION upsert_write_rewrite()")
+        for label, command in [
+            ("triggered", "INSERT INTO upsert_write_target VALUES (2, 30) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount"),
+            ("repeated", "INSERT INTO upsert_write_target VALUES (2, 21), (2, 22) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount"),
+        ]:
+            error = sqlstate(reader, command)
+            rows = reader.execute("SELECT id, amount FROM upsert_write_target").fetchall()
+            result.append(f"upsert_{label}={error},rows:{rows}")
+        return result
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE upsert_write_reference")
+        writer.execute("DROP TABLE upsert_write_target")
+        writer.execute("DROP FUNCTION IF EXISTS upsert_write_rewrite()")
+
+
 def on_conflict_snapshot_transcript(reader, writer) -> list[str]:
     writer.execute("CREATE TABLE conflict_snapshot(id integer PRIMARY KEY, value text)")
     writer.execute("INSERT INTO conflict_snapshot VALUES (1, 'old')")
@@ -706,7 +976,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + merge_write_transcript(reader, writer) + merge_lock_transcript(reader, writer) + partition_move_transcript(reader, writer) + partition_move_transcript(reader, writer, reordered=True) + partition_attachment_transcript(reader, writer) + wide_partition_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

@@ -67,8 +67,13 @@ Statements, transactions, streaming uploads, and imported snapshots retain
 which committed data they may read. Captured reads and selected UPDATE, DELETE,
 and MERGE targets keep their original bytes; sorting, nested SQL, and table
 replacement cannot redirect those reads. Trigger-side changes preserve
-PostgreSQL's command boundaries. Inherited targets map query columns to stored
-columns and enforce each physical table's constraints.
+PostgreSQL's command boundaries. Internal metadata walks check the captured
+table identity during point admission. Definition and shared row/version guards
+release before callbacks. Pending-change walks retain original byte owners
+through heap relocation. Saved-row rereads and commit key encoding use those
+same owners; publication uses the current location of the validated version.
+Inherited targets map query columns to stored columns
+and enforce each physical table's constraints.
 
 Validation and maintenance use current committed and earlier own changes while
 preserving ordinary transaction query snapshots. Their row buffers remain

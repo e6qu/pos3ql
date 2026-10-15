@@ -29948,15 +29948,28 @@ impl Storage {
         table_slot: usize,
         each: &mut RowReadVisitor<'_>,
     ) -> Result<core::ops::ControlFlow<()>, SqlError> {
-        let rowids = self.row_walks.retain(&self.tables[table_slot].rows)?;
+        let (target, rowids) = self.retain_metadata_walk_rows(table_slot)?;
         for rowid in rowids.iter() {
-            if let Some(state) = self.resident_row_state(table_slot, rowid)?
+            if let Some(state) = self.capture_resident_row_metadata(target, rowid)?
                 && each(rowid, state)?.is_break()
             {
                 return Ok(core::ops::ControlFlow::Break(()));
             }
         }
         Ok(core::ops::ControlFlow::Continue(()))
+    }
+
+    fn retain_metadata_walk_rows(
+        &self,
+        table_slot: usize,
+    ) -> Result<(row_walks::RowMetadataTarget, row_walks::RetainedRowIds), SqlError> {
+        let table = &self.tables[table_slot];
+        let definition = table.definition.read();
+        let target = row_walks::RowMetadataTarget::Captured {
+            table: table_slot,
+            created_at: definition.identity.created_at,
+        };
+        Ok((target, self.row_walks.retain(&table.rows)?))
     }
 
     fn retain_checkpoint_rowids(
@@ -30247,8 +30260,18 @@ impl Storage {
         table_slot: usize,
         rowid: u64,
     ) -> Result<Option<RowRead<'static>>, SqlError> {
+        self.capture_resident_row_metadata(row_walks::RowMetadataTarget::Current(table_slot), rowid)
+    }
+
+    fn capture_resident_row_metadata(
+        &self,
+        target: row_walks::RowMetadataTarget,
+        rowid: u64,
+    ) -> Result<Option<RowRead<'static>>, SqlError> {
+        let table_slot = target.table();
         let table = &self.tables[table_slot];
         let definition = table.definition.read();
+        target.validate(definition.identity.created_at)?;
         let publication = table.publication();
         let generations = table.spill_generations();
         let image = spill_generations::SpillGenerationImage::capture(
@@ -30508,19 +30531,33 @@ impl Storage {
         rowid: u64,
         snapshot: RowSnapshot,
     ) -> Result<VisibleRowHome, SqlError> {
-        if self.tables[table_slot].created_at() != snapshot.created_at {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "retained row belongs to a retired table incarnation"
-            ));
-        }
-        let state = self.row_state(table_slot, rowid)?.ok_or_else(|| {
-            sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "retained row version is no longer available"
-            )
-        })?;
-        match snapshot.version {
+        let target = row_walks::RowMetadataTarget::Captured {
+            table: table_slot,
+            created_at: snapshot.created_at,
+        };
+        let state = match self.capture_resident_row_metadata(target, rowid)? {
+            Some(state) => state,
+            None => self
+                .spill_row_state_at(table_slot, rowid, u64::MAX)?
+                .map(RowRead::immutable)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "retained row version is no longer available"
+                    )
+                })?,
+        };
+        self.pin_row_snapshot(table_slot, rowid, snapshot, state)
+    }
+
+    fn pin_row_snapshot(
+        &self,
+        table_slot: usize,
+        rowid: u64,
+        snapshot: RowSnapshot,
+        state: RowRead<'_>,
+    ) -> Result<VisibleRowHome, SqlError> {
+        let image = match snapshot.version {
             RowVersionIdentity::Pending(identity) => {
                 let home = state
                     .retained_pending_home(identity)
@@ -30531,26 +30568,31 @@ impl Storage {
                             "retained pending row version is no longer available"
                         )
                     })?;
-                self.pin_visible_home(table_slot, rowid, snapshot, RowHome::Heap(home))
+                state.pin_owned(
+                    table_slot,
+                    rowid,
+                    Some((snapshot.version, Some(RowHome::Heap(home)))),
+                )?
             }
             RowVersionIdentity::Committed(commit_lsn) => {
-                let image = self
-                    .visible_row_home_at(table_slot, rowid, state, 0, SNAPSHOT_ALL, commit_lsn)?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::SERIALIZATION_FAILURE,
-                            "retained committed row version is no longer available"
-                        )
-                    })?;
-                if image.snapshot().version != snapshot.version {
-                    return Err(sql_err!(
-                        sqlstate::SERIALIZATION_FAILURE,
-                        "retained committed row version was retired"
-                    ));
-                }
-                Ok(image)
+                self.visible_row_home_at(table_slot, rowid, state, 0, SNAPSHOT_ALL, commit_lsn)?
             }
         }
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "retained row version is no longer available"
+            )
+        })?;
+        if image.snapshot().created_at != snapshot.created_at
+            || image.snapshot().version != snapshot.version
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "retained row belongs to a different table or version"
+            ));
+        }
+        Ok(image)
     }
 
     /// How many rows `txid` sees, through the same seam — under the current
@@ -31783,10 +31825,22 @@ impl Storage {
         commit_lsn: u64,
         rewritten: bool,
     ) -> Result<(), SqlError> {
-        let table = &self.tables[table_index];
         let Some(selected) = self.resident_row_state(table_index, rowid)? else {
             return Ok(());
         };
+        self.publish_selected_row(table_index, rowid, txid, commit_lsn, rewritten, selected)
+    }
+
+    fn publish_selected_row(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        commit_lsn: u64,
+        rewritten: bool,
+        selected: RowRead<'_>,
+    ) -> Result<(), SqlError> {
+        let table = &self.tables[table_index];
         let Some(pending) = selected
             .pending_last()
             .filter(|pending| pending.txid == txid)
@@ -31796,20 +31850,14 @@ impl Storage {
         let head = selected
             .pending_head_identity()
             .expect("selected pending head");
-        let image = pending
-            .loc
-            .map(|location| {
-                self.pin_visible_home(
-                    table_index,
-                    rowid,
-                    RowSnapshot {
-                        created_at: table.created_at(),
-                        version: row_images::RowVersionIdentity::Pending(head),
-                    },
-                    RowHome::Heap(location),
-                )
-            })
-            .transpose()?;
+        let image = selected.pin_owned(
+            table_index,
+            rowid,
+            Some((
+                RowVersionIdentity::Pending(head),
+                pending.loc.map(RowHome::Heap),
+            )),
+        )?;
         drop(selected);
         let mut inserts = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
         let count = if !rewritten {
@@ -31854,6 +31902,10 @@ impl Storage {
                 "pending row changed before committed publication"
             ));
         }
+        // Placement may change without changing the pending version identity.
+        // Publish the location protected by the write transition, not its old copy.
+        let pending = pending_last(&versions.pending_row_versions, state.pending)
+            .expect("validated pending head");
         if snapshots.retains_for(txid) && (state.committed.is_some() || state.committed_lsn != 0) {
             let old = CommittedVersion {
                 home: state.committed,

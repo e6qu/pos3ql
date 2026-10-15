@@ -126,6 +126,21 @@ represents a newest deletion, so an older transaction can still resolve the
 preceding saved version after resident history disappears. Latest-committed
 constraint checks probe the captured objects beyond an older scan's read
 position instead of treating that scan's selected row as the latest version.
+Internal metadata walks validate the table's captured identity while holding
+the same brief definition guard used to retain each row's metadata and original
+byte owners. A reused table slot returns `40001` before a new reader slot is
+reserved. Definition and shared row/version guards release before callbacks,
+so an unrelated writer can progress while a callback retains bytes. Pending
+changes select bytes through the retained metadata owner, including after
+heap relocation. Saved-row rereads and commit key encoding also use the
+captured byte owner. Commit publication validates the pending version and uses
+its current location if reclamation moved it. Current row versions within the
+same table remain visible to authoritative walks.
+
+**User example:** a storage check started for an old orders table cannot start
+reading the replacement orders table through the reused internal slot. Bytes
+it already selected stay readable; a later admission fails explicitly.
+
 Captured sources remain readable after table replacement and Storage teardown.
 The last shared lease releases the roots and makes its slot reusable.
 

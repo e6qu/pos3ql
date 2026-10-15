@@ -67,6 +67,31 @@ def generated_write_transcript(reader, writer) -> list[str]:
         writer.execute("DROP FUNCTION generated_write_before_diff()")
 
 
+def merge_write_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE merge_write_diff(id integer PRIMARY KEY, amount integer)")
+    writer.execute("CREATE TABLE merge_reference_diff(id integer REFERENCES merge_write_diff(id) ON UPDATE CASCADE ON DELETE CASCADE)")
+    writer.execute("INSERT INTO merge_write_diff VALUES (1, 10)")
+    writer.execute("INSERT INTO merge_reference_diff VALUES (1)")
+    try:
+        changed = reader.execute("MERGE INTO merge_write_diff t USING (VALUES (1, 20)) AS s(id, amount) ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = 2, amount = s.amount RETURNING t.id, t.amount").fetchall()
+        referenced = reader.execute("SELECT id FROM merge_reference_diff").fetchall()
+        results = [f"merge_key_actions=rows:{changed},references:{referenced}"]
+        writer.execute("CREATE FUNCTION merge_rewrite_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN IF NEW.amount = 30 THEN UPDATE merge_write_diff SET amount = 99 WHERE id = OLD.id; END IF; RETURN NEW; END$$")
+        writer.execute("CREATE TRIGGER merge_rewrite_diff BEFORE UPDATE ON merge_write_diff FOR EACH ROW EXECUTE FUNCTION merge_rewrite_diff()")
+        error = sqlstate(reader, "MERGE INTO merge_write_diff t USING (VALUES (2, 30)) AS s(id, amount) ON t.id = s.id WHEN MATCHED THEN UPDATE SET amount = s.amount")
+        rows = reader.execute("SELECT id, amount FROM merge_write_diff").fetchall()
+        results.append(f"merge_triggered_rewrite={error},rows:{rows}")
+        reader.execute("MERGE INTO merge_write_diff t USING (VALUES (2)) AS s(id) ON t.id = s.id WHEN MATCHED THEN DELETE")
+        referenced = reader.execute("SELECT id FROM merge_reference_diff").fetchall()
+        results.append(f"merge_delete_actions={referenced}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE merge_reference_diff")
+        writer.execute("DROP TABLE merge_write_diff")
+        writer.execute("DROP FUNCTION IF EXISTS merge_rewrite_diff()")
+
+
 def upsert_write_transcript(reader, writer) -> list[str]:
     writer.execute("CREATE TABLE upsert_write_target(id integer PRIMARY KEY, amount integer)")
     writer.execute("CREATE TABLE upsert_write_reference(id integer REFERENCES upsert_write_target(id) ON UPDATE CASCADE)")
@@ -777,7 +802,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + merge_write_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

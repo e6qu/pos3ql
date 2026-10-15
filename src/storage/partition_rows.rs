@@ -87,7 +87,7 @@ impl PartitionKeyRow<'_, '_> {
             .all(|key| known.get(usize::from(*key)).copied().unwrap_or(false))
     }
 
-    pub(super) fn matches(self, bound: PartitionBound) -> Result<bool, SqlError> {
+    pub(crate) fn matches(self, bound: PartitionBound) -> Result<bool, SqlError> {
         super::partition_bound_matches(
             self.scheme.strategy,
             self.scheme.keys,

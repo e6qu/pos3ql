@@ -81898,9 +81898,13 @@ fn dml_target_generates_after_before_triggers_and_accepts_upsert_defaults() {
          CREATE FUNCTION generated_timing_before() RETURNS trigger LANGUAGE plpgsql AS \
          'BEGIN NEW.seed := 2; RETURN NEW; END'; \
          CREATE TRIGGER generated_timing_before BEFORE INSERT ON generated_timing FOR EACH ROW EXECUTE FUNCTION generated_timing_before(); \
-         INSERT INTO generated_timing(id, seed) VALUES (1, 0); \
-         MERGE INTO generated_timing t USING (VALUES (2, 0)) AS s(id, seed) ON t.id = s.id \
-         WHEN NOT MATCHED THEN INSERT(id, seed) VALUES (s.id, s.seed)", true);
+         INSERT INTO generated_timing(id, seed) VALUES (1, 0)", true);
+    session.success(
+        &mut engine,
+        "MERGE INTO generated_timing t USING (VALUES (2, 0)) AS s(id, seed) ON t.id = s.id \
+         WHEN NOT MATCHED THEN INSERT(id, seed) VALUES (s.id, s.seed)",
+        true,
+    );
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
@@ -81944,6 +81948,60 @@ fn dml_target_generates_after_before_triggers_and_accepts_upsert_defaults() {
     );
     assert_eq!(data_rows(&session.success(&mut engine,
         "INSERT INTO upsert_default_serial(label) VALUES ('kept') ON CONFLICT(label) DO UPDATE SET id = DEFAULT RETURNING id, label", true)), ["2|kept"]);
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn dml_target_merge_applies_key_actions_and_rejects_triggered_rewrites() {
+    let config = test_config("dml-target-merge-key-actions");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE merge_key_target(id integer PRIMARY KEY, amount integer); \
+         CREATE TABLE merge_key_reference(id integer REFERENCES merge_key_target(id) ON UPDATE CASCADE ON DELETE CASCADE); \
+         INSERT INTO merge_key_target VALUES (1, 10); \
+         INSERT INTO merge_key_reference VALUES (1)", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "MERGE INTO merge_key_target t USING (VALUES (1, 20)) AS s(id, amount) ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET id = 2, amount = s.amount RETURNING t.id, t.amount",
+            true
+        )),
+        ["2|20"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id FROM merge_key_reference", true)),
+        ["2"]
+    );
+    session.success(&mut engine,
+        "CREATE FUNCTION merge_key_rewrite() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN IF NEW.amount = 30 THEN UPDATE merge_key_target SET amount = 99 WHERE id = OLD.id; END IF; RETURN NEW; END'; \
+         CREATE TRIGGER merge_key_rewrite BEFORE UPDATE ON merge_key_target FOR EACH ROW EXECUTE FUNCTION merge_key_rewrite()", true);
+    let failed = session.execute(&mut engine,
+        "MERGE INTO merge_key_target t USING (VALUES (2, 30)) AS s(id, amount) ON t.id = s.id WHEN MATCHED THEN UPDATE SET amount = s.amount", true);
+    assert!(
+        String::from_utf8_lossy(&failed).contains("27000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, amount FROM merge_key_target", true)),
+        ["2|20"]
+    );
+    session.success(&mut engine,
+        "MERGE INTO merge_key_target t USING (VALUES (2)) AS s(id) ON t.id = s.id WHEN MATCHED THEN DELETE", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM merge_key_reference",
+            true
+        )),
+        ["0"]
+    );
     drop(session);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

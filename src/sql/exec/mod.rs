@@ -52928,7 +52928,6 @@ pub(crate) fn apply_replication_insert(
         false,
     )?;
     let definition = *storage.table_def(table_index, txn.txid);
-    let checks = parse_checks(&definition, arena)?;
     let mut values = decode_replication_tuple(storage, txn, binding, tuple, arena, false)?;
     let mut explicit = [false; MAX_COLUMNS];
     for &local in binding.remote_to_local() {
@@ -52945,12 +52944,34 @@ pub(crate) fn apply_replication_insert(
         &explicit,
         arena,
     )?;
-    let generated = parse_generated(&definition, arena)?;
-    partition_insert::with_partition_insert_row(
+    apply_replication_insert_values(
         storage,
+        txn,
         table_index,
         &definition,
         &mut values,
+        arena,
+        context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_replication_insert_values<'arena>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    table_index: usize,
+    definition: &TableDef,
+    values: &mut [Datum<'arena>; MAX_COLUMNS],
+    arena: &'arena Arena,
+    context: &mut ReplicationTriggerContext<'_, '_>,
+) -> Result<(), SqlError> {
+    let checks = parse_checks(definition, arena)?;
+    let generated = parse_generated(definition, arena)?;
+    partition_insert::with_partition_insert_row(
+        storage,
+        table_index,
+        definition,
+        values,
         txn.txid,
         arena,
         |storage, target_table, definition, values, _mapping| {
@@ -53169,7 +53190,7 @@ pub(crate) struct ReplicationUpdate<'a> {
     pub new: Tuple<'a>,
 }
 
-impl ReplicationRow<'_> {
+impl<'arena> ReplicationRow<'arena> {
     pub fn table_slot(&self) -> usize {
         self.table_slot
     }
@@ -53183,7 +53204,7 @@ impl ReplicationRow<'_> {
             .expect("selected replication row retains its definition")
     }
 
-    pub(crate) fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &'arena [u8] {
         self.bytes
     }
 
@@ -53322,6 +53343,16 @@ pub(crate) fn apply_replication_delete(
     context: &mut ReplicationTriggerContext<'_, '_>,
 ) -> Result<(), SqlError> {
     let row = locate_replication_row(storage, txn, binding, old, arena)?;
+    apply_replication_delete_row(storage, txn, &row, arena, context)
+}
+
+fn apply_replication_delete_row(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    row: &ReplicationRow<'_>,
+    arena: &Arena,
+    context: &mut ReplicationTriggerContext<'_, '_>,
+) -> Result<(), SqlError> {
     let row_table = row.table_slot();
     storage.require_subscription_target(row_table, txn.txid)?;
     match storage.acquire_row_lock(
@@ -53464,52 +53495,66 @@ pub(crate) fn apply_replication_update(
         }
         crate::sql::lock::LockDecision::Skipped => unreachable!("apply update waits for its row"),
     }
-    let definition = *storage.table_def(table_index, txn.txid);
-    let state = storage.row_state(row_table, row.rowid())?.ok_or_else(|| {
-        sql_err!(
-            sqlstate::PROTOCOL_VIOLATION,
-            "subscription replica identity disappeared before update"
-        )
-    })?;
-    let home = storage
-        .visible_row_home(row_table, row.rowid(), state, txn.txid)?
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROTOCOL_VIOLATION,
-                "subscription replica identity is no longer visible before update"
-            )
-        })?;
-    let bytes = storage.row_bytes(row_table, row.rowid(), home, arena)?;
+    storage.require_subscription_target(row_table, txn.txid)?;
+    let logical_definition = row
+        .definitions
+        .retained_definition(table_index, txn.txid)
+        .expect("replication selection retains its logical definition");
+    let definition = row.definition();
+    let mapping = crate::storage::RelationColumnMap::new(logical_definition, definition, arena)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
     let mut old_values = [Datum::Null; MAX_COLUMNS];
-    rowenc::decode(bytes, &schema[..definition.n_columns], &mut old_values)?;
-    let mut new_values = decode_replication_tuple(storage, txn, binding, new, arena, true)?;
+    rowenc::decode(
+        row.bytes(),
+        &schema[..definition.n_columns],
+        &mut old_values,
+    )?;
+    let mut logical_old = [Datum::Null; MAX_COLUMNS];
+    mapping.project(&old_values, &mut logical_old);
+    let mut logical_new = decode_replication_tuple(storage, txn, binding, new, arena, true)?;
     let mut explicit = [false; MAX_COLUMNS];
     for &local in binding.remote_to_local() {
         explicit[local] = true;
     }
-    for (column, value) in old_values[..definition.n_columns].iter().enumerate() {
+    for (column, value) in logical_old[..logical_definition.n_columns]
+        .iter()
+        .enumerate()
+    {
         if !explicit[column] {
-            new_values[column] = *value;
+            logical_new[column] = *value;
         }
     }
     for (remote, field) in new.columns().enumerate() {
         if matches!(field, TupleColumn::UnchangedToast) {
             let local = binding.remote_to_local()[remote];
-            new_values[local] = old_values[local];
+            logical_new[local] = logical_old[local];
         }
     }
-    let checks = parse_checks(&definition, arena)?;
-    let generated = parse_generated(&definition, arena)?;
-    compute_generated(
-        &definition,
-        &generated,
-        &mut new_values,
-        storage,
+    // PostgreSQL replication classifies a move before BEFORE UPDATE. A move
+    // runs DELETE and INSERT triggers, using each physical table's definition.
+    let target_table = storage.partition_target(
+        table_index,
+        logical_definition,
+        &logical_new[..logical_definition.n_columns],
         txn.txid,
-        arena,
     )?;
+    if target_table != row_table {
+        apply_replication_delete_row(storage, txn, &row, arena, context)?;
+        return apply_replication_insert_values(
+            storage,
+            txn,
+            table_index,
+            logical_definition,
+            &mut logical_new,
+            arena,
+            context,
+        );
+    }
+    let mut new_values = old_values;
+    mapping.overlay(&logical_new, &mut new_values);
+    let checks = parse_checks(definition, arena)?;
+    let generated = parse_generated(definition, arena)?;
     if !fire_partition_row_triggers(
         storage,
         txn,
@@ -53518,7 +53563,7 @@ pub(crate) fn apply_replication_update(
         context.responder,
         context.scratch,
         row_table,
-        &definition,
+        definition,
         TriggerEvents::UPDATE,
         true,
         false,
@@ -53529,64 +53574,41 @@ pub(crate) fn apply_replication_update(
         return Ok(());
     }
     compute_generated(
-        &definition,
+        definition,
         &generated,
         &mut new_values,
         storage,
         txn.txid,
         arena,
     )?;
-    let target_table = storage.partition_target(
-        table_index,
-        &definition,
+    storage.validate_partition_target(
+        row_table,
+        definition,
         &new_values[..definition.n_columns],
         txn.txid,
     )?;
-    check_not_null(&definition, &new_values)?;
-    let stored_rowid = if target_table == row_table {
-        row.rowid()
-    } else {
-        storage.next_rowid()?
-    };
+    check_not_null(definition, &new_values)?;
     enforce_row_constraints(
         storage,
-        target_table,
-        &definition,
+        row_table,
+        definition,
         &schema[..definition.n_columns],
         &new_values[..definition.n_columns],
-        ConstraintRow::Stored {
-            excluded: (target_table == row_table).then_some(row.rowid()),
-            rowid: stored_rowid,
-        },
+        ConstraintRow::update(row.rowid()),
         txn.txid,
         Some(txn),
         &checks,
         arena,
         &[],
     )?;
-    if target_table == row_table {
-        store_row(
-            storage,
-            txn,
-            row_table,
-            Some(row.rowid()),
-            &new_values[..definition.n_columns],
-        )?;
-    } else {
-        store_row(
-            storage,
-            txn,
-            target_table,
-            Some(stored_rowid),
-            &new_values[..definition.n_columns],
-        )?;
-        let prior =
-            storage.write_pending(row_table, row.rowid(), txn.txid, txn.command_id(), None)?;
-        if let Err(error) = txn.touch(row_table as u32, row.rowid(), prior) {
-            storage.restore_pending(row_table, row.rowid(), txn.txid, prior);
-            return Err(error);
-        }
-    }
+    row.available(storage, txn, "updated")?;
+    store_row(
+        storage,
+        txn,
+        row_table,
+        Some(row.rowid()),
+        &new_values[..definition.n_columns],
+    )?;
     if referenced_key_changed(
         storage,
         definition.schema.as_str(),
@@ -53615,8 +53637,8 @@ pub(crate) fn apply_replication_update(
         context.seq_session,
         context.responder,
         context.scratch,
-        target_table,
-        &definition,
+        row_table,
+        definition,
         TriggerEvents::UPDATE,
         false,
         false,

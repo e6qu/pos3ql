@@ -67875,7 +67875,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         frame[9..17].copy_from_slice(&end_lsn.to_be_bytes());
         frame[25..25 + plugin.len()].copy_from_slice(plugin);
         let parsed = copy_data(&frame[..25 + plugin.len()]).expect("valid pgoutput frame");
-        apply.receive(engine, parsed).unwrap()
+        crate::mem::guard::forbid_alloc(|| apply.receive(engine, parsed).unwrap())
     }
 
     fn relation() -> Vec<u8> {
@@ -67927,11 +67927,24 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
     run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE replicated_partition (id int PRIMARY KEY, body text) PARTITION BY RANGE (id); \
+        "CREATE TABLE replicated_partition (id int PRIMARY KEY, body text, computed integer GENERATED ALWAYS AS (length(body)) STORED) PARTITION BY RANGE (id); \
          CREATE TABLE replicated_partition_low PARTITION OF replicated_partition \
            FOR VALUES FROM (0) TO (10); \
          CREATE TABLE replicated_partition_high PARTITION OF replicated_partition \
            FOR VALUES FROM (10) TO (20); \
+         ALTER TABLE replicated_partition_low ALTER COLUMN computed SET EXPRESSION AS (length(body) + 100); \
+         ALTER TABLE replicated_partition_high ALTER COLUMN computed SET EXPRESSION AS (length(body) + 200); \
+         CREATE TABLE replicated_partition_audit(event text, leaf text, id integer, body text, computed integer); \
+         CREATE FUNCTION replicated_partition_before() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN IF TG_OP = ''INSERT'' THEN NEW.body := upper(NEW.body); ELSE NEW.body := NEW.body || '':U''; END IF; RETURN NEW; END'; \
+         CREATE FUNCTION replicated_partition_after() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN IF TG_OP = ''DELETE'' THEN INSERT INTO replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, OLD.id, OLD.body, OLD.computed); RETURN OLD; ELSE INSERT INTO replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, NEW.id, NEW.body, NEW.computed); RETURN NEW; END IF; END'; \
+         CREATE TRIGGER replica_partition_before BEFORE INSERT OR UPDATE ON replicated_partition FOR EACH ROW EXECUTE FUNCTION replicated_partition_before(); \
+         CREATE TRIGGER replica_partition_after AFTER INSERT OR UPDATE OR DELETE ON replicated_partition FOR EACH ROW EXECUTE FUNCTION replicated_partition_after(); \
+         ALTER TABLE replicated_partition_low ENABLE REPLICA TRIGGER replica_partition_before; \
+         ALTER TABLE replicated_partition_low ENABLE REPLICA TRIGGER replica_partition_after; \
+         ALTER TABLE replicated_partition_high ENABLE REPLICA TRIGGER replica_partition_before; \
+         ALTER TABLE replicated_partition_high ENABLE REPLICA TRIGGER replica_partition_after; \
          ALTER TABLE replicated_partition ENABLE ROW LEVEL SECURITY; \
          ALTER TABLE replicated_partition FORCE ROW LEVEL SECURITY; \
          CREATE POLICY reject_local_writes ON replicated_partition FOR ALL \
@@ -67970,16 +67983,34 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT id, body FROM replicated_partition_low",
+            "SELECT id, body, computed FROM replicated_partition_low",
         )),
-        ["1|first"]
+        ["1|FIRST|105"]
     );
 
-    receive(&mut apply, &mut engine, 80, &begin(80, 2));
+    receive(&mut apply, &mut engine, 60, &begin(60, 2));
+    let mut same_leaf = vec![b'U'];
+    same_leaf.extend_from_slice(&7_u32.to_be_bytes());
+    same_leaf.push(b'K');
+    same_leaf.extend_from_slice(&tuple(&[b"1", b"first"]));
+    same_leaf.push(b'N');
+    same_leaf.extend_from_slice(&tuple(&[b"2", b"changed"]));
+    receive(&mut apply, &mut engine, 60, &same_leaf);
+    receive(&mut apply, &mut engine, 61, &commit(60, 61));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, body, computed FROM replicated_partition_low"
+        )),
+        ["2|changed:U|109"]
+    );
+
+    receive(&mut apply, &mut engine, 80, &begin(80, 3));
     let mut update = vec![b'U'];
     update.extend_from_slice(&7_u32.to_be_bytes());
     update.push(b'K');
-    update.extend_from_slice(&tuple(&[b"1", b"first"]));
+    update.extend_from_slice(&tuple(&[b"2", b"changed"]));
     update.push(b'N');
     update.extend_from_slice(&tuple(&[b"11", b"moved"]));
     receive(&mut apply, &mut engine, 80, &update);
@@ -67988,9 +68019,9 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT id, body FROM replicated_partition_high",
+            "SELECT id, body, computed FROM replicated_partition_high",
         )),
-        ["11|moved"]
+        ["11|MOVED|205"]
     );
     assert!(
         data_rows(&run_with(
@@ -68001,7 +68032,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         .is_empty()
     );
 
-    receive(&mut apply, &mut engine, 100, &begin(100, 3));
+    receive(&mut apply, &mut engine, 100, &begin(100, 4));
     let mut delete = vec![b'D'];
     delete.extend_from_slice(&7_u32.to_be_bytes());
     delete.push(b'K');
@@ -68017,6 +68048,20 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         .is_empty()
     );
     assert_eq!(apply.confirmed_lsn(), 101);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT event, leaf, id, body, computed FROM replicated_partition_audit ORDER BY event, id"
+        )),
+        [
+            "DELETE|replicated_partition_low|2|changed:U|109",
+            "DELETE|replicated_partition_high|11|MOVED|205",
+            "INSERT|replicated_partition_low|1|FIRST|105",
+            "INSERT|replicated_partition_high|11|MOVED|205",
+            "UPDATE|replicated_partition_low|2|changed:U|109",
+        ]
+    );
 }
 
 #[test]

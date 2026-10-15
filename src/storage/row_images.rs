@@ -150,6 +150,10 @@ unsafe impl<'source, 'arena> Sync for OrderedRowSource<'source, 'arena> where
 }
 
 impl<'arena> TableRowSnapshot<'arena> {
+    pub(super) fn matches_table(&self, slot: usize, created_at: u64) -> bool {
+        self.table_slot == slot && self.created_at == created_at
+    }
+
     pub(super) fn capture(
         storage: &super::Storage,
         image: SpillGenerationImage,

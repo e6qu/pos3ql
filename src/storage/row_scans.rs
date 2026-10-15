@@ -11,6 +11,7 @@ use core::ops::ControlFlow;
 pub(crate) struct CapturedRowScan<'arena> {
     source: TableRowSnapshot<'arena>,
     rows: &'arena [CapturedRowRecord],
+    generation: u64,
 }
 
 impl Storage {
@@ -49,7 +50,7 @@ impl Storage {
         arena: &'arena Arena,
     ) -> Result<CapturedRowScan<'arena>, SqlError> {
         crate::sql::query::check_timeout()?;
-        let (source, records) = {
+        let (source, records, generation) = {
             let table = &self.tables[table_slot];
             let definition = table.definition.read();
             let publication = table.publication();
@@ -93,7 +94,7 @@ impl Storage {
                 records[at] = source.capture_selection(rowid, selected)?;
                 at += 1;
             }
-            (source, records)
+            (source, records, publication.generation)
         };
         for record in records.iter_mut() {
             crate::sql::query::check_timeout()?;
@@ -103,11 +104,29 @@ impl Storage {
         Ok(CapturedRowScan {
             source,
             rows: records,
+            generation,
         })
     }
 }
 
 impl<'source_arena> CapturedRowScan<'source_arena> {
+    pub(super) fn publication_generation(
+        &self,
+        storage: &Storage,
+        table: usize,
+    ) -> Result<u64, SqlError> {
+        if !self
+            .source
+            .matches_table(table, storage.tables[table].created_at())
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "statistics source belongs to a different table incarnation"
+            ));
+        }
+        Ok(self.generation)
+    }
+
     pub(crate) fn retain<'source>(
         &'source self,
         rowid: u64,
@@ -372,6 +391,56 @@ mod tests {
         });
         storage.set_read_snapshot(old_command);
         storage.set_commit_snapshot(old_commit);
+    }
+
+    #[test]
+    fn analyze_snapshot_nesting_and_failed_capture_restore_visibility_and_owners() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("analyze_snapshot", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        let mut small_budget = Budget::new(4);
+        let small = Arena::new(&mut small_budget, "analysis capture capacity", 4).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let old_command = storage.read_snapshot();
+            let old_commit = storage.commit_snapshot();
+            storage.set_read_snapshot(1);
+            storage.set_commit_snapshot(7);
+            storage.set_lsn(11);
+            let location = storage
+                .heap
+                .append_row(&[crate::sql::types::Datum::Int4(1)])
+                .unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, RowState::committed_only_at(location, 11))
+                .unwrap();
+            let before = storage.table_statistics(table, 0);
+            let failed = storage.analyze_table(table, 0, &[], &small).unwrap_err();
+            assert_eq!(failed.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.read_snapshot(), 1);
+            assert_eq!(storage.commit_snapshot(), 7);
+            assert_eq!(storage.table_statistics(table, 0).valid, before.valid);
+            assert!(storage.heap.test_write().is_ok());
+            let outer = storage.analyze_snapshot();
+            assert_eq!(storage.read_snapshot(), super::super::SNAPSHOT_ALL);
+            assert_eq!(storage.commit_snapshot(), 11);
+            storage.set_lsn(13);
+            let nested = storage.analyze_snapshot();
+            assert_eq!(storage.commit_snapshot(), 11);
+            drop(nested);
+            assert_eq!(storage.commit_snapshot(), 11);
+            drop(outer);
+            assert_eq!(storage.read_snapshot(), 1);
+            assert_eq!(storage.commit_snapshot(), 7);
+            let retry = storage.analyze_snapshot();
+            assert_eq!(storage.commit_snapshot(), 13);
+            drop(retry);
+            storage.set_read_snapshot(old_command);
+            storage.set_commit_snapshot(old_commit);
+        });
     }
 
     #[test]

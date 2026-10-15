@@ -1530,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn index_validation_sources_keep_latest_saved_and_own_pending_rows_after_retirement() {
+    fn analyze_and_index_sources_keep_latest_saved_and_own_pending_rows_after_retirement() {
         use super::super::RowState;
         use super::super::row_images::VisibleRowBytes;
         use crate::sql::types::Datum;
@@ -1565,6 +1565,17 @@ mod tests {
             storage.set_read_snapshot(1);
             storage.set_commit_snapshot(7);
             let scan = storage.index_validation_scan_in(table, 11, &arena).unwrap();
+            storage.set_lsn(11);
+            let analysis = {
+                let _snapshot = storage.analyze_snapshot();
+                storage.captured_row_scan_in(table, 11, &arena).unwrap()
+            };
+            let captured_generation = storage.tables[table].generation();
+            storage.tables[table].publication().generation += 1;
+            assert_eq!(
+                analysis.publication_generation(&storage, table).unwrap(),
+                captured_generation
+            );
             assert_eq!(storage.read_snapshot(), 1);
             assert_eq!(storage.commit_snapshot(), 7);
             assert!(
@@ -1599,39 +1610,54 @@ mod tests {
                 table
             );
             storage.set_spill_list(table, &[roots[2]]);
+            assert_eq!(
+                analysis
+                    .publication_generation(&storage, table)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
             storage.set_read_snapshot(command);
             storage.set_commit_snapshot(commit);
             drop(storage);
             registry.copy_roots(false, &mut retained).unwrap();
             assert_eq!(retained.len(), 2);
             assert!(retained.contains(&roots[0]) && retained.contains(&roots[1]));
-            let mut found = [(0, 0); 3];
-            let mut count = 0;
-            assert!(
-                scan.for_each_home(&mut |rowid, home| {
-                    let mut decode = |bytes: &[u8]| {
-                        let mut values = [Datum::Null];
-                        crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
-                        let Datum::Int4(value) = values[0] else {
-                            panic!("integer fixture")
-                        };
-                        found[count] = (rowid, value);
-                        count += 1;
-                        Ok(())
-                    };
-                    match home.bytes {
-                        VisibleRowBytes::Heap(bytes) => decode(&bytes)?,
-                        VisibleRowBytes::Spilled(source) => source.with_bytes(decode)?,
-                    }
-                    Ok(ControlFlow::Continue(()))
-                })
-                .unwrap()
-                .is_continue()
-            );
-            assert_eq!(count, 3);
-            found.sort_unstable();
-            assert_eq!(found, [(1, 88), (3, 55), (4, 40)]);
+            for source in [&scan, &analysis] {
+                let mut found = [(0, 0); 3];
+                let mut count = 0;
+                assert!(
+                    source
+                        .for_each_home(&mut |rowid, home| {
+                            let mut decode = |bytes: &[u8]| {
+                                let mut values = [Datum::Null];
+                                crate::storage::rowenc::decode(
+                                    bytes,
+                                    &[ColType::Int4],
+                                    &mut values,
+                                )?;
+                                let Datum::Int4(value) = values[0] else {
+                                    panic!("integer fixture")
+                                };
+                                found[count] = (rowid, value);
+                                count += 1;
+                                Ok(())
+                            };
+                            match home.bytes {
+                                VisibleRowBytes::Heap(bytes) => decode(&bytes)?,
+                                VisibleRowBytes::Spilled(source) => source.with_bytes(decode)?,
+                            }
+                            Ok(ControlFlow::Continue(()))
+                        })
+                        .unwrap()
+                        .is_continue()
+                );
+                assert_eq!(count, 3);
+                found.sort_unstable();
+                assert_eq!(found, [(1, 88), (3, 55), (4, 40)]);
+            }
             drop(scan);
+            drop(analysis);
             registry.copy_roots(false, &mut retained).unwrap();
             assert!(retained.is_empty());
         });

@@ -7630,6 +7630,7 @@ impl Engine {
         txn: &mut TxnState,
     ) -> Result<u64, SqlError> {
         self.validate_maintenance_targets(targets, txn.txid)?;
+        let _snapshot = self.storage.analyze_snapshot();
         let mut total_rows = 0u64;
         if targets.is_empty() {
             for slot in 0..self.storage.table_count() {
@@ -7639,6 +7640,7 @@ impl Engine {
                         .relation_visible_to_current_session(slot, txn.txid)
                 {
                     txn.record_statistics(slot as u32)?;
+                    self.work.reset();
                     let started = datetime::now_micros();
                     let statistics = self
                         .storage
@@ -7686,6 +7688,7 @@ impl Engine {
                 }
                 drop(definition);
                 txn.record_statistics(slot as u32)?;
+                self.work.reset();
                 let started = datetime::now_micros();
                 let statistics = self.storage.analyze_table(
                     slot,

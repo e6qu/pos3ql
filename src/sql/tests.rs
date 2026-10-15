@@ -43593,6 +43593,358 @@ fn alter_table_multi_action() {
 }
 
 #[test]
+fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statistics() {
+    let (mut engine, mut budget) = test_engine();
+    let mut reader = TxnState::new(&mut budget, 256).unwrap();
+    let mut writer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE TABLE analyze_current(id integer, a integer, b integer, label text); \
+         INSERT INTO analyze_current VALUES (1, 1, 1, 'old'), (2, 1, 1, 'old'); \
+         CREATE STATISTICS analyze_current_ab (ndistinct, dependencies, mcv) ON a, b FROM analyze_current; ANALYZE analyze_current",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT count(*) FROM analyze_current"
+        )),
+        ["2"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "INSERT INTO analyze_current VALUES (3, 2, 2, NULL)",
+    );
+    let analyzed = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "ANALYZE analyze_current",
+    );
+    assert!(
+        analyzed.contains("ANALYZE") && !analyzed.contains("ERROR"),
+        "{analyzed}"
+    );
+    let table = engine
+        .storage
+        .find_table("public", "analyze_current")
+        .unwrap();
+    let extended = engine
+        .storage
+        .extended_statistics_slot("public", "analyze_current_ab", reader.txid)
+        .unwrap();
+    let statistics = engine.storage.table_statistics(table, reader.txid);
+    let data = engine
+        .storage
+        .extended_statistics_data(extended, reader.txid);
+    assert_eq!(statistics.rows, 3);
+    assert_eq!(statistics.columns[3].null_fraction_ppm, 333_333);
+    assert_eq!(data.rows, 3);
+    assert_eq!(data.mcv[0].count, 2);
+    assert_eq!(data.mcv[0].values.as_str(), "{1,1}");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT count(*) FROM analyze_current"
+        )),
+        ["2"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "BEGIN; UPDATE analyze_current SET a = 9, label = NULL WHERE id = 1; DELETE FROM analyze_current WHERE id = 2; INSERT INTO analyze_current VALUES (4, 9, 9, NULL)",
+    );
+    let ignored = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "ANALYZE analyze_current",
+    );
+    assert!(!ignored.contains("ERROR"), "{ignored}");
+    assert_eq!(engine.storage.table_statistics(table, reader.txid).rows, 3);
+    assert_eq!(
+        engine
+            .storage
+            .extended_statistics_data(extended, reader.txid)
+            .mcv[0]
+            .values
+            .as_str(),
+        "{1,1}"
+    );
+    run_txn(&mut engine, &mut budget, &mut writer, "ROLLBACK");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "SAVEPOINT before_changes; UPDATE analyze_current SET a = 4, b = 4, label = NULL WHERE id = 1; DELETE FROM analyze_current WHERE id = 2; INSERT INTO analyze_current VALUES (4, 4, 4, NULL); ANALYZE analyze_current",
+    );
+    let data = engine
+        .storage
+        .extended_statistics_data(extended, reader.txid);
+    assert_eq!(data.rows, 3);
+    assert_eq!(data.mcv[0].values.as_str(), "{4,4}");
+    assert_eq!(data.mcv[0].count, 2);
+    assert_eq!(
+        engine.storage.table_statistics(table, reader.txid).columns[3].null_fraction_ppm,
+        1_000_000
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "ROLLBACK TO SAVEPOINT before_changes",
+    );
+    assert_eq!(
+        engine
+            .storage
+            .extended_statistics_data(extended, reader.txid)
+            .mcv[0]
+            .values
+            .as_str(),
+        "{1,1}"
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT count(*) FROM analyze_current"
+        )),
+        ["2"]
+    );
+    run_txn(&mut engine, &mut budget, &mut reader, "ROLLBACK");
+}
+
+#[test]
+fn analyze_reclaims_each_target_capture_within_the_fixed_work_arena() {
+    let mut config = test_config("analysis-target-recycling");
+    config.work_arena_bytes = 12 << 10;
+    config.max_tables = 4;
+    config.table_rows = 512;
+    config.value_index_rows = 512;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE analyze_budget_a(id integer); CREATE TABLE analyze_budget_b(id integer); \
+         CREATE TABLE analyze_budget_c(id integer)",
+        true,
+    );
+    for value in 1..=256 {
+        session.success(
+            &mut engine,
+            &format!(
+                "INSERT INTO analyze_budget_a VALUES ({value}); \
+             INSERT INTO analyze_budget_b VALUES ({value}); \
+             INSERT INTO analyze_budget_c VALUES ({value})"
+            ),
+            true,
+        );
+    }
+    session.success(&mut engine, "ANALYZE", true);
+    session.success(
+        &mut engine,
+        "ANALYZE analyze_budget_a, analyze_budget_b, analyze_budget_c",
+        true,
+    );
+    for name in ["analyze_budget_a", "analyze_budget_b", "analyze_budget_c"] {
+        let table = engine.storage.find_table("public", name).unwrap();
+        assert_eq!(engine.storage.table_statistics(table, 0).rows, 256);
+    }
+}
+
+#[test]
+fn analyze_expression_error_restores_the_read_snapshot_and_allows_retry() {
+    let (mut engine, mut budget) = test_engine();
+    let mut reader = TxnState::new(&mut budget, 256).unwrap();
+    let mut writer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE TABLE analyze_error(id integer, divisor integer); INSERT INTO analyze_error VALUES (1, 1)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM analyze_error",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "INSERT INTO analyze_error VALUES (2, 0)",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "CREATE STATISTICS analyze_error_expression ON (100 / divisor) FROM analyze_error; SAVEPOINT before_analysis",
+    );
+    let failed = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "ANALYZE analyze_error",
+    );
+    assert!(failed.contains("22012"), "{failed}");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "ROLLBACK TO SAVEPOINT before_analysis",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT count(*) FROM analyze_error"
+        )),
+        ["1"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "DROP STATISTICS analyze_error_expression",
+    );
+    let retry = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "ANALYZE analyze_error",
+    );
+    assert!(
+        retry.contains("ANALYZE") && !retry.contains("ERROR"),
+        "{retry}"
+    );
+    let table = engine
+        .storage
+        .find_table("public", "analyze_error")
+        .unwrap();
+    assert_eq!(engine.storage.table_statistics(table, reader.txid).rows, 2);
+    run_txn(&mut engine, &mut budget, &mut reader, "ROLLBACK");
+}
+
+#[test]
+fn analyze_retained_sources_preserve_pending_changes_rollback_and_cold_recovery() {
+    let mut config = test_config("retained-analyze-sources");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("retained-analyze-sources-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE analyzed_orders(id integer, a integer, b integer, label text); \
+         INSERT INTO analyzed_orders VALUES (1, 1, 1, 'old'), (2, 1, 1, 'old'), (3, 2, 2, NULL); \
+         CREATE STATISTICS analyzed_orders_ab (ndistinct, dependencies, mcv) ON a, b FROM analyzed_orders; ANALYZE analyzed_orders", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "BEGIN; SAVEPOINT before_changes; \
+         UPDATE analyzed_orders SET a = 4, b = 4, label = NULL WHERE id = 1; \
+         DELETE FROM analyzed_orders WHERE id = 2; INSERT INTO analyzed_orders VALUES (4, 4, 4, NULL); ANALYZE analyzed_orders", true);
+    let table = engine
+        .storage
+        .find_table("public", "analyzed_orders")
+        .unwrap();
+    let extended = engine
+        .storage
+        .extended_statistics_slot("public", "analyzed_orders_ab", session.transaction.txid)
+        .unwrap();
+    assert_eq!(
+        engine
+            .storage
+            .table_statistics(table, session.transaction.txid)
+            .rows,
+        3
+    );
+    assert_eq!(
+        engine
+            .storage
+            .table_statistics(table, session.transaction.txid)
+            .columns[3]
+            .null_fraction_ppm,
+        1_000_000
+    );
+    assert_eq!(
+        engine
+            .storage
+            .extended_statistics_data(extended, session.transaction.txid)
+            .mcv[0]
+            .values
+            .as_str(),
+        "{4,4}"
+    );
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT before_changes; ANALYZE analyzed_orders; COMMIT",
+        true,
+    );
+    assert_eq!(
+        engine.storage.table_statistics(table, 0).columns[3].null_fraction_ppm,
+        333_333
+    );
+    assert_eq!(
+        engine.storage.extended_statistics_data(extended, 0).mcv[0]
+            .values
+            .as_str(),
+        "{1,1}"
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let engine = Engine::new(&config, &mut budget).unwrap();
+    let table = engine
+        .storage
+        .find_table("public", "analyzed_orders")
+        .unwrap();
+    let extended = engine
+        .storage
+        .extended_statistics_slot("public", "analyzed_orders_ab", 0)
+        .unwrap();
+    assert_eq!(engine.storage.table_statistics(table, 0).rows, 3);
+    assert_eq!(engine.storage.extended_statistics_data(extended, 0).rows, 3);
+    assert_eq!(
+        engine.storage.extended_statistics_data(extended, 0).mcv[0]
+            .values
+            .as_str(),
+        "{1,1}"
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn vacuum_and_analyze() {
     let config = test_config("vacuum");
     let mut b = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));

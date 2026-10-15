@@ -72,6 +72,61 @@ def index_validation_transcript(reader, writer) -> list[str]:
         writer.execute("DROP TABLE index_validation_diff")
 
 
+def analyze_snapshot_transcript(reader, writer) -> list[str]:
+    writer.execute("DROP TABLE IF EXISTS analyze_snapshot_diff CASCADE")
+    writer.execute("CREATE TABLE analyze_snapshot_diff (id integer, a integer, b integer, label text)")
+    writer.execute("INSERT INTO analyze_snapshot_diff VALUES (1, 1, 1, 'old'), (2, 1, 1, 'old')")
+    writer.execute("CREATE STATISTICS analyze_snapshot_ab (ndistinct, dependencies, mcv) ON a, b FROM analyze_snapshot_diff")
+    writer.execute("ANALYZE analyze_snapshot_diff")
+    results = []
+
+    def report(stage):
+        count = reader.execute("SELECT count(*) FROM analyze_snapshot_diff").fetchone()[0]
+        estimated = reader.execute("SELECT reltuples::integer FROM pg_class WHERE oid = 'analyze_snapshot_diff'::regclass").fetchone()[0]
+        nulls = reader.execute("SELECT null_frac > 0.3 AND null_frac < 0.4 FROM pg_stats WHERE tablename = 'analyze_snapshot_diff' AND attname = 'label'").fetchone()[0]
+        frequent = reader.execute("SELECT most_common_freqs[1] > 0.6 AND most_common_freqs[1] < 0.7 FROM pg_stats_ext WHERE statistics_name = 'analyze_snapshot_ab'").fetchone()[0]
+        results.append(f"analyze_{stage}=rows:{estimated},query:{count},nulls:{nulls},mcv:{frequent}")
+
+    try:
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        assert reader.execute("SELECT count(*) FROM analyze_snapshot_diff").fetchone()[0] == 2
+        writer.execute("INSERT INTO analyze_snapshot_diff VALUES (3, 2, 2, NULL)")
+        reader.execute("ANALYZE analyze_snapshot_diff")
+        report("committed")
+        writer.execute("BEGIN")
+        writer.execute("UPDATE analyze_snapshot_diff SET a = 9, label = NULL WHERE id = 1")
+        writer.execute("DELETE FROM analyze_snapshot_diff WHERE id = 2")
+        writer.execute("INSERT INTO analyze_snapshot_diff VALUES (4, 9, 9, NULL)")
+        reader.execute("ANALYZE analyze_snapshot_diff")
+        report("foreign_pending")
+        writer.execute("ROLLBACK")
+        reader.execute("SAVEPOINT before_changes")
+        reader.execute("UPDATE analyze_snapshot_diff SET a = 4, b = 4, label = NULL WHERE id = 1")
+        reader.execute("DELETE FROM analyze_snapshot_diff WHERE id = 2")
+        reader.execute("INSERT INTO analyze_snapshot_diff VALUES (4, 4, 4, NULL)")
+        reader.execute("ANALYZE analyze_snapshot_diff")
+        own_nulls = reader.execute("SELECT null_frac = 1 FROM pg_stats WHERE tablename = 'analyze_snapshot_diff' AND attname = 'label'").fetchone()[0]
+        own_count = reader.execute("SELECT count(*) FROM analyze_snapshot_diff").fetchone()[0]
+        results.append(f"analyze_own=all_null:{own_nulls},query:{own_count}")
+        reader.execute("ROLLBACK TO SAVEPOINT before_changes")
+        report("rolled_back")
+        reader.execute("CREATE STATISTICS analyze_snapshot_error ON (100 / (id - 3)) FROM analyze_snapshot_diff")
+        reader.execute("SAVEPOINT before_error")
+        error = sqlstate(reader, "ANALYZE analyze_snapshot_diff")
+        reader.execute("ROLLBACK TO SAVEPOINT before_error")
+        unchanged = reader.execute("SELECT count(*) FROM analyze_snapshot_diff").fetchone()[0]
+        results.append(f"analyze_error={error},query:{unchanged}")
+        reader.execute("DROP STATISTICS analyze_snapshot_error")
+        reader.execute("ANALYZE analyze_snapshot_diff")
+        report("retried")
+        reader.execute("ROLLBACK")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        writer.execute("DROP TABLE analyze_snapshot_diff CASCADE")
+
+
 def exercise(port: int) -> list[str]:
     reader = connect(port)
     writer = connect(port)
@@ -110,7 +165,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + index_validation_transcript(reader, writer)
+        ] + index_validation_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

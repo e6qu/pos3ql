@@ -171,6 +171,24 @@ later committed duplicates. The [PostgreSQL 18 index-build implementation](https
 is the upstream visibility reference; the differential suite checks actual
 PostgreSQL results.
 
+ANALYZE captures resident row choices and retains the original heap and saved
+files. Saved rows continue streaming through the merged reader. Base and
+extended statistics share a current read position for the operation, including
+all own changes. Success and errors restore the caller's earlier query snapshot.
+The work buffer is reused between target tables, so a database-wide ANALYZE
+does not accumulate captured metadata from every table.
+Statistics record the data generation examined; table replacement rejects a
+captured source with `40001` instead of publishing it onto a reused table slot.
+
+**User example:** an older report still sees two orders after another customer
+commits a third. Running `ANALYZE orders` refreshes estimates using the three
+current orders, while the report still sees two. Another transaction's pending
+changes are excluded; this transaction's earlier changes are included. A failed
+statistics expression or a full statement buffer releases readers and permits
+retry. Relation estimates survive rollback, while column and extended statistics
+retain PostgreSQL's transaction behavior. See the
+[PostgreSQL 18 ANALYZE row-selection implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/heap/heapam_handler.c).
+
 Internal metadata/byte scans also reserve 64 retention slots per workspace.
 Captured row identity lists own their startup pool slot, so their numbers remain
 available after the source map, table, or Storage owner is removed. Concurrent

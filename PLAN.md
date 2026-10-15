@@ -73,6 +73,9 @@ view's output names. Prepared WITH descriptions analyze RETURNING without
 running the change. Prepared-statement cleanup releases names while bound
 portals keep their original statement bytes. Validation checks
 current rows without changing ordinary query snapshots.
+COPY keeps the inserted values needed by statement triggers in a fixed buffer
+across network messages. Exhaustion names `copy_transition_bytes` and rolls back
+the COPY; no later row lookup supplies its trigger inputs.
 Table rewrites choose their row identities from an already retained byte source;
 metadata-only changes do not build a list of all rows.
 Reader cleanup uses a separate startup workspace and rechecks active readers
@@ -81,9 +84,6 @@ owns the detailed contracts, completed work, and limits.
 
 Still to do:
 
-- Keep COPY's inserted values for end-of-statement triggers across incoming
-  network messages. That path still records row/version identities and fetches
-  their bytes later.
 - Extend partition attachment and all write paths to reordered physical
   columns; keep the current explicit rejection until those paths agree.
 - Finish shared-state protection for table creation/removal and engine-wide

@@ -696,6 +696,9 @@ fn sql_fail(e: SqlError) -> Outcome {
     Ok(Err(e))
 }
 
+mod copy_transition;
+pub(crate) use copy_transition::CopyTransitionRows;
+
 mod describe;
 pub(crate) use describe::CatalogCols;
 pub use describe::{
@@ -52223,7 +52226,7 @@ pub(crate) fn copy_statement_end(
     arena: &Arena,
     responder: &mut Responder,
     scratch: &mut DmlScratch,
-    inserted: &DmlScratch,
+    inserted: &CopyTransitionRows,
 ) -> Result<(), SqlError> {
     setup.restore_snapshot(storage);
     let definition = setup
@@ -52243,26 +52246,7 @@ pub(crate) fn copy_statement_end(
     if let Some(capture) = transition_capture.as_mut() {
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         definition.schema(&mut schema);
-        for row in inserted.iter() {
-            let bytes = match *row {
-                PhysicalRow::Local {
-                    table_index,
-                    rowid,
-                    home,
-                } => storage.row_bytes(table_index, rowid, home, arena)?,
-                PhysicalRow::Foreign {
-                    table_index,
-                    tuple_id,
-                } => {
-                    crate::sql::foreign::fetch_row(storage, table_index, txn.txid, tuple_id, arena)?
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::SERIALIZATION_FAILURE,
-                                "foreign COPY row changed before statement triggers ran"
-                            )
-                        })?
-                }
-            };
+        for bytes in inserted.iter() {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..definition.n_columns], &mut values)?;
             capture.push_new(&values[..definition.n_columns], arena)?;
@@ -52370,7 +52354,7 @@ pub(crate) fn copy_row(
     arena: &Arena,
     responder: &mut Responder,
     scratch: &mut DmlScratch,
-    inserted: &mut DmlScratch,
+    inserted: &mut CopyTransitionRows,
 ) -> Result<CopyRowOutcome, SqlError> {
     setup.restore_snapshot(storage);
     let def = setup
@@ -52502,7 +52486,7 @@ pub(crate) fn copy_row_binary(
     arena: &Arena,
     responder: &mut Responder,
     scratch: &mut DmlScratch,
-    inserted: &mut DmlScratch,
+    inserted: &mut CopyTransitionRows,
 ) -> Result<CopyRowOutcome, SqlError> {
     setup.restore_snapshot(storage);
     let def = setup
@@ -52601,7 +52585,7 @@ fn finish_copy_row<'a>(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     scratch: &mut DmlScratch,
-    inserted: &mut DmlScratch,
+    inserted: &mut CopyTransitionRows,
     logical_table: usize,
     security_role: Option<u16>,
     definition: &TableDef,
@@ -52685,8 +52669,8 @@ fn finish_copy_row<'a>(
         arena,
         &[],
     )?;
-    let stored = if definition.kind == crate::storage::TableKind::Foreign {
-        let tuple_id = crate::sql::foreign::insert_row(
+    if definition.kind == crate::storage::TableKind::Foreign {
+        crate::sql::foreign::insert_row(
             storage,
             target,
             txn.txid,
@@ -52701,26 +52685,24 @@ fn finish_copy_row<'a>(
                 "foreign COPY INSERT unexpectedly returned no row"
             )
         })?;
-        PhysicalRow::Foreign {
-            table_index: target,
-            tuple_id,
-        }
     } else {
-        store_row_with_identity(
+        store_row(
             storage,
             txn,
             target,
             row.stored(),
             &values[..definition.n_columns],
-        )?
-    };
-    inserted.push(stored).map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "COPY transition capture exceeds {} rows",
-            inserted.capacity()
-        )
-    })?;
+        )?;
+    }
+    if transition_capture_required(
+        storage,
+        logical_table,
+        txn.txid,
+        txn.replication_apply,
+        TriggerEvents::INSERT,
+    ) {
+        inserted.capture(&values[..definition.n_columns])?;
+    }
     fire_partition_row_triggers(
         storage,
         txn,
@@ -68632,16 +68614,6 @@ fn store_row(
     rowid: Option<u64>,
     values: &[Datum],
 ) -> Result<(), SqlError> {
-    store_row_with_identity(storage, txn, table_index, rowid, values).map(|_| ())
-}
-
-fn store_row_with_identity(
-    storage: &mut Storage,
-    txn: &mut TxnState,
-    table_index: usize,
-    rowid: Option<u64>,
-    values: &[Datum],
-) -> Result<PhysicalRow, SqlError> {
     let rowid = match rowid {
         Some(rowid) => rowid,
         None => storage.next_rowid()?,
@@ -68652,20 +68624,7 @@ fn store_row_with_identity(
         storage.restore_pending(table_index, rowid, txn.txid, prior);
         return Err(e);
     }
-    let state = storage
-        .resident_row_state(table_index, rowid)?
-        .expect("a successful pending append publishes its row state");
-    let image = storage
-        .visible_row_home_at(
-            table_index,
-            rowid,
-            state,
-            txn.txid,
-            crate::storage::SNAPSHOT_ALL,
-            u64::MAX,
-        )?
-        .expect("a successful row insert has a visible image");
-    Ok(PhysicalRow::local(table_index, rowid, image.snapshot()))
+    Ok(())
 }
 
 pub(crate) fn coerce<'a>(

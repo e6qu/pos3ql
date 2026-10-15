@@ -11726,7 +11726,7 @@ fn copy_line(
     seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
     line: &[u8],
-    inserted: &mut crate::sql::exec::DmlScratch,
+    inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<crate::sql::exec::CopyRowOutcome, SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy test response", 1 << 16).unwrap();
     let mut responder = Responder::new(&mut send);
@@ -11749,7 +11749,7 @@ fn copy_binary_row(
     seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
     row: &[u8],
-    inserted: &mut crate::sql::exec::DmlScratch,
+    inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<crate::sql::exec::CopyRowOutcome, SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy test response", 1 << 16).unwrap();
     let mut responder = Responder::new(&mut send);
@@ -11766,7 +11766,7 @@ fn finish_copy(
     setup: &crate::sql::exec::CopySetup,
     txn: &mut TxnState,
     guc: &GucState,
-    inserted: &mut crate::sql::exec::DmlScratch,
+    inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<(), SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy finish response", 1 << 16).unwrap();
     let result = engine.copy_finish(setup, txn, guc, &mut Responder::new(&mut send), inserted);
@@ -11774,8 +11774,8 @@ fn finish_copy(
     result
 }
 
-fn copy_transition_scratch(budget: &mut Budget) -> crate::sql::exec::DmlScratch {
-    FixedVec::new(budget, "test copy transition scratch", 1024).unwrap()
+fn copy_transition_scratch(budget: &mut Budget) -> crate::sql::exec::CopyTransitionRows {
+    crate::sql::exec::CopyTransitionRows::new(budget, 1024, 256 << 10).unwrap()
 }
 
 fn run_with_arena_bytes(

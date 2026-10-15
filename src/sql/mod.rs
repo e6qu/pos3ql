@@ -483,7 +483,7 @@ pub struct CopyRowContext<'a, 'response> {
     arena: &'a Arena,
     responder: &'a mut Responder<'response>,
     dml_scratch: CopyDmlScratch<'a>,
-    transition_rows: &'a mut exec::DmlScratch,
+    transition_rows: &'a mut exec::CopyTransitionRows,
 }
 
 enum CopyDmlScratch<'a> {
@@ -494,14 +494,14 @@ enum CopyDmlScratch<'a> {
 pub(crate) struct SubscriptionCopyWorkspace<'a> {
     arena: &'a mut Arena,
     dml_scratch: &'a mut exec::DmlScratch,
-    transition_rows: &'a exec::DmlScratch,
+    transition_rows: &'a exec::CopyTransitionRows,
 }
 
 impl<'a> SubscriptionCopyWorkspace<'a> {
     pub(crate) fn new(
         arena: &'a mut Arena,
         dml_scratch: &'a mut exec::DmlScratch,
-        transition_rows: &'a exec::DmlScratch,
+        transition_rows: &'a exec::CopyTransitionRows,
     ) -> Self {
         Self {
             arena,
@@ -517,7 +517,7 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
         seq_session: &'a guc::SeqSession,
         arena: &'a Arena,
         responder: &'a mut Responder<'response>,
-        transition_rows: &'a mut exec::DmlScratch,
+        transition_rows: &'a mut exec::CopyTransitionRows,
     ) -> Self {
         Self {
             txn,
@@ -535,7 +535,7 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
         arena: &'a Arena,
         responder: &'a mut Responder<'response>,
         dml_scratch: &'a mut exec::DmlScratch,
-        transition_rows: &'a mut exec::DmlScratch,
+        transition_rows: &'a mut exec::CopyTransitionRows,
     ) -> Self {
         Self {
             txn,
@@ -8806,7 +8806,7 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
         responder: &mut Responder,
-        inserted: &exec::DmlScratch,
+        inserted: &exec::CopyTransitionRows,
     ) -> Result<(), SqlError> {
         self.work.reset();
         let result = Self::copy_finish_with_scratch(
@@ -8864,7 +8864,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
         scratch: &mut exec::DmlScratch,
-        inserted: &exec::DmlScratch,
+        inserted: &exec::CopyTransitionRows,
     ) -> Result<(), SqlError> {
         exec::copy_statement_end(
             storage,

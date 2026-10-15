@@ -81841,3 +81841,65 @@ fn pgoutput_targets_reject_foreign_tables_views_and_other_relation_kinds() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn dml_target_generates_after_before_triggers_and_accepts_upsert_defaults() {
+    let config = test_config("dml-target-generated-timing");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE generated_timing(id integer PRIMARY KEY, seed integer DEFAULT 4, result integer GENERATED ALWAYS AS (100 / seed) STORED); \
+         CREATE FUNCTION generated_timing_before() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN NEW.seed := 2; RETURN NEW; END'; \
+         CREATE TRIGGER generated_timing_before BEFORE INSERT ON generated_timing FOR EACH ROW EXECUTE FUNCTION generated_timing_before(); \
+         INSERT INTO generated_timing(id, seed) VALUES (1, 0); \
+         MERGE INTO generated_timing t USING (VALUES (2, 0)) AS s(id, seed) ON t.id = s.id \
+         WHEN NOT MATCHED THEN INSERT(id, seed) VALUES (s.id, s.seed)", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, seed, result FROM generated_timing ORDER BY id",
+            true
+        )),
+        ["1|2|50", "2|2|50"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "INSERT INTO generated_timing(id, seed) VALUES (1, 0) ON CONFLICT(id) \
+         DO UPDATE SET seed = DEFAULT, result = DEFAULT RETURNING id, seed, result",
+            true
+        )),
+        ["1|4|25"]
+    );
+    let failed = session.execute(&mut engine,
+        "INSERT INTO generated_timing(id, seed) VALUES (3, 1) ON CONFLICT(id) DO UPDATE SET result = 99", true);
+    assert!(
+        String::from_utf8_lossy(&failed).contains("428C9"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM generated_timing", true)),
+        ["2"]
+    );
+    let failed = session.execute(&mut engine,
+        "CREATE TABLE generated_partition_key(seed integer, result integer GENERATED ALWAYS AS (seed + 1) STORED) PARTITION BY RANGE(result)", true);
+    assert!(
+        String::from_utf8_lossy(&failed).contains("42P17"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    session.success(
+        &mut engine,
+        "CREATE TABLE upsert_default_serial(id serial PRIMARY KEY, label text UNIQUE); \
+         INSERT INTO upsert_default_serial VALUES (10, 'kept')",
+        true,
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "INSERT INTO upsert_default_serial(label) VALUES ('kept') ON CONFLICT(label) DO UPDATE SET id = DEFAULT RETURNING id, label", true)), ["2|kept"]);
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

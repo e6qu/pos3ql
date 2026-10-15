@@ -3157,6 +3157,15 @@ fn resolve_partition_scheme(
                 name
             )
         })? as u16;
+        if definition.columns()[usize::from(keys[index])]
+            .default
+            .is_generated()
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "cannot use generated column in partition key"
+            ));
+        }
     }
     if strategy == PartitionStrategy::Hash
         && keys[..columns.len()].iter().any(|key| {
@@ -4511,6 +4520,20 @@ fn resolve_arbiter<'a>(
     oc: &super::ast::OnConflict<'a>,
     txid: u32,
 ) -> Result<Arbiter<'a>, SqlError> {
+    if let Some(assignments) = oc.update {
+        for (name, expression) in assignments {
+            let column = def.column_index(name).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                )
+            })?;
+            if !matches!(expression, Expr::DefaultMarker) {
+                reject_generated_write(def, column)?;
+            }
+        }
+    }
     if !oc.target.is_empty() {
         if oc.target.iter().any(|target| target.column.is_none()) {
             for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
@@ -5070,6 +5093,7 @@ fn handle_conflict<'a, 'outer, 'snapshot>(
     storage: &mut Storage,
     txn: &mut TxnState,
     table_index: usize,
+    logical_table_index: usize,
     def: &TableDef,
     logical_definition: &TableDef,
     mapping: Option<crate::storage::RelationColumnMap<'a>>,
@@ -5247,6 +5271,14 @@ where
                 ));
             }
         }
+        let defaults = if assigns
+            .iter()
+            .any(|(_, expression)| matches!(expression, Expr::DefaultMarker))
+        {
+            Some(parse_defaults(logical_definition, arena)?)
+        } else {
+            None
+        };
         new_values[..def.n_columns].copy_from_slice(&existing[..def.n_columns]);
         for (name, expression) in assigns {
             let Some(target) = def.column_index(name) else {
@@ -5257,7 +5289,50 @@ where
                     def.name.as_str()
                 ));
             };
-            let v = eval_full(expression, arena, params, &context, &hooks)?;
+            let v = if matches!(expression, Expr::DefaultMarker) {
+                let logical_column = logical_definition
+                    .column_index(name)
+                    .expect("validated by arbiter");
+                let column = &logical_definition.columns()[logical_column];
+                if column.auto_increment {
+                    next_auto_value(
+                        storage,
+                        logical_table_index,
+                        logical_column,
+                        column.ctype,
+                        seq_session,
+                        txn.txid,
+                    )?
+                } else {
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(&sequences),
+                        ..NO_HOOKS
+                    };
+                    let value = column_default_value(
+                        storage,
+                        txn.txid,
+                        column,
+                        defaults.as_ref().expect("DEFAULT expressions parsed")[logical_column],
+                        arena,
+                        &hooks,
+                    )?;
+                    detach_routine_datum(value, arena)?
+                }
+            } else {
+                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let hooks = EvalHooks {
+                    subs: Some(&subqueries),
+                    catalog: Some(&catalog),
+                    sequences: Some(&sequences),
+                    ..NO_HOOKS
+                };
+                eval_full(expression, arena, params, &context, &hooks)?
+            };
             new_values[target] = coerce(v, &def.columns()[target], storage, txn.txid, arena)?;
         }
     }
@@ -51598,8 +51673,8 @@ impl CopyFilter {
         })
     }
 
-    /// Evaluates after input coercion, defaults, and generated values, but
-    /// before constraints or a durable write. The source was parsed before
+    /// Evaluates after input coercion and defaults, before row triggers,
+    /// generated values, constraints, or a durable write. The source was parsed before
     /// CopyInResponse and is re-parsed only because streamed rows recycle the
     /// statement arena between protocol chunks.
     fn accepts(
@@ -52498,7 +52573,6 @@ pub(crate) fn copy_row(
         seq_session,
         txn.txid,
     )?;
-    compute_generated(def, &generated_exprs, &mut values, storage, txn.txid, arena)?;
     if !setup.filter.accepts(
         storage,
         txn.txid,
@@ -52604,7 +52678,6 @@ pub(crate) fn copy_row_binary(
         seq_session,
         txn.txid,
     )?;
-    compute_generated(def, &generated_exprs, &mut values, storage, txn.txid, arena)?;
     if !setup.filter.accepts(
         storage,
         txn.txid,
@@ -52873,14 +52946,6 @@ pub(crate) fn apply_replication_insert(
         arena,
     )?;
     let generated = parse_generated(&definition, arena)?;
-    compute_generated(
-        &definition,
-        &generated,
-        &mut values,
-        storage,
-        txn.txid,
-        arena,
-    )?;
     partition_insert::with_partition_insert_row(
         storage,
         table_index,
@@ -57787,7 +57852,6 @@ fn merge_insert<'a>(
         txn.txid,
     )?;
     let mut row_arr = row;
-    compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
     partition_insert::with_partition_insert_row(
         storage,
         table_index,
@@ -57980,9 +58044,6 @@ fn finish_insert_row<'a, 'outer, 'snapshot>(
 where
     'snapshot: 'a,
 {
-    if let Err(error) = compute_generated(definition, generated, values, storage, txn.txid, arena) {
-        return Ok(Err(error));
-    }
     match partition_insert::with_partition_insert_row(
         storage,
         logical_table_index,
@@ -58130,6 +58191,7 @@ where
                     storage,
                     txn,
                     table_index,
+                    logical_table_index,
                     definition,
                     logical_definition,
                     mapping,

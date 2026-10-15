@@ -23,6 +23,7 @@ pub(super) fn with_partition_insert_row<'arena, R>(
     let target =
         storage.partition_target(logical, definition, &values[..definition.n_columns], txid)?;
     if target == logical {
+        clear_generated(definition, values);
         return Ok(operation(storage, target, definition, values, None));
     }
     storage.lock_table(
@@ -34,6 +35,7 @@ pub(super) fn with_partition_insert_row<'arena, R>(
     let definitions = storage.table_definition_images();
     let physical_definition = definitions.definition(storage, target, txid)?;
     if RelationColumnMap::same_order(definition, physical_definition) {
+        clear_generated(physical_definition, values);
         return Ok(operation(
             storage,
             target,
@@ -45,6 +47,7 @@ pub(super) fn with_partition_insert_row<'arena, R>(
     let mapping = RelationColumnMap::new(definition, physical_definition, arena)?;
     let mut physical = [Datum::Null; MAX_COLUMNS];
     mapping.overlay(values, &mut physical);
+    clear_generated(physical_definition, &mut physical);
     let result = operation(
         storage,
         target,
@@ -90,4 +93,14 @@ pub(super) fn logical_insert_row_bytes<'arena>(
         .map_err(|_| super::arena_full())?;
     crate::storage::rowenc::encode(logical, encoded);
     Ok(encoded)
+}
+
+// BEFORE INSERT sees the input row; only the destination table's generation
+// expressions run after its triggers have supplied their final base values.
+fn clear_generated(definition: &TableDef, values: &mut [Datum]) {
+    for (column, value) in definition.columns().iter().zip(values) {
+        if column.default.is_generated() {
+            *value = Datum::Null;
+        }
+    }
 }

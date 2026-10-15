@@ -28,6 +28,45 @@ def sqlstate(connection, statement: str) -> str:
     return "ok"
 
 
+def generated_write_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE generated_write_diff(id integer PRIMARY KEY, seed integer DEFAULT 4, result integer GENERATED ALWAYS AS (100 / seed) STORED)")
+    writer.execute("CREATE FUNCTION generated_write_before_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.seed := 2; RETURN NEW; END$$")
+    writer.execute("CREATE TRIGGER generated_write_before_diff BEFORE INSERT ON generated_write_diff FOR EACH ROW EXECUTE FUNCTION generated_write_before_diff()")
+    writer.execute("CREATE TABLE generated_serial_diff(id serial PRIMARY KEY, label text UNIQUE)")
+    results = []
+    try:
+        reader.execute("INSERT INTO generated_write_diff(id, seed) VALUES (1, 0)")
+        reader.execute("MERGE INTO generated_write_diff t USING (VALUES (2, 0)) AS s(id, seed) ON t.id = s.id WHEN NOT MATCHED THEN INSERT(id, seed) VALUES (s.id, s.seed)")
+        with reader.cursor().copy("COPY generated_write_diff(id, seed) FROM STDIN") as copied:
+            copied.write(b"3\t0\n")
+        with reader.cursor().copy("COPY generated_write_diff(id, seed) FROM STDIN (FORMAT binary)") as copied:
+            copied.set_types(["int4", "int4"])
+            copied.write_row((4, 0))
+        reader.execute("DROP TRIGGER generated_write_before_diff ON generated_write_diff")
+        with reader.cursor().copy("COPY generated_write_diff(id, seed) FROM STDIN WHERE id < 0") as copied:
+            copied.write(b"5\t0\n")
+        rows = reader.execute("SELECT id, seed, result FROM generated_write_diff ORDER BY id").fetchall()
+        results.append(f"generated_after_before={rows}")
+        changed = reader.execute("INSERT INTO generated_write_diff(id, seed) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET seed = DEFAULT, result = DEFAULT RETURNING id, seed, result").fetchall()
+        results.append(f"upsert_default_generated={changed}")
+        for label, statement in [
+            ("generated_assignment", "INSERT INTO generated_write_diff(id, seed) VALUES (5, 1) ON CONFLICT(id) DO UPDATE SET result = 99"),
+            ("generated_partition_key", "CREATE TABLE generated_key_diff(seed integer, result integer GENERATED ALWAYS AS (seed + 1) STORED) PARTITION BY RANGE(result)"),
+        ]:
+            error = sqlstate(reader, statement)
+            rows = reader.execute("SELECT id, seed, result FROM generated_write_diff ORDER BY id").fetchall()
+            results.append(f"{label}={error},rows:{rows}")
+        reader.execute("INSERT INTO generated_serial_diff VALUES (10, 'kept')")
+        changed = reader.execute("INSERT INTO generated_serial_diff(label) VALUES ('kept') ON CONFLICT(label) DO UPDATE SET id = DEFAULT RETURNING id, label").fetchall()
+        results.append(f"upsert_default_serial={changed}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE generated_write_diff")
+        writer.execute("DROP TABLE generated_serial_diff")
+        writer.execute("DROP FUNCTION generated_write_before_diff()")
+
+
 def upsert_write_transcript(reader, writer) -> list[str]:
     writer.execute("CREATE TABLE upsert_write_target(id integer PRIMARY KEY, amount integer)")
     writer.execute("CREATE TABLE upsert_write_reference(id integer REFERENCES upsert_write_target(id) ON UPDATE CASCADE)")
@@ -738,7 +777,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

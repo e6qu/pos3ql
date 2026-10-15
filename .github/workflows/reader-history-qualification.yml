@@ -1,0 +1,70 @@
+name: Reader history qualification
+
+on:
+  push:
+    branches: [batch-reader-history-reclamation]
+
+concurrency:
+  group: reader-history-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Reproduce cleanup blocking an unrelated statement and writer
+        run: |
+          set -euo pipefail
+          cp src/storage/snapshot_reclamation.rs "$RUNNER_TEMP/reclamation.original"
+          trap 'cp "$RUNNER_TEMP/reclamation.original" src/storage/snapshot_reclamation.rs' EXIT
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          p = Path('src/storage/snapshot_reclamation.rs')
+          s = p.read_text()
+          begin = s.index('    pub(super) fn prune_snapshot_versions(&self) {')
+          end = s.index('    pub(crate) fn prune_released_statement_snapshots', begin)
+          legacy = '    pub(super) fn prune_snapshot_versions(&self) {\n        let snapshots = self.snapshot_state();\n        let oldest = snapshots.oldest();\n        let mut versions = self.row_versions.write();\n        for table in self.tables.iter() {\n            let mut rows = table.rows.write();\n            for (_, state) in rows.iter_mut() {\n                prune_committed_history(\n                    &mut versions.committed_row_versions,\n                    &mut state.history,\n                    oldest,\n                );\n            }\n            if oldest.is_none() && table.spill_generations().is_empty() {\n                loop {\n                    let mut batch = [0u64; 512];\n                    let mut count = 0;\n                    for (rowid, state) in rows.iter() {\n                        if state.committed.is_none()\n                            && state.history.is_empty()\n                            && state.pending.is_none()\n                        {\n                            batch[count] = *rowid;\n                            count += 1;\n                            if count == batch.len() {\n                                break;\n                            }\n                        }\n                    }\n                    if count == 0 {\n                        break;\n                    }\n                    for rowid in &batch[..count] {\n                        rows.remove(rowid);\n                    }\n                }\n            }\n        }\n    }\n\n'
+          p.write_text(s[:begin] + legacy + s[end:])
+          PYCODE
+          set +e
+          cargo test --lib --locked snapshot_reclamation_allows_unrelated_publication_while_another_table_waits -- --nocapture --test-threads=1 > "$RUNNER_TEMP/legacy-history.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/legacy-history.log"
+          test "$result" -ne 0
+          grep -a -F 'test result: FAILED. 0 passed; 1 failed;' "$RUNNER_TEMP/legacy-history.log"
+          grep -a -F 'cleanup waiting on one table must release shared registry and versions' "$RUNNER_TEMP/legacy-history.log"
+      - name: Verify candidate source is restored
+        run: git diff --exit-code
+      - name: Lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Reader cleanup, leases, publication and retained sources
+        run: |
+          set -euo pipefail
+          for filter in snapshot_reclamation snapshot_leases row_publication row_walks row_read_ownership; do
+            cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee -a "$RUNNER_TEMP/history-tests.log"
+          done
+      - name: Symbolicate allocation failures in one batch
+        if: failure()
+        run: |
+          python3 - <<'PYCODE'
+          import os, re, subprocess
+          from pathlib import Path
+          log = Path(os.environ['RUNNER_TEMP']) / 'history-tests.log'
+          if log.exists():
+              frames = re.findall(r'(\S*/target/debug/deps/pos3ql-[0-9a-f]+)\(\+(0x[0-9a-f]+)\)', log.read_text(errors='replace'))
+              for binary in sorted({binary for binary, _ in frames}):
+                  addresses = [address for owner, address in frames if owner == binary]
+                  subprocess.run(['addr2line', '-C', '-f', '-e', binary, *addresses], check=True)
+          PYCODE

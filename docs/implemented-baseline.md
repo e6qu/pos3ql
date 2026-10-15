@@ -135,7 +135,16 @@ changes select bytes through the retained metadata owner, including after
 heap relocation. Saved-row rereads and commit key encoding also use the
 captured byte owner. Commit publication validates the pending version and uses
 its current location if reclamation moved it. Current row versions within the
-same table remain visible to authoritative walks.
+same table remain visible to authoritative walks. Reader cleanup holds shared
+registry and row/version guards for at most 64 captured row identities at a
+time. It rechecks current readers before each batch. Cleanup waiting for another
+table's row map holds neither the registry nor the shared version pool. New
+statement admission coalesces cleanup already in progress and leaves later
+release notifications pending for the next attempt.
+
+**User example:** finishing a report can reclaim its old order versions without
+keeping an unrelated customer update waiting for every table to be visited.
+A new report admitted between cleanup batches still keeps the versions it needs.
 
 **User example:** a storage check started for an old orders table cannot start
 reading the replacement orders table through the reused internal slot. Bytes

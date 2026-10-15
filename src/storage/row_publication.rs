@@ -184,6 +184,7 @@ impl Storage {
             existed,
             track_statistics,
         } = prepared;
+        let snapshots = self.snapshot_state();
         let definition = self.tables[table].definition.read();
         if definition.identity.created_at != incarnation {
             return Err(sql_err!(
@@ -203,9 +204,9 @@ impl Storage {
                 "statement is waiting for a concurrent table definition change",
             ));
         }
-        // Snapshot registration/retirement still requires exclusive Storage.
-        // Do not retain its registry mutex while waiting for metadata readers.
-        let oldest = self.oldest_snapshot();
+        // Retention selection and history pruning share registry ownership.
+        // A newly registered reader cannot appear between those operations.
+        let oldest = snapshots.oldest();
         // Match reader lock ordering. Never perform byte or object reads while
         // owning these locks; statistics failure is undone before release.
         let mut versions = self.row_versions.write();

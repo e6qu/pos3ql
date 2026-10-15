@@ -77,7 +77,9 @@ and enforce each physical table's constraints.
 
 Validation and maintenance use current committed and earlier own changes while
 preserving ordinary transaction query snapshots. Their row buffers remain
-bounded and are reused. The [implementation guide](docs/implemented-baseline.md)
+bounded and are reused. Reader cleanup retains row identities in a separate
+startup workspace and releases registry, version, and map guards between small
+batches. Each batch rechecks active readers before deleting history. The [implementation guide](docs/implemented-baseline.md)
 owns the detailed contracts, completed work, and limits.
 
 Still to do:

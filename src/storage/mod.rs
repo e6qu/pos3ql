@@ -23,6 +23,8 @@ mod row_versions;
 mod row_walks;
 pub(crate) mod rowenc;
 mod snapshot_leases;
+mod snapshot_reclamation;
+use snapshot_reclamation::SnapshotReclamation;
 mod statistics;
 pub(crate) use statistics::StatisticsReceiptPool;
 use statistics::{StatisticsVersions, TableStatisticsOwner};
@@ -13613,6 +13615,7 @@ pub struct Storage {
     max_row_versions_per_row: usize,
     row_versions: RowVersionPools,
     row_walks: std::sync::Arc<RowWalkPool>,
+    snapshot_reclamation: SnapshotReclamation,
     query_roots: std::sync::Arc<QueryRootPool>,
     spill_roots: std::sync::Arc<SpillRootRegistry>,
     large_objects: std::sync::Mutex<LargeObjectCatalog>,
@@ -17602,6 +17605,7 @@ impl Storage {
             + RowVersionPools::control_bytes()
             + RowVersionPools::metadata_budget_bytes(config)
             + Self::retained_row_walk_budget_bytes(config)
+            + SnapshotReclamation::budget_bytes(config)
             + SpillRootRegistry::budget_bytes(config)
             + QueryRootPool::budget_bytes(config)
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
@@ -17733,6 +17737,7 @@ impl Storage {
             definition_images::TableDefinitionImagePool::new(config, budget)?;
         let row_versions = RowVersionPools::new(config, budget)?;
         let row_walks = RowWalkPool::new(config, budget)?;
+        let snapshot_reclamation = SnapshotReclamation::new(config, budget)?;
         let spill_roots = SpillRootRegistry::new(config, budget)?;
         let query_roots = QueryRootPool::new(config, budget)?;
         let pending_table_defs =
@@ -18483,6 +18488,7 @@ impl Storage {
             max_row_versions_per_row: config.max_row_versions_per_row,
             row_versions,
             row_walks,
+            snapshot_reclamation,
             spill_roots,
             query_roots,
             large_objects: std::sync::Mutex::new(LargeObjectCatalog {
@@ -48049,57 +48055,11 @@ impl Storage {
             return;
         };
         snapshots.active.swap_remove(index);
-        self.prune_snapshot_versions(snapshots.oldest());
         drop(snapshots);
+        self.prune_snapshot_versions();
         // Snapshot release can unblock schema waits without a held row lock.
         let wait_owner = self.transaction_wait_owner(txid);
         self.lock_state().row.resource_released(wait_owner);
-    }
-
-    fn prune_snapshot_versions(&self, oldest: Option<u64>) {
-        let mut versions = self.row_versions.write();
-        for table in self.tables.iter() {
-            let mut rows = table.rows.write();
-            for (_, state) in rows.iter_mut() {
-                prune_committed_history(
-                    &mut versions.committed_row_versions,
-                    &mut state.history,
-                    oldest,
-                );
-            }
-            if oldest.is_none() && table.spill_generations().is_empty() {
-                loop {
-                    let mut batch = [0u64; 512];
-                    let mut count = 0;
-                    for (rowid, state) in rows.iter() {
-                        if state.committed.is_none()
-                            && state.history.is_empty()
-                            && state.pending.is_none()
-                        {
-                            batch[count] = *rowid;
-                            count += 1;
-                            if count == batch.len() {
-                                break;
-                            }
-                        }
-                    }
-                    if count == 0 {
-                        break;
-                    }
-                    for rowid in &batch[..count] {
-                        rows.remove(rowid);
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) fn prune_released_statement_snapshots(&self) {
-        let mut snapshots = self.snapshot_state();
-        if !core::mem::take(&mut snapshots.statement_reclamation_pending) {
-            return;
-        }
-        self.prune_snapshot_versions(snapshots.oldest());
     }
 
     pub fn oldest_snapshot(&self) -> Option<u64> {

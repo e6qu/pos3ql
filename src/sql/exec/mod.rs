@@ -25917,6 +25917,23 @@ fn fire_row_trigger_slot<'a>(
         }
         _ => target,
     };
+    let trigger_columns = match target {
+        crate::storage::TriggerTarget::Table(table) if event == TriggerEvents::UPDATE => {
+            let declaring = context
+                .storage()
+                .table_def(usize::from(table), context.txn.txid);
+            let mut columns = ColumnSet::EMPTY;
+            for (column, metadata) in definition.columns().iter().enumerate() {
+                if updated_columns.contains(column)
+                    && let Some(declared) = declaring.column_index(metadata.name.as_str())
+                {
+                    columns.insert(declared);
+                }
+            }
+            columns
+        }
+        _ => updated_columns,
+    };
     let enabled = clone_table.map_or_else(
         || trigger.enabled_to(context.txn.txid),
         |table| {
@@ -25941,7 +25958,7 @@ fn fire_row_trigger_slot<'a>(
         || !trigger.events.contains(event)
         || (event == 2
             && !trigger.update_columns.is_empty()
-            && !trigger.update_columns.intersects(updated_columns))
+            && !trigger.update_columns.intersects(trigger_columns))
     {
         return Ok(None);
     }

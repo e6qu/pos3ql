@@ -61,17 +61,22 @@ DROP TABLE ordinary_inheritance_alter_parent CASCADE;
 -- DML uses names to project reordered child columns and checks child constraints.
 CREATE TABLE inheritance_dml_parent (id integer PRIMARY KEY, amount integer);
 CREATE TABLE inheritance_dml_child
-  (extra text, amount integer, id integer UNIQUE, CHECK (amount < 100));
+  (extra text, amount integer, id integer UNIQUE,
+   derived integer GENERATED ALWAYS AS (amount * 2) STORED, CHECK (amount < 100));
 ALTER TABLE inheritance_dml_child INHERIT inheritance_dml_parent;
-INSERT INTO inheritance_dml_child VALUES ('retained', 10, 1);
+INSERT INTO inheritance_dml_child (extra, amount, id) VALUES ('retained', 10, 1);
+CREATE FUNCTION inheritance_dml_touch() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN NEW.extra = NEW.extra || ':changed'; RETURN NEW; END $$;
+CREATE TRIGGER inheritance_dml_touch BEFORE UPDATE OF amount ON inheritance_dml_child
+  FOR EACH ROW EXECUTE FUNCTION inheritance_dml_touch();
 UPDATE inheritance_dml_parent SET amount = amount + 1 WHERE id = 1
   RETURNING id, amount;
-SELECT extra, amount, id FROM ONLY inheritance_dml_child;
+SELECT extra, amount, id, derived FROM ONLY inheritance_dml_child;
 UPDATE inheritance_dml_parent AS target SET amount = source.amount
   FROM (VALUES (1, 20)) AS source(id, amount) WHERE target.id = source.id
   RETURNING target.id, target.amount;
 UPDATE inheritance_dml_parent SET amount = 100 WHERE id = 1;
-SELECT extra, amount, id FROM ONLY inheritance_dml_child;
+SELECT extra, amount, id, derived FROM ONLY inheritance_dml_child;
 CREATE TABLE inheritance_dml_ref
   (child_id integer REFERENCES inheritance_dml_child(id) ON UPDATE CASCADE ON DELETE CASCADE);
 INSERT INTO inheritance_dml_ref VALUES (1);
@@ -80,11 +85,12 @@ SELECT child_id FROM inheritance_dml_ref;
 DELETE FROM inheritance_dml_parent USING (VALUES (2)) AS source(id)
   WHERE inheritance_dml_parent.id = source.id RETURNING inheritance_dml_parent.id, amount;
 SELECT count(*) FROM inheritance_dml_ref;
-INSERT INTO inheritance_dml_child VALUES ('second', 30, 3);
+INSERT INTO inheritance_dml_child (extra, amount, id) VALUES ('second', 30, 3);
 DELETE FROM inheritance_dml_parent WHERE id = 3 RETURNING id, amount;
 DROP TABLE inheritance_dml_parent CASCADE;
 DROP TABLE inheritance_dml_child CASCADE;
 DROP TABLE inheritance_dml_ref;
+DROP FUNCTION inheritance_dml_touch();
 
 -- A new parent column follows existing child-only columns in stored rows.
 CREATE TABLE inheritance_tail_parent (id integer PRIMARY KEY);
@@ -108,6 +114,10 @@ INSERT INTO partition_dml_parent VALUES (1, 30);
 CREATE TABLE partition_dml_ref
   (id integer REFERENCES partition_dml_parent(id) ON UPDATE CASCADE ON DELETE CASCADE);
 INSERT INTO partition_dml_ref VALUES (1);
+CREATE FUNCTION partition_dml_touch() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN NEW.amount = NEW.amount + 1; RETURN NEW; END $$;
+CREATE TRIGGER partition_dml_touch BEFORE UPDATE OF amount ON partition_dml_parent
+  FOR EACH ROW EXECUTE FUNCTION partition_dml_touch();
 UPDATE partition_dml_parent SET amount = amount + 1 WHERE id = 1 RETURNING id, amount;
 UPDATE partition_dml_parent SET id = 2 WHERE id = 1 RETURNING id, amount;
 SELECT id FROM partition_dml_ref;
@@ -118,3 +128,4 @@ DELETE FROM partition_dml_parent WHERE id = 12 RETURNING id, amount;
 SELECT count(*) FROM partition_dml_ref;
 DROP TABLE partition_dml_parent CASCADE;
 DROP TABLE partition_dml_ref;
+DROP FUNCTION partition_dml_touch();

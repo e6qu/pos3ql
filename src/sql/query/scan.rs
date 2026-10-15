@@ -2444,6 +2444,10 @@ pub(crate) fn parameterized_index_access_plan<'a>(
 /// key must then be a contiguous suffix of the same index. The concrete
 /// catalog index, including its declared direction and NULL placement, is
 /// retained so duplicate physical bindings cannot receive the wrong plan.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ordering must cover every scanned relation"
+)]
 pub(crate) fn ordered_index_access_plan<'a>(
     storage: &Storage,
     scope: &QueryScope<'a>,

@@ -81101,6 +81101,22 @@ fn dml_target_reordered_partition_writes_and_constraints_survive_cold_recovery()
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
+            "SELECT id FROM partition_order_parent ORDER BY id LIMIT 2 OFFSET 1",
+            true
+        )),
+        ["9", "11"]
+    );
+    assert!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id FROM ONLY partition_order_parent ORDER BY id",
+            true
+        ))
+        .is_empty()
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
             "DELETE FROM partition_order_parent WHERE id = 3 RETURNING id, label, seed, result",
             true
         )),

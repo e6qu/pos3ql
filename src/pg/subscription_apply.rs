@@ -104,7 +104,7 @@ impl RelationMap {
             ));
         }
         let mut remote_to_local = [usize::MAX; MAX_COLUMNS];
-        let mut published = [SqlName::new(); MAX_COLUMNS];
+        let mut published = [SqlName::EMPTY; MAX_COLUMNS];
         let mut key_remote_to_local = [usize::MAX; MAX_COLUMNS];
         let mut key_count = 0;
         for (remote, column) in relation.columns().enumerate() {

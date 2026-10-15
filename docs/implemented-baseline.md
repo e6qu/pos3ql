@@ -65,6 +65,8 @@ connection and subscription worker reserves `copy_transition_bytes` at startup
 (default 256 KiB), plus `txn_rows` records of two machine-sized offsets. The
 values survive message boundaries and arena resets without later heap, object,
 or remote-row lookup. COPY without these triggers does not consume that buffer.
+Trigger queries also need their existing statement memory: `work_arena_bytes`
+for client COPY, or `subscription_arena_bytes` for a subscription worker.
 Overflow returns `54000` and aborts the COPY. Completion, errors, cancellation,
 connection reuse and subscription cleanup release the bytes for the next COPY.
 

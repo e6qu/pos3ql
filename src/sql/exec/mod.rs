@@ -56178,7 +56178,7 @@ pub(crate) fn merge<'a>(
         match when.action() {
             MergeAction::Update(assignments) => {
                 let mut assigned = ColumnSet::EMPTY;
-                for (name, _) in assignments {
+                for (name, expression) in assignments {
                     let Some(column) = def.column_index(name) else {
                         return sql_fail(undefined_column(name));
                     };
@@ -56188,6 +56188,11 @@ pub(crate) fn merge<'a>(
                             "multiple assignments to same column \"{}\"",
                             name
                         ));
+                    }
+                    if !matches!(expression, Expr::DefaultMarker)
+                        && let Err(error) = reject_generated_write(def, column)
+                    {
+                        return sql_fail(error);
                     }
                     assigned.insert(column);
                     update_columns.insert(column);
@@ -57100,6 +57105,17 @@ pub(crate) fn merge<'a>(
                         if affected[j] {
                             return sql_fail(merge_cardinality());
                         }
+                        if !foreign_target
+                            && let Err(error) = lock_merge_row(
+                                storage,
+                                txn,
+                                target_tables[j],
+                                target_ids[j],
+                                crate::sql::ast::LockStrength::Update,
+                            )
+                        {
+                            return sql_fail(error);
+                        }
                         if !match fire_partition_row_triggers(
                             storage,
                             txn,
@@ -57264,6 +57280,27 @@ pub(crate) fn merge<'a>(
                         new_values[..def.n_columns].copy_from_slice(target_vals[j]);
                         let mut action_update_columns = ColumnSet::EMPTY;
                         let mut action_targets = [0usize; MAX_COLUMNS];
+                        for (name, _) in assignments {
+                            let column = def.column_index(name).expect("MERGE assignment analyzed");
+                            action_update_columns.insert(column);
+                        }
+                        if !foreign_target {
+                            let strength = update_lock_strength(
+                                storage,
+                                row_definition,
+                                row_layout.column_set(action_update_columns),
+                                txn.txid,
+                            );
+                            if let Err(error) = lock_merge_row(
+                                storage,
+                                txn,
+                                target_tables[j],
+                                target_ids[j],
+                                strength,
+                            ) {
+                                return sql_fail(error);
+                            }
+                        }
                         for (assignment, (name, expression)) in assignments.iter().enumerate() {
                             let Some(ci) = def.column_index(name) else {
                                 return sql_fail(undefined_column(name));
@@ -57880,6 +57917,29 @@ pub(crate) fn merge<'a>(
         )?;
     }
     sql_ok()
+}
+
+fn lock_merge_row(
+    storage: &Storage,
+    txn: &TxnState,
+    table: usize,
+    rowid: u64,
+    strength: crate::sql::ast::LockStrength,
+) -> Result<(), SqlError> {
+    match storage.acquire_row_lock(
+        table,
+        rowid,
+        txn.txid,
+        strength,
+        crate::sql::ast::LockWait::Wait,
+    )? {
+        crate::sql::lock::LockDecision::Acquired => Ok(()),
+        crate::sql::lock::LockDecision::Waiting => Err(sql_err!(
+            sqlstate::INTERNAL_LOCK_WAIT,
+            "MERGE is waiting for a row lock"
+        )),
+        crate::sql::lock::LockDecision::Skipped => unreachable!("MERGE waits for its selected row"),
+    }
 }
 
 /// The 21000 error PostgreSQL raises when a MERGE would affect a target row a

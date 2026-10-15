@@ -51,6 +51,7 @@ def generated_write_transcript(reader, writer) -> list[str]:
         results.append(f"upsert_default_generated={changed}")
         for label, statement in [
             ("generated_assignment", "INSERT INTO generated_write_diff(id, seed) VALUES (5, 1) ON CONFLICT(id) DO UPDATE SET result = 99"),
+            ("merge_generated_assignment", "MERGE INTO generated_write_diff t USING (VALUES (-1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET result = 99"),
             ("generated_partition_key", "CREATE TABLE generated_key_diff(seed integer, result integer GENERATED ALWAYS AS (seed + 1) STORED) PARTITION BY RANGE(result)"),
         ]:
             error = sqlstate(reader, statement)
@@ -212,6 +213,29 @@ def partition_move_transcript(reader, writer, reordered=False) -> list[str]:
         writer.execute("DROP TABLE move_audit_diff")
         writer.execute("DROP FUNCTION move_before_diff()")
         writer.execute("DROP FUNCTION move_after_diff()")
+
+
+def merge_lock_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE merge_lock_diff(id integer PRIMARY KEY, amount integer)")
+    writer.execute("INSERT INTO merge_lock_diff VALUES (1, 10)")
+    try:
+        writer.execute("BEGIN")
+        writer.execute("SELECT id FROM merge_lock_diff WHERE id = 1 FOR KEY SHARE")
+        reader.execute("SET lock_timeout = '50ms'")
+        changed = reader.execute("MERGE INTO merge_lock_diff t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET amount = 11 RETURNING t.id, t.amount").fetchall()
+        results = [f"merge_key_share_compatible={changed}"]
+        for label, action in [("key", "UPDATE SET id = 2"), ("delete", "DELETE")]:
+            error = sqlstate(reader, f"MERGE INTO merge_lock_diff t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN {action}")
+            results.append(f"merge_key_share_{label}={error}")
+        writer.execute("ROLLBACK")
+        rows = reader.execute("SELECT id, amount FROM merge_lock_diff").fetchall()
+        results.append(f"merge_locked_rows={rows}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        reader.execute("RESET lock_timeout")
+        writer.execute("DROP TABLE merge_lock_diff")
 
 
 def merge_write_transcript(reader, writer) -> list[str]:
@@ -949,7 +973,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + merge_write_transcript(reader, writer) + partition_move_transcript(reader, writer) + partition_move_transcript(reader, writer, reordered=True) + partition_attachment_transcript(reader, writer) + wide_partition_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + merge_write_transcript(reader, writer) + merge_lock_transcript(reader, writer) + partition_move_transcript(reader, writer) + partition_move_transcript(reader, writer, reordered=True) + partition_attachment_transcript(reader, writer) + wide_partition_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

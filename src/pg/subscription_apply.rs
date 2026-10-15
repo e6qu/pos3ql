@@ -202,7 +202,7 @@ pub struct SubscriptionApply {
     arena: Arena,
     trigger_response: FixedBuf,
     trigger_scratch: crate::sql::exec::DmlScratch,
-    copy_transition_scratch: crate::sql::exec::DmlScratch,
+    copy_transition_scratch: crate::sql::exec::CopyTransitionRows,
     remote: RemoteTransaction,
     confirmed_lsn: u64,
     behavior: crate::storage::SubscriptionBehavior,
@@ -215,7 +215,8 @@ impl SubscriptionApply {
             + GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction)
             + config.subscription_arena_bytes
             + TRIGGER_RESPONSE_BYTES
-            + 2 * config.txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>()
+            + config.txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>()
+            + crate::sql::exec::CopyTransitionRows::budget_bytes(config)
             + crate::sql::guc::SeqSession::extra_budget_bytes(config.max_sequences)
     }
 
@@ -250,10 +251,10 @@ impl SubscriptionApply {
                 "subscription_trigger_scratch",
                 config.txn_rows,
             )?,
-            copy_transition_scratch: FixedVec::new(
+            copy_transition_scratch: crate::sql::exec::CopyTransitionRows::new(
                 budget,
-                "subscription_copy_transition_scratch",
                 config.txn_rows,
+                config.copy_transition_bytes,
             )?,
             remote: RemoteTransaction::Idle,
             confirmed_lsn,

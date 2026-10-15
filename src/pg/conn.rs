@@ -390,7 +390,7 @@ pub struct Conn {
     copy_buf: FixedBuf,
     /// Rows inserted by this connection's active COPY statement. Statement
     /// transition tables retain this state across interleaved reactor turns.
-    copy_transition_scratch: crate::sql::exec::DmlScratch,
+    copy_transition_scratch: crate::sql::exec::CopyTransitionRows,
     prepared: Vec<Prepared>,
     portals: Vec<Portal>,
     phase: Phase,
@@ -506,10 +506,10 @@ impl Conn {
             )?,
             copy: None,
             copy_buf: FixedBuf::new(budget, "copy_line", config.copy_line_bytes)?,
-            copy_transition_scratch: FixedVec::new(
+            copy_transition_scratch: crate::sql::exec::CopyTransitionRows::new(
                 budget,
-                "copy_transition_scratch",
                 config.txn_rows,
+                config.copy_transition_bytes,
             )?,
             prepared,
             portals,
@@ -5355,6 +5355,221 @@ mod tests {
             drop(engine);
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn copy_transition_values_survive_chunks_and_release_after_errors_and_rollback() {
+        fn message(
+            conn: &mut Conn,
+            engine: &mut Engine,
+            kind: u8,
+            payload: &[u8],
+            error: bool,
+        ) -> Vec<u8> {
+            conn.send.clear();
+            assert!(conn.recv.append(&frontend(kind, payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            let output = conn.send.readable().to_vec();
+            assert_eq!(
+                has_backend_message(&output, wire::MSG_ERROR_RESPONSE),
+                error,
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            output
+        }
+        fn query(conn: &mut Conn, engine: &mut Engine, sql: &str) -> Vec<u8> {
+            let mut payload = sql.as_bytes().to_vec();
+            payload.push(0);
+            message(conn, engine, wire::FMSG_QUERY, &payload, false)
+        }
+        fn rows(mut output: &[u8]) -> Vec<String> {
+            let mut rows = Vec::new();
+            while !output.is_empty() {
+                let length = i32::from_be_bytes(output[1..5].try_into().unwrap()) as usize + 1;
+                if output[0] == wire::MSG_DATA_ROW {
+                    let mut values = Vec::new();
+                    let mut at = 7;
+                    let count = u16::from_be_bytes(output[5..7].try_into().unwrap());
+                    for _ in 0..count {
+                        let size = i32::from_be_bytes(output[at..at + 4].try_into().unwrap());
+                        at += 4;
+                        if size < 0 {
+                            values.push("NULL".to_string());
+                        } else {
+                            values.push(
+                                core::str::from_utf8(&output[at..at + size as usize])
+                                    .unwrap()
+                                    .to_string(),
+                            );
+                            at += size as usize;
+                        }
+                    }
+                    rows.push(values.join("|"));
+                }
+                output = &output[length..];
+            }
+            rows
+        }
+        let directory =
+            std::env::temp_dir().join(format!("pos3ql-copy-values-{}", std::process::id()));
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.max_tables = 8;
+        config.table_rows = 64;
+        config.copy_transition_bytes = 32;
+        config.wal_bytes = 1 << 20;
+        config.wal_buffer_bytes = 1 << 16;
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        conn.phase = Phase::Ready;
+        query(
+            &mut conn,
+            &mut engine,
+            "CREATE TABLE copy_values(id integer, label text); \
+             CREATE TABLE copy_values_audit(labels text); \
+             CREATE TABLE copy_values_plain(id integer, label text); \
+             CREATE FUNCTION copy_values_before() RETURNS trigger LANGUAGE plpgsql AS \
+               'BEGIN NEW.label := upper(NEW.label); RETURN NEW; END'; \
+             CREATE FUNCTION copy_values_after() RETURNS trigger LANGUAGE plpgsql AS \
+               'BEGIN UPDATE copy_values SET label = label || '':changed'' WHERE id < NEW.id; RETURN NULL; END'; \
+             CREATE FUNCTION copy_values_statement() RETURNS trigger LANGUAGE plpgsql AS \
+               'BEGIN INSERT INTO copy_values_audit SELECT string_agg(label, '','' ORDER BY id) FROM inserted_rows; RETURN NULL; END'; \
+             CREATE TRIGGER copy_values_before BEFORE INSERT ON copy_values FOR EACH ROW EXECUTE FUNCTION copy_values_before(); \
+             CREATE TRIGGER copy_values_after AFTER INSERT ON copy_values FOR EACH ROW EXECUTE FUNCTION copy_values_after(); \
+             CREATE TRIGGER copy_values_statement AFTER INSERT ON copy_values REFERENCING NEW TABLE AS inserted_rows \
+               FOR EACH STATEMENT EXECUTE FUNCTION copy_values_statement()",
+        );
+        query(&mut conn, &mut engine, "BEGIN; SAVEPOINT before_copy");
+        query(&mut conn, &mut engine, "COPY copy_values FROM STDIN");
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_COPY_DATA,
+            b"1\tone\n2\t",
+            false,
+        );
+        let mut oversized = vec![b'x'; 80];
+        oversized.push(b'\n');
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_COPY_DATA,
+            &oversized,
+            false,
+        );
+        let output = message(&mut conn, &mut engine, wire::FMSG_COPY_DONE, b"", true);
+        assert!(output.windows(5).any(|bytes| bytes == b"54000"));
+        assert!(String::from_utf8_lossy(&output).contains("copy_transition_bytes"));
+        assert!(conn.copy_transition_scratch.is_empty());
+        query(&mut conn, &mut engine, "ROLLBACK TO SAVEPOINT before_copy");
+        assert_eq!(
+            rows(&query(
+                &mut conn,
+                &mut engine,
+                "SELECT count(*) FROM copy_values; SELECT count(*) FROM copy_values_audit"
+            )),
+            ["0", "0"]
+        );
+        query(&mut conn, &mut engine, "COPY copy_values FROM STDIN");
+        message(&mut conn, &mut engine, wire::FMSG_COPY_DATA, b"1\to", false);
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_COPY_DATA,
+            b"ne\n2\ttwo\n",
+            false,
+        );
+        message(&mut conn, &mut engine, wire::FMSG_COPY_DONE, b"", false);
+        assert!(conn.copy_transition_scratch.is_empty());
+        assert_eq!(
+            rows(&query(
+                &mut conn,
+                &mut engine,
+                "SELECT labels FROM copy_values_audit"
+            )),
+            ["ONE,TWO"]
+        );
+        assert_eq!(
+            rows(&query(
+                &mut conn,
+                &mut engine,
+                "SELECT id, label FROM copy_values ORDER BY id"
+            )),
+            ["1|ONE:changed", "2|TWO"]
+        );
+        query(&mut conn, &mut engine, "ROLLBACK");
+        assert_eq!(
+            rows(&query(
+                &mut conn,
+                &mut engine,
+                "SELECT count(*) FROM copy_values; SELECT count(*) FROM copy_values_audit"
+            )),
+            ["0", "0"]
+        );
+        query(&mut conn, &mut engine, "COPY copy_values FROM STDIN");
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_COPY_DATA,
+            b"9\tnine\n",
+            false,
+        );
+        message(&mut conn, &mut engine, wire::FMSG_COPY_DONE, b"", false);
+        assert_eq!(
+            rows(&query(
+                &mut conn,
+                &mut engine,
+                "SELECT labels FROM copy_values_audit"
+            )),
+            ["NINE"]
+        );
+        query(&mut conn, &mut engine, "COPY copy_values FROM STDIN");
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_COPY_DATA,
+            b"8\tother\n",
+            false,
+        );
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_COPY_FAIL,
+            b"cancelled\0",
+            true,
+        );
+        assert!(conn.copy_transition_scratch.is_empty());
+        assert_eq!(
+            rows(&query(
+                &mut conn,
+                &mut engine,
+                "SELECT id, label FROM copy_values ORDER BY id"
+            )),
+            ["9|NINE"]
+        );
+        query(&mut conn, &mut engine, "COPY copy_values_plain FROM STDIN");
+        let mut plain = b"1\t".to_vec();
+        plain.extend_from_slice(&[b'z'; 80]);
+        plain.push(b'\n');
+        message(&mut conn, &mut engine, wire::FMSG_COPY_DATA, &plain, false);
+        assert!(conn.copy_transition_scratch.is_empty());
+        message(&mut conn, &mut engine, wire::FMSG_COPY_DONE, b"", false);
+        assert_eq!(
+            rows(&query(
+                &mut conn,
+                &mut engine,
+                "SELECT count(*) FROM copy_values_plain"
+            )),
+            ["1"]
+        );
+        drop(conn);
+        drop(engine);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

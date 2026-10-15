@@ -11726,7 +11726,7 @@ fn copy_line(
     seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
     line: &[u8],
-    inserted: &mut crate::sql::exec::DmlScratch,
+    inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<crate::sql::exec::CopyRowOutcome, SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy test response", 1 << 16).unwrap();
     let mut responder = Responder::new(&mut send);
@@ -11749,7 +11749,7 @@ fn copy_binary_row(
     seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
     row: &[u8],
-    inserted: &mut crate::sql::exec::DmlScratch,
+    inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<crate::sql::exec::CopyRowOutcome, SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy test response", 1 << 16).unwrap();
     let mut responder = Responder::new(&mut send);
@@ -11766,7 +11766,7 @@ fn finish_copy(
     setup: &crate::sql::exec::CopySetup,
     txn: &mut TxnState,
     guc: &GucState,
-    inserted: &mut crate::sql::exec::DmlScratch,
+    inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<(), SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy finish response", 1 << 16).unwrap();
     let result = engine.copy_finish(setup, txn, guc, &mut Responder::new(&mut send), inserted);
@@ -11774,8 +11774,8 @@ fn finish_copy(
     result
 }
 
-fn copy_transition_scratch(budget: &mut Budget) -> crate::sql::exec::DmlScratch {
-    FixedVec::new(budget, "test copy transition scratch", 1024).unwrap()
+fn copy_transition_scratch(budget: &mut Budget) -> crate::sql::exec::CopyTransitionRows {
+    crate::sql::exec::CopyTransitionRows::new(budget, 1024, 256 << 10).unwrap()
 }
 
 fn run_with_arena_bytes(
@@ -81454,4 +81454,130 @@ fn alter_rewrite_sources_metadata_changes_stream_saved_rows_beyond_update_capaci
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
+    use crate::pg::subscription_apply::SubscriptionApply;
+    use crate::storage::SqlName;
+
+    let mut config = test_config("subscription-copy-transition-values");
+    // Nested trigger queries use the same fixed statement budget as this harness.
+    config.subscription_arena_bytes = config.work_arena_bytes;
+    config.copy_transition_bytes = 32;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE worker_copy_values(id integer, label text); \
+         CREATE TABLE worker_copy_audit(labels text); \
+         CREATE FUNCTION worker_copy_before() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN NEW.label := upper(NEW.label); RETURN NEW; END'; \
+         CREATE FUNCTION worker_copy_after() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN UPDATE worker_copy_values SET label = label || ''+'' WHERE id < NEW.id; RETURN NEW; END'; \
+         CREATE FUNCTION worker_copy_statement() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN INSERT INTO worker_copy_audit SELECT string_agg(label, '','' ORDER BY id) FROM inserted; RETURN NULL; END'; \
+         CREATE TRIGGER worker_copy_before BEFORE INSERT ON worker_copy_values \
+         FOR EACH ROW EXECUTE FUNCTION worker_copy_before(); \
+         CREATE TRIGGER worker_copy_after AFTER INSERT ON worker_copy_values \
+         FOR EACH ROW EXECUTE FUNCTION worker_copy_after(); \
+         CREATE TRIGGER worker_copy_statement AFTER INSERT ON worker_copy_values \
+         REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE FUNCTION worker_copy_statement(); \
+         ALTER TABLE worker_copy_values ENABLE REPLICA TRIGGER worker_copy_before; \
+         ALTER TABLE worker_copy_values ENABLE REPLICA TRIGGER worker_copy_after; \
+         ALTER TABLE worker_copy_values ENABLE REPLICA TRIGGER worker_copy_statement; \
+         CREATE SUBSCRIPTION worker_copy_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+         PUBLICATION changes WITH (connect = false, slot_name = NONE)", true);
+    let stream = engine.subscription_stream("worker_copy_changes").unwrap();
+    let mut apply = SubscriptionApply::new(
+        &mut budget,
+        stream,
+        &config,
+        0,
+        crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+    )
+    .unwrap();
+    let schema = SqlName::parse("public").unwrap();
+    let table = SqlName::parse("worker_copy_values").unwrap();
+    let columns = [
+        SqlName::parse("id").unwrap(),
+        SqlName::parse("label").unwrap(),
+    ];
+    crate::mem::guard::forbid_alloc(|| {
+        apply.begin_bootstrap(&mut engine).unwrap();
+        apply
+            .register_bootstrap_relation(&mut engine, schema, table)
+            .unwrap();
+        let setup = apply
+            .start_copy_table(&mut engine, schema, table, &columns)
+            .unwrap();
+        apply.copy_line(&mut engine, &setup, b"1\tone").unwrap();
+        let oversized = [b'x'; 80];
+        let mut line = [b'0'; 82];
+        line[..2].copy_from_slice(b"2\t");
+        line[2..].copy_from_slice(&oversized);
+        let error = apply.copy_line(&mut engine, &setup, &line).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("copy_transition_bytes"));
+        apply.stop(&mut engine);
+    });
+    assert_eq!(apply.confirmed_lsn(), 0);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT (SELECT count(*) FROM worker_copy_values), (SELECT count(*) FROM worker_copy_audit)", true)), ["0|0"]);
+    crate::mem::guard::forbid_alloc(|| {
+        apply.begin_bootstrap(&mut engine).unwrap();
+        apply
+            .register_bootstrap_relation(&mut engine, schema, table)
+            .unwrap();
+        let setup = apply
+            .start_copy_table(&mut engine, schema, table, &columns)
+            .unwrap();
+        apply.copy_line(&mut engine, &setup, b"1\tone").unwrap();
+        apply.copy_line(&mut engine, &setup, b"2\ttwo").unwrap();
+        apply.finish_copy_table(&mut engine, &setup).unwrap();
+        apply.finish_bootstrap(&mut engine, 41).unwrap();
+    });
+    assert_eq!(apply.confirmed_lsn(), 41);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, label FROM worker_copy_values ORDER BY id",
+            true
+        )),
+        ["1|ONE+", "2|TWO"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT labels FROM worker_copy_audit", true)),
+        ["ONE,TWO"]
+    );
+    crate::mem::guard::forbid_alloc(|| {
+        apply.begin_bootstrap(&mut engine).unwrap();
+        apply
+            .register_bootstrap_relation(&mut engine, schema, table)
+            .unwrap();
+        let setup = apply
+            .start_copy_table(&mut engine, schema, table, &columns)
+            .unwrap();
+        apply.copy_line(&mut engine, &setup, b"3\tnew").unwrap();
+        apply.finish_copy_table(&mut engine, &setup).unwrap();
+        apply.stop(&mut engine);
+        apply.unbind();
+    });
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, label FROM worker_copy_values ORDER BY id",
+            true
+        )),
+        ["1|ONE+", "2|TWO"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT labels FROM worker_copy_audit", true)),
+        ["ONE,TWO"]
+    );
+    drop(apply);
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

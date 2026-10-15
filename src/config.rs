@@ -68,7 +68,7 @@ pub struct Config {
     /// Portal slots per connection.
     pub max_portals: usize,
     /// Rows one transaction may touch. Each connection also reserves this
-    /// many streamed COPY transition-row identities.
+    /// many streamed COPY transition rows.
     pub txn_rows: usize,
     /// Catalog mutations one transaction may stage for commit or rollback.
     pub max_ddl_per_transaction: usize,
@@ -331,6 +331,9 @@ pub struct Config {
     /// Per-connection staging for one COPY FROM data row (rows may split
     /// across CopyData messages). A row larger than this fails loudly.
     pub copy_line_bytes: usize,
+    /// Encoded COPY rows retained for statement triggers, per connection and
+    /// subscription worker. Reserved at startup; exhaustion aborts the COPY.
+    pub copy_transition_bytes: usize,
     /// Locale resolved once for PostgreSQL's `default` collation. It is never
     /// taken from the process environment during query execution.
     pub database_collation_locale: String,
@@ -484,6 +487,7 @@ impl Config {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             copy_line_bytes: 256 * KIB,
+            copy_transition_bytes: 256 * KIB,
             database_collation_locale: "C".to_string(),
             collation_scratch_bytes: 256 * KIB,
             #[cfg(test)]
@@ -1108,6 +1112,10 @@ impl Config {
                     config.copy_line_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
                 }
+                "copy_transition_bytes" => {
+                    config.copy_transition_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
                 "database_collation_locale" => {
                     if value.is_empty() || value.as_bytes().contains(&0) {
                         return Err(ConfigError::at(
@@ -1677,7 +1685,7 @@ impl Config {
             + self.conn_recv_buffer_bytes
             + self.conn_send_buffer_bytes
             + self.sql_arena_bytes
-            + self.txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>()
+            + crate::sql::exec::CopyTransitionRows::budget_bytes(self)
             // Wire Parse and SQL PREPARE have independent fixed slot pools.
             + 2 * self.max_prepared * self.prepared_bytes
             + self.max_portals * (self.portal_bytes + self.portal_result_bytes)
@@ -2452,7 +2460,7 @@ sql_arena_bytes = 4096
                 c.max_savepoints_per_transaction,
             );
         let sequence_session = crate::sql::guc::SeqSession::extra_budget_bytes(c.max_sequences);
-        let copy_transition = c.txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>();
+        let copy_transition = crate::sql::exec::CopyTransitionRows::budget_bytes(&c);
         let per_connection = 890
             + copy_transition
             + publication_selection

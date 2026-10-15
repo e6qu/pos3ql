@@ -574,6 +574,45 @@ def alter_rewrite_source_transcript(reader, writer) -> list[str]:
         writer.execute("DROP TABLE alter_source_diff")
 
 
+def copy_transition_value_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE copy_value_diff(id integer, label text, chars integer GENERATED ALWAYS AS (length(label)) STORED)")
+    writer.execute("CREATE TABLE copy_value_audit_diff(labels text, total bigint)")
+    writer.execute("CREATE FUNCTION copy_value_before_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.label := upper(NEW.label); RETURN NEW; END$$")
+    writer.execute("CREATE FUNCTION copy_value_after_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN UPDATE copy_value_diff SET label = label || '+' WHERE id < NEW.id; RETURN NULL; END$$")
+    writer.execute("CREATE FUNCTION copy_value_statement_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO copy_value_audit_diff SELECT string_agg(label, ',' ORDER BY id), sum(chars) FROM inserted_rows; RETURN NULL; END$$")
+    writer.execute("CREATE TRIGGER copy_value_before_diff BEFORE INSERT ON copy_value_diff FOR EACH ROW EXECUTE FUNCTION copy_value_before_diff()")
+    writer.execute("CREATE TRIGGER copy_value_after_diff AFTER INSERT ON copy_value_diff FOR EACH ROW EXECUTE FUNCTION copy_value_after_diff()")
+    writer.execute("CREATE TRIGGER copy_value_statement_diff AFTER INSERT ON copy_value_diff REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT EXECUTE FUNCTION copy_value_statement_diff()")
+    results = []
+    try:
+        reader.execute("BEGIN")
+        with reader.cursor().copy("COPY copy_value_diff(id, label) FROM STDIN") as copied:
+            copied.write(b"1\tone\n2\tt")
+            assert writer.execute("SELECT 42").fetchone() == (42,)
+            copied.write(b"wo\n3\tthree\n")
+        current = reader.execute("SELECT id, label, chars FROM copy_value_diff ORDER BY id").fetchall()
+        captured = reader.execute("SELECT labels, total FROM copy_value_audit_diff").fetchall()
+        results.append(f"copy_values_text=rows:{current},transition:{captured}")
+        reader.execute("ROLLBACK")
+        empty = writer.execute("SELECT count(*) FROM copy_value_diff").fetchone()[0]
+        no_audit = writer.execute("SELECT count(*) FROM copy_value_audit_diff").fetchone()[0]
+        results.append(f"copy_values_rollback=rows:{empty},audit:{no_audit}")
+        with reader.cursor().copy("COPY copy_value_diff(id, label) FROM STDIN (FORMAT binary)") as copied:
+            copied.set_types(["int4", "text"])
+            copied.write_row((4, "four"))
+            copied.write_row((5, "five"))
+        current = reader.execute("SELECT id, label, chars FROM copy_value_diff ORDER BY id").fetchall()
+        captured = reader.execute("SELECT labels, total FROM copy_value_audit_diff").fetchall()
+        results.append(f"copy_values_binary=rows:{current},transition:{captured}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE copy_value_diff CASCADE")
+        writer.execute("DROP TABLE copy_value_audit_diff")
+        for name in ("before", "after", "statement"):
+            writer.execute(f"DROP FUNCTION copy_value_{name}_diff()")
+
+
 def analyze_snapshot_transcript(reader, writer) -> list[str]:
     writer.execute("DROP TABLE IF EXISTS analyze_snapshot_diff CASCADE")
     writer.execute("CREATE TABLE analyze_snapshot_diff (id integer, a integer, b integer, label text)")
@@ -667,7 +706,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

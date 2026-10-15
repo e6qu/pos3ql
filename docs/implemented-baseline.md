@@ -45,7 +45,7 @@ next statement.
 | Planner statistics | Readers copy their visible estimates; private versions and saved-state markers use guarded cells and fixed pools | Integrate these captures with concurrent engine publication |
 | Row bytes | Selected rows own their startup heap allocation; reclamation can copy live rows into an unretained buffer | Integrate relocation with concurrent table publication and maintenance scheduling |
 | Read positions | Statement and transaction retention; replication export validity and import protection share one guard, with separate fixed capacities | Integrate every remaining table lifecycle path and engine publication |
-| Deferred reads | Scans and rewrites keep their original byte sources; UPDATE, DELETE, and MERGE copy selected values into fixed statement memory | Retain COPY transition-table inputs across messages; finish coherent table lifecycle changes |
+| Deferred reads | Scans and rewrites keep their original byte sources; UPDATE, DELETE, and MERGE copy selected values into fixed statement memory | Finish coherent table lifecycle changes |
 
 ### How long reads keep data alive
 
@@ -58,7 +58,24 @@ errors, and transaction end release retention, wake schema waiters, and
 schedule pruning.
 
 Streaming `COPY FROM` keeps its lease in the connection's setup until completion
-or abort and restores the captured read position for each chunk. `COPY TO`,
+or abort and restores the captured read position for each chunk. When statement
+triggers need the inserted values, COPY encodes them after BEFORE triggers,
+generated-column calculation and storage, before AFTER row triggers. Each
+connection and subscription worker reserves `copy_transition_bytes` at startup
+(default 256 KiB), plus `txn_rows` records of two machine-sized offsets. The
+values survive message boundaries and arena resets without later heap, object,
+or remote-row lookup. COPY without these triggers does not consume that buffer.
+Trigger queries also need their existing statement memory: `work_arena_bytes`
+for client COPY, or `subscription_arena_bytes` for a subscription worker.
+Overflow returns `54000` and aborts the COPY. Completion, errors, cancellation,
+connection reuse and subscription cleanup release the bytes for the next COPY.
+
+**User example:** an AFTER trigger updates an order that COPY just inserted.
+A statement trigger inspecting the inserted rows still receives the values
+that COPY stored. If its fixed buffer fills, the COPY fails and its transaction
+can roll back and retry a smaller batch.
+
+`COPY TO`,
 buffered portals, and SQL cursors finish their storage reads before suspension.
 Table `COPY TO` captures visible resident versions, its schema, and saved
 files before ordering its output records. It fetches original bytes through those

@@ -10585,8 +10585,7 @@ impl Engine {
             let mut names: [&str; MAX_PROJ] = [""; MAX_PROJ];
             let mut types = [(0i32, 0i16, -1i32); MAX_PROJ];
             for i in 0..ncols {
-                // Copy the name into the statement arena: a described column
-                // name borrows the (local, owned) table def, which drops here.
+                // Materialized names outlive the local description and schema owner.
                 let nm = cte.columns.get(i).copied().unwrap_or(descs[i].name);
                 names[i] = arena.alloc_str(nm).map_err(|_| query::arena_full_pub())?;
                 types[i] = (descs[i].type_oid, descs[i].typlen, descs[i].type_mod);

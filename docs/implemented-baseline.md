@@ -149,7 +149,7 @@ keeping an unrelated customer update waiting for every table to be visited.
 A new report admitted between cleanup batches still keeps the versions it needs.
 
 Client descriptions and data-changing WITH queries use the same DML output
-analysis, including view-column rewriting. Their target definition comes from
+analysis, including view-column rewriting and original output names. Their target definition comes from
 the existing startup-owned image pool. Live table and pending-schema guards
 release before nested result-type lookup; a WITH query no longer puts a complete
 wide target definition into its statement arena just to describe its output.

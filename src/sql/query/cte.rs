@@ -1490,7 +1490,16 @@ fn expand_view_returning<'a>(
                 count += 1;
             }
         } else {
-            output[count] = *item;
+            // Binding a view column to storage must preserve its output name.
+            output[count] = match item {
+                SelectItem::Expr { expression, alias } => SelectItem::Expr {
+                    expression,
+                    alias: Some(
+                        alias.unwrap_or_else(|| crate::sql::exec::derived_name(expression)),
+                    ),
+                },
+                _ => *item,
+            };
             count += 1;
         }
     }

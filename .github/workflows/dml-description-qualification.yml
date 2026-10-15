@@ -58,6 +58,7 @@ jobs:
           set -euo pipefail
           cp src/sql/mod.rs "$RUNNER_TEMP/sql-description.original"
           cp src/storage/definition_images.rs "$RUNNER_TEMP/definition-images.original"
+          cp src/sql/query/cte.rs "$RUNNER_TEMP/cte-description.original"
           qualification_pid=''
           cleanup_legacy() {
             if [ -n "$qualification_pid" ]; then
@@ -66,10 +67,12 @@ jobs:
             fi
             cp "$RUNNER_TEMP/sql-description.original" src/sql/mod.rs
             cp "$RUNNER_TEMP/definition-images.original" src/storage/definition_images.rs
+            cp "$RUNNER_TEMP/cte-description.original" src/sql/query/cte.rs
           }
           trap cleanup_legacy EXIT
           git fetch --no-tags --depth=1 origin 3a8df3c370fbbc22f6c314083ea4349ee5fb8b5a
           git show 3a8df3c370fbbc22f6c314083ea4349ee5fb8b5a:src/sql/mod.rs > src/sql/mod.rs
+          git show 3a8df3c370fbbc22f6c314083ea4349ee5fb8b5a:src/sql/query/cte.rs > src/sql/query/cte.rs
           python3 - <<'PYCODE'
           from pathlib import Path
           p = Path('src/storage/definition_images.rs')
@@ -111,7 +114,8 @@ jobs:
           assert len(expected) == len(observed) == 6
           assert not any('=error:' in line for line in expected)
           assert not any('error:None' in line or 'error:08' in line for line in observed)
-          assert observed[-1] == expected[-1], 'direct view RETURNING control changed'
+          assert observed[-1].split('types:', 1)[1] == expected[-1].split('types:', 1)[1], 'direct view values or types changed'
+          assert observed[-1] != expected[-1], 'legacy view output labels unexpectedly matched'
           assert observed[0] != expected[0], 'legacy CTE output unexpectedly matched'
           PYCODE
       - name: Verify candidate source is restored

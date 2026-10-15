@@ -67579,7 +67579,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     );
     // An ALTER replaces the publisher stream before this worker can process
     // its next raw pgoutput transaction. Authority is checked before the
-    // first row mutation, so stale work never reaches the local write path.
+    // next transaction begins, so stale work never reaches the local write path.
     run_with(
         &mut engine,
         &mut budget,
@@ -67587,11 +67587,8 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     );
     begin[8] = 130;
     begin[20] = 7;
-    receive(&mut apply, &mut engine, 130, &begin);
-    let mut stale_insert = durable_insert;
-    stale_insert[13] = b'3';
-    let bytes = frame(130, &stale_insert);
-    let parsed = copy_data(&bytes[..25 + stale_insert.len()]).unwrap();
+    let bytes = frame(130, &begin);
+    let parsed = copy_data(&bytes[..25 + begin.len()]).unwrap();
     let error = apply.receive(&mut engine, parsed).unwrap_err();
     assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
     assert_eq!(apply.confirmed_lsn(), 121);
@@ -67947,7 +67944,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
          CREATE FUNCTION replicated_partition_before() RETURNS trigger LANGUAGE plpgsql AS \
            'BEGIN IF current_setting(''search_path'') <> '''' THEN RAISE EXCEPTION ''worker inherited a frontend path''; END IF; IF TG_OP = ''INSERT'' THEN NEW.body := upper(NEW.body); ELSE NEW.body := NEW.body || '':U''; END IF; RETURN NEW; END'; \
          CREATE FUNCTION replicated_partition_after() RETURNS trigger LANGUAGE plpgsql AS \
-           'BEGIN IF TG_OP = ''DELETE'' THEN INSERT INTO public.replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, OLD.id, OLD.body, OLD.computed); RETURN OLD; ELSE INSERT INTO public.replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, NEW.id, NEW.body, NEW.computed); RETURN NEW; END IF; END'; \
+           'BEGIN IF TG_OP = ''DELETE'' THEN INSERT INTO public.replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, OLD.id, OLD.body, OLD.computed); ELSE INSERT INTO public.replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, NEW.id, NEW.body, NEW.computed); END IF; RETURN NULL; END'; \
          CREATE TRIGGER replica_partition_before BEFORE INSERT OR UPDATE ON replicated_partition FOR EACH ROW EXECUTE FUNCTION replicated_partition_before(); \
          CREATE TRIGGER replica_partition_after AFTER INSERT OR UPDATE OR DELETE ON replicated_partition FOR EACH ROW EXECUTE FUNCTION replicated_partition_after(); \
          ALTER TABLE replicated_partition_low ENABLE REPLICA TRIGGER replica_partition_before; \

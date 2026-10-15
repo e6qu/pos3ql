@@ -2448,6 +2448,7 @@ pub(crate) fn ordered_index_access_plan<'a>(
     storage: &Storage,
     scope: &QueryScope<'a>,
     txid: u32,
+    include_descendants: bool,
     where_clause: Option<&'a Expr<'a>>,
     items: &'a [SelectItem<'a>],
     order: &'a [OrderBy<'a>],
@@ -2458,6 +2459,7 @@ pub(crate) fn ordered_index_access_plan<'a>(
         || scope.n != 1
         || scope.derived[0].is_some()
         || scope.lateral[0]
+        || (include_descendants && storage.relation_has_descendants(scope.slots[0], txid))
         || !index_snapshot_is_current(storage, scope.slots[0], txid)
     {
         return Ok(None);

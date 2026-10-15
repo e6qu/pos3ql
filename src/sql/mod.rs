@@ -2921,6 +2921,9 @@ impl Engine {
             arena,
             trigger_context,
         );
+        let result = result.and_then(|()| {
+            exec::finish_replication_row(&mut self.storage, txn, arena, trigger_context)
+        });
         eval::funcs::system::set_current_user(prior.as_str());
         result
     }
@@ -2945,6 +2948,9 @@ impl Engine {
             arena,
             trigger_context,
         );
+        let result = result.and_then(|()| {
+            exec::finish_replication_row(&mut self.storage, txn, arena, trigger_context)
+        });
         eval::funcs::system::set_current_user(prior.as_str());
         result
     }
@@ -2969,6 +2975,9 @@ impl Engine {
             arena,
             trigger_context,
         );
+        let result = result.and_then(|()| {
+            exec::finish_replication_row(&mut self.storage, txn, arena, trigger_context)
+        });
         eval::funcs::system::set_current_user(prior.as_str());
         result
     }

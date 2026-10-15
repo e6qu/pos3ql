@@ -392,6 +392,32 @@ impl<'a, 'response> ReplicationTriggerContext<'a, 'response> {
     }
 }
 
+/// Each replicated action ends its row-trigger query before the next action
+/// can reset scratch. Subscription apply never fires statement triggers here.
+pub(crate) fn finish_replication_row<'arena>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    arena: &'arena Arena,
+    context: &mut ReplicationTriggerContext<'_, '_>,
+) -> Result<(), SqlError> {
+    let depth = txn.trigger_depth();
+    fire_statement_row_trigger_events(
+        TriggerExecContext {
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: context.scratch as *mut _,
+                seq_session: context.seq_session,
+            },
+            txn,
+            arena,
+            params: crate::sql::eval::NO_PARAMS,
+            responder: context.responder,
+        },
+        depth,
+        None,
+    )
+}
+
 /// Column resolution over one decoded row. The datum lifetime `'v` (heap /
 /// arena bytes) is independent of the borrow of the value slice itself, so
 /// looked-up datums may outlive the decode buffer.

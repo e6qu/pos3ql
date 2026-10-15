@@ -67,7 +67,9 @@ Statements, transactions, streaming uploads, and imported snapshots retain
 which committed data they may read. Captured reads and selected UPDATE, DELETE,
 and MERGE targets keep their original bytes. Metadata walks validate the
 original table when acquiring a row and release shared guards before callbacks.
-Validation checks current rows without changing ordinary query snapshots.
+DML output descriptions retain their target definition and share view rewriting
+between client descriptions and data-changing WITH queries. Validation checks
+current rows without changing ordinary query snapshots.
 Reader cleanup uses a separate startup workspace and rechecks active readers
 in each small batch. The [implementation guide](docs/implemented-baseline.md)
 owns the detailed contracts, completed work, and limits.

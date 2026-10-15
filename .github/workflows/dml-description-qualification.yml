@@ -1,0 +1,175 @@
+name: DML description qualification
+
+on:
+  push:
+    branches: [retain-pending-table-definitions]
+
+concurrency:
+  group: dml-description-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  descriptions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Record reference and prepare server configuration
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -p 5432 -U postgres -tAc 'SELECT version()'
+          cat > "$RUNNER_TEMP/description.conf" <<CONFIG
+          listen_addr = 127.0.0.1:15599
+          data_dir = $RUNNER_TEMP/description-data
+          object_store = off
+          max_tables = 64
+          table_rows = 8192
+          max_value_indexes = 64
+          memtable_bytes = 256MiB
+          CONFIG
+          cat tests/external/differential-capacities.conf >> "$RUNNER_TEMP/description.conf"
+      - name: Reproduce prior schema guard retention and CTE output mismatch
+        run: |
+          set -euo pipefail
+          cp src/sql/mod.rs "$RUNNER_TEMP/sql-description.original"
+          cp src/storage/definition_images.rs "$RUNNER_TEMP/definition-images.original"
+          qualification_pid=''
+          cleanup_legacy() {
+            if [ -n "$qualification_pid" ]; then
+              kill "$qualification_pid" || true
+              wait "$qualification_pid" || true
+            fi
+            cp "$RUNNER_TEMP/sql-description.original" src/sql/mod.rs
+            cp "$RUNNER_TEMP/definition-images.original" src/storage/definition_images.rs
+          }
+          trap cleanup_legacy EXIT
+          git fetch --no-tags --depth=1 origin 3a8df3c370fbbc22f6c314083ea4349ee5fb8b5a
+          git show 3a8df3c370fbbc22f6c314083ea4349ee5fb8b5a:src/sql/mod.rs > src/sql/mod.rs
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          p = Path('src/storage/definition_images.rs')
+          s = p.read_text()
+          old = '        let images = self.table_definition_images();\n        each(images.definition(self, table, transaction)?)'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, '        let definition = self.table_def(table, transaction);\n        each(&definition)'))
+          PYCODE
+          set +e
+          cargo test --lib --locked retained_definition_callbacks_release_live_and_pending_catalog_guards -- --nocapture --test-threads=1 > "$RUNNER_TEMP/legacy-description-guards.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/legacy-description-guards.log"
+          test "$result" -ne 0
+          grep -a -F 'test result: FAILED. 0 passed; 1 failed;' "$RUNNER_TEMP/legacy-description-guards.log"
+          grep -a -F 'description callback retained the live table guard' "$RUNNER_TEMP/legacy-description-guards.log"
+          cargo build --locked
+          target/debug/pos3ql --config "$RUNNER_TEMP/description.conf" > "$RUNNER_TEMP/legacy-description-server.log" 2>&1 &
+          qualification_pid=$!
+          for attempt in $(seq 1 100); do
+            kill -0 "$qualification_pid"
+            if psql -h 127.0.0.1 -p 15599 -U postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+              break
+            fi
+            test "$attempt" -lt 100
+            sleep 0.1
+          done
+          target/external-venv/bin/python - <<'PYCODE'
+          import sys
+          sys.path.insert(0, 'tests/external')
+          import mvcc_diff
+          def transcript(port):
+              with mvcc_diff.connect(port) as reader, mvcc_diff.connect(port) as writer:
+                  return mvcc_diff.dml_description_transcript(reader, writer)
+          expected = transcript(5432)
+          observed = transcript(15599)
+          print('PostgreSQL:', expected, flush=True)
+          print('Legacy pos3ql:', observed, flush=True)
+          assert len(expected) == len(observed) == 6
+          assert not any('=error:' in line for line in expected)
+          assert not any('error:None' in line or 'error:08' in line for line in observed)
+          assert observed[-1] == expected[-1], 'direct view RETURNING control changed'
+          assert observed[0] != expected[0], 'legacy CTE output unexpectedly matched'
+          PYCODE
+      - name: Verify candidate source is restored
+        run: git diff --exit-code
+      - name: Lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Schema owners, DML descriptions and existing output contracts
+        run: |
+          set -euo pipefail
+          for filter in retained_definition retained_dml_descriptions returning_old_new dml_target; do
+            cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee -a "$RUNNER_TEMP/description-tests.log"
+          done
+      - name: Build checked reference-comparison executable
+        run: cargo build --locked
+      - name: Compare candidate descriptions and full transaction transcript
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          P3_PORT: "15599"
+        run: |
+          set -euo pipefail
+          target/debug/pos3ql --config "$RUNNER_TEMP/description.conf" > "$RUNNER_TEMP/description-server.log" 2>&1 &
+          qualification_pid=$!
+          trap 'kill "$qualification_pid" || true; cat "$RUNNER_TEMP/description-server.log"' EXIT
+          for attempt in $(seq 1 100); do
+            kill -0 "$qualification_pid"
+            if psql -h 127.0.0.1 -p 15599 -U postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+              break
+            fi
+            test "$attempt" -lt 100
+            sleep 0.1
+          done
+          target/external-venv/bin/python - <<'PYCODE'
+          import sys
+          sys.path.insert(0, 'tests/external')
+          import mvcc_diff
+          def transcript(port):
+              with mvcc_diff.connect(port) as reader, mvcc_diff.connect(port) as writer:
+                  return mvcc_diff.dml_description_transcript(reader, writer)
+          expected = transcript(5432)
+          observed = transcript(15599)
+          print('PostgreSQL:', expected, flush=True)
+          print('pos3ql:', observed, flush=True)
+          assert not any('=error:' in line for line in expected)
+          assert observed == expected, 'DML output description divergence'
+          PYCODE
+          target/external-venv/bin/python tests/external/mvcc_diff.py
+      - name: Symbolicate allocation failures in one batch
+        if: failure()
+        run: |
+          python3 - <<'PYCODE'
+          import os, re, subprocess
+          from pathlib import Path
+          log = Path(os.environ['RUNNER_TEMP']) / 'description-tests.log'
+          if log.exists():
+              frames = re.findall(r'(\S*/target/debug/deps/pos3ql-[0-9a-f]+)\(\+(0x[0-9a-f]+)\)', log.read_text(errors='replace'))
+              for binary in sorted({binary for binary, _ in frames}):
+                  addresses = [address for owner, address in frames if owner == binary]
+                  subprocess.run(['addr2line', '-C', '-f', '-e', binary, *addresses], check=True)
+          PYCODE

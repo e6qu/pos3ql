@@ -10258,16 +10258,18 @@ impl Engine {
                 Err(error) => return Err(error),
             };
         let table_index = exec::resolve_dml_table(&self.storage, &target, txn.txid)?;
-        let definition = self.storage.table_def(table_index, txn.txid);
-        exec::describe_returning_items(
-            returning,
-            Some(&definition),
-            target_alias,
-            Some(&self.storage),
-            txn.txid,
-            arena,
-            columns,
-        )
+        self.storage
+            .with_retained_table_definition(table_index, txn.txid, |definition| {
+                exec::describe_returning_items(
+                    returning,
+                    Some(definition),
+                    target_alias,
+                    Some(&self.storage),
+                    txn.txid,
+                    arena,
+                    columns,
+                )
+            })
     }
 
     fn describe_data_modification<'a>(
@@ -10558,69 +10560,19 @@ impl Engine {
                     txn.txid,
                 )),
             )?;
-            let returning = match dml {
-                Stmt::Insert(i) => (&i.table, i.returning),
-                Stmt::Update(u) => (&u.table, u.returning),
-                Stmt::Delete(d) => (&d.table, d.returning),
-                Stmt::Merge(m) => (&m.target, m.returning),
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "a data-modifying WITH sub-statement must be INSERT, UPDATE, DELETE or MERGE"
-                    ));
-                }
-            };
-            // Describe the RETURNING columns against the target table, applying
-            // the CTE's optional rename list.
+            if !matches!(
+                dml,
+                Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
+            ) {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "a data-modifying WITH sub-statement must be INSERT, UPDATE, DELETE or MERGE"
+                ));
+            }
+            // Protocol and CTE outputs share view rewriting, target ownership,
+            // aliases, and catalog-derived result types.
             let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
-            let ncols = match dml {
-                Stmt::Merge(merge) => exec::describe_merge_returning(
-                    &self.storage,
-                    txn.txid,
-                    merge,
-                    arena,
-                    &mut descs,
-                )?,
-                _ => {
-                    let target = returning.0;
-                    let described_target =
-                        match query::resolve_view_for_dml(&self.storage, *target, txn.txid, arena)?
-                        {
-                            Some(view) => view.base,
-                            None => *target,
-                        };
-                    let idx = crate::sql::exec::resolve_dml_table(
-                        &self.storage,
-                        &described_target,
-                        txn.txid,
-                    )?;
-                    let def = arena
-                        .alloc(*self.storage.table_def(idx, txn.txid))
-                        .map_err(|_| query::arena_full_pub())?;
-                    let mut local = [ColDesc::new("", 0, 0); MAX_PROJ];
-                    let count = exec::describe_returning_items(
-                        returning.1,
-                        Some(&*def),
-                        match dml {
-                            Stmt::Insert(_) => None,
-                            Stmt::Update(update) => update.alias,
-                            Stmt::Delete(delete) => delete.alias,
-                            _ => unreachable!(),
-                        },
-                        Some(&self.storage),
-                        txn.txid,
-                        arena,
-                        &mut local,
-                    )?;
-                    for index in 0..count {
-                        descs[index] = local[index];
-                        descs[index].name = arena
-                            .alloc_str(local[index].name)
-                            .map_err(|_| query::arena_full_pub())?;
-                    }
-                    count
-                }
-            };
+            let ncols = self.describe_data_modification_columns(dml, arena, txn, &mut descs)?;
             if cte.columns.len() > ncols {
                 return Err(sql_err!(
                     sqlstate::INVALID_COLUMN_REFERENCE,

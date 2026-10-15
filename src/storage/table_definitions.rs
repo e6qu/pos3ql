@@ -103,6 +103,14 @@ impl DefinitionVersions {
             .expect("table definition version lock poisoned")
     }
 
+    #[cfg(test)]
+    pub(super) fn test_write(
+        &self,
+    ) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, FixedVec<PendingTableDefSlot>>>
+    {
+        self.state.try_write()
+    }
+
     pub(super) fn exclusive(&mut self) -> &mut FixedVec<PendingTableDefSlot> {
         self.state
             .get_mut()

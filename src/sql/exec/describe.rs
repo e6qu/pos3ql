@@ -322,7 +322,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
     let output_aliases = [returning.old_name(), returning.new_name()];
-    describe_items_with_output_aliases(
+    let count = describe_items_with_output_aliases(
         returning.items,
         DescribeContext {
             def: definition,
@@ -333,7 +333,81 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
             arena,
         },
         out,
-    )
+    )?;
+    if !returning.items.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Expr {
+                expression: Expr::Subquery(_) | Expr::ArraySubquery(_),
+                ..
+            }
+        )
+    }) {
+        return Ok(count);
+    }
+    let Some(storage) = storage else {
+        return Ok(count);
+    };
+    let mut scope = None;
+    let mut column = 0;
+    for item in returning.items {
+        match item {
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                column += definition.map_or(0, |definition| definition.n_columns);
+            }
+            SelectItem::RecordStar(base) => {
+                let mut width = 0;
+                describe_record_star(
+                    base,
+                    DescribeContext {
+                        def: definition,
+                        table_alias: target_alias,
+                        output_aliases: &output_aliases,
+                        storage: Some(storage),
+                        txid,
+                        arena,
+                    },
+                    &mut |_| {
+                        width += 1;
+                        Ok(())
+                    },
+                )?;
+                column += width;
+            }
+            SelectItem::Expr { expression, .. } => {
+                if matches!(expression, Expr::Subquery(_) | Expr::ArraySubquery(_)) {
+                    if scope.is_none()
+                        && let Some(definition) = definition
+                    {
+                        scope = Some(super::super::query::QueryScope::for_returning(
+                            storage,
+                            definition,
+                            target_alias,
+                            &output_aliases,
+                            txid,
+                            arena,
+                        )?);
+                    }
+                    if let Some(description) = super::super::query::subquery_result_type(
+                        expression,
+                        scope.as_ref(),
+                        storage,
+                        txid,
+                        arena,
+                    )? {
+                        out[column] = ColDesc::new(
+                            out[column].name,
+                            description.type_oid,
+                            description.typlen,
+                        )
+                        .with_type_mod(description.type_mod);
+                    }
+                }
+                column += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 pub(crate) struct CatalogCols<'a> {

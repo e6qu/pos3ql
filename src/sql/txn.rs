@@ -13,7 +13,7 @@ use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
-use crate::storage::ColumnSet;
+use crate::storage::{ColumnSet, Storage};
 use crate::util::StackStr;
 
 use super::ast::TransactionIsolation;
@@ -151,6 +151,34 @@ pub(crate) struct TransactionConfiguration {
     sources: TransactionSources,
 }
 
+#[must_use]
+pub(crate) struct TriggerSqlScope<'txn> {
+    transaction: &'txn mut TxnState,
+    parent_command: u32,
+    parent_depth: u16,
+    _snapshot: crate::storage::ReadSnapshotScope,
+}
+
+impl core::ops::Deref for TriggerSqlScope<'_> {
+    type Target = TxnState;
+    fn deref(&self) -> &TxnState {
+        self.transaction
+    }
+}
+
+impl core::ops::DerefMut for TriggerSqlScope<'_> {
+    fn deref_mut(&mut self) -> &mut TxnState {
+        self.transaction
+    }
+}
+
+impl Drop for TriggerSqlScope<'_> {
+    fn drop(&mut self) {
+        self.transaction.command_id = self.parent_command;
+        self.transaction.trigger_depth = self.parent_depth;
+    }
+}
+
 pub struct TxnState {
     pub mode: TxnMode,
     /// An error occurred inside an explicit block: everything until
@@ -171,13 +199,12 @@ pub struct TxnState {
     extension_script: bool,
     snapshot_lsn: Option<u64>,
     snapshot_taken: bool,
-    /// PostgreSQL's command-id: a monotonically increasing counter bumped once
-    /// per statement. A row write records the command that made it, so a query
-    /// snapshotting at command K sees writes from commands `< K` but not its own
-    /// (K) — the mechanism that keeps a data-modifying CTE's changes invisible
-    /// to the same statement's main query. Starts at 1 so any stored `cid: 0`
-    /// (a restored pre-savepoint change) is always visible.
+    /// Current statement identity. Snapshot K sees own writes with identifiers
+    /// below K. Nested SQL temporarily uses a separately issued identity.
     command_id: u32,
+    /// The greatest issued identity, including nested commands whose caller
+    /// context has already been restored. Identities are never reused.
+    command_counter: u32,
     /// Nested trigger-side SQL is bounded independently of row and arena
     /// capacity so a self-referential trigger cannot consume the call stack.
     trigger_depth: u16,
@@ -869,6 +896,7 @@ impl TxnState {
             snapshot_lsn: None,
             snapshot_taken: false,
             command_id: 1,
+            command_counter: 1,
             trigger_depth: 0,
             rule_stack: [0; MAX_RULE_NESTING],
             rule_depth: 0,
@@ -1071,9 +1099,8 @@ impl TxnState {
     /// Advances to the next command. Called once at the start of each statement,
     /// so all of a statement's sub-parts (a WITH clause's data-modifying CTEs
     /// and its main query) share one command-id and therefore one snapshot.
-    pub fn begin_command(&mut self) -> Result<(), SqlError> {
-        let command_id = self
-            .command_id
+    fn next_command_identity(&self) -> Result<u32, SqlError> {
+        self.command_counter
             .checked_add(1)
             .filter(|command| *command < crate::storage::SNAPSHOT_ALL)
             .ok_or_else(|| {
@@ -1081,17 +1108,26 @@ impl TxnState {
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "transaction command identity space is exhausted"
                 )
-            })?;
-        self.command_id = command_id;
+            })
+    }
+
+    pub fn begin_command(&mut self) -> Result<(), SqlError> {
+        let command = self.next_command_identity()?;
+        self.command_counter = command;
+        self.command_id = command;
         Ok(())
     }
 
     #[cfg(test)]
     pub(super) fn test_set_command_id(&mut self, command: u32) {
         self.command_id = command;
+        self.command_counter = command;
     }
 
-    pub fn enter_trigger_sql(&mut self) -> Result<(), SqlError> {
+    pub(crate) fn enter_trigger_sql<'txn>(
+        &'txn mut self,
+        storage: &Storage,
+    ) -> Result<TriggerSqlScope<'txn>, SqlError> {
         if self.trigger_depth == MAX_TRIGGER_NESTING {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1099,8 +1135,26 @@ impl TxnState {
                 MAX_TRIGGER_NESTING
             ));
         }
+        let command = self.next_command_identity()?;
+        let snapshot = self.statement_snapshot(storage.lsn());
+        if matches!(
+            self.isolation,
+            TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
+        ) {
+            storage.register_snapshot(self.txid, snapshot)?;
+        }
+        let parent_command = self.command_id;
+        let parent_depth = self.trigger_depth;
+        self.command_counter = command;
+        self.command_id = command;
         self.trigger_depth += 1;
-        Ok(())
+        let snapshot = storage.nested_statement_snapshot(snapshot);
+        Ok(TriggerSqlScope {
+            transaction: self,
+            parent_command,
+            parent_depth,
+            _snapshot: snapshot,
+        })
     }
 
     pub(crate) fn trigger_depth(&self) -> u16 {
@@ -1119,13 +1173,6 @@ impl TxnState {
 
     pub(crate) fn in_extension_script(&self) -> bool {
         self.extension_script
-    }
-
-    pub fn leave_trigger_sql(&mut self) {
-        self.trigger_depth = self
-            .trigger_depth
-            .checked_sub(1)
-            .expect("trigger depth is paired");
     }
 
     pub(crate) fn enter_rule(&mut self, oid: i32, relation: &str) -> Result<(), SqlError> {
@@ -2228,6 +2275,7 @@ impl TxnState {
     pub fn clear(&mut self) {
         self.mode = TxnMode::Idle;
         self.command_id = 0;
+        self.command_counter = 0;
         self.failed = false;
         self.isolation = TransactionIsolation::ReadCommitted;
         self.read_only = false;
@@ -2274,7 +2322,7 @@ mod tests {
     fn visible_row_heap_ownership_command_exhaustion_preserves_snapshot_boundary() {
         let mut budget = Budget::new(TxnState::budget_bytes(8));
         let mut txn = TxnState::new(&mut budget, 8).unwrap();
-        txn.command_id = crate::storage::SNAPSHOT_ALL - 2;
+        txn.test_set_command_id(crate::storage::SNAPSHOT_ALL - 2);
         crate::mem::guard::forbid_alloc(|| {
             txn.begin_command().unwrap();
             assert_eq!(txn.command_id(), crate::storage::SNAPSHOT_ALL - 1);

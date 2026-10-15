@@ -8,13 +8,16 @@ import psycopg
 
 
 def connect(port: int):
-    return psycopg.connect(
+    connection = psycopg.connect(
         host=os.environ.get("PGHOST", "127.0.0.1"),
         port=port,
         user=os.environ.get("PGUSER", "postgres"),
         dbname="postgres",
         autocommit=True,
     )
+    # The shared test server reserves 16 plans; bound the driver's LRU cache.
+    connection.prepared_max = 8
+    return connection
 
 
 def sqlstate(connection, statement: str) -> str:
@@ -96,6 +99,68 @@ def on_conflict_snapshot_transcript(reader, writer) -> list[str]:
         reader.execute("ROLLBACK")
         writer.execute("ROLLBACK")
         writer.execute("DROP TABLE conflict_snapshot")
+
+
+def dml_target_transcript(reader, _writer) -> list[str]:
+    results = []
+    cases = [
+        ("before_update_changes_other", "BEFORE UPDATE", "UPDATE dml_target_rows SET value = value + 100 WHERE id = 2", "UPDATE dml_target_rows SET value = value + 1"),
+        ("before_update_deletes_other", "BEFORE UPDATE", "DELETE FROM dml_target_rows WHERE id = 2", "UPDATE dml_target_rows SET value = value + 1"),
+        ("before_delete_changes_other", "BEFORE DELETE", "UPDATE dml_target_rows SET value = value + 100 WHERE id = 2", "DELETE FROM dml_target_rows"),
+        ("before_delete_deletes_other", "BEFORE DELETE", "DELETE FROM dml_target_rows WHERE id = 2", "DELETE FROM dml_target_rows"),
+        ("after_update_changes_other", "AFTER UPDATE", "UPDATE dml_target_rows SET value = value + 100 WHERE id = 2", "UPDATE dml_target_rows SET value = value + 1"),
+        ("joined_update_changes_other", "BEFORE UPDATE", "UPDATE dml_target_rows SET value = value + 100 WHERE id = 2", "UPDATE dml_target_rows SET value = dml_target_rows.value + 1 FROM (VALUES (1), (2)) AS source(id) WHERE source.id = dml_target_rows.id"),
+        ("joined_delete_changes_other", "BEFORE DELETE", "UPDATE dml_target_rows SET value = value + 100 WHERE id = 2", "DELETE FROM dml_target_rows USING (VALUES (1), (2)) AS source(id) WHERE source.id = dml_target_rows.id"),
+    ]
+    try:
+        for label, event, mutation, command in cases:
+            reader.execute("CREATE TABLE dml_target_rows(id integer PRIMARY KEY, value integer)")
+            reader.execute("INSERT INTO dml_target_rows VALUES (1, 10), (2, 20)")
+            returned = "OLD" if "DELETE" in event else "NEW"
+            reader.execute(f"CREATE FUNCTION dml_target_action() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.id = 1 THEN {mutation}; END IF; RETURN {returned}; END $$")
+            reader.execute(f"CREATE TRIGGER dml_target_trigger {event} ON dml_target_rows FOR EACH ROW EXECUTE FUNCTION dml_target_action()")
+            error = sqlstate(reader, command)
+            rows = reader.execute("SELECT id, value FROM dml_target_rows ORDER BY id").fetchall()
+            results.append(f"dml_target_{label}={error},rows:{rows}")
+            reader.execute("DROP TABLE dml_target_rows")
+            reader.execute("DROP FUNCTION dml_target_action()")
+        reader.execute("CREATE TABLE dml_target_rows(id integer PRIMARY KEY, value integer)")
+        reader.execute("INSERT INTO dml_target_rows VALUES (1, 10), (2, 20), (3, 30)")
+        changed = reader.execute("UPDATE dml_target_rows AS target SET value = source.value FROM dml_target_rows AS source WHERE source.id = target.id - 1 RETURNING target.id, target.value").fetchall()
+        rows = reader.execute("SELECT id, value FROM dml_target_rows ORDER BY id").fetchall()
+        results.append(f"dml_target_self_join=changed:{changed},rows:{rows}")
+        reader.execute("DROP TABLE dml_target_rows")
+        reader.execute("CREATE TABLE dml_target_rows(id integer PRIMARY KEY, value integer)")
+        reader.execute("INSERT INTO dml_target_rows VALUES (1, 10), (2, 20)")
+        changed = reader.execute("UPDATE dml_target_rows AS target SET value = value + 1 RETURNING id, value, (SELECT sum(value) FROM dml_target_rows), (SELECT target.value), (SELECT old.value), (SELECT new.value), ARRAY(SELECT id FROM dml_target_rows ORDER BY id)").fetchall()
+        results.append(f"dml_target_update_returning_snapshot={sorted(changed)}")
+        deleted = reader.execute("DELETE FROM dml_target_rows AS target RETURNING id, value, (SELECT sum(value) FROM dml_target_rows), (SELECT target.value), (SELECT old.value), (SELECT new.value), ARRAY(SELECT id FROM dml_target_rows ORDER BY id)").fetchall()
+        results.append(f"dml_target_delete_returning_snapshot={sorted(deleted)}")
+        empty = reader.execute("UPDATE dml_target_rows SET value = value RETURNING (SELECT sum(value) FROM dml_target_rows), ARRAY(SELECT id FROM dml_target_rows)")
+        types = [column.type_code for column in empty.description]
+        results.append(f"dml_target_empty_returning=rows:{empty.fetchall()},types:{types}")
+        inserted = reader.execute("INSERT INTO dml_target_rows VALUES (3, 30) RETURNING id, value, (SELECT count(*) FROM dml_target_rows), (SELECT old.value), (SELECT new.value)").fetchall()
+        results.append(f"dml_target_insert_returning_snapshot={inserted}")
+        conflicted = reader.execute("INSERT INTO dml_target_rows VALUES (3, 40) ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING id, value, (SELECT sum(value) FROM dml_target_rows), (SELECT old.value), (SELECT new.value)").fetchall()
+        results.append(f"dml_target_conflict_returning_snapshot={conflicted}")
+        reader.execute("DROP TABLE dml_target_rows")
+        reader.execute("CREATE TABLE dml_target_rows(id integer PRIMARY KEY, value integer)")
+        reader.execute("CREATE FUNCTION dml_target_action() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.value < 100 THEN INSERT INTO dml_target_rows VALUES (NEW.id, 101); END IF; RETURN NEW; END $$")
+        reader.execute("CREATE TRIGGER dml_target_trigger BEFORE INSERT ON dml_target_rows FOR EACH ROW EXECUTE FUNCTION dml_target_action()")
+        for label, clause in [
+            ("update", "DO UPDATE SET value = excluded.value"),
+            ("filtered", "DO UPDATE SET value = excluded.value WHERE false"),
+            ("nothing", "DO NOTHING"),
+        ]:
+            reader.execute("TRUNCATE dml_target_rows")
+            error = sqlstate(reader, f"INSERT INTO dml_target_rows VALUES (1, 1) ON CONFLICT (id) {clause}")
+            rows = reader.execute("SELECT id, value FROM dml_target_rows").fetchall()
+            results.append(f"dml_target_trigger_conflict_{label}={error},rows:{rows}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        reader.execute("DROP TABLE IF EXISTS dml_target_rows CASCADE")
+        reader.execute("DROP FUNCTION IF EXISTS dml_target_action() CASCADE")
 
 
 def index_validation_transcript(reader, writer) -> list[str]:
@@ -518,7 +583,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

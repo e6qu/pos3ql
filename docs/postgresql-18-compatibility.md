@@ -53,6 +53,14 @@ ordering. Expression results are recomputed from fetched rows rather than
 projected directly from an index expression tuple. Native PostgreSQL index page
 layouts and custom native callbacks are not implemented.
 
+### Partition column order
+
+An existing table attached as a partition must currently store its columns in
+the parent's order. Reordered columns return `0A000`; PostgreSQL accepts those
+layouts. Ordinary inheritance supports matching columns in different orders.
+For example, attaching `(amount integer, id integer)` beneath a partitioned
+parent `(id integer, amount integer)` is not yet supported.
+
 ## Capacity boundaries
 
 Some limits come from PostgreSQL, some are smaller implementation limits, and
@@ -91,6 +99,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | ANALYZE resident retention | 32 bytes per resident overlay row plus saved-file lists in the existing work arena; saved rows stream | SQLSTATE 54000 on exhaustion; failed capture releases original data owners and restores the query snapshot |
 | Schema validation retention | 32 bytes per resident overlay row plus saved-file lists in the fixed statement arena, reused between tables; saved rows stream | Current committed and own changes are checked independently of query snapshots; SQLSTATE 54000 releases failed capture ownership |
 | ON CONFLICT row retention | Only the matched encoded row is copied into the existing statement arena; per-row index expression scratch is reused | Current committed and own changes select the conflict; SQLSTATE 54000 on capture exhaustion leaves rows unchanged and releases the source |
+| Local UPDATE and DELETE retention | Matched encoded bytes, 32-byte row records, and per-table column maps, schemas, and parsed checks/generated expressions within the existing statement arena | Sources release after copying; SQLSTATE 54000 aborts failed capture before mutation; identity-only DELETE avoids unnecessary byte copies |
 | Internal transaction identities | Checked 32-bit transaction identities and per-transaction command counters | SQLSTATE 54000 before identity reuse or command advancement |
 | Statement memory | Retained heap/spilled row images, escaped query metadata, lists, joins, programs, retry logs, event graphs, JSON widths, table-function rows, and variable-width geometry | Fixed arenas; arena exhaustion is a program-limit error |
 | Value-specific limits | Full-text, XML/XPath, JSON/path nesting, rendered values, GUC bytes, and finite catalog identities | Typed source boundaries and specialized contracts below |

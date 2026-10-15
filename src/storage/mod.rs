@@ -39,7 +39,7 @@ pub(crate) use row_images::{
 };
 use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::RowMap;
-pub(crate) use row_reads::RowRead;
+pub(crate) use row_reads::{RowRead, RowSelfChange};
 use row_reads::{RowReadView, RowReadVisitor};
 pub(crate) use row_scans::ValidationRead;
 use row_versions::{
@@ -12765,14 +12765,13 @@ fn replace_execution_visibility(visibility: VisibilityContext) -> VisibilityCont
     EXECUTION_VISIBILITY.with(|current| current.replace(visibility))
 }
 
-/// ANALYZE shares one current read position across base and extended scans.
-/// Restore the caller's query snapshot on every exit, on this thread only.
-pub(crate) struct AnalyzeSnapshot {
+/// Restore the caller's complete read context on every exit, on this thread only.
+pub(crate) struct ReadSnapshotScope {
     previous: VisibilityContext,
     thread: core::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-impl Drop for AnalyzeSnapshot {
+impl Drop for ReadSnapshotScope {
     fn drop(&mut self) {
         replace_execution_visibility(self.previous);
     }
@@ -47654,7 +47653,7 @@ impl Storage {
         execution_visibility().commit_snapshot
     }
 
-    pub(crate) fn analyze_snapshot(&self) -> AnalyzeSnapshot {
+    pub(crate) fn analyze_snapshot(&self) -> ReadSnapshotScope {
         let previous = execution_visibility();
         if !previous.analyzing {
             replace_execution_visibility(VisibilityContext {
@@ -47663,7 +47662,32 @@ impl Storage {
                 analyzing: true,
             });
         }
-        AnalyzeSnapshot {
+        ReadSnapshotScope {
+            previous,
+            thread: core::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn nested_statement_snapshot(&self, commit_lsn: u64) -> ReadSnapshotScope {
+        let previous = execution_visibility();
+        replace_execution_visibility(VisibilityContext {
+            read_snapshot: SNAPSHOT_ALL,
+            commit_snapshot: commit_lsn,
+            ..previous
+        });
+        ReadSnapshotScope {
+            previous,
+            thread: core::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn dml_expression_snapshot(&self, command: u32) -> ReadSnapshotScope {
+        let previous = execution_visibility();
+        replace_execution_visibility(VisibilityContext {
+            read_snapshot: previous.read_snapshot.min(command),
+            ..previous
+        });
+        ReadSnapshotScope {
             previous,
             thread: core::marker::PhantomData,
         }

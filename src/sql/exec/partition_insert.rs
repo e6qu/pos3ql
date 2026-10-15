@@ -71,3 +71,23 @@ pub(super) fn logical_insert_values<'row, 'arena: 'row>(
     mapping.project(physical, logical);
     Ok(logical)
 }
+
+pub(super) fn logical_insert_row_bytes<'arena>(
+    mapping: Option<RelationColumnMap<'arena>>,
+    width: usize,
+    schema: &[crate::sql::types::ColType],
+    bytes: &'arena [u8],
+    arena: &'arena Arena,
+) -> Result<&'arena [u8], SqlError> {
+    if mapping.is_none() {
+        return Ok(bytes);
+    }
+    let mut physical = [Datum::Null; MAX_COLUMNS];
+    crate::storage::rowenc::decode(bytes, schema, &mut physical)?;
+    let logical = logical_insert_values(mapping, width, &physical[..schema.len()], arena)?;
+    let encoded = arena
+        .alloc_slice_with(crate::storage::rowenc::encoded_len(logical), |_| 0u8)
+        .map_err(|_| super::arena_full())?;
+    crate::storage::rowenc::encode(logical, encoded);
+    Ok(encoded)
+}

@@ -28,6 +28,38 @@ def sqlstate(connection, statement: str) -> str:
     return "ok"
 
 
+def upsert_write_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE upsert_write_target(id integer PRIMARY KEY, amount integer)")
+    writer.execute("CREATE TABLE upsert_write_reference(id integer REFERENCES upsert_write_target(id) ON UPDATE CASCADE)")
+    writer.execute("INSERT INTO upsert_write_target VALUES (1, 10)")
+    writer.execute("INSERT INTO upsert_write_reference VALUES (1)")
+    try:
+        changed = reader.execute("INSERT INTO upsert_write_target VALUES (1, 20) ON CONFLICT(id) DO UPDATE SET id = 2, amount = excluded.amount RETURNING id, amount").fetchall()
+        referenced = reader.execute("SELECT id FROM upsert_write_reference").fetchall()
+        result = [f"upsert_key_actions=rows:{changed},references:{referenced}"]
+        writer.execute("""CREATE FUNCTION upsert_write_rewrite() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.amount = 30 THEN
+                    UPDATE upsert_write_target SET amount = 99 WHERE id = OLD.id;
+                END IF;
+                RETURN NEW;
+            END$$""")
+        writer.execute("CREATE TRIGGER upsert_write_rewrite BEFORE UPDATE ON upsert_write_target FOR EACH ROW EXECUTE FUNCTION upsert_write_rewrite()")
+        for label, command in [
+            ("triggered", "INSERT INTO upsert_write_target VALUES (2, 30) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount"),
+            ("repeated", "INSERT INTO upsert_write_target VALUES (2, 21), (2, 22) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount"),
+        ]:
+            error = sqlstate(reader, command)
+            rows = reader.execute("SELECT id, amount FROM upsert_write_target").fetchall()
+            result.append(f"upsert_{label}={error},rows:{rows}")
+        return result
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE upsert_write_reference")
+        writer.execute("DROP TABLE upsert_write_target")
+        writer.execute("DROP FUNCTION IF EXISTS upsert_write_rewrite()")
+
+
 def on_conflict_snapshot_transcript(reader, writer) -> list[str]:
     writer.execute("CREATE TABLE conflict_snapshot(id integer PRIMARY KEY, value text)")
     writer.execute("INSERT INTO conflict_snapshot VALUES (1, 'old')")
@@ -706,7 +738,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

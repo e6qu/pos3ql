@@ -4400,6 +4400,25 @@ enum Arbiter<'a> {
     },
 }
 
+impl<'a> Arbiter<'a> {
+    fn for_physical(&self, logical: &TableDef, physical: &TableDef) -> Result<Self, SqlError> {
+        Ok(match self {
+            Self::Any => Self::Any,
+            Self::Keys {
+                columns,
+                expressions,
+                n_columns,
+                nulls_not_distinct,
+            } => Self::Keys {
+                columns: remap_columns(physical, logical, &columns[..*n_columns])?,
+                expressions: *expressions,
+                n_columns: *n_columns,
+                nulls_not_distinct: *nulls_not_distinct,
+            },
+        })
+    }
+}
+
 fn same_index_expression(stored: &str, target: &str) -> bool {
     let target = target.trim();
     stored == target
@@ -4598,6 +4617,7 @@ enum ConflictRowOrigin {
 
 struct ConflictRow<'arena> {
     rowid: u64,
+    selected: PhysicalRow,
     origin: ConflictRowOrigin,
     bytes: &'arena [u8],
 }
@@ -4692,6 +4712,7 @@ fn find_conflict<'a>(
                         .cid,
                 ),
             };
+            let selected = PhysicalRow::local(table_index, rowid, home.snapshot());
             let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 // Index expression results never escape this evaluation. Original
                 // bytes belong to a heap owner or spill scratch outside the arena.
@@ -4881,6 +4902,7 @@ fn find_conflict<'a>(
             if let Some(bytes) = matched {
                 found = Some(ConflictRow {
                     rowid,
+                    selected,
                     origin,
                     bytes,
                 });
@@ -5049,6 +5071,8 @@ fn handle_conflict<'a, 'outer, 'snapshot>(
     txn: &mut TxnState,
     table_index: usize,
     def: &TableDef,
+    logical_definition: &TableDef,
+    mapping: Option<crate::storage::RelationColumnMap<'a>>,
     schema: &[ColType],
     values: &[Datum<'a>],
     on_conflict: &Option<super::ast::OnConflict<'a>>,
@@ -5143,10 +5167,22 @@ where
     let mut new_values = [Datum::Null; MAX_COLUMNS];
     {
         rowenc::decode(conflict.bytes, schema, &mut existing)?;
+        let logical_existing = partition_insert::logical_insert_values(
+            mapping,
+            logical_definition.n_columns,
+            &existing[..def.n_columns],
+            arena,
+        )?;
+        let logical_excluded = partition_insert::logical_insert_values(
+            mapping,
+            logical_definition.n_columns,
+            values,
+            arena,
+        )?;
         let context = ExcludedCtx {
-            def: *def,
-            existing: &existing[..def.n_columns],
-            excluded: values,
+            def: *logical_definition,
+            existing: logical_existing,
+            excluded: logical_excluded,
             outer,
         };
         let mut subquery_expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
@@ -5184,8 +5220,8 @@ where
         }
         if let Some(plan) = row_security_using {
             let policy_row = RowCtx {
-                def,
-                values: &existing[..def.n_columns],
+                def: logical_definition,
+                values: logical_existing,
                 alias: None,
             };
             let catalog = super::query::storage_catalog(storage, arena, txn.txid);
@@ -5251,9 +5287,15 @@ where
     }
     compute_generated(def, &generated, &mut new_values, storage, txn.txid, arena)?;
     if let Some(plan) = row_security_check {
+        let logical_new = partition_insert::logical_insert_values(
+            mapping,
+            logical_definition.n_columns,
+            &new_values[..def.n_columns],
+            arena,
+        )?;
         let policy_row = RowCtx {
-            def,
-            values: &new_values[..def.n_columns],
+            def: logical_definition,
+            values: logical_new,
             alias: None,
         };
         let catalog = super::query::storage_catalog(storage, arena, txn.txid);
@@ -5279,10 +5321,20 @@ where
             ));
         }
     }
+    let view_values = if view_check.is_some() {
+        partition_insert::logical_insert_values(
+            mapping,
+            logical_definition.n_columns,
+            &new_values[..def.n_columns],
+            arena,
+        )?
+    } else {
+        &new_values[..def.n_columns]
+    };
     enforce_view_check(
         view_check,
-        def,
-        &new_values[..def.n_columns],
+        logical_definition,
+        view_values,
         ViewCheckContext {
             storage,
             txid: txn.txid,
@@ -5321,6 +5373,9 @@ where
         arena,
         params,
     )?;
+    if !dml_row_available(storage, txn, conflict.selected, "updated")? {
+        return Ok(ConflictOutcome::Skip);
+    }
     let len = rowenc::encoded_len(&new_values[..def.n_columns]);
     let new_bytes = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
         sql_err!(
@@ -5341,6 +5396,27 @@ where
         storage.restore_pending(table_index, rowid, txn.txid, prior);
         return Err(e);
     }
+    if referenced_key_changed(
+        storage,
+        def.schema.as_str(),
+        def.name.as_str(),
+        &existing[..def.n_columns],
+        &new_values[..def.n_columns],
+        txn.txid,
+    )? {
+        apply_fk_parent_actions(
+            storage,
+            txn,
+            def.schema.as_str(),
+            def.name.as_str(),
+            &existing[..def.n_columns],
+            Some(&new_values[..def.n_columns]),
+            arena,
+            params,
+            seq_session,
+            MAX_FK_CASCADE_DEPTH,
+        )?;
+    }
     fire_partition_row_triggers(
         storage,
         txn,
@@ -5358,8 +5434,20 @@ where
         Some(&mut new_values[..def.n_columns]),
     )?;
     if let Some(transition_capture) = transition_capture {
-        transition_capture.push_old(&existing[..def.n_columns], arena)?;
-        transition_capture.push_new(&new_values[..def.n_columns], arena)?;
+        let logical_old = partition_insert::logical_insert_values(
+            mapping,
+            logical_definition.n_columns,
+            &existing[..def.n_columns],
+            arena,
+        )?;
+        let logical_new = partition_insert::logical_insert_values(
+            mapping,
+            logical_definition.n_columns,
+            &new_values[..def.n_columns],
+            arena,
+        )?;
+        transition_capture.push_old(logical_old, arena)?;
+        transition_capture.push_new(logical_new, arena)?;
     }
     let old = arena
         .alloc_slice_copy(&existing[..def.n_columns])
@@ -57817,126 +57905,304 @@ where
     if let Err(error) = compute_generated(definition, generated, values, storage, txn.txid, arena) {
         return Ok(Err(error));
     }
-    let table_index = match storage.partition_target(
+    match partition_insert::with_partition_insert_row(
+        storage,
         logical_table_index,
         definition,
-        &values[..definition.n_columns],
+        values,
         txn.txid,
-    ) {
-        Ok(target) => target,
-        Err(error) => return Ok(Err(error)),
-    };
-    if !match fire_partition_row_triggers(
-        storage,
-        txn,
         arena,
-        seq_session,
-        responder,
-        scratch as *mut _,
-        table_index,
-        definition,
-        TriggerEvents::INSERT,
-        true,
-        false,
-        ColumnSet::EMPTY,
-        None,
-        Some(&mut values[..definition.n_columns]),
-    ) {
-        Ok(run) => run,
-        Err(error) => return Ok(Err(error)),
-    } {
-        return Ok(Ok(false));
-    }
-    if let Err(error) = compute_generated(definition, generated, values, storage, txn.txid, arena) {
-        return Ok(Err(error));
-    }
-    if let Err(error) = storage.validate_partition_target(
-        table_index,
-        definition,
-        &values[..definition.n_columns],
-        txn.txid,
-    ) {
-        return Ok(Err(error));
-    }
-    if let Some(plan) = insert_check {
-        let context = RowCtx {
-            def: definition,
-            values: &values[..definition.n_columns],
-            alias: None,
-        };
-        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-        let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            sequences: Some(&sequences),
-            ..NO_HOOKS
-        };
-        match super::query::row_security_passes(
-            plan, &context, storage, txn.txid, arena, params, &hooks,
-        ) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(Err(sql_err!(
-                    sqlstate::INSUFFICIENT_PRIVILEGE,
-                    "new row violates row-level security policy for table \"{}\"",
-                    definition.name.as_str()
-                )));
+        |storage, table_index, physical_definition, values, mapping| {
+            let logical_definition = definition;
+            let definition = physical_definition;
+            let leaf_checks;
+            let checks = if table_index == logical_table_index {
+                checks
+            } else {
+                leaf_checks = match parse_checks(definition, arena) {
+                    Ok(checks) => checks,
+                    Err(error) => return Ok(Err(error)),
+                };
+                &leaf_checks
+            };
+            let leaf_generated;
+            let generated = if table_index == logical_table_index {
+                generated
+            } else {
+                leaf_generated = match parse_generated(definition, arena) {
+                    Ok(generated) => generated,
+                    Err(error) => return Ok(Err(error)),
+                };
+                &leaf_generated
+            };
+            let leaf_arbiter;
+            let arbiter = if mapping.is_some() {
+                leaf_arbiter = match arbiter.for_physical(logical_definition, definition) {
+                    Ok(arbiter) => arbiter,
+                    Err(error) => return Ok(Err(error)),
+                };
+                &leaf_arbiter
+            } else {
+                arbiter
+            };
+            if !match fire_partition_row_triggers(
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch as *mut _,
+                table_index,
+                definition,
+                TriggerEvents::INSERT,
+                true,
+                false,
+                ColumnSet::EMPTY,
+                None,
+                Some(&mut values[..definition.n_columns]),
+            ) {
+                Ok(run) => run,
+                Err(error) => return Ok(Err(error)),
+            } {
+                return Ok(Ok(false));
             }
-            Err(error) => return Ok(Err(error)),
-        }
-    }
-    if let Err(error) = enforce_view_check(
-        view_check,
-        definition,
-        &values[..definition.n_columns],
-        ViewCheckContext {
-            storage,
-            txid: txn.txid,
-            arena,
-            params,
-            seq_session,
-        },
-    ) {
-        return Ok(Err(error));
-    }
-    if let Err(error) = check_not_null(definition, values) {
-        return Ok(Err(error));
-    }
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
-    definition.schema(&mut schema);
-    if definition.kind != crate::storage::TableKind::Foreign {
-        match handle_conflict(
-            storage,
-            txn,
-            table_index,
-            definition,
-            &schema[..definition.n_columns],
-            &values[..definition.n_columns],
-            &statement.on_conflict,
-            arbiter,
-            checks,
-            view_check,
-            conflict_using,
-            conflict_check,
-            arena,
-            params,
-            seq_session,
-            responder,
-            scratch,
-            outer,
-            conflict_transition_capture,
-        ) {
-            Ok(ConflictOutcome::Store) => {}
-            Ok(ConflictOutcome::Skip) => return Ok(Ok(false)),
-            Ok(ConflictOutcome::Updated { old, new }) => {
+            if let Err(error) =
+                compute_generated(definition, generated, values, storage, txn.txid, arena)
+            {
+                return Ok(Err(error));
+            }
+            if let Err(error) = storage.validate_partition_target(
+                table_index,
+                definition,
+                &values[..definition.n_columns],
+                txn.txid,
+            ) {
+                return Ok(Err(error));
+            }
+            if let Some(plan) = insert_check {
+                let logical_values = match partition_insert::logical_insert_values(
+                    mapping,
+                    logical_definition.n_columns,
+                    &values[..definition.n_columns],
+                    arena,
+                ) {
+                    Ok(values) => values,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let context = RowCtx {
+                    def: logical_definition,
+                    values: logical_values,
+                    alias: None,
+                };
+                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let hooks = EvalHooks {
+                    catalog: Some(&catalog),
+                    sequences: Some(&sequences),
+                    ..NO_HOOKS
+                };
+                match super::query::row_security_passes(
+                    plan, &context, storage, txn.txid, arena, params, &hooks,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(Err(sql_err!(
+                            sqlstate::INSUFFICIENT_PRIVILEGE,
+                            "new row violates row-level security policy for table \"{}\"",
+                            definition.name.as_str()
+                        )));
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+            let view_values = if view_check.is_some() {
+                match partition_insert::logical_insert_values(
+                    mapping,
+                    logical_definition.n_columns,
+                    &values[..definition.n_columns],
+                    arena,
+                ) {
+                    Ok(values) => values,
+                    Err(error) => return Ok(Err(error)),
+                }
+            } else {
+                &values[..definition.n_columns]
+            };
+            if let Err(error) = enforce_view_check(
+                view_check,
+                logical_definition,
+                view_values,
+                ViewCheckContext {
+                    storage,
+                    txid: txn.txid,
+                    arena,
+                    params,
+                    seq_session,
+                },
+            ) {
+                return Ok(Err(error));
+            }
+            if let Err(error) = check_not_null(definition, values) {
+                return Ok(Err(error));
+            }
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            definition.schema(&mut schema);
+            if definition.kind != crate::storage::TableKind::Foreign {
+                match handle_conflict(
+                    storage,
+                    txn,
+                    table_index,
+                    definition,
+                    logical_definition,
+                    mapping,
+                    &schema[..definition.n_columns],
+                    &values[..definition.n_columns],
+                    &statement.on_conflict,
+                    arbiter,
+                    checks,
+                    view_check,
+                    conflict_using,
+                    conflict_check,
+                    arena,
+                    params,
+                    seq_session,
+                    responder,
+                    scratch,
+                    outer,
+                    conflict_transition_capture,
+                ) {
+                    Ok(ConflictOutcome::Store) => {}
+                    Ok(ConflictOutcome::Skip) => return Ok(Ok(false)),
+                    Ok(ConflictOutcome::Updated { old, new }) => {
+                        if !statement.returning.is_empty() {
+                            let old = match partition_insert::logical_insert_values(
+                                mapping,
+                                logical_definition.n_columns,
+                                old,
+                                arena,
+                            ) {
+                                Ok(values) => values,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            let new = match partition_insert::logical_insert_row_bytes(
+                                mapping,
+                                logical_definition.n_columns,
+                                &schema[..definition.n_columns],
+                                new,
+                                arena,
+                            ) {
+                                Ok(bytes) => bytes,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            if let Err(error) = emit_conflict_returning(
+                                storage,
+                                txn,
+                                logical_definition,
+                                new,
+                                statement.returning,
+                                Some(old),
+                                arena,
+                                params,
+                                responder,
+                                capture,
+                            )? {
+                                return Ok(Err(error));
+                            }
+                        }
+                        return Ok(Ok(true));
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+            let row = if definition.kind == crate::storage::TableKind::Foreign {
+                ConstraintRow::Validation { excluded: None }
+            } else {
+                match storage.next_rowid() {
+                    Ok(rowid) => ConstraintRow::insert(rowid),
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
+            if let Err(error) = enforce_row_constraints(
+                storage,
+                table_index,
+                definition,
+                &schema[..definition.n_columns],
+                &values[..definition.n_columns],
+                row,
+                txn.txid,
+                Some(txn),
+                checks,
+                arena,
+                params,
+            ) {
+                return Ok(Err(error));
+            }
+            if definition.kind == crate::storage::TableKind::Foreign {
+                match crate::sql::foreign::insert_row(
+                    storage,
+                    table_index,
+                    txn.txid,
+                    &mut values[..definition.n_columns],
+                    statement.on_conflict.is_some(),
+                    responder.render_context(),
+                    arena,
+                ) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(Ok(false)),
+                    Err(error) => return Ok(Err(error)),
+                }
+            } else if let Err(error) = store_row(
+                storage,
+                txn,
+                table_index,
+                row.stored(),
+                &values[..definition.n_columns],
+            ) {
+                return Ok(Err(error));
+            }
+            if let Err(error) = fire_partition_row_triggers(
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch,
+                table_index,
+                definition,
+                TriggerEvents::INSERT,
+                false,
+                false,
+                ColumnSet::EMPTY,
+                None,
+                Some(&mut values[..definition.n_columns]),
+            ) {
+                return Ok(Err(error));
+            }
+            if transition_capture.is_some() || !statement.returning.is_empty() {
+                let logical_values = match partition_insert::logical_insert_values(
+                    mapping,
+                    logical_definition.n_columns,
+                    &values[..definition.n_columns],
+                    arena,
+                ) {
+                    Ok(values) => values,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if let Some(transition_capture) = transition_capture
+                    && let Err(error) = transition_capture.push_new(logical_values, arena)
+                {
+                    return Ok(Err(error));
+                }
                 if !statement.returning.is_empty()
-                    && let Err(error) = emit_conflict_returning(
+                    && let Err(error) = emit_projected(
                         storage,
                         txn,
-                        definition,
-                        new,
+                        logical_definition,
+                        None,
+                        logical_values,
                         statement.returning,
-                        Some(old),
+                        None,
+                        Some(logical_values),
                         arena,
                         params,
                         responder,
@@ -57945,99 +58211,13 @@ where
                 {
                     return Ok(Err(error));
                 }
-                return Ok(Ok(true));
             }
-            Err(error) => return Ok(Err(error)),
-        }
-    }
-    let row = if definition.kind == crate::storage::TableKind::Foreign {
-        ConstraintRow::Validation { excluded: None }
-    } else {
-        match storage.next_rowid() {
-            Ok(rowid) => ConstraintRow::insert(rowid),
-            Err(error) => return Ok(Err(error)),
-        }
-    };
-    if let Err(error) = enforce_row_constraints(
-        storage,
-        table_index,
-        definition,
-        &schema[..definition.n_columns],
-        &values[..definition.n_columns],
-        row,
-        txn.txid,
-        Some(txn),
-        checks,
-        arena,
-        params,
+            Ok(Ok(true))
+        },
     ) {
-        return Ok(Err(error));
+        Ok(outcome) => outcome,
+        Err(error) => Ok(Err(error)),
     }
-    if definition.kind == crate::storage::TableKind::Foreign {
-        match crate::sql::foreign::insert_row(
-            storage,
-            table_index,
-            txn.txid,
-            &mut values[..definition.n_columns],
-            statement.on_conflict.is_some(),
-            responder.render_context(),
-            arena,
-        ) {
-            Ok(Some(_)) => {}
-            Ok(None) => return Ok(Ok(false)),
-            Err(error) => return Ok(Err(error)),
-        }
-    } else if let Err(error) = store_row(
-        storage,
-        txn,
-        table_index,
-        row.stored(),
-        &values[..definition.n_columns],
-    ) {
-        return Ok(Err(error));
-    }
-    if let Err(error) = fire_partition_row_triggers(
-        storage,
-        txn,
-        arena,
-        seq_session,
-        responder,
-        scratch,
-        table_index,
-        definition,
-        TriggerEvents::INSERT,
-        false,
-        false,
-        ColumnSet::EMPTY,
-        None,
-        Some(&mut values[..definition.n_columns]),
-    ) {
-        return Ok(Err(error));
-    }
-    if let Some(transition_capture) = transition_capture
-        && let Err(error) = transition_capture.push_new(&values[..definition.n_columns], arena)
-    {
-        return Ok(Err(error));
-    }
-    if !statement.returning.is_empty()
-        && let Err(error) = emit_projected(
-            storage,
-            txn,
-            definition,
-            None,
-            &values[..definition.n_columns],
-            statement.returning,
-            None,
-            Some(&values[..definition.n_columns]),
-            arena,
-            params,
-            responder,
-            capture,
-        )?
-    {
-        return Ok(Err(error));
-    }
-    Ok(Ok(true))
 }
 
 pub(crate) fn view_trigger_definition(

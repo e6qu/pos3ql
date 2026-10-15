@@ -81581,3 +81581,88 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn dml_target_upsert_applies_referenced_key_actions() {
+    let config = test_config("dml-target-upsert-referenced-key");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE upsert_key_target(id integer PRIMARY KEY, amount integer); \
+         CREATE TABLE upsert_key_reference(id integer REFERENCES upsert_key_target(id) ON UPDATE CASCADE); \
+         INSERT INTO upsert_key_target VALUES (1, 10); \
+         INSERT INTO upsert_key_reference VALUES (1)", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "INSERT INTO upsert_key_target VALUES (1, 20) ON CONFLICT(id) \
+         DO UPDATE SET id = 2, amount = excluded.amount RETURNING id, amount",
+            true
+        )),
+        ["2|20"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id FROM upsert_key_reference", true)),
+        ["2"]
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn dml_target_upsert_rejects_triggered_rewrites_and_repeated_updates() {
+    let config = test_config("dml-target-upsert-triggered-rewrite");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE upsert_trigger_target(id integer PRIMARY KEY, amount integer); \
+         INSERT INTO upsert_trigger_target VALUES (2, 20); \
+         CREATE FUNCTION upsert_trigger_rewrite() RETURNS trigger LANGUAGE plpgsql AS \
+         'BEGIN IF NEW.amount = 30 THEN UPDATE upsert_trigger_target SET amount = 99 WHERE id = OLD.id; END IF; RETURN NEW; END'; \
+         CREATE TRIGGER upsert_trigger_rewrite BEFORE UPDATE ON upsert_trigger_target \
+         FOR EACH ROW EXECUTE FUNCTION upsert_trigger_rewrite()", true);
+    let failed = session.execute(
+        &mut engine,
+        "INSERT INTO upsert_trigger_target VALUES (2, 30) ON CONFLICT(id) \
+         DO UPDATE SET amount = excluded.amount",
+        true,
+    );
+    assert!(
+        String::from_utf8_lossy(&failed).contains("27000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, amount FROM upsert_trigger_target",
+            true
+        )),
+        ["2|20"]
+    );
+    let failed = session.execute(
+        &mut engine,
+        "INSERT INTO upsert_trigger_target VALUES (2, 21), (2, 22) ON CONFLICT(id) \
+         DO UPDATE SET amount = excluded.amount",
+        true,
+    );
+    assert!(
+        String::from_utf8_lossy(&failed).contains("21000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, amount FROM upsert_trigger_target",
+            true
+        )),
+        ["2|20"]
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

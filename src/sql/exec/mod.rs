@@ -57908,7 +57908,7 @@ where
                 if !statement.returning.is_empty()
                     && let Err(error) = emit_conflict_returning(
                         storage,
-                        txn.txid,
+                        txn,
                         definition,
                         new,
                         statement.returning,
@@ -57998,7 +57998,7 @@ where
     if !statement.returning.is_empty()
         && let Err(error) = emit_projected(
             storage,
-            txn.txid,
+            txn,
             definition,
             None,
             &values[..definition.n_columns],
@@ -58533,7 +58533,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                 if !returning.is_empty() {
                     match emit_projected(
                         storage,
-                        txn.txid,
+                        txn,
                         &def,
                         update.alias,
                         new,
@@ -58635,7 +58635,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                 if !returning.is_empty() {
                     match emit_projected(
                         storage,
-                        txn.txid,
+                        txn,
                         &def,
                         delete.alias,
                         &old[..def.n_columns],
@@ -58810,7 +58810,7 @@ fn finish_instead_of_view_new_row<'a>(
     if !returning.is_empty() {
         match emit_projected(
             storage,
-            txn.txid,
+            txn,
             definition,
             None,
             values,
@@ -59647,7 +59647,7 @@ where
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn emit_conflict_returning(
     storage: &Storage,
-    txid: u32,
+    txn: &TxnState,
     def: &TableDef,
     row_bytes: &[u8],
     returning: crate::sql::ast::Returning<'_>,
@@ -59665,7 +59665,7 @@ fn emit_conflict_returning(
     }
     emit_projected(
         storage,
-        txid,
+        txn,
         def,
         None,
         &updated[..def.n_columns],
@@ -59682,7 +59682,7 @@ fn emit_conflict_returning(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn emit_projected(
     storage: &Storage,
-    txid: u32,
+    txn: &TxnState,
     def: &TableDef,
     alias: Option<&str>,
     current: &[Datum],
@@ -59694,6 +59694,8 @@ fn emit_projected(
     responder: &mut Responder,
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Result<Result<(), SqlError>, WireFull> {
+    let txid = txn.txid;
+    let _snapshot = storage.dml_expression_snapshot(txn.command_id());
     let context = ReturningLookup {
         definition: def,
         target_alias: alias,
@@ -60990,11 +60992,10 @@ pub(crate) fn update<'a>(
                     return sql_fail(error);
                 }
             }
-            let _snapshot = storage.dml_expression_snapshot(txn.command_id());
             if !statement.returning.is_empty()
                 && let Err(error) = emit_projected(
                     storage,
-                    txn.txid,
+                    txn,
                     def,
                     statement.alias,
                     &new_values[..def.n_columns],
@@ -61148,11 +61149,10 @@ pub(crate) fn update<'a>(
                 return sql_fail(error);
             }
         }
-        let _snapshot = storage.dml_expression_snapshot(txn.command_id());
         if !statement.returning.is_empty()
             && let Err(error) = emit_projected(
                 storage,
-                txn.txid,
+                txn,
                 def,
                 statement.alias,
                 &logical_new[..def.n_columns],
@@ -61593,7 +61593,7 @@ pub(crate) fn delete<'a>(
             if !statement.returning.is_empty()
                 && let Err(error) = emit_projected(
                     storage,
-                    txn.txid,
+                    txn,
                     def,
                     statement.alias,
                     &old_transition[..def.n_columns],
@@ -61720,10 +61720,9 @@ pub(crate) fn delete<'a>(
             return sql_fail(error);
         }
         if !statement.returning.is_empty() {
-            let _snapshot = storage.dml_expression_snapshot(txn.command_id());
             if let Err(error) = emit_projected(
                 storage,
-                txn.txid,
+                txn,
                 def,
                 statement.alias,
                 &logical_old[..def.n_columns],

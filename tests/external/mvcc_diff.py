@@ -139,6 +139,10 @@ def dml_target_transcript(reader, _writer) -> list[str]:
         empty = reader.execute("UPDATE dml_target_rows SET value = value RETURNING (SELECT sum(value) FROM dml_target_rows), ARRAY(SELECT id FROM dml_target_rows)")
         types = [column.type_code for column in empty.description]
         results.append(f"dml_target_empty_returning=rows:{empty.fetchall()},types:{types}")
+        inserted = reader.execute("INSERT INTO dml_target_rows VALUES (3, 30) RETURNING id, value, (SELECT count(*) FROM dml_target_rows), (SELECT old.value), (SELECT new.value)").fetchall()
+        results.append(f"dml_target_insert_returning_snapshot={inserted}")
+        conflicted = reader.execute("INSERT INTO dml_target_rows VALUES (3, 40) ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING id, value, (SELECT sum(value) FROM dml_target_rows), (SELECT old.value), (SELECT new.value)").fetchall()
+        results.append(f"dml_target_conflict_returning_snapshot={conflicted}")
         reader.execute("DROP TABLE dml_target_rows")
         reader.execute("CREATE TABLE dml_target_rows(id integer PRIMARY KEY, value integer)")
         reader.execute("CREATE FUNCTION dml_target_action() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.value < 100 THEN INSERT INTO dml_target_rows VALUES (NEW.id, 101); END IF; RETURN NEW; END $$")

@@ -81021,6 +81021,19 @@ fn dml_target_returning_subqueries_keep_old_new_values_and_statement_reads() {
          (SELECT sum(value) FROM returning_target), (SELECT target.value), \
          (SELECT old.value), (SELECT new.value), ARRAY(SELECT id FROM returning_target ORDER BY id)", true)),
         ["1|11|32|11|11|NULL|{1,2}", "2|21|32|21|21|NULL|{1,2}"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "INSERT INTO returning_target VALUES (3, 30) RETURNING id, value, \
+         (SELECT count(*) FROM returning_target), (SELECT old.value), (SELECT new.value)",
+            true
+        )),
+        ["3|30|0|NULL|30"]
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "INSERT INTO returning_target VALUES (3, 40) ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+         RETURNING id, value, (SELECT sum(value) FROM returning_target), (SELECT old.value), (SELECT new.value)", true)),
+        ["3|40|30|30|40"]);
     drop(session);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

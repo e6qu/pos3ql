@@ -30,6 +30,7 @@ mod snapshot_leases;
 mod snapshot_reclamation;
 use snapshot_reclamation::SnapshotReclamation;
 mod statistics;
+mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
 use statistics::{StatisticsVersions, TableStatisticsOwner};
 mod spill_generations;

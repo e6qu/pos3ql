@@ -81779,3 +81779,65 @@ fn pgoutput_row_selection_copies_only_matches_and_owns_original_schema() {
     drop(selected);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn pgoutput_targets_reject_foreign_tables_views_and_other_relation_kinds() {
+    let config = test_config("pgoutput-target-kinds");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE subscription_local(id integer); \
+         CREATE TABLE subscription_parent(id integer) PARTITION BY RANGE(id); \
+         CREATE TABLE subscription_leaf PARTITION OF subscription_parent FOR VALUES FROM (0) TO (10); \
+         CREATE VIEW subscription_view AS SELECT 1 AS id; \
+         CREATE MATERIALIZED VIEW subscription_matview AS SELECT 1 AS id; \
+         CREATE SEQUENCE subscription_sequence; \
+         CREATE FOREIGN DATA WRAPPER postgres_fdw HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         CREATE SERVER subscription_upstream FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host '127.0.0.1', port '1', sslmode 'disable'); \
+         CREATE FOREIGN TABLE subscription_foreign(id integer) SERVER subscription_upstream", true);
+    let schema = crate::storage::SqlName::parse("public").unwrap();
+    let columns = [crate::storage::SqlName::parse("id").unwrap()];
+    crate::mem::guard::forbid_alloc(|| {
+        for name in [
+            "subscription_local",
+            "subscription_parent",
+            "subscription_leaf",
+        ] {
+            let table = engine
+                .storage
+                .resolve_subscription_target("public", name, 0)
+                .unwrap();
+            engine
+                .storage
+                .require_subscription_target(table, 0)
+                .unwrap();
+        }
+        for name in [
+            "subscription_foreign",
+            "subscription_view",
+            "subscription_matview",
+            "subscription_sequence",
+        ] {
+            let error = engine
+                .storage
+                .resolve_subscription_target("public", name, 0)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::WRONG_OBJECT_TYPE);
+            let table = crate::storage::SqlName::parse(name).unwrap();
+            let error = engine
+                .subscription_copy_setup(schema, table, &columns, 0)
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::WRONG_OBJECT_TYPE);
+        }
+        let error = engine
+            .storage
+            .resolve_subscription_target("public", "subscription_missing", 0)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    });
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

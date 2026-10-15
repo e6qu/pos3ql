@@ -78,16 +78,8 @@ impl RelationMap {
         txid: u32,
         relation: Relation<'_>,
     ) -> Result<(), SqlError> {
-        let table_slot = storage
-            .find_visible(relation.namespace, relation.name, txid)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "subscription relation \"{}.{}\" does not exist locally",
-                    relation.namespace,
-                    relation.name
-                )
-            })?;
+        let table_slot =
+            storage.resolve_subscription_target(relation.namespace, relation.name, txid)?;
         let definition = storage.table_def(table_slot, txid);
         if relation.columns().len() > definition.n_columns {
             return Err(sql_err!(

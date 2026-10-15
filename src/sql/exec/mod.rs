@@ -52155,16 +52155,7 @@ pub(crate) fn subscription_copy_setup(
     columns: &[SqlName],
     txid: u32,
 ) -> Result<CopySetup, SqlError> {
-    let table_index = storage
-        .find_visible(schema.as_str(), table.as_str(), txid)
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "subscription relation \"{}.{}\" does not exist locally",
-                schema.as_str(),
-                table.as_str()
-            )
-        })?;
+    let table_index = storage.resolve_subscription_target(schema.as_str(), table.as_str(), txid)?;
     let definition = storage.table_def(table_index, txid);
     let mut targets = [0usize; MAX_COLUMNS];
     if columns.is_empty() || columns.len() > definition.n_columns {
@@ -52668,6 +52659,9 @@ fn finish_copy_row<'a>(
         txn.txid,
         arena,
         |storage, target, physical, values, mapping| {
+            if txn.replication_apply {
+                storage.require_subscription_target(target, txn.txid)?;
+            }
             let leaf_checks;
             let checks = if target == logical_table {
                 checks
@@ -52853,6 +52847,7 @@ pub(crate) fn apply_replication_insert(
         ));
     }
     let table_index = binding.table_slot();
+    storage.require_subscription_target(table_index, txn.txid)?;
     storage.lock_table(
         txn.txid,
         table_index,
@@ -52886,86 +52881,97 @@ pub(crate) fn apply_replication_insert(
         txn.txid,
         arena,
     )?;
-    let initial_target = storage.partition_target(
+    partition_insert::with_partition_insert_row(
+        storage,
         table_index,
         &definition,
-        &values[..definition.n_columns],
-        txn.txid,
-    )?;
-    if !fire_partition_row_triggers(
-        storage,
-        txn,
-        arena,
-        context.seq_session,
-        context.responder,
-        context.scratch,
-        initial_target,
-        &definition,
-        TriggerEvents::INSERT,
-        true,
-        false,
-        ColumnSet::EMPTY,
-        None,
-        Some(&mut values[..definition.n_columns]),
-    )? {
-        return Ok(());
-    }
-    compute_generated(
-        &definition,
-        &generated,
         &mut values,
-        storage,
         txn.txid,
         arena,
-    )?;
-    storage.validate_partition_target(
-        initial_target,
-        &definition,
-        &values[..definition.n_columns],
-        txn.txid,
-    )?;
-    let target_table = initial_target;
-    check_not_null(&definition, &values)?;
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
-    definition.schema(&mut schema);
-    let rowid = storage.next_rowid()?;
-    enforce_row_constraints(
-        storage,
-        target_table,
-        &definition,
-        &schema[..definition.n_columns],
-        &values[..definition.n_columns],
-        ConstraintRow::insert(rowid),
-        txn.txid,
-        Some(txn),
-        &checks,
-        arena,
-        &[],
-    )?;
-    store_row(
-        storage,
-        txn,
-        target_table,
-        Some(rowid),
-        &values[..definition.n_columns],
-    )?;
-    fire_partition_row_triggers(
-        storage,
-        txn,
-        arena,
-        context.seq_session,
-        context.responder,
-        context.scratch,
-        target_table,
-        &definition,
-        TriggerEvents::INSERT,
-        false,
-        false,
-        ColumnSet::EMPTY,
-        None,
-        Some(&mut values[..definition.n_columns]),
-    )?;
-    Ok(())
+        |storage, target_table, definition, values, _mapping| {
+            storage.require_subscription_target(target_table, txn.txid)?;
+            let leaf_checks;
+            let checks = if target_table == table_index {
+                &checks
+            } else {
+                leaf_checks = parse_checks(definition, arena)?;
+                &leaf_checks
+            };
+            let leaf_generated;
+            let generated = if target_table == table_index {
+                &generated
+            } else {
+                leaf_generated = parse_generated(definition, arena)?;
+                &leaf_generated
+            };
+            if !fire_partition_row_triggers(
+                storage,
+                txn,
+                arena,
+                context.seq_session,
+                context.responder,
+                context.scratch,
+                target_table,
+                definition,
+                TriggerEvents::INSERT,
+                true,
+                false,
+                ColumnSet::EMPTY,
+                None,
+                Some(&mut values[..definition.n_columns]),
+            )? {
+                return Ok(());
+            }
+            compute_generated(definition, generated, values, storage, txn.txid, arena)?;
+            storage.validate_partition_target(
+                target_table,
+                definition,
+                &values[..definition.n_columns],
+                txn.txid,
+            )?;
+            check_not_null(definition, values)?;
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            definition.schema(&mut schema);
+            let rowid = storage.next_rowid()?;
+            enforce_row_constraints(
+                storage,
+                target_table,
+                definition,
+                &schema[..definition.n_columns],
+                &values[..definition.n_columns],
+                ConstraintRow::insert(rowid),
+                txn.txid,
+                Some(txn),
+                checks,
+                arena,
+                &[],
+            )?;
+            store_row(
+                storage,
+                txn,
+                target_table,
+                Some(rowid),
+                &values[..definition.n_columns],
+            )?;
+            fire_partition_row_triggers(
+                storage,
+                txn,
+                arena,
+                context.seq_session,
+                context.responder,
+                context.scratch,
+                target_table,
+                definition,
+                TriggerEvents::INSERT,
+                false,
+                false,
+                ColumnSet::EMPTY,
+                None,
+                Some(&mut values[..definition.n_columns]),
+            )?;
+            Ok(())
+        },
+    )?
 }
 
 /// Decodes a pgoutput tuple according to an already verified local relation
@@ -53163,6 +53169,7 @@ fn locate_replication_row_by_values<'arena>(
         ));
     }
     let table_index = binding.table_slot();
+    storage.require_subscription_target(table_index, txn.txid)?;
     let definitions = storage.table_definition_images();
     let definition = definitions.definition(storage, table_index, txn.txid)?;
     let mut found = None;
@@ -53251,6 +53258,7 @@ pub(crate) fn apply_replication_delete(
 ) -> Result<(), SqlError> {
     let row = locate_replication_row(storage, txn, binding, old, arena)?;
     let row_table = row.table_slot();
+    storage.require_subscription_target(row_table, txn.txid)?;
     match storage.acquire_row_lock(
         row_table,
         row.rowid(),
@@ -57780,128 +57788,168 @@ fn merge_insert<'a>(
     )?;
     let mut row_arr = row;
     compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
-    let initial_target =
-        storage.partition_target(table_index, def, &row_arr[..def.n_columns], txn.txid)?;
-    if !fire_partition_row_triggers(
+    partition_insert::with_partition_insert_row(
         storage,
-        txn,
-        arena,
-        seq_session,
-        responder,
-        scratch as *mut _,
-        initial_target,
+        table_index,
         def,
-        TriggerEvents::INSERT,
-        true,
-        false,
-        ColumnSet::EMPTY,
-        None,
-        Some(&mut row_arr[..def.n_columns]),
-    )? {
-        return Ok(None);
-    }
-    compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
-    storage.validate_partition_target(initial_target, def, &row_arr[..def.n_columns], txn.txid)?;
-    let target_table = initial_target;
-    if let Some(plan) = row_security_check {
-        let policy_row = RowCtx {
-            def,
-            values: &row_arr[..def.n_columns],
-            alias: None,
-        };
-        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-        let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            sequences: Some(&sequences),
-            ..NO_HOOKS
-        };
-        if !super::query::row_security_passes(
-            plan,
-            &policy_row,
-            storage,
-            txn.txid,
-            arena,
-            params,
-            &hooks,
-        )? {
-            return Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "new row violates row-level security policy for table \"{}\"",
-                def.name.as_str()
-            ));
-        }
-    }
-    check_not_null(def, &row_arr)?;
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
-    def.schema(&mut schema);
-    let row = if def.kind == crate::storage::TableKind::Foreign {
-        ConstraintRow::Validation { excluded: None }
-    } else {
-        ConstraintRow::insert(storage.next_rowid()?)
-    };
-    enforce_row_constraints(
-        storage,
-        target_table,
-        def,
-        &schema[..def.n_columns],
-        &row_arr[..def.n_columns],
-        row,
+        &mut row_arr,
         txn.txid,
-        Some(txn),
-        checks,
         arena,
-        params,
-    )?;
-    if def.kind == crate::storage::TableKind::Foreign {
-        if crate::sql::foreign::insert_row(
-            storage,
-            target_table,
-            txn.txid,
-            &mut row_arr[..def.n_columns],
-            false,
-            responder.render_context(),
-            arena,
-        )?
-        .is_none()
-        {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "foreign MERGE INSERT returned no row"
-            ));
-        }
-    } else {
-        store_row(
-            storage,
-            txn,
-            target_table,
-            row.stored(),
-            &row_arr[..def.n_columns],
-        )?;
-    }
-    fire_partition_row_triggers(
-        storage,
-        txn,
-        arena,
-        seq_session,
-        responder,
-        scratch as *mut _,
-        target_table,
-        def,
-        TriggerEvents::INSERT,
-        false,
-        false,
-        ColumnSet::EMPTY,
-        None,
-        Some(&mut row_arr[..def.n_columns]),
-    )?;
-    if let Some(transition_capture) = transition_capture {
-        transition_capture.push_new(&row_arr[..def.n_columns], arena)?;
-    }
-    let returned = arena
-        .alloc_slice_copy(&row_arr[..def.n_columns])
-        .map_err(|_| super::query::arena_full_pub())?;
-    Ok(Some(&*returned))
+        |storage, target_table, physical_definition, row_arr, mapping| {
+            let logical_definition = def;
+            let def = physical_definition;
+            let leaf_checks;
+            let checks = if target_table == table_index {
+                checks
+            } else {
+                leaf_checks = parse_checks(def, arena)?;
+                &leaf_checks
+            };
+            let leaf_generated;
+            let generated = if target_table == table_index {
+                generated
+            } else {
+                leaf_generated = parse_generated(def, arena)?;
+                &leaf_generated
+            };
+            if !fire_partition_row_triggers(
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch as *mut _,
+                target_table,
+                def,
+                TriggerEvents::INSERT,
+                true,
+                false,
+                ColumnSet::EMPTY,
+                None,
+                Some(&mut row_arr[..def.n_columns]),
+            )? {
+                return Ok(None);
+            }
+            compute_generated(def, generated, row_arr, storage, txn.txid, arena)?;
+            storage.validate_partition_target(
+                target_table,
+                def,
+                &row_arr[..def.n_columns],
+                txn.txid,
+            )?;
+            if let Some(plan) = row_security_check {
+                let logical_values = partition_insert::logical_insert_values(
+                    mapping,
+                    logical_definition.n_columns,
+                    &row_arr[..def.n_columns],
+                    arena,
+                )?;
+                let policy_row = RowCtx {
+                    def: logical_definition,
+                    values: logical_values,
+                    alias: None,
+                };
+                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let hooks = EvalHooks {
+                    catalog: Some(&catalog),
+                    sequences: Some(&sequences),
+                    ..NO_HOOKS
+                };
+                if !super::query::row_security_passes(
+                    plan,
+                    &policy_row,
+                    storage,
+                    txn.txid,
+                    arena,
+                    params,
+                    &hooks,
+                )? {
+                    return Err(sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "new row violates row-level security policy for table \"{}\"",
+                        def.name.as_str()
+                    ));
+                }
+            }
+            check_not_null(def, row_arr)?;
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            def.schema(&mut schema);
+            let row = if def.kind == crate::storage::TableKind::Foreign {
+                ConstraintRow::Validation { excluded: None }
+            } else {
+                ConstraintRow::insert(storage.next_rowid()?)
+            };
+            enforce_row_constraints(
+                storage,
+                target_table,
+                def,
+                &schema[..def.n_columns],
+                &row_arr[..def.n_columns],
+                row,
+                txn.txid,
+                Some(txn),
+                checks,
+                arena,
+                params,
+            )?;
+            if def.kind == crate::storage::TableKind::Foreign {
+                if crate::sql::foreign::insert_row(
+                    storage,
+                    target_table,
+                    txn.txid,
+                    &mut row_arr[..def.n_columns],
+                    false,
+                    responder.render_context(),
+                    arena,
+                )?
+                .is_none()
+                {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "foreign MERGE INSERT returned no row"
+                    ));
+                }
+            } else {
+                store_row(
+                    storage,
+                    txn,
+                    target_table,
+                    row.stored(),
+                    &row_arr[..def.n_columns],
+                )?;
+            }
+            fire_partition_row_triggers(
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch as *mut _,
+                target_table,
+                def,
+                TriggerEvents::INSERT,
+                false,
+                false,
+                ColumnSet::EMPTY,
+                None,
+                Some(&mut row_arr[..def.n_columns]),
+            )?;
+            let logical_values = partition_insert::logical_insert_values(
+                mapping,
+                logical_definition.n_columns,
+                &row_arr[..def.n_columns],
+                arena,
+            )?;
+            if let Some(transition_capture) = transition_capture {
+                transition_capture.push_new(logical_values, arena)?;
+            }
+            let returned = arena
+                .alloc_slice_copy(logical_values)
+                .map_err(|_| super::query::arena_full_pub())?;
+            Ok(Some(&*returned))
+        },
+    )?
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]

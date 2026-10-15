@@ -12735,6 +12735,7 @@ struct VisibilityContext {
     read_snapshot: u32,
     /// Greatest durable commit LSN visible to the running statement.
     commit_snapshot: u64,
+    analyzing: bool,
 }
 
 impl VisibilityContext {
@@ -12742,6 +12743,7 @@ impl VisibilityContext {
         Self {
             read_snapshot: SNAPSHOT_ALL,
             commit_snapshot: u64::MAX,
+            analyzing: false,
         }
     }
 }
@@ -12760,6 +12762,19 @@ fn execution_visibility() -> VisibilityContext {
 
 fn replace_execution_visibility(visibility: VisibilityContext) -> VisibilityContext {
     EXECUTION_VISIBILITY.with(|current| current.replace(visibility))
+}
+
+/// ANALYZE shares one current read position across base and extended scans.
+/// Restore the caller's query snapshot on every exit, on this thread only.
+pub(crate) struct AnalyzeSnapshot {
+    previous: VisibilityContext,
+    thread: core::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for AnalyzeSnapshot {
+    fn drop(&mut self) {
+        replace_execution_visibility(self.previous);
+    }
 }
 
 /// What a relation name resolved to.
@@ -30554,8 +30569,8 @@ impl Storage {
         Ok(count)
     }
 
-    /// Rebuilds planner statistics from the same MVCC-visible row seam every
-    /// query uses. An empty `selected_columns` means every column; otherwise
+    /// Rebuilds statistics from current committed data and all own changes.
+    /// An empty `selected_columns` means every column; otherwise
     /// only the named column statistics are replaced while table cardinality
     /// and row width are always refreshed.
     pub(crate) fn analyze_table(
@@ -30565,6 +30580,7 @@ impl Storage {
         selected_columns: &[usize],
         arena: &crate::mem::arena::Arena,
     ) -> Result<TableStatistics, SqlError> {
+        let _snapshot = self.analyze_snapshot();
         const REGISTERS: usize = 64;
 
         fn add_distinct(registers: &mut [u8; REGISTERS], hash: u64) {
@@ -30635,11 +30651,8 @@ impl Storage {
         // rows absent from that overlay stream below with their payload from
         // the already resident merge cursor, avoiding one object point read
         // per row during cold ANALYZE.
-        let scan = self.row_scan(table_slot)?;
-        let _ = scan.for_each_overlay(&mut |rowid, state| {
-            let Some(home) = self.visible_row_home(table_slot, rowid, state, txid)? else {
-                return Ok(core::ops::ControlFlow::Continue(()));
-            };
+        let scan = self.captured_row_scan_in(table_slot, txid, arena)?;
+        let _ = scan.for_each_overlay(&mut |rowid, home| {
             self.with_row_bytes(table_slot, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
@@ -30648,16 +30661,10 @@ impl Storage {
             })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
-        Self::spill_merged_walk_bytes(
-            &scan.roots,
-            arena,
-            true,
-            None,
-            true,
-            SpillOverlayMode::VisibleScan(&scan.rowids),
-            None,
-            &mut |_rowid, _commit_lsn, representation| {
-                match representation {
+        scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
+            for row in batch {
+                crate::sql::query::check_timeout()?;
+                match row.representation {
                     SpilledRowRepresentation::Encoded(bytes) => {
                         let mut values = [Datum::Null; MAX_COLUMNS];
                         rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
@@ -30667,10 +30674,11 @@ impl Storage {
                         observe(values, rowenc::encoded_len(values));
                     }
                 }
-                Ok(core::ops::ControlFlow::Continue(()))
-            },
-        )?;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
 
+        let analyzed_generation = scan.publication_generation(self, table_slot)?;
         drop(scan);
         let mut statistics = self.table_statistics(table_slot, txid);
         statistics.valid = true;
@@ -30679,7 +30687,7 @@ impl Storage {
             .checked_div(rows)
             .unwrap_or(0)
             .min(u64::from(u32::MAX)) as u32;
-        statistics.analyzed_generation = self.tables[table_slot].generation();
+        statistics.analyzed_generation = analyzed_generation;
         for column in 0..n_columns {
             if !selected[column] {
                 continue;
@@ -47632,6 +47640,21 @@ impl Storage {
         execution_visibility().commit_snapshot
     }
 
+    pub(crate) fn analyze_snapshot(&self) -> AnalyzeSnapshot {
+        let previous = execution_visibility();
+        if !previous.analyzing {
+            replace_execution_visibility(VisibilityContext {
+                read_snapshot: SNAPSHOT_ALL,
+                commit_snapshot: self.lsn(),
+                analyzing: true,
+            });
+        }
+        AnalyzeSnapshot {
+            previous,
+            thread: core::marker::PhantomData,
+        }
+    }
+
     /// Publishes the running statement's durable snapshot to this worker.
     pub fn set_commit_snapshot(&self, snapshot: u64) {
         let mut visibility = execution_visibility();
@@ -53145,6 +53168,7 @@ mod tests {
         let prior = replace_execution_visibility(VisibilityContext {
             read_snapshot: 7,
             commit_snapshot: 13,
+            analyzing: false,
         });
         let child = std::thread::spawn(|| {
             let initial = execution_visibility();
@@ -53153,6 +53177,7 @@ mod tests {
             replace_execution_visibility(VisibilityContext {
                 read_snapshot: 11,
                 commit_snapshot: 17,
+                analyzing: false,
             });
             let changed = execution_visibility();
             assert_eq!(changed.read_snapshot, 11);

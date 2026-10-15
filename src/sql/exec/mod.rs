@@ -46911,6 +46911,7 @@ pub(crate) fn analyze_extended_statistics(
     selected_columns: &[usize],
     arena: &mut Arena,
 ) -> Result<(), SqlError> {
+    let _snapshot = storage.analyze_snapshot();
     use crate::storage::{
         ColumnStatistics, EXTENDED_STATISTICS_MCV_TEXT_MAX, ExtendedStatisticsData,
         ExtendedStatisticsKey, ExtendedStatisticsMcv, MAX_EXTENDED_STATISTICS_KEYS,
@@ -47017,6 +47018,7 @@ pub(crate) fn analyze_extended_statistics(
         {
             continue;
         }
+        let analyzed_generation = storage.table(table).generation();
         arena.reset();
         let mut sql = StackStr::<8192>::new();
         let _ = sql.write_str("SELECT ");
@@ -47243,7 +47245,7 @@ pub(crate) fn analyze_extended_statistics(
         let mut data = ExtendedStatisticsData::EMPTY;
         data.valid = true;
         data.inherited = table_definition.partition.is_partitioned();
-        data.analyzed_generation = storage.table(table).generation();
+        data.analyzed_generation = analyzed_generation;
         data.rows = rows;
         data.non_null_rows = non_null_rows;
         data.distinct_values = distinct_estimate(&full_registers).min(non_null_rows);

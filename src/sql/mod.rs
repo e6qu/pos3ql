@@ -7630,6 +7630,7 @@ impl Engine {
         txn: &mut TxnState,
     ) -> Result<u64, SqlError> {
         self.validate_maintenance_targets(targets, txn.txid)?;
+        let _snapshot = self.storage.analyze_snapshot();
         let mut total_rows = 0u64;
         if targets.is_empty() {
             for slot in 0..self.storage.table_count() {

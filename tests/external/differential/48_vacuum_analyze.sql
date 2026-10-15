@@ -1,10 +1,6 @@
--- VACUUM and ANALYZE. VACUUM reclaims space (a checkpoint/compaction of the
--- LSM when object storage is configured; otherwise nothing to reclaim), and
--- ANALYZE validates its targets and walks the exact live table state used by
--- this planner instead of collecting a stale sampled catalog. Both accept the
--- option and per-table/column forms, and VACUUM is non-transactional (25001)
--- while ANALYZE is not. Matches PostgreSQL 18. The VERBOSE form is omitted: it
--- prints INFO progress this engine does not.
+-- Maintenance preserves data and checks targets and transaction boundaries.
+-- ANALYZE samples current committed rows plus own changes. Relation estimates
+-- remain visible after rollback; column and extended statistics roll back.
 DROP TABLE IF EXISTS vt;
 CREATE TABLE vt (a int, b text);
 INSERT INTO vt VALUES (1, 'x'), (2, 'y');
@@ -54,3 +50,26 @@ ANALYZE vt;
 COMMIT;
 
 DROP TABLE vt;
+
+
+CREATE TABLE analyze_pending (id integer, a integer, b integer, label text);
+INSERT INTO analyze_pending VALUES (1, 1, 1, 'old'), (2, 1, 1, 'old');
+CREATE STATISTICS analyze_pending_ab (ndistinct, dependencies, mcv)
+ON a, b FROM analyze_pending;
+ANALYZE analyze_pending;
+BEGIN;
+SAVEPOINT before_changes;
+UPDATE analyze_pending SET a = 4, b = 4, label = NULL WHERE id = 1;
+DELETE FROM analyze_pending WHERE id = 2;
+INSERT INTO analyze_pending VALUES (3, 4, 4, NULL);
+ANALYZE analyze_pending;
+SELECT reltuples::integer FROM pg_class WHERE oid = 'analyze_pending'::regclass;
+SELECT null_frac = 1 FROM pg_stats
+WHERE tablename = 'analyze_pending' AND attname = 'label';
+ROLLBACK TO SAVEPOINT before_changes;
+SELECT null_frac = 0 FROM pg_stats
+WHERE tablename = 'analyze_pending' AND attname = 'label';
+ANALYZE analyze_pending(label);
+COMMIT;
+SELECT count(*) FROM analyze_pending;
+DROP TABLE analyze_pending;

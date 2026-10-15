@@ -67,6 +67,64 @@ def generated_write_transcript(reader, writer) -> list[str]:
         writer.execute("DROP FUNCTION generated_write_before_diff()")
 
 
+def partition_move_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE move_write_diff(id integer PRIMARY KEY, label text, computed integer GENERATED ALWAYS AS (length(label)) STORED) PARTITION BY RANGE(id)")
+    writer.execute("CREATE TABLE move_low_diff PARTITION OF move_write_diff FOR VALUES FROM (0) TO (10)")
+    writer.execute("CREATE TABLE move_high_diff PARTITION OF move_write_diff FOR VALUES FROM (10) TO (20)")
+    writer.execute("ALTER TABLE move_low_diff ALTER COLUMN computed SET EXPRESSION AS (length(label) + 100)")
+    writer.execute("ALTER TABLE move_high_diff ALTER COLUMN computed SET EXPRESSION AS (length(label) + 200)")
+    writer.execute("CREATE TABLE move_audit_diff(event text, leaf text, id integer, label text, computed integer)")
+    writer.execute("""CREATE FUNCTION move_before_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
+        IF TG_OP = 'DELETE' THEN
+            IF OLD.label = 'SKIP_DELETE' THEN RETURN NULL; END IF;
+            RETURN OLD;
+        ELSIF TG_OP = 'UPDATE' THEN NEW.label := NEW.label || ':U';
+        ELSE
+            IF NEW.label = 'skip_insert:U' THEN RETURN NULL; END IF;
+            NEW.label := upper(NEW.label);
+        END IF;
+        RETURN NEW;
+    END$$""")
+    writer.execute("""CREATE FUNCTION move_after_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
+        IF TG_OP = 'DELETE' THEN INSERT INTO move_audit_diff VALUES (TG_OP, TG_TABLE_NAME, OLD.id, OLD.label, OLD.computed);
+        ELSE INSERT INTO move_audit_diff VALUES (TG_OP, TG_TABLE_NAME, NEW.id, NEW.label, NEW.computed); END IF;
+        RETURN NULL;
+    END$$""")
+    writer.execute("CREATE TRIGGER move_before_diff BEFORE INSERT OR UPDATE OR DELETE ON move_write_diff FOR EACH ROW EXECUTE FUNCTION move_before_diff()")
+    writer.execute("CREATE TRIGGER move_after_diff AFTER INSERT OR UPDATE OR DELETE ON move_write_diff FOR EACH ROW EXECUTE FUNCTION move_after_diff()")
+    writer.execute("INSERT INTO move_write_diff(id, label) VALUES (1, 'first'), (2, 'skip_delete'), (3, 'skip_insert')")
+    writer.execute("TRUNCATE move_audit_diff")
+    results = []
+    try:
+        for label, command in [
+            ("update_move", "UPDATE move_write_diff SET id = 11, label = 'moved' WHERE id = 1 RETURNING id, label, computed"),
+            ("merge_skip_delete", "MERGE INTO move_write_diff t USING (VALUES (2, 12)) AS s(old_id, new_id) ON t.id = s.old_id WHEN MATCHED THEN UPDATE SET id = s.new_id RETURNING t.id, t.label, t.computed"),
+            ("merge_skip_insert", "MERGE INTO move_write_diff t USING (VALUES (3, 13)) AS s(old_id, new_id) ON t.id = s.old_id WHEN MATCHED THEN UPDATE SET id = s.new_id, label = 'skip_insert' RETURNING t.id, t.label, t.computed"),
+            ("same_leaf", "UPDATE move_write_diff SET label = 'same' WHERE id = 11 RETURNING id, label, computed"),
+        ]:
+            cursor = reader.execute(command)
+            changed = cursor.fetchall()
+            rows = reader.execute("SELECT id, label, computed FROM move_write_diff ORDER BY id").fetchall()
+            audit = reader.execute("SELECT event, leaf, id, label, computed FROM move_audit_diff ORDER BY event, id, label").fetchall()
+            results.append(f"{label}=changed:{changed},rows:{rows},audit:{audit}")
+        error = sqlstate(reader, "UPDATE move_high_diff SET id = 1 WHERE id = 11")
+        rows = reader.execute("SELECT id, label, computed FROM move_write_diff ORDER BY id").fetchall()
+        results.append(f"direct_leaf_move={error},rows:{rows}")
+        reader.execute("BEGIN")
+        reader.execute("UPDATE move_write_diff SET id = 1, label = 'rollback' WHERE id = 11")
+        reader.execute("ROLLBACK")
+        rows = reader.execute("SELECT id, label, computed FROM move_write_diff ORDER BY id").fetchall()
+        audit = reader.execute("SELECT event, leaf, id, label, computed FROM move_audit_diff ORDER BY event, id, label").fetchall()
+        results.append(f"move_rollback=rows:{rows},audit:{audit}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE move_write_diff CASCADE")
+        writer.execute("DROP TABLE move_audit_diff")
+        writer.execute("DROP FUNCTION move_before_diff()")
+        writer.execute("DROP FUNCTION move_after_diff()")
+
+
 def merge_write_transcript(reader, writer) -> list[str]:
     writer.execute("CREATE TABLE merge_write_diff(id integer PRIMARY KEY, amount integer)")
     writer.execute("CREATE TABLE merge_reference_diff(id integer REFERENCES merge_write_diff(id) ON UPDATE CASCADE ON DELETE CASCADE)")
@@ -802,7 +860,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + merge_write_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + merge_write_transcript(reader, writer) + partition_move_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

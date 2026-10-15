@@ -675,6 +675,7 @@ fn sql_fail(e: SqlError) -> Outcome {
 
 mod copy_transition;
 mod partition_insert;
+mod partition_update;
 pub(crate) use copy_transition::CopyTransitionRows;
 
 mod describe;
@@ -57452,16 +57453,33 @@ pub(crate) fn merge<'a>(
                                 .copy_from_slice(&physical_new[..row_definition.n_columns]);
                         }
                         new_layout.overlay(&new_values, &mut persisted);
-                        if updated_table != target_tables[j]
-                            && let Err(error) = compute_generated(
+                        if updated_table != target_tables[j] {
+                            match partition_update::prepare_move(
+                                storage,
+                                txn,
+                                selected_rows[j].expect("local MERGE retains selected row"),
+                                row_definition,
+                                target_physical[j],
+                                updated_table,
                                 new_definition,
                                 new_layout.generated,
-                                &mut persisted,
-                                storage,
-                                txn.txid,
+                                &mut persisted[..new_definition.n_columns],
                                 arena,
-                            )
-                        {
+                                params,
+                                seq_session,
+                                responder,
+                                scratch as *mut _,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => break,
+                                Err(error) => return sql_fail(error),
+                            }
+                        } else if let Err(error) = storage.validate_partition_target(
+                            updated_table,
+                            new_definition,
+                            &persisted[..new_definition.n_columns],
+                            txn.txid,
+                        ) {
                             return sql_fail(error);
                         }
                         if let Err(error) = check_not_null(new_definition, &persisted) {
@@ -57524,15 +57542,17 @@ pub(crate) fn merge<'a>(
                                 ));
                             }
                         } else {
-                            match dml_row_available(
-                                storage,
-                                txn,
-                                selected_rows[j].expect("local MERGE retains selected row"),
-                                "updated",
-                            ) {
-                                Ok(true) => {}
-                                Ok(false) => break,
-                                Err(error) => return sql_fail(error),
+                            if updated_table == target_tables[j] {
+                                match dml_row_available(
+                                    storage,
+                                    txn,
+                                    selected_rows[j].expect("local MERGE retains selected row"),
+                                    "updated",
+                                ) {
+                                    Ok(true) => {}
+                                    Ok(false) => break,
+                                    Err(error) => return sql_fail(error),
+                                }
                             }
                             let len = rowenc::encoded_len(&persisted[..new_definition.n_columns]);
                             let out = match arena.alloc_slice_with(len, |_| 0u8) {
@@ -57590,27 +57610,6 @@ pub(crate) fn merge<'a>(
                                     );
                                     return sql_fail(error);
                                 }
-                                let prior = match storage.write_pending(
-                                    target_tables[j],
-                                    target_ids[j],
-                                    txn.txid,
-                                    txn.command_id(),
-                                    None,
-                                ) {
-                                    Ok(prior) => prior,
-                                    Err(error) => return sql_fail(error),
-                                };
-                                if let Err(error) =
-                                    txn.touch(target_tables[j] as u32, target_ids[j], prior)
-                                {
-                                    storage.restore_pending(
-                                        target_tables[j],
-                                        target_ids[j],
-                                        txn.txid,
-                                        prior,
-                                    );
-                                    return sql_fail(error);
-                                }
                             }
                         }
                         if !foreign_target {
@@ -57647,29 +57646,41 @@ pub(crate) fn merge<'a>(
                                 return sql_fail(error);
                             }
                         }
-                        let mut old_for_trigger = [Datum::Null; MAX_COLUMNS];
-                        if updated_table == target_tables[j] {
-                            old_for_trigger[..row_definition.n_columns]
-                                .copy_from_slice(target_physical[j]);
+                        let after = if updated_table != target_tables[j] {
+                            partition_update::fire_after_move(
+                                storage,
+                                txn,
+                                target_tables[j],
+                                row_definition,
+                                target_physical[j],
+                                updated_table,
+                                new_definition,
+                                &mut persisted[..new_definition.n_columns],
+                                arena,
+                                seq_session,
+                                responder,
+                                scratch as *mut _,
+                            )
                         } else {
-                            new_layout.overlay(target_vals[j], &mut old_for_trigger);
-                        }
-                        if let Err(error) = fire_partition_row_triggers(
-                            storage,
-                            txn,
-                            arena,
-                            seq_session,
-                            responder,
-                            scratch as *mut _,
-                            updated_table,
-                            new_definition,
-                            TriggerEvents::UPDATE,
-                            false,
-                            false,
-                            new_layout.column_set(action_update_columns),
-                            Some(&old_for_trigger[..new_definition.n_columns]),
-                            Some(&mut persisted[..new_definition.n_columns]),
-                        ) {
+                            fire_partition_row_triggers(
+                                storage,
+                                txn,
+                                arena,
+                                seq_session,
+                                responder,
+                                scratch as *mut _,
+                                updated_table,
+                                new_definition,
+                                TriggerEvents::UPDATE,
+                                false,
+                                false,
+                                new_layout.column_set(action_update_columns),
+                                Some(target_physical[j]),
+                                Some(&mut persisted[..new_definition.n_columns]),
+                            )
+                            .map(|_| ())
+                        };
+                        if let Err(error) = after {
                             return sql_fail(error);
                         }
                         if let Some(transitions) = update_transitions.as_mut() {
@@ -61060,7 +61071,7 @@ pub(crate) fn update<'a>(
                     {
                         auto_defaults[a] = match next_auto_value(
                             storage,
-                            row_table,
+                            table_index,
                             targets[a],
                             def.columns()[targets[a]].ctype,
                             seq_session,
@@ -61165,7 +61176,7 @@ pub(crate) fn update<'a>(
                     {
                         logical_new[targets[a]] = match next_auto_value(
                             storage,
-                            row_table,
+                            table_index,
                             targets[a],
                             def.columns()[targets[a]].ctype,
                             seq_session,
@@ -61239,16 +61250,6 @@ pub(crate) fn update<'a>(
             drop(expression_snapshot);
             let mut physical_new = physical_old;
             row_layout.overlay(&logical_new, &mut physical_new);
-            if let Err(error) = compute_generated(
-                row_definition,
-                row_layout.generated,
-                &mut physical_new,
-                storage,
-                txn.txid,
-                arena,
-            ) {
-                return sql_fail(error);
-            }
             let old_transition =
                 match detached_trigger_row(&physical_old[..row_definition.n_columns], arena) {
                     Ok(values) => values,
@@ -61371,16 +61372,33 @@ pub(crate) fn update<'a>(
                 persisted[..row_definition.n_columns].copy_from_slice(new_physical);
             }
             new_layout.overlay(new_values, &mut persisted);
-            if target_table != row_table
-                && let Err(error) = compute_generated(
+            if target_table != row_table {
+                match partition_update::prepare_move(
+                    storage,
+                    txn,
+                    scratch[i],
+                    row_definition,
+                    &physical_old[..row_definition.n_columns],
+                    target_table,
                     new_definition,
                     new_layout.generated,
-                    &mut persisted,
-                    storage,
-                    txn.txid,
+                    &mut persisted[..new_definition.n_columns],
                     arena,
-                )
-            {
+                    params,
+                    seq_session,
+                    responder,
+                    scratch as *mut _,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => return sql_fail(error),
+                }
+            } else if let Err(error) = storage.validate_partition_target(
+                target_table,
+                new_definition,
+                &persisted[..new_definition.n_columns],
+                txn.txid,
+            ) {
                 return sql_fail(error);
             }
             let persisted = &persisted[..new_definition.n_columns];
@@ -61397,7 +61415,7 @@ pub(crate) fn update<'a>(
                     ConstraintRow::Validation { excluded: None }
                 } else {
                     ConstraintRow::Stored {
-                        excluded: Some(rowid),
+                        excluded: (target_table == row_table).then_some(rowid),
                         rowid: stored_rowid,
                     }
                 },
@@ -61503,10 +61521,12 @@ pub(crate) fn update<'a>(
             continue;
         }
 
-        match dml_row_available(storage, txn, scratch[i], "updated") {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(error) => return sql_fail(error),
+        if target_table == row_table {
+            match dml_row_available(storage, txn, scratch[i], "updated") {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => return sql_fail(error),
+            }
         }
         let new_loc = match storage.heap.append_bytes(new_bytes) {
             Ok(x) => x,
@@ -61537,15 +61557,6 @@ pub(crate) fn update<'a>(
             };
             if let Err(error) = txn.touch(target_table as u32, inserted_rowid, insert_prior) {
                 storage.restore_pending(target_table, inserted_rowid, txn.txid, insert_prior);
-                return sql_fail(error);
-            }
-            let delete_prior =
-                match storage.write_pending(row_table, rowid, txn.txid, txn.command_id(), None) {
-                    Ok(prior) => prior,
-                    Err(error) => return sql_fail(error),
-                };
-            if let Err(error) = txn.touch(row_table as u32, rowid, delete_prior) {
-                storage.restore_pending(row_table, rowid, txn.txid, delete_prior);
                 return sql_fail(error);
             }
         }
@@ -61607,27 +61618,41 @@ pub(crate) fn update<'a>(
         }
         let mut logical_new = [Datum::Null; MAX_COLUMNS];
         new_layout.project(&new_physical, &mut logical_new);
-        let mut old_for_trigger = physical_old;
-        if target_table != row_table {
-            old_for_trigger = [Datum::Null; MAX_COLUMNS];
-            new_layout.overlay(&logical_old, &mut old_for_trigger);
-        }
-        if let Err(error) = fire_partition_row_triggers(
-            storage,
-            txn,
-            arena,
-            seq_session,
-            responder,
-            scratch as *mut _,
-            target_table,
-            new_definition,
-            TriggerEvents::UPDATE,
-            false,
-            false,
-            new_layout.column_set(updated_columns),
-            Some(&old_for_trigger[..new_definition.n_columns]),
-            Some(&mut new_physical[..new_definition.n_columns]),
-        ) {
+        let after = if target_table != row_table {
+            partition_update::fire_after_move(
+                storage,
+                txn,
+                row_table,
+                row_definition,
+                &physical_old[..row_definition.n_columns],
+                target_table,
+                new_definition,
+                &mut new_physical[..new_definition.n_columns],
+                arena,
+                seq_session,
+                responder,
+                scratch as *mut _,
+            )
+        } else {
+            fire_partition_row_triggers(
+                storage,
+                txn,
+                arena,
+                seq_session,
+                responder,
+                scratch as *mut _,
+                target_table,
+                new_definition,
+                TriggerEvents::UPDATE,
+                false,
+                false,
+                new_layout.column_set(updated_columns),
+                Some(&physical_old[..row_definition.n_columns]),
+                Some(&mut new_physical[..new_definition.n_columns]),
+            )
+            .map(|_| ())
+        };
+        if let Err(error) = after {
             return sql_fail(error);
         }
         if let Some(transition_capture) = transition_capture.as_mut() {

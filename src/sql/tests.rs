@@ -81892,7 +81892,8 @@ fn dml_target_generates_after_before_triggers_and_accepts_upsert_defaults() {
     let config = test_config("dml-target-generated-timing");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
     session.success(&mut engine,
         "CREATE TABLE generated_timing(id integer PRIMARY KEY, seed integer DEFAULT 4, result integer GENERATED ALWAYS AS (100 / seed) STORED); \
          CREATE FUNCTION generated_timing_before() RETURNS trigger LANGUAGE plpgsql AS \
@@ -81958,7 +81959,8 @@ fn dml_target_merge_applies_key_actions_and_rejects_triggered_rewrites() {
     let config = test_config("dml-target-merge-key-actions");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
     session.success(&mut engine,
         "CREATE TABLE merge_key_target(id integer PRIMARY KEY, amount integer); \
          CREATE TABLE merge_key_reference(id integer REFERENCES merge_key_target(id) ON UPDATE CASCADE ON DELETE CASCADE); \

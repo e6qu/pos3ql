@@ -84,10 +84,9 @@ owns the detailed contracts, completed work, and limits.
 
 Still to do:
 
-- Complete reader protection for authoritative metadata walks and remaining
-  executor reads that retain only a version stamp. Sequential SQL byte scans
-  and exports already keep selected versions and their source files. Metadata
-  walks still consult live row state; coordinate their updates and retirement.
+- Keep the original row data for remaining executor paths that still save
+  only a version number. A later reread must keep its source through updates
+  and maintenance.
 - Extend partition attachment and all write paths to reordered physical
   columns; keep the current explicit rejection until those paths agree.
 - Finish shared-state protection for table creation/removal and engine-wide

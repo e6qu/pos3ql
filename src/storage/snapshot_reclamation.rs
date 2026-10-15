@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn snapshot_reclamation_allows_unrelated_publication_while_another_table_waits() {
         for mode in 0..3 {
-            let (storage, first, second) = fixture();
+            let (mut storage, first, second) = fixture();
             let reader = if mode == 2 {
                 Some(storage.retain_statement_snapshot(99, |lsn| lsn).unwrap())
             } else {

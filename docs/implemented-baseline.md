@@ -135,10 +135,10 @@ changes select bytes through the retained metadata owner, including after
 heap relocation. Saved-row rereads and commit key encoding also use the
 captured byte owner. Commit publication validates the pending version and uses
 its current location if reclamation moved it. Current row versions within the
-same table remain visible to authoritative walks. Reader cleanup holds shared
-registry and row/version guards for at most 64 captured row identities at a
-time. It rechecks current readers before each batch. Cleanup waiting for another
-table's row map holds neither the registry nor the shared version pool. New
+same table remain visible to authoritative walks. History deletion holds the registry and shared version guards for at most
+64 captured row identities at a time. One brief row-map read copies each table's
+identities before its batches begin. It rechecks current readers before each batch. Capturing the next table's identities holds neither the registry nor the
+shared version pool while waiting for its row map. New
 statement admission coalesces cleanup already in progress and leaves later
 release notifications pending for the next attempt.
 

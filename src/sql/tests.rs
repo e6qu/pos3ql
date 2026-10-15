@@ -6928,6 +6928,18 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         "{}",
         String::from_utf8_lossy(&lock)
     );
+    let table_locks = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT mode, granted, pid IS NULL FROM pg_locks \
+         WHERE locktype='relation' AND relation='durable_prepared'::regclass AND mode='RowExclusiveLock'",
+    );
+    assert_eq!(
+        data_rows(&table_locks),
+        ["RowExclusiveLock|t|t"],
+        "{}",
+        String::from_utf8_lossy(&table_locks)
+    );
     let view_locks = run_with(
         &mut recovered,
         &mut recovered_budget,

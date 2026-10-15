@@ -982,6 +982,17 @@ def rule_publication_transcript(reader, writer) -> list[str]:
             reader.execute("SELECT * FROM rule_publication_diff")
             results.append(f"rule_existing_reader_{label}=" + str(sqlstate(writer, statement)))
             reader.execute("ROLLBACK")
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM rule_publication_view_diff")
+        view_locks = reader.execute("SELECT mode, database=(SELECT oid FROM pg_database WHERE datname=current_database()) FROM pg_locks WHERE pid=pg_backend_pid() AND relation='rule_publication_view_diff'::regclass ORDER BY mode").fetchall()
+        results.append(f"rule_view_lock_identity={view_locks}")
+        for label, statement in [
+            ("replace", "CREATE OR REPLACE VIEW rule_publication_view_diff AS SELECT id FROM rule_publication_diff"),
+            ("rename", "ALTER VIEW rule_publication_view_diff RENAME TO renamed_view"),
+            ("drop", "DROP VIEW rule_publication_view_diff"),
+        ]:
+            results.append(f"view_existing_reader_{label}=" + str(sqlstate(writer, statement)))
+        reader.execute("ROLLBACK")
         return results
     finally:
         reader.execute("ROLLBACK")

@@ -47812,6 +47812,24 @@ impl Storage {
             .register(transaction_id, self.current_connection_id())
     }
 
+    /// Recovery must never attach a prepared transaction to the caller's
+    /// thread-local frontend identity.
+    pub(crate) fn begin_prepared_transaction_identity(
+        &self,
+        transaction_id: u32,
+    ) -> Result<(), SqlError> {
+        let mut identities = self.transaction_identity_state();
+        if identities.active.iter().any(|identity| {
+            identity.transaction_id == transaction_id && identity.connection_id.is_some()
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "recovered prepared identity belongs to a connection"
+            ));
+        }
+        identities.register(transaction_id, 0)
+    }
+
     fn transaction_wait_owner(&self, transaction_id: u32) -> crate::sql::lock::WaitOwner {
         self.transaction_identity_state()
             .active
@@ -50885,9 +50903,10 @@ impl Storage {
             .identity
             .existence
             .pending_txid()
-            .or_else(|| state.pending.map(|head| head.transaction))
-            .or(state.pending_has_rules_txid)
-            .filter(|&owner| owner != txid);
+            .into_iter()
+            .chain(state.pending.map(|head| head.transaction))
+            .chain(state.pending_has_rules_txid)
+            .find(|&owner| owner != txid);
         if let Some(owner) = other {
             let name = state.committed.name;
             drop(state);
@@ -56323,6 +56342,63 @@ mod tests {
     }
 
     #[test]
+    fn relation_publication_recovered_identity_never_belongs_to_a_connection() {
+        let mut config = test_config();
+        config.max_connections = 1;
+        config.max_prepared_transactions = 1;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let previous = crate::sql::execution_connection_id();
+        crate::sql::set_execution_connection_id(42);
+        crate::mem::guard::forbid_alloc(|| {
+            storage.begin_prepared_transaction_identity(7).unwrap();
+            storage
+                .lock_relation(
+                    7,
+                    RelationLockTarget::View(0),
+                    crate::sql::ast::TableLockMode::AccessShare,
+                    false,
+                )
+                .unwrap();
+            storage.visit_table_locks(|_, owner, _, _| {
+                assert_eq!(crate::sql::lock::wait_owner_pid(owner), None)
+            });
+            let ordinary = storage.start_transaction_identity().unwrap();
+            assert_eq!(ordinary, 8);
+            assert_eq!(
+                storage
+                    .begin_prepared_transaction_identity(ordinary)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(
+                storage.transaction_wait_owner(ordinary),
+                crate::sql::lock::connection_wait_owner(42)
+            );
+            assert_eq!(
+                storage
+                    .begin_prepared_transaction_identity(9)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.latest_transaction_identity(), 8);
+            assert_eq!(
+                storage
+                    .begin_prepared_transaction_identity(0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            storage.release_table_locks(7);
+            storage.finish_transaction_identity(7, false);
+            storage.finish_transaction_identity(ordinary, false);
+        });
+        crate::sql::set_execution_connection_id(previous);
+    }
+
+    #[test]
     fn relation_publication_rule_history_rejects_foreign_owners_and_restores_savepoints() {
         let config = test_config();
         let mut budget = test_budget(&config);
@@ -56431,7 +56507,10 @@ mod tests {
     #[test]
     fn relation_publication_table_and_view_slots_are_distinct_and_bounded() {
         use crate::sql::ast::TableLockMode;
-        let config = test_config();
+        let mut config = test_config();
+        config.max_connections = 2;
+        config.max_prepared_transactions = 0;
+        config.max_views = 2;
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {

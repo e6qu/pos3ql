@@ -19133,7 +19133,7 @@ fn replay_transaction_batches(
                     .slot_mut(slot)
                     .transaction
                     .restore_prepared_identity(transaction_id);
-                storage.begin_transaction_identity(transaction_id)?;
+                storage.begin_prepared_transaction_identity(transaction_id)?;
                 storage.assign_transaction_identity(transaction_id);
                 storage.select_database_for_recovery(database)?;
                 for (record_lsn, raw) in &batch[..batch.len() - 1] {

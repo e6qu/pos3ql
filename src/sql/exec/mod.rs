@@ -4045,7 +4045,6 @@ fn copy_comment_if_present(
     stage_comment(storage, wal, txn, target, Some(text.as_str()))
 }
 
-/// Upper bound on the secondary indexes one `LIKE ... INCLUDING INDEXES` copies.
 /// The next value of a serial/identity column: a real sequence, as PostgreSQL
 /// has it. Explicit inserts do not advance it, deletes and TRUNCATE do not
 /// rewind it, and the advance survives a rollback (a consumed number stays

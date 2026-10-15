@@ -114,6 +114,119 @@ def partition_index_validation_transcript(reader, writer) -> list[str]:
         writer.execute("DROP TABLE partition_index_diff CASCADE")
 
 
+def constraint_validation_transcript(reader, writer) -> list[str]:
+    results = []
+    cases = [
+        (
+            "check", "CREATE TABLE constraint_current(id integer, value integer)",
+            "INSERT INTO constraint_current VALUES (3, -1)",
+            "ALTER TABLE constraint_current ADD CONSTRAINT positive CHECK (value > 0)",
+        ),
+        (
+            "not_null", "CREATE TABLE constraint_current(id integer, value integer)",
+            "INSERT INTO constraint_current VALUES (3, NULL)",
+            "ALTER TABLE constraint_current ALTER COLUMN value SET NOT NULL",
+        ),
+        (
+            "unique", "CREATE TABLE constraint_current(id integer, value integer)",
+            "INSERT INTO constraint_current VALUES (3, 30), (4, 30)",
+            "ALTER TABLE constraint_current ADD CONSTRAINT distinct_value UNIQUE (value)",
+        ),
+        (
+            "foreign_key", "CREATE TABLE constraint_current(id integer, value integer)",
+            "INSERT INTO constraint_current VALUES (3, 99)",
+            "ALTER TABLE constraint_current ADD CONSTRAINT known_value FOREIGN KEY (value) REFERENCES constraint_parent(id)",
+        ),
+    ]
+    writer.execute("DROP TABLE IF EXISTS constraint_current CASCADE")
+    writer.execute("DROP TABLE IF EXISTS constraint_parent CASCADE")
+    writer.execute("CREATE TABLE constraint_parent(id integer PRIMARY KEY)")
+    writer.execute("INSERT INTO constraint_parent VALUES (10), (20)")
+    try:
+        for label, setup, change, command in cases:
+            writer.execute(setup)
+            writer.execute("INSERT INTO constraint_current VALUES (1, 10), (2, 20)")
+            reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            before = reader.execute("SELECT count(*) FROM constraint_current").fetchone()[0]
+            writer.execute(change)
+            reader.execute("SAVEPOINT before_validation")
+            error = sqlstate(reader, command)
+            reader.execute("ROLLBACK TO SAVEPOINT before_validation")
+            after = reader.execute("SELECT count(*) FROM constraint_current").fetchone()[0]
+            results.append(f"constraint_{label}={error},before:{before},after:{after}")
+            reader.execute("ROLLBACK")
+            writer.execute("DROP TABLE constraint_current CASCADE")
+        for label, change, definition in [
+            ("validate_check", "INSERT INTO constraint_current VALUES (3, -1)", "CHECK (value > 0)"),
+            ("validate_fk", "INSERT INTO constraint_current VALUES (3, 99)", "FOREIGN KEY (value) REFERENCES constraint_parent(id)"),
+        ]:
+            writer.execute("CREATE TABLE constraint_current(id integer, value integer)")
+            writer.execute("INSERT INTO constraint_current VALUES (1, 10), (2, 20)")
+            reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            before = reader.execute("SELECT count(*) FROM constraint_current").fetchone()[0]
+            writer.execute(change)
+            reader.execute(f"ALTER TABLE constraint_current ADD CONSTRAINT pending_validation {definition} NOT VALID")
+            reader.execute("SAVEPOINT before_validation")
+            error = sqlstate(reader, "ALTER TABLE constraint_current VALIDATE CONSTRAINT pending_validation")
+            reader.execute("ROLLBACK TO SAVEPOINT before_validation")
+            after = reader.execute("SELECT count(*) FROM constraint_current").fetchone()[0]
+            valid = reader.execute("SELECT convalidated FROM pg_constraint WHERE conname = 'pending_validation'").fetchone()[0]
+            results.append(f"constraint_{label}={error},before:{before},after:{after},valid:{valid}")
+            reader.execute("ROLLBACK")
+            writer.execute("DROP TABLE constraint_current CASCADE")
+        writer.execute("CREATE TABLE constraint_current(id integer, value integer)")
+        writer.execute("INSERT INTO constraint_current VALUES (1, 10), (2, 20)")
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        before = reader.execute("SELECT count(*) FROM constraint_current").fetchone()[0]
+        writer.execute("INSERT INTO constraint_parent VALUES (30)")
+        writer.execute("INSERT INTO constraint_current VALUES (3, 30)")
+        reader.execute("SAVEPOINT before_validation")
+        error = sqlstate(reader, "ALTER TABLE constraint_current ADD CONSTRAINT current_parent FOREIGN KEY (value) REFERENCES constraint_parent(id)")
+        reader.execute("ROLLBACK TO SAVEPOINT before_validation")
+        after = reader.execute("SELECT count(*) FROM constraint_current").fetchone()[0]
+        results.append(f"constraint_current_parent={error},before:{before},after:{after}")
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE constraint_current")
+        for label, change, command in [
+            ("domain_check", "INSERT INTO constraint_current VALUES (3, -1)", "ALTER DOMAIN constraint_domain ADD CONSTRAINT domain_positive CHECK (VALUE > 0)"),
+            ("domain_not_null", "INSERT INTO constraint_current VALUES (3, NULL)", "ALTER DOMAIN constraint_domain SET NOT NULL"),
+        ]:
+            writer.execute("CREATE DOMAIN constraint_domain AS integer")
+            writer.execute("CREATE TABLE constraint_current(id integer, value constraint_domain)")
+            writer.execute("INSERT INTO constraint_current VALUES (1, 10), (2, 20)")
+            reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            before = reader.execute("SELECT count(*) FROM constraint_current").fetchone()[0]
+            writer.execute(change)
+            reader.execute("SAVEPOINT before_validation")
+            error = sqlstate(reader, command)
+            reader.execute("ROLLBACK TO SAVEPOINT before_validation")
+            after = reader.execute("SELECT count(*) FROM constraint_current").fetchone()[0]
+            results.append(f"constraint_{label}={error},before:{before},after:{after}")
+            reader.execute("ROLLBACK")
+            writer.execute("DROP TABLE constraint_current")
+            writer.execute("DROP DOMAIN constraint_domain")
+        writer.execute("CREATE TABLE constraint_partition(id integer) PARTITION BY RANGE (id)")
+        writer.execute("CREATE TABLE constraint_current(id integer)")
+        writer.execute("INSERT INTO constraint_current VALUES (1)")
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        before = reader.execute("SELECT count(*) FROM constraint_current").fetchone()[0]
+        writer.execute("INSERT INTO constraint_current VALUES (99)")
+        reader.execute("SAVEPOINT before_validation")
+        error = sqlstate(reader, "ALTER TABLE constraint_partition ATTACH PARTITION constraint_current FOR VALUES FROM (0) TO (10)")
+        reader.execute("ROLLBACK TO SAVEPOINT before_validation")
+        after = reader.execute("SELECT count(*) FROM constraint_current").fetchone()[0]
+        results.append(f"constraint_partition={error},before:{before},after:{after}")
+        reader.execute("ROLLBACK")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        writer.execute("DROP TABLE IF EXISTS constraint_current CASCADE")
+        writer.execute("DROP TABLE IF EXISTS constraint_partition CASCADE")
+        writer.execute("DROP TABLE IF EXISTS constraint_parent CASCADE")
+        writer.execute("DROP DOMAIN IF EXISTS constraint_domain CASCADE")
+
+
 def analyze_snapshot_transcript(reader, writer) -> list[str]:
     writer.execute("DROP TABLE IF EXISTS analyze_snapshot_diff CASCADE")
     writer.execute("CREATE TABLE analyze_snapshot_diff (id integer, a integer, b integer, label text)")
@@ -207,7 +320,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

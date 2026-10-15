@@ -53824,6 +53824,68 @@ fn bool_aggregates() {
 }
 
 #[test]
+fn constraint_validation_checks_current_commits_without_changing_repeatable_read() {
+    let config = test_config("constraint-current-snapshot");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    writer.success(&mut engine,
+        "CREATE TABLE validation_parent(id integer PRIMARY KEY); INSERT INTO validation_parent VALUES (10), (20)", true);
+    for (change, definition, error) in [
+        (
+            "INSERT INTO validation_current VALUES (3, -1)",
+            "ADD CONSTRAINT validation_rule CHECK (value > 0)",
+            "23514",
+        ),
+        (
+            "INSERT INTO validation_current VALUES (3, NULL)",
+            "ALTER COLUMN value SET NOT NULL",
+            "23502",
+        ),
+        (
+            "INSERT INTO validation_current VALUES (3, 30), (4, 30)",
+            "ADD CONSTRAINT validation_rule UNIQUE (value)",
+            "23505",
+        ),
+        (
+            "INSERT INTO validation_current VALUES (3, 99)",
+            "ADD CONSTRAINT validation_rule FOREIGN KEY (value) REFERENCES validation_parent(id)",
+            "23503",
+        ),
+    ] {
+        writer.success(&mut engine,
+            "CREATE TABLE validation_current(id integer, value integer); INSERT INTO validation_current VALUES (1, 10), (2, 20)", true);
+        reader.success(&mut engine, "BEGIN ISOLATION LEVEL REPEATABLE READ", true);
+        assert_eq!(
+            data_rows(&reader.success(
+                &mut engine,
+                "SELECT count(*) FROM validation_current",
+                true
+            )),
+            ["2"]
+        );
+        writer.success(&mut engine, change, true);
+        reader.success(&mut engine, "SAVEPOINT before_validation", true);
+        let failed = reader.execute(
+            &mut engine,
+            &format!("ALTER TABLE validation_current {definition}"),
+            true,
+        );
+        assert!(
+            failed.windows(5).any(|field| field == error.as_bytes()),
+            "{definition}: {}",
+            String::from_utf8_lossy(&failed)
+        );
+        reader.success(&mut engine, "ROLLBACK TO SAVEPOINT before_validation", true);
+        assert_eq!(data_rows(&reader.success(&mut engine,
+            "SELECT count(*) FROM validation_current; SELECT count(*) FROM pg_constraint WHERE conname = 'validation_rule'", true)), ["2", "0"]);
+        reader.success(&mut engine, "ROLLBACK", true);
+        writer.success(&mut engine, "DROP TABLE validation_current", true);
+    }
+}
+
+#[test]
 fn partition_index_validation_checks_own_changes_rollback_and_cold_recovery() {
     let mut config = test_config("partition-index-validation");
     config.object_store_on = true;

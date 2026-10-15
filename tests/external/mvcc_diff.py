@@ -982,6 +982,7 @@ def rule_publication_transcript(reader, writer) -> list[str]:
             reader.execute("SELECT * FROM rule_publication_diff")
             results.append(f"rule_existing_reader_{label}=" + str(sqlstate(writer, statement)))
             reader.execute("ROLLBACK")
+        reader.execute("CREATE RULE stable_view_rule AS ON INSERT TO rule_publication_view_diff DO INSTEAD NOTHING")
         reader.execute("BEGIN")
         reader.execute("SELECT * FROM rule_publication_view_diff")
         view_locks = reader.execute("SELECT mode, database=(SELECT oid FROM pg_database WHERE datname=current_database()) FROM pg_locks WHERE pid=pg_backend_pid() AND relation='rule_publication_view_diff'::regclass ORDER BY mode").fetchall()
@@ -990,6 +991,7 @@ def rule_publication_transcript(reader, writer) -> list[str]:
             ("replace", "CREATE OR REPLACE VIEW rule_publication_view_diff AS SELECT id FROM rule_publication_diff"),
             ("rename", "ALTER VIEW rule_publication_view_diff RENAME TO renamed_view"),
             ("drop", "DROP VIEW rule_publication_view_diff"),
+            ("disable-rule", "ALTER TABLE rule_publication_view_diff DISABLE RULE stable_view_rule"),
         ]:
             results.append(f"view_existing_reader_{label}=" + str(sqlstate(writer, statement)))
         reader.execute("ROLLBACK")

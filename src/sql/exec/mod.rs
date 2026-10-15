@@ -37566,6 +37566,14 @@ fn alter_table_rule_enabled(
     emit_completion: bool,
     tag: &'static str,
 ) -> Outcome {
+    if let Err(error) = storage.lock_relation(
+        txn.txid,
+        target.into(),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let Some(slot) = storage.rule_slot(target, name, txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,

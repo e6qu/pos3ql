@@ -105,3 +105,44 @@ ORDER BY conname;
 DROP TABLE constraint_drop_child, constraint_drop_parent,
   constraint_enforcement_child, constraint_enforcement_parent,
   constraint_lifecycle_child, constraint_lifecycle_parent;
+
+-- Validation includes earlier changes and tables created by this transaction.
+CREATE DOMAIN validation_amount AS integer;
+CREATE TABLE validation_parent(id integer PRIMARY KEY);
+INSERT INTO validation_parent VALUES (1), (2);
+CREATE TABLE validation_orders(id integer, parent_id integer, value validation_amount);
+INSERT INTO validation_orders VALUES (1, 1, 10), (2, 2, 20);
+BEGIN;
+SAVEPOINT before_validation;
+UPDATE validation_orders SET value = -1 WHERE id = 2;
+ALTER TABLE validation_orders ADD CONSTRAINT valid_amount CHECK (value > 0);
+ROLLBACK TO SAVEPOINT before_validation;
+INSERT INTO validation_orders VALUES (3, 99, 30);
+ALTER TABLE validation_orders ADD CONSTRAINT valid_parent
+FOREIGN KEY (parent_id) REFERENCES validation_parent(id);
+ROLLBACK TO SAVEPOINT before_validation;
+UPDATE validation_orders SET value = NULL WHERE id = 2;
+ALTER DOMAIN validation_amount SET NOT NULL;
+ROLLBACK TO SAVEPOINT before_validation;
+CREATE TABLE validation_extra(value validation_amount);
+INSERT INTO validation_extra VALUES (-1);
+ALTER DOMAIN validation_amount ADD CONSTRAINT positive_domain CHECK (VALUE > 0);
+ROLLBACK TO SAVEPOINT before_validation;
+SELECT count(*) FROM pg_constraint
+WHERE conname IN ('valid_amount', 'valid_parent', 'positive_domain');
+UPDATE validation_orders SET value = 30 WHERE id = 2;
+INSERT INTO validation_parent VALUES (3);
+INSERT INTO validation_orders VALUES (3, 3, 40);
+ALTER TABLE validation_orders ADD CONSTRAINT valid_amount CHECK (value > 0);
+ALTER TABLE validation_orders ADD CONSTRAINT valid_parent
+FOREIGN KEY (parent_id) REFERENCES validation_parent(id);
+ALTER DOMAIN validation_amount SET NOT NULL;
+ALTER DOMAIN validation_amount ADD CONSTRAINT positive_domain CHECK (VALUE > 0);
+COMMIT;
+SELECT id, parent_id, value FROM validation_orders ORDER BY id;
+INSERT INTO validation_orders VALUES (4, 1, NULL);
+INSERT INTO validation_orders VALUES (4, 1, -1);
+INSERT INTO validation_orders VALUES (4, 99, 1);
+DROP TABLE validation_orders;
+DROP TABLE validation_parent;
+DROP DOMAIN validation_amount;

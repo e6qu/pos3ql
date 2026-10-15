@@ -1530,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_and_index_sources_keep_latest_saved_and_own_pending_rows_after_retirement() {
+    fn constraint_validation_and_analyze_sources_keep_current_rows_after_retirement() {
         use super::super::RowState;
         use super::super::row_images::VisibleRowBytes;
         use crate::sql::types::Datum;
@@ -1570,6 +1570,10 @@ mod tests {
                 let _snapshot = storage.analyze_snapshot();
                 storage.captured_row_scan_in(table, 11, &arena).unwrap()
             };
+            let validation = storage
+                .validation_read()
+                .scan_in(&storage, table, 11, &arena)
+                .unwrap();
             let captured_generation = storage.tables[table].generation();
             storage.tables[table].publication().generation += 1;
             assert_eq!(
@@ -1623,12 +1627,24 @@ mod tests {
             registry.copy_roots(false, &mut retained).unwrap();
             assert_eq!(retained.len(), 2);
             assert!(retained.contains(&roots[0]) && retained.contains(&roots[1]));
-            for source in [&scan, &analysis] {
+            for source in [&scan, &analysis, &validation] {
                 let mut found = [(0, 0); 3];
                 let mut count = 0;
                 assert!(
                     source
                         .for_each_home(&mut |rowid, home| {
+                            let snapshot = home.snapshot();
+                            let reread = source.read_snapshot(rowid, snapshot)?;
+                            if rowid == 1 {
+                                let mut older = snapshot;
+                                older.version =
+                                    super::super::row_images::RowVersionIdentity::Committed(7);
+                                assert_eq!(
+                                    source.read_snapshot(rowid, older).err().unwrap().sqlstate,
+                                    sqlstate::SERIALIZATION_FAILURE
+                                );
+                            }
+                            drop(home);
                             let mut decode = |bytes: &[u8]| {
                                 let mut values = [Datum::Null];
                                 crate::storage::rowenc::decode(
@@ -1643,7 +1659,7 @@ mod tests {
                                 count += 1;
                                 Ok(())
                             };
-                            match home.bytes {
+                            match reread.bytes {
                                 VisibleRowBytes::Heap(bytes) => decode(&bytes)?,
                                 VisibleRowBytes::Spilled(source) => source.with_bytes(decode)?,
                             }
@@ -1658,6 +1674,7 @@ mod tests {
             }
             drop(scan);
             drop(analysis);
+            drop(validation);
             registry.copy_roots(false, &mut retained).unwrap();
             assert!(retained.is_empty());
         });

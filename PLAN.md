@@ -43,7 +43,9 @@ machine do not establish production availability or speed.
   tables. A table-form export reads only its named relation; the query form
   selects a complete partition or inheritance tree.
 - A report and a uniqueness check can need different views of the same rows.
-  Keeping a report stable must not let an index miss a later committed duplicate.
+  Keeping a report stable must not let an index miss a later committed duplicate. A new
+  table CHECK can inspect current rows while a STABLE SQL function inside that
+  check still sees the transaction's earlier data.
 - A safe storage layout needs to keep older versions until every reader and
   backup has finished with them. Copying only today's logical rows is not
   sufficient when an older transaction still needs historical object data.
@@ -76,6 +78,9 @@ failure cleanup. Validation reuses its fixed buffer between rows and tables;
 unread bytes keep their original owners.
 ANALYZE retains original row sources and uses one current read position for base
 and extended statistics, restoring the caller's query snapshot on every exit.
+Table and domain constraints validate current committed and own changes through
+retained sources without changing ordinary query snapshots. Partition attachment
+streams its validation rows, and schema rewrites fetch original captured bytes.
 
 The [implementation guide](docs/implemented-baseline.md) owns the detailed
 contracts and limits; this sequence keeps the remaining acceptance gates.

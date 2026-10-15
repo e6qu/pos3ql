@@ -2529,6 +2529,12 @@ fn build_partitioned_table_def(
             subpartition,
         } => {
             let parent_slot = resolve_dml_table(storage, &parent, txid)?;
+            storage.lock_table(
+                txid,
+                parent_slot,
+                crate::sql::ast::TableLockMode::AccessExclusive,
+                false,
+            )?;
             let parent_def = *storage.table_def(parent_slot, txid);
             let child_is_temporary =
                 statement.persistence == crate::sql::ast::RelationPersistence::Temporary;
@@ -2608,6 +2614,7 @@ fn build_partitioned_table_def(
                 arena,
             )?;
             validate_partition_bound(storage, parent_slot, resolved_bound, txid)?;
+            validate_default_partition_rows(storage, parent_slot, resolved_bound, txid, arena)?;
             def.partition = PartitionDef::child(
                 u16::try_from(parent_slot)
                     .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many tables"))?,
@@ -2932,6 +2939,96 @@ fn validate_partition_bound(
             storage.table_def(parent, txid).name.as_str(),
             storage.table_def(slot, txid).name.as_str()
         ));
+    }
+    Ok(())
+}
+
+/// Adding a bound also narrows the default partition's allowed rows. Lock its
+/// tree before scanning; no current row may silently acquire the wrong home.
+fn validate_default_partition_rows(
+    storage: &Storage,
+    parent: usize,
+    bound: StoredPartitionBound,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if matches!(bound, StoredPartitionBound::Default) {
+        return Ok(());
+    }
+    let parent_def = *storage.table_def(parent, txid);
+    let scheme = parent_def
+        .partition
+        .scheme
+        .expect("partition parent has a scheme");
+    for default in 0..storage.table_count() {
+        if !storage.table(default).visible_to(txid) {
+            continue;
+        }
+        let definition = *storage.table_def(default, txid);
+        if !definition.partition.attachment.is_some_and(|attachment| {
+            usize::from(attachment.parent) == parent
+                && attachment.state.routable()
+                && matches!(attachment.bound, StoredPartitionBound::Default)
+        }) {
+            continue;
+        }
+        for candidate in 0..storage.table_count() {
+            if storage.table(candidate).visible_to(txid)
+                && (candidate == default
+                    || storage.partition_descends_from(candidate, default, txid))
+            {
+                storage.lock_table(
+                    txid,
+                    candidate,
+                    crate::sql::ast::TableLockMode::AccessExclusive,
+                    false,
+                )?;
+            }
+        }
+        let read = storage.validation_read();
+        for candidate in 0..storage.table_count() {
+            if !storage.table(candidate).visible_to(txid)
+                || storage
+                    .table_def(candidate, txid)
+                    .partition
+                    .is_partitioned()
+                || !(candidate == default
+                    || storage.partition_descends_from(candidate, default, txid))
+            {
+                continue;
+            }
+            let physical = *storage.table_def(candidate, txid);
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            physical.schema(&mut schema);
+            // SAFETY: bound comparison consumes each row and returns only an
+            // owned error; no front-arena or row value escapes.
+            unsafe {
+                constraints::for_each_validation_row(
+                    storage,
+                    candidate,
+                    txid,
+                    read,
+                    &schema[..physical.n_columns],
+                    arena,
+                    &mut |_, values| {
+                        if crate::storage::partition_bound_matches(
+                            scheme.strategy,
+                            scheme.keys,
+                            scheme.n_keys,
+                            bound,
+                            values,
+                        )? {
+                            return Err(sql_err!(
+                                sqlstate::CHECK_VIOLATION,
+                                "updated partition constraint for default partition \"{}\" would be violated by some row",
+                                definition.name.as_str()
+                            ));
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -3948,7 +4045,6 @@ fn copy_comment_if_present(
     stage_comment(storage, wal, txn, target, Some(text.as_str()))
 }
 
-/// Upper bound on the secondary indexes one `LIKE ... INCLUDING INDEXES` copies.
 /// The next value of a serial/identity column: a real sequence, as PostgreSQL
 /// has it. Explicit inserts do not advance it, deletes and TRUNCATE do not
 /// rewind it, and the advance survives a rollback (a consumed number stays
@@ -41140,8 +41236,12 @@ fn validate_domain_rows(
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    for (table_index, table) in storage.live_tables() {
-        let def = *table.definition();
+    let read = storage.validation_read();
+    for table_index in 0..storage.table_count() {
+        if !storage.table(table_index).visible_to(txid) {
+            continue;
+        }
+        let def = *storage.table_def(table_index, txid);
         let mut affected = [false; MAX_COLUMNS];
         let mut any = false;
         for (column_index, column) in def.columns().iter().enumerate() {
@@ -41153,47 +41253,51 @@ fn validate_domain_rows(
             else {
                 continue;
             };
-            if !domain_depends_on(storage, domain_slot, target, txid) {
-                continue;
+            if domain_depends_on(storage, domain_slot, target, txid) {
+                affected[column_index] = true;
+                any = true;
             }
-            affected[column_index] = true;
-            any = true;
         }
         if !any {
             continue;
         }
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         def.schema(&mut schema);
-        storage.for_each_row_state(table_index, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(home) = storage.visible_row_home(table_index, rowid, state, txid)? else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
-            for column_index in 0..def.n_columns {
-                if !affected[column_index] {
-                    continue;
-                }
-                let identity = def.columns()[column_index]
-                    .user_type
-                    .expect("affected domain");
-                let leaf = storage
-                    .domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .expect("affected domain remains visible");
-                validate_stored_domain_value(
-                    storage,
-                    leaf,
-                    validation,
-                    def.columns()[column_index].ctype,
-                    values[column_index],
-                    txid,
-                    arena,
-                )?;
-            }
-            Ok(ControlFlow::Continue(()))
-        })?;
+        // SAFETY: validation consumes domain coercion results within the row;
+        // only an owned error or success escapes the callback.
+        unsafe {
+            constraints::for_each_validation_row(
+                storage,
+                table_index,
+                txid,
+                read,
+                &schema[..def.n_columns],
+                arena,
+                &mut |_, values| {
+                    for column_index in 0..def.n_columns {
+                        if !affected[column_index] {
+                            continue;
+                        }
+                        let identity = def.columns()[column_index]
+                            .user_type
+                            .expect("affected domain");
+                        let leaf = storage
+                            .domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                            .expect("affected domain remains visible");
+                        validate_stored_domain_value(
+                            storage,
+                            leaf,
+                            validation,
+                            def.columns()[column_index].ctype,
+                            values[column_index],
+                            txid,
+                            arena,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
     }
     Ok(())
 }
@@ -61463,11 +61567,6 @@ pub(crate) fn truncate(
     sql_ok()
 }
 
-/// ALTER TABLE, autocommit-only: rewrites are journaled as DROP, CREATE,
-/// full re-UPSERT within one WAL batch, so replay reproduces the new
-/// shape atomically. Two-phase in memory: all new row images are prepared
-/// first, then the definition and row map swap; a failure part-way leaves
-/// the table untouched (only heap bytes leak until compaction).
 /// Whether `ALTER COLUMN ... TYPE` may cast `from` to `to` without a `USING`
 /// clause — i.e. PostgreSQL has an assignment (or implicit) cast for the pair.
 /// Mirrors `pg_cast` (castcontext in {'a','i'}) over this engine's types, plus
@@ -61527,10 +61626,8 @@ fn alter_type_auto_castable(from: ColType, to: ColType) -> bool {
     )
 }
 
-/// Validates every committed row against a table's whole constraint set, for
-/// ALTER TABLE ADD CONSTRAINT — the just-added constraint is the only one that
-/// can fail, and its violation surfaces with the same SQLSTATE the INSERT path
-/// would give (23514 CHECK, 23505 UNIQUE, 23503 FK, 23502 the PK's NOT NULL).
+/// Validates stored rows against a proposed definition using current committed
+/// and own changes. Ordinary queries retain their transaction snapshot.
 fn validate_all_rows(
     storage: &Storage,
     table_index: usize,
@@ -61539,6 +61636,7 @@ fn validate_all_rows(
     arena: &Arena,
     include_descendants: bool,
 ) -> Result<(), SqlError> {
+    let read = storage.validation_read();
     let mut validated = *new_def;
     for check in &mut validated.checks[..validated.n_checks] {
         if !check.validation.validated() {
@@ -61552,7 +61650,8 @@ fn validate_all_rows(
     }
     let new_def = &validated;
     let checks = parse_checks(new_def, arena)?;
-    let mut result = Ok(());
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    new_def.schema(&mut schema);
     for candidate in 0..storage.table_count() {
         let selected = if include_descendants && storage.relation_has_descendants(table_index, txid)
         {
@@ -61569,75 +61668,55 @@ fn validate_all_rows(
         if !selected {
             continue;
         }
-        storage.for_each_row_state(candidate, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(home) = storage.visible_row_home_at(
+        let physical = *storage.table_def(candidate, txid);
+        let mut physical_schema = [ColType::Bool; MAX_COLUMNS];
+        physical.schema(&mut physical_schema);
+        // SAFETY: parsed checks precede the scan; only an owned validation
+        // result escapes each row, including inherited-column mapping.
+        unsafe {
+            constraints::for_each_validation_row(
+                storage,
                 candidate,
-                rowid,
-                state,
                 txid,
-                crate::storage::SNAPSHOT_ALL,
-                storage.commit_snapshot(),
-            )?
-            else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            let physical = *storage.table_def(candidate, txid);
-            let mut physical_schema = [ColType::Bool; MAX_COLUMNS];
-            physical.schema(&mut physical_schema);
-            let bytes = storage.row_bytes(candidate, rowid, home, arena)?;
-            let mut physical_values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(
-                bytes,
+                read,
                 &physical_schema[..physical.n_columns],
-                &mut physical_values,
-            )?;
-            // An ordinary child may have local columns interleaved with later
-            // parent additions. Constraints inherited from `new_def` therefore
-            // bind by the durable column name, never by physical position.
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            for (index, column) in new_def.columns().iter().enumerate() {
-                let source = physical.column_index(column.name.as_str()).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "inherited row is missing column \"{}\"",
-                        column.name.as_str()
+                arena,
+                &mut |rowid, physical_values| {
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    for (index, column) in new_def.columns().iter().enumerate() {
+                        let source =
+                            physical.column_index(column.name.as_str()).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "inherited row is missing column \"{}\"",
+                                    column.name.as_str()
+                                )
+                            })?;
+                        values[index] = physical_values[source];
+                    }
+                    let values = &values[..new_def.n_columns];
+                    check_not_null(new_def, values)?;
+                    enforce_row_constraints(
+                        storage,
+                        candidate,
+                        new_def,
+                        &schema[..new_def.n_columns],
+                        values,
+                        ConstraintRow::Existing {
+                            excluded: Some(rowid),
+                            read,
+                        },
+                        txid,
+                        None,
+                        &checks,
+                        arena,
+                        &[],
                     )
-                })?;
-                values[index] = physical_values[source];
-            }
-            let values = &values[..new_def.n_columns];
-            let mut schema = [ColType::Bool; MAX_COLUMNS];
-            new_def.schema(&mut schema);
-            let schema = &schema[..new_def.n_columns];
-            let check = check_not_null(new_def, values).and_then(|()| {
-                enforce_row_constraints(
-                    storage,
-                    candidate,
-                    new_def,
-                    schema,
-                    values,
-                    ConstraintRow::Validation {
-                        excluded: Some(rowid),
-                    },
-                    txid,
-                    None,
-                    &checks,
-                    arena,
-                    &[],
-                )
-            });
-            if let Err(error) = check {
-                result = Err(error);
-                return Ok(ControlFlow::Break(()));
-            }
-            Ok(ControlFlow::Continue(()))
-        })?;
-        if result.is_err() {
-            break;
+                },
+            )?;
         }
     }
-    result
+    Ok(())
 }
 
 /// Removes a named constraint from `def` for ALTER TABLE DROP CONSTRAINT:
@@ -63224,7 +63303,7 @@ fn alter_partition_attachment(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    scratch: &mut DmlScratch,
+    _scratch: &mut DmlScratch,
     request: PartitionAttachmentRequest<'_>,
     arena: &Arena,
     responder: &mut Responder,
@@ -63336,7 +63415,12 @@ fn alter_partition_attachment(
         if let Err(error) = validate_partition_bound(storage, parent, resolved, txn.txid) {
             return sql_fail(error);
         }
-        scratch.clear();
+        if let Err(error) =
+            validate_default_partition_rows(storage, parent, resolved, txn.txid, arena)
+        {
+            return sql_fail(error);
+        }
+        let read = storage.validation_read();
         let leaves = match arena.alloc_slice_with(storage.table_count(), |_| usize::MAX) {
             Ok(leaves) => leaves,
             Err(_) => return sql_fail(arena_full()),
@@ -63345,95 +63429,57 @@ fn alter_partition_attachment(
             Ok(count) => count,
             Err(error) => return sql_fail(error),
         };
-        for &leaf in &leaves[..leaf_count] {
-            let mut overflow = false;
-            if let Err(error) = storage.for_each_row_state(leaf, &mut |rowid, state| {
-                use core::ops::ControlFlow;
-                let Some(home) = storage.visible_row_home_at(
-                    leaf,
-                    rowid,
-                    state,
-                    txn.txid,
-                    crate::storage::SNAPSHOT_ALL,
-                    storage.commit_snapshot(),
-                )?
-                else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                if scratch
-                    .push(PhysicalRow::local(leaf, rowid, home.snapshot()))
-                    .is_err()
-                {
-                    overflow = true;
-                    return Ok(ControlFlow::Break(()));
-                }
-                Ok(ControlFlow::Continue(()))
-            }) {
-                return sql_fail(error);
-            }
-            if overflow {
-                return sql_fail(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "partition validation exceeds the DDL row budget"
-                ));
-            }
-        }
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        parent_def.schema(&mut schema);
         if let Err(error) = validate_all_rows(storage, child, &new_def, txn.txid, arena, true) {
             return sql_fail(error);
         }
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        parent_def.schema(&mut schema);
         let parent_checks = match parse_checks(&parent_def, arena) {
             Ok(checks) => checks,
             Err(error) => return sql_fail(error),
         };
-        for row in scratch.iter() {
-            let (row_table, rowid, home) = (*row).local_parts();
-            let bytes = match storage.row_bytes(row_table, rowid, home, arena) {
-                Ok(bytes) => bytes,
-                Err(error) => return sql_fail(error),
+        for &leaf in &leaves[..leaf_count] {
+            // SAFETY: checks precede capture; bound and constraint validation
+            // return only owned errors and retain no row or scratch values.
+            let validation = unsafe {
+                constraints::for_each_validation_row(
+                    storage,
+                    leaf,
+                    txn.txid,
+                    read,
+                    &schema[..parent_def.n_columns],
+                    arena,
+                    &mut |rowid, values| {
+                        if !storage.partition_attachment_accepts(
+                            parent, child, resolved, values, txn.txid,
+                        )? {
+                            return Err(sql_err!(
+                                sqlstate::CHECK_VIOLATION,
+                                "partition constraint of relation \"{}\" is violated by some row",
+                                child_def.name.as_str()
+                            ));
+                        }
+                        check_not_null(&parent_def, values)?;
+                        enforce_row_constraints(
+                            storage,
+                            parent,
+                            &parent_def,
+                            &schema[..parent_def.n_columns],
+                            values,
+                            ConstraintRow::Existing {
+                                excluded: Some(rowid),
+                                read,
+                            },
+                            txn.txid,
+                            None,
+                            &parent_checks,
+                            arena,
+                            &[],
+                        )
+                    },
+                )
             };
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            if let Err(error) = rowenc::decode(bytes, &schema[..parent_def.n_columns], &mut values)
-            {
-                return sql_fail(error);
-            }
-            match storage.partition_attachment_accepts(
-                parent,
-                child,
-                resolved,
-                &values[..parent_def.n_columns],
-                txn.txid,
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return sql_fail(sql_err!(
-                        sqlstate::CHECK_VIOLATION,
-                        "partition constraint of relation \"{}\" is violated by some row",
-                        child_def.name.as_str()
-                    ));
-                }
-                Err(error) => return sql_fail(error),
-            }
-            if let Err(error) = check_not_null(&parent_def, &values[..parent_def.n_columns])
-                .and_then(|()| {
-                    enforce_row_constraints(
-                        storage,
-                        parent,
-                        &parent_def,
-                        &schema[..parent_def.n_columns],
-                        &values[..parent_def.n_columns],
-                        ConstraintRow::Validation {
-                            excluded: Some(rowid),
-                        },
-                        txn.txid,
-                        Some(txn),
-                        &parent_checks,
-                        arena,
-                        &[],
-                    )
-                })
-            {
+            if let Err(error) = validation {
                 return sql_fail(error);
             }
         }
@@ -64802,35 +64848,32 @@ fn alter_table_relation(
         return sql_ok();
     }
 
-    // Collect every committed row up front: the row count decides whether an
+    // Collect current committed and own row identities: the count decides whether an
     // added NOT NULL column needs a fill (a spilled table has rows even when
     // the overlay map has evicted them, so `rows.is_empty()` cannot answer
     // this), and the same list drives the rewrite below.
+    let ddl_read = storage.validation_read();
     scratch.clear();
     {
         let mut overflow = false;
-        if let Err(error) = storage.for_each_row_state(table_index, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(loc) = storage.visible_row_home_at(
-                table_index,
-                rowid,
-                state,
-                txn.txid,
-                crate::storage::SNAPSHOT_ALL,
-                storage.commit_snapshot(),
-            )?
-            else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            if scratch
-                .push(PhysicalRow::local(table_index, rowid, loc.snapshot()))
-                .is_err()
-            {
-                overflow = true;
-                return Ok(ControlFlow::Break(()));
-            }
-            Ok(ControlFlow::Continue(()))
-        }) {
+        if let Err(error) =
+            ddl_read.for_each_row_state(storage, table_index, &mut |rowid, state| {
+                use core::ops::ControlFlow;
+                let Some(loc) =
+                    ddl_read.visible_row_home(storage, table_index, rowid, state, txn.txid)?
+                else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                if scratch
+                    .push(PhysicalRow::local(table_index, rowid, loc.snapshot()))
+                    .is_err()
+                {
+                    overflow = true;
+                    return Ok(ControlFlow::Break(()));
+                }
+                Ok(ControlFlow::Continue(()))
+            })
+        {
             return sql_fail(error);
         }
         if overflow {
@@ -65761,6 +65804,7 @@ fn alter_table_relation(
                                     &new_def,
                                     &candidate,
                                     txn.txid,
+                                    arena,
                                 )
                             {
                                 return sql_fail(error);
@@ -65872,6 +65916,7 @@ fn alter_table_relation(
                                 &new_def,
                                 &foreign_key,
                                 txn.txid,
+                                arena,
                             )
                         {
                             return sql_fail(error);
@@ -66026,6 +66071,14 @@ fn alter_table_relation(
 
     let has_rewrite = added_any || dropped_any || retyped_any || generated_changed;
     let rewritten_rows = if has_rewrite { scratch.len() } else { 0 };
+    let original_rows = if has_rewrite {
+        match ddl_read.scan_in(storage, table_index, txn.txid, arena) {
+            Ok(rows) => Some(rows),
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
 
     let mut old_schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut old_schema);
@@ -66083,7 +66136,18 @@ fn alter_table_relation(
             // Build the new image in the statement arena so the heap borrow
             // (decoded text refs) ends before the heap append.
             let new_bytes: &[u8] = {
-                let old_bytes = match storage.row_bytes(table_index, rowid, old_home, arena) {
+                let crate::storage::RowReadSource::Snapshot(snapshot) = old_home else {
+                    unreachable!("rewrite input is an original stored row")
+                };
+                let home = match original_rows
+                    .as_ref()
+                    .expect("rewrite retains its source")
+                    .read_snapshot(rowid, snapshot)
+                {
+                    Ok(home) => home,
+                    Err(error) => return sql_fail(error),
+                };
+                let old_bytes = match storage.row_bytes(table_index, rowid, home, arena) {
                     Ok(b) => b,
                     Err(e) => return sql_fail(e),
                 };
@@ -66177,6 +66241,7 @@ fn alter_table_relation(
                     arena,
                     &[],
                     txn.txid,
+                    ddl_read,
                 ) {
                     return sql_fail(e);
                 }

@@ -14,7 +14,63 @@ pub(crate) struct CapturedRowScan<'arena> {
     generation: u64,
 }
 
+/// One current committed position for validation, independent of the
+/// transaction's query snapshot. Earlier own changes remain visible.
+#[derive(Clone, Copy)]
+pub(crate) struct ValidationRead {
+    commit_lsn: u64,
+}
+
+impl ValidationRead {
+    pub(crate) fn scan_in<'arena>(
+        self,
+        storage: &Storage,
+        table: usize,
+        txid: u32,
+        arena: &'arena Arena,
+    ) -> Result<CapturedRowScan<'arena>, SqlError> {
+        storage.capture_byte_scan(table, txid, super::SNAPSHOT_ALL, self.commit_lsn, arena)
+    }
+
+    pub(crate) fn for_each_row_state(
+        self,
+        storage: &Storage,
+        table: usize,
+        each: &mut super::RowReadVisitor<'_>,
+    ) -> Result<(), SqlError> {
+        let scan = storage.metadata_row_scan_at(table, self.commit_lsn)?;
+        if scan.for_each_overlay(each)?.is_continue() {
+            scan.for_each_spilled_state(each)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn visible_row_home(
+        self,
+        storage: &Storage,
+        table: usize,
+        rowid: u64,
+        state: RowRead<'_>,
+        txid: u32,
+    ) -> Result<Option<VisibleRowHome>, SqlError> {
+        storage.visible_row_home_at(
+            table,
+            rowid,
+            state,
+            txid,
+            super::SNAPSHOT_ALL,
+            self.commit_lsn,
+        )
+    }
+}
+
 impl Storage {
+    pub(crate) fn validation_read(&self) -> ValidationRead {
+        ValidationRead {
+            commit_lsn: self.lsn(),
+        }
+    }
+
     pub(crate) fn captured_row_scan_in<'arena>(
         &self,
         table_slot: usize,
@@ -110,6 +166,31 @@ impl Storage {
 }
 
 impl<'source_arena> CapturedRowScan<'source_arena> {
+    pub(crate) fn read_snapshot(
+        &self,
+        rowid: u64,
+        snapshot: super::RowSnapshot,
+    ) -> Result<VisibleRowHome, SqlError> {
+        let Ok(index) = self.rows.binary_search_by_key(&rowid, |row| row.rowid) else {
+            return self.source.read_saved_snapshot(rowid, snapshot);
+        };
+        let home = self.source.read_record(self.rows[index])?.ok_or_else(|| {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "captured row is invisible in its original source"
+            )
+        })?;
+        if home.snapshot().created_at != snapshot.created_at
+            || home.snapshot().version != snapshot.version
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "captured row has a different table or version"
+            ));
+        }
+        Ok(home)
+    }
+
     pub(super) fn publication_generation(
         &self,
         storage: &Storage,
@@ -285,6 +366,18 @@ mod tests {
                     .for_each_overlay(&mut |rowid, home| {
                         assert_eq!(rowid, expected[at].0);
                         assert_eq!(home.snapshot().version, versions[at]);
+                        let snapshot = home.snapshot();
+                        let reread = scan.read_snapshot(rowid, snapshot).unwrap();
+                        let VisibleRowBytes::Heap(original) = reread.bytes else {
+                            panic!("retained rewrite source is heap-backed")
+                        };
+                        assert_eq!(&*original, expected[at].1);
+                        let mut replaced = snapshot;
+                        replaced.created_at = replaced.created_at.wrapping_add(1);
+                        assert_eq!(
+                            scan.read_snapshot(rowid, replaced).err().unwrap().sqlstate,
+                            sqlstate::SERIALIZATION_FAILURE
+                        );
                         let VisibleRowBytes::Heap(bytes) = home.bytes else {
                             panic!("heap fixture")
                         };

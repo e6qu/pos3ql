@@ -16,9 +16,74 @@ use crate::sql::eval::{
 use crate::sql::txn::TxnState;
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{MAX_COLUMNS, Storage, TableDef, rowenc};
+use crate::storage::{MAX_COLUMNS, Storage, TableDef, ValidationRead, rowenc};
 
 use super::{RowCtx, check_not_null};
+
+type ValidationRowVisitor<'callback> =
+    dyn for<'row> FnMut(u64, &'row [Datum<'row>]) -> Result<(), SqlError> + 'callback;
+
+/// Streams the current rows through retained byte owners and reuses validation
+/// scratch between rows and tables.
+///
+/// # Safety
+///
+/// The callback must not retain front-arena allocations or row values. Its
+/// expression and output state must precede this call's arena mark.
+pub(super) unsafe fn for_each_validation_row(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    read: ValidationRead,
+    schema: &[ColType],
+    arena: &Arena,
+    each: &mut ValidationRowVisitor<'_>,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let result = (|| {
+        let scan = read.scan_in(storage, table, txid, arena)?;
+        let mut validate = |rowid, values: &[Datum<'_>]| {
+            crate::sql::query::check_timeout()?;
+            let row_mark = arena.mark();
+            let result = each(rowid, values);
+            // SAFETY: the callback contract excludes references into this suffix.
+            unsafe { arena.rewind_to(row_mark) };
+            result
+        };
+        let flow = scan.for_each_overlay(&mut |rowid, home| {
+            storage.with_row_bytes(table, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut values)?;
+                validate(rowid, &values[..schema.len()])
+            })?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        if flow.is_break() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "constraint validation stopped before completing the scan"
+            ));
+        }
+        scan.for_each_spilled_row_batch(arena, true, None, &mut |rows| {
+            for row in rows {
+                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                let values = match row.representation {
+                    crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                        rowenc::decode(bytes, schema, &mut decoded)?;
+                        &decoded[..schema.len()]
+                    }
+                    crate::storage::SpilledRowRepresentation::Values(values) => values,
+                };
+                validate(row.rowid, values)?;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })
+    })();
+    // SAFETY: every row callback and retained scan has ended; only owned errors
+    // or success escape. Persistent tail allocations are preserved.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
 
 /// A one-column lookup binding PostgreSQL's `VALUE` placeholder to a domain's
 /// candidate input, for evaluating that domain's CHECK predicates.
@@ -548,24 +613,26 @@ fn enforce_expression_index_uniqueness<'a>(
             &other_keys[..columns.len()],
         )
     };
-    storage.for_each_row_state(table_index, &mut |rowid, state| {
-        use core::ops::ControlFlow;
-        if Some(rowid) == self_rowid {
-            return Ok(ControlFlow::Continue(()));
-        }
-        let Some(home) = storage.uniqueness_row_home(table_index, rowid, state, txid)? else {
-            return Ok(ControlFlow::Continue(()));
-        };
-        let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
-            let mut other = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut other)?;
-            matches(&other)
+    storage
+        .validation_read()
+        .for_each_row_state(storage, table_index, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            if Some(rowid) == self_rowid {
+                return Ok(ControlFlow::Continue(()));
+            }
+            let Some(home) = storage.uniqueness_row_home(table_index, rowid, state, txid)? else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+                let mut other = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut other)?;
+                matches(&other)
+            })?;
+            if matched {
+                return Err(unique_violation(def, name));
+            }
+            Ok(ControlFlow::Continue(()))
         })?;
-        if matched {
-            return Err(unique_violation(def, name));
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
     storage.for_each_pending_row_change(table_index, &mut |rowid, pending, image| {
         use core::ops::ControlFlow;
         if Some(rowid) == self_rowid {
@@ -736,24 +803,26 @@ fn committed_scan_uniqueness(
     def: &TableDef,
     name: &ConstraintName,
 ) -> Result<(), SqlError> {
-    storage.for_each_row_state(table_index, &mut |rowid, state| {
-        use core::ops::ControlFlow;
-        if Some(rowid) == self_rowid {
-            return Ok(ControlFlow::Continue(()));
-        }
-        let Some(home) = storage.uniqueness_row_home(table_index, rowid, state, txid)? else {
-            return Ok(ControlFlow::Continue(()));
-        };
-        let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
-            let mut other = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut other)?;
-            key_equal(storage, def, columns, values, &other, nulls_not_distinct)
+    storage
+        .validation_read()
+        .for_each_row_state(storage, table_index, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            if Some(rowid) == self_rowid {
+                return Ok(ControlFlow::Continue(()));
+            }
+            let Some(home) = storage.uniqueness_row_home(table_index, rowid, state, txid)? else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+                let mut other = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut other)?;
+                key_equal(storage, def, columns, values, &other, nulls_not_distinct)
+            })?;
+            if matched {
+                return Err(unique_violation(def, name));
+            }
+            Ok(ControlFlow::Continue(()))
         })?;
-        if matched {
-            return Err(unique_violation(def, name));
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
     Ok(())
 }
 
@@ -837,24 +906,26 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 && key_equal(storage, def, columns, values, other, nulls_not_distinct)?,
         )
     };
-    storage.for_each_row_state(table_index, &mut |rowid, state| {
-        use core::ops::ControlFlow;
-        if Some(rowid) == self_rowid {
-            return Ok(ControlFlow::Continue(()));
-        }
-        let Some(home) = storage.uniqueness_row_home(table_index, rowid, state, txid)? else {
-            return Ok(ControlFlow::Continue(()));
-        };
-        let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
-            let mut other = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut other)?;
-            matches(&other)
+    storage
+        .validation_read()
+        .for_each_row_state(storage, table_index, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            if Some(rowid) == self_rowid {
+                return Ok(ControlFlow::Continue(()));
+            }
+            let Some(home) = storage.uniqueness_row_home(table_index, rowid, state, txid)? else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+                let mut other = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut other)?;
+                matches(&other)
+            })?;
+            if matched {
+                return Err(unique_violation(def, name));
+            }
+            Ok(ControlFlow::Continue(()))
         })?;
-        if matched {
-            return Err(unique_violation(def, name));
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
     storage.for_each_pending_row_change(table_index, &mut |rowid, pending, image| {
         use core::ops::ControlFlow;
         if Some(rowid) == self_rowid {
@@ -1376,8 +1447,17 @@ pub(crate) fn parse_generated<'a>(
 /// when an update moves to another partition. Validation publishes no row.
 #[derive(Clone, Copy)]
 pub(crate) enum ConstraintRow {
-    Stored { excluded: Option<u64>, rowid: u64 },
-    Validation { excluded: Option<u64> },
+    Stored {
+        excluded: Option<u64>,
+        rowid: u64,
+    },
+    Validation {
+        excluded: Option<u64>,
+    },
+    Existing {
+        excluded: Option<u64>,
+        read: ValidationRead,
+    },
 }
 
 impl ConstraintRow {
@@ -1397,14 +1477,23 @@ impl ConstraintRow {
 
     fn excluded(self) -> Option<u64> {
         match self {
-            Self::Stored { excluded, .. } | Self::Validation { excluded } => excluded,
+            Self::Stored { excluded, .. }
+            | Self::Validation { excluded }
+            | Self::Existing { excluded, .. } => excluded,
         }
     }
 
     pub(crate) fn stored(self) -> Option<u64> {
         match self {
             Self::Stored { rowid, .. } => Some(rowid),
-            Self::Validation { .. } => None,
+            Self::Validation { .. } | Self::Existing { .. } => None,
+        }
+    }
+
+    fn validation_read(self) -> Option<ValidationRead> {
+        match self {
+            Self::Existing { read, .. } => Some(read),
+            Self::Stored { .. } | Self::Validation { .. } => None,
         }
     }
 }
@@ -1527,13 +1616,14 @@ pub(crate) fn check_row_content(
     arena: &Arena,
     params: &[Datum],
     txid: u32,
+    read: ValidationRead,
 ) -> Result<(), SqlError> {
     check_not_null(def, values)?;
     check_index_tuple_sizes(storage, def, values, txid, arena)?;
     check_detached_partition_bound(def, values)?;
     check_row_checks(storage, def, checks, values, txid, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;
-    check_fk_child(storage, def, values, txid)?;
+    check_fk_child(storage, def, values, txid, read)?;
     Ok(())
 }
 
@@ -1607,41 +1697,16 @@ fn check_fk_child(
     def: &TableDef,
     values: &[Datum],
     txid: u32,
+    read: ValidationRead,
 ) -> Result<(), SqlError> {
     for fk in def.fkeys() {
-        if !fk.validation.enforced() {
-            continue;
-        }
-        if fk.columns().iter().any(|&c| values[c as usize].is_null()) {
-            continue;
-        }
-        let Some(pi) = storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
-        else {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::FOREIGN_KEY_VIOLATION,
-                "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
-                def.name.as_str(),
-                fk.name.as_str()
-            ));
-        };
-        let pdef = *storage.table_def(pi, txid);
-        let mut pschema = [ColType::Bool; MAX_COLUMNS];
-        pdef.schema(&mut pschema);
-        if !parent_has_key(
-            storage,
-            pi,
-            &pschema[..pdef.n_columns],
-            fk.parent_cols(),
-            fk.columns(),
-            values,
-            txid,
-        )? {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::FOREIGN_KEY_VIOLATION,
-                "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
-                def.name.as_str(),
-                fk.name.as_str()
-            ));
+        if fk.validation.enforced()
+            && !fk
+                .columns()
+                .iter()
+                .any(|&column| values[column as usize].is_null())
+        {
+            check_fk_child_one_at(storage, def, fk, values, txid, Some(read))?;
         }
     }
     Ok(())
@@ -1720,6 +1785,7 @@ fn check_or_defer_exclusions(
             exclusion,
             expressions[crate::storage::MAX_CHECKS + index],
             arena,
+            row.validation_read(),
         )?;
     }
     Ok(())
@@ -1737,6 +1803,7 @@ fn enforce_exclusion_constraint(
     exclusion: &crate::storage::ExclusionConstraint,
     predicate: Option<&Expr>,
     arena: &Arena,
+    read: Option<ValidationRead>,
 ) -> Result<(), SqlError> {
     let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
@@ -1760,12 +1827,16 @@ fn enforce_exclusion_constraint(
     if !predicate_holds(values)? {
         return Ok(());
     }
-    storage.for_each_row_state(table_index, &mut |rowid, state| {
+    let mut visit = |rowid: u64, state: crate::storage::RowRead<'_>| {
         use core::ops::ControlFlow;
         if self_rowid == Some(rowid) {
             return Ok(ControlFlow::Continue(()));
         }
-        let Some(home) = storage.visible_row_home(table_index, rowid, state, txid)? else {
+        let home = match read {
+            Some(read) => read.visible_row_home(storage, table_index, rowid, state, txid)?,
+            None => storage.visible_row_home(table_index, rowid, state, txid)?,
+        };
+        let Some(home) = home else {
             return Ok(ControlFlow::Continue(()));
         };
         let conflicts = storage.with_row_bytes(table_index, rowid, home, |bytes| {
@@ -1808,7 +1879,11 @@ fn enforce_exclusion_constraint(
             ));
         }
         Ok(ControlFlow::Continue(()))
-    })?;
+    };
+    match read {
+        Some(read) => read.for_each_row_state(storage, table_index, &mut visit)?,
+        None => storage.for_each_row_state(table_index, &mut visit)?,
+    }
     Ok(())
 }
 
@@ -1838,7 +1913,7 @@ fn check_or_defer_fk_child(
             transaction.defer_constraint(identity, rowid)?;
             continue;
         }
-        check_fk_child_one(storage, def, fk, values, txid)?;
+        check_fk_child_one_at(storage, def, fk, values, txid, row.validation_read())?;
     }
     Ok(())
 }
@@ -1849,6 +1924,17 @@ fn check_fk_child_one(
     fk: &crate::storage::ForeignKey,
     values: &[Datum],
     txid: u32,
+) -> Result<(), SqlError> {
+    check_fk_child_one_at(storage, def, fk, values, txid, None)
+}
+
+fn check_fk_child_one_at(
+    storage: &Storage,
+    def: &TableDef,
+    fk: &crate::storage::ForeignKey,
+    values: &[Datum],
+    txid: u32,
+    read: Option<ValidationRead>,
 ) -> Result<(), SqlError> {
     let Some(parent_index) =
         storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
@@ -1871,6 +1957,7 @@ fn check_fk_child_one(
         fk.columns(),
         values,
         txid,
+        read,
     )? {
         Ok(())
     } else {
@@ -1981,6 +2068,7 @@ pub(crate) fn validate_constraint_obligation(
                     &exclusion,
                     predicate,
                     arena,
+                    None,
                 )?;
             }
             Ok(())
@@ -2019,37 +2107,40 @@ pub(crate) fn validate_foreign_key_constraint(
     definition: &TableDef,
     foreign_key: &crate::storage::ForeignKey,
     txid: u32,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
+    let read = storage.validation_read();
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
-    let schema = &schema[..definition.n_columns];
     constraint_row_tables(storage, table_index, txid, |row_table| {
-        storage.for_each_row_state(row_table, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(home) = storage.visible_row_home(row_table, rowid, state, txid)? else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            storage.with_row_bytes(row_table, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut values)?;
-                if foreign_key
-                    .columns()
-                    .iter()
-                    .any(|&column| values[column as usize].is_null())
-                {
-                    return Ok(());
-                }
-                check_fk_child_one(
-                    storage,
-                    definition,
-                    foreign_key,
-                    &values[..definition.n_columns],
-                    txid,
-                )
-            })?;
-            Ok(ControlFlow::Continue(()))
-        })?;
-        Ok(())
+        // SAFETY: the callback returns only an owned validation result.
+        unsafe {
+            for_each_validation_row(
+                storage,
+                row_table,
+                txid,
+                read,
+                &schema[..definition.n_columns],
+                arena,
+                &mut |_, values| {
+                    if foreign_key
+                        .columns()
+                        .iter()
+                        .any(|&column| values[column as usize].is_null())
+                    {
+                        return Ok(());
+                    }
+                    check_fk_child_one_at(
+                        storage,
+                        definition,
+                        foreign_key,
+                        values,
+                        txid,
+                        Some(read),
+                    )
+                },
+            )
+        }
     })
 }
 
@@ -2061,6 +2152,7 @@ pub(crate) fn validate_check_constraint(
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    let read = storage.validation_read();
     let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
     let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
@@ -2069,37 +2161,38 @@ pub(crate) fn validate_check_constraint(
     };
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
-    let schema = &schema[..definition.n_columns];
     constraint_row_tables(storage, table_index, txid, |row_table| {
-        storage.for_each_row_state(row_table, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(home) = storage.visible_row_home(row_table, rowid, state, txid)? else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            storage.with_row_bytes(row_table, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut values)?;
-                let context = RowCtx {
-                    def: definition,
-                    values: &values[..definition.n_columns],
-                    alias: None,
-                };
-                if matches!(
-                    eval_full(expression, arena, &[], &context, &hooks)?,
-                    Datum::Bool(false)
-                ) {
-                    return Err(sql_err!(
-                        sqlstate::CHECK_VIOLATION,
-                        "check constraint \"{}\" of relation \"{}\" is violated by some row",
-                        check.name.as_str(),
-                        definition.name.as_str()
-                    ));
-                }
-                Ok(())
-            })?;
-            Ok(ControlFlow::Continue(()))
-        })?;
-        Ok(())
+        // SAFETY: the expression and hooks precede the scan. Its callback
+        // consumes every evaluated value before returning an owned result.
+        unsafe {
+            for_each_validation_row(
+                storage,
+                row_table,
+                txid,
+                read,
+                &schema[..definition.n_columns],
+                arena,
+                &mut |_, values| {
+                    let context = RowCtx {
+                        def: definition,
+                        values,
+                        alias: None,
+                    };
+                    if matches!(
+                        eval_full(expression, arena, &[], &context, &hooks)?,
+                        Datum::Bool(false)
+                    ) {
+                        return Err(sql_err!(
+                            sqlstate::CHECK_VIOLATION,
+                            "check constraint \"{}\" of relation \"{}\" is violated by some row",
+                            check.name.as_str(),
+                            definition.name.as_str()
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+        }
     })
 }
 
@@ -2348,39 +2441,54 @@ fn parent_has_key(
     child_cols: &[u16],
     child_values: &[Datum],
     txid: u32,
+    read: Option<ValidationRead>,
 ) -> Result<bool, SqlError> {
-    let parent_definition = storage.table_def(parent_index, txid);
+    let parent_definition = *storage.table_def(parent_index, txid);
     let mut found = false;
-    storage.for_each_row_state(parent_index, &mut |rowid, state| {
-        use core::ops::ControlFlow;
-        let Some(home) = storage.visible_row_home(parent_index, rowid, state, txid)? else {
-            return Ok(ControlFlow::Continue(()));
-        };
-        let all_eq = storage.with_row_bytes(parent_index, rowid, home, |bytes| {
-            let mut prow = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, parent_schema, &mut prow)?;
-            for (&parent_column, &child_column) in parent_cols.iter().zip(child_cols) {
-                let parent = &prow[parent_column as usize];
-                let child = &child_values[child_column as usize];
-                if parent.is_null()
-                    || !compare_datums_collated(
-                        storage,
-                        parent_definition.columns()[parent_column as usize].collation,
-                        child,
-                        parent,
-                    )?
-                    .is_eq()
-                {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        })?;
-        if all_eq {
-            found = true;
-            return Ok(ControlFlow::Break(()));
+    constraint_row_tables(storage, parent_index, txid, |row_table| {
+        if found {
+            return Ok(());
         }
-        Ok(ControlFlow::Continue(()))
+        let mut visit = |rowid: u64, state: crate::storage::RowRead<'_>| {
+            use core::ops::ControlFlow;
+            let home = match read {
+                Some(read) => read.visible_row_home(storage, row_table, rowid, state, txid)?,
+                None => storage.visible_row_home(row_table, rowid, state, txid)?,
+            };
+            let Some(home) = home else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let all_eq = storage.with_row_bytes(row_table, rowid, home, |bytes| {
+                let mut prow = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, parent_schema, &mut prow)?;
+                for (&parent_column, &child_column) in parent_cols.iter().zip(child_cols) {
+                    let parent = &prow[parent_column as usize];
+                    let child = &child_values[child_column as usize];
+                    if parent.is_null()
+                        || !compare_datums_collated(
+                            storage,
+                            parent_definition.columns()[parent_column as usize].collation,
+                            child,
+                            parent,
+                        )?
+                        .is_eq()
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
+            if all_eq {
+                found = true;
+                return Ok(ControlFlow::Break(()));
+            }
+            Ok(ControlFlow::Continue(()))
+        };
+        match read {
+            Some(read) => read.for_each_row_state(storage, row_table, &mut visit)?,
+            None => storage.for_each_row_state(row_table, &mut visit)?,
+        }
+        Ok(())
     })?;
     Ok(found)
 }
@@ -2430,7 +2538,7 @@ pub(crate) fn apply_fk_parent_actions(
             if !fk.validation.enforced() {
                 continue;
             }
-            if fk.parent_schema.as_str() != parent_schema || fk.parent.as_str() != parent_name {
+            if !references_parent(storage, &fk, parent_schema, parent_name, txn.txid) {
                 continue;
             }
             // An update triggers this key's action only when the key changed.
@@ -2716,6 +2824,32 @@ pub(crate) fn apply_fk_parent_actions(
     Ok(())
 }
 
+/// A key referencing a partitioned relation also protects mutations directed
+/// at one of its leaves. Ordinary inheritance does not extend REFERENCES.
+fn references_parent(
+    storage: &Storage,
+    foreign_key: &crate::storage::ForeignKey,
+    schema: &str,
+    name: &str,
+    txid: u32,
+) -> bool {
+    if foreign_key.parent_schema.as_str() == schema && foreign_key.parent.as_str() == name {
+        return true;
+    }
+    let Some(actual) = storage.find_visible(schema, name, txid) else {
+        return false;
+    };
+    let Some(parent) = storage.find_visible(
+        foreign_key.parent_schema.as_str(),
+        foreign_key.parent.as_str(),
+        txid,
+    ) else {
+        return false;
+    };
+    let partitioned = storage.table_def(parent, txid).partition.is_partitioned();
+    partitioned && storage.partition_descends_from(actual, parent, txid)
+}
+
 /// Whether any visible table has a foreign key referencing `name`.
 pub(crate) fn table_is_referenced(storage: &Storage, schema: &str, name: &str, txid: u32) -> bool {
     for column_index in 0..storage.table_count() {
@@ -2726,7 +2860,7 @@ pub(crate) fn table_is_referenced(storage: &Storage, schema: &str, name: &str, t
             .table_def(column_index, txid)
             .fkeys()
             .iter()
-            .any(|fk| fk.parent_schema.as_str() == schema && fk.parent.as_str() == name)
+            .any(|fk| references_parent(storage, fk, schema, name, txid))
         {
             return true;
         }
@@ -2750,7 +2884,7 @@ pub(crate) fn referenced_key_changed(
         }
         let cdef = *storage.table_def(column_index, txid);
         for fk in cdef.fkeys() {
-            if fk.parent_schema.as_str() != parent_schema || fk.parent.as_str() != parent_name {
+            if !references_parent(storage, fk, parent_schema, parent_name, txid) {
                 continue;
             }
             for (&child_column, &pc) in fk.columns().iter().zip(fk.parent_cols()) {

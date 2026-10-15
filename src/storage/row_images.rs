@@ -359,6 +359,49 @@ impl<'arena> TableRowSnapshot<'arena> {
         .map(Some)
     }
 
+    pub(super) fn read_saved_snapshot(
+        &self,
+        rowid: u64,
+        snapshot: RowSnapshot,
+    ) -> Result<VisibleRowHome, SqlError> {
+        let RowVersionIdentity::Committed(_) = snapshot.version else {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "captured pending row is absent from its resident source"
+            ));
+        };
+        if snapshot.created_at != self.created_at {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "captured row belongs to a different table incarnation"
+            ));
+        }
+        let read_position = self
+            .roots
+            .with_view(|source| Ok(source.commit_lsn()))?
+            .ok_or_else(|| {
+                sql_err!(
+                    crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                    "captured row has no saved-file source"
+                )
+            })?;
+        let mut row = CapturedRowRecord::empty(rowid, CapturedRowKind::LookupSaved);
+        self.resolve_saved(&mut row, read_position)?;
+        let home = self.read_record(row)?.ok_or_else(|| {
+            sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "captured saved row is no longer available"
+            )
+        })?;
+        if home.snapshot().version != snapshot.version {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "captured saved row has a different version"
+            ));
+        }
+        Ok(home)
+    }
+
     pub(super) fn roots(&self) -> &CapturedSpillRoots<'arena> {
         &self.roots
     }

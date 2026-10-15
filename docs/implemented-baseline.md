@@ -132,8 +132,10 @@ byte owners. A reused table slot returns `40001` before a new reader slot is
 reserved. Definition and shared row/version guards release before callbacks,
 so an unrelated writer can progress while a callback retains bytes. Pending
 changes select bytes through the retained metadata owner, including after
-heap relocation. Current row versions within the same table
-remain visible to authoritative walks.
+heap relocation. Saved-row rereads and commit key encoding also use the
+captured byte owner. Commit publication validates the pending version and uses
+its current location if reclamation moved it. Current row versions within the
+same table remain visible to authoritative walks.
 
 **User example:** a storage check started for an old orders table cannot start
 reading the replacement orders table through the reused internal slot. Bytes

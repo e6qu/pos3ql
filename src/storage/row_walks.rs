@@ -1861,4 +1861,163 @@ mod tests {
             storage.restore_pending(table, 1, 7, undo);
         });
     }
+
+    #[test]
+    fn metadata_walk_saved_row_rereads_keep_original_bytes_after_relocation() {
+        for pending in [false, true] {
+            let (mut storage, table) = fixture();
+            let mut budget = Budget::new(4096);
+            let mut scratch = FixedVec::new(&mut budget, "saved row relocation", 16).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                storage
+                    .heap
+                    .append_row(&[Datum::Text("discarded padding before the selected row")])
+                    .unwrap();
+                let location = storage.heap.append_row(&[Datum::Int4(20)]).unwrap();
+                let undo = storage
+                    .write_pending(table, 1, 7, 2, Some(location))
+                    .unwrap();
+                let state = storage.resident_row_state(table, 1).unwrap().unwrap();
+                let snapshot = super::super::RowSnapshot {
+                    created_at: storage.tables[table].created_at(),
+                    version: if pending {
+                        super::super::RowVersionIdentity::Pending(
+                            state.pending_head_identity().unwrap(),
+                        )
+                    } else {
+                        super::super::RowVersionIdentity::Committed(7)
+                    },
+                };
+                storage.compact_heap(&mut scratch).unwrap();
+                storage.restore_pending(table, 1, 7, undo);
+                let image = storage.pin_row_snapshot(table, 1, snapshot, state).unwrap();
+                storage
+                    .with_row_bytes(table, 1, image, |bytes| {
+                        let mut values = [Datum::Null];
+                        super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                        assert_eq!(values[0], Datum::Int4(if pending { 20 } else { 1 }));
+                        Ok(())
+                    })
+                    .unwrap();
+                if pending {
+                    assert_eq!(
+                        storage
+                            .read_row_snapshot(table, 1, snapshot)
+                            .err()
+                            .unwrap()
+                            .sqlstate,
+                        sqlstate::SERIALIZATION_FAILURE
+                    );
+                } else {
+                    assert!(storage.read_row_snapshot(table, 1, snapshot).is_ok());
+                }
+                assert!(storage.row_versions.test_write().is_ok());
+                assert!(storage.tables[table].rows.test_write().is_ok());
+            });
+        }
+    }
+
+    #[test]
+    fn metadata_walk_commit_uses_current_location_after_selected_bytes_move() {
+        for rewritten in [false, true] {
+            let (mut storage, table) = checkpoint_fixture();
+            let mut budget = Budget::new(4096);
+            let mut scratch = FixedVec::new(&mut budget, "commit row relocation", 16).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                storage
+                    .heap
+                    .append_row(&[Datum::Text("discarded padding before the committed row")])
+                    .unwrap();
+                let location = storage.heap.append_row(&[Datum::Int4(20)]).unwrap();
+                storage
+                    .write_pending(table, 1, 8, 1, Some(location))
+                    .unwrap();
+                let selected = storage.resident_row_state(table, 1).unwrap().unwrap();
+                storage.compact_heap(&mut scratch).unwrap();
+                let current_location = storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .pending_last()
+                    .unwrap()
+                    .loc
+                    .unwrap();
+                assert_ne!(current_location, location);
+                storage
+                    .publish_selected_row(table, 1, 8, 9, rewritten, selected)
+                    .unwrap();
+                let state = storage.resident_row_state(table, 1).unwrap().unwrap();
+                assert_eq!(state.committed, Some(RowHome::Heap(current_location)));
+                assert_eq!(state.committed_lsn, 9);
+                assert!(state.pending_last().is_none());
+                let image = storage
+                    .committed_row_home(table, 1, state)
+                    .unwrap()
+                    .unwrap();
+                storage
+                    .with_row_bytes(table, 1, image, |bytes| {
+                        let mut values = [Datum::Null];
+                        super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                        assert_eq!(values[0], Datum::Int4(20));
+                        Ok(())
+                    })
+                    .unwrap();
+                if !rewritten {
+                    let mut hashes = [(0usize, 0u64); super::super::MAX_VALUE_ENFORCERS];
+                    let state = storage.resident_row_state(table, 1).unwrap().unwrap();
+                    let image = storage
+                        .committed_row_home(table, 1, state)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        storage
+                            .row_enforcer_hashes(table, 1, image, &mut hashes)
+                            .unwrap(),
+                        1
+                    );
+                    let mut found = false;
+                    assert!(
+                        storage
+                            .probe_value(table, &[0], hashes[0].1, |rowid, _| {
+                                assert_eq!(rowid, 1);
+                                found = true;
+                                Ok(())
+                            })
+                            .unwrap()
+                    );
+                    assert!(found);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn metadata_walk_commit_rejects_a_pending_version_replaced_after_capture() {
+        let (storage, table) = checkpoint_fixture();
+        crate::mem::guard::forbid_alloc(|| {
+            let location = storage.heap.append_row(&[Datum::Int4(20)]).unwrap();
+            let undo = storage
+                .write_pending(table, 1, 8, 1, Some(location))
+                .unwrap();
+            let selected = storage.resident_row_state(table, 1).unwrap().unwrap();
+            storage.restore_pending(table, 1, 8, undo);
+            let replacement = storage.heap.append_row(&[Datum::Int4(30)]).unwrap();
+            storage
+                .write_pending(table, 1, 8, 2, Some(replacement))
+                .unwrap();
+            let error = storage
+                .publish_selected_row(table, 1, 8, 9, false, selected)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            let state = storage.resident_row_state(table, 1).unwrap().unwrap();
+            assert_eq!(state.committed_lsn, 7);
+            assert_eq!(state.pending_last().unwrap().loc, Some(replacement));
+            drop(state);
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(storage.tables[table].rows.test_write().is_ok());
+            storage.commit_row(table, 1, 8, 9).unwrap();
+            let state = storage.resident_row_state(table, 1).unwrap().unwrap();
+            assert_eq!(state.committed, Some(RowHome::Heap(replacement)));
+        });
+    }
 }

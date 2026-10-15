@@ -108,7 +108,7 @@ struct DmlRowImage<'arena> {
 #[derive(Clone, Copy)]
 struct DmlTableLayout<'arena> {
     table: usize,
-    columns: &'arena [u16],
+    columns: crate::storage::RelationColumnMap<'arena>,
     schema: &'arena [ColType],
     checks: constraints::ParsedChecks<'arena>,
     generated: &'arena [Option<&'arena Expr<'arena>>],
@@ -116,25 +116,15 @@ struct DmlTableLayout<'arena> {
 
 impl DmlTableLayout<'_> {
     fn project<'values>(self, physical: &[Datum<'values>], logical: &mut [Datum<'values>]) {
-        for (column, &source) in self.columns.iter().enumerate() {
-            logical[column] = physical[source as usize];
-        }
+        self.columns.project(physical, logical);
     }
 
     fn overlay<'values>(self, logical: &[Datum<'values>], physical: &mut [Datum<'values>]) {
-        for (column, &target) in self.columns.iter().enumerate() {
-            physical[target as usize] = logical[column];
-        }
+        self.columns.overlay(logical, physical);
     }
 
     fn column_set(self, logical: ColumnSet) -> ColumnSet {
-        let mut physical = ColumnSet::EMPTY;
-        for (column, &target) in self.columns.iter().enumerate() {
-            if logical.contains(column) {
-                physical.insert(target as usize);
-            }
-        }
-        physical
+        self.columns.column_set(logical)
     }
 }
 
@@ -169,20 +159,7 @@ impl<'arena> DmlRowImages<'arena> {
         {
             return Ok(*layout);
         }
-        let columns = arena
-            .alloc_slice_with(logical.n_columns, |_| 0u16)
-            .map_err(|_| arena_full())?;
-        for (column, definition) in logical.columns().iter().enumerate() {
-            columns[column] = physical
-                .column_index(definition.name.as_str())
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::SERIALIZATION_FAILURE,
-                        "selected DML table is missing column \"{}\"",
-                        definition.name.as_str()
-                    )
-                })? as u16;
-        }
+        let columns = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
         let schema = arena
             .alloc_slice_with(physical.n_columns, |column| {
                 physical.columns()[column].ctype
@@ -5321,7 +5298,7 @@ where
     {
         logical_table = usize::from(attachment.parent);
     }
-    if storage.partition_target(logical_table, &new_values[..def.n_columns], txn.txid)?
+    if storage.partition_target(logical_table, def, &new_values[..def.n_columns], txn.txid)?
         != table_index
     {
         return Err(sql_err!(
@@ -26066,7 +26043,7 @@ fn fire_row_trigger_slot<'a>(
         && usize::from(declaring_table) != leaf
         && context
             .storage()
-            .validate_partition_target(leaf, values, context.txn.txid)
+            .validate_partition_target(leaf, definition, values, context.txn.txid)
             .is_err()
     {
         return Err(sql_err!(
@@ -52594,8 +52571,12 @@ fn finish_copy_row<'a>(
     values: &mut [Datum<'a>; MAX_COLUMNS],
     arena: &'a Arena,
 ) -> Result<CopyRowOutcome, SqlError> {
-    let initial_target =
-        storage.partition_target(logical_table, &values[..definition.n_columns], txn.txid)?;
+    let initial_target = storage.partition_target(
+        logical_table,
+        definition,
+        &values[..definition.n_columns],
+        txn.txid,
+    )?;
     if !fire_partition_row_triggers(
         storage,
         txn,
@@ -52615,7 +52596,12 @@ fn finish_copy_row<'a>(
         return Ok(CopyRowOutcome::Filtered);
     }
     compute_generated(definition, generated, values, storage, txn.txid, arena)?;
-    storage.validate_partition_target(initial_target, &values[..definition.n_columns], txn.txid)?;
+    storage.validate_partition_target(
+        initial_target,
+        definition,
+        &values[..definition.n_columns],
+        txn.txid,
+    )?;
     let target = initial_target;
     if let Some(role) = security_role
         && let Some(plan) = super::query::plan_row_security(
@@ -52774,8 +52760,12 @@ pub(crate) fn apply_replication_insert(
         txn.txid,
         arena,
     )?;
-    let initial_target =
-        storage.partition_target(table_index, &values[..definition.n_columns], txn.txid)?;
+    let initial_target = storage.partition_target(
+        table_index,
+        &definition,
+        &values[..definition.n_columns],
+        txn.txid,
+    )?;
     if !fire_partition_row_triggers(
         storage,
         txn,
@@ -52802,7 +52792,12 @@ pub(crate) fn apply_replication_insert(
         txn.txid,
         arena,
     )?;
-    storage.validate_partition_target(initial_target, &values[..definition.n_columns], txn.txid)?;
+    storage.validate_partition_target(
+        initial_target,
+        &definition,
+        &values[..definition.n_columns],
+        txn.txid,
+    )?;
     let target_table = initial_target;
     check_not_null(&definition, &values)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -53312,8 +53307,12 @@ pub(crate) fn apply_replication_update(
         txn.txid,
         arena,
     )?;
-    let target_table =
-        storage.partition_target(table_index, &new_values[..definition.n_columns], txn.txid)?;
+    let target_table = storage.partition_target(
+        table_index,
+        &definition,
+        &new_values[..definition.n_columns],
+        txn.txid,
+    )?;
     check_not_null(&definition, &new_values)?;
     let stored_rowid = if target_table == row_table {
         row.rowid()
@@ -57100,6 +57099,7 @@ pub(crate) fn merge<'a>(
                         } else if def.partition.scheme.is_some() {
                             match storage.partition_target(
                                 table_index,
+                                def,
                                 &new_values[..def.n_columns],
                                 txn.txid,
                             ) {
@@ -57625,7 +57625,7 @@ fn merge_insert<'a>(
     let mut row_arr = row;
     compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
     let initial_target =
-        storage.partition_target(table_index, &row_arr[..def.n_columns], txn.txid)?;
+        storage.partition_target(table_index, def, &row_arr[..def.n_columns], txn.txid)?;
     if !fire_partition_row_triggers(
         storage,
         txn,
@@ -57645,7 +57645,7 @@ fn merge_insert<'a>(
         return Ok(None);
     }
     compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
-    storage.validate_partition_target(initial_target, &row_arr[..def.n_columns], txn.txid)?;
+    storage.validate_partition_target(initial_target, def, &row_arr[..def.n_columns], txn.txid)?;
     let target_table = initial_target;
     if let Some(plan) = row_security_check {
         let policy_row = RowCtx {
@@ -57781,6 +57781,7 @@ where
     }
     let table_index = match storage.partition_target(
         logical_table_index,
+        definition,
         &values[..definition.n_columns],
         txn.txid,
     ) {
@@ -57811,9 +57812,12 @@ where
     if let Err(error) = compute_generated(definition, generated, values, storage, txn.txid, arena) {
         return Ok(Err(error));
     }
-    if let Err(error) =
-        storage.validate_partition_target(table_index, &values[..definition.n_columns], txn.txid)
-    {
+    if let Err(error) = storage.validate_partition_target(
+        table_index,
+        definition,
+        &values[..definition.n_columns],
+        txn.txid,
+    ) {
         return Ok(Err(error));
     }
     if let Some(plan) = insert_check {
@@ -60838,6 +60842,7 @@ pub(crate) fn update<'a>(
             if remote_tuple.is_none() && def.partition.is_partitioned() {
                 target_table = match storage.partition_target(
                     table_index,
+                    def,
                     &new_values[..def.n_columns],
                     txn.txid,
                 ) {
@@ -63967,7 +63972,12 @@ fn alter_partition_attachment(
                     arena,
                     &mut |rowid, values| {
                         if !storage.partition_attachment_accepts(
-                            parent, child, resolved, values, txn.txid,
+                            parent,
+                            child,
+                            resolved,
+                            &parent_def,
+                            values,
+                            txn.txid,
                         )? {
                             return Err(sql_err!(
                                 sqlstate::CHECK_VIOLATION,

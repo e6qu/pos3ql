@@ -84,8 +84,9 @@ owns the detailed contracts, completed work, and limits.
 
 Still to do:
 
-- Extend partition attachment and all write paths to reordered physical
-  columns; keep the current explicit rejection until those paths agree.
+- Map reordered partition columns consistently in routing, query pruning,
+  attachment, triggers, constraints, every write path and replication. Keep
+  the current explicit rejection until those paths agree.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.
 - Integrate bounded heap relocation with concurrent table publication and

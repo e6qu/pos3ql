@@ -5420,6 +5420,11 @@ fn scan_source_mode<'a>(
                 &mut known,
             )?;
         }
+        let definition = scope
+            .defs
+            .get(source)
+            .expect("physical source has a definition");
+        let row = crate::storage::PartitionRow::new(definition, &values[..definition.n_columns])?;
         let mut current = root;
         loop {
             let Some(scheme) = storage.table_def(current, txid).partition.scheme else {
@@ -5433,20 +5438,11 @@ fn scan_source_mode<'a>(
                     })
                     .map(Some);
             };
-            if scheme.keys[..usize::from(scheme.n_keys)]
-                .iter()
-                .any(|key| !known[usize::from(*key)])
-            {
+            let keys = row.keys(&storage.table_def(current, txid), scheme)?;
+            if !keys.all_known(&known) {
                 return Ok(None);
             }
-            current = match storage.partition_child_target(
-                current,
-                scheme.strategy,
-                scheme.keys,
-                scheme.n_keys,
-                &values,
-                txid,
-            ) {
+            current = match storage.partition_child_target(current, keys, txid) {
                 Ok(child) => child,
                 Err(_) => return Ok(None),
             };

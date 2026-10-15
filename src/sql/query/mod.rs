@@ -8100,13 +8100,13 @@ fn array_subquery_field_type_inner<'q>(
 }
 
 #[derive(Clone, Copy)]
-struct SubqueryResultType {
-    type_oid: i32,
-    typlen: i16,
-    type_mod: i32,
+pub(crate) struct SubqueryResultType {
+    pub(crate) type_oid: i32,
+    pub(crate) typlen: i16,
+    pub(crate) type_mod: i32,
 }
 
-fn subquery_result_type<'a>(
+pub(crate) fn subquery_result_type<'a>(
     expression: &Expr<'a>,
     outer_scope: Option<&QueryScope<'a>>,
     storage: &'a Storage,

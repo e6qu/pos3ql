@@ -206,6 +206,7 @@ pub struct QueryScope<'d> {
     txid: u32,
     arena: &'d Arena,
     pub names: &'d mut [&'d str],
+    returning_aliases: &'d [&'d str],
     pub(crate) defs: QueryDefinitions<'d>,
     pub slots: &'d mut [usize],
     /// Per-source system fields encoded after the visible relation shape.
@@ -301,6 +302,53 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
 }
 
 impl<'d> QueryScope<'d> {
+    /// Describe correlated RETURNING expressions without adding OLD and NEW
+    /// as separate, ambiguous sources of unqualified columns.
+    pub(crate) fn for_returning(
+        storage: &'d Storage,
+        definition: &TableDef,
+        alias: Option<&'d str>,
+        output_aliases: &[&'d str],
+        txid: u32,
+        arena: &'d Arena,
+    ) -> Result<Self, SqlError> {
+        let schema = arena
+            .alloc_str(definition.schema.as_str())
+            .map_err(|_| arena_full())?;
+        let table = arena
+            .alloc_str(definition.name.as_str())
+            .map_err(|_| arena_full())?;
+        let from = arena
+            .alloc(crate::sql::ast::FromClause {
+                base: TableRef {
+                    schema: Some(schema),
+                    table,
+                    alias,
+                    subquery: None,
+                    func_args: None,
+                    func_argument_names: &[],
+                    func_variadic: false,
+                    rows_from: None,
+                    col_alias: None,
+                    inheritance: crate::sql::ast::RelationInheritance::Only,
+                    sample: None,
+                    cte: None,
+                    with_ordinality: false,
+                    lateral: false,
+                    authorization_role: None,
+                    bound_table: None,
+                    view_access: None,
+                },
+                joins: &[],
+            })
+            .map_err(|_| arena_full())?;
+        let mut scope = Self::resolve_schema(storage, from, txid, arena)?;
+        scope.returning_aliases = arena
+            .alloc_slice_copy(output_aliases)
+            .map_err(|_| arena_full())?;
+        Ok(scope)
+    }
+
     fn empty(
         storage: &'d Storage,
         txid: u32,
@@ -378,6 +426,7 @@ impl<'d> QueryScope<'d> {
             txid,
             arena,
             names,
+            returning_aliases: &[],
             defs: QueryDefinitions {
                 sources: defs,
                 images: storage.table_definition_images(),
@@ -1522,6 +1571,9 @@ impl<'d> QueryScope<'d> {
     /// the exposed name; a composed `schema.table` qualifier (a three-part
     /// reference) matches only an unaliased base table of that schema.
     fn entry_answers_to(&self, t: usize, q: &str) -> bool {
+        if self.n == 1 && self.returning_aliases.contains(&q) {
+            return true;
+        }
         match q.split_once('.') {
             None => self.names[t] == q,
             Some((schema, table)) => {

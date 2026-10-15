@@ -14,7 +14,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::guc::GucState;
 use crate::sql::txn::TxnState;
 use crate::sql_err;
-use crate::storage::{MAX_COLUMNS, Storage};
+use crate::storage::{MAX_COLUMNS, SqlName, Storage};
 
 /// Internal trigger execution never exposes query output to the publisher.
 /// This fixed buffer only retains protocol framing required by the shared
@@ -56,12 +56,24 @@ impl RelationBinding {
     }
 }
 
-/// Fixed, connection-local relation bindings for one apply worker.
+struct RelationEntry {
+    binding: RelationBinding,
+    schema: SqlName,
+    name: SqlName,
+    columns: [SqlName; MAX_COLUMNS],
+}
+
+/// Fixed, connection-local publisher descriptors for one apply worker. Exact
+/// names permit rebuilding local positions after DDL without another R frame.
 pub struct RelationMap {
-    bindings: FixedVec<RelationBinding>,
+    bindings: FixedVec<RelationEntry>,
 }
 
 impl RelationMap {
+    pub const fn budget_bytes(capacity: usize) -> usize {
+        capacity * core::mem::size_of::<RelationEntry>()
+    }
+
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
         Ok(Self {
             bindings: FixedVec::new(budget, "subscription_relations", capacity)?,
@@ -83,7 +95,7 @@ impl RelationMap {
         let definition = storage.table_def(table_slot, txid);
         if relation.columns().len() > definition.n_columns {
             return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "subscription relation \"{}.{}\" has {} columns, local table has {}",
                 relation.namespace,
                 relation.name,
@@ -92,12 +104,13 @@ impl RelationMap {
             ));
         }
         let mut remote_to_local = [usize::MAX; MAX_COLUMNS];
+        let mut published = [SqlName::new(); MAX_COLUMNS];
         let mut key_remote_to_local = [usize::MAX; MAX_COLUMNS];
         let mut key_count = 0;
         for (remote, column) in relation.columns().enumerate() {
             let local = definition.column_index(column.name).ok_or_else(|| {
                 sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                     "subscription relation \"{}.{}\" has no local column \"{}\"",
                     relation.namespace,
                     relation.name,
@@ -113,6 +126,14 @@ impl RelationMap {
                     column.name
                 ));
             }
+            if definition.columns()[local].default.is_generated() {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "logical replication target column \"{}\" is generated",
+                    column.name
+                ));
+            }
+            published[remote] = definition.columns()[local].name;
             remote_to_local[remote] = local;
             if column.key {
                 key_remote_to_local[key_count] = local;
@@ -127,15 +148,21 @@ impl RelationMap {
             key_remote_to_local,
             key_count,
         };
+        let entry = RelationEntry {
+            binding,
+            schema: definition.schema,
+            name: definition.name,
+            columns: published,
+        };
         if let Some(existing) = self
             .bindings
             .iter_mut()
-            .find(|existing| existing.relation_id == relation.id)
+            .find(|existing| existing.binding.relation_id == relation.id)
         {
-            *existing = binding;
+            *existing = entry;
             return Ok(());
         }
-        self.bindings.push(binding).map_err(|_| {
+        self.bindings.push(entry).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "subscription relation cache exceeds {} entries",
@@ -144,18 +171,81 @@ impl RelationMap {
         })
     }
 
-    pub fn binding(&self, relation_id: u32) -> Result<RelationBinding, SqlError> {
-        self.bindings
-            .iter()
-            .copied()
-            .find(|binding| binding.relation_id == relation_id)
+    pub fn binding(
+        &mut self,
+        storage: &Storage,
+        txid: u32,
+        relation_id: u32,
+    ) -> Result<RelationBinding, SqlError> {
+        let entry = self
+            .bindings
+            .iter_mut()
+            .find(|entry| entry.binding.relation_id == relation_id)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROTOCOL_VIOLATION,
                     "subscription data references unknown relation {}",
                     relation_id
                 )
-            })
+            })?;
+        let table = storage.resolve_subscription_target(
+            entry.schema.as_str(),
+            entry.name.as_str(),
+            txid,
+        )?;
+        storage.lock_table(
+            txid,
+            table,
+            crate::sql::ast::TableLockMode::RowExclusive,
+            false,
+        )?;
+        let definition = storage.table_def(table, txid);
+        let binding = entry.binding;
+        if binding.table_slot == table
+            && binding
+                .remote_to_local()
+                .iter()
+                .enumerate()
+                .all(|(remote, &local)| {
+                    definition.columns().get(local).is_some_and(|column| {
+                        column.name == entry.columns[remote] && !column.default.is_generated()
+                    })
+                })
+        {
+            return Ok(binding);
+        }
+        let mut replacement = binding;
+        replacement.table_slot = table;
+        for remote in 0..binding.column_count {
+            let name = entry.columns[remote];
+            let local = definition.column_index(name.as_str()).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "logical replication target relation \"{}.{}\" is missing column \"{}\"",
+                    entry.schema.as_str(),
+                    entry.name.as_str(),
+                    name.as_str()
+                )
+            })?;
+            if definition.columns()[local].default.is_generated() {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "logical replication target column \"{}\" is generated",
+                    name.as_str()
+                ));
+            }
+            replacement.remote_to_local[remote] = local;
+        }
+        for (key, &old_local) in binding.key_local_columns().iter().enumerate() {
+            let remote = binding
+                .remote_to_local()
+                .iter()
+                .position(|&column| column == old_local)
+                .expect("registered identity key belongs to the published columns");
+            replacement.key_remote_to_local[key] = replacement.remote_to_local[remote];
+        }
+        entry.binding = replacement;
+        Ok(replacement)
     }
 
     pub fn clear(&mut self) {
@@ -202,7 +292,7 @@ pub struct SubscriptionApply {
 
 impl SubscriptionApply {
     pub const fn budget_bytes(config: &crate::config::Config) -> usize {
-        config.subscription_relation_capacity * core::mem::size_of::<RelationBinding>()
+        RelationMap::budget_bytes(config.subscription_relation_capacity)
             + TxnState::budget_bytes_with_config(config)
             + GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction)
             + config.subscription_arena_bytes
@@ -685,10 +775,15 @@ impl SubscriptionApply {
                         &mut responder,
                         &mut self.trigger_scratch,
                     );
+                    let binding = engine.resolve_subscription_relation(
+                        &mut self.relations,
+                        &self.txn,
+                        relation_id,
+                    )?;
                     engine.apply_subscription_insert(
                         &mut self.txn,
                         self.stream,
-                        self.relations.binding(relation_id)?,
+                        binding,
                         new,
                         &self.arena,
                         &mut trigger_context,
@@ -730,10 +825,15 @@ impl SubscriptionApply {
                         &mut responder,
                         &mut self.trigger_scratch,
                     );
+                    let binding = engine.resolve_subscription_relation(
+                        &mut self.relations,
+                        &self.txn,
+                        relation_id,
+                    )?;
                     engine.apply_subscription_update(
                         &mut self.txn,
                         self.stream,
-                        self.relations.binding(relation_id)?,
+                        binding,
                         crate::sql::exec::ReplicationUpdate { identity, new },
                         &self.arena,
                         &mut trigger_context,
@@ -774,10 +874,15 @@ impl SubscriptionApply {
                         &mut responder,
                         &mut self.trigger_scratch,
                     );
+                    let binding = engine.resolve_subscription_relation(
+                        &mut self.relations,
+                        &self.txn,
+                        relation_id,
+                    )?;
                     engine.apply_subscription_delete(
                         &mut self.txn,
                         self.stream,
-                        self.relations.binding(relation_id)?,
+                        binding,
                         old,
                         &self.arena,
                         &mut trigger_context,
@@ -824,7 +929,9 @@ impl SubscriptionApply {
                         )
                     })?;
                 for (index, relation_id) in truncate.relation_ids().enumerate() {
-                    tables[index] = self.relations.binding(relation_id)?.table_slot();
+                    tables[index] = engine
+                        .resolve_subscription_relation(&mut self.relations, &self.txn, relation_id)?
+                        .table_slot();
                 }
                 engine.apply_subscription_truncate(
                     &mut self.txn,

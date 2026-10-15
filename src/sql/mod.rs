@@ -2762,6 +2762,15 @@ impl Engine {
         relations.register(&self.storage, txn.txid, relation)
     }
 
+    pub(crate) fn resolve_subscription_relation(
+        &self,
+        relations: &mut crate::pg::subscription_apply::RelationMap,
+        txn: &TxnState,
+        relation_id: u32,
+    ) -> Result<crate::pg::subscription_apply::RelationBinding, SqlError> {
+        relations.binding(&self.storage, txn.txid, relation_id)
+    }
+
     pub(crate) fn apply_subscription_insert(
         &mut self,
         txn: &mut TxnState,

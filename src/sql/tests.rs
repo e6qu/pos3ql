@@ -81819,7 +81819,9 @@ fn pgoutput_row_selection_copies_only_matches_and_owns_original_schema() {
         relations
             .register(&engine.storage, session.transaction.txid, relation)
             .unwrap();
-        let binding = relations.binding(1).unwrap();
+        let binding = relations
+            .binding(&engine.storage, session.transaction.txid, 1)
+            .unwrap();
         let CopyData::XLogData {
             message: Message::Delete { old, .. },
             ..
@@ -82057,6 +82059,212 @@ fn dml_target_merge_applies_key_actions_and_rejects_triggered_rewrites() {
         )),
         ["0"]
     );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn pgoutput_descriptors_refresh_after_local_ddl_without_new_relation_frames() {
+    use crate::pg::pginput::copy_data;
+    use crate::pg::subscription_apply::{ApplyResult, RelationMap, SubscriptionApply};
+
+    fn receive(
+        apply: &mut SubscriptionApply,
+        engine: &mut Engine,
+        end: u64,
+        message: &[u8],
+    ) -> Result<ApplyResult, super::eval::SqlError> {
+        let mut frame = vec![0; 25];
+        frame[0] = b'w';
+        frame[9..17].copy_from_slice(&end.to_be_bytes());
+        frame.extend_from_slice(message);
+        let parsed = copy_data(&frame).unwrap();
+        crate::mem::guard::forbid_alloc(|| apply.receive(engine, parsed))
+    }
+    fn relation(id: u32, name: &str, label: &str) -> Vec<u8> {
+        let mut message = vec![b'R'];
+        message.extend_from_slice(&id.to_be_bytes());
+        message.extend_from_slice(b"public\0");
+        message.extend_from_slice(name.as_bytes());
+        message.extend_from_slice(&[0, b'd', 0, 2]);
+        for (key, name, oid) in [(1, "id", 23_u32), (0, label, 25)] {
+            message.push(key);
+            message.extend_from_slice(name.as_bytes());
+            message.push(0);
+            message.extend_from_slice(&oid.to_be_bytes());
+            message.extend_from_slice(&(-1_i32).to_be_bytes());
+        }
+        message
+    }
+    fn begin(lsn: u64) -> [u8; 21] {
+        let mut message = [0; 21];
+        message[0] = b'B';
+        message[1..9].copy_from_slice(&lsn.to_be_bytes());
+        message[17..21].copy_from_slice(&(lsn as u32).to_be_bytes());
+        message
+    }
+    fn commit(lsn: u64) -> [u8; 26] {
+        let mut message = [0; 26];
+        message[0] = b'C';
+        message[2..10].copy_from_slice(&lsn.to_be_bytes());
+        message[10..18].copy_from_slice(&(lsn + 1).to_be_bytes());
+        message
+    }
+    fn insert(id: &[u8], label: &[u8]) -> Vec<u8> {
+        let mut message = vec![b'I', 0, 0, 0, 7, b'N', 0, 2];
+        for value in [id, label] {
+            message.push(b't');
+            message.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            message.extend_from_slice(value);
+        }
+        message
+    }
+
+    let mut map_budget = Budget::new(RelationMap::budget_bytes(1));
+    let map = RelationMap::new(&mut map_budget, 1).unwrap();
+    assert_eq!(map_budget.remaining(), 0);
+    drop(map);
+    let mut config = test_config("pgoutput-local-ddl-descriptors");
+    config.subscription_relation_capacity = 1;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE replica_descriptor(id integer PRIMARY KEY, unused integer, label text); \
+         CREATE SUBSCRIPTION descriptor_apply CONNECTION 'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+         PUBLICATION descriptor_changes WITH (connect = false, slot_name = NONE)", true);
+    let original_slot = engine
+        .storage
+        .find_table("public", "replica_descriptor")
+        .unwrap();
+    let mut apply = SubscriptionApply::new(
+        &mut budget,
+        engine.subscription_stream("descriptor_apply").unwrap(),
+        &config,
+        0,
+        crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+    )
+    .unwrap();
+    receive(
+        &mut apply,
+        &mut engine,
+        1,
+        &relation(7, "replica_descriptor", "label"),
+    )
+    .unwrap();
+    session.success(
+        &mut engine,
+        "ALTER TABLE replica_descriptor DROP COLUMN unused",
+        true,
+    );
+    receive(&mut apply, &mut engine, 40, &begin(40)).unwrap();
+    receive(&mut apply, &mut engine, 40, &insert(b"1", b"after drop")).unwrap();
+    assert_eq!(
+        receive(&mut apply, &mut engine, 41, &commit(40)).unwrap(),
+        ApplyResult::Acknowledge {
+            flushed_lsn: 41,
+            reply_requested: false
+        }
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, label FROM replica_descriptor",
+            true
+        )),
+        ["1|after drop"]
+    );
+
+    session.success(&mut engine, "DROP TABLE replica_descriptor", true);
+    session.success(
+        &mut engine,
+        "CREATE TABLE descriptor_filler(id integer, label text)",
+        true,
+    );
+    assert_eq!(
+        engine.storage.find_table("public", "descriptor_filler"),
+        Some(original_slot)
+    );
+    session.success(
+        &mut engine,
+        "CREATE TABLE replica_descriptor(label text, id integer PRIMARY KEY)",
+        true,
+    );
+    receive(&mut apply, &mut engine, 60, &begin(60)).unwrap();
+    receive(
+        &mut apply,
+        &mut engine,
+        60,
+        &insert(b"2", b"after recreate"),
+    )
+    .unwrap();
+    receive(&mut apply, &mut engine, 61, &commit(60)).unwrap();
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, label FROM replica_descriptor",
+            true
+        )),
+        ["2|after recreate"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM descriptor_filler", true)),
+        ["0"]
+    );
+
+    session.success(
+        &mut engine,
+        "ALTER TABLE replica_descriptor RENAME COLUMN label TO other",
+        true,
+    );
+    receive(&mut apply, &mut engine, 80, &begin(80)).unwrap();
+    let error = receive(&mut apply, &mut engine, 80, &insert(b"3", b"renamed")).unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    assert_eq!(apply.confirmed_lsn(), 61);
+    session.success(
+        &mut engine,
+        "ALTER TABLE replica_descriptor RENAME COLUMN other TO label",
+        true,
+    );
+    let error = receive(
+        &mut apply,
+        &mut engine,
+        80,
+        &relation(7, "replica_descriptor", "missing"),
+    )
+    .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    let error = receive(
+        &mut apply,
+        &mut engine,
+        80,
+        &relation(8, "descriptor_filler", "label"),
+    )
+    .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    session.success(&mut engine, "ALTER TABLE replica_descriptor ADD COLUMN computed integer GENERATED ALWAYS AS (id + 1) STORED", true);
+    let error = receive(
+        &mut apply,
+        &mut engine,
+        80,
+        &relation(7, "replica_descriptor", "computed"),
+    )
+    .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    receive(&mut apply, &mut engine, 80, &begin(80)).unwrap();
+    receive(&mut apply, &mut engine, 80, &insert(b"3", b"retry")).unwrap();
+    receive(&mut apply, &mut engine, 81, &commit(80)).unwrap();
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, label, computed FROM replica_descriptor ORDER BY id",
+            true
+        )),
+        ["2|after recreate|3", "3|retry|4"]
+    );
+    assert_eq!(apply.confirmed_lsn(), 81);
+    drop(apply);
     drop(session);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

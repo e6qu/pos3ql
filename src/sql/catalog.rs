@@ -26872,7 +26872,7 @@ fn pg_locks<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
         count += 1;
     }
     let mut table_error = None;
-    storage.visit_table_locks(|_, owner, table_slot, mode| {
+    storage.visit_table_locks(|_, owner, relation, mode| {
         if table_error.is_some() {
             return;
         }
@@ -26886,11 +26886,19 @@ fn pg_locks<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
             crate::sql::ast::TableLockMode::Exclusive => "ExclusiveLock",
             crate::sql::ast::TableLockMode::AccessExclusive => "AccessExclusiveLock",
         };
+        let (relation_database, relation_oid) = match relation {
+            crate::storage::RelationLockTarget::Table(slot) => {
+                (storage.table(slot).database(), user_table_oid(slot))
+            }
+            crate::storage::RelationLockTarget::View(slot) => {
+                (storage.view(slot).database, view_oid(slot))
+            }
+        };
         let virtual_transaction = virtual_transaction(owner);
         let values = [
             Datum::Text("relation"),
-            Datum::Oid(database_oid),
-            Datum::Oid(user_table_oid(table_slot) as u32),
+            Datum::Oid(relation_database.get() as u32),
+            Datum::Oid(relation_oid as u32),
             Datum::Null,
             Datum::Null,
             Datum::Null,

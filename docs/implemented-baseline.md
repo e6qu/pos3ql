@@ -421,6 +421,27 @@ rows. The report continues with its original file set and read position; a new
 scan captures the replacement. Downloads and callbacks hold none of the table
 capture guards. Cancellation and failed capture release reader registrations.
 
+### Changing rewrite rules
+
+A rewrite rule changes what a command does before it runs. For example, a rule
+can redirect an insert into an audit table. Changing that rule takes the target
+table or view's exclusive relation lock, shared with ordinary reads and writes.
+Unrelated relations remain usable.
+
+For example, connection A can run `BEGIN; CREATE RULE ignore_insert AS ON INSERT
+TO orders DO INSTEAD NOTHING`. Until A commits or rolls back, connection B's
+`SET lock_timeout = '50ms'; SELECT * FROM orders` returns `55P03`. A query against
+an unrelated table can continue. A failed or rolled-back rule creation does not
+publish the table's rule-history flag; committed history remains set after the
+last rule is dropped. Savepoint rollback restores both the history and locks.
+
+Table and view slots have distinct lock identities. The lock registry reserves
+space at startup for each transaction's tables and views; exhaustion returns
+`54000` naming the registry. Prepared transactions retain view locks through
+restart and recovery without local caches. `pg_locks` reports the actual relation
+and database identities. Statements still execute serially; these protections
+are prerequisites for the planned execution workers.
+
 ### Reading index caches during replacement
 
 A selected in-memory index cache owns its storage. Rebuilding or dropping a table

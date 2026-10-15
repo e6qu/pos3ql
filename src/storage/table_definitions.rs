@@ -16,6 +16,8 @@ pub(super) struct DefinitionState {
     pub(super) identity: TableIdentity,
     pub(super) committed: TableDef,
     pub(super) pending: Option<PendingDefinitionHead>,
+    /// A CREATE RULE changes the visible history only for its transaction.
+    pub(super) pending_has_rules_txid: Option<u32>,
 }
 
 /// Identity and existence share publication ownership with the definition.
@@ -61,6 +63,7 @@ impl TableDefinition {
                 identity: TableIdentity::EMPTY,
                 committed,
                 pending: None,
+                pending_has_rules_txid: None,
             }),
         }
     }
@@ -321,6 +324,11 @@ impl<'a> TableDefinitionRead<'a> {
                 self.state
                     .pending
                     .map(|head| head.transaction)
+                    .filter(|&owner| owner != transaction)
+            })
+            .or_else(|| {
+                self.state
+                    .pending_has_rules_txid
                     .filter(|&owner| owner != transaction)
             })
     }

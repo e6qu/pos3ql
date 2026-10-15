@@ -10910,6 +10910,14 @@ impl Engine {
                 );
             }
         };
+        if let Err(error) = storage.lock_relation(
+            txn.txid,
+            target.into(),
+            ast::TableLockMode::RowExclusive,
+            false,
+        ) {
+            return Ok(Err(error));
+        }
         if matches!(
             statement,
             Stmt::Insert(Insert {

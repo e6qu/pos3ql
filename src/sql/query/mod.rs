@@ -4669,6 +4669,14 @@ pub fn resolve_view_for_dml<'a>(
         Some(crate::storage::ResolvedRelation::View(slot)) => slot,
         _ => return Ok(None),
     };
+    if txid != 0 {
+        storage.lock_relation(
+            txid,
+            crate::storage::RelationLockTarget::View(view_slot),
+            crate::sql::ast::TableLockMode::RowExclusive,
+            false,
+        )?;
+    }
     let check_option = storage.view(view_slot).check_option_for(txid);
     // The body re-resolves under the view creator's search path.
     let user = crate::sql::eval::funcs::system::session_user_owned();

@@ -6775,7 +6775,7 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
 #[test]
 fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
     let mut config = test_config("prepared-object-cold-recovery");
-    config.max_prepared_transactions = 3;
+    config.max_prepared_transactions = 4;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.wal_upload = true;
@@ -6831,6 +6831,18 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         !String::from_utf8_lossy(&prepared_rollback).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&prepared_rollback)
+    );
+    let prepared_view = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW durable_prepared_view AS SELECT 1 AS id; \
+         BEGIN; SELECT * FROM durable_prepared_view; \
+         PREPARE TRANSACTION 'object-view-lock'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&prepared_view).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&prepared_view)
     );
     assert!(engine.checkpoint().unwrap());
     engine.commit_wal().unwrap();
@@ -6889,7 +6901,8 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
             "1|checkpoint",
             "object-cold",
             "object-ddl",
-            "object-ddl-rollback"
+            "object-ddl-rollback",
+            "object-view-lock"
         ]
     );
     for statement in [
@@ -6914,6 +6927,46 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         String::from_utf8_lossy(&lock).contains("55P03"),
         "{}",
         String::from_utf8_lossy(&lock)
+    );
+    let view_locks = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT mode, granted, pid IS NULL FROM pg_locks \
+         WHERE locktype='relation' AND relation='durable_prepared_view'::regclass",
+    );
+    assert_eq!(
+        data_rows(&view_locks),
+        ["AccessShareLock|t|t"],
+        "{}",
+        String::from_utf8_lossy(&view_locks)
+    );
+    let view = recovered
+        .storage
+        .view_slot("public", "durable_prepared_view", 0)
+        .unwrap();
+    assert_eq!(
+        recovered
+            .storage
+            .lock_relation(
+                u32::MAX - 1,
+                crate::storage::RelationLockTarget::View(view),
+                ast::TableLockMode::AccessExclusive,
+                true
+            )
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::LOCK_NOT_AVAILABLE
+    );
+    let resolved_view = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "COMMIT PREPARED 'object-view-lock'; \
+         CREATE RULE after_recovery AS ON INSERT TO durable_prepared_view DO INSTEAD NOTHING",
+    );
+    assert!(
+        !String::from_utf8_lossy(&resolved_view).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&resolved_view)
     );
     let committed = run_with(
         &mut recovered,
@@ -6987,6 +7040,14 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
              SELECT count(*) FROM pg_prepared_xacts",
         )),
         ["1|resolved", "2|new", "0"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut final_engine,
+            &mut final_budget,
+            "SELECT rulename FROM pg_rules WHERE tablename='durable_prepared_view'",
+        )),
+        ["after_recovery"]
     );
     drop(final_engine);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

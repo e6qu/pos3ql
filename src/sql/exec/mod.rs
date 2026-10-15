@@ -13100,6 +13100,14 @@ pub(crate) fn drop_schema(
                 }
             }
             SchemaObject::View(v) => {
+                if let Err(error) = storage.lock_relation(
+                    txn.txid,
+                    crate::storage::RelationLockTarget::View(*v),
+                    crate::sql::ast::TableLockMode::AccessExclusive,
+                    false,
+                ) {
+                    return sql_fail(error);
+                }
                 let (schema, vname, temporary) = {
                     let view = storage.view(*v);
                     (
@@ -36027,6 +36035,14 @@ pub fn create_view(
                 .then_some(slot)
         })
     {
+        if let Err(error) = storage.lock_relation(
+            txn.txid,
+            crate::storage::RelationLockTarget::View(slot),
+            crate::sql::ast::TableLockMode::AccessExclusive,
+            false,
+        ) {
+            return sql_fail(error);
+        }
         let prior = *storage.view(slot).columns_for(txn.txid);
         if prior.len() > columns.len() {
             return sql_fail(sql_err!(
@@ -36318,6 +36334,14 @@ pub fn alter_view(
             },
         );
     };
+    if let Err(error) = storage.lock_relation(
+        txn.txid,
+        crate::storage::RelationLockTarget::View(slot),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.require_owner(
         crate::storage::AccessObject {
             class: crate::storage::AccessClass::View,
@@ -37409,6 +37433,14 @@ pub fn create_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = storage.lock_relation(
+        txn.txid,
+        target.into(),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
     }
@@ -37423,10 +37455,17 @@ pub fn create_rule(
             Ok(created) => created,
             Err(error) => return sql_fail(error),
         };
-    let prior_table_rule_txid = existing
-        .is_none()
-        .then(|| storage.begin_rule_history(target, txn.txid))
-        .flatten();
+    let prior_table_rule_txid = if existing.is_none() {
+        match storage.begin_rule_history(target, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => {
+                storage.discard_rule_create(slot);
+                return sql_fail(error);
+            }
+        }
+    } else {
+        None
+    };
     if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
         if existing.is_some() {
             storage.rollback_rule_alter(slot, prior);
@@ -37471,6 +37510,14 @@ pub fn alter_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = storage.lock_relation(
+        txn.txid,
+        target.into(),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
     }
@@ -37572,6 +37619,14 @@ pub fn drop_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = storage.lock_relation(
+        txn.txid,
+        target.into(),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
     }
@@ -44691,6 +44746,12 @@ fn drop_view_slot(
     txn: &mut TxnState,
     slot: usize,
 ) -> Result<(), SqlError> {
+    storage.lock_relation(
+        txn.txid,
+        crate::storage::RelationLockTarget::View(slot),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    )?;
     let (schema, name, temporary) = {
         let view = storage.view(slot);
         (
@@ -46998,6 +47059,14 @@ pub fn drop_view(
             _ => None,
         };
         if let Some(slot) = found {
+            if let Err(error) = storage.lock_relation(
+                txn.txid,
+                crate::storage::RelationLockTarget::View(slot),
+                crate::sql::ast::TableLockMode::AccessExclusive,
+                false,
+            ) {
+                return sql_fail(error);
+            }
             if let Err(error) = storage.require_not_extension_member(
                 crate::storage::AccessObject {
                     class: crate::storage::AccessClass::View,

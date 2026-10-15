@@ -4678,6 +4678,14 @@ fn subst_tableref<'a>(
             .resolve_relation(t.schema, t.table, context.txid),
     });
     if let Some(crate::storage::ResolvedRelation::View(slot)) = resolved {
+        if context.txid != 0 && context.execution.is_some() {
+            context.storage.lock_relation(
+                context.txid,
+                crate::storage::RelationLockTarget::View(slot),
+                crate::sql::ast::TableLockMode::AccessShare,
+                false,
+            )?;
+        }
         if context.depth >= MAX_VIEW_DEPTH {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,

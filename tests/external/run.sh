@@ -902,7 +902,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     -c "CREATE TABLE subscription_typed (id int PRIMARY KEY, state subscription_state, positive subscription_positive, labels text[], span int4range, spans int4multirange, pair subscription_pair)" \
     -c "CREATE TABLE subscription_union_target (id int PRIMARY KEY, left_value text NOT NULL, right_value text NOT NULL, publisher_only text DEFAULT 'subscriber-default')" \
     -c "CREATE TABLE subscription_trigger_audit (id int)" \
-    -c "CREATE FUNCTION audit_subscription_copy() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN INSERT INTO subscription_trigger_audit VALUES (NEW.id); RETURN NEW; END'" \
+    -c "CREATE FUNCTION audit_subscription_copy() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN IF current_setting(''search_path'') <> '''' THEN RAISE EXCEPTION ''worker inherited a frontend path''; END IF; INSERT INTO public.subscription_trigger_audit VALUES (NEW.id); RETURN NEW; END'" \
     -c "CREATE TRIGGER subscription_copy_trigger BEFORE INSERT ON subscription_target FOR EACH ROW EXECUTE FUNCTION audit_subscription_copy()" \
     -c "ALTER TABLE subscription_target ENABLE REPLICA TRIGGER subscription_copy_trigger" \
     -c "CREATE SUBSCRIPTION subscription_apply CONNECTION 'host=127.0.0.1 port=$SUB_PG_PORT user=postgres dbname=postgres application_name=pos3ql_subscription_apply sslmode=disable' PUBLICATION subscription_apply_pub, subscription_apply_pub_columns_left, subscription_apply_pub_columns_right WITH (binary = true, streaming = parallel, failover = true)" \

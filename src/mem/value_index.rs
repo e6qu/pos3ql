@@ -212,78 +212,87 @@ impl ValueIndex {
     }
 }
 
-/// A startup-allocated pool of [`ValueIndex`] buffers with a free list. Every
-/// index's slot array is reserved once at construction, so acquiring one for a
-/// new constraint at runtime allocates nothing — it just clears a spare and
-/// hands back its slot. Exhausting the pool is a loud error, never growth.
+/// Cache buffers and their shared owners are allocated once at startup.
+/// The pool's sole reference means a slot is free; issued handles prevent reuse.
 pub struct ValueIndexPool {
-    indexes: Box<[std::sync::RwLock<ValueIndex>]>,
-    free: super::fixed_vec::FixedVec<u32>,
+    indexes: Box<[std::sync::Arc<std::sync::RwLock<ValueIndex>>]>,
+    allocation: std::sync::Mutex<()>,
+}
+
+/// An issued handle keeps its cache alive independently of the pool. Returned
+/// guards borrow this owner, so the last handle cannot release a borrowed cache.
+#[derive(Clone)]
+pub struct ValueIndexLease {
+    owner: std::sync::Arc<std::sync::RwLock<ValueIndex>>,
+    slot: usize,
+}
+
+impl ValueIndexLease {
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, ValueIndex> {
+        self.owner.read().expect("value index lock poisoned")
+    }
+
+    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, ValueIndex> {
+        self.owner.write().expect("value index lock poisoned")
+    }
 }
 
 impl ValueIndexPool {
-    /// Bytes `new` draws for `capacity` indexes each holding up to `rows`
-    /// entries (the container, each index's slots, and the free list).
+    fn owner_bytes() -> usize {
+        size_of::<std::sync::RwLock<ValueIndex>>() + 2 * size_of::<std::sync::atomic::AtomicUsize>()
+    }
+
     pub fn budget_bytes(capacity: usize, rows: usize) -> usize {
-        capacity * size_of::<std::sync::RwLock<ValueIndex>>()
-            + capacity * ValueIndex::budget_bytes(rows)
-            + capacity * size_of::<u32>()
+        size_of::<Self>()
+            + capacity
+                * (size_of::<std::sync::Arc<std::sync::RwLock<ValueIndex>>>()
+                    + Self::owner_bytes()
+                    + ValueIndex::budget_bytes(rows))
     }
 
     pub fn new(budget: &mut Budget, capacity: usize, rows: usize) -> Result<Self, BudgetError> {
+        budget.draw(size_of::<Self>(), "value index allocation controls")?;
         budget.draw_array(
             capacity,
-            size_of::<std::sync::RwLock<ValueIndex>>(),
+            size_of::<std::sync::Arc<std::sync::RwLock<ValueIndex>>>(),
             "value_index_pool",
         )?;
+        budget.draw_array(capacity, Self::owner_bytes(), "value index owners")?;
         let mut indexes = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            indexes.push(std::sync::RwLock::new(ValueIndex::new(
-                budget,
-                "value_index",
-                rows,
-            )?));
-        }
-        let mut free = super::fixed_vec::FixedVec::new(budget, "value_index_free", capacity)?;
-        for slot in (0..capacity as u32).rev() {
-            free.push(slot).expect("free list sized to capacity");
+            indexes.push(std::sync::Arc::new(std::sync::RwLock::new(
+                ValueIndex::new(budget, "value_index", rows)?,
+            )));
         }
         Ok(Self {
             indexes: indexes.into_boxed_slice(),
-            free,
+            allocation: std::sync::Mutex::new(()),
         })
     }
 
-    /// Claims a cleared index, returning its slot, or `None` if the pool is
-    /// exhausted (the caller raises a loud error).
-    pub fn acquire(&mut self) -> Option<u32> {
-        let slot = self.free.pop()?;
-        self.indexes[slot as usize]
-            .get_mut()
-            .expect("value index lock poisoned")
-            .clear();
-        Some(slot)
-    }
-
-    /// Returns a slot to the pool, clearing its index.
-    pub fn release(&mut self, slot: u32) {
-        self.indexes[slot as usize]
-            .get_mut()
-            .expect("value index lock poisoned")
-            .clear();
-        self.free.push(slot).expect("free list sized to capacity");
-    }
-
-    pub fn get(&self, slot: u32) -> std::sync::RwLockReadGuard<'_, ValueIndex> {
-        self.indexes[slot as usize]
-            .read()
-            .expect("value index lock poisoned")
-    }
-
-    pub fn get_mut(&self, slot: u32) -> std::sync::RwLockWriteGuard<'_, ValueIndex> {
-        self.indexes[slot as usize]
-            .write()
-            .expect("value index lock poisoned")
+    /// Issuing handles is serialized; cloning an already issued handle cannot
+    /// make an occupied slot appear free. No weak owner can revive a lease.
+    pub fn acquire(&self) -> Option<ValueIndexLease> {
+        let selected = {
+            let _allocation = self
+                .allocation
+                .lock()
+                .expect("value index allocation lock poisoned");
+            self.indexes.iter().enumerate().find_map(|(slot, owner)| {
+                (std::sync::Arc::strong_count(owner) == 1).then(|| ValueIndexLease {
+                    owner: std::sync::Arc::clone(owner),
+                    slot,
+                })
+            })
+        }?;
+        // The claim owns the only issued handle. Clear outside allocation
+        // ownership so an unrelated table can claim another reserved cache.
+        selected.write().clear();
+        Some(selected)
     }
 }
 
@@ -301,13 +310,14 @@ mod tests {
     #[test]
     fn shared_committed_publication_cache_slots_are_independent_and_budgeted() {
         let mut budget = Budget::new(ValueIndexPool::budget_bytes(2, 8));
-        let mut pool = ValueIndexPool::new(&mut budget, 2, 8).unwrap();
+        let pool = ValueIndexPool::new(&mut budget, 2, 8).unwrap();
         assert_eq!(budget.remaining(), 0);
         let first = pool.acquire().unwrap();
         let second = pool.acquire().unwrap();
+        let second_slot = second.slot();
         crate::mem::guard::forbid_alloc(|| {
-            let reader = pool.get(first);
-            let mut writer = pool.get_mut(second);
+            let reader = first.read();
+            let mut writer = second.write();
             writer.insert(7, 1).unwrap();
             writer.publish_at(9);
             assert!(reader.is_empty());
@@ -315,12 +325,135 @@ mod tests {
             assert!(writer.is_complete_at(9));
             drop(writer);
             drop(reader);
-            pool.release(second);
+            drop(second);
             let reused = pool.acquire().unwrap();
-            assert_eq!(reused, second);
-            assert!(pool.get(reused).is_complete_at(0));
-            assert!(pool.get(reused).is_empty());
+            assert_eq!(reused.slot(), second_slot);
+            assert!(reused.read().is_complete_at(0));
+            assert!(reused.read().is_empty());
         });
+    }
+
+    #[test]
+    fn value_cache_owners_prevent_reuse_until_every_reader_releases() {
+        let mut budget = Budget::new(ValueIndexPool::budget_bytes(1, 8));
+        let pool = ValueIndexPool::new(&mut budget, 1, 8).unwrap();
+        let original = pool.acquire().unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            original.write().insert(5, 11).unwrap();
+            let retained = original.clone();
+            drop(original);
+            assert!(pool.acquire().is_none());
+            let mut found = 0;
+            retained.read().probe(5, |row| found = row);
+            assert_eq!(found, 11);
+            drop(retained);
+            let replacement = pool.acquire().unwrap();
+            assert!(replacement.read().is_empty());
+            assert!(replacement.read().is_complete_at(0));
+        });
+    }
+
+    #[test]
+    fn value_cache_owners_keep_selected_values_after_pool_removal() {
+        let mut budget = Budget::new(ValueIndexPool::budget_bytes(1, 8));
+        let pool = ValueIndexPool::new(&mut budget, 1, 8).unwrap();
+        let retained = pool.acquire().unwrap();
+        retained.write().insert(5, 12).unwrap();
+        drop(pool);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut found = 0;
+            retained.read().probe(5, |row| found = row);
+            assert_eq!(found, 12);
+            retained.write().insert(6, 13).unwrap();
+        });
+    }
+
+    #[test]
+    fn value_cache_owners_concurrent_claims_never_share_an_occupied_slot() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const WORKERS: usize = 4;
+        let mut budget = Budget::new(ValueIndexPool::budget_bytes(WORKERS, 8));
+        let pool = ValueIndexPool::new(&mut budget, WORKERS, 8).unwrap();
+        let start = std::sync::Barrier::new(WORKERS);
+        let claims = [const { AtomicUsize::new(usize::MAX) }; WORKERS];
+        let failed = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let pool = &pool;
+                let start = &start;
+                let claims = &claims;
+                let failed = &failed;
+                scope.spawn(move || {
+                    crate::mem::guard::forbid_alloc(|| {
+                        for epoch in 1..=50 {
+                            start.wait();
+                            let selected = pool.acquire();
+                            claims[worker].store(
+                                selected.as_ref().map_or(usize::MAX, ValueIndexLease::slot),
+                                Ordering::Release,
+                            );
+                            if let Some(selected) = &selected {
+                                if selected.write().insert(worker as u64, epoch).is_err() {
+                                    failed.store(true, Ordering::Release);
+                                }
+                            } else {
+                                failed.store(true, Ordering::Release);
+                            }
+                            start.wait();
+                            if pool.acquire().is_some() {
+                                failed.store(true, Ordering::Release);
+                            }
+                            for other in 0..WORKERS {
+                                if other != worker
+                                    && claims[worker].load(Ordering::Acquire)
+                                        == claims[other].load(Ordering::Acquire)
+                                {
+                                    failed.store(true, Ordering::Release);
+                                }
+                            }
+                            if let Some(selected) = &selected {
+                                let mut found = 0;
+                                selected.read().probe(worker as u64, |row| found = row);
+                                if found != epoch {
+                                    failed.store(true, Ordering::Release);
+                                }
+                            }
+                            start.wait();
+                            drop(selected);
+                            start.wait();
+                        }
+                    })
+                });
+            }
+        });
+        assert!(
+            !failed.load(Ordering::Acquire),
+            "simultaneous claims lost or reused an occupied cache"
+        );
+        let held: [_; WORKERS] = std::array::from_fn(|_| pool.acquire().unwrap());
+        assert!(pool.acquire().is_none());
+        drop(held);
+        assert!(pool.acquire().is_some());
+    }
+
+    #[test]
+    fn value_cache_owners_startup_controls_and_slots_are_exactly_budgeted() {
+        let mut budget = Budget::new(ValueIndexPool::budget_bytes(0, 8));
+        let empty = ValueIndexPool::new(&mut budget, 0, 8).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        assert!(empty.acquire().is_none());
+        let mut short = Budget::new(size_of::<ValueIndexPool>() - 1);
+        let error = match ValueIndexPool::new(&mut short, 0, 8) {
+            Ok(_) => panic!("undersized cache controls accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.what, "value index allocation controls");
+        let mut short = Budget::new(ValueIndexPool::budget_bytes(2, 8) - 1);
+        let error = match ValueIndexPool::new(&mut short, 2, 8) {
+            Ok(_) => panic!("undersized cache payload accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.what, "value_index");
     }
 
     #[test]

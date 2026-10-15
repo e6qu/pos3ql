@@ -67,7 +67,7 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_map::FixedMap;
 use crate::mem::fixed_vec::FixedVec;
-use crate::mem::value_index::ValueIndexPool;
+use crate::mem::value_index::{ValueIndexLease, ValueIndexPool};
 use crate::pg::replication_client::{ConnectionInfo, ConnectionInfoError};
 use crate::sql::ast::{Collation, TablespaceCost};
 use crate::sql::eval::{SqlError, SqlState, hash_key, hash_key_collated, sqlstate};
@@ -2531,7 +2531,9 @@ impl TableSerialState {
 struct TablePublication {
     dirty: bool,
     generation: u64,
+    /// A complete candidate list and its count publish together.
     enforcers: [Option<Enforcer>; MAX_VALUE_ENFORCERS],
+    n_enforcers: usize,
 }
 
 pub struct Table {
@@ -2553,10 +2555,6 @@ pub struct Table {
     /// Ordered immutable row generations and their eviction boundaries.
     /// Capture and replacement share ownership until reader roots are retained.
     spill_generations: SpillGenerationRoster,
-    /// Value caches accelerating this table's uniqueness and equality probes,
-    /// one per distinct constrained or named-index tuple, rebuilt whenever the
-    /// definition/index set changes and maintained per committed row otherwise.
-    pub(crate) n_enforcers: usize,
 }
 
 /// Statistics for one stored column.
@@ -3525,9 +3523,14 @@ impl ExtendedStatisticsDef {
 /// A table's binding of one indexed tuple to its value cache: the key columns
 /// it covers and the pool slot holding the `value_hash → rowid` map. Constraint
 /// enforcement and eligible query scans share this lookup.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Enforcer {
-    slot: u32,
+    cache: ValueIndexLease,
+    metadata: EnforcerMetadata,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct EnforcerMetadata {
     columns: [u16; MAX_INDEX_COLS],
     n_cols: usize,
     /// A partial or expression index owns a distinct physical binding. Full
@@ -3561,6 +3564,19 @@ pub(crate) struct Enforcer {
     /// reslices use it to retain an unpublished generation when only another
     /// binding changed after the prior slice.
     durable_dirty_lsn: u64,
+}
+
+impl core::ops::Deref for Enforcer {
+    type Target = EnforcerMetadata;
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+
+impl core::ops::DerefMut for Enforcer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.metadata
+    }
 }
 
 impl Enforcer {
@@ -3838,11 +3854,15 @@ impl Table {
     pub(crate) fn dirty(&self) -> bool {
         self.publication().dirty
     }
+    pub(crate) fn enforcer_count(&self) -> usize {
+        self.publication().n_enforcers
+    }
+
     fn enforcer(&self, binding: usize) -> Option<Enforcer> {
-        self.publication().enforcers[binding]
+        self.publication().enforcers[binding].clone()
     }
     fn enforcers(&self) -> [Option<Enforcer>; MAX_VALUE_ENFORCERS] {
-        self.publication().enforcers
+        self.publication().enforcers.clone()
     }
 
     pub fn mark_dirty(&self) {
@@ -17766,7 +17786,8 @@ impl Storage {
                     publication: std::sync::Mutex::new(TablePublication {
                         dirty: false,
                         generation: 1,
-                        enforcers: [None; MAX_VALUE_ENFORCERS],
+                        enforcers: [const { None }; MAX_VALUE_ENFORCERS],
+                        n_enforcers: 0,
                     }),
                     statistics: TableStatisticsOwner::new(budget)?,
                     serial: std::sync::Mutex::new(TableSerialState::EMPTY),
@@ -17774,7 +17795,6 @@ impl Storage {
                         budget,
                         config.max_spill_generations_per_table,
                     )?,
-                    n_enforcers: 0,
                 })
                 .expect("sized to max_tables");
         }
@@ -31894,6 +31914,7 @@ impl Storage {
             ));
         }
         let mut publication = table.publication();
+        let n_enforcers = publication.n_enforcers;
         let generation = publication.generation.checked_add(1).ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -31941,17 +31962,13 @@ impl Storage {
             );
         }
         if rewritten {
-            for enforcer in publication.enforcers[..table.n_enforcers]
-                .iter_mut()
-                .flatten()
-            {
+            for enforcer in publication.enforcers[..n_enforcers].iter_mut().flatten() {
                 enforcer.durable_dirty = true;
                 enforcer.durable_rebuild = true;
                 enforcer.durable_dirty_lsn = commit_lsn;
             }
         } else {
-            let pool = &self.value_indexes;
-            for (binding, enforcer) in publication.enforcers[..table.n_enforcers]
+            for (binding, enforcer) in publication.enforcers[..n_enforcers]
                 .iter_mut()
                 .enumerate()
                 .filter_map(|(binding, enforcer)| {
@@ -31963,7 +31980,7 @@ impl Storage {
                 {
                     continue;
                 }
-                let mut index = pool.get_mut(enforcer.slot);
+                let mut index = enforcer.cache.write();
                 index.remove_rowid(rowid);
                 for &(_, hash) in inserts[..count]
                     .iter()
@@ -31974,6 +31991,7 @@ impl Storage {
                     }
                 }
                 index.publish_at(commit_lsn);
+                drop(index);
                 enforcer.durable_dirty = true;
                 enforcer.durable_dirty_lsn = commit_lsn;
             }
@@ -32004,6 +32022,19 @@ impl Storage {
         home: impl Into<RowByteRead>,
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
+        let bindings = self.tables[table_index].enforcers();
+        let count = bindings.iter().take_while(|entry| entry.is_some()).count();
+        self.row_enforcer_hashes_for(table_index, rowid, home, &bindings[..count], out)
+    }
+
+    fn row_enforcer_hashes_for(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        home: impl Into<RowByteRead>,
+        bindings: &[Option<Enforcer>],
+        out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
+    ) -> Result<usize, SqlError> {
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = self.tables[table_index].definition().schema(&mut schema);
         let arena = self
@@ -32014,7 +32045,13 @@ impl Storage {
         let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            self.values_enforcer_hashes(&arena, table_index, &values[..n_columns], out)
+            self.values_enforcer_hashes_for(
+                &arena,
+                table_index,
+                bindings,
+                &values[..n_columns],
+                out,
+            )
         });
         // SAFETY: callers receive only hashes and binding ordinals; expression
         // evaluation cannot retain values allocated above this row-local mark.
@@ -32022,20 +32059,21 @@ impl Storage {
         result
     }
 
-    fn values_enforcer_hashes(
+    fn values_enforcer_hashes_for(
         &self,
         arena: &Arena,
         table_index: usize,
+        bindings: &[Option<Enforcer>],
         values: &[Datum],
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
-        let n_enforcers = self.tables[table_index].n_enforcers;
         let mut n_out = 0;
-        for binding in 0..n_enforcers {
-            self.with_value_binding_values(
+        for (binding, selected) in bindings.iter().enumerate() {
+            let selected = selected.as_ref().expect("candidate binding");
+            self.with_value_binding_values_for(
                 arena,
                 table_index,
-                binding,
+                selected,
                 values,
                 |key, _, enforcer| {
                     let Some(key) = key else { return Ok(()) };
@@ -32101,8 +32139,19 @@ impl Storage {
         values: &[Datum],
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
+        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
+        self.with_value_binding_values_for(arena, table_index, &enforcer, values, visit)
+    }
+
+    fn with_value_binding_values_for<R>(
+        &self,
+        arena: &Arena,
+        table_index: usize,
+        enforcer: &Enforcer,
+        values: &[Datum],
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
         let table = &self.tables[table_index];
-        let enforcer = table.enforcer(binding).expect("binding");
         let mut key = [Datum::Null; MAX_INDEX_COLS];
         let index;
         if let Some(created_at) = enforcer.index_created_at {
@@ -32131,7 +32180,7 @@ impl Storage {
                     predicate,
                     arena,
                 )? {
-                    return visit(None, values, &enforcer);
+                    return visit(None, values, enforcer);
                 }
             }
             let mut expressions = [None; MAX_INDEX_COLS];
@@ -32155,7 +32204,7 @@ impl Storage {
                 key[position] = values[*column as usize];
             }
         }
-        visit(Some(&key[..enforcer.n_cols]), values, &enforcer)
+        visit(Some(&key[..enforcer.n_cols]), values, enforcer)
     }
 
     /// Probes the value cache for the indexed tuple covering exactly `columns`,
@@ -32172,7 +32221,7 @@ impl Storage {
         visit: impl FnMut(u64, Option<&[u8]>) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
-        let Some(i) = (0..table.n_enforcers).find(|index| {
+        let Some(i) = (0..table.enforcer_count()).find(|index| {
             let enforcer = table.enforcer(*index).expect("enforcer present");
             enforcer.index_created_at.is_none() && enforcer.columns() == columns
         }) else {
@@ -32189,12 +32238,13 @@ impl Storage {
         mut visit: impl FnMut(u64, Option<&[u8]>) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
-        if i < table.n_enforcers {
+        if i < table.enforcer_count() {
             let e = table.enforcer(i).expect("enforcer present");
-            let index = self.value_indexes.get(e.slot);
+            let index = e.cache.read();
             if index.is_complete_at(self.commit_snapshot()) {
                 let candidates = self.row_walks.retain_value_probe(&index, hash)?;
                 drop(index);
+                drop(e);
                 for rowid in candidates.iter() {
                     visit(rowid, None)?;
                 }
@@ -32204,6 +32254,7 @@ impl Storage {
             let Some(handle) = e.durable else {
                 return Ok(false);
             };
+            drop(e);
             if self.commit_snapshot() < handle.published_lsn {
                 return Ok(false);
             }
@@ -32278,24 +32329,21 @@ impl Storage {
     /// Physical cache completeness; query usability also checks its snapshot.
     pub fn value_cache_complete(&self, table_index: usize, columns: &[u16]) -> bool {
         let table = &self.tables[table_index];
-        (0..table.n_enforcers).any(|index| {
+        (0..table.enforcer_count()).any(|index| {
             let enforcer = table.enforcer(index).expect("enforcer present");
             enforcer.index_created_at.is_none()
                 && enforcer.columns() == columns
-                && self.value_indexes.get(enforcer.slot).is_complete()
+                && enforcer.cache.read().is_complete()
         })
     }
 
     pub fn value_probe_complete(&self, table_index: usize, columns: &[u16]) -> bool {
         let table = &self.tables[table_index];
-        (0..table.n_enforcers).any(|index| {
+        (0..table.enforcer_count()).any(|index| {
             let enforcer = table.enforcer(index).expect("enforcer present");
             enforcer.index_created_at.is_none()
                 && enforcer.columns() == columns
-                && (self
-                    .value_indexes
-                    .get(enforcer.slot)
-                    .is_complete_at(self.commit_snapshot())
+                && (enforcer.cache.read().is_complete_at(self.commit_snapshot())
                     || enforcer
                         .durable
                         .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn))
@@ -32304,7 +32352,7 @@ impl Storage {
 
     pub fn value_durable_complete(&self, table_index: usize, columns: &[u16]) -> bool {
         let table = &self.tables[table_index];
-        (0..table.n_enforcers).any(|index| {
+        (0..table.enforcer_count()).any(|index| {
             let enforcer = table.enforcer(index).expect("enforcer present");
             enforcer.index_created_at.is_none()
                 && enforcer.columns() == columns
@@ -32320,7 +32368,7 @@ impl Storage {
         created_at: u64,
     ) -> Option<usize> {
         let table = &self.tables[table_index];
-        (0..table.n_enforcers).find(|binding| {
+        (0..table.enforcer_count()).find(|binding| {
             table
                 .enforcer(*binding)
                 .is_some_and(|enforcer| enforcer.index_created_at == Some(created_at))
@@ -32601,20 +32649,14 @@ impl Storage {
     pub(crate) fn value_binding_cache_complete(&self, table_index: usize, binding: usize) -> bool {
         self.tables[table_index]
             .enforcer(binding)
-            .is_some_and(|enforcer| {
-                self.value_indexes
-                    .get(enforcer.slot)
-                    .is_complete_at(self.commit_snapshot())
-            })
+            .is_some_and(|enforcer| enforcer.cache.read().is_complete_at(self.commit_snapshot()))
     }
 
     pub(crate) fn value_binding_probe_complete(&self, table_index: usize, binding: usize) -> bool {
         self.tables[table_index]
             .enforcer(binding)
             .is_some_and(|enforcer| {
-                self.value_indexes
-                    .get(enforcer.slot)
-                    .is_complete_at(self.commit_snapshot())
+                enforcer.cache.read().is_complete_at(self.commit_snapshot())
                     || enforcer
                         .durable
                         .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn)
@@ -32822,7 +32864,7 @@ impl Storage {
         mut visit: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
-        let Some((binding, handle)) = (0..table.n_enforcers).find_map(|binding| {
+        let Some((binding, handle)) = (0..table.enforcer_count()).find_map(|binding| {
             let enforcer = table.enforcer(binding).expect("enforcer");
             (enforcer.index_created_at.is_none() && enforcer.columns() == columns)
                 .then_some((binding, enforcer.durable?))
@@ -32904,7 +32946,7 @@ impl Storage {
         visit: impl FnMut(u64, u64, &[u8], &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
-        let Some(binding) = (0..table.n_enforcers).find(|binding| {
+        let Some(binding) = (0..table.enforcer_count()).find(|binding| {
             let enforcer = table.enforcer(*binding).expect("enforcer");
             enforcer.index_created_at.is_none() && enforcer.columns() == columns
         }) else {
@@ -33330,7 +33372,7 @@ impl Storage {
     }
 
     pub(crate) fn value_binding_count(&self, table_index: usize) -> usize {
-        self.tables[table_index].n_enforcers
+        self.tables[table_index].enforcer_count()
     }
 
     pub(crate) fn value_binding_columns(
@@ -33400,7 +33442,7 @@ impl Storage {
     }
 
     pub(crate) fn mark_value_bindings_changed_at(&mut self, table_index: usize, dirty_lsn: u64) {
-        let n_enforcers = self.tables[table_index].n_enforcers;
+        let n_enforcers = self.tables[table_index].enforcer_count();
         for enforcer in self.tables[table_index].publication().enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
@@ -33412,7 +33454,7 @@ impl Storage {
 
     fn mark_value_bindings_rebuild_at(&mut self, table_index: usize, dirty_lsn: u64) {
         self.mark_value_bindings_changed_at(table_index, dirty_lsn);
-        let n_enforcers = self.tables[table_index].n_enforcers;
+        let n_enforcers = self.tables[table_index].enforcer_count();
         for enforcer in self.tables[table_index].publication().enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
@@ -33478,7 +33520,7 @@ impl Storage {
         include_mask: ColumnSet,
         handle: Option<crate::store::ValueIndexHandle>,
     ) -> Result<(), SqlError> {
-        let n_enforcers = self.tables[table_index].n_enforcers;
+        let n_enforcers = self.tables[table_index].enforcer_count();
         let mut publication = self.tables[table_index].publication();
         let Some(enforcer) = publication.enforcers[..n_enforcers]
             .iter_mut()
@@ -33725,26 +33767,9 @@ impl Storage {
     /// enforcer list. Called before a slot is reused and when a table is
     /// dropped.
     fn release_enforcers(&mut self, table_index: usize) {
-        let n = self.tables[table_index].n_enforcers;
-        if n == 0 {
-            return;
-        }
-        let mut slots = [u32::MAX; MAX_VALUE_ENFORCERS];
-        for (i, s) in slots.iter_mut().enumerate().take(n) {
-            if let Some(e) = self.tables[table_index].enforcer(i) {
-                *s = e.slot;
-            }
-        }
-        {
-            let pool = &mut self.value_indexes;
-            for &slot in slots.iter().take(n) {
-                if slot != u32::MAX {
-                    pool.release(slot);
-                }
-            }
-        }
-        self.tables[table_index].publication().enforcers = [None; MAX_VALUE_ENFORCERS];
-        self.tables[table_index].n_enforcers = 0;
+        let mut publication = self.tables[table_index].publication();
+        publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
+        publication.n_enforcers = 0;
     }
 
     /// Rebuilds every live table's value-index enforcers from its committed
@@ -33785,12 +33810,7 @@ impl Storage {
         table_index: usize,
         txid: Option<u32>,
     ) -> Result<(), SqlError> {
-        let result = self.build_enforcers_visible(table_index, txid);
-        if result.is_err() {
-            // A partial population cannot advertise complete lookup results.
-            self.release_enforcers(table_index);
-        }
-        result
+        self.build_enforcers_visible(table_index, txid)
     }
 
     fn build_enforcers_visible(
@@ -33801,13 +33821,19 @@ impl Storage {
         let new_dirty_lsn = self.lsn.saturating_add(1);
         // DDL reshapes the cache slots, but an unchanged column tuple keeps
         // its manifest-published object generation.
-        let mut published = [None; MAX_VALUE_ENFORCERS];
-        let n_published = self.tables[table_index].n_enforcers;
-        for (index, entry) in published.iter_mut().enumerate().take(n_published) {
-            let enforcer = self.tables[table_index].enforcer(index).expect("enforcer");
-            *entry = Some(enforcer);
-        }
-        self.release_enforcers(table_index);
+        let (published, n_published, expected_generation) = {
+            let mut publication = self.tables[table_index].publication();
+            let metadata: [Option<EnforcerMetadata>; MAX_VALUE_ENFORCERS] =
+                core::array::from_fn(|index| {
+                    publication.enforcers[index]
+                        .as_ref()
+                        .map(|entry| entry.metadata)
+                });
+            let count = publication.n_enforcers;
+            publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
+            publication.n_enforcers = 0;
+            (metadata, count, publication.generation)
+        };
         #[derive(Clone, Copy)]
         struct WantedBinding {
             columns: [u16; MAX_INDEX_COLS],
@@ -34005,12 +34031,12 @@ impl Storage {
             want[n_want].include_mask = include_mask;
             n_want += 1;
         }
+        let mut candidate: [Option<Enforcer>; MAX_VALUE_ENFORCERS] =
+            [const { None }; MAX_VALUE_ENFORCERS];
         for (w, wanted) in want.iter().take(n_want).enumerate() {
-            let slot = match self.value_indexes.acquire() {
+            let cache = match self.value_indexes.acquire() {
                 Some(s) => s,
                 None => {
-                    // Give back what this call already took, then fail loudly.
-                    self.release_enforcers(table_index);
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "value index pool exhausted (raise max_value_indexes)"
@@ -34033,58 +34059,75 @@ impl Storage {
                         && enforcer.columns[..enforcer.n_cols] == wanted.columns[..wanted.n_columns]
                 })
                 .copied();
-            self.tables[table_index].publication().enforcers[w] = Some(Enforcer {
-                slot,
-                columns: wanted.columns,
-                n_cols: wanted.n_columns,
-                index_created_at: wanted.index_created_at,
-                evaluation_txid: txid.unwrap_or(0),
-                key_types: wanted.key_types,
-                collations: wanted.collations,
-                ordered: wanted.ordered,
-                include_mask: wanted.include_mask,
-                dependency_mask: wanted.dependency_mask,
-                durable: prior.and_then(|enforcer| enforcer.durable),
-                durable_dirty: prior.is_none_or(|enforcer| enforcer.durable_dirty),
-                durable_rebuild: prior.is_none_or(|enforcer| enforcer.durable_rebuild),
-                durable_dirty_lsn: prior
-                    .map_or(new_dirty_lsn, |enforcer| enforcer.durable_dirty_lsn),
+            candidate[w] = Some(Enforcer {
+                cache,
+                metadata: EnforcerMetadata {
+                    columns: wanted.columns,
+                    n_cols: wanted.n_columns,
+                    index_created_at: wanted.index_created_at,
+                    evaluation_txid: txid.unwrap_or(0),
+                    key_types: wanted.key_types,
+                    collations: wanted.collations,
+                    ordered: wanted.ordered,
+                    include_mask: wanted.include_mask,
+                    dependency_mask: wanted.dependency_mask,
+                    durable: prior.and_then(|enforcer| enforcer.durable),
+                    durable_dirty: prior.is_none_or(|enforcer| enforcer.durable_dirty),
+                    durable_rebuild: prior.is_none_or(|enforcer| enforcer.durable_rebuild),
+                    durable_dirty_lsn: prior
+                        .map_or(new_dirty_lsn, |enforcer| enforcer.durable_dirty_lsn),
+                },
             });
-            // Keep the installed prefix visible to `release_enforcers`, so an
-            // acquire failure later in this loop returns every slot already
-            // taken by this rebuild.
-            self.tables[table_index].n_enforcers = w + 1;
         }
-        self.populate_enforcers(table_index)?;
+        self.populate_enforcers(table_index, &candidate[..n_want])?;
+        let mut publication = self.tables[table_index].publication();
+        if publication.generation != expected_generation {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table changed while its value caches were being built"
+            ));
+        }
+        publication.enforcers = candidate;
+        publication.n_enforcers = n_want;
         Ok(())
     }
 
-    /// Populates startup-sized cache slots from committed row images.
-    fn populate_enforcers(&mut self, table_index: usize) -> Result<(), SqlError> {
-        if self.tables[table_index].n_enforcers == 0 {
+    /// Populates a private replacement set before publishing any binding.
+    fn populate_enforcers(
+        &self,
+        table_index: usize,
+        bindings: &[Option<Enforcer>],
+    ) -> Result<(), SqlError> {
+        let n_enf = bindings.len();
+        if n_enf == 0 {
             return Ok(());
         }
-        self.populate_into(table_index, &self.value_indexes)
-    }
-
-    fn populate_into(&self, table_index: usize, pool: &ValueIndexPool) -> Result<(), SqlError> {
-        let n_enf = self.tables[table_index].n_enforcers;
-        let mut slots = [u32::MAX; MAX_VALUE_ENFORCERS];
+        let mut slots: [Option<ValueIndexLease>; MAX_VALUE_ENFORCERS] =
+            [const { None }; MAX_VALUE_ENFORCERS];
         for (i, s) in slots.iter_mut().enumerate().take(n_enf) {
-            *s = self.tables[table_index].enforcer(i).expect("enforcer").slot;
+            *s = Some(
+                bindings[i]
+                    .as_ref()
+                    .expect("candidate binding")
+                    .cache
+                    .clone(),
+            );
         }
         let boundary = self.tables[table_index]
             .rows
             .iter()
             .fold(self.lsn(), |lsn, (_, state)| lsn.max(state.committed_lsn));
-        for &slot in &slots[..n_enf] {
-            pool.get_mut(slot).publish_at(boundary);
+        for slot in &slots[..n_enf] {
+            slot.as_ref()
+                .expect("selected cache")
+                .write()
+                .publish_at(boundary);
         }
         let mut incomplete = false;
         let mut buf = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
         let mut insert_hashes = |rowid: u64, lsn: u64, hashes: &[(usize, u64)]| {
             for &(binding, hash) in hashes {
-                let mut index = pool.get_mut(slots[binding]);
+                let mut index = slots[binding].as_ref().expect("selected cache").write();
                 index.publish_at(lsn);
                 if index.insert(hash, rowid).is_err() {
                     incomplete = true;
@@ -34099,13 +34142,14 @@ impl Storage {
             let Some(home) = self.committed_row_home(table_index, rowid, state)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
-            let count = self.row_enforcer_hashes(table_index, rowid, home, &mut buf)?;
+            let count =
+                self.row_enforcer_hashes_for(table_index, rowid, home, bindings, &mut buf)?;
             Ok(insert_hashes(rowid, lsn, &buf[..count]))
         })?;
         if overlay.is_continue() {
             let mut schema = [ColType::Bool; MAX_COLUMNS];
             let n_columns = self.tables[table_index].definition().schema(&mut schema);
-            let dependency_mask = self.tables[table_index].enforcers()[..n_enf]
+            let dependency_mask = bindings
                 .iter()
                 .flatten()
                 .fold(ColumnSet::EMPTY, |mask, enforcer| {
@@ -34137,7 +34181,13 @@ impl Storage {
                         }
                         SpilledRowRepresentation::Values(values) => values,
                     };
-                    let hashes = self.values_enforcer_hashes(&arena, table_index, values, &mut buf);
+                    let hashes = self.values_enforcer_hashes_for(
+                        &arena,
+                        table_index,
+                        bindings,
+                        values,
+                        &mut buf,
+                    );
                     // SAFETY: `hashes` retains only fixed hash values and
                     // binding ordinals from expression evaluation.
                     unsafe { arena.rewind_to(mark) };
@@ -34149,8 +34199,11 @@ impl Storage {
         if incomplete {
             // A stopped walk can leave any cache without later rows, including
             // one that still had room when another binding filled.
-            for &slot in &slots[..n_enf] {
-                pool.get_mut(slot).mark_incomplete();
+            for slot in &slots[..n_enf] {
+                slot.as_ref()
+                    .expect("selected cache")
+                    .write()
+                    .mark_incomplete();
             }
         }
         Ok(())
@@ -53710,6 +53763,73 @@ mod tests {
     }
 
     #[test]
+    fn value_cache_owners_survive_replacement_and_storage_removal() {
+        let mut config = test_config();
+        config.max_value_indexes = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut definition = make_def("owned_cache", &[("id", ColType::Int4, true)]);
+        definition.columns[0].unique = true;
+        let table = storage.create_table(definition).unwrap();
+        let selected = storage.tables[table].enforcer(0).unwrap();
+        selected.cache.write().insert(41, 99).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.refresh_enforcers(table).unwrap();
+            let replacement = storage.tables[table].enforcer(0).unwrap();
+            assert_ne!(replacement.cache.slot(), selected.cache.slot());
+            assert!(replacement.cache.read().is_empty());
+            let mut original = 0;
+            selected.cache.read().probe(41, |row| original = row);
+            assert_eq!(original, 99);
+            assert_eq!(selected.columns(), &[0]);
+        });
+        drop(storage);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut original = 0;
+            selected.cache.read().probe(41, |row| original = row);
+            assert_eq!(original, 99);
+        });
+    }
+
+    #[test]
+    fn value_cache_owners_failed_candidate_releases_capacity_and_publishes_no_prefix() {
+        let mut config = test_config();
+        config.max_value_indexes = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let mut definition = make_def(
+            "cache_candidate",
+            &[("id", ColType::Int4, true), ("other", ColType::Int4, true)],
+        );
+        definition.columns[0].unique = true;
+        let table = storage.create_table(definition).unwrap();
+        let selected = storage.tables[table].enforcer(0).unwrap();
+        selected.cache.write().insert(41, 99).unwrap();
+        storage.tables[table].definition_mut().columns[1].unique = true;
+        crate::mem::guard::forbid_alloc(|| {
+            let error = storage.refresh_enforcers(table).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("max_value_indexes"));
+            {
+                let publication = storage.tables[table].publication();
+                assert_eq!(publication.n_enforcers, 0);
+                assert!(publication.enforcers.iter().all(Option::is_none));
+            }
+            let free = storage.value_indexes.acquire().unwrap();
+            assert!(storage.value_indexes.acquire().is_none());
+            drop(free);
+            let mut original = 0;
+            selected.cache.read().probe(41, |row| original = row);
+            assert_eq!(original, 99);
+            drop(selected);
+            storage.refresh_enforcers(table).unwrap();
+            let publication = storage.tables[table].publication();
+            assert_eq!(publication.n_enforcers, 2);
+            assert!(publication.enforcers[..2].iter().all(Option::is_some));
+        });
+    }
+
+    #[test]
     fn cluster_metadata_failed_table_creation_releases_identity_and_value_bindings() {
         let mut config = test_config();
         config.max_value_indexes = 2;
@@ -53748,14 +53868,14 @@ mod tests {
                 assert_eq!(rejected.ownership().owner, Ownership::BOOTSTRAP.owner);
                 assert!(rejected.ownership().pending.is_none());
                 assert_eq!(rejected.existence(), CatalogDdlState::Absent);
-                assert_eq!(rejected.n_enforcers, 0);
+                assert_eq!(rejected.enforcer_count(), 0);
                 assert!(rejected.enforcers().iter().all(Option::is_none));
-                assert_eq!(storage.tables[retained_slot].n_enforcers, 1);
+                assert_eq!(storage.tables[retained_slot].enforcer_count(), 1);
                 let mut replacement = retained;
                 replacement.name = SqlName::parse("replacement").unwrap();
                 let reused = storage.create_table_in(replacement, 8).unwrap();
                 assert_eq!(reused, slot);
-                assert_eq!(storage.tables[reused].n_enforcers, 1);
+                assert_eq!(storage.tables[reused].enforcer_count(), 1);
                 storage.rollback_create(reused);
             }
         });

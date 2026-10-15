@@ -698,7 +698,6 @@ fn sql_fail(e: SqlError) -> Outcome {
 
 mod describe;
 pub(crate) use describe::CatalogCols;
-pub(crate) use describe::describe_returning_items;
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
@@ -713,6 +712,7 @@ pub(crate) use describe::{
     infer_type_catalog, intrinsic_record_field_meta, record_shape_pool_bytes,
     routine_result_metadata, unify_numeric_tower,
 };
+pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
 pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_types};
 
 mod projected;

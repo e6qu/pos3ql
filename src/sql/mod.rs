@@ -386,6 +386,14 @@ impl core::ops::DerefMut for QueryWorkspaces {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ProtocolReset {
+    #[default]
+    None,
+    Statements,
+    All,
+}
+
 /// The query engine: catalog, memtable storage, WAL, object-storage
 /// checkpointing, and statement execution.
 pub struct Engine {
@@ -441,7 +449,7 @@ pub struct Engine {
     database_connections: FixedVec<u16>,
     active_system_settings: ActiveSystemSettings,
     object_store_credentials_reload_requested: bool,
-    discard_protocol_state: bool,
+    protocol_reset: ProtocolReset,
     clean_shutdown_path: std::path::PathBuf,
     #[cfg(test)]
     _test_data_dir_cleanup: Option<std::sync::Arc<crate::config::TestDataDirCleanup>>,
@@ -3097,8 +3105,8 @@ impl Engine {
             .expect("an authenticated database connection is released once");
     }
 
-    pub(crate) fn take_discard_protocol_state(&mut self) -> bool {
-        core::mem::take(&mut self.discard_protocol_state)
+    pub(crate) fn take_protocol_reset(&mut self) -> ProtocolReset {
+        core::mem::take(&mut self.protocol_reset)
     }
 
     pub(crate) fn database_connection_capacity(&self) -> usize {
@@ -3489,7 +3497,7 @@ impl Engine {
             database_connections,
             active_system_settings: ActiveSystemSettings::new(active_system_settings),
             object_store_credentials_reload_requested: false,
-            discard_protocol_state: false,
+            protocol_reset: ProtocolReset::None,
             clean_shutdown_path,
             #[cfg(test)]
             _test_data_dir_cleanup: config.test_data_dir_cleanup.clone(),
@@ -8376,8 +8384,15 @@ impl Engine {
             }
         } else {
             sqlprep.clear();
+            if self.protocol_reset != ProtocolReset::All {
+                self.protocol_reset = ProtocolReset::Statements;
+            }
         }
-        responder.command_complete("DEALLOCATE")?;
+        responder.command_complete(if name.is_some() {
+            "DEALLOCATE"
+        } else {
+            "DEALLOCATE ALL"
+        })?;
         Ok(Ok(()))
     }
 
@@ -8405,7 +8420,7 @@ impl Engine {
                     return Ok(Err(error));
                 }
                 self.notify.drop_conn(self.work.connection_id());
-                self.discard_protocol_state = true;
+                self.protocol_reset = ProtocolReset::All;
             }
             ast::DiscardTarget::Sequences => guc.seq_session().discard(),
             ast::DiscardTarget::Plans | ast::DiscardTarget::Temporary => {}
@@ -10208,66 +10223,7 @@ impl Engine {
         txn: &TxnState,
         columns: &mut [ColDesc<'a>],
     ) -> Result<usize, SqlError> {
-        if let Stmt::Merge(merge) = statement {
-            if merge.returning.is_empty() {
-                return Ok(0);
-            }
-            return exec::describe_merge_returning(&self.storage, txn.txid, merge, arena, columns);
-        }
-        let (target, returning, target_alias) = match statement {
-            Stmt::Insert(insert) => {
-                let insert = *insert;
-                (insert.table, insert.returning, None)
-            }
-            Stmt::Update(update) => {
-                let update = *update;
-                (update.table, update.returning, update.alias)
-            }
-            Stmt::Delete(delete) => {
-                let delete = *delete;
-                (delete.table, delete.returning, delete.alias)
-            }
-            _ => return Ok(0),
-        };
-        if returning.is_empty() {
-            return Ok(0);
-        }
-        let (target, returning, target_alias) =
-            match query::resolve_view_for_dml(&self.storage, target, txn.txid, arena) {
-                Ok(Some(view)) => {
-                    let rewritten = query::rewrite_view_dml(
-                        statement,
-                        target.name,
-                        view.base.name,
-                        view.base.schema.expect("view base is qualified"),
-                        view.columns,
-                        view.base_columns,
-                        &self.storage,
-                        txn.txid,
-                        arena,
-                    )?;
-                    let (returning, target_alias) = match rewritten {
-                        Stmt::Insert(insert) => (insert.returning, None),
-                        Stmt::Update(update) => (update.returning, update.alias),
-                        Stmt::Delete(delete) => (delete.returning, delete.alias),
-                        _ => unreachable!("view rewrite keeps its statement kind"),
-                    };
-                    (view.base, returning, target_alias)
-                }
-                Ok(None) => (target, returning, target_alias),
-                Err(error) => return Err(error),
-            };
-        let table_index = exec::resolve_dml_table(&self.storage, &target, txn.txid)?;
-        let definition = self.storage.table_def(table_index, txn.txid);
-        exec::describe_returning_items(
-            returning,
-            Some(&definition),
-            target_alias,
-            Some(&self.storage),
-            txn.txid,
-            arena,
-            columns,
-        )
+        exec::describe_data_modification_columns(&self.storage, statement, arena, txn.txid, columns)
     }
 
     fn describe_data_modification<'a>(
@@ -10558,69 +10514,19 @@ impl Engine {
                     txn.txid,
                 )),
             )?;
-            let returning = match dml {
-                Stmt::Insert(i) => (&i.table, i.returning),
-                Stmt::Update(u) => (&u.table, u.returning),
-                Stmt::Delete(d) => (&d.table, d.returning),
-                Stmt::Merge(m) => (&m.target, m.returning),
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "a data-modifying WITH sub-statement must be INSERT, UPDATE, DELETE or MERGE"
-                    ));
-                }
-            };
-            // Describe the RETURNING columns against the target table, applying
-            // the CTE's optional rename list.
+            if !matches!(
+                dml,
+                Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
+            ) {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "a data-modifying WITH sub-statement must be INSERT, UPDATE, DELETE or MERGE"
+                ));
+            }
+            // Protocol and CTE outputs share view rewriting, target ownership,
+            // aliases, and catalog-derived result types.
             let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
-            let ncols = match dml {
-                Stmt::Merge(merge) => exec::describe_merge_returning(
-                    &self.storage,
-                    txn.txid,
-                    merge,
-                    arena,
-                    &mut descs,
-                )?,
-                _ => {
-                    let target = returning.0;
-                    let described_target =
-                        match query::resolve_view_for_dml(&self.storage, *target, txn.txid, arena)?
-                        {
-                            Some(view) => view.base,
-                            None => *target,
-                        };
-                    let idx = crate::sql::exec::resolve_dml_table(
-                        &self.storage,
-                        &described_target,
-                        txn.txid,
-                    )?;
-                    let def = arena
-                        .alloc(*self.storage.table_def(idx, txn.txid))
-                        .map_err(|_| query::arena_full_pub())?;
-                    let mut local = [ColDesc::new("", 0, 0); MAX_PROJ];
-                    let count = exec::describe_returning_items(
-                        returning.1,
-                        Some(&*def),
-                        match dml {
-                            Stmt::Insert(_) => None,
-                            Stmt::Update(update) => update.alias,
-                            Stmt::Delete(delete) => delete.alias,
-                            _ => unreachable!(),
-                        },
-                        Some(&self.storage),
-                        txn.txid,
-                        arena,
-                        &mut local,
-                    )?;
-                    for index in 0..count {
-                        descs[index] = local[index];
-                        descs[index].name = arena
-                            .alloc_str(local[index].name)
-                            .map_err(|_| query::arena_full_pub())?;
-                    }
-                    count
-                }
-            };
+            let ncols = self.describe_data_modification_columns(dml, arena, txn, &mut descs)?;
             if cte.columns.len() > ncols {
                 return Err(sql_err!(
                     sqlstate::INVALID_COLUMN_REFERENCE,
@@ -10633,8 +10539,7 @@ impl Engine {
             let mut names: [&str; MAX_PROJ] = [""; MAX_PROJ];
             let mut types = [(0i32, 0i16, -1i32); MAX_PROJ];
             for i in 0..ncols {
-                // Copy the name into the statement arena: a described column
-                // name borrows the (local, owned) table def, which drops here.
+                // Materialized names outlive the local description and schema owner.
                 let nm = cte.columns.get(i).copied().unwrap_or(descs[i].name);
                 names[i] = arena.alloc_str(nm).map_err(|_| query::arena_full_pub())?;
                 types[i] = (descs[i].type_oid, descs[i].typlen, descs[i].type_mod);

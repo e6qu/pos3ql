@@ -177,7 +177,24 @@ fn expand_ctes_with_path<'a>(
                 cte.name
             ));
         }
-        if cte.recursive && self_references > 0 {
+        if let Some(dml) = cte.dml {
+            let expanded = match dml {
+                Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
+                Stmt::Update(update) => Stmt::Update(subst_update(update, context, arena)?),
+                Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
+                Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "a data-modifying WITH sub-statement must be INSERT, UPDATE, DELETE or MERGE"
+                    ));
+                }
+            };
+            let entry = describe_dml_materialized(cte, &expanded, storage, txid, arena)?;
+            materialized
+                .push((cte.name, entry))
+                .map_err(|_| arena_full())?;
+        } else if cte.recursive && self_references > 0 {
             let entry = describe_recursive_materialized(cte, context, storage, txid, arena)?;
             materialized
                 .push((cte.name, entry))
@@ -1490,7 +1507,16 @@ fn expand_view_returning<'a>(
                 count += 1;
             }
         } else {
-            output[count] = *item;
+            // Binding a view column to storage must preserve its output name.
+            output[count] = match item {
+                SelectItem::Expr { expression, alias } => SelectItem::Expr {
+                    expression,
+                    alias: Some(
+                        alias.unwrap_or_else(|| crate::sql::exec::derived_name(expression)),
+                    ),
+                },
+                _ => *item,
+            };
             count += 1;
         }
     }
@@ -3165,6 +3191,69 @@ fn append_recursive_state<'a>(
     arena
         .alloc(SetTree::Select(&*select))
         .map(|tree| &*tree)
+        .map_err(|_| arena_full())
+}
+
+/// Only the output schema is needed by Describe; no CTE may change data here.
+fn describe_dml_materialized<'a>(
+    cte: &'a Cte<'a>,
+    statement: &Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a MaterializedCte<'a>, SqlError> {
+    let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let count = crate::sql::exec::describe_data_modification_columns(
+        storage,
+        statement,
+        arena,
+        txid,
+        &mut described,
+    )?;
+    if cte.columns.len() > count {
+        return Err(sql_err!(
+            sqlstate::INVALID_COLUMN_REFERENCE,
+            "WITH query \"{}\" has {} columns available but {} columns specified",
+            cte.name,
+            count,
+            cte.columns.len()
+        ));
+    }
+    let mut names = [""; MAX_PROJ];
+    for (index, name) in names.iter_mut().enumerate().take(count) {
+        *name = arena
+            .alloc_str(
+                cte.columns
+                    .get(index)
+                    .copied()
+                    .unwrap_or(described[index].name),
+            )
+            .map_err(|_| arena_full())?;
+    }
+    let column_names = arena
+        .alloc_slice_copy(&names[..count])
+        .map_err(|_| arena_full())?;
+    let column_types = arena
+        .alloc_slice_with(count, |index| {
+            (
+                described[index].type_oid,
+                described[index].typlen,
+                described[index].type_mod,
+            )
+        })
+        .map_err(|_| arena_full())?;
+    let column_collations = arena
+        .alloc_slice_with(count, |index| described[index].collation)
+        .map_err(|_| arena_full())?;
+    arena
+        .alloc(MaterializedCte {
+            column_names,
+            column_types,
+            column_collations,
+            definition: None,
+            source: crate::sql::ast::MaterializedCteSource::Inline(&[]),
+        })
+        .map(|relation| &*relation)
         .map_err(|_| arena_full())
 }
 

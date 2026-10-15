@@ -148,6 +148,23 @@ progress and leaves later release notifications pending for the next attempt.
 keeping an unrelated customer update waiting for every table to be visited.
 A new report admitted between cleanup batches still keeps the versions it needs.
 
+Client descriptions and data-changing WITH queries use the same DML output
+analysis, including view-column rewriting and original output names. Their target definition comes from
+the existing startup-owned image pool. Live table and pending-schema guards
+release before nested result-type lookup; a WITH query no longer puts a complete
+wide target definition into its statement arena just to describe its output. Reading
+the WITH result reserves its own relation schema in the statement buffer.
+Exhaustion returns `54000` and rolls back the change; a narrower query can retry
+within the same startup budget.
+
+For a view that calls an order's `amount` column `total`, an update inside a
+WITH query returning `total` reports that name and the original numeric type.
+Preparing or describing that query determines its columns without updating an order.
+`DEALLOCATE ALL` releases client-prepared names as well as SQL PREPARE names.
+Already bound portals keep their original statements until closed; replacement
+names cannot redirect their execution. Repeated client cache resets reuse the
+same fixed pool.
+
 **User example:** a storage check started for an old orders table cannot start
 reading the replacement orders table through the reused internal slot. Bytes
 it already selected stay readable; a later admission fails explicitly.

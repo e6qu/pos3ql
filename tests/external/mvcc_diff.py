@@ -163,6 +163,55 @@ def dml_target_transcript(reader, _writer) -> list[str]:
         reader.execute("DROP FUNCTION IF EXISTS dml_target_action() CASCADE")
 
 
+def dml_description_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE described_orders_diff(id integer PRIMARY KEY, amount bigint, label text)")
+    writer.execute("INSERT INTO described_orders_diff VALUES (1, 10, 'first')")
+    writer.execute("CREATE VIEW described_view_diff(order_id, total, note) AS SELECT id, amount, label FROM described_orders_diff")
+    results = []
+    try:
+        cases = [
+            ("update", "WITH changed AS (UPDATE described_view_diff SET total = total + 2 WHERE order_id = 1 RETURNING order_id, total, note) SELECT order_id, total, note FROM changed"),
+            ("insert", "WITH changed AS (INSERT INTO described_view_diff VALUES (2, 20, 'second') RETURNING order_id, total, note) SELECT order_id, total, note FROM changed"),
+            ("delete", "WITH changed AS (DELETE FROM described_view_diff WHERE order_id = 1 RETURNING order_id, total, note) SELECT order_id, total, note FROM changed"),
+            ("empty", "WITH changed AS (UPDATE described_view_diff SET total = total WHERE false RETURNING order_id, total, note) SELECT order_id, total, note FROM changed"),
+            ("renamed", "WITH changed(order_number, spent, message) AS (UPDATE described_view_diff SET total = total WHERE order_id = 1 RETURNING *) SELECT order_number, spent, message FROM changed"),
+            ("prepared", "UPDATE described_view_diff SET total = total WHERE order_id = 1 RETURNING order_id, total, note"),
+        ]
+        for label, statement in cases:
+            writer.execute("TRUNCATE described_orders_diff")
+            writer.execute("INSERT INTO described_orders_diff VALUES (1, 10, 'first')")
+            try:
+                cursor = reader.execute(statement, prepare=True)
+                names = [column.name for column in cursor.description]
+                types = [column.type_code for column in cursor.description]
+                rows = cursor.fetchall()
+                results.append(f"dml_description_{label}=names:{names},types:{types},rows:{rows}")
+            except psycopg.Error as error:
+                results.append(f"dml_description_{label}=error:{error.sqlstate}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE described_orders_diff CASCADE")
+
+
+def prepared_statement_cleanup_transcript(reader) -> list[str]:
+    # Rollback clears psycopg's cache through DEALLOCATE ALL. Repeatedly replace
+    # every cached name without exceeding the server's startup reservation.
+    for cycle in range(24):
+        reader.execute("BEGIN")
+        last = reader.execute(f"SELECT {cycle} AS cleanup_cycle", prepare=True).fetchone()[0]
+        reader.execute("ROLLBACK")
+    results = [f"prepared_cleanup_rollback=cycles:24,last:{last}"]
+    for cycle in range(24):
+        query = f"SELECT {cycle} AS explicit_cleanup_cycle"
+        last = reader.execute(query, prepare=True).fetchone()[0]
+        reader.execute("DEALLOCATE ALL", prepare=False)
+        # The completion tag must also tell the driver to forget this name.
+        assert reader.execute(query, prepare=True).fetchone()[0] == cycle
+    results.append(f"prepared_cleanup_all=cycles:24,last:{last}")
+    return results
+
+
 def index_validation_transcript(reader, writer) -> list[str]:
     writer.execute("DROP TABLE IF EXISTS index_validation_diff")
     writer.execute("CREATE TABLE index_validation_diff (id integer, value integer)")
@@ -583,7 +632,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

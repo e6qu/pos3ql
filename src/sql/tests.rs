@@ -81038,3 +81038,167 @@ fn dml_target_returning_subqueries_keep_old_new_values_and_statement_reads() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn retained_dml_descriptions_rewrite_view_columns_in_data_changing_ctes() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE described_orders(id integer PRIMARY KEY, amount bigint, label text); \
+         INSERT INTO described_orders VALUES (1, 10, 'first'); \
+         CREATE VIEW described_view(order_id, total, note) AS SELECT id, amount, label FROM described_orders",
+    );
+    for (query, expected) in [
+        (
+            "WITH changed AS (UPDATE described_view SET total = total + 2 WHERE order_id = 1 RETURNING order_id, total, note) SELECT order_id, total, note FROM changed",
+            "1|12|first",
+        ),
+        (
+            "WITH changed AS (INSERT INTO described_view VALUES (2, 20, 'second') RETURNING order_id, total, note) SELECT order_id, total, note FROM changed",
+            "2|20|second",
+        ),
+        (
+            "WITH changed AS (DELETE FROM described_view WHERE order_id = 2 RETURNING order_id, total, note) SELECT order_id, total, note FROM changed",
+            "2|20|second",
+        ),
+    ] {
+        let before = data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, amount, label FROM described_orders ORDER BY id",
+        ));
+        let described = describe_with(&mut engine, &mut budget, query);
+        assert_eq!(
+            row_description_names(&described),
+            ["order_id", "total", "note"]
+        );
+        assert_eq!(
+            row_description_type_oids(&described),
+            [types::oid::INT4, types::oid::INT8, types::oid::TEXT]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT id, amount, label FROM described_orders ORDER BY id"
+            )),
+            before
+        );
+        let output = run_with(&mut engine, &mut budget, query);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(data_rows(&output), [expected]);
+        assert_eq!(
+            row_description_names(&output),
+            ["order_id", "total", "note"]
+        );
+        assert_eq!(
+            row_description_type_oids(&output),
+            [types::oid::INT4, types::oid::INT8, types::oid::TEXT]
+        );
+    }
+    let empty = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH changed AS (UPDATE described_view SET total = total WHERE false RETURNING order_id, total, note) SELECT order_id, total, note FROM changed",
+    );
+    assert!(data_rows(&empty).is_empty());
+    assert_eq!(row_description_names(&empty), ["order_id", "total", "note"]);
+    assert_eq!(
+        row_description_type_oids(&empty),
+        [types::oid::INT4, types::oid::INT8, types::oid::TEXT]
+    );
+    let described = describe_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE described_view SET total = total RETURNING order_id, total, note",
+    );
+    assert_eq!(
+        row_description_names(&described),
+        ["order_id", "total", "note"]
+    );
+    assert_eq!(
+        row_description_type_oids(&described),
+        [types::oid::INT4, types::oid::INT8, types::oid::TEXT]
+    );
+}
+
+#[test]
+fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
+    let mut config = test_config("retained-description-cold");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("retained-description-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE described_cold(id integer PRIMARY KEY, amount bigint); INSERT INTO described_cold VALUES (1, 10)", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    config.work_arena_bytes = 64 << 10;
+    assert!(size_of::<crate::storage::TableDef>() > config.work_arena_bytes);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 64 << 10);
+    let narrow = "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT 1 AS applied";
+    let output = session.success(&mut engine, narrow, true);
+    assert_eq!(data_rows(&output), ["1"]);
+    assert_eq!(row_description_names(&output), ["applied"]);
+    assert_eq!(row_description_type_oids(&output), [types::oid::INT4]);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
+        ["1|11"]
+    );
+    // Reading the captured rows needs a separate full-width relation schema.
+    // Its named failure must roll back the update and release description owners.
+    let rejected = session.execute(&mut engine,
+        "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT id, amount FROM changed", true);
+    let error = String::from_utf8_lossy(&rejected);
+    assert!(
+        error.contains("54000") && error.contains("statement arena"),
+        "{error}"
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
+        ["1|11"]
+    );
+    session.success(&mut engine, narrow, true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
+        ["1|12"]
+    );
+    session.success(&mut engine, "BEGIN", true);
+    session.success(&mut engine, narrow, true);
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
+        ["1|12"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 64 << 10);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
+        ["1|12"]
+    );
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

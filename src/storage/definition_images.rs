@@ -89,6 +89,20 @@ pub(crate) struct TableDefinitionImages {
     head: Cell<Option<usize>>,
 }
 
+impl Storage {
+    /// Consume a copied definition after the live catalog guards release.
+    /// Returned values cannot borrow the temporary definition owner.
+    pub(crate) fn with_retained_table_definition<R>(
+        &self,
+        table: usize,
+        transaction: u32,
+        each: impl FnOnce(&TableDef) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        let images = self.table_definition_images();
+        each(images.definition(self, table, transaction)?)
+    }
+}
+
 impl TableDefinitionImages {
     pub(super) fn new(pool: &Arc<TableDefinitionImagePool>) -> Self {
         Self {
@@ -238,5 +252,114 @@ mod tests {
         };
         assert_eq!(error.what, "table definition images");
         assert_eq!(error.requested, pool.cells.len() * size_of::<ImageCell>());
+    }
+
+    #[test]
+    fn retained_definition_callbacks_release_live_and_pending_catalog_guards() {
+        use crate::sql::types::ColType;
+        use crate::storage::tests::{make_def, test_budget, test_config};
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "description_owner",
+                &[("original", ColType::Int4, true)],
+            ))
+            .unwrap();
+        let mut pending = *storage.table_def(table, 0);
+        pending.columns[0].name = crate::storage::SqlName::parse("pending_name").unwrap();
+        let mut mapping = [None; crate::storage::MAX_COLUMNS];
+        mapping[0] = Some(pending.columns[0].name);
+        storage
+            .write_table_def(table, 7, pending, &mapping, false)
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let error = storage
+                .with_retained_table_definition(table, 7, |definition| {
+                    assert_eq!(definition.columns()[0].name.as_str(), "pending_name");
+                    assert!(
+                        storage.tables[table].definition.test_write().is_ok(),
+                        "description callback retained the live table guard"
+                    );
+                    assert!(
+                        storage.pending_table_defs.test_write().is_ok(),
+                        "description callback retained the shared pending-schema pool"
+                    );
+                    Err::<(), _>(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "description callback error"
+                    ))
+                })
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::DATA_EXCEPTION);
+            storage
+                .with_retained_table_definition(table, 7, |definition| {
+                    assert_eq!(definition.columns()[0].name.as_str(), "pending_name");
+                    assert!(storage.tables[table].definition.test_write().is_ok());
+                    assert!(storage.pending_table_defs.test_write().is_ok());
+                    Ok(())
+                })
+                .unwrap();
+            storage.rollback_table_def(table, 7);
+            storage
+                .with_retained_table_definition(table, 7, |definition| {
+                    assert_eq!(definition.columns()[0].name.as_str(), "original");
+                    Ok(())
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn retained_definition_callback_capacity_failure_skips_callback_and_allows_retry() {
+        use crate::sql::types::ColType;
+        use crate::storage::tests::{make_def, test_budget, test_config};
+        let mut config = test_config();
+        config.max_tables = 1;
+        config.max_catalog_versions_per_object = 1;
+        config.query_workspace_slots = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "description_capacity",
+                &[("id", ColType::Int4, true)],
+            ))
+            .unwrap();
+        let capacity = TableDefinitionImagePool::capacity(&config);
+        let mut owners = Vec::with_capacity(capacity);
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..capacity {
+                let images = storage.table_definition_images();
+                images.definition(&storage, table, 0).unwrap();
+                owners.push(images);
+            }
+            let mut called = false;
+            let error = storage
+                .with_retained_table_definition(table, 0, |_| {
+                    called = true;
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(!called);
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(
+                error
+                    .message
+                    .as_str()
+                    .contains("table definition image pool")
+            );
+            assert!(storage.tables[table].definition.test_write().is_ok());
+            assert!(storage.pending_table_defs.test_write().is_ok());
+            owners.pop();
+            storage
+                .with_retained_table_definition(table, 0, |definition| {
+                    assert_eq!(definition.columns()[0].name.as_str(), "id");
+                    Ok(())
+                })
+                .unwrap();
+            owners.clear();
+        });
     }
 }

@@ -72,6 +72,48 @@ def index_validation_transcript(reader, writer) -> list[str]:
         writer.execute("DROP TABLE index_validation_diff")
 
 
+def partition_index_validation_transcript(reader, writer) -> list[str]:
+    writer.execute("DROP TABLE IF EXISTS partition_index_diff CASCADE")
+    writer.execute("CREATE TABLE partition_index_diff (bucket integer, value integer) PARTITION BY RANGE (bucket)")
+    writer.execute("CREATE TABLE partition_index_low PARTITION OF partition_index_diff FOR VALUES FROM (0) TO (10)")
+    writer.execute("CREATE TABLE partition_index_high PARTITION OF partition_index_diff FOR VALUES FROM (10) TO (20)")
+    results = []
+    try:
+        for label, change in [
+            ("update", "UPDATE partition_index_diff SET value = 10 WHERE value = 20"),
+            ("insert", "INSERT INTO partition_index_diff VALUES (1, 10)"),
+        ]:
+            writer.execute("TRUNCATE partition_index_diff")
+            writer.execute("INSERT INTO partition_index_diff VALUES (1, 10), (1, 20), (11, 30)")
+            reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            before = reader.execute("SELECT value FROM partition_index_diff WHERE bucket = 1 ORDER BY value").fetchall()
+            writer.execute(change)
+            reader.execute("SAVEPOINT before_partition_index")
+            error = sqlstate(reader, "CREATE UNIQUE INDEX partition_index_key ON partition_index_diff(bucket, value)")
+            reader.execute("ROLLBACK TO SAVEPOINT before_partition_index")
+            after = reader.execute("SELECT value FROM partition_index_diff WHERE bucket = 1 ORDER BY value").fetchall()
+            results.append(f"partition_index_{label}={error},before:{before},after:{after}")
+            reader.execute("ROLLBACK")
+        writer.execute("TRUNCATE partition_index_diff")
+        writer.execute("INSERT INTO partition_index_diff VALUES (1, 10), (1, 20), (11, 30)")
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        before = reader.execute("SELECT value FROM partition_index_diff WHERE bucket = 1 ORDER BY value").fetchall()
+        writer.execute("UPDATE partition_index_diff SET value = 30 WHERE value = 20")
+        reader.execute("CREATE UNIQUE INDEX partition_index_key ON partition_index_diff(bucket, value)")
+        after = reader.execute("SELECT value FROM partition_index_diff WHERE bucket = 1 ORDER BY value").fetchall()
+        reader.execute("ROLLBACK")
+        remaining = writer.execute("SELECT count(*) FROM pg_indexes WHERE tablename IN ('partition_index_diff', 'partition_index_low', 'partition_index_high')").fetchone()[0]
+        results.append(f"partition_index_valid=before:{before},after:{after},rolled_back:{remaining}")
+        writer.execute("CREATE UNIQUE INDEX partition_index_key ON partition_index_diff(bucket, value)")
+        error = sqlstate(writer, "INSERT INTO partition_index_diff VALUES (1, 30)")
+        results.append(f"partition_index_enforced={error}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        writer.execute("DROP TABLE partition_index_diff CASCADE")
+
+
 def analyze_snapshot_transcript(reader, writer) -> list[str]:
     writer.execute("DROP TABLE IF EXISTS analyze_snapshot_diff CASCADE")
     writer.execute("CREATE TABLE analyze_snapshot_diff (id integer, a integer, b integer, label text)")
@@ -165,7 +207,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + index_validation_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

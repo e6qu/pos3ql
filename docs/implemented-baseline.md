@@ -155,7 +155,13 @@ version stamp against a mutable row map.
 
 Index creation uses the same captured byte owners, but validates current
 committed rows and all earlier writes by the creating transaction. It does not
-change which versions ordinary transaction queries see. Saved-index probes
+change which versions ordinary transaction queries see. Ordinary index creation,
+recursive partition indexes, and indexes copied by `LIKE INCLUDING INDEXES`
+share validation, cache preparation, journal staging, and failure cleanup.
+Validation recycles expression scratch after each row and captured sources after
+each table. Failed cache preparation releases partial bindings and preserves
+earlier visible indexes when restoration succeeds; a failed restoration returns
+an error without advertising partial lookup results. Saved-index probes
 retain recent row bytes and release shared row-state guards before reading or
 returning each key.
 
@@ -163,7 +169,11 @@ returning each key.
 and then creating a unique index must fail with `23505`. Updating or deleting
 an order before creating the index checks the replacement values. A failed
 creation releases its row sources and pending catalog entry; rolling back to a
-savepoint allows a corrected creation with the same name. Later uniqueness
+savepoint allows a corrected creation with the same name. With orders partitioned
+by month, a unique index on `(month, reference)` must also reject duplicate
+references inserted earlier in the same transaction into a leaf partition.
+A later partition's failure removes the root and any child indexes already
+created by that statement. Later uniqueness
 checks also use own replacements and deletions: deleting an order lets that
 transaction reuse its reference before commit, including through a saved index.
 An older repeatable read transaction cannot create a unique index that misses

@@ -1,0 +1,123 @@
+name: Index creation qualification
+
+on:
+  push:
+    branches: [retain-partition-index-validation]
+
+concurrency:
+  group: index-creation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--locale-provider=libc --lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Lint and index creation regressions
+        run: |
+          set -euo pipefail
+          cargo clippy --all-targets --locked -- -D warnings
+          for filter in partition_index_validation index_creation_ index_validation like_ index_lifecycle captured_resident_byte_scans; do
+            cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/index-validation-test.log"
+          done
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Index transcripts against vanilla PostgreSQL 18
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          RUN_FAST: "0"
+          RUN_CORE: "0"
+          RUN_CORPUS: "1"
+          RUN_AUX: "0"
+          RUN_SLT: "0"
+          RUN_FUZZ: "0"
+          FAST_CORPUS_SHARDS: "1"
+        run: |
+          set -euo pipefail
+          for corpus in 43_indexes 107_index_lifecycle; do
+            FAST_CORPUS_ONLY="$corpus" bash tests/external/ci_diff.sh
+          done
+      - name: Ordinary and partition indexes with older snapshots
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          P3_PORT: "15599"
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/index-validation.conf" <<CONFIG
+          listen_addr = 127.0.0.1:15599
+          data_dir = $RUNNER_TEMP/index-validation-data
+          object_store = off
+          max_tables = 64
+          table_rows = 8192
+          max_value_indexes = 64
+          memtable_bytes = 256MiB
+          CONFIG
+          cat tests/external/differential-capacities.conf >> "$RUNNER_TEMP/index-validation.conf"
+          target/release/pos3ql --config "$RUNNER_TEMP/index-validation.conf" > "$RUNNER_TEMP/index-validation.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"; cat "$RUNNER_TEMP/index-validation.log"' EXIT
+          for attempt in $(seq 1 100); do
+            kill -0 "$server_pid"
+            if psql -h 127.0.0.1 -p 15599 -U postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+              break
+            fi
+            test "$attempt" -lt 100
+            sleep 0.1
+          done
+          target/external-venv/bin/python tests/external/mvcc_diff.py
+      - name: Symbolicate allocation failures in one batch
+        if: failure()
+        run: |
+          python3 - <<'PYCODE'
+          import os, re, subprocess
+          from pathlib import Path
+          log = Path(os.environ["RUNNER_TEMP"]) / "index-validation-test.log"
+          if log.exists():
+              frames = re.findall(r"(\S*/target/debug/deps/pos3ql-[0-9a-f]+)\(\+(0x[0-9a-f]+)\)", log.read_text(errors="replace"))
+              for binary in sorted({binary for binary, _ in frames}):
+                  addresses = [address for owner, address in frames if owner == binary]
+                  subprocess.run(["addr2line", "-C", "-f", "-e", binary, *addresses], check=True)
+          PYCODE
+      - name: Verify the regression fails before the fix
+        run: |
+          set -euo pipefail
+          cp src/sql/exec/mod.rs "$RUNNER_TEMP/index-creation-fixed.rs"
+          trap 'cp "$RUNNER_TEMP/index-creation-fixed.rs" src/sql/exec/mod.rs' EXIT
+          git fetch --depth=1 origin ba070d25b41fdb7b30e1614bf8d3f1f015087a06
+          git show ba070d25b41fdb7b30e1614bf8d3f1f015087a06:src/sql/exec/mod.rs > src/sql/exec/mod.rs
+          set +e
+          cargo test --lib --locked partition_index_validation_checks_own_changes_rollback_and_cold_recovery -- --nocapture --test-threads=1 > "$RUNNER_TEMP/index-creation-control.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/index-creation-control.log"
+          test "$result" -eq 101
+          rg -F 'test result: FAILED' "$RUNNER_TEMP/index-creation-control.log"
+          rg -F 'CREATE INDEX' "$RUNNER_TEMP/index-creation-control.log"
+          rg -F "INSERT INTO partition_validation VALUES (11, 'fresh'" "$RUNNER_TEMP/index-creation-control.log"

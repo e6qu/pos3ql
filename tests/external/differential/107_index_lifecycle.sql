@@ -65,3 +65,46 @@ WHERE indexname = 'index_lifecycle_value'
    OR indexname LIKE 'index_lifecycle_%_id_idx';
 DROP TABLE index_lifecycle_root CASCADE;
 DROP TABLE index_lifecycle_concurrent;
+
+-- Recursive index creation validates earlier changes in every leaf. A later
+-- child's failure rolls back the root and already completed child indexes.
+CREATE TABLE partition_validation(bucket integer, label text, active boolean, divisor integer)
+PARTITION BY RANGE (bucket);
+CREATE TABLE partition_validation_low PARTITION OF partition_validation
+FOR VALUES FROM (0) TO (10);
+CREATE TABLE partition_validation_high PARTITION OF partition_validation
+FOR VALUES FROM (10) TO (20);
+INSERT INTO partition_validation VALUES
+(1, 'one', true, 10), (1, 'two', false, 20),
+(11, 'eleven', true, 10), (11, 'twelve', true, 20);
+BEGIN;
+SAVEPOINT before_partition_index;
+INSERT INTO partition_validation VALUES (11, 'fresh', true, 30), (11, 'fresh', true, 40);
+CREATE UNIQUE INDEX partition_validated ON partition_validation(bucket, label);
+ROLLBACK TO SAVEPOINT before_partition_index;
+SELECT count(*) FROM pg_indexes WHERE tablename IN
+('partition_validation', 'partition_validation_low', 'partition_validation_high');
+UPDATE partition_validation SET label = 'eleven' WHERE label = 'twelve';
+CREATE UNIQUE INDEX partition_validated ON partition_validation(bucket, label);
+ROLLBACK TO SAVEPOINT before_partition_index;
+INSERT INTO partition_validation VALUES (1, 'ONE', true, 30);
+CREATE UNIQUE INDEX partition_validated ON partition_validation(bucket, lower(label)) WHERE active;
+ROLLBACK TO SAVEPOINT before_partition_index;
+INSERT INTO partition_validation VALUES (11, NULL, true, 30), (11, NULL, true, 40);
+CREATE UNIQUE INDEX partition_validated ON partition_validation(bucket, label) NULLS NOT DISTINCT;
+ROLLBACK TO SAVEPOINT before_partition_index;
+UPDATE partition_validation SET divisor = 0 WHERE label = 'twelve';
+CREATE INDEX partition_validated ON partition_validation(bucket, (100 / divisor));
+ROLLBACK TO SAVEPOINT before_partition_index;
+SELECT count(*) FROM pg_indexes WHERE tablename IN
+('partition_validation', 'partition_validation_low', 'partition_validation_high');
+DELETE FROM partition_validation WHERE label = 'one';
+UPDATE partition_validation SET label = 'one', active = true WHERE label = 'two';
+INSERT INTO partition_validation VALUES (11, 'thirteen', true, 30);
+CREATE UNIQUE INDEX partition_validated ON partition_validation(bucket, lower(label)) WHERE active;
+COMMIT;
+INSERT INTO partition_validation VALUES (11, 'ELEVEN', true, 40);
+SELECT bucket, label FROM partition_validation ORDER BY bucket, label;
+SELECT count(*) FROM pg_indexes WHERE tablename IN
+('partition_validation', 'partition_validation_low', 'partition_validation_high');
+DROP TABLE partition_validation CASCADE;

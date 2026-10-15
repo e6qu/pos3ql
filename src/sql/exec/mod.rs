@@ -3570,8 +3570,7 @@ impl CopiedIndex {
     };
 }
 
-/// Recreates each `LIKE` source's secondary indexes on the new table. It has no
-/// rows yet, so the uniqueness scan [`create_index`] performs is unnecessary.
+/// Recreates secondary indexes through the shared creation and cleanup boundary.
 fn copy_like_indexes(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -3581,6 +3580,9 @@ fn copy_like_indexes(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     use crate::storage::IndexDef;
+    let table_slot = storage
+        .find_visible(def.schema.as_str(), def.name.as_str(), txn.txid)
+        .expect("new LIKE table is visible to its creator");
     for like in statement.likes.iter().filter(|l| l.indexes) {
         // Collected up front: creating one needs `storage` mutably.
         let source_def = *storage.table_def(
@@ -3681,44 +3683,7 @@ fn copy_like_indexes(
                 },
                 txn.txid,
             )?;
-            let lsn = storage.bump_lsn();
-            let durable = storage
-                .index_visible_to(slot, txn.txid)
-                .expect("new index is visible to its creating transaction");
-            if let Err(e) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::CreateIndex {
-                    created_at: durable.created_at,
-                    schema: def.schema.as_str(),
-                    name: name.as_str(),
-                    table: def.name.as_str(),
-                    method: index.method,
-                    columns,
-                    expressions: index
-                        .expressions
-                        .each_ref()
-                        .map(|expression| expression.as_ref().map(|text| text.as_str())),
-                    include_columns,
-                    collations: index.collations,
-                    explicit_collations: index.explicit_collations,
-                    operator_classes: index.operator_classes,
-                    resolved_operator_classes: index.resolved_operator_classes,
-                    operator_class_options: index.operator_class_options,
-                    descending: index.descending,
-                    nulls_first: index.nulls_first,
-                    n_cols: index.n_cols,
-                    n_include_cols: index.n_include_cols,
-                    nulls_not_distinct: index.nulls_not_distinct,
-                    predicate: index.predicate.as_ref().map(|text| text.as_str()),
-                    unique: index.unique,
-                    definition: durable.mutable_for(txn.txid),
-                },
-            ) {
-                storage.rollback_index_create(slot);
-                return Err(e);
-            }
-            txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32))?;
+            finish_index_creation(storage, wal, txn, slot, table_slot, arena)?;
             if like.comments {
                 copy_comment_if_present(
                     storage,
@@ -48218,123 +48183,8 @@ pub fn create_index(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
-    tdef.schema(&mut schema);
-    // Validate every existing tuple against the physical generation limit.
-    // UNIQUE additionally checks authoritative rows for duplicate keys. A
-    // conflict is deferred so rollback can remove the pending catalog entry
-    // after the shared row walk releases its borrows.
-    let validate_values = |rowid: u64, values: &[Datum]| -> Result<(), SqlError> {
-        check_index_tuple_sizes(storage, &tdef, values, txn.txid, arena)?;
-        if command.unique {
-            check_unique_indexes(
-                storage,
-                table_index,
-                &tdef,
-                &schema[..tdef.n_columns],
-                values,
-                Some(rowid),
-                // The just-registered index is an uncommitted CREATE owned
-                // by this transaction; validation must see it.
-                txn.txid,
-                arena,
-            )?;
-        }
-        Ok(())
-    };
-    let validation = storage
-        .index_validation_scan_in(table_index, txn.txid, arena)
-        .and_then(|scan| {
-            let overlay = scan.for_each_overlay(&mut |rowid, home| {
-                storage.with_row_bytes(table_index, rowid, home, |bytes| {
-                    let mut values = [Datum::Null; MAX_COLUMNS];
-                    rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
-                    validate_values(rowid, &values[..tdef.n_columns])
-                })?;
-                Ok(core::ops::ControlFlow::Continue(()))
-            })?;
-            if overlay.is_break() {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "index validation stopped before completing the scan"
-                ));
-            }
-            scan.for_each_spilled_row_batch(arena, true, None, &mut |rows| {
-                for spilled in rows {
-                    let mut decoded = [Datum::Null; MAX_COLUMNS];
-                    let values = match spilled.representation {
-                        crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
-                            rowenc::decode(bytes, &schema[..tdef.n_columns], &mut decoded)?;
-                            &decoded[..tdef.n_columns]
-                        }
-                        crate::storage::SpilledRowRepresentation::Values(values) => values,
-                    };
-                    validate_values(spilled.rowid, values)?;
-                }
-                Ok(core::ops::ControlFlow::Continue(()))
-            })
-        });
-    if let Err(error) = validation {
-        storage.rollback_index_create(slot);
+    if let Err(error) = finish_index_creation(storage, wal, txn, slot, table_index, arena) {
         return sql_fail(error);
-    }
-    if let Err(error) = storage.prepare_index_enforcers(table_index, txn.txid) {
-        storage.rollback_index_create(slot);
-        storage
-            .refresh_enforcers(table_index)
-            .expect("rolling back a pending index restores the prior cache shape");
-        return sql_fail(error);
-    }
-    let durable = storage
-        .index_visible_to(slot, txn.txid)
-        .expect("new index is visible to its creating transaction");
-    let wal_result = if tdef.persistence == crate::storage::RelationPersistence::Temporary {
-        Ok(())
-    } else {
-        let lsn = storage.bump_lsn();
-        wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::CreateIndex {
-                created_at: durable.created_at,
-                schema: tdef.schema.as_str(),
-                name: sqlname.as_str(),
-                table: tdef.name.as_str(),
-                method: command.method,
-                columns,
-                expressions: expressions
-                    .each_ref()
-                    .map(|expression| expression.as_ref().map(|text| text.as_str())),
-                include_columns,
-                collations,
-                explicit_collations,
-                operator_classes,
-                resolved_operator_classes,
-                operator_class_options,
-                descending,
-                nulls_first,
-                n_cols,
-                n_include_cols: command.include_columns.len(),
-                nulls_not_distinct: command.nulls_not_distinct,
-                predicate: predicate.as_ref().map(|text| text.as_str()),
-                unique: command.unique,
-                definition: durable.mutable_for(txn.txid),
-            },
-        )
-    };
-    if let Err(e) = wal_result {
-        storage.rollback_index_create(slot);
-        storage
-            .refresh_enforcers(table_index)
-            .expect("failed index WAL restores the prior cache shape");
-        return sql_fail(e);
-    }
-    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32)) {
-        storage.rollback_index_create(slot);
-        storage
-            .refresh_enforcers(table_index)
-            .expect("failed DDL undo reservation restores the prior cache shape");
-        return sql_fail(e);
     }
     if tdef.partition.is_partitioned()
         && command.scope == crate::sql::ast::IndexTargetScope::Recurse
@@ -48421,6 +48271,152 @@ fn stage_index_definition(
     Ok(())
 }
 
+/// Complete a registered index or remove it before returning an error. Ordinary
+/// and generated partition indexes share validation, cache, and journal rules.
+fn finish_index_creation(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    table: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let index = storage
+        .index_visible_to(slot, txn.txid)
+        .expect("new index is visible to its creator");
+    if let Err(error) = validate_index_rows(storage, table, txn.txid, index.unique, arena) {
+        storage.rollback_index_create(slot);
+        return Err(error);
+    }
+    let result = (|| {
+        storage.prepare_index_enforcers(table, txn.txid)?;
+        if storage.table_def(table, txn.txid).persistence
+            != crate::storage::RelationPersistence::Temporary
+        {
+            let lsn = storage.bump_lsn();
+            wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateIndex {
+                    created_at: index.created_at,
+                    schema: index.schema.as_str(),
+                    name: index.name_for(txn.txid).as_str(),
+                    table: index.table.as_str(),
+                    method: index.method,
+                    columns: index.columns,
+                    expressions: index
+                        .expressions
+                        .each_ref()
+                        .map(|value| value.as_ref().map(|text| text.as_str())),
+                    include_columns: index.include_columns,
+                    collations: index.collations,
+                    explicit_collations: index.explicit_collations,
+                    operator_classes: index.operator_classes,
+                    resolved_operator_classes: index.resolved_operator_classes,
+                    operator_class_options: index.operator_class_options,
+                    descending: index.descending,
+                    nulls_first: index.nulls_first,
+                    n_cols: index.n_cols,
+                    n_include_cols: index.n_include_cols,
+                    nulls_not_distinct: index.nulls_not_distinct,
+                    predicate: index.predicate.as_ref().map(|text| text.as_str()),
+                    unique: index.unique,
+                    definition: index.mutable_for(txn.txid),
+                },
+            )?;
+        }
+        txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32))
+    })();
+    if let Err(error) = &result {
+        storage.rollback_index_create(slot);
+        if let Err(restore) = storage.prepare_index_enforcers(table, txn.txid) {
+            return Err(SqlError {
+                sqlstate: restore.sqlstate,
+                message: stack_format!(
+                    192,
+                    "index creation failed ({}); cache restoration failed: {}",
+                    error.sqlstate,
+                    restore.message.as_str()
+                ),
+            });
+        }
+    }
+    result
+}
+
+/// Validate current committed rows and earlier own changes through retained
+/// byte sources. No row, parsed expression, or arena reference escapes.
+fn validate_index_rows(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    unique: bool,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let result = (|| {
+        let definition = *storage.table_def(table_index, txid);
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        definition.schema(&mut schema);
+        let validate_values = |rowid: u64, values: &[Datum]| -> Result<(), SqlError> {
+            let row_mark = arena.mark();
+            let result = (|| {
+                check_index_tuple_sizes(storage, &definition, values, txid, arena)?;
+                if unique {
+                    check_unique_indexes(
+                        storage,
+                        table_index,
+                        &definition,
+                        &schema[..definition.n_columns],
+                        values,
+                        Some(rowid),
+                        txid,
+                        arena,
+                    )?;
+                }
+                Ok(())
+            })();
+            // SAFETY: validation returns only an owned error or success; key
+            // values and parsed expressions are consumed before returning.
+            unsafe { arena.rewind_to(row_mark) };
+            result
+        };
+        let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
+        let overlay = scan.for_each_overlay(&mut |rowid, home| {
+            storage.with_row_bytes(table_index, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, &schema[..definition.n_columns], &mut values)?;
+                validate_values(rowid, &values[..definition.n_columns])
+            })?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        if overlay.is_break() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "index validation stopped before completing the scan"
+            ));
+        }
+        scan.for_each_spilled_row_batch(arena, true, None, &mut |rows| {
+            for spilled in rows {
+                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                let values = match spilled.representation {
+                    crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                        rowenc::decode(bytes, &schema[..definition.n_columns], &mut decoded)?;
+                        &decoded[..definition.n_columns]
+                    }
+                    crate::storage::SpilledRowRepresentation::Values(values) => values,
+                };
+                validate_values(spilled.rowid, values)?;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })
+    })();
+    // SAFETY: the retained scan and callbacks have ended. Validation publishes
+    // no references; the caller's SQL and catalog state precede the mark.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
 struct PartitionIndexCreate<'a> {
     root_table: usize,
     root_index: usize,
@@ -48502,82 +48498,7 @@ fn create_partition_index_children(
                 ..command.root
             };
             let slot = storage.create_index(index, txn.txid)?;
-            let mut schema = [ColType::Bool; MAX_COLUMNS];
-            table.schema(&mut schema);
-            let validation = storage.for_each_row_state(table_slot, &mut |rowid, state| {
-                use core::ops::ControlFlow;
-                let Some(home) = storage.committed_row_home(table_slot, rowid, state)? else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                storage.with_row_bytes(table_slot, rowid, home, |bytes| {
-                    let mut values = [Datum::Null; MAX_COLUMNS];
-                    rowenc::decode(bytes, &schema[..table.n_columns], &mut values)?;
-                    check_index_tuple_sizes(
-                        storage,
-                        &table,
-                        &values[..table.n_columns],
-                        txn.txid,
-                        command.arena,
-                    )?;
-                    if index.unique {
-                        check_unique_indexes(
-                            storage,
-                            table_slot,
-                            &table,
-                            &schema[..table.n_columns],
-                            &values[..table.n_columns],
-                            Some(rowid),
-                            txn.txid,
-                            command.arena,
-                        )?;
-                    }
-                    Ok(())
-                })?;
-                Ok(ControlFlow::Continue(()))
-            });
-            if let Err(error) = validation {
-                storage.rollback_index_create(slot);
-                return Err(error);
-            }
-            storage.prepare_index_enforcers(table_slot, txn.txid)?;
-            let durable = storage
-                .index_visible_to(slot, txn.txid)
-                .expect("new partition index is visible to its creator");
-            let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::CreateIndex {
-                    created_at: durable.created_at,
-                    schema: index.schema.as_str(),
-                    name: index.name.as_str(),
-                    table: index.table.as_str(),
-                    method: index.method,
-                    columns: index.columns,
-                    expressions: index
-                        .expressions
-                        .each_ref()
-                        .map(|value| value.as_ref().map(|text| text.as_str())),
-                    include_columns: index.include_columns,
-                    collations: index.collations,
-                    explicit_collations: index.explicit_collations,
-                    operator_classes: index.operator_classes,
-                    resolved_operator_classes: index.resolved_operator_classes,
-                    operator_class_options: index.operator_class_options,
-                    descending: index.descending,
-                    nulls_first: index.nulls_first,
-                    n_cols: index.n_cols,
-                    n_include_cols: index.n_include_cols,
-                    nulls_not_distinct: index.nulls_not_distinct,
-                    predicate: index.predicate.as_ref().map(|text| text.as_str()),
-                    unique: index.unique,
-                    definition,
-                },
-            ) {
-                storage.rollback_index_create(slot);
-                return Err(error);
-            }
-            txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32))?;
+            finish_index_creation(storage, wal, txn, slot, table_slot, command.arena)?;
         }
     }
     Ok(())

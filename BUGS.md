@@ -4,10 +4,10 @@ This file records only defects whose repair is prevented by an external blocker
 or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
-The ANALYZE reader review covers current committed and own changes, base and
-extended statistics, original heap/file ownership, captured generation stamps,
-query-snapshot restoration, errors, rollback, fixed-arena exhaustion, retry,
-and cold recovery. Remaining metadata-walk and executor lifetime work is in PLAN.md.
+The index-creation review covers ordinary, copied, and generated partition
+indexes, current committed and own changes, rollback and failed undo reservation,
+partial-cache release, prior pending bindings, fixed-arena reuse, and cold recovery. Remaining metadata-walk and executor
+lifetime work is in PLAN.md.
 No known defects meet this file's inclusion criteria. This does not mean all
 planned work is finished or that every possible bug has been ruled out.
 Resolved investigations are indexed in [history](docs/history/README.md).

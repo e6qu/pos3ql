@@ -118,6 +118,11 @@ jobs:
           set -e
           cat "$RUNNER_TEMP/index-creation-control.log"
           test "$result" -eq 101
-          rg -F 'test result: FAILED' "$RUNNER_TEMP/index-creation-control.log"
-          rg -F 'CREATE INDEX' "$RUNNER_TEMP/index-creation-control.log"
-          rg -F "INSERT INTO partition_validation VALUES (11, 'fresh'" "$RUNNER_TEMP/index-creation-control.log"
+          python3 - <<'PYCODE'
+          import os
+          from pathlib import Path
+          log = (Path(os.environ["RUNNER_TEMP"]) / "index-creation-control.log").read_bytes()
+          for expected in (b"test result: FAILED", b"CREATE INDEX", b"INSERT INTO partition_validation VALUES (11, 'fresh'"):
+              assert expected in log, expected
+          print("The old implementation accepted duplicate pending partition keys; the regression caught it")
+          PYCODE

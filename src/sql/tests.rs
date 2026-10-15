@@ -67882,7 +67882,10 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
             super::eval::funcs::system::session_setting("search_path"),
             setting
         );
-        assert_eq!(engine.storage.path().entries(), path.entries());
+        assert!(
+            engine.storage.path().entries() == path.entries(),
+            "worker restores frontend lookup path"
+        );
         result
     }
 

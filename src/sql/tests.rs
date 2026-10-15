@@ -81129,22 +81129,39 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session =
         ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 64 << 10);
-    let output = session.success(&mut engine,
-        "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT id, amount FROM changed", true);
-    assert_eq!(data_rows(&output), ["1|11"]);
-    assert_eq!(row_description_names(&output), ["id", "amount"]);
-    assert_eq!(
-        row_description_type_oids(&output),
-        [types::oid::INT4, types::oid::INT8]
-    );
-    session.success(&mut engine, "BEGIN", true);
-    let output = session.success(&mut engine,
-        "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT id, amount FROM changed", true);
-    assert_eq!(data_rows(&output), ["1|12"]);
-    session.success(&mut engine, "ROLLBACK", true);
+    let narrow = "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT 1 AS applied";
+    let output = session.success(&mut engine, narrow, true);
+    assert_eq!(data_rows(&output), ["1"]);
+    assert_eq!(row_description_names(&output), ["applied"]);
+    assert_eq!(row_description_type_oids(&output), [types::oid::INT4]);
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
         ["1|11"]
+    );
+    // Reading the captured rows needs a separate full-width relation schema.
+    // Its named failure must roll back the update and release description owners.
+    let rejected = session.execute(&mut engine,
+        "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT id, amount FROM changed", true);
+    let error = String::from_utf8_lossy(&rejected);
+    assert!(
+        error.contains("54000") && error.contains("statement arena"),
+        "{error}"
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
+        ["1|11"]
+    );
+    session.success(&mut engine, narrow, true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
+        ["1|12"]
+    );
+    session.success(&mut engine, "BEGIN", true);
+    session.success(&mut engine, narrow, true);
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
+        ["1|12"]
     );
     assert!(engine.checkpoint().unwrap());
     drop(session);
@@ -81156,7 +81173,7 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
         ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 64 << 10);
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
-        ["1|11"]
+        ["1|12"]
     );
     drop(session);
     drop(engine);

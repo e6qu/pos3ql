@@ -20,6 +20,9 @@ use crate::storage::{MAX_COLUMNS, Storage, TableDef, ValidationRead, rowenc};
 
 use super::{RowCtx, check_not_null};
 
+type ValidationRowVisitor<'callback> =
+    dyn for<'row> FnMut(u64, &'row [Datum<'row>]) -> Result<(), SqlError> + 'callback;
+
 /// Streams the current rows through retained byte owners and reuses validation
 /// scratch between rows and tables.
 ///
@@ -34,7 +37,7 @@ pub(super) unsafe fn for_each_validation_row(
     read: ValidationRead,
     schema: &[ColType],
     arena: &Arena,
-    each: &mut dyn for<'row> FnMut(u64, &'row [Datum<'row>]) -> Result<(), SqlError>,
+    each: &mut ValidationRowVisitor<'_>,
 ) -> Result<(), SqlError> {
     let mark = arena.mark();
     let result = (|| {
@@ -47,7 +50,7 @@ pub(super) unsafe fn for_each_validation_row(
             unsafe { arena.rewind_to(row_mark) };
             result
         };
-        scan.for_each_overlay(&mut |rowid, home| {
+        let flow = scan.for_each_overlay(&mut |rowid, home| {
             storage.with_row_bytes(table, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, schema, &mut values)?;
@@ -55,6 +58,12 @@ pub(super) unsafe fn for_each_validation_row(
             })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
+        if flow.is_break() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "constraint validation stopped before completing the scan"
+            ));
+        }
         scan.for_each_spilled_row_batch(arena, true, None, &mut |rows| {
             for row in rows {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];

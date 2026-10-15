@@ -75,6 +75,22 @@ def on_conflict_snapshot_transcript(reader, writer) -> list[str]:
         key_share = sqlstate(writer, "SELECT id FROM conflict_snapshot WHERE id = 1 FOR KEY SHARE")
         reader.execute("ROLLBACK")
         results.append(f"conflict_key_assignment=key_share:{key_share}")
+        reader.execute("SET lock_timeout = '50ms'")
+        writer.execute("BEGIN")
+        writer.execute("UPDATE conflict_snapshot SET id = 10 WHERE id = 1")
+        for label, command in [
+            ("old_key", "INSERT INTO conflict_snapshot VALUES (1, 'candidate') ON CONFLICT (id) DO NOTHING"),
+            ("new_key", "INSERT INTO conflict_snapshot VALUES (10, 'candidate') ON CONFLICT (id) DO NOTHING"),
+            ("filtered", "INSERT INTO conflict_snapshot VALUES (1, 'candidate') ON CONFLICT (id) DO UPDATE SET value = excluded.value WHERE false"),
+        ]:
+            results.append(f"conflict_pending_{label}={sqlstate(reader, command)}")
+        writer.execute("ROLLBACK")
+        writer.execute("BEGIN")
+        writer.execute("INSERT INTO conflict_snapshot VALUES (5, 'pending')")
+        error = sqlstate(reader, "INSERT INTO conflict_snapshot VALUES (5, 'candidate') ON CONFLICT (id) DO UPDATE SET value = excluded.value")
+        writer.execute("COMMIT")
+        retry = reader.execute("INSERT INTO conflict_snapshot VALUES (5, 'retry') ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING value").fetchall()
+        results.append(f"conflict_pending_insert={error},retry:{retry}")
         return results
     finally:
         reader.execute("ROLLBACK")

@@ -80195,3 +80195,278 @@ fn statement_list_width_is_allocation_free_and_survives_cold_recovery() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn on_conflict_retains_saved_rows_through_update_rollback_and_cold_recovery() {
+    let mut config = test_config("on-conflict-owned-cold");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.value_index_rows = 1;
+    config.object_store_bucket = format!("on-conflict-owned-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE conflict_saved(id integer PRIMARY KEY, value text, label text COLLATE \"C\", active boolean); \
+         INSERT INTO conflict_saved VALUES (1, 'old', 'One', true), (2, 'second', 'Two', true); \
+         CREATE UNIQUE INDEX conflict_saved_label ON conflict_saved(lower(label))", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let table = engine
+        .storage
+        .find_table("public", "conflict_saved")
+        .unwrap();
+    assert!(
+        engine.storage.table(table).rows.is_empty(),
+        "saved-only recovery must exercise the evicted-row path"
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "INSERT INTO conflict_saved VALUES (1, 'changed', 'One', true) \
+         ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING id, value",
+            true
+        )),
+        ["1|changed"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "INSERT INTO conflict_saved VALUES (3, 'expression', 'ONE', true) \
+         ON CONFLICT (lower(label)) DO UPDATE SET value = excluded.value RETURNING id, value",
+            true
+        )),
+        ["1|expression"]
+    );
+    for _ in 0..70 {
+        session.success(&mut engine,
+            "INSERT INTO conflict_saved VALUES (1, 'ignored', 'One', true) ON CONFLICT (id) DO NOTHING", true);
+    }
+    session.success(
+        &mut engine,
+        "BEGIN; SAVEPOINT before_reuse; UPDATE conflict_saved SET label = 'Released' WHERE id = 1; \
+         INSERT INTO conflict_saved VALUES (3, 'fresh', 'ONE', true) \
+         ON CONFLICT (lower(label)) DO UPDATE SET value = excluded.value; \
+         ROLLBACK TO SAVEPOINT before_reuse; ROLLBACK",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM conflict_saved; SELECT value FROM conflict_saved WHERE id = 1",
+            true
+        )),
+        ["2", "expression"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "INSERT INTO conflict_saved VALUES (2, 'recovered', 'Two', true) \
+         ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING id, value",
+            true
+        )),
+        ["2|recovered"]
+    );
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn on_conflict_current_rows_preserve_older_reports_and_reject_second_updates() {
+    let config = test_config("conflict-current-rows");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    writer.success(
+        &mut engine,
+        "CREATE TABLE conflict_current(id integer PRIMARY KEY, value text)",
+        true,
+    );
+    for isolation in ["REPEATABLE READ", "SERIALIZABLE"] {
+        writer.success(
+            &mut engine,
+            "TRUNCATE conflict_current; INSERT INTO conflict_current VALUES (1, 'old')",
+            true,
+        );
+        reader.success(
+            &mut engine,
+            &format!("BEGIN ISOLATION LEVEL {isolation}"),
+            true,
+        );
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, "SELECT value FROM conflict_current", true)),
+            ["old"]
+        );
+        writer.success(&mut engine, "UPDATE conflict_current SET value = 'new' WHERE id = 1; INSERT INTO conflict_current VALUES (2, 'later')", true);
+        for command in [
+            "INSERT INTO conflict_current VALUES (1, 'candidate') ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO conflict_current VALUES (1, 'candidate') ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+            "INSERT INTO conflict_current VALUES (2, 'candidate') ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO conflict_current VALUES (2, 'candidate') ON CONFLICT (id) DO UPDATE SET value = excluded.value WHERE false",
+        ] {
+            reader.success(&mut engine, "SAVEPOINT before_conflict", true);
+            let output = reader.execute(&mut engine, command, true);
+            assert!(
+                String::from_utf8_lossy(&output).contains("40001"),
+                "{command}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            reader.success(&mut engine, "ROLLBACK TO SAVEPOINT before_conflict", true);
+            assert_eq!(
+                data_rows(&reader.success(
+                    &mut engine,
+                    "SELECT value FROM conflict_current; SELECT count(*) FROM conflict_current",
+                    true
+                )),
+                ["old", "1"]
+            );
+        }
+        reader.success(
+            &mut engine,
+            "INSERT INTO conflict_current VALUES (3, 'own')",
+            true,
+        );
+        assert_eq!(data_rows(&reader.success(&mut engine,
+            "INSERT INTO conflict_current VALUES (3, 'changed') ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING value", true)), ["changed"]);
+        reader.success(&mut engine, "ROLLBACK", true);
+    }
+    for command in [
+        "INSERT INTO conflict_current VALUES (4, 'first'), (4, 'second') ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+        "INSERT INTO conflict_current VALUES (1, 'first'), (1, 'second') ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+    ] {
+        let output = reader.execute(&mut engine, command, true);
+        assert!(
+            String::from_utf8_lossy(&output).contains("21000"),
+            "{command}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(data_rows(&reader.success(&mut engine, "SELECT value FROM conflict_current WHERE id = 1; SELECT count(*) FROM conflict_current WHERE id = 4", true)), ["new", "0"]);
+    }
+    reader.success(&mut engine, "INSERT INTO conflict_current VALUES (4, 'first'), (4, 'second') ON CONFLICT (id) DO NOTHING", true);
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "SELECT value FROM conflict_current WHERE id = 4",
+            true
+        )),
+        ["first"]
+    );
+}
+
+#[test]
+fn on_conflict_where_false_retains_lock_strength_and_savepoint_releases_it() {
+    let config = test_config("conflict-row-locks");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut owner = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut other = ConfiguredTransactionSession::new(&config, &mut budget);
+    owner.success(&mut engine, "CREATE TABLE conflict_locks(id integer PRIMARY KEY, value text); INSERT INTO conflict_locks VALUES (1, 'old'), (2, 'unrelated')", true);
+    for (assignment, key_share_allowed) in [
+        ("value = excluded.value", true),
+        ("id = excluded.id", false),
+    ] {
+        owner.success(&mut engine, "BEGIN; SAVEPOINT before_lock", true);
+        owner.success(&mut engine, &format!("INSERT INTO conflict_locks VALUES (1, 'ignored') ON CONFLICT (id) DO UPDATE SET {assignment} WHERE false"), true);
+        if key_share_allowed {
+            other.success(
+                &mut engine,
+                "SELECT id FROM conflict_locks WHERE id = 1 FOR KEY SHARE NOWAIT",
+                true,
+            );
+        } else {
+            let output = other.execute(
+                &mut engine,
+                "SELECT id FROM conflict_locks WHERE id = 1 FOR KEY SHARE NOWAIT",
+                true,
+            );
+            assert!(
+                String::from_utf8_lossy(&output).contains("55P03"),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        let output = other.execute(
+            &mut engine,
+            "SELECT id FROM conflict_locks WHERE id = 1 FOR UPDATE NOWAIT",
+            true,
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains("55P03"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        other.success(
+            &mut engine,
+            "UPDATE conflict_locks SET value = 'independent' WHERE id = 2",
+            true,
+        );
+        owner.success(&mut engine, "ROLLBACK TO SAVEPOINT before_lock", true);
+        other.success(
+            &mut engine,
+            "SELECT id FROM conflict_locks WHERE id = 1 FOR UPDATE NOWAIT",
+            true,
+        );
+        owner.success(&mut engine, "ROLLBACK", true);
+    }
+}
+
+#[test]
+fn on_conflict_reuses_expression_scratch_and_exhaustion_preserves_retry() {
+    let mut config = test_config("conflict-fixed-arena");
+    config.table_rows = 1024;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut setup = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut small = ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 16 << 10);
+    setup.success(&mut engine, "CREATE TABLE conflict_scratch(id integer PRIMARY KEY, label text COLLATE \"C\", value text); CREATE UNIQUE INDEX conflict_scratch_label ON conflict_scratch(lower(label))", true);
+    for id in 0..512 {
+        setup.success(
+            &mut engine,
+            &format!("INSERT INTO conflict_scratch VALUES ({id}, 'Label{id}', 'old')"),
+            true,
+        );
+    }
+    assert_eq!(data_rows(&small.success(&mut engine,
+        "INSERT INTO conflict_scratch VALUES (999, 'LABEL511', 'changed') ON CONFLICT (lower(label)) DO UPDATE SET value = excluded.value RETURNING id, value", true)), ["511|changed"]);
+    let large = "x".repeat(24 << 10);
+    setup.success(
+        &mut engine,
+        &format!("INSERT INTO conflict_scratch VALUES (600, 'Large', '{large}')"),
+        true,
+    );
+    let output = small.execute(&mut engine,
+        "INSERT INTO conflict_scratch VALUES (600, 'Large', 'candidate') ON CONFLICT (id) DO UPDATE SET value = excluded.value", true);
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("54000") && text.contains("ON CONFLICT row exceeds the statement arena"),
+        "{text}"
+    );
+    assert_eq!(
+        data_rows(&setup.success(
+            &mut engine,
+            "SELECT length(value) FROM conflict_scratch WHERE id = 600",
+            true
+        )),
+        [(24 << 10).to_string()]
+    );
+    assert_eq!(data_rows(&setup.success(&mut engine,
+        "INSERT INTO conflict_scratch VALUES (600, 'Large', 'retry') ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING value", true)), ["retry"]);
+}

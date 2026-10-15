@@ -81,6 +81,9 @@ and extended statistics, restoring the caller's query snapshot on every exit.
 Table and domain constraints validate current committed and own changes through
 retained sources without changing ordinary query snapshots. Partition attachment
 streams its validation rows, and schema rewrites fetch original captured bytes.
+`ON CONFLICT` captures the matched current row before releasing its source.
+Older repeatable-read transactions reject a newer conflicting commit, and
+skipped conflict updates retain PostgreSQL's row locks until rollback or end.
 
 The [implementation guide](docs/implemented-baseline.md) owns the detailed
 contracts and limits; this sequence keeps the remaining acceptance gates.

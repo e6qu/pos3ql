@@ -35,6 +35,12 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - run: cargo clean -p pos3ql
+      - name: Lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Conflict ownership and fixed-memory regressions
+        run: |
+          set -euo pipefail
+          cargo test --lib --locked on_conflict -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/on-conflict-tests.log"
       - name: Build reference-comparison executable
         run: cargo build --release --locked
       - uses: ./.github/actions/python-test-environment
@@ -81,4 +87,35 @@ jobs:
           observed = transcript(15599)
           print('pos3ql:', observed, flush=True)
           assert observed == expected, 'ON CONFLICT divergence'
+          PYCODE
+          target/external-venv/bin/python tests/external/mvcc_diff.py
+      - name: Conflict, expression-index, and row-security SQL
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          RUN_FAST: "0"
+          RUN_CORE: "0"
+          RUN_CORPUS: "1"
+          RUN_AUX: "0"
+          RUN_SLT: "0"
+          RUN_FUZZ: "0"
+          FAST_CORPUS_SHARDS: "1"
+        run: |
+          set -euo pipefail
+          for corpus in 66_on_conflict 96_nulls_not_distinct_indexes 97_expression_indexes 106_row_level_security 90_row_triggers; do
+            FAST_CORPUS_ONLY="$corpus" bash tests/external/ci_diff.sh
+          done
+      - name: Symbolicate allocation failures in one batch
+        if: failure()
+        run: |
+          python3 - <<'PYCODE'
+          import os, re, subprocess
+          from pathlib import Path
+          log = Path(os.environ["RUNNER_TEMP"]) / "on-conflict-tests.log"
+          if log.exists():
+              frames = re.findall(r"(\S*/target/debug/deps/pos3ql-[0-9a-f]+)\(\+(0x[0-9a-f]+)\)", log.read_text(errors="replace"))
+              for binary in sorted({binary for binary, _ in frames}):
+                  addresses = [address for owner, address in frames if owner == binary]
+                  subprocess.run(["addr2line", "-C", "-f", "-e", binary, *addresses], check=True)
           PYCODE

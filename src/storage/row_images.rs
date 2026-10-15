@@ -19,6 +19,15 @@ pub(crate) struct RowSnapshot {
     pub(super) version: RowVersionIdentity,
 }
 
+impl RowSnapshot {
+    pub(crate) fn committed_lsn(self) -> Option<u64> {
+        match self.version {
+            RowVersionIdentity::Committed(lsn) => Some(lsn),
+            RowVersionIdentity::Pending(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RowVersionIdentity {
     Pending(u64),

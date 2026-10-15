@@ -153,6 +153,23 @@ before policy evaluation or writes. Later decoding uses those copies, including
 for inherited columns and partition moves. It no longer looks up a saved
 version stamp against a mutable row map.
 
+`INSERT ... ON CONFLICT` copies the matched current row into the existing
+statement buffer before releasing its original source. It includes earlier own
+changes and committed rows recovered entirely from object storage. Index
+expression scratch is reused between examined rows; an oversized matched row
+fails with `54000` before changing data.
+
+**User example:** a repeatable-read report still sees an order's old reference
+after another session changes it. An insert that conflicts with the newer row
+must fail with `40001`, including `DO NOTHING`; it cannot silently update or
+ignore a row outside that transaction's view. Two proposed rows cannot update
+the same existing row in one statement: PostgreSQL returns `21000` and rolls
+back that statement. `DO UPDATE ... WHERE false` still locks its conflicting
+row, while unrelated orders can change. Savepoint rollback releases that lock.
+The [PostgreSQL 18 conflict executor](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/nodeModifyTable.c)
+defines the ordering of visibility, locking, filtering, and policy checks;
+two-session comparisons verify actual results.
+
 Index creation uses the same captured byte owners, but validates current
 committed rows and all earlier writes by the creating transaction. It does not
 change which versions ordinary transaction queries see. Ordinary index creation,

@@ -2571,9 +2571,6 @@ impl Engine {
             .and_then(|(slot, _)| self.storage.subscription_stream(slot, 0))
     }
 
-    /// Opens the local transaction that will receive one publisher commit.
-    /// The worker uses the ordinary engine transaction and durability path;
-    /// replication cannot create a second, weaker write path.
     fn publish_session_context(
         &self,
         guc: &GucState,
@@ -2704,6 +2701,9 @@ impl Engine {
         self.storage.swap_path(path);
     }
 
+    /// Opens the local transaction that will receive one publisher commit.
+    /// The worker uses the ordinary engine transaction and durability path;
+    /// replication cannot create a second, weaker write path.
     pub(crate) fn begin_subscription_apply(
         &mut self,
         database: crate::storage::DatabaseOid,

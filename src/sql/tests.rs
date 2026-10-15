@@ -67875,7 +67875,15 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         frame[9..17].copy_from_slice(&end_lsn.to_be_bytes());
         frame[25..25 + plugin.len()].copy_from_slice(plugin);
         let parsed = copy_data(&frame[..25 + plugin.len()]).expect("valid pgoutput frame");
-        crate::mem::guard::forbid_alloc(|| apply.receive(engine, parsed).unwrap())
+        let setting = super::eval::funcs::system::session_setting("search_path");
+        let path = engine.storage.path();
+        let result = crate::mem::guard::forbid_alloc(|| apply.receive(engine, parsed).unwrap());
+        assert_eq!(
+            super::eval::funcs::system::session_setting("search_path"),
+            setting
+        );
+        assert_eq!(engine.storage.path().entries(), path.entries());
+        result
     }
 
     fn relation() -> Vec<u8> {
@@ -67934,7 +67942,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
          ALTER TABLE replicated_partition ATTACH PARTITION replicated_partition_high FOR VALUES FROM (10) TO (20); \
          CREATE TABLE replicated_partition_audit(event text, leaf text, id integer, body text, computed integer); \
          CREATE FUNCTION replicated_partition_before() RETURNS trigger LANGUAGE plpgsql AS \
-           'BEGIN IF TG_OP = ''INSERT'' THEN NEW.body := upper(NEW.body); ELSE NEW.body := NEW.body || '':U''; END IF; RETURN NEW; END'; \
+           'BEGIN IF current_setting(''search_path'') <> '''' THEN RAISE EXCEPTION ''worker inherited a frontend path''; END IF; IF TG_OP = ''INSERT'' THEN NEW.body := upper(NEW.body); ELSE NEW.body := NEW.body || '':U''; END IF; RETURN NEW; END'; \
          CREATE FUNCTION replicated_partition_after() RETURNS trigger LANGUAGE plpgsql AS \
            'BEGIN IF TG_OP = ''DELETE'' THEN INSERT INTO public.replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, OLD.id, OLD.body, OLD.computed); RETURN OLD; ELSE INSERT INTO public.replicated_partition_audit VALUES (TG_OP, TG_TABLE_NAME, NEW.id, NEW.body, NEW.computed); RETURN NEW; END IF; END'; \
          CREATE TRIGGER replica_partition_before BEFORE INSERT OR UPDATE ON replicated_partition FOR EACH ROW EXECUTE FUNCTION replicated_partition_before(); \

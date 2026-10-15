@@ -309,7 +309,7 @@ impl SubscriptionApply {
         confirmed_lsn: u64,
         behavior: crate::storage::SubscriptionBehavior,
     ) -> Result<Self, BudgetError> {
-        let mut guc = GucState::new_with_capacities(
+        let guc = GucState::new_with_capacities(
             budget,
             config.max_sequences,
             config.max_savepoints_per_transaction,
@@ -353,6 +353,7 @@ impl SubscriptionApply {
         operation: impl FnOnce(&mut Self, &mut crate::sql::Engine) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let _published = crate::sql::eval::funcs::system::retain_session_evaluation();
+        engine.select_database(self.stream.database_oid())?;
         if !self.txn.is_active() {
             let owner = engine.subscription_session_user(self.stream, self.txn.txid)?;
             self.guc.set_session_user(owner.as_str());

@@ -44,6 +44,7 @@ def setup_subscriber(connection):
         "ALTER TABLE subscription_layout_diff ATTACH PARTITION subscription_layout_high_diff FOR VALUES FROM (10) TO (20)",
         "CREATE TABLE subscription_layout_audit_diff(event text, leaf text, id integer, label text, computed integer)",
         """CREATE FUNCTION subscription_layout_before_diff() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
+            IF current_setting('search_path') <> '' THEN RAISE EXCEPTION 'worker inherited a frontend path'; END IF;
             IF TG_OP = 'INSERT' THEN NEW.label := upper(NEW.label);
             ELSE NEW.label := NEW.label || ':U'; END IF;
             RETURN NEW;

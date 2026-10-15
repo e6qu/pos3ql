@@ -1,0 +1,84 @@
+name: ON CONFLICT qualification
+
+on:
+  push:
+    branches: [retain-on-conflict-row-sources]
+
+concurrency:
+  group: on-conflict-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conflict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--locale-provider=libc --lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Build reference-comparison executable
+        run: cargo build --release --locked
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Compare conflict visibility, cardinality, and row locks
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          P3_PORT: "15599"
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/on-conflict.conf" <<CONFIG
+          listen_addr = 127.0.0.1:15599
+          data_dir = $RUNNER_TEMP/on-conflict-data
+          object_store = off
+          max_tables = 64
+          table_rows = 8192
+          max_value_indexes = 64
+          memtable_bytes = 256MiB
+          CONFIG
+          cat tests/external/differential-capacities.conf >> "$RUNNER_TEMP/on-conflict.conf"
+          target/release/pos3ql --config "$RUNNER_TEMP/on-conflict.conf" > "$RUNNER_TEMP/on-conflict.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"; cat "$RUNNER_TEMP/on-conflict.log"' EXIT
+          for attempt in $(seq 1 100); do
+            kill -0 "$server_pid"
+            if psql -h 127.0.0.1 -p 15599 -U postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+              break
+            fi
+            test "$attempt" -lt 100
+            sleep 0.1
+          done
+          target/external-venv/bin/python - <<'PYCODE'
+          import sys
+          sys.path.insert(0, 'tests/external')
+          import mvcc_diff
+          def transcript(port):
+              with mvcc_diff.connect(port) as reader, mvcc_diff.connect(port) as writer:
+                  return mvcc_diff.on_conflict_snapshot_transcript(reader, writer)
+          expected = transcript(5432)
+          print('PostgreSQL:', expected, flush=True)
+          observed = transcript(15599)
+          print('pos3ql:', observed, flush=True)
+          assert observed == expected, 'ON CONFLICT divergence'
+          PYCODE

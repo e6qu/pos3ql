@@ -25,6 +25,63 @@ def sqlstate(connection, statement: str) -> str:
     return "ok"
 
 
+def on_conflict_snapshot_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE conflict_snapshot(id integer PRIMARY KEY, value text)")
+    writer.execute("INSERT INTO conflict_snapshot VALUES (1, 'old')")
+    results = []
+    try:
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        before = reader.execute("SELECT value FROM conflict_snapshot WHERE id = 1").fetchone()[0]
+        writer.execute("UPDATE conflict_snapshot SET value = 'new' WHERE id = 1")
+        writer.execute("INSERT INTO conflict_snapshot VALUES (2, 'later')")
+        for label, command in [
+            ("updated_nothing", "INSERT INTO conflict_snapshot VALUES (1, 'candidate') ON CONFLICT (id) DO NOTHING"),
+            ("updated_update", "INSERT INTO conflict_snapshot VALUES (1, 'candidate') ON CONFLICT (id) DO UPDATE SET value = excluded.value"),
+            ("inserted_nothing", "INSERT INTO conflict_snapshot VALUES (2, 'candidate') ON CONFLICT (id) DO NOTHING"),
+            ("inserted_update", "INSERT INTO conflict_snapshot VALUES (2, 'candidate') ON CONFLICT (id) DO UPDATE SET value = excluded.value"),
+        ]:
+            reader.execute("SAVEPOINT before_conflict")
+            error = sqlstate(reader, command)
+            reader.execute("ROLLBACK TO SAVEPOINT before_conflict")
+            after = reader.execute("SELECT value FROM conflict_snapshot WHERE id = 1").fetchone()[0]
+            count = reader.execute("SELECT count(*) FROM conflict_snapshot").fetchone()[0]
+            results.append(f"conflict_{label}={error},before:{before},after:{after},count:{count}")
+        reader.execute("INSERT INTO conflict_snapshot VALUES (3, 'own')")
+        own = reader.execute("INSERT INTO conflict_snapshot VALUES (3, 'changed') ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING value").fetchall()
+        results.append(f"conflict_prior_own={own}")
+        reader.execute("ROLLBACK")
+        current = reader.execute("INSERT INTO conflict_snapshot VALUES (1, 'candidate') ON CONFLICT (id) DO UPDATE SET value = conflict_snapshot.value || ':changed' RETURNING value").fetchall()
+        results.append(f"conflict_current={current}")
+        for label, command in [
+            ("nothing", "INSERT INTO conflict_snapshot VALUES (4, 'first'), (4, 'second') ON CONFLICT (id) DO NOTHING"),
+            ("update", "INSERT INTO conflict_snapshot VALUES (4, 'first'), (4, 'second') ON CONFLICT (id) DO UPDATE SET value = excluded.value"),
+            ("existing_update", "INSERT INTO conflict_snapshot VALUES (1, 'first'), (1, 'second') ON CONFLICT (id) DO UPDATE SET value = excluded.value"),
+        ]:
+            reader.execute("BEGIN")
+            error = sqlstate(reader, command)
+            reader.execute("ROLLBACK")
+            results.append(f"conflict_same_statement_{label}={error}")
+        reader.execute("BEGIN")
+        reader.execute("INSERT INTO conflict_snapshot VALUES (1, 'ignored') ON CONFLICT (id) DO UPDATE SET value = excluded.value WHERE false")
+        writer.execute("SET lock_timeout = '50ms'")
+        key_share = sqlstate(writer, "SELECT id FROM conflict_snapshot WHERE id = 1 FOR KEY SHARE")
+        updated = sqlstate(writer, "UPDATE conflict_snapshot SET value = 'blocked' WHERE id = 1")
+        unrelated = sqlstate(writer, "UPDATE conflict_snapshot SET value = 'unrelated' WHERE id = 2")
+        reader.execute("ROLLBACK")
+        released = sqlstate(writer, "UPDATE conflict_snapshot SET value = 'released' WHERE id = 1")
+        results.append(f"conflict_where_false=key_share:{key_share},update:{updated},unrelated:{unrelated},released:{released}")
+        reader.execute("BEGIN")
+        reader.execute("INSERT INTO conflict_snapshot VALUES (1, 'ignored') ON CONFLICT (id) DO UPDATE SET id = excluded.id WHERE false")
+        key_share = sqlstate(writer, "SELECT id FROM conflict_snapshot WHERE id = 1 FOR KEY SHARE")
+        reader.execute("ROLLBACK")
+        results.append(f"conflict_key_assignment=key_share:{key_share}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        writer.execute("DROP TABLE conflict_snapshot")
+
+
 def index_validation_transcript(reader, writer) -> list[str]:
     writer.execute("DROP TABLE IF EXISTS index_validation_diff")
     writer.execute("CREATE TABLE index_validation_diff (id integer, value integer)")
@@ -445,7 +502,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

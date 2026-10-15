@@ -43,7 +43,7 @@ use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::RowMap;
 pub(crate) use row_reads::{RowRead, RowSelfChange};
 use row_reads::{RowReadView, RowReadVisitor};
-pub(crate) use row_scans::ValidationRead;
+pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
 use row_versions::{
     RowVersionPools, clear_pending_versions, pending_last, pop_pending_version,
     prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,

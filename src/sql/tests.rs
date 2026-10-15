@@ -81202,3 +81202,256 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn alter_rewrite_sources_keep_selected_pending_and_saved_bytes_after_rollback_and_reuse() {
+    for saved in [false, true] {
+        let mut config = test_config(if saved {
+            "alter-source-saved"
+        } else {
+            "alter-source-heap"
+        });
+        config.object_store_on = saved;
+        config.object_store_sim = saved;
+        config.wal_upload = false;
+        config.wal_upload_sync = false;
+        config.object_store_bucket = format!("alter-source-{}-{saved}", std::process::id());
+        if saved {
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE TABLE alter_source(id integer, amount bigint); INSERT INTO alter_source VALUES (1, 10), (2, 20), (3, 30)", true);
+        if saved {
+            assert!(engine.checkpoint().unwrap());
+        }
+        session.success(&mut engine,
+            "BEGIN; UPDATE alter_source SET amount = amount + 100 WHERE id = 2; DELETE FROM alter_source WHERE id = 3", true);
+        let table = engine.storage.find_table("public", "alter_source").unwrap();
+        let mut scratch =
+            crate::mem::fixed_vec::FixedVec::new(&mut budget, "alter selected rows", 3).unwrap();
+        let arena = Arena::new(&mut budget, "alter selected source", 2 << 20).unwrap();
+        let source = crate::mem::guard::forbid_alloc(|| {
+            exec::capture_alter_rewrite_rows(
+                &engine.storage,
+                engine.storage.validation_read(),
+                table,
+                session.transaction.txid,
+                &mut scratch,
+                &arena,
+            )
+        })
+        .unwrap();
+        assert_eq!(scratch.len(), 2);
+        session.success(&mut engine, "ROLLBACK", true);
+        session.success(&mut engine, "DROP TABLE alter_source", true);
+        session.success(&mut engine,
+            "CREATE TABLE alter_source(id integer, amount bigint); INSERT INTO alter_source VALUES (9, 900)", true);
+        assert_eq!(
+            engine.storage.find_table("public", "alter_source"),
+            Some(table)
+        );
+        let mut selected = Vec::new();
+        for &row in scratch.iter() {
+            let exec::PhysicalRow::Local {
+                table_index,
+                rowid,
+                home: crate::storage::RowReadSource::Snapshot(snapshot),
+            } = row
+            else {
+                panic!("stored rewrite input");
+            };
+            let values = crate::mem::guard::forbid_alloc(|| {
+                let home = source.read_snapshot(rowid, snapshot)?;
+                engine
+                    .storage
+                    .with_row_bytes(table_index, rowid, home, |bytes| {
+                        let mut values = [Datum::Null; 2];
+                        crate::storage::rowenc::decode(
+                            bytes,
+                            &[ColType::Int4, ColType::Int8],
+                            &mut values,
+                        )?;
+                        let [Datum::Int4(id), Datum::Int8(amount)] = values else {
+                            panic!("captured types");
+                        };
+                        Ok::<_, SqlError>((id, amount))
+                    })
+            })
+            .unwrap();
+            selected.push(values);
+        }
+        selected.sort_unstable();
+        assert_eq!(selected, [(1, 10), (2, 120)]);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT id, amount FROM alter_source", true)),
+            ["9|900"]
+        );
+        drop(source);
+        drop(session);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        if saved {
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn alter_rewrite_sources_release_failed_capture_and_allow_fixed_capacity_retry() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE alter_capacity(id integer); INSERT INTO alter_capacity VALUES (1), (2), (3)",
+    );
+    let table = engine
+        .storage
+        .find_table("public", "alter_capacity")
+        .unwrap();
+    let arena = Arena::new(&mut budget, "alter capture retry", 2 << 20).unwrap();
+    let tiny = Arena::new(&mut budget, "alter tiny arena", 1).unwrap();
+    let mut short =
+        crate::mem::fixed_vec::FixedVec::new(&mut budget, "alter short scratch", 2).unwrap();
+    let mut complete =
+        crate::mem::fixed_vec::FixedVec::new(&mut budget, "alter complete scratch", 3).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let error = exec::capture_alter_rewrite_rows(
+            &engine.storage,
+            engine.storage.validation_read(),
+            table,
+            0,
+            &mut short,
+            &arena,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(
+            error
+                .message
+                .as_str()
+                .contains("ALTER touches more than 2 rows")
+        );
+        assert!(short.is_empty());
+        let error = exec::capture_alter_rewrite_rows(
+            &engine.storage,
+            engine.storage.validation_read(),
+            table,
+            0,
+            &mut complete,
+            &tiny,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(complete.is_empty());
+        let source = exec::capture_alter_rewrite_rows(
+            &engine.storage,
+            engine.storage.validation_read(),
+            table,
+            0,
+            &mut complete,
+            &arena,
+        )
+        .unwrap();
+        assert_eq!(complete.len(), 3);
+        drop(source);
+    });
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM alter_capacity ORDER BY id"
+        )),
+        ["1", "2", "3"]
+    );
+}
+
+#[test]
+fn alter_rewrite_sources_metadata_changes_stream_saved_rows_beyond_update_capacity() {
+    let mut config = test_config("alter-saved-definition");
+    config.table_rows = 8;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("alter-saved-definition-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE alter_saved(id integer, amount bigint)",
+        true,
+    );
+    for start in [1, 5, 9] {
+        session.success(&mut engine, &format!(
+            "INSERT INTO alter_saved SELECT id, id::bigint * 10 FROM generate_series({start}, {}) AS id", start + 3), true);
+        assert!(engine.checkpoint().unwrap());
+    }
+    session.success(
+        &mut engine,
+        "ALTER TABLE alter_saved RENAME COLUMN amount TO total",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "ALTER TABLE alter_saved ALTER COLUMN total SET DEFAULT 5",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "ALTER TABLE alter_saved ALTER COLUMN total SET NOT NULL",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*), sum(total) FROM alter_saved",
+            true
+        )),
+        ["12|780"]
+    );
+    let rejected = session.execute(
+        &mut engine,
+        "ALTER TABLE alter_saved ALTER COLUMN total TYPE text",
+        true,
+    );
+    assert!(String::from_utf8_lossy(&rejected).contains("54000"));
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*), sum(total) FROM alter_saved",
+            true
+        )),
+        ["12|780"]
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; ALTER TABLE alter_saved RENAME COLUMN total TO reverted; ROLLBACK",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*), sum(total) FROM alter_saved",
+            true
+        )),
+        ["12|780"]
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}

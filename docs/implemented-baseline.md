@@ -169,6 +169,16 @@ same fixed pool.
 reading the replacement orders table through the reused internal slot. Bytes
 it already selected stay readable; a later admission fails explicitly.
 
+ALTER TABLE rewrites retain the source before choosing any input row identity.
+The chosen versions and their later reads therefore share one source through
+row changes, rollback, and maintenance. An ALTER that changes only a definition
+checks for a first row when needed; it does not reserve one rewrite record for
+every saved row.
+
+**User example:** renaming a column in a large saved orders table does not fail
+because the server's update workspace cannot hold every order. A type change
+that really rewrites those orders still obeys its fixed row and statement limits.
+
 Captured sources remain readable after table replacement and Storage teardown.
 The last shared lease releases the roots and makes its slot reusable.
 

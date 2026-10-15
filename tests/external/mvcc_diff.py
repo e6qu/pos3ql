@@ -539,6 +539,41 @@ def constraint_rewrite_transcript(reader, writer) -> list[str]:
         writer.execute("DROP TABLE validation_rewrite")
 
 
+def alter_rewrite_source_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE alter_source_diff(id integer, amount bigint)")
+    writer.execute("INSERT INTO alter_source_diff VALUES (1, 10), (2, 20), (3, 30)")
+    results = []
+    try:
+        reader.execute("BEGIN")
+        reader.execute("UPDATE alter_source_diff SET amount = amount + 100 WHERE id = 2")
+        reader.execute("DELETE FROM alter_source_diff WHERE id = 3")
+        reader.execute("ALTER TABLE alter_source_diff ALTER COLUMN amount TYPE text USING amount::text")
+        changed = reader.execute("SELECT id, amount FROM alter_source_diff ORDER BY id").fetchall()
+        reader.execute("ROLLBACK")
+        restored = writer.execute("SELECT id, amount FROM alter_source_diff ORDER BY id").fetchall()
+        results.append(f"alter_source_own=changed:{changed},restored:{restored}")
+        writer.execute("ALTER TABLE alter_source_diff RENAME COLUMN amount TO total")
+        writer.execute("ALTER TABLE alter_source_diff ALTER COLUMN total SET DEFAULT 5")
+        writer.execute("ALTER TABLE alter_source_diff ALTER COLUMN total SET NOT NULL")
+        writer.execute("INSERT INTO alter_source_diff(id) VALUES (4)")
+        rows = writer.execute("SELECT id, total FROM alter_source_diff ORDER BY id").fetchall()
+        results.append(f"alter_source_metadata={rows}")
+        error = sqlstate(writer, "ALTER TABLE alter_source_diff ADD COLUMN required integer NOT NULL")
+        count = writer.execute("SELECT count(*) FROM alter_source_diff").fetchone()[0]
+        results.append(f"alter_source_required={error},rows:{count}")
+        reader.execute("BEGIN")
+        reader.execute("DELETE FROM alter_source_diff")
+        reader.execute("ALTER TABLE alter_source_diff ADD COLUMN required integer NOT NULL")
+        empty = reader.execute("SELECT count(*) FROM alter_source_diff").fetchone()[0]
+        reader.execute("ROLLBACK")
+        restored = writer.execute("SELECT id, total FROM alter_source_diff ORDER BY id").fetchall()
+        results.append(f"alter_source_own_delete=empty:{empty},restored:{restored}")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("DROP TABLE alter_source_diff")
+
+
 def analyze_snapshot_transcript(reader, writer) -> list[str]:
     writer.execute("DROP TABLE IF EXISTS analyze_snapshot_diff CASCADE")
     writer.execute("CREATE TABLE analyze_snapshot_diff (id integer, a integer, b integer, label text)")
@@ -632,7 +667,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

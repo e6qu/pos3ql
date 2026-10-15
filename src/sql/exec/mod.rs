@@ -64536,6 +64536,35 @@ fn alter_table_inner(
     sql_ok()
 }
 
+/// Every rewrite identity comes from this same retained byte source.
+pub(crate) fn capture_alter_rewrite_rows<'arena>(
+    storage: &Storage,
+    read: crate::storage::ValidationRead,
+    table: usize,
+    txid: u32,
+    scratch: &mut DmlScratch,
+    arena: &'arena Arena,
+) -> Result<crate::storage::CapturedRowScan<'arena>, SqlError> {
+    scratch.clear();
+    let source = read.scan_in(storage, table, txid, arena)?;
+    if let Err(error) = source.for_each_home(&mut |rowid, home| {
+        scratch
+            .push(PhysicalRow::local(table, rowid, home.snapshot()))
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "ALTER touches more than {} rows",
+                    scratch.capacity()
+                )
+            })?;
+        Ok(core::ops::ControlFlow::Continue(()))
+    }) {
+        scratch.clear();
+        return Err(error);
+    }
+    Ok(source)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn alter_table_relation(
     storage: &mut Storage,
@@ -65382,43 +65411,24 @@ fn alter_table_relation(
         return sql_ok();
     }
 
-    // Collect current committed and own row identities: the count decides whether an
-    // added NOT NULL column needs a fill (a spilled table has rows even when
-    // the overlay map has evicted them, so `rows.is_empty()` cannot answer
-    // this), and the same list drives the rewrite below.
+    // An added NOT NULL column without a default only needs to know whether
+    // a row exists. Retain rewrite inputs after the new definition is known.
     let ddl_read = storage.validation_read();
     scratch.clear();
-    {
-        let mut overflow = false;
-        if let Err(error) =
-            ddl_read.for_each_row_state(storage, table_index, &mut |rowid, state| {
-                use core::ops::ControlFlow;
-                let Some(loc) =
-                    ddl_read.visible_row_home(storage, table_index, rowid, state, txn.txid)?
-                else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                if scratch
-                    .push(PhysicalRow::local(table_index, rowid, loc.snapshot()))
-                    .is_err()
-                {
-                    overflow = true;
-                    return Ok(ControlFlow::Break(()));
-                }
-                Ok(ControlFlow::Continue(()))
-            })
+    let mut has_rows = false;
+    if let Err(error) = ddl_read.for_each_row_state(storage, table_index, &mut |rowid, state| {
+        if ddl_read
+            .visible_row_home(storage, table_index, rowid, state, txn.txid)?
+            .is_some()
         {
-            return sql_fail(error);
+            has_rows = true;
+            Ok(core::ops::ControlFlow::Break(()))
+        } else {
+            Ok(core::ops::ControlFlow::Continue(()))
         }
-        if overflow {
-            return sql_fail(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "ALTER touches more than {} rows",
-                scratch.capacity()
-            ));
-        }
+    }) {
+        return sql_fail(error);
     }
-    let has_rows = !scratch.is_empty();
 
     // Build the new definition and the composed per-column rewrite source.
     // Names resolve against the running definition, so an ADD CONSTRAINT can
@@ -66604,15 +66614,15 @@ fn alter_table_relation(
     }
 
     let has_rewrite = added_any || dropped_any || retyped_any || generated_changed;
-    let rewritten_rows = if has_rewrite { scratch.len() } else { 0 };
     let original_rows = if has_rewrite {
-        match ddl_read.scan_in(storage, table_index, txn.txid, arena) {
+        match capture_alter_rewrite_rows(storage, ddl_read, table_index, txn.txid, scratch, arena) {
             Ok(rows) => Some(rows),
             Err(error) => return sql_fail(error),
         }
     } else {
         None
     };
+    let rewritten_rows = scratch.len();
 
     let mut old_schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut old_schema);

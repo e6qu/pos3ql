@@ -73,15 +73,14 @@ view's output names. Prepared WITH descriptions analyze RETURNING without
 running the change. Prepared-statement cleanup releases names while bound
 portals keep their original statement bytes. Validation checks
 current rows without changing ordinary query snapshots.
+Table rewrites choose their row identities from an already retained byte source;
+metadata-only changes do not build a list of all rows.
 Reader cleanup uses a separate startup workspace and rechecks active readers
 in each small batch. The [implementation guide](docs/implemented-baseline.md)
 owns the detailed contracts, completed work, and limits.
 
 Still to do:
 
-- Keep the original row data for remaining executor paths that still save
-  only a version number. A later reread must keep its source through updates
-  and maintenance.
 - Extend partition attachment and all write paths to reordered physical
   columns; keep the current explicit rejection until those paths agree.
 - Finish shared-state protection for table creation/removal and engine-wide

@@ -81710,14 +81710,14 @@ fn pgoutput_row_selection_copies_only_matches_and_owns_original_schema() {
     let small = deletion(b"101");
     let selected = crate::mem::guard::forbid_alloc(|| {
         let CopyData::XLogData {
-            message: Message::Relation(relation),
+            message: Message::Relation { relation, .. },
             ..
         } = crate::pg::pginput::copy_data(&relation).unwrap()
         else {
             panic!("relation frame");
         };
         relations
-            .register(&engine.storage, session.txn.txid, relation)
+            .register(&engine.storage, session.transaction.txid, relation)
             .unwrap();
         let binding = relations.binding(1).unwrap();
         let CopyData::XLogData {
@@ -81729,7 +81729,7 @@ fn pgoutput_row_selection_copies_only_matches_and_owns_original_schema() {
         };
         let error = super::exec::locate_replication_row(
             &engine.storage,
-            &session.txn,
+            &session.transaction,
             binding,
             old,
             &arena,
@@ -81745,8 +81745,14 @@ fn pgoutput_row_selection_copies_only_matches_and_owns_original_schema() {
         else {
             panic!("delete frame");
         };
-        super::exec::locate_replication_row(&engine.storage, &session.txn, binding, old, &arena)
-            .unwrap()
+        super::exec::locate_replication_row(
+            &engine.storage,
+            &session.transaction,
+            binding,
+            old,
+            &arena,
+        )
+        .unwrap()
     });
     let table = selected.table_slot();
     session.success(&mut engine, "ROLLBACK", true);

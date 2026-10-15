@@ -117,7 +117,7 @@ impl DefinitionVersions {
         })
     }
 
-    pub(super) fn read(&self, slot: usize) -> DefinitionSlotRead<'_> {
+    fn read(&self, slot: usize) -> DefinitionSlotRead<'_> {
         DefinitionSlotRead {
             state: self.slots[slot]
                 .read()
@@ -263,7 +263,7 @@ impl DefinitionVersions {
     }
 }
 
-pub(super) struct DefinitionSlotRead<'a> {
+struct DefinitionSlotRead<'a> {
     state: RwLockReadGuard<'a, Option<PendingTableDefSlot>>,
 }
 

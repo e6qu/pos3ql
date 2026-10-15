@@ -27353,7 +27353,7 @@ impl Storage {
             rename_table_sql_identity(&mut definition, prior, name)?;
             let mut tail = table.pending_definition_tail();
             while let Some(pending_slot) = tail {
-                let pending = self.pending_table_defs.read(pending_slot as usize);
+                let pending = self.pending_table_defs.exclusive(pending_slot as usize);
                 let mut definition = pending.version.def;
                 rename_table_sql_identity(&mut definition, prior, name)?;
                 tail = pending.previous;

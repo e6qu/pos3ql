@@ -175,6 +175,8 @@ ANALYZE captures resident row choices and retains the original heap and saved
 files. Saved rows continue streaming through the merged reader. Base and
 extended statistics share a current read position for the operation, including
 all own changes. Success and errors restore the caller's earlier query snapshot.
+The work buffer is reused between target tables, so a database-wide ANALYZE
+does not accumulate captured metadata from every table.
 Statistics record the data generation examined; table replacement rejects a
 captured source with `40001` instead of publishing it onto a reused table slot.
 

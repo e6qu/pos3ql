@@ -4113,7 +4113,7 @@ fn next_auto_value<'x>(
 
 /// The unique constraint or index an `ON CONFLICT` clause arbitrates on.
 /// `Any` (no target, DO NOTHING) treats a violation of *any* unique constraint
-/// as the conflict; `Columns` restricts the conflict to rows equal on exactly
+/// as the conflict; `Keys` restricts the conflict to rows equal on exactly
 /// this column set, so a violation of a *different* unique falls through to a
 /// normal 23505 — matching PostgreSQL, which uses the arbiter index alone.
 #[expect(

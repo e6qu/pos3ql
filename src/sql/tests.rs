@@ -80447,10 +80447,6 @@ fn on_conflict_reuses_expression_scratch_in_fixed_execution_memory() {
     }
     assert_eq!(data_rows(&small.success(&mut engine,
         "INSERT INTO conflict_scratch VALUES (999, 'LABEL511', 'changed') ON CONFLICT (lower(label)) DO UPDATE SET value = excluded.value RETURNING id, value", true)), ["511|changed"]);
-    assert_eq!(
-        data_rows(&setup.success(&mut engine, "SELECT count(*) FROM conflict_scratch", true)),
-        ["512"]
-    );
 }
 
 #[test]

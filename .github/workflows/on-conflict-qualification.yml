@@ -42,11 +42,15 @@ jobs:
           set -euo pipefail
           cargo test --lib --locked on_conflict -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/on-conflict-tests.log"
       - name: Build reference-comparison executable
+        id: build
+        if: ${{ !cancelled() }}
         run: cargo build --release --locked
       - uses: ./.github/actions/python-test-environment
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         with:
           venv: target/external-venv
       - name: Compare conflict visibility, cardinality, and row locks
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           PGHOST: 127.0.0.1
           PGPORT: "5432"
@@ -90,6 +94,7 @@ jobs:
           PYCODE
           target/external-venv/bin/python tests/external/mvcc_diff.py
       - name: Conflict, expression-index, and row-security SQL
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           PGHOST: 127.0.0.1
           PGPORT: "5432"

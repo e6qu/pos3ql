@@ -15,12 +15,12 @@ INSERT INTO oc_t VALUES (1, 10, 'x'), (2, 20, 'y');
 INSERT INTO oc_t VALUES (1, 10, 'z') ON CONFLICT (a) DO UPDATE SET note = 'upd'
   RETURNING a, b, note;
 
--- ON CONSTRAINT names the arbiter index directly.
+-- ON CONSTRAINT selects a unique constraint by name.
 INSERT INTO oc_t VALUES (99, 20, 'z') ON CONFLICT ON CONSTRAINT oc_t_b_key
   DO UPDATE SET note = 'byname' RETURNING a, b, note;
 
--- EXCLUDED is the proposed row; it is usable in SET and RETURNING. The main
--- query's WHERE can reference the existing row (oc_t).
+-- EXCLUDED is the proposed row used by SET. The conflict WHERE can reference
+-- the existing row (oc_t).
 INSERT INTO oc_t VALUES (2, 20, 'w') ON CONFLICT (b) DO UPDATE
   SET note = EXCLUDED.note WHERE oc_t.a < 100 RETURNING a, b, note;
 

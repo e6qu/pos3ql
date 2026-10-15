@@ -69,7 +69,9 @@ valid through nested changes and table replacement. Reader cleanup rechecks
 active readers in small batches. Metadata-only ALTER does not reserve a rewrite
 record for every saved row. Attached partitions map matching columns by name
 through reads, constraints, writes, and replication; subscription descriptors
-recheck local tables after schema changes. The [implementation guide](docs/implemented-baseline.md)
+recheck local tables after schema changes. Pending table definitions retain one
+startup slot rather than the whole pool; unrelated tables can publish and retire
+their own versions while that definition remains selected. The [implementation guide](docs/implemented-baseline.md)
 owns the detailed completed contracts, examples, and capacity limits.
 
 Still to do:

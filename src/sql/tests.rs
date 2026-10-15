@@ -23953,7 +23953,7 @@ fn parent_for_update_locks_the_physical_leaf_row() {
 }
 
 #[test]
-fn parent_before_update_trigger_cannot_move_a_row_to_another_leaf() {
+fn partition_parent_before_update_trigger_routes_to_its_chosen_leaf() {
     let (mut engine, mut budget) = test_engine();
     let moved = run_with(
         &mut engine,
@@ -23966,10 +23966,13 @@ fn parent_before_update_trigger_cannot_move_a_row_to_another_leaf() {
          CREATE TRIGGER parent_update_route BEFORE UPDATE ON update_trigger_parent \
            FOR EACH ROW EXECUTE FUNCTION move_updated_partition(); \
          INSERT INTO update_trigger_parent VALUES (1); \
-         UPDATE update_trigger_parent SET id = 2 WHERE id = 1",
+         UPDATE update_trigger_parent SET id = 2 WHERE id = 1 RETURNING id; \
+         SELECT id FROM update_trigger_low; \
+         SELECT id FROM update_trigger_high",
     );
-    assert!(
-        String::from_utf8_lossy(&moved).contains("0A000"),
+    assert_eq!(
+        data_rows(&moved),
+        ["11", "11"],
         "{}",
         String::from_utf8_lossy(&moved)
     );

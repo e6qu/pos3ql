@@ -155,7 +155,9 @@ def partition_move_transcript(reader, writer, reordered=False) -> list[str]:
         IF TG_OP = 'DELETE' THEN
             IF OLD.label = 'SKIP_DELETE' THEN RETURN NULL; END IF;
             RETURN OLD;
-        ELSIF TG_OP = 'UPDATE' THEN NEW.label := NEW.label || ':U';
+        ELSIF TG_OP = 'UPDATE' THEN
+            NEW.label := NEW.label || ':U';
+            IF NEW.label = 'trigger_move:U' THEN NEW.id := 14; END IF;
         ELSE
             IF NEW.label = 'skip_insert:U' THEN RETURN NULL; END IF;
             NEW.label := upper(NEW.label);
@@ -191,6 +193,7 @@ def partition_move_transcript(reader, writer, reordered=False) -> list[str]:
             ("merge_skip_delete", "MERGE INTO move_write_diff t USING (VALUES (2, 12)) AS s(old_id, new_id) ON t.id = s.old_id WHEN MATCHED THEN UPDATE SET id = s.new_id RETURNING t.id, t.label, t.computed"),
             ("merge_skip_insert", "MERGE INTO move_write_diff t USING (VALUES (3, 13)) AS s(old_id, new_id) ON t.id = s.old_id WHEN MATCHED THEN UPDATE SET id = s.new_id, label = 'skip_insert' RETURNING t.id, t.label, t.computed"),
             ("same_leaf", "UPDATE move_write_diff SET label = 'same' WHERE id = 11 RETURNING id, label, computed"),
+            ("before_update_chosen_leaf", "UPDATE move_write_diff SET id = 9, label = 'trigger_move' WHERE id = 6 RETURNING id, label, computed"),
         ]:
             cursor = reader.execute(command)
             changed = cursor.fetchall()

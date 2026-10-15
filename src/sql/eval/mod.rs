@@ -242,6 +242,7 @@ pub mod sqlstate {
     pub const AMBIGUOUS_FUNCTION: &str = "42725";
     pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
     pub const CARDINALITY_VIOLATION: &str = "21000";
+    pub const TRIGGERED_DATA_CHANGE_VIOLATION: &str = "27000";
     pub const CHECK_VIOLATION: &str = "23514";
     pub const EXCLUSION_VIOLATION: &str = "23P01";
     pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";

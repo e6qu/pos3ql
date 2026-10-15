@@ -98,6 +98,162 @@ impl PhysicalRow {
 
 pub(crate) type DmlScratch = FixedVec<PhysicalRow>;
 
+#[derive(Clone, Copy)]
+struct DmlRowImage<'arena> {
+    table: usize,
+    rowid: u64,
+    bytes: &'arena [u8],
+}
+
+/// Selected bytes outlive target ordering and nested trigger scratch changes.
+/// The staging records remain independent of this statement's arena lifetime.
+pub(super) struct DmlRowImages<'arena> {
+    rows: ArenaList<'arena, DmlRowImage<'arena>>,
+}
+
+impl<'arena> DmlRowImages<'arena> {
+    fn new(arena: &'arena Arena) -> Self {
+        Self {
+            rows: ArenaList::new(arena),
+        }
+    }
+
+    fn push(&mut self, table: usize, rowid: u64, bytes: &'arena [u8]) -> Result<(), SqlError> {
+        self.rows
+            .push(DmlRowImage {
+                table,
+                rowid,
+                bytes,
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "selected DML row records exceed the statement arena"
+                )
+            })
+    }
+
+    fn finish(mut self) -> Self {
+        self.rows
+            .as_mut_slice()
+            .sort_unstable_by_key(|row| (row.table, row.rowid));
+        self
+    }
+
+    pub(super) fn bytes(&self, table: usize, rowid: u64) -> Result<&'arena [u8], SqlError> {
+        let rows = self.rows.as_slice();
+        let index = rows
+            .binary_search_by_key(&(table, rowid), |row| (row.table, row.rowid))
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "selected DML row has no retained bytes"
+                )
+            })?;
+        Ok(rows[index].bytes)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DmlCapture {
+    Update { command: u32 },
+    Delete { command: u32, returning: bool },
+}
+
+impl DmlCapture {
+    fn command(self) -> u32 {
+        match self {
+            Self::Update { command } | Self::Delete { command, .. } => command,
+        }
+    }
+
+    fn needs_bytes(
+        self,
+        storage: &Storage,
+        logical_table: usize,
+        logical: &TableDef,
+        table: usize,
+        txid: u32,
+    ) -> bool {
+        match self {
+            Self::Update { .. } => true,
+            Self::Delete { returning, .. } => {
+                let physical = *storage.table_def(table, txid);
+                returning
+                    || table_is_referenced(
+                        storage,
+                        logical.schema.as_str(),
+                        logical.name.as_str(),
+                        txid,
+                    )
+                    || table_is_referenced(
+                        storage,
+                        physical.schema.as_str(),
+                        physical.name.as_str(),
+                        txid,
+                    )
+                    || storage.triggers_for_table(table, txid).next().is_some()
+                    || storage
+                        .triggers_for_table(logical_table, txid)
+                        .next()
+                        .is_some()
+            }
+        }
+    }
+}
+
+enum MatchedDmlRow<'arena> {
+    Identity,
+    Bytes(&'arena [u8]),
+}
+
+fn retain_dml_bytes<'arena>(arena: &'arena Arena, bytes: &[u8]) -> Result<&'arena [u8], SqlError> {
+    arena
+        .alloc_slice_copy(bytes)
+        .map(|bytes| &*bytes)
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "selected DML row exceeds the statement arena"
+            )
+        })
+}
+
+fn dml_row_available(
+    storage: &Storage,
+    txn: &TxnState,
+    row: PhysicalRow,
+    action: &str,
+) -> Result<bool, SqlError> {
+    let PhysicalRow::Local {
+        table_index,
+        rowid,
+        home,
+    } = row
+    else {
+        return Ok(true);
+    };
+    let crate::storage::RowReadSource::Snapshot(original) = home else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "selected DML row is a staging record"
+        ));
+    };
+    Ok(
+        match storage.row_self_change(table_index, rowid, original, txn.txid, txn.command_id())? {
+            crate::storage::RowSelfChange::Original => true,
+            crate::storage::RowSelfChange::SameCommand => false,
+            crate::storage::RowSelfChange::TriggeredCommand => {
+                return Err(sql_err!(
+                    sqlstate::TRIGGERED_DATA_CHANGE_VIOLATION,
+                    "tuple to be {} was already modified by an operation triggered by the current command",
+                    action
+                ));
+            }
+        },
+    )
+}
+
 /// The role whose privileges and row-security policies authorize a DML
 /// target. Rewrite actions use their owning relation's role without changing
 /// SQL-visible session identity.
@@ -20521,7 +20677,8 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
             let params = query.arguments;
             let (storage, txn, scratch, responder, seq_session) = context.dml_parts_with_sequence();
             let scratch = unsafe { &mut *scratch };
-            txn.enter_trigger_sql()?;
+            let mut command = txn.enter_trigger_sql(storage)?;
+            let txn = &mut *command;
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
                 insert(
@@ -20543,7 +20700,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                         .map_or(InsertSource::Statement, InsertSource::MaterializedSelect),
                 )
             });
-            txn.leave_trigger_sql();
+            drop(command);
             dynamic_dml_outcome(responder, outcome, "INSERT")
         }
         Stmt::Update(statement) => {
@@ -20560,7 +20717,8 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
             let arena = context.arena;
             let params = query.arguments;
             let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
-            txn.enter_trigger_sql()?;
+            let mut command = txn.enter_trigger_sql(storage)?;
+            let txn = &mut *command;
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
                 update(
@@ -20578,7 +20736,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                     Some(scope),
                 )
             });
-            txn.leave_trigger_sql();
+            drop(command);
             scratch.clear();
             for item in saved.iter().copied() {
                 scratch.push(item).map_err(|_| {
@@ -20604,7 +20762,8 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
             let arena = context.arena;
             let params = query.arguments;
             let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
-            txn.enter_trigger_sql()?;
+            let mut command = txn.enter_trigger_sql(storage)?;
+            let txn = &mut *command;
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
                 delete(
@@ -20621,7 +20780,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                     Some(scope),
                 )
             });
-            txn.leave_trigger_sql();
+            drop(command);
             scratch.clear();
             for item in saved.iter().copied() {
                 scratch.push(item).map_err(|_| {
@@ -24682,7 +24841,8 @@ fn execute_trigger_block<'a>(
                     let (storage, txn, scratch, responder, seq_session) =
                         context.dml_parts_with_sequence();
                     let scratch = unsafe { &mut *scratch };
-                    txn.enter_trigger_sql()?;
+                    let mut command = txn.enter_trigger_sql(storage)?;
+                    let txn = &mut *command;
                     responder.clear_affected_rows();
                     let outcome = responder.without_command_complete(|responder| {
                         insert(
@@ -24704,7 +24864,7 @@ fn execute_trigger_block<'a>(
                                 .map_or(InsertSource::Statement, InsertSource::MaterializedSelect),
                         )
                     });
-                    txn.leave_trigger_sql();
+                    drop(command);
                     match outcome {
                         Ok(Ok(())) => status.set_rows(
                             context
@@ -24782,7 +24942,8 @@ fn execute_trigger_block<'a>(
                     let params = context.params;
                     let (storage, txn, _, responder, seq_session) =
                         context.dml_parts_with_sequence();
-                    txn.enter_trigger_sql()?;
+                    let mut command = txn.enter_trigger_sql(storage)?;
+                    let txn = &mut *command;
                     responder.clear_affected_rows();
                     let outcome = responder.without_command_complete(|responder| {
                         update(
@@ -24800,7 +24961,7 @@ fn execute_trigger_block<'a>(
                             Some(&scope),
                         )
                     });
-                    txn.leave_trigger_sql();
+                    drop(command);
                     scratch.clear();
                     for item in saved.iter().copied() {
                         scratch.push(item).map_err(|_| {
@@ -24887,7 +25048,8 @@ fn execute_trigger_block<'a>(
                     let params = context.params;
                     let (storage, txn, _, responder, seq_session) =
                         context.dml_parts_with_sequence();
-                    txn.enter_trigger_sql()?;
+                    let mut command = txn.enter_trigger_sql(storage)?;
+                    let txn = &mut *command;
                     responder.clear_affected_rows();
                     let outcome = responder.without_command_complete(|responder| {
                         delete(
@@ -24904,7 +25066,7 @@ fn execute_trigger_block<'a>(
                             Some(&scope),
                         )
                     });
-                    txn.leave_trigger_sql();
+                    drop(command);
                     scratch.clear();
                     for item in saved.iter().copied() {
                         scratch.push(item).map_err(|_| {
@@ -60047,6 +60209,9 @@ pub(crate) fn update<'a>(
                 &hooks,
                 row_security,
                 scratch,
+                DmlCapture::Update {
+                    command: txn.command_id(),
+                },
                 outer,
             )
         } else {
@@ -60064,6 +60229,9 @@ pub(crate) fn update<'a>(
                 &hooks,
                 row_security,
                 scratch,
+                DmlCapture::Update {
+                    command: txn.command_id(),
+                },
             )
         }
     } else {
@@ -60079,12 +60247,16 @@ pub(crate) fn update<'a>(
             &hooks,
             row_security,
             scratch,
+            DmlCapture::Update {
+                command: txn.command_id(),
+            },
             outer_lookup,
         )
     };
-    if let Err(e) = collect {
-        return sql_fail(e);
-    }
+    let retained_rows = match collect {
+        Ok(rows) => rows,
+        Err(error) => return sql_fail(error),
+    };
 
     // PostgreSQL obtains a row lock before it computes or publishes any new
     // image. Collecting all target rowids first makes a default wait
@@ -60153,6 +60325,12 @@ pub(crate) fn update<'a>(
 
     let mut updated = 0u64;
     for i in 0..scratch.len() {
+        match dml_row_available(storage, txn, scratch[i], "updated") {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => return sql_fail(error),
+        }
+
         let (row_table, rowid, home, remote_tuple) = match scratch[i] {
             PhysicalRow::Local {
                 table_index,
@@ -60166,7 +60344,7 @@ pub(crate) fn update<'a>(
         };
         // Referential actions retain the arena-owned old values across mutation.
         let row_bytes = match (|| match (home, remote_tuple) {
-            (Some(home), None) => storage.row_bytes(row_table, rowid, home, arena),
+            (Some(_), None) => retained_rows.bytes(row_table, rowid),
             (None, Some(tuple_id)) => {
                 crate::sql::foreign::fetch_row(storage, row_table, txn.txid, tuple_id, arena)?
                     .ok_or_else(|| {
@@ -60201,6 +60379,7 @@ pub(crate) fn update<'a>(
                 values: &values[..def.n_columns],
                 alias: statement.alias,
             };
+            let expression_snapshot = storage.dml_expression_snapshot(txn.command_id());
             if let Some(from) = statement.from {
                 // UPDATE ... FROM: evaluate the assignments against the target
                 // row joined with the first matching FROM row.
@@ -60402,6 +60581,7 @@ pub(crate) fn update<'a>(
                     }
                 }
             }
+            drop(expression_snapshot);
             // Every generated column is recomputed from the updated row (a change
             // to any dependency must flow through).
             if let Err(e) = compute_generated(
@@ -60643,6 +60823,12 @@ pub(crate) fn update<'a>(
             }
             updated += 1;
             continue;
+        }
+
+        match dml_row_available(storage, txn, scratch[i], "updated") {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => return sql_fail(error),
         }
         let new_loc = match storage.heap.append_bytes(new_bytes) {
             Ok(x) => x,
@@ -60996,6 +61182,10 @@ pub(crate) fn delete<'a>(
                 &hooks,
                 row_security,
                 scratch,
+                DmlCapture::Delete {
+                    command: txn.command_id(),
+                    returning: !statement.returning.is_empty(),
+                },
                 outer,
             )
         } else {
@@ -61013,6 +61203,10 @@ pub(crate) fn delete<'a>(
                 &hooks,
                 row_security,
                 scratch,
+                DmlCapture::Delete {
+                    command: txn.command_id(),
+                    returning: !statement.returning.is_empty(),
+                },
             )
         }
     } else {
@@ -61028,12 +61222,17 @@ pub(crate) fn delete<'a>(
             &hooks,
             row_security,
             scratch,
+            DmlCapture::Delete {
+                command: txn.command_id(),
+                returning: !statement.returning.is_empty(),
+            },
             outer_lookup,
         )
     };
-    if let Err(e) = collect {
-        return sql_fail(e);
-    }
+    let retained_rows = match collect {
+        Ok(rows) => rows,
+        Err(error) => return sql_fail(error),
+    };
     for row in scratch.iter().copied() {
         let PhysicalRow::Local {
             table_index: row_table,
@@ -61099,6 +61298,12 @@ pub(crate) fn delete<'a>(
         .is_some();
     let mut deleted = 0u64;
     for i in 0..scratch.len() {
+        match dml_row_available(storage, txn, scratch[i], "deleted") {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => return sql_fail(error),
+        }
+
         if let PhysicalRow::Foreign {
             table_index: row_table,
             tuple_id,
@@ -61216,7 +61421,7 @@ pub(crate) fn delete<'a>(
             deleted += 1;
             continue;
         }
-        let (row_table, rowid, old_home) = scratch[i].local_parts();
+        let (row_table, rowid, _old_home) = scratch[i].local_parts();
         let row_has_triggers = has_triggers
             || storage
                 .triggers_for_table(row_table, txn.txid)
@@ -61225,7 +61430,7 @@ pub(crate) fn delete<'a>(
         if !statement.returning.is_empty() || referenced || row_has_triggers {
             // The cascade below mutates storage, so the row image is decoded
             // from an arena-owned copy.
-            let fetched = match storage.row_bytes(row_table, rowid, old_home, arena) {
+            let fetched = match retained_rows.bytes(row_table, rowid) {
                 Ok(b) => b,
                 Err(e) => return sql_fail(e),
             };
@@ -61292,6 +61497,12 @@ pub(crate) fn delete<'a>(
             {
                 return sql_fail(e);
             }
+        }
+
+        match dml_row_available(storage, txn, scratch[i], "deleted") {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => return sql_fail(error),
         }
         match storage.write_pending(row_table, rowid, txn.txid, txn.command_id(), None) {
             Ok(prior) => {
@@ -67527,64 +67738,92 @@ fn row_matches<'a>(
     alias: Option<&str>,
     _schema: &[ColType],
     home: crate::storage::VisibleRowHome,
+    capture_bytes: bool,
     where_clause: Option<&Expr<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &super::eval::EvalHooks<'_, 'a>,
     row_security: Option<super::query::RowSecurityPlan<'a>>,
     transition: Option<&dyn ColumnLookup<'a>>,
-) -> Result<bool, SqlError> {
+) -> Result<Option<MatchedDmlRow<'a>>, SqlError> {
     if where_clause.is_none() && row_security.is_none() {
-        return Ok(true);
+        return if capture_bytes {
+            storage
+                .row_bytes(table_index, rowid, home, arena)
+                .map(|bytes| Some(MatchedDmlRow::Bytes(bytes)))
+        } else {
+            Ok(Some(MatchedDmlRow::Identity))
+        };
     }
     // Consume-in-place: the row's bytes live only for this predicate — a
     // WHERE over thousands of spilled rows must not fill the arena with
     // rows it rejects. (A WHERE subquery's own spilled reads take the
     // arena path, not this scratch, so nesting holds.)
-    let physical = storage.table_def(table_index, txid);
+    let physical = *storage.table_def(table_index, txid);
     let mut physical_schema = [ColType::Bool; MAX_COLUMNS];
     physical.schema(&mut physical_schema);
     let physical_schema = &physical_schema[..physical.n_columns];
     if let Some(transition) = transition {
+        let row_mark = arena.mark();
         let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
-        let bytes = arena.alloc_slice_copy(bytes).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "trigger DML predicate exceeds the statement arena"
+        let expression_mark = arena.mark();
+        let result = (|| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, physical_schema, &mut values)?;
+            row_matches_values(
+                storage,
+                txid,
+                def,
+                alias,
+                &values,
+                where_clause,
+                arena,
+                params,
+                hooks,
+                row_security,
+                Some(transition),
             )
-        })?;
-        let mut values = [Datum::Null; MAX_COLUMNS];
-        rowenc::decode(bytes, physical_schema, &mut values)?;
-        return row_matches_values(
-            storage,
-            txid,
-            def,
-            alias,
-            &values,
-            where_clause,
-            arena,
-            params,
-            hooks,
-            row_security,
-            Some(transition),
-        );
+        })();
+        // SAFETY: only a Boolean or owned error escapes predicate evaluation.
+        unsafe { arena.rewind_to(expression_mark) };
+        return match result {
+            Ok(true) if capture_bytes => Ok(Some(MatchedDmlRow::Bytes(bytes))),
+            outcome => {
+                // SAFETY: no bytes from a rejected or identity-only row escape.
+                unsafe { arena.rewind_to(row_mark) };
+                outcome.map(|matched| matched.then_some(MatchedDmlRow::Identity))
+            }
+        };
     }
     storage.with_row_bytes(table_index, rowid, home, |bytes| {
-        let mut values = [Datum::Null; MAX_COLUMNS];
-        rowenc::decode(bytes, physical_schema, &mut values)?;
-        row_matches_values(
-            storage,
-            txid,
-            def,
-            alias,
-            &values,
-            where_clause,
-            arena,
-            params,
-            hooks,
-            row_security,
-            None,
-        )
+        let mark = arena.mark();
+        let matched = (|| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, physical_schema, &mut values)?;
+            row_matches_values(
+                storage,
+                txid,
+                def,
+                alias,
+                &values,
+                where_clause,
+                arena,
+                params,
+                hooks,
+                row_security,
+                None,
+            )
+        })();
+        // SAFETY: decoded values and temporary expressions do not escape.
+        unsafe { arena.rewind_to(mark) };
+        if !matched? {
+            return Ok(None);
+        }
+        Ok(Some(if capture_bytes {
+            MatchedDmlRow::Bytes(retain_dml_bytes(arena, bytes)?)
+        } else {
+            MatchedDmlRow::Identity
+        }))
     })
 }
 
@@ -67687,7 +67926,7 @@ fn dml_leaf_slots_for<'a>(
 }
 
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
-fn collect_matches<'a>(
+pub(super) fn collect_matches<'a>(
     storage: &Storage,
     table_index: usize,
     alias: Option<&str>,
@@ -67699,10 +67938,13 @@ fn collect_matches<'a>(
     hooks: &super::eval::EvalHooks<'_, 'a>,
     row_security: Option<super::query::RowSecurityPlan<'a>>,
     scratch: &mut DmlScratch,
+    capture: DmlCapture,
     transition: Option<&dyn ColumnLookup<'a>>,
-) -> Result<(), SqlError> {
+) -> Result<DmlRowImages<'a>, SqlError> {
+    let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
-    let def = storage.table_def(table_index, txid);
+    let mut images = DmlRowImages::new(arena);
+    let def = *storage.table_def(table_index, txid);
     if def.kind == crate::storage::TableKind::Foreign {
         crate::sql::foreign::visit_mutable_rows(
             storage,
@@ -67748,7 +67990,7 @@ fn collect_matches<'a>(
             },
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
-        return Ok(());
+        return Ok(images.finish());
     }
     let indexed = if transition.is_none() && !storage.relation_has_descendants(table_index, txid) {
         super::query::dml_indexed_candidates(
@@ -67776,6 +68018,7 @@ fn collect_matches<'a>(
                 access.map_or(0, |access| access.index_entries()),
             )?;
         }
+        let capture_bytes = capture.needs_bytes(storage, table_index, &def, leaf, txid);
         let mut visit = |rowid, state: crate::storage::RowRead<'_>| {
             let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
                 return Ok(());
@@ -67786,7 +68029,7 @@ fn collect_matches<'a>(
                 access.map(|access| access.index_oid()),
             )?;
             let snapshot = loc.snapshot();
-            if row_matches(
+            if let Some(image) = row_matches(
                 storage,
                 leaf,
                 rowid,
@@ -67795,6 +68038,7 @@ fn collect_matches<'a>(
                 alias,
                 schema,
                 loc,
+                capture_bytes,
                 where_clause,
                 arena,
                 params,
@@ -67802,6 +68046,9 @@ fn collect_matches<'a>(
                 row_security,
                 transition,
             )? {
+                if let MatchedDmlRow::Bytes(bytes) = image {
+                    images.push(leaf, rowid, bytes)?;
+                }
                 scratch
                     .push(PhysicalRow::local(leaf, rowid, snapshot))
                     .map_err(|_| {
@@ -67831,7 +68078,7 @@ fn collect_matches<'a>(
     // map is hash-addressed, so restore the monotonic row identity assigned
     // when the heap image was first appended before locks and writes begin.
     scratch.sort_unstable_by_key(|row| row.sort_key());
-    Ok(())
+    Ok(images.finish())
 }
 
 /// Collects target rows that join at least one row of the extra `from` tables
@@ -67839,21 +68086,24 @@ fn collect_matches<'a>(
 /// target row supplies its columns as the outer scope of the FROM scan.
 #[allow(clippy::too_many_arguments)]
 fn collect_join_matches<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     table_index: usize,
     def: &TableDef,
     alias: Option<&str>,
     schema: &[ColType],
-    from: &'a super::ast::FromClause<'a>,
-    where_clause: Option<&'a Expr<'a>>,
+    from: &super::ast::FromClause<'a>,
+    where_clause: Option<&Expr<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     txid: u32,
     hooks: &super::eval::EvalHooks<'_, 'a>,
     row_security: Option<super::query::RowSecurityPlan<'a>>,
     scratch: &mut DmlScratch,
-) -> Result<(), SqlError> {
+    capture: DmlCapture,
+) -> Result<DmlRowImages<'a>, SqlError> {
+    let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
+    let mut images = DmlRowImages::new(arena);
     if def.kind == crate::storage::TableKind::Foreign {
         crate::sql::foreign::visit_mutable_rows(
             storage,
@@ -67909,62 +68159,82 @@ fn collect_join_matches<'a>(
             },
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
-        return Ok(());
+        return Ok(images.finish());
     }
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
         storage.record_relation_scan(txid, leaf, None, 0)?;
-        storage.for_each_row_state(leaf, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            storage.record_relation_tuple_read(txid, leaf, None)?;
-            // Consume-in-place, as in row_matches: the joined-row probe reads
-            // this row's values only while it runs.
-            let snapshot = loc.snapshot();
-            let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
-                let mut tv = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut tv)?;
-                let context = RowCtx {
-                    def,
-                    values: &tv[..def.n_columns],
-                    alias,
+        let capture_bytes = capture.needs_bytes(storage, table_index, def, leaf, txid);
+        storage.for_each_row_state(
+            leaf,
+            &mut |rowid: u64, state: crate::storage::RowRead<'_>| {
+                use core::ops::ControlFlow;
+                let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
+                    return Ok(ControlFlow::Continue(()));
                 };
-                if let Some(plan) = row_security
-                    && !super::query::row_security_passes(
-                        plan, &context, storage, txid, arena, params, hooks,
-                    )?
-                {
-                    return Ok(false);
-                }
-                super::query::first_from_match(
-                    storage,
-                    from,
-                    txid,
-                    where_clause,
-                    &[],
-                    arena,
-                    params,
-                    &context,
-                    &mut |_| Ok(()),
-                )
-            })?;
-            if found {
-                scratch
-                    .push(PhysicalRow::local(leaf, rowid, snapshot))
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statement touches more than {} rows",
-                            scratch.capacity()
+                storage.record_relation_tuple_read(txid, leaf, None)?;
+                // Consume-in-place, as in row_matches: the joined-row probe reads
+                // this row's values only while it runs.
+                let snapshot = loc.snapshot();
+                let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
+                    let mark = arena.mark();
+                    let found = (|| -> Result<bool, SqlError> {
+                        let mut tv = [Datum::Null; MAX_COLUMNS];
+                        rowenc::decode(bytes, schema, &mut tv)?;
+                        let context = RowCtx {
+                            def,
+                            values: &tv[..def.n_columns],
+                            alias,
+                        };
+                        if let Some(plan) = row_security
+                            && !super::query::row_security_passes(
+                                plan, &context, storage, txid, arena, params, hooks,
+                            )?
+                        {
+                            return Ok(false);
+                        }
+                        super::query::first_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            &[],
+                            arena,
+                            params,
+                            &context,
+                            &mut |_| Ok(()),
                         )
-                    })?;
-            }
-            Ok(ControlFlow::Continue(()))
-        })?;
+                    })();
+                    // SAFETY: joined predicates retain no decoded values or front scratch.
+                    unsafe { arena.rewind_to(mark) };
+                    if !found? {
+                        return Ok(None);
+                    }
+                    Ok(Some(if capture_bytes {
+                        MatchedDmlRow::Bytes(retain_dml_bytes(arena, bytes)?)
+                    } else {
+                        MatchedDmlRow::Identity
+                    }))
+                })?;
+                if let Some(image) = found {
+                    if let MatchedDmlRow::Bytes(bytes) = image {
+                        images.push(leaf, rowid, bytes)?;
+                    }
+                    scratch
+                        .push(PhysicalRow::local(leaf, rowid, snapshot))
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "statement touches more than {} rows",
+                                scratch.capacity()
+                            )
+                        })?;
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
     }
-    Ok(())
+    Ok(images.finish())
 }
 
 /// Trigger-program variant of `collect_join_matches`. Its transition source
@@ -67985,9 +68255,12 @@ fn collect_join_matches_with_transition<'a>(
     hooks: &super::eval::EvalHooks<'_, 'a>,
     row_security: Option<super::query::RowSecurityPlan<'a>>,
     scratch: &mut DmlScratch,
+    capture: DmlCapture,
     outer: &dyn ColumnLookup<'a>,
-) -> Result<(), SqlError> {
+) -> Result<DmlRowImages<'a>, SqlError> {
+    let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
+    let mut images = DmlRowImages::new(arena);
     if def.kind == crate::storage::TableKind::Foreign {
         crate::sql::foreign::visit_mutable_rows(
             storage,
@@ -68047,64 +68320,84 @@ fn collect_join_matches_with_transition<'a>(
             },
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
-        return Ok(());
+        return Ok(images.finish());
     }
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
         storage.record_relation_scan(txid, leaf, None, 0)?;
-        storage.for_each_row_state(leaf, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            storage.record_relation_tuple_read(txid, leaf, None)?;
-            let snapshot = loc.snapshot();
-            let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut values)?;
-                let context = RowCtx {
-                    def,
-                    values: &values[..def.n_columns],
-                    alias,
+        let capture_bytes = capture.needs_bytes(storage, table_index, def, leaf, txid);
+        storage.for_each_row_state(
+            leaf,
+            &mut |rowid: u64, state: crate::storage::RowRead<'_>| {
+                use core::ops::ControlFlow;
+                let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
+                    return Ok(ControlFlow::Continue(()));
                 };
-                if let Some(plan) = row_security
-                    && !super::query::row_security_passes(
-                        plan, &context, storage, txid, arena, params, hooks,
-                    )?
-                {
-                    return Ok(false);
-                }
-                let scope = JoinedTriggerDmlScope {
-                    row: &context,
-                    outer,
-                };
-                super::query::first_from_match(
-                    storage,
-                    from,
-                    txid,
-                    where_clause,
-                    &[],
-                    arena,
-                    params,
-                    &scope,
-                    &mut |_| Ok(()),
-                )
-            })?;
-            if found {
-                scratch
-                    .push(PhysicalRow::local(leaf, rowid, snapshot))
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statement touches more than {} rows",
-                            scratch.capacity()
+                storage.record_relation_tuple_read(txid, leaf, None)?;
+                let snapshot = loc.snapshot();
+                let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
+                    let mark = arena.mark();
+                    let found = (|| -> Result<bool, SqlError> {
+                        let mut values = [Datum::Null; MAX_COLUMNS];
+                        rowenc::decode(bytes, schema, &mut values)?;
+                        let context = RowCtx {
+                            def,
+                            values: &values[..def.n_columns],
+                            alias,
+                        };
+                        if let Some(plan) = row_security
+                            && !super::query::row_security_passes(
+                                plan, &context, storage, txid, arena, params, hooks,
+                            )?
+                        {
+                            return Ok(false);
+                        }
+                        let scope = JoinedTriggerDmlScope {
+                            row: &context,
+                            outer,
+                        };
+                        super::query::first_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            &[],
+                            arena,
+                            params,
+                            &scope,
+                            &mut |_| Ok(()),
                         )
-                    })?;
-            }
-            Ok(ControlFlow::Continue(()))
-        })?;
+                    })();
+                    // SAFETY: joined predicates retain no decoded values or front scratch.
+                    unsafe { arena.rewind_to(mark) };
+                    if !found? {
+                        return Ok(None);
+                    }
+                    Ok(Some(if capture_bytes {
+                        MatchedDmlRow::Bytes(retain_dml_bytes(arena, bytes)?)
+                    } else {
+                        MatchedDmlRow::Identity
+                    }))
+                })?;
+                if let Some(image) = found {
+                    if let MatchedDmlRow::Bytes(bytes) = image {
+                        images.push(leaf, rowid, bytes)?;
+                    }
+                    scratch
+                        .push(PhysicalRow::local(leaf, rowid, snapshot))
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "statement touches more than {} rows",
+                                scratch.capacity()
+                            )
+                        })?;
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
     }
-    Ok(())
+    Ok(images.finish())
 }
 
 fn store_row(

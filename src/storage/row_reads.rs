@@ -24,6 +24,62 @@ use crate::mem::fixed_map::FixedMap;
 
 const METADATA_READS_PER_WORKSPACE: usize = 64;
 
+pub(crate) enum RowSelfChange {
+    Original,
+    SameCommand,
+    TriggeredCommand,
+}
+
+impl super::Storage {
+    /// Only pending metadata is needed; no byte read or callback runs while
+    /// definition, version, and row-map guards are held.
+    pub(crate) fn row_self_change(
+        &self,
+        table: usize,
+        rowid: u64,
+        original: super::RowSnapshot,
+        txid: u32,
+        command: u32,
+    ) -> Result<RowSelfChange, SqlError> {
+        let table = self.tables.get(table).ok_or_else(|| {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "selected DML table was removed"
+            )
+        })?;
+        let definition = table.definition();
+        if definition.created_at != original.created_at || !definition.visible_to(txid) {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "selected DML table was replaced"
+            ));
+        }
+        let versions = self.row_versions.read();
+        let rows = table.rows.read();
+        let Some(&state) = rows.get(&rowid) else {
+            return Ok(RowSelfChange::Original);
+        };
+        let state = RowRead::borrowed(state, &versions);
+        let Some(pending) = state.pending_last().filter(|pending| pending.txid == txid) else {
+            return Ok(RowSelfChange::Original);
+        };
+        let identity = state.pending_head_identity().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "pending DML row has no version identity"
+            )
+        })?;
+        if original.version == RowVersionIdentity::Pending(identity) {
+            return Ok(RowSelfChange::Original);
+        }
+        Ok(if pending.cid == command {
+            RowSelfChange::SameCommand
+        } else {
+            RowSelfChange::TriggeredCommand
+        })
+    }
+}
+
 pub(super) struct CapturedRowMetadata {
     pending: FixedVec<(u64, PendingChange)>,
     history: FixedVec<CommittedVersion>,

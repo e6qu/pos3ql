@@ -80510,3 +80510,332 @@ fn on_conflict_capture_exhaustion_preserves_cold_rows_and_retry() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn dml_target_bytes_survive_rollback_table_reuse_and_storage_removal() {
+    let mut config = test_config("dml-target-owned-source");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.value_index_rows = 1;
+    config.object_store_bucket = format!("dml-target-owned-source-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE dml_owned(id integer PRIMARY KEY, value text)",
+        true,
+    );
+    for id in 0..70 {
+        session.success(
+            &mut engine,
+            &format!("INSERT INTO dml_owned VALUES ({id}, 'saved')"),
+            true,
+        );
+    }
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let table = engine.storage.find_table("public", "dml_owned").unwrap();
+    assert!(engine.storage.table(table).rows.is_empty());
+    session.success(
+        &mut engine,
+        "BEGIN; INSERT INTO dml_owned VALUES (100, 'pending')",
+        true,
+    );
+    session.transaction.begin_command().unwrap();
+    let capture_arena = Arena::new(&mut budget, "retained DML test", 1 << 20).unwrap();
+    let mut scratch = FixedVec::new(&mut budget, "retained DML test rows", 128).unwrap();
+    let images = crate::mem::guard::forbid_alloc(|| {
+        crate::sql::exec::collect_matches(
+            &engine.storage,
+            table,
+            None,
+            session.transaction.txid,
+            &[ColType::Int4, ColType::Text],
+            None,
+            &capture_arena,
+            &[],
+            &crate::sql::eval::NO_HOOKS,
+            None,
+            &mut scratch,
+            crate::sql::exec::DmlCapture::Update {
+                command: session.transaction.command_id(),
+            },
+            None,
+        )
+    })
+    .unwrap();
+    let keys: Vec<_> = scratch
+        .iter()
+        .map(|row| match row {
+            crate::sql::exec::PhysicalRow::Local {
+                table_index, rowid, ..
+            } => (*table_index, *rowid),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(keys.len(), 71);
+    session.success(
+        &mut engine,
+        "ROLLBACK; DROP TABLE dml_owned; CREATE TABLE dml_replacement(unrelated boolean)",
+        true,
+    );
+    assert_eq!(
+        engine.storage.find_table("public", "dml_replacement"),
+        Some(table)
+    );
+    drop(session);
+    drop(engine);
+    crate::mem::guard::forbid_alloc(|| {
+        for (position, &(table, rowid)) in keys.iter().enumerate() {
+            let mut values = [Datum::Null; 2];
+            crate::storage::rowenc::decode(
+                images.bytes(table, rowid).unwrap(),
+                &[ColType::Int4, ColType::Text],
+                &mut values,
+            )
+            .unwrap();
+            let id = if position < 70 { position as i32 } else { 100 };
+            assert_eq!(values[0], Datum::Int4(id));
+            assert_eq!(
+                values[1],
+                Datum::Text(if id == 100 { "pending" } else { "saved" })
+            );
+        }
+        assert!(images.bytes(table + 1, keys[0].1).is_err());
+    });
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn dml_target_trigger_changes_fail_atomically_for_plain_and_joined_statements() {
+    let config = test_config("dml-target-trigger-status");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for (event, mutation, command) in [
+        (
+            "BEFORE UPDATE",
+            "UPDATE dml_target SET value = value + 100 WHERE id = 2",
+            "UPDATE dml_target SET value = value + 1",
+        ),
+        (
+            "BEFORE UPDATE",
+            "DELETE FROM dml_target WHERE id = 2",
+            "UPDATE dml_target SET value = value + 1",
+        ),
+        (
+            "BEFORE DELETE",
+            "UPDATE dml_target SET value = value + 100 WHERE id = 2",
+            "DELETE FROM dml_target",
+        ),
+        (
+            "BEFORE DELETE",
+            "DELETE FROM dml_target WHERE id = 2",
+            "DELETE FROM dml_target",
+        ),
+        (
+            "BEFORE UPDATE",
+            "UPDATE dml_target SET value = value + 100 WHERE id = 2",
+            "UPDATE dml_target SET value = dml_target.value + 1 FROM (VALUES (1), (2)) AS source(id) WHERE source.id = dml_target.id",
+        ),
+        (
+            "BEFORE DELETE",
+            "UPDATE dml_target SET value = value + 100 WHERE id = 2",
+            "DELETE FROM dml_target USING (VALUES (1), (2)) AS source(id) WHERE source.id = dml_target.id",
+        ),
+    ] {
+        session.success(&mut engine, "CREATE TABLE dml_target(id integer PRIMARY KEY, value integer); INSERT INTO dml_target VALUES (1, 10), (2, 20)", true);
+        let returned = if event.ends_with("DELETE") {
+            "OLD"
+        } else {
+            "NEW"
+        };
+        session.success(&mut engine, &format!(
+            "CREATE FUNCTION dml_target_action() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.id = 1 THEN {mutation}; END IF; RETURN {returned}; END $$; \
+             CREATE TRIGGER dml_target_trigger {event} ON dml_target FOR EACH ROW EXECUTE FUNCTION dml_target_action()"), true);
+        let output = session.execute(&mut engine, command, true);
+        assert!(
+            String::from_utf8_lossy(&output).contains("27000"),
+            "{command}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT value FROM dml_target WHERE id = 1; SELECT value FROM dml_target WHERE id = 2", true)), ["10", "20"]);
+        session.success(
+            &mut engine,
+            "DROP TABLE dml_target; DROP FUNCTION dml_target_action()",
+            true,
+        );
+    }
+    session.success(&mut engine, "CREATE TABLE dml_join_source(id integer PRIMARY KEY, value integer); INSERT INTO dml_join_source VALUES (1, 10), (2, 20), (3, 30)", true);
+    let mut rows = data_rows(&session.success(&mut engine,
+        "UPDATE dml_join_source AS target SET value = source.value FROM dml_join_source AS source WHERE source.id = target.id - 1 RETURNING target.id, target.value", true));
+    rows.sort();
+    assert_eq!(rows, ["2|10", "3|20"]);
+}
+
+#[test]
+fn dml_target_nested_commands_restore_callers_and_survive_cold_recovery() {
+    let mut config = test_config("dml-target-command-scope");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("dml-target-command-scope-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE dml_command_target(id integer PRIMARY KEY, value integer); \
+         CREATE TABLE dml_command_audit(id integer PRIMARY KEY, value integer); \
+         INSERT INTO dml_command_target VALUES (1, 10); \
+         CREATE FUNCTION dml_command_action() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+           INSERT INTO dml_command_audit VALUES (NEW.id, NEW.value) \
+             ON CONFLICT (id) DO UPDATE SET value = excluded.value; \
+           UPDATE dml_command_audit SET value = value + 100 WHERE id = NEW.id; RETURN NEW; END $$; \
+         CREATE TRIGGER dml_command_update BEFORE UPDATE ON dml_command_target \
+           FOR EACH ROW EXECUTE FUNCTION dml_command_action(); \
+         UPDATE dml_command_target SET value = value + 1 WHERE id = 1",
+        true,
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT value FROM dml_command_target WHERE id = 1; SELECT value FROM dml_command_audit WHERE id = 1", true)), ["11", "111"]);
+    session.success(&mut engine, "BEGIN", true);
+    session
+        .transaction
+        .test_set_command_id(crate::storage::SNAPSHOT_ALL - 2);
+    let output = session.execute(
+        &mut engine,
+        "UPDATE dml_command_target SET value = value + 1 WHERE id = 1",
+        true,
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("54000") && text.contains("command identity space"),
+        "{text}"
+    );
+    session.success(
+        &mut engine,
+        "ROLLBACK; UPDATE dml_command_target SET value = value + 1 WHERE id = 1",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "CREATE TRIGGER dml_command_insert BEFORE INSERT ON dml_command_target \
+           FOR EACH ROW EXECUTE FUNCTION dml_command_action()",
+        true,
+    );
+    let output = session.execute(
+        &mut engine,
+        "INSERT INTO dml_command_target VALUES (1, 100), (1, 200) \
+           ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+        true,
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("21000"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT value FROM dml_command_target WHERE id = 1; SELECT value FROM dml_command_audit WHERE id = 1", true)), ["12", "112"]);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT value FROM dml_command_target WHERE id = 1; SELECT value FROM dml_command_audit WHERE id = 1", true)), ["12", "112"]);
+    session.success(
+        &mut engine,
+        "UPDATE dml_command_target SET value = value + 1 WHERE id = 1",
+        true,
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT value FROM dml_command_target WHERE id = 1; SELECT value FROM dml_command_audit WHERE id = 1", true)), ["13", "113"]);
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn dml_target_capture_exhaustion_releases_sources_and_allows_narrow_retry() {
+    let mut config = test_config("dml-target-capture-exhaustion");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("dml-target-capture-exhaustion-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE dml_limited(id integer, value integer)",
+        true,
+    );
+    for id in 0..512 {
+        session.success(
+            &mut engine,
+            &format!("INSERT INTO dml_limited VALUES ({id}, 0)"),
+            true,
+        );
+    }
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let original_work_bytes = config.work_arena_bytes;
+    config.work_arena_bytes = 16 << 10;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.execute(&mut engine, "UPDATE dml_limited SET value = 1", true);
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("54000") && text.contains("selected DML row records"),
+        "{text}"
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "UPDATE dml_limited SET value = 1 WHERE id = 511 RETURNING value",
+            true
+        )),
+        ["1"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    config.work_arena_bytes = original_work_bytes;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*), sum(value) FROM dml_limited",
+            true
+        )),
+        ["512|1"]
+    );
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

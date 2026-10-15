@@ -35,12 +35,24 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - run: cargo clean -p pos3ql
+      - name: Lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Target ownership, trigger, and command regressions
+        run: |
+          set -euo pipefail
+          for filter in dml_target on_conflict trigger command_exhaustion; do
+            cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/dml-target-tests.log"
+          done
       - name: Build reference-comparison executable
+        id: build
+        if: ${{ !cancelled() }}
         run: cargo build --release --locked
       - uses: ./.github/actions/python-test-environment
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         with:
           venv: target/external-venv
       - name: Compare changes to rows selected for UPDATE and DELETE
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           PGHOST: 127.0.0.1
           PGPORT: "5432"
@@ -81,4 +93,36 @@ jobs:
           observed = transcript(15599)
           print('pos3ql:', observed, flush=True)
           assert observed == expected, 'DML target divergence'
+          PYCODE
+          target/external-venv/bin/python tests/external/mvcc_diff.py
+      - name: Trigger, inheritance, DML, and foreign-key SQL
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          RUN_FAST: "0"
+          RUN_CORE: "0"
+          RUN_CORPUS: "1"
+          RUN_AUX: "0"
+          RUN_SLT: "0"
+          RUN_FUZZ: "0"
+          FAST_CORPUS_SHARDS: "1"
+        run: |
+          set -euo pipefail
+          for corpus in 66_on_conflict 90_row_triggers 100_constraint_lifecycle 106_row_level_security 117_dml_row_assignments; do
+            FAST_CORPUS_ONLY="$corpus" bash tests/external/ci_diff.sh
+          done
+      - name: Symbolicate allocation failures in one batch
+        if: failure()
+        run: |
+          python3 - <<'PYCODE'
+          import os, re, subprocess
+          from pathlib import Path
+          log = Path(os.environ["RUNNER_TEMP"]) / "dml-target-tests.log"
+          if log.exists():
+              frames = re.findall(r"(\S*/target/debug/deps/pos3ql-[0-9a-f]+)\(\+(0x[0-9a-f]+)\)", log.read_text(errors="replace"))
+              for binary in sorted({binary for binary, _ in frames}):
+                  addresses = [address for owner, address in frames if owner == binary]
+                  subprocess.run(["addr2line", "-C", "-f", "-e", binary, *addresses], check=True)
           PYCODE

@@ -153,6 +153,24 @@ before policy evaluation or writes. Later decoding uses those copies, including
 for inherited columns and partition moves. It no longer looks up a saved
 version stamp against a mutable row map.
 
+Ordinary local UPDATE and DELETE also retain selected bytes in the existing
+statement buffer before releasing their original sources. Sorting target
+identities or reusing nested trigger scratch cannot redirect a later fetch.
+Foreign tables keep their remote tuple-identity contract. A plain DELETE avoids
+copying old values when no projection, trigger, or referencing key needs them.
+
+**User example:** a BEFORE trigger changes another order already selected by
+the same UPDATE. PostgreSQL returns `27000` and rolls back that statement;
+silently overwriting the trigger's change would be wrong. AFTER triggers remain
+queued until the main changes finish. When an UPDATE joins the orders table to
+itself, a later order reads its source values from the statement's earlier view.
+
+Nested trigger SQL receives a checked command identity and read scope. The
+caller regains its command and read view after success or failure, while issued
+identities remain consumed. Buffer or identity exhaustion returns `54000` and
+allows rollback. The PostgreSQL executor source linked below documents the
+distinction between a repeated write and a write made by triggered SQL.
+
 `INSERT ... ON CONFLICT` copies the matched current row into the existing
 statement buffer before releasing its original source. It includes earlier own
 changes and committed rows recovered entirely from object storage. Index

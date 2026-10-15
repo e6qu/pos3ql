@@ -121,6 +121,11 @@ def dml_target_transcript(reader, _writer) -> list[str]:
             results.append(f"dml_target_{label}={error},rows:{rows}")
             reader.execute("DROP TABLE dml_target_rows")
             reader.execute("DROP FUNCTION dml_target_action()")
+        reader.execute("CREATE TABLE dml_target_rows(id integer PRIMARY KEY, value integer)")
+        reader.execute("INSERT INTO dml_target_rows VALUES (1, 10), (2, 20), (3, 30)")
+        changed = reader.execute("UPDATE dml_target_rows AS target SET value = source.value FROM dml_target_rows AS source WHERE source.id = target.id - 1 RETURNING target.id, target.value").fetchall()
+        rows = reader.execute("SELECT id, value FROM dml_target_rows ORDER BY id").fetchall()
+        results.append(f"dml_target_self_join=changed:{changed},rows:{rows}")
         return results
     finally:
         reader.execute("ROLLBACK")

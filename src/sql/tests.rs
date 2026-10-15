@@ -81694,7 +81694,8 @@ fn pgoutput_row_selection_copies_only_matches_and_owns_original_schema() {
     session.success(&mut engine,
         "CREATE TABLE replica_selection(id integer PRIMARY KEY, label text); \
          INSERT INTO replica_selection SELECT value, repeat('x', 512) FROM generate_series(1, 100) AS series(value); \
-         INSERT INTO replica_selection VALUES (101, 'kept'); BEGIN", true);
+         INSERT INTO replica_selection VALUES (101, 'kept')", true);
+    session.success(&mut engine, "BEGIN", true);
     let mut relation = vec![b'R', 0, 0, 0, 1];
     relation.extend_from_slice(b"public\0replica_selection\0");
     relation.extend_from_slice(&[b'd', 0, 2, 1]);

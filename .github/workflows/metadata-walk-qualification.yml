@@ -65,7 +65,8 @@ jobs:
           import os
           from pathlib import Path
           log = (Path(os.environ['RUNNER_TEMP']) / 'legacy-metadata.log').read_text(errors='replace')
-          assert 'metadata_walk_pending_bytes_keep_the_original_heap_after_relocation ... FAILED' in log
+          assert 'metadata_walk_pending_bytes_keep_the_original_heap_after_relocation' in log
+          assert 'test result: FAILED. 0 passed; 1 failed;' in log
           assert 'row heap location was invalidated by relocation' in log
           print('Legacy heap selection reproduces the captured-location failure')
           PYCODE

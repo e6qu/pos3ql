@@ -37183,6 +37183,15 @@ impl Storage {
 
     /// The stored SELECT text of a view visible to `txid`, if `name` names one
     /// (own uncommitted CREATE/DROP included; another transaction's excluded).
+    pub(crate) fn view_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.view_rule_catalog().views.iter().position(|view| {
+            view.database == current_database()
+                && view.visible_to(txid)
+                && view.schema_for(txid).as_str() == schema
+                && view.name_for(txid).as_str() == name
+        })
+    }
+
     pub fn find_view(&self, schema: &str, name: &str, txid: u32) -> Option<ViewDef> {
         self.view_rule_catalog()
             .views

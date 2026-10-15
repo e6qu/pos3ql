@@ -15,12 +15,12 @@ INSERT INTO oc_t VALUES (1, 10, 'x'), (2, 20, 'y');
 INSERT INTO oc_t VALUES (1, 10, 'z') ON CONFLICT (a) DO UPDATE SET note = 'upd'
   RETURNING a, b, note;
 
--- ON CONSTRAINT names the arbiter index directly.
+-- ON CONSTRAINT selects a unique constraint by name.
 INSERT INTO oc_t VALUES (99, 20, 'z') ON CONFLICT ON CONSTRAINT oc_t_b_key
   DO UPDATE SET note = 'byname' RETURNING a, b, note;
 
--- EXCLUDED is the proposed row; it is usable in SET and RETURNING. The main
--- query's WHERE can reference the existing row (oc_t).
+-- EXCLUDED is the proposed row used by SET. The conflict WHERE can reference
+-- the existing row (oc_t).
 INSERT INTO oc_t VALUES (2, 20, 'w') ON CONFLICT (b) DO UPDATE
   SET note = EXCLUDED.note WHERE oc_t.a < 100 RETURNING a, b, note;
 
@@ -62,3 +62,41 @@ SELECT x, y, v FROM oc_c ORDER BY x, y;
 
 DROP TABLE oc_t;
 DROP TABLE oc_c;
+
+-- One statement may skip duplicates, but cannot update a row twice.
+CREATE TABLE oc_repeat (id integer PRIMARY KEY, value integer);
+INSERT INTO oc_repeat VALUES (1, 10), (1, 20)
+  ON CONFLICT (id) DO UPDATE SET value = excluded.value;
+SELECT count(*) FROM oc_repeat;
+INSERT INTO oc_repeat VALUES (1, 10), (1, 20)
+  ON CONFLICT (id) DO UPDATE SET value = excluded.value WHERE false;
+SELECT count(*) FROM oc_repeat;
+INSERT INTO oc_repeat VALUES (1, 10), (1, 20)
+  ON CONFLICT (id) DO NOTHING;
+INSERT INTO oc_repeat VALUES (1, 30), (1, 40)
+  ON CONFLICT (id) DO UPDATE SET value = excluded.value;
+SELECT id, value FROM oc_repeat;
+-- A filtered existing row was locked, but not changed by this command.
+INSERT INTO oc_repeat VALUES (1, 5), (1, 50)
+  ON CONFLICT (id) DO UPDATE SET value = excluded.value
+  WHERE excluded.value > 10 RETURNING id, value;
+DROP TABLE oc_repeat;
+
+-- The UPDATE policy is checked only after the conflict WHERE admits the row.
+CREATE ROLE oc_policy_user;
+CREATE TABLE oc_policy (id integer PRIMARY KEY, value integer);
+INSERT INTO oc_policy VALUES (1, 10);
+GRANT SELECT, INSERT, UPDATE ON oc_policy TO oc_policy_user;
+ALTER TABLE oc_policy ENABLE ROW LEVEL SECURITY;
+CREATE POLICY oc_policy_read ON oc_policy FOR SELECT USING (true);
+CREATE POLICY oc_policy_insert ON oc_policy FOR INSERT WITH CHECK (true);
+CREATE POLICY oc_policy_update ON oc_policy FOR UPDATE USING (false) WITH CHECK (true);
+SET ROLE oc_policy_user;
+INSERT INTO oc_policy VALUES (1, 20)
+  ON CONFLICT (id) DO UPDATE SET value = excluded.value WHERE false RETURNING id;
+INSERT INTO oc_policy VALUES (1, 20)
+  ON CONFLICT (id) DO UPDATE SET value = excluded.value WHERE true RETURNING id;
+RESET ROLE;
+SELECT id, value FROM oc_policy;
+DROP TABLE oc_policy;
+DROP ROLE oc_policy_user;

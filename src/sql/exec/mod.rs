@@ -4113,7 +4113,7 @@ fn next_auto_value<'x>(
 
 /// The unique constraint or index an `ON CONFLICT` clause arbitrates on.
 /// `Any` (no target, DO NOTHING) treats a violation of *any* unique constraint
-/// as the conflict; `Columns` restricts the conflict to rows equal on exactly
+/// as the conflict; `Keys` restricts the conflict to rows equal on exactly
 /// this column set, so a violation of a *different* unique falls through to a
 /// normal 23505 — matching PostgreSQL, which uses the arbiter index alone.
 #[expect(
@@ -4320,9 +4320,20 @@ fn resolve_arbiter<'a>(
     Ok(Arbiter::Any)
 }
 
-/// Finds an existing visible row that conflicts with the candidate on the
-/// resolved [`Arbiter`] — the row `ON CONFLICT` acts on. NULLs are distinct, so
-/// a candidate with a NULL key column never conflicts.
+#[derive(Clone, Copy)]
+enum ConflictRowOrigin {
+    Committed(u64),
+    OwnCommand(u32),
+}
+
+struct ConflictRow<'arena> {
+    rowid: u64,
+    origin: ConflictRowOrigin,
+    bytes: &'arena [u8],
+}
+
+/// Captures the matched current row before releasing its original byte owner.
+/// Ordinary query snapshots do not govern unique-key conflict detection.
 #[allow(clippy::too_many_arguments)]
 fn find_conflict<'a>(
     storage: &Storage,
@@ -4333,7 +4344,7 @@ fn find_conflict<'a>(
     arbiter: &Arbiter<'a>,
     txid: u32,
     arena: &'a Arena,
-) -> Result<Option<u64>, SqlError> {
+) -> Result<Option<ConflictRow<'a>>, SqlError> {
     let partial_count = storage
         .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
         .filter(|index| {
@@ -4384,168 +4395,230 @@ fn find_conflict<'a>(
         });
         next_partial += 1;
     }
-    let mut found: Option<u64> = None;
-    storage.for_each_row_state(table_index, &mut |rowid, state| {
-        use core::ops::ControlFlow;
-        let Some(home) = storage.visible_row_home(table_index, rowid, state, txid)? else {
-            return Ok(ControlFlow::Continue(()));
-        };
-        let hit = storage.with_row_bytes(table_index, rowid, home, |bytes| {
-            let mut other = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut other)?;
-            let eq = |a: &Datum, b: &Datum| {
-                if a.is_null() || b.is_null() {
-                    Ok(false)
-                } else {
-                    compare_datums(a, b).map(|ordering| ordering.is_eq())
-                }
+    let mut found = None;
+    let read = storage.validation_read();
+    read.for_each_row_state(
+        storage,
+        table_index,
+        &mut |rowid: u64, state: crate::storage::RowRead<'_>| {
+            use core::ops::ControlFlow;
+            crate::sql::query::check_timeout()?;
+            let pending = state.pending_last();
+            let Some(home) = read.visible_row_home(storage, table_index, rowid, state, txid)?
+            else {
+                return Ok(ControlFlow::Continue(()));
             };
-            let key_hit = |cols: &[u16], nulls_not_distinct: bool| {
-                for &column in cols {
-                    if !eq(&values[column as usize], &other[column as usize])? {
-                        if nulls_not_distinct
-                            && values[column as usize].is_null()
-                            && other[column as usize].is_null()
-                        {
-                            continue;
-                        }
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+            let origin = match home.snapshot().committed_lsn() {
+                Some(lsn) => ConflictRowOrigin::Committed(lsn),
+                None => ConflictRowOrigin::OwnCommand(
+                    pending
+                        .filter(|pending| pending.txid == txid)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "conflict row has no owning command"
+                            )
+                        })?
+                        .cid,
+                ),
             };
-            match arbiter {
-                // A named/inferred arbiter conflicts on its own columns only.
-                Arbiter::Keys {
-                    columns,
-                    expressions,
-                    n_columns,
-                    nulls_not_distinct,
-                } => {
-                    if expressions[..*n_columns].iter().all(Option::is_none) {
-                        key_hit(&columns[..*n_columns], *nulls_not_distinct)
-                    } else {
-                        let keys = crate::sql::exec::constraints::index_key_values(
-                            storage,
-                            txid,
-                            def,
-                            values,
-                            &columns[..*n_columns],
-                            &expressions[..*n_columns],
-                            arena,
-                        )?;
-                        let other_keys = crate::sql::exec::constraints::index_key_values(
-                            storage,
-                            txid,
-                            def,
-                            &other,
-                            &columns[..*n_columns],
-                            &expressions[..*n_columns],
-                            arena,
-                        )?;
-                        let collations = crate::sql::exec::constraints::index_key_collations(
-                            storage,
-                            txid,
-                            def,
-                            &columns[..*n_columns],
-                            &expressions[..*n_columns],
-                            arena,
-                        )?;
-                        crate::sql::exec::constraints::key_values_equal(
-                            storage,
-                            &collations[..*n_columns],
-                            &keys[..*n_columns],
-                            &other_keys[..*n_columns],
-                            *nulls_not_distinct,
-                        )
-                    }
-                }
-                // No target (DO NOTHING): any unique violation is a conflict.
-                Arbiter::Any => {
-                    for (i, c) in def.columns().iter().enumerate() {
-                        if c.unique && eq(&values[i], &other[i])? {
-                            return Ok(true);
-                        }
-                    }
-                    for uk in def.uniques() {
-                        if !uk.timing.is_deferrable() && key_hit(uk.columns(), false)? {
-                            return Ok(true);
-                        }
-                    }
-                    for index in
-                        storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
-                    {
-                        if index.predicate.is_none()
-                            && index.expressions[..index.n_cols]
-                                .iter()
-                                .all(Option::is_none)
-                            && key_hit(&index.columns[..index.n_cols], index.nulls_not_distinct)?
-                        {
-                            return Ok(true);
-                        }
-                    }
-                    for partial_index in partial.iter().flatten() {
-                        let candidate_member =
-                            partial_index.predicate.map_or(Ok(true), |predicate| {
-                                crate::sql::exec::constraints::index_predicate_matches(
-                                    storage, txid, def, values, predicate, arena,
-                                )
-                            })?;
-                        let other_member =
-                            partial_index.predicate.map_or(Ok(true), |predicate| {
-                                crate::sql::exec::constraints::index_predicate_matches(
-                                    storage, txid, def, &other, predicate, arena,
-                                )
-                            })?;
-                        let candidate_keys = crate::sql::exec::constraints::index_key_values(
-                            storage,
-                            txid,
-                            def,
-                            values,
-                            &partial_index.columns[..partial_index.n_columns],
-                            &partial_index.expressions[..partial_index.n_columns],
-                            arena,
-                        )?;
-                        let other_keys = crate::sql::exec::constraints::index_key_values(
-                            storage,
-                            txid,
-                            def,
-                            &other,
-                            &partial_index.columns[..partial_index.n_columns],
-                            &partial_index.expressions[..partial_index.n_columns],
-                            arena,
-                        )?;
-                        let collations = crate::sql::exec::constraints::index_key_collations(
-                            storage,
-                            txid,
-                            def,
-                            &partial_index.columns[..partial_index.n_columns],
-                            &partial_index.expressions[..partial_index.n_columns],
-                            arena,
-                        )?;
-                        if candidate_member
-                            && other_member
-                            && crate::sql::exec::constraints::key_values_equal(
+            let matched = storage.with_row_bytes(table_index, rowid, home, |bytes| {
+                // Index expression results never escape this evaluation. Original
+                // bytes belong to a heap owner or spill scratch outside the arena.
+                let mark = arena.mark();
+                let hit = (|| -> Result<bool, SqlError> {
+                    let mut other = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(bytes, schema, &mut other)?;
+                    let key_hit = |cols: &[u16], nulls_not_distinct: bool| {
+                        for &column in cols {
+                            let column = column as usize;
+                            if values[column].is_null() || other[column].is_null() {
+                                if nulls_not_distinct
+                                    && values[column].is_null()
+                                    && other[column].is_null()
+                                {
+                                    continue;
+                                }
+                                return Ok(false);
+                            }
+                            if !compare_datums_collated(
                                 storage,
-                                &collations[..partial_index.n_columns],
-                                &candidate_keys[..partial_index.n_columns],
-                                &other_keys[..partial_index.n_columns],
-                                partial_index.nulls_not_distinct,
+                                def.columns()[column].collation,
+                                &values[column],
+                                &other[column],
                             )?
-                        {
-                            return Ok(true);
+                            .is_eq()
+                            {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    };
+                    match arbiter {
+                        // A named/inferred arbiter conflicts on its own columns only.
+                        Arbiter::Keys {
+                            columns,
+                            expressions,
+                            n_columns,
+                            nulls_not_distinct,
+                        } => {
+                            if expressions[..*n_columns].iter().all(Option::is_none) {
+                                key_hit(&columns[..*n_columns], *nulls_not_distinct)
+                            } else {
+                                let keys = crate::sql::exec::constraints::index_key_values(
+                                    storage,
+                                    txid,
+                                    def,
+                                    values,
+                                    &columns[..*n_columns],
+                                    &expressions[..*n_columns],
+                                    arena,
+                                )?;
+                                let other_keys = crate::sql::exec::constraints::index_key_values(
+                                    storage,
+                                    txid,
+                                    def,
+                                    &other,
+                                    &columns[..*n_columns],
+                                    &expressions[..*n_columns],
+                                    arena,
+                                )?;
+                                let collations =
+                                    crate::sql::exec::constraints::index_key_collations(
+                                        storage,
+                                        txid,
+                                        def,
+                                        &columns[..*n_columns],
+                                        &expressions[..*n_columns],
+                                        arena,
+                                    )?;
+                                crate::sql::exec::constraints::key_values_equal(
+                                    storage,
+                                    &collations[..*n_columns],
+                                    &keys[..*n_columns],
+                                    &other_keys[..*n_columns],
+                                    *nulls_not_distinct,
+                                )
+                            }
+                        }
+                        // No target (DO NOTHING): any unique violation is a conflict.
+                        Arbiter::Any => {
+                            for (i, c) in def.columns().iter().enumerate() {
+                                if c.unique && key_hit(&[i as u16], false)? {
+                                    return Ok(true);
+                                }
+                            }
+                            for uk in def.uniques() {
+                                if !uk.timing.is_deferrable() && key_hit(uk.columns(), false)? {
+                                    return Ok(true);
+                                }
+                            }
+                            for index in storage.unique_indexes_for(
+                                def.schema.as_str(),
+                                def.name.as_str(),
+                                txid,
+                            ) {
+                                if index.predicate.is_none()
+                                    && index.expressions[..index.n_cols]
+                                        .iter()
+                                        .all(Option::is_none)
+                                    && key_hit(
+                                        &index.columns[..index.n_cols],
+                                        index.nulls_not_distinct,
+                                    )?
+                                {
+                                    return Ok(true);
+                                }
+                            }
+                            for partial_index in partial.iter().flatten() {
+                                let candidate_member =
+                                    partial_index.predicate.map_or(Ok(true), |predicate| {
+                                        crate::sql::exec::constraints::index_predicate_matches(
+                                            storage, txid, def, values, predicate, arena,
+                                        )
+                                    })?;
+                                let other_member =
+                                    partial_index.predicate.map_or(Ok(true), |predicate| {
+                                        crate::sql::exec::constraints::index_predicate_matches(
+                                            storage, txid, def, &other, predicate, arena,
+                                        )
+                                    })?;
+                                let candidate_keys =
+                                    crate::sql::exec::constraints::index_key_values(
+                                        storage,
+                                        txid,
+                                        def,
+                                        values,
+                                        &partial_index.columns[..partial_index.n_columns],
+                                        &partial_index.expressions[..partial_index.n_columns],
+                                        arena,
+                                    )?;
+                                let other_keys = crate::sql::exec::constraints::index_key_values(
+                                    storage,
+                                    txid,
+                                    def,
+                                    &other,
+                                    &partial_index.columns[..partial_index.n_columns],
+                                    &partial_index.expressions[..partial_index.n_columns],
+                                    arena,
+                                )?;
+                                let collations =
+                                    crate::sql::exec::constraints::index_key_collations(
+                                        storage,
+                                        txid,
+                                        def,
+                                        &partial_index.columns[..partial_index.n_columns],
+                                        &partial_index.expressions[..partial_index.n_columns],
+                                        arena,
+                                    )?;
+                                if candidate_member
+                                    && other_member
+                                    && crate::sql::exec::constraints::key_values_equal(
+                                        storage,
+                                        &collations[..partial_index.n_columns],
+                                        &candidate_keys[..partial_index.n_columns],
+                                        &other_keys[..partial_index.n_columns],
+                                        partial_index.nulls_not_distinct,
+                                    )?
+                                {
+                                    return Ok(true);
+                                }
+                            }
+                            Ok(false)
                         }
                     }
-                    Ok(false)
+                })();
+                // SAFETY: only a Boolean or owned error escapes expression work.
+                unsafe { arena.rewind_to(mark) };
+                if !hit? {
+                    return Ok(None);
                 }
+                if let Some(pending) = pending.filter(|pending| pending.txid != txid) {
+                    storage.wait_for_transaction(txid, pending.txid)?;
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_LOCK_WAIT,
+                        "statement is waiting for a concurrent conflict-row writer"
+                    ));
+                }
+                let retained = arena.alloc_slice_copy(bytes).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "ON CONFLICT row exceeds the statement arena"
+                    )
+                })?;
+                Ok(Some(&*retained))
+            })?;
+            if let Some(bytes) = matched {
+                found = Some(ConflictRow {
+                    rowid,
+                    origin,
+                    bytes,
+                });
+                return Ok(ControlFlow::Break(()));
             }
-        })?;
-        if hit {
-            found = Some(rowid);
-            return Ok(ControlFlow::Break(()));
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
     Ok(found)
 }
 
@@ -4658,6 +4731,35 @@ where
     }
 }
 
+fn update_lock_strength(
+    storage: &Storage,
+    def: &TableDef,
+    updated: ColumnSet,
+    txid: u32,
+) -> crate::sql::ast::LockStrength {
+    let changes_key = def
+        .columns()
+        .iter()
+        .enumerate()
+        .any(|(column, definition)| {
+            updated.contains(column)
+                && (definition.primary
+                    || definition.unique
+                    || def
+                        .uniques()
+                        .iter()
+                        .any(|key| key.columns().contains(&(column as u16)))
+                    || storage
+                        .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+                        .any(|index| index.columns[..index.n_cols].contains(&(column as u16))))
+        });
+    if changes_key {
+        crate::sql::ast::LockStrength::Update
+    } else {
+        crate::sql::ast::LockStrength::NoKeyUpdate
+    }
+}
+
 enum ConflictOutcome<'a> {
     Store,
     Skip,
@@ -4680,7 +4782,7 @@ fn handle_conflict<'a, 'outer, 'snapshot>(
     schema: &[ColType],
     values: &[Datum<'a>],
     on_conflict: &Option<super::ast::OnConflict<'a>>,
-    arbiter: &Arbiter,
+    arbiter: &Arbiter<'a>,
     checks: &ParsedChecks,
     view_check: Option<ViewCheck<'a>>,
     row_security_using: Option<super::query::RowSecurityPlan<'a>>,
@@ -4699,7 +4801,7 @@ where
     let Some(oc) = on_conflict else {
         return Ok(ConflictOutcome::Store);
     };
-    let Some(rowid) = find_conflict(
+    let Some(conflict) = find_conflict(
         storage,
         table_index,
         def,
@@ -4712,50 +4814,65 @@ where
     else {
         return Ok(ConflictOutcome::Store);
     };
+    let rowid = conflict.rowid;
+    if let Some(assigns) = oc.update {
+        let mut updated_columns = ColumnSet::EMPTY;
+        for (name, _) in assigns {
+            let column = def.column_index(name).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                )
+            })?;
+            updated_columns.insert(column);
+        }
+        let strength = update_lock_strength(storage, def, updated_columns, txn.txid);
+        match storage.acquire_row_lock(
+            table_index,
+            rowid,
+            txn.txid,
+            strength,
+            crate::sql::ast::LockWait::Wait,
+        )? {
+            crate::sql::lock::LockDecision::Acquired => {}
+            crate::sql::lock::LockDecision::Waiting => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_LOCK_WAIT,
+                    "statement is waiting for a conflict-row lock"
+                ));
+            }
+            crate::sql::lock::LockDecision::Skipped => {
+                unreachable!("conflict update does not skip locked rows")
+            }
+        }
+        if matches!(conflict.origin, ConflictRowOrigin::OwnCommand(command) if command == txn.command_id())
+        {
+            return Err(sql_err!(
+                sqlstate::CARDINALITY_VIOLATION,
+                "ON CONFLICT DO UPDATE command cannot affect row a second time"
+            ));
+        }
+    }
+    if matches!(
+        txn.isolation,
+        crate::sql::ast::TransactionIsolation::RepeatableRead
+            | crate::sql::ast::TransactionIsolation::Serializable
+    ) && matches!(conflict.origin, ConflictRowOrigin::Committed(lsn) if txn.snapshot_lsn().is_some_and(|snapshot| lsn > snapshot))
+    {
+        return Err(sql_err!(
+            sqlstate::SERIALIZATION_FAILURE,
+            "could not serialize access due to concurrent update"
+        ));
+    }
     let Some(assigns) = oc.update else {
-        return Ok(ConflictOutcome::Skip); // DO NOTHING
+        return Ok(ConflictOutcome::Skip);
     };
-    // DO UPDATE: recompute the conflicting row, `excluded` = the proposed row.
+    // `excluded` is the proposed row; target values use the captured conflict.
     let mut existing = [Datum::Null; MAX_COLUMNS];
     let mut new_values = [Datum::Null; MAX_COLUMNS];
     {
-        let state = storage
-            .resident_row_state(table_index, rowid)?
-            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
-        let home = storage
-            .visible_row_home(table_index, rowid, state, txn.txid)?
-            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "conflict row vanished"))?;
-        let bytes = storage.row_bytes(table_index, rowid, home, arena)?;
-        rowenc::decode(bytes, schema, &mut existing)?;
-        if let Some(plan) = row_security_using {
-            let policy_row = RowCtx {
-                def,
-                values: &existing[..def.n_columns],
-                alias: None,
-            };
-            let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-            let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-            let policy_hooks = EvalHooks {
-                catalog: Some(&catalog),
-                sequences: Some(&sequences),
-                ..NO_HOOKS
-            };
-            if !super::query::row_security_passes(
-                plan,
-                &policy_row,
-                storage,
-                txn.txid,
-                arena,
-                params,
-                &policy_hooks,
-            )? {
-                return Err(sql_err!(
-                    sqlstate::INSUFFICIENT_PRIVILEGE,
-                    "new row violates row-level security policy for table \"{}\"",
-                    def.name.as_str()
-                ));
-            }
-        }
+        rowenc::decode(conflict.bytes, schema, &mut existing)?;
         let context = ExcludedCtx {
             def: *def,
             existing: &existing[..def.n_columns],
@@ -4794,6 +4911,35 @@ where
             )
         {
             return Ok(ConflictOutcome::Skip); // WHERE excluded this row
+        }
+        if let Some(plan) = row_security_using {
+            let policy_row = RowCtx {
+                def,
+                values: &existing[..def.n_columns],
+                alias: None,
+            };
+            let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+            let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+            let policy_hooks = EvalHooks {
+                catalog: Some(&catalog),
+                sequences: Some(&sequences),
+                ..NO_HOOKS
+            };
+            if !super::query::row_security_passes(
+                plan,
+                &policy_row,
+                storage,
+                txn.txid,
+                arena,
+                params,
+                &policy_hooks,
+            )? {
+                return Err(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "new row violates row-level security policy for table \"{}\"",
+                    def.name.as_str()
+                ));
+            }
         }
         new_values[..def.n_columns].copy_from_slice(&existing[..def.n_columns]);
         for (name, expression) in assigns {
@@ -57314,7 +57460,7 @@ fn finish_insert_row<'a, 'outer, 'snapshot>(
     values: &mut [Datum<'a>; MAX_COLUMNS],
     generated: &constraints::ParsedDefaults<'a>,
     statement: &Insert<'a>,
-    arbiter: &Arbiter,
+    arbiter: &Arbiter<'a>,
     checks: &ParsedChecks<'a>,
     insert_check: Option<super::query::RowSecurityPlan<'a>>,
     view_check: Option<ViewCheck<'a>>,
@@ -59943,24 +60089,7 @@ pub(crate) fn update<'a>(
     // PostgreSQL obtains a row lock before it computes or publishes any new
     // image. Collecting all target rowids first makes a default wait
     // suspendable without partially executing the statement.
-    let changes_key = targets[..statement.assignments.len()]
-        .iter()
-        .any(|&column| {
-            def.columns()[column].primary
-                || def.columns()[column].unique
-                || def
-                    .uniques()
-                    .iter()
-                    .any(|constraint| constraint.columns().contains(&(column as u16)))
-                || storage
-                    .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid)
-                    .any(|index| index.columns[..index.n_cols].contains(&(column as u16)))
-        });
-    let lock_strength = if changes_key {
-        crate::sql::ast::LockStrength::Update
-    } else {
-        crate::sql::ast::LockStrength::NoKeyUpdate
-    };
+    let lock_strength = update_lock_strength(storage, def, updated_columns, txn.txid);
     for row in scratch.iter().copied() {
         let PhysicalRow::Local {
             table_index: row_table,

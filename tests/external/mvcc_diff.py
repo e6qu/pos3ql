@@ -201,7 +201,15 @@ def prepared_statement_cleanup_transcript(reader) -> list[str]:
         reader.execute("BEGIN")
         last = reader.execute(f"SELECT {cycle} AS cleanup_cycle", prepare=True).fetchone()[0]
         reader.execute("ROLLBACK")
-    return [f"prepared_cleanup=cycles:24,last:{last}"]
+    results = [f"prepared_cleanup_rollback=cycles:24,last:{last}"]
+    for cycle in range(24):
+        query = f"SELECT {cycle} AS explicit_cleanup_cycle"
+        last = reader.execute(query, prepare=True).fetchone()[0]
+        reader.execute("DEALLOCATE ALL", prepare=False)
+        # The completion tag must also tell the driver to forget this name.
+        assert reader.execute(query, prepare=True).fetchone()[0] == cycle
+    results.append(f"prepared_cleanup_all=cycles:24,last:{last}")
+    return results
 
 
 def index_validation_transcript(reader, writer) -> list[str]:

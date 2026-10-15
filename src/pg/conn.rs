@@ -5299,12 +5299,13 @@ mod tests {
                     message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Ssaved\0");
                 }
                 1 => {
-                    message(
+                    let output = message(
                         &mut conn,
                         &mut engine,
                         wire::FMSG_QUERY,
                         b"DEALLOCATE ALL\0",
                     );
+                    assert!(output.windows(15).any(|bytes| bytes == b"DEALLOCATE ALL\0"));
                 }
                 2 => {
                     parse(&mut conn, &mut engine, "reset", "DEALLOCATE ALL");

@@ -8388,7 +8388,11 @@ impl Engine {
                 self.protocol_reset = ProtocolReset::Statements;
             }
         }
-        responder.command_complete("DEALLOCATE")?;
+        responder.command_complete(if name.is_some() {
+            "DEALLOCATE"
+        } else {
+            "DEALLOCATE ALL"
+        })?;
         Ok(Ok(()))
     }
 

@@ -80429,9 +80429,10 @@ fn on_conflict_where_false_retains_lock_strength_and_savepoint_releases_it() {
 }
 
 #[test]
-fn on_conflict_reuses_expression_scratch_and_exhaustion_preserves_retry() {
+fn on_conflict_reuses_expression_scratch_in_fixed_execution_memory() {
     let mut config = test_config("conflict-fixed-arena");
     config.table_rows = 1024;
+    config.work_arena_bytes = 16 << 10;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut setup = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -80446,27 +80447,70 @@ fn on_conflict_reuses_expression_scratch_and_exhaustion_preserves_retry() {
     }
     assert_eq!(data_rows(&small.success(&mut engine,
         "INSERT INTO conflict_scratch VALUES (999, 'LABEL511', 'changed') ON CONFLICT (lower(label)) DO UPDATE SET value = excluded.value RETURNING id, value", true)), ["511|changed"]);
+    assert_eq!(
+        data_rows(&setup.success(&mut engine, "SELECT count(*) FROM conflict_scratch", true)),
+        ["512"]
+    );
+}
+
+#[test]
+fn on_conflict_capture_exhaustion_preserves_cold_rows_and_retry() {
+    let mut config = test_config("conflict-capture-exhaustion");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("conflict-capture-exhaustion-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     let large = "x".repeat(24 << 10);
-    setup.success(
+    session.success(
         &mut engine,
-        &format!("INSERT INTO conflict_scratch VALUES (600, 'Large', '{large}')"),
+        &format!(
+            "CREATE TABLE conflict_limited(id integer PRIMARY KEY, value text); \
+         INSERT INTO conflict_limited VALUES (1, '{large}')"
+        ),
         true,
     );
-    let output = small.execute(&mut engine,
-        "INSERT INTO conflict_scratch VALUES (600, 'Large', 'candidate') ON CONFLICT (id) DO UPDATE SET value = excluded.value", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let original_work_bytes = config.work_arena_bytes;
+    config.work_arena_bytes = 16 << 10;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.execute(&mut engine,
+        "INSERT INTO conflict_limited VALUES (1, 'candidate') ON CONFLICT (id) DO UPDATE SET value = excluded.value", true);
     let text = String::from_utf8_lossy(&output);
     assert!(
         text.contains("54000") && text.contains("ON CONFLICT row exceeds the statement arena"),
         "{text}"
     );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    // A new process can choose a different startup reservation; the failed
+    // statement neither grows its own buffer nor changes the durable row.
+    config.work_arena_bytes = original_work_bytes;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     assert_eq!(
-        data_rows(&setup.success(
+        data_rows(&session.success(
             &mut engine,
-            "SELECT length(value) FROM conflict_scratch WHERE id = 600",
+            "SELECT length(value) FROM conflict_limited WHERE id = 1",
             true
         )),
         [(24 << 10).to_string()]
     );
-    assert_eq!(data_rows(&setup.success(&mut engine,
-        "INSERT INTO conflict_scratch VALUES (600, 'Large', 'retry') ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING value", true)), ["retry"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "INSERT INTO conflict_limited VALUES (1, 'retry') ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING value", true)), ["retry"]);
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

@@ -2947,6 +2947,10 @@ fn build_inherited_table_def(
             // A child has its own physical rows and its own identity-sequence
             // ownership. PostgreSQL does not make the parent's sequence an
             // implicit writable dependency of the child relation.
+            // Ordinary inheritance shares column definitions and CHECKs, but
+            // primary and unique keys remain local to their declaring table.
+            inherited.primary = false;
+            inherited.unique = false;
             inherited.auto_increment = false;
             inherited.is_identity = false;
             inherited.identity_always = false;
@@ -2985,6 +2989,8 @@ fn build_inherited_table_def(
                     column.name.as_str()
                 ));
             }
+            definition.columns[existing].primary |= column.primary;
+            definition.columns[existing].unique |= column.unique;
             // PostgreSQL lets the child declaration supply an explicit default
             // while the inherited type identity remains fixed.
             if !matches!(column.default, crate::storage::ColumnDefault::None) {
@@ -3010,6 +3016,25 @@ fn build_inherited_table_def(
             push_column(&mut definition, &mut count, *column)?;
             definition.n_columns = count;
         }
+    }
+    for index in 0..definition.n_uniques {
+        definition.uniques[index].columns =
+            remap_columns(&definition, &own, definition.uniques[index].columns())?;
+    }
+    for index in 0..definition.n_fkeys {
+        definition.fkeys[index].columns =
+            remap_columns(&definition, &own, definition.fkeys[index].columns())?;
+    }
+    for index in 0..definition.n_fkeys {
+        let key = definition.fkeys[index];
+        if key.parent_schema == definition.schema && key.parent == definition.name {
+            definition.fkeys[index].parent_cols =
+                remap_columns(&definition, &own, key.parent_cols())?;
+        }
+    }
+    for index in 0..definition.n_exclusions {
+        definition.exclusions[index].columns =
+            remap_columns(&definition, &own, definition.exclusions[index].columns())?;
     }
     Ok(definition)
 }
@@ -63310,6 +63335,12 @@ fn inherit_partition_constraints(
     for index in 0..parent.n_columns {
         let expected = parent.columns[index];
         let actual = child.columns[index];
+        if expected.name != actual.name && child.column_index(expected.name.as_str()).is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "partition columns must currently use the parent's physical order"
+            ));
+        }
         if expected.name != actual.name
             || expected.ctype != actual.ctype
             || expected.type_mod != actual.type_mod

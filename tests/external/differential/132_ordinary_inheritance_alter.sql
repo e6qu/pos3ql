@@ -103,11 +103,11 @@ DELETE FROM inheritance_tail_parent WHERE amount = 8 RETURNING id, amount;
 DROP TABLE inheritance_tail_parent CASCADE;
 DROP TABLE inheritance_tail_child;
 
--- Partition leaves may also store the parent's columns in another order.
+-- Partition moves and root foreign keys use the selected leaf layout.
 CREATE TABLE partition_dml_parent (id integer PRIMARY KEY, amount integer)
   PARTITION BY RANGE (id);
-CREATE TABLE partition_dml_left (amount integer, id integer NOT NULL);
-CREATE TABLE partition_dml_right (amount integer, id integer NOT NULL);
+CREATE TABLE partition_dml_left (id integer NOT NULL, amount integer);
+CREATE TABLE partition_dml_right (id integer NOT NULL, amount integer);
 ALTER TABLE partition_dml_parent ATTACH PARTITION partition_dml_left FOR VALUES FROM (0) TO (10);
 ALTER TABLE partition_dml_parent ATTACH PARTITION partition_dml_right FOR VALUES FROM (10) TO (20);
 INSERT INTO partition_dml_parent VALUES (1, 30);
@@ -129,3 +129,19 @@ SELECT count(*) FROM partition_dml_ref;
 DROP TABLE partition_dml_parent CASCADE;
 DROP TABLE partition_dml_ref;
 DROP FUNCTION partition_dml_touch();
+
+-- Child-local composite constraints follow prepended inherited columns.
+CREATE TABLE inheritance_key_parent (id integer PRIMARY KEY);
+CREATE TABLE inheritance_key_lookup (extra text, marker integer, PRIMARY KEY(extra, marker));
+INSERT INTO inheritance_key_lookup VALUES ('first', 7), ('second', 8);
+CREATE TABLE inheritance_key_child (extra text, marker integer,
+  UNIQUE(extra, marker), FOREIGN KEY(extra, marker) REFERENCES inheritance_key_lookup)
+  INHERITS (inheritance_key_parent);
+INSERT INTO inheritance_key_child VALUES (1, 'first', 7), (1, 'second', 8);
+INSERT INTO inheritance_key_child VALUES (2, 'first', 7);
+INSERT INTO inheritance_key_child VALUES (3, 'missing', 9);
+UPDATE inheritance_key_parent SET id = 5;
+SELECT id, extra, marker FROM ONLY inheritance_key_child ORDER BY extra;
+DROP TABLE inheritance_key_parent CASCADE;
+DROP TABLE inheritance_key_child;
+DROP TABLE inheritance_key_lookup;

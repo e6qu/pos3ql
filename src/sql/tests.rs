@@ -80961,3 +80961,40 @@ fn dml_target_inherited_layouts_preserve_child_values_after_cold_recovery() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn dml_target_reordered_partition_attachment_is_explicitly_unsupported() {
+    let config = test_config("dml-target-partition-order");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE partition_order_parent(id integer, amount integer) PARTITION BY RANGE(id); \
+         CREATE TABLE partition_order_child(amount integer, id integer)",
+        true,
+    );
+    let failed = session.execute(&mut engine,
+        "ALTER TABLE partition_order_parent ATTACH PARTITION partition_order_child FOR VALUES FROM (0) TO (10)", true);
+    let text = String::from_utf8_lossy(&failed);
+    assert!(
+        text.contains("0A000") && text.contains("physical order"),
+        "{text}"
+    );
+    session.success(
+        &mut engine,
+        "INSERT INTO partition_order_child VALUES (30, 1)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM partition_order_parent",
+            true
+        )),
+        ["0"]
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

@@ -81,6 +81,8 @@ Still to do:
   executor reads that retain only a version stamp. Sequential SQL byte scans
   and exports already keep selected versions and their source files. Metadata
   walks still consult live row state; coordinate their updates and retirement.
+- Extend partition attachment and all write paths to reordered physical
+  columns; keep the current explicit rejection until those paths agree.
 - Finish shared-state protection for table creation/removal and engine-wide
   publication.
 - Integrate bounded heap relocation with concurrent table publication and

@@ -53,6 +53,14 @@ ordering. Expression results are recomputed from fetched rows rather than
 projected directly from an index expression tuple. Native PostgreSQL index page
 layouts and custom native callbacks are not implemented.
 
+### Partition column order
+
+An existing table attached as a partition must currently store its columns in
+the parent's order. Reordered columns return `0A000`; PostgreSQL accepts those
+layouts. Ordinary inheritance supports matching columns in different orders.
+For example, attaching `(amount integer, id integer)` beneath a partitioned
+parent `(id integer, amount integer)` is not yet supported.
+
 ## Capacity boundaries
 
 Some limits come from PostgreSQL, some are smaller implementation limits, and

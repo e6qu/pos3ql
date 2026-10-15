@@ -386,6 +386,14 @@ impl core::ops::DerefMut for QueryWorkspaces {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ProtocolReset {
+    #[default]
+    None,
+    Statements,
+    All,
+}
+
 /// The query engine: catalog, memtable storage, WAL, object-storage
 /// checkpointing, and statement execution.
 pub struct Engine {
@@ -441,7 +449,7 @@ pub struct Engine {
     database_connections: FixedVec<u16>,
     active_system_settings: ActiveSystemSettings,
     object_store_credentials_reload_requested: bool,
-    discard_protocol_state: bool,
+    protocol_reset: ProtocolReset,
     clean_shutdown_path: std::path::PathBuf,
     #[cfg(test)]
     _test_data_dir_cleanup: Option<std::sync::Arc<crate::config::TestDataDirCleanup>>,
@@ -3097,8 +3105,8 @@ impl Engine {
             .expect("an authenticated database connection is released once");
     }
 
-    pub(crate) fn take_discard_protocol_state(&mut self) -> bool {
-        core::mem::take(&mut self.discard_protocol_state)
+    pub(crate) fn take_protocol_reset(&mut self) -> ProtocolReset {
+        core::mem::take(&mut self.protocol_reset)
     }
 
     pub(crate) fn database_connection_capacity(&self) -> usize {
@@ -3489,7 +3497,7 @@ impl Engine {
             database_connections,
             active_system_settings: ActiveSystemSettings::new(active_system_settings),
             object_store_credentials_reload_requested: false,
-            discard_protocol_state: false,
+            protocol_reset: ProtocolReset::None,
             clean_shutdown_path,
             #[cfg(test)]
             _test_data_dir_cleanup: config.test_data_dir_cleanup.clone(),
@@ -8376,6 +8384,9 @@ impl Engine {
             }
         } else {
             sqlprep.clear();
+            if self.protocol_reset != ProtocolReset::All {
+                self.protocol_reset = ProtocolReset::Statements;
+            }
         }
         responder.command_complete("DEALLOCATE")?;
         Ok(Ok(()))
@@ -8405,7 +8416,7 @@ impl Engine {
                     return Ok(Err(error));
                 }
                 self.notify.drop_conn(self.work.connection_id());
-                self.discard_protocol_state = true;
+                self.protocol_reset = ProtocolReset::All;
             }
             ast::DiscardTarget::Sequences => guc.seq_session().discard(),
             ast::DiscardTarget::Plans | ast::DiscardTarget::Temporary => {}

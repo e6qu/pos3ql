@@ -432,6 +432,19 @@ impl Conn {
         }
     }
 
+    fn apply_protocol_reset(&mut self, engine: &mut Engine) {
+        match engine.take_protocol_reset() {
+            crate::sql::ProtocolReset::None => {}
+            crate::sql::ProtocolReset::Statements => {
+                // Bound portals retain their original statement bytes until closed.
+                for statement in &mut self.prepared {
+                    statement.active = false;
+                }
+            }
+            crate::sql::ProtocolReset::All => self.clear_protocol_state(),
+        }
+    }
+
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         let empty = SqlName::parse("").expect("empty name fits");
         let mut prepared = Vec::with_capacity(config.max_prepared);
@@ -2639,16 +2652,29 @@ impl Conn {
             );
         }
 
-        // Named statements may not be redefined; the unnamed one always is.
-        let slot = if name.is_empty() {
+        // A closed name may still have bound portals. Its bytes are reusable
+        // only after the last portal releases that slot.
+        let retained = |slot| {
+            self.portals
+                .iter()
+                .any(|portal| portal.active && portal.statement == slot)
+        };
+        let unnamed = self
+            .prepared
+            .iter()
+            .position(|statement| statement.active && statement.name.as_str().is_empty());
+        let free = || {
             self.prepared
                 .iter()
-                .position(|p| p.active && p.name.as_str().is_empty())
-                .or_else(|| self.prepared.iter().position(|p| !p.active))
+                .enumerate()
+                .position(|(slot, statement)| !statement.active && !retained(slot))
+        };
+        let slot = if name.is_empty() {
+            unnamed.filter(|&slot| !retained(slot)).or_else(free)
         } else if self
             .prepared
             .iter()
-            .any(|p| p.active && p.name.as_str() == name)
+            .any(|statement| statement.active && statement.name.as_str() == name)
         {
             return ext_err(
                 &mut self.send,
@@ -2657,7 +2683,7 @@ impl Conn {
                 "prepared statement already exists",
             );
         } else {
-            self.prepared.iter().position(|p| !p.active)
+            free()
         };
         let Some(slot) = slot else {
             return ext_err(
@@ -2695,6 +2721,12 @@ impl Conn {
         entry.name = sql_name;
         entry.query_len = query.len();
         entry.n_params = n_params as u16;
+        if name.is_empty()
+            && let Some(prior) = unnamed
+            && prior != slot
+        {
+            self.prepared[prior].active = false;
+        }
 
         let mut responder = Responder::new(&mut self.send);
         match responder.parse_complete() {
@@ -3126,14 +3158,7 @@ impl Conn {
             let lock_timeout_expired = self.lock_timeout_expired();
             let portal = &mut self.portals[portal_slot];
             let prepared = &self.prepared[portal.statement];
-            if !prepared.active {
-                return ext_err(
-                    &mut self.send,
-                    &mut self.phase,
-                    "26000",
-                    "prepared statement no longer exists",
-                );
-            }
+            // Bind owns this slot even after its prepared name is closed.
             let text = prepared.query();
             if engine.is_copy_statement(text, &self.arena) {
                 // COPY uses CopyData framing, not DataRow/PortalSuspended.
@@ -3367,9 +3392,7 @@ impl Conn {
                 let portal = &mut self.portals[portal_slot];
                 portal.completion = completion;
                 portal.execution = PortalExecution::Complete;
-                if engine.take_discard_protocol_state() {
-                    self.clear_protocol_state();
-                }
+                self.apply_protocol_reset(engine);
                 return Step::Continue;
             }
         }
@@ -3408,9 +3431,7 @@ impl Conn {
                     responder.raw(&data[..total_msg])
                 };
                 portal.execution = PortalExecution::Complete;
-                if engine.take_discard_protocol_state() {
-                    self.clear_protocol_state();
-                }
+                self.apply_protocol_reset(engine);
                 return match result {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
@@ -3590,9 +3611,7 @@ impl Conn {
                 }
             }
         };
-        if engine.take_discard_protocol_state() {
-            self.clear_protocol_state();
-        }
+        self.apply_protocol_reset(engine);
         self.arena.reset();
         self.recv.consume(total);
         step
@@ -5222,6 +5241,119 @@ mod tests {
             bytes = &bytes[1 + length as usize..];
         }
         false
+    }
+
+    #[test]
+    fn prepared_statement_cleanup_keeps_bound_bytes_and_reuses_released_slots() {
+        fn message(conn: &mut Conn, engine: &mut Engine, kind: u8, payload: &[u8]) -> Vec<u8> {
+            conn.send.clear();
+            assert!(conn.recv.append(&frontend(kind, payload)));
+            let step = crate::mem::guard::forbid_alloc(|| conn.process_message(engine));
+            assert!(matches!(step, Step::Continue));
+            let response = conn.send.readable().to_vec();
+            assert!(
+                !has_backend_message(&response, wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            response
+        }
+        fn parse(conn: &mut Conn, engine: &mut Engine, name: &str, sql: &str) {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(name.as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(sql.as_bytes());
+            payload.extend_from_slice(&[0, 0, 0]);
+            message(conn, engine, wire::FMSG_PARSE, &payload);
+        }
+        fn bind(conn: &mut Conn, engine: &mut Engine, portal: &str, name: &str) {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(portal.as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(&[0; 7]);
+            message(conn, engine, wire::FMSG_BIND, &payload);
+        }
+        for reset in 0..4 {
+            let directory = std::env::temp_dir().join(format!(
+                "pos3ql-prepared-cleanup-{}-{reset}",
+                std::process::id()
+            ));
+            let mut config = Config::default_dev();
+            config.data_dir = directory.to_string_lossy().into_owned();
+            config.max_tables = 8;
+            config.table_rows = 128;
+            config.max_prepared = 2;
+            config.wal_bytes = 1 << 20;
+            config.wal_buffer_bytes = 1 << 16;
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut conn = Conn::new(&config, &mut budget).unwrap();
+            conn.phase = Phase::Ready;
+            message(&mut conn, &mut engine, wire::FMSG_QUERY, b"BEGIN\0");
+            let name = if reset == 3 { "" } else { "saved" };
+            parse(&mut conn, &mut engine, name, "SELECT 1 AS original_value");
+            bind(&mut conn, &mut engine, "kept", name);
+            match reset {
+                0 => {
+                    message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Ssaved\0");
+                }
+                1 => {
+                    message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_QUERY,
+                        b"DEALLOCATE ALL\0",
+                    );
+                }
+                2 => {
+                    parse(&mut conn, &mut engine, "reset", "DEALLOCATE ALL");
+                    bind(&mut conn, &mut engine, "reset_portal", "reset");
+                    message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_EXECUTE,
+                        b"reset_portal\0\0\0\0\0",
+                    );
+                    message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Preset_portal\0");
+                }
+                3 => {}
+                _ => unreachable!(),
+            }
+            parse(
+                &mut conn,
+                &mut engine,
+                name,
+                "SELECT 99 AS replacement_value",
+            );
+            let description = message(&mut conn, &mut engine, wire::FMSG_DESCRIBE, b"Pkept\0");
+            assert!(
+                description
+                    .windows(15)
+                    .any(|bytes| bytes == b"original_value\0")
+            );
+            let output = message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_EXECUTE,
+                b"kept\0\0\0\0\0",
+            );
+            assert!(output.starts_with(&[b'D', 0, 0, 0, 11, 0, 1, 0, 0, 0, 1, b'1']));
+            message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Pkept\0");
+            message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_CLOSE,
+                if reset == 3 { b"S\0" } else { b"Ssaved\0" },
+            );
+            // Both slots are reusable after the last portal releases its source.
+            parse(&mut conn, &mut engine, "one", "SELECT 2");
+            parse(&mut conn, &mut engine, "two", "SELECT 3");
+            message(&mut conn, &mut engine, wire::FMSG_QUERY, b"ROLLBACK\0");
+            drop(conn);
+            drop(engine);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

@@ -59,6 +59,7 @@ jobs:
           cp src/sql/mod.rs "$RUNNER_TEMP/sql-description.original"
           cp src/storage/definition_images.rs "$RUNNER_TEMP/definition-images.original"
           cp src/sql/query/cte.rs "$RUNNER_TEMP/cte-description.original"
+          cp src/pg/conn.rs "$RUNNER_TEMP/description-conn.original"
           qualification_pid=''
           cleanup_legacy() {
             if [ -n "$qualification_pid" ]; then
@@ -68,11 +69,13 @@ jobs:
             cp "$RUNNER_TEMP/sql-description.original" src/sql/mod.rs
             cp "$RUNNER_TEMP/definition-images.original" src/storage/definition_images.rs
             cp "$RUNNER_TEMP/cte-description.original" src/sql/query/cte.rs
+            cp "$RUNNER_TEMP/description-conn.original" src/pg/conn.rs
           }
           trap cleanup_legacy EXIT
           git fetch --no-tags --depth=1 origin 3a8df3c370fbbc22f6c314083ea4349ee5fb8b5a
           git show 3a8df3c370fbbc22f6c314083ea4349ee5fb8b5a:src/sql/mod.rs > src/sql/mod.rs
           git show 3a8df3c370fbbc22f6c314083ea4349ee5fb8b5a:src/sql/query/cte.rs > src/sql/query/cte.rs
+          git show 3a8df3c370fbbc22f6c314083ea4349ee5fb8b5a:src/pg/conn.rs > src/pg/conn.rs
           python3 - <<'PYCODE'
           from pathlib import Path
           p = Path('src/storage/definition_images.rs')
@@ -125,7 +128,7 @@ jobs:
       - name: Schema owners, DML descriptions and existing output contracts
         run: |
           set -euo pipefail
-          for filter in retained_definition retained_dml_descriptions returning_old_new dml_target; do
+          for filter in retained_definition retained_dml_descriptions returning_old_new dml_target prepared_statement_cleanup; do
             cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee -a "$RUNNER_TEMP/description-tests.log"
           done
       - name: Build checked reference-comparison executable

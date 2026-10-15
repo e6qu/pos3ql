@@ -160,6 +160,10 @@ within the same startup budget.
 For a view that calls an order's `amount` column `total`, an update inside a
 WITH query returning `total` reports that name and the original numeric type.
 Preparing or describing that query determines its columns without updating an order.
+`DEALLOCATE ALL` releases client-prepared names as well as SQL PREPARE names.
+Already bound portals keep their original statements until closed; replacement
+names cannot redirect their execution. Repeated client cache resets reuse the
+same fixed pool.
 
 **User example:** a storage check started for an old orders table cannot start
 reading the replacement orders table through the reused internal slot. Bytes

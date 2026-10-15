@@ -194,6 +194,16 @@ def dml_description_transcript(reader, writer) -> list[str]:
         writer.execute("DROP TABLE described_orders_diff CASCADE")
 
 
+def prepared_statement_cleanup_transcript(reader) -> list[str]:
+    # Rollback clears psycopg's cache through DEALLOCATE ALL. Repeatedly replace
+    # every cached name without exceeding the server's startup reservation.
+    for cycle in range(24):
+        reader.execute("BEGIN")
+        last = reader.execute(f"SELECT {cycle} AS cleanup_cycle", prepare=True).fetchone()[0]
+        reader.execute("ROLLBACK")
+    return [f"prepared_cleanup=cycles:24,last:{last}"]
+
+
 def index_validation_transcript(reader, writer) -> list[str]:
     writer.execute("DROP TABLE IF EXISTS index_validation_diff")
     writer.execute("CREATE TABLE index_validation_diff (id integer, value integer)")
@@ -614,7 +624,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

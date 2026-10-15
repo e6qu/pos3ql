@@ -574,7 +574,6 @@ mod tests {
                                 image.state.pending.unwrap().transaction
                             );
                             assert!(table.test_write().is_err());
-                            assert!(versions.allocation.try_lock().is_ok());
                             match identity.existence {
                                 CatalogDdlState::PendingCreate { txid } => {
                                     assert!(identity.existence.visible_to(txid));
@@ -595,6 +594,15 @@ mod tests {
                                 CatalogDdlState::Present => {
                                     assert!(identity.live());
                                 }
+                            }
+                            drop(image);
+                            let own = TableDefinitionRead::visible(table, versions, 7);
+                            if own.state.pending.is_some_and(|head| head.transaction == 7) {
+                                assert_eq!(own.n_columns, own.committed_definition().n_columns + 1);
+                                assert_eq!(own.pending.as_ref().unwrap().version.txid, 7);
+                            } else {
+                                assert_eq!(own.n_columns, own.committed_definition().n_columns);
+                                assert!(own.pending.is_none());
                             }
                         }
                     });

@@ -29,7 +29,7 @@ jobs:
         run: |
           set -euo pipefail
           qualification_status=0
-          for filter in live_definition_ownership table_catalog_lifecycle definition_images metadata_alter catalog_version_budget storage_budget reservation dml_target; do
+          for filter in live_definition_ownership table_catalog_lifecycle definition_images metadata_alter configured_catalog_version catalog_object_pools_follow configured_transaction_ddl reservation dml_target; do
             if ! cargo test --lib --locked "$filter" -- --nocapture --test-threads=2; then
               qualification_status=1
             fi

@@ -45,7 +45,7 @@ next statement.
 | Planner statistics | Readers copy their visible estimates; private versions and saved-state markers use guarded cells and fixed pools | Integrate these captures with concurrent engine publication |
 | Row bytes | Selected rows own their startup heap allocation; reclamation can copy live rows into an unretained buffer | Integrate relocation with concurrent table publication and maintenance scheduling |
 | Read positions | Statement and transaction retention; replication export validity and import protection share one guard, with separate fixed capacities | Integrate every remaining table lifecycle path and engine publication |
-| Deferred reads | Logical row identity, table identity, and exact version identity, rather than remembered heap addresses | Coherent table lifecycle changes across every read path |
+| Deferred reads | Scans and rewrites keep their original byte sources; UPDATE, DELETE, and MERGE copy selected values into fixed statement memory | Retain COPY transition-table inputs across messages; finish coherent table lifecycle changes |
 
 ### How long reads keep data alive
 

@@ -110,7 +110,7 @@ jobs:
           FAST_CORPUS_SHARDS: "1"
         run: |
           set -euo pipefail
-          for corpus in 66_on_conflict 90_row_triggers 100_constraint_lifecycle 106_row_level_security 117_dml_row_assignments; do
+          for corpus in 66_on_conflict 90_row_triggers 100_constraint_lifecycle 106_row_level_security 117_dml_row_assignments 132_ordinary_inheritance_alter; do
             FAST_CORPUS_ONLY="$corpus" bash tests/external/ci_diff.sh
           done
       - name: Symbolicate allocation failures in one batch

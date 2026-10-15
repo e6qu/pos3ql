@@ -86,7 +86,10 @@ Older repeatable-read transactions reject a newer conflicting commit, and
 skipped conflict updates retain PostgreSQL's row locks until rollback or end.
 Local UPDATE and DELETE retain selected bytes through ordering and nested SQL.
 Trigger-side statements use checked, separate command identities and restore
-the caller's read context; conflicting BEFORE-trigger changes abort the statement.
+the caller's read context; conflicting BEFORE-trigger changes abort the statement. Inherited and partitioned
+targets map query columns to each stored row layout, preserving child-only values
+and enforcing the physical table's constraints. Foreign-key cascades retain
+matching child bytes in one scan.
 
 The [implementation guide](docs/implemented-baseline.md) owns the detailed
 contracts and limits; this sequence keeps the remaining acceptance gates.

@@ -80890,3 +80890,74 @@ fn dml_target_trigger_insert_conflicts_use_the_outer_command_boundary() {
         ["1|101"]
     );
 }
+
+#[test]
+fn dml_target_inherited_layouts_preserve_child_values_after_cold_recovery() {
+    let mut config = test_config("dml-target-child-layout");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("dml-target-child-layout-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE layout_parent(id integer PRIMARY KEY, amount integer); \
+         CREATE TABLE layout_child(extra text, amount integer CHECK (amount < 100), id integer UNIQUE); \
+         ALTER TABLE layout_child INHERIT layout_parent; \
+         INSERT INTO layout_child VALUES ('kept', 10, 1); \
+         CREATE TABLE layout_ref(id integer REFERENCES layout_child(id) ON UPDATE CASCADE ON DELETE CASCADE); \
+         INSERT INTO layout_ref VALUES (1)", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "UPDATE layout_parent SET amount = amount + 1, id = 2 WHERE id = 1 RETURNING id, amount", true)), ["2|11"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT extra, amount, id FROM ONLY layout_child",
+            true
+        )),
+        ["kept|11|2"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id FROM layout_ref", true)),
+        ["2"]
+    );
+    let failed = session.execute(&mut engine, "UPDATE layout_parent SET amount = 100", true);
+    assert!(String::from_utf8_lossy(&failed).contains("23514"));
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "DELETE FROM layout_parent WHERE amount = 11 RETURNING id, amount",
+            true
+        )),
+        ["2|11"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM layout_ref", true)),
+        ["0"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM layout_parent", true)),
+        ["0"]
+    );
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

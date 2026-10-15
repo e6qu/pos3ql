@@ -158,6 +158,16 @@ statement buffer before releasing their original sources. Sorting target
 identities or reusing nested trigger scratch cannot redirect a later fetch.
 Foreign tables keep their remote tuple-identity contract. A plain DELETE avoids
 copying old values when no projection, trigger, or referencing key needs them.
+Query predicates and `RETURNING` use the named table's column order; stored
+bytes, row triggers, generated columns, and constraints use each child's
+physical column order. Foreign-key actions map referenced columns by name and
+retain matching child bytes in one scan.
+
+**User example:** `UPDATE parent SET amount = amount + 1` preserves a child's
+extra columns after `ALTER TABLE parent ADD COLUMN`, or after attaching an
+existing child whose columns are in a different order. Child constraints still
+apply, while a primary key declared only on the parent does not become a child
+constraint.
 
 **User example:** a BEFORE trigger changes another order already selected by
 the same UPDATE. PostgreSQL returns `27000` and rolls back that statement;

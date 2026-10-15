@@ -648,6 +648,57 @@ mod tests {
     }
 
     #[test]
+    fn live_definition_ownership_independent_writers_share_capacity_without_aliasing() {
+        const WRITERS: usize = 4;
+        let versions = versions(WRITERS * 2);
+        let tables: [TableDefinition; WRITERS] =
+            std::array::from_fn(|_| TableDefinition::new(definition(1)));
+        let start = std::sync::Barrier::new(WRITERS);
+        std::thread::scope(|scope| {
+            for (worker, table) in tables.iter().enumerate() {
+                let versions = &versions;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        let transaction = worker as u32 + 7;
+                        for epoch in 1..=100 {
+                            let width = (worker + 1) * 100 + epoch;
+                            versions
+                                .stage(table, pending(width, transaction), 2)
+                                .unwrap();
+                            versions
+                                .stage(table, pending(width + 1, transaction), 2)
+                                .unwrap();
+                            assert_eq!(
+                                TableDefinitionRead::visible(table, versions, transaction)
+                                    .n_columns,
+                                width + 1
+                            );
+                            assert_eq!(
+                                TableDefinitionRead::visible(table, versions, 99).n_columns,
+                                1
+                            );
+                            assert!(versions.rollback(table, transaction));
+                            assert_eq!(
+                                TableDefinitionRead::visible(table, versions, transaction)
+                                    .n_columns,
+                                width
+                            );
+                            versions.clear(table);
+                            assert!(PendingDefinitionRead::current(table, versions).is_none());
+                        }
+                    });
+                });
+            }
+        });
+        assert!(versions.test_write().is_ok());
+        for table in &tables {
+            assert!(table.read().pending.is_none());
+        }
+    }
+
+    #[test]
     fn live_definition_ownership_controls_and_pending_capacity_are_exactly_charged() {
         let _ = versions(2);
         let mut short = Budget::new(DefinitionVersions::control_bytes() - 1);

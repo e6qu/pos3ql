@@ -6972,13 +6972,22 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
     let resolved_view = run_with(
         &mut recovered,
         &mut recovered_budget,
-        "COMMIT PREPARED 'object-view-lock'; \
-         CREATE RULE after_recovery AS ON INSERT TO durable_prepared_view DO INSTEAD NOTHING",
+        "COMMIT PREPARED 'object-view-lock'",
     );
     assert!(
         !String::from_utf8_lossy(&resolved_view).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&resolved_view)
+    );
+    let created_rule = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "CREATE RULE after_recovery AS ON INSERT TO durable_prepared_view DO INSTEAD NOTHING",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created_rule).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created_rule)
     );
     let committed = run_with(
         &mut recovered,

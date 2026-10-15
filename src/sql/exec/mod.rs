@@ -53083,10 +53083,13 @@ fn decode_replication_old_tuple<'a>(
 /// Proof that a publisher's replica-identity tuple names exactly one local
 /// visible row.  Only this module constructs it, so apply mutations cannot
 /// accidentally use a missing or ambiguous identity.
-#[derive(Clone, Copy)]
-pub struct ReplicationRow {
+pub struct ReplicationRow<'arena> {
     table_slot: usize,
     rowid: u64,
+    selected: PhysicalRow,
+    bytes: &'arena [u8],
+    definitions: crate::storage::TableDefinitionImages,
+    transaction: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -53095,26 +53098,45 @@ pub(crate) struct ReplicationUpdate<'a> {
     pub new: Tuple<'a>,
 }
 
-impl ReplicationRow {
-    pub fn table_slot(self) -> usize {
+impl ReplicationRow<'_> {
+    pub fn table_slot(&self) -> usize {
         self.table_slot
     }
-
-    pub fn rowid(self) -> u64 {
+    pub fn rowid(&self) -> u64 {
         self.rowid
+    }
+
+    pub(crate) fn definition(&self) -> &TableDef {
+        self.definitions
+            .retained_definition(self.table_slot, self.transaction)
+            .expect("selected replication row retains its definition")
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.bytes
+    }
+
+    fn available(&self, storage: &Storage, txn: &TxnState, action: &str) -> Result<(), SqlError> {
+        if dml_row_available(storage, txn, self.selected, action)? {
+            return Ok(());
+        }
+        Err(sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "subscription row changed while applying {}",
+            action
+        ))
     }
 }
 
-/// Finds exactly one row matching a decoded publisher old image.  NULL equals
-/// NULL here because pgoutput's old tuple is a replica identity, not an SQL
-/// predicate; a second matching image is an unsafe local divergence.
-pub fn locate_replication_row(
+/// Finds exactly one matching replica identity and retains its original bytes
+/// and physical definition before any row trigger can execute.
+pub fn locate_replication_row<'arena>(
     storage: &Storage,
     txn: &TxnState,
     binding: RelationBinding,
     old: OldTuple<'_>,
-    arena: &Arena,
-) -> Result<ReplicationRow, SqlError> {
+    arena: &'arena Arena,
+) -> Result<ReplicationRow<'arena>, SqlError> {
     let expected = decode_replication_old_tuple(storage, txn, binding, old, arena)?;
     locate_replication_row_by_values(
         storage,
@@ -53126,14 +53148,14 @@ pub fn locate_replication_row(
     )
 }
 
-fn locate_replication_row_by_values(
+fn locate_replication_row_by_values<'arena>(
     storage: &Storage,
     txn: &TxnState,
     binding: RelationBinding,
     expected: &[Datum<'_>; MAX_COLUMNS],
     identity_columns: &[usize],
-    arena: &Arena,
-) -> Result<ReplicationRow, SqlError> {
+    arena: &'arena Arena,
+) -> Result<ReplicationRow<'arena>, SqlError> {
     if identity_columns.is_empty() {
         return Err(sql_err!(
             sqlstate::PROTOCOL_VIOLATION,
@@ -53141,55 +53163,77 @@ fn locate_replication_row_by_values(
         ));
     }
     let table_index = binding.table_slot();
-    let definition = storage.table_def(table_index, txn.txid);
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
-    definition.schema(&mut schema);
+    let definitions = storage.table_definition_images();
+    let definition = definitions.definition(storage, table_index, txn.txid)?;
     let mut found = None;
     let leaves = arena
         .alloc_slice_with(storage.table_count(), |_| 0usize)
         .map_err(|_| arena_full())?;
     let leaf_count = storage.partition_leaf_slots(table_index, txn.txid, leaves)?;
     for &leaf in &leaves[..leaf_count] {
+        storage.lock_table(
+            txn.txid,
+            leaf,
+            crate::sql::ast::TableLockMode::RowExclusive,
+            false,
+        )?;
+        let physical = definitions.definition(storage, leaf, txn.txid)?;
+        let mapping = crate::storage::RelationColumnMap::new(definition, physical, arena)?;
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        physical.schema(&mut schema);
         storage.for_each_row_state(leaf, &mut |rowid, state| {
             use core::ops::ControlFlow;
             let Some(home) = storage.visible_row_home(leaf, rowid, state, txn.txid)? else {
                 return Ok(ControlFlow::Continue(()));
             };
-            let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
-            let mut actual = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, &schema[..definition.n_columns], &mut actual)?;
-            let equal = identity_columns.iter().try_fold(true, |same, &column| {
-                if !same {
-                    return Ok(false);
+            let selected = PhysicalRow::local(leaf, rowid, home.snapshot());
+            storage.with_row_bytes(leaf, rowid, home, |bytes| {
+                let mut actual = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, &schema[..physical.n_columns], &mut actual)?;
+                let equal = identity_columns.iter().try_fold(true, |same, &column| {
+                    if !same {
+                        return Ok(false);
+                    }
+                    let left = &expected[column];
+                    let right = &actual[mapping.physical_column(column)?];
+                    if left.is_null() || right.is_null() {
+                        return Ok(left.is_null() && right.is_null());
+                    }
+                    compare_datums(left, right).map(|ordering| ordering.is_eq())
+                })?;
+                if equal {
+                    if found.is_some() {
+                        return Err(sql_err!(
+                            sqlstate::CARDINALITY_VIOLATION,
+                            "subscription replica identity matches more than one local row"
+                        ));
+                    }
+                    let retained = arena.alloc_slice_copy(bytes).map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "subscription row image exceeds the statement arena"
+                        )
+                    })?;
+                    found = Some((leaf, rowid, selected, &*retained));
                 }
-                let left = &expected[column];
-                let right = &actual[column];
-                if left.is_null() || right.is_null() {
-                    return Ok(left.is_null() && right.is_null());
-                }
-                compare_datums(left, right).map(|ordering| ordering.is_eq())
+                Ok(())
             })?;
-            if equal
-                && found
-                    .replace(ReplicationRow {
-                        table_slot: leaf,
-                        rowid,
-                    })
-                    .is_some()
-            {
-                return Err(sql_err!(
-                    sqlstate::CARDINALITY_VIOLATION,
-                    "subscription replica identity matches more than one local row"
-                ));
-            }
             Ok(ControlFlow::Continue(()))
         })?;
     }
-    found.ok_or_else(|| {
+    let (table_slot, rowid, selected, bytes) = found.ok_or_else(|| {
         sql_err!(
             sqlstate::PROTOCOL_VIOLATION,
             "subscription replica identity does not match a local row"
         )
+    })?;
+    Ok(ReplicationRow {
+        table_slot,
+        rowid,
+        selected,
+        bytes,
+        definitions,
+        transaction: txn.txid,
     })
 }
 
@@ -53206,7 +53250,6 @@ pub(crate) fn apply_replication_delete(
     context: &mut ReplicationTriggerContext<'_, '_>,
 ) -> Result<(), SqlError> {
     let row = locate_replication_row(storage, txn, binding, old, arena)?;
-    let table_index = binding.table_slot();
     let row_table = row.table_slot();
     match storage.acquire_row_lock(
         row_table,
@@ -53224,22 +53267,8 @@ pub(crate) fn apply_replication_delete(
         }
         crate::sql::lock::LockDecision::Skipped => unreachable!("apply delete waits for its row"),
     }
-    let definition = *storage.table_def(table_index, txn.txid);
-    let state = storage.row_state(row_table, row.rowid())?.ok_or_else(|| {
-        sql_err!(
-            sqlstate::PROTOCOL_VIOLATION,
-            "subscription replica identity disappeared before delete"
-        )
-    })?;
-    let home = storage
-        .visible_row_home(row_table, row.rowid(), state, txn.txid)?
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROTOCOL_VIOLATION,
-                "subscription replica identity is no longer visible before delete"
-            )
-        })?;
-    let bytes = storage.row_bytes(row_table, row.rowid(), home, arena)?;
+    let definition = row.definition();
+    let bytes = row.bytes();
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
     let mut old_values = [Datum::Null; MAX_COLUMNS];
@@ -53252,7 +53281,7 @@ pub(crate) fn apply_replication_delete(
         context.responder,
         context.scratch,
         row_table,
-        &definition,
+        definition,
         TriggerEvents::DELETE,
         true,
         false,
@@ -53262,6 +53291,7 @@ pub(crate) fn apply_replication_delete(
     )? {
         return Ok(());
     }
+    row.available(storage, txn, "deleted")?;
     if table_is_referenced(
         storage,
         definition.schema.as_str(),
@@ -53294,7 +53324,7 @@ pub(crate) fn apply_replication_delete(
         context.responder,
         context.scratch,
         row_table,
-        &definition,
+        definition,
         TriggerEvents::DELETE,
         false,
         false,

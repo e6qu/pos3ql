@@ -81666,3 +81666,108 @@ fn dml_target_upsert_rejects_triggered_rewrites_and_repeated_updates() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn pgoutput_row_selection_copies_only_matches_and_owns_original_schema() {
+    use crate::pg::pginput::{CopyData, Message};
+    use crate::pg::subscription_apply::RelationMap;
+
+    fn frame(plugin: &[u8]) -> Vec<u8> {
+        let mut out = vec![0; 25];
+        out[0] = b'w';
+        out.extend_from_slice(plugin);
+        out
+    }
+    fn deletion(id: &[u8]) -> Vec<u8> {
+        let mut plugin = vec![b'D', 0, 0, 0, 1, b'K', 0, 2, b't'];
+        plugin.extend_from_slice(&(id.len() as u32).to_be_bytes());
+        plugin.extend_from_slice(id);
+        plugin.push(b'n');
+        frame(&plugin)
+    }
+    let config = test_config("pgoutput-owned-row-selection");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut relations = RelationMap::new(&mut budget, 1).unwrap();
+    let arena = Arena::new(&mut budget, "replication_selection", 256).unwrap();
+    session.success(&mut engine,
+        "CREATE TABLE replica_selection(id integer PRIMARY KEY, label text); \
+         INSERT INTO replica_selection SELECT value, repeat('x', 512) FROM generate_series(1, 100) AS series(value); \
+         INSERT INTO replica_selection VALUES (101, 'kept'); BEGIN", true);
+    let mut relation = vec![b'R', 0, 0, 0, 1];
+    relation.extend_from_slice(b"public\0replica_selection\0");
+    relation.extend_from_slice(&[b'd', 0, 2, 1]);
+    relation.extend_from_slice(b"id\0");
+    relation.extend_from_slice(&23u32.to_be_bytes());
+    relation.extend_from_slice(&(-1i32).to_be_bytes());
+    relation.push(0);
+    relation.extend_from_slice(b"label\0");
+    relation.extend_from_slice(&25u32.to_be_bytes());
+    relation.extend_from_slice(&(-1i32).to_be_bytes());
+    let relation = frame(&relation);
+    let large = deletion(b"1");
+    let small = deletion(b"101");
+    let selected = crate::mem::guard::forbid_alloc(|| {
+        let CopyData::XLogData {
+            message: Message::Relation(relation),
+            ..
+        } = crate::pg::pginput::copy_data(&relation).unwrap()
+        else {
+            panic!("relation frame");
+        };
+        relations
+            .register(&engine.storage, session.txn.txid, relation)
+            .unwrap();
+        let binding = relations.binding(1).unwrap();
+        let CopyData::XLogData {
+            message: Message::Delete { old, .. },
+            ..
+        } = crate::pg::pginput::copy_data(&large).unwrap()
+        else {
+            panic!("delete frame");
+        };
+        let error = super::exec::locate_replication_row(
+            &engine.storage,
+            &session.txn,
+            binding,
+            old,
+            &arena,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("subscription row image"));
+        let CopyData::XLogData {
+            message: Message::Delete { old, .. },
+            ..
+        } = crate::pg::pginput::copy_data(&small).unwrap()
+        else {
+            panic!("delete frame");
+        };
+        super::exec::locate_replication_row(&engine.storage, &session.txn, binding, old, &arena)
+            .unwrap()
+    });
+    let table = selected.table_slot();
+    session.success(&mut engine, "ROLLBACK", true);
+    session.success(&mut engine, "DROP TABLE replica_selection", true);
+    session.success(&mut engine, "CREATE TABLE replica_selection(replacement text); INSERT INTO replica_selection VALUES ('new table')", true);
+    assert_eq!(
+        engine.storage.find_table("public", "replica_selection"),
+        Some(table)
+    );
+    drop(session);
+    drop(engine);
+    crate::mem::guard::forbid_alloc(|| {
+        let definition = selected.definition();
+        assert_eq!(definition.n_columns, 2);
+        assert_eq!(definition.columns()[0].name.as_str(), "id");
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        definition.schema(&mut schema);
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        crate::storage::rowenc::decode(selected.bytes(), &schema[..2], &mut values).unwrap();
+        assert_eq!(&values[..2], &[Datum::Int4(101), Datum::Text("kept")]);
+    });
+    drop(selected);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

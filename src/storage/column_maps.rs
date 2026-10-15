@@ -62,6 +62,19 @@ impl<'arena> RelationColumnMap<'arena> {
         Ok(Self { columns })
     }
 
+    pub(crate) fn physical_column(self, logical: usize) -> Result<usize, SqlError> {
+        self.columns
+            .get(logical)
+            .copied()
+            .map(usize::from)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "logical column is outside its retained mapping"
+                )
+            })
+    }
+
     pub(crate) fn project<'values>(
         self,
         physical: &[Datum<'values>],

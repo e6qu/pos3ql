@@ -58,7 +58,7 @@ jobs:
       - name: Column mapping and partition regression tests
         run: |
           set -euo pipefail
-          for filter in relation_column_maps dml_target partition copy_ metadata_alter; do
+          for filter in relation_column_maps dml_target partition copy_ pgoutput metadata_alter; do
             cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee -a "$RUNNER_TEMP/partition-order-tests.log"
           done
       - name: Build candidate reference executable

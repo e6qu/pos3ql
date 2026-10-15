@@ -81671,6 +81671,7 @@ fn dml_target_upsert_rejects_triggered_rewrites_and_repeated_updates() {
 fn pgoutput_row_selection_copies_only_matches_and_owns_original_schema() {
     use crate::pg::pginput::{CopyData, Message};
     use crate::pg::subscription_apply::RelationMap;
+    use crate::storage::MAX_COLUMNS;
 
     fn frame(plugin: &[u8]) -> Vec<u8> {
         let mut out = vec![0; 25];

@@ -71,7 +71,9 @@ record for every saved row. Attached partitions map matching columns by name
 through reads, constraints, writes, and replication; subscription descriptors
 recheck local tables after schema changes. Pending table definitions retain one
 startup slot rather than the whole pool; unrelated tables can publish and retire
-their own versions while that definition remains selected. The [implementation guide](docs/implemented-baseline.md)
+their own versions while that definition remains selected. Selected index caches
+retain their own storage; replacements publish their binding list and count
+together after population. The [implementation guide](docs/implemented-baseline.md)
 owns the detailed completed contracts, examples, and capacity limits.
 
 Still to do:

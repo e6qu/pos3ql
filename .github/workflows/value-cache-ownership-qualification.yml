@@ -1,0 +1,37 @@
+name: Value cache ownership qualification
+
+on:
+  push:
+    branches: [retain-value-index-cache-owners]
+
+concurrency:
+  group: value-cache-ownership-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  value-cache-ownership:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Retention, publication, budgets, and index regressions
+        run: |
+          set -euo pipefail
+          qualification_status=0
+          for filter in value_cache_owners shared_committed_publication_cache value_index cluster_metadata_failed_table_creation catalog_object_pools_follow index_cache index_creation_copied_indexes metadata_alter dml_target; do
+            if ! cargo test --lib --locked "$filter" -- --nocapture --test-threads=2; then
+              qualification_status=1
+            fi
+          done
+          exit "$qualification_status"

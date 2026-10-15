@@ -421,6 +421,19 @@ rows. The report continues with its original file set and read position; a new
 scan captures the replacement. Downloads and callbacks hold none of the table
 capture guards. Cancellation and failed capture release reader registrations.
 
+### Reading index caches during replacement
+
+A selected in-memory index cache owns its storage. Rebuilding or dropping a table
+cannot reuse that cache slot until its last reader releases it. A replacement
+binding list and its count publish together after population; failed builds
+release their claims and publish no partial list. A cache whose row map fills is
+marked incomplete, so it cannot supply an authoritative negative lookup.
+
+Cache owners and their buffers are reserved at startup. Retained readers count
+against `max_value_indexes`; a full claim pool returns `54000`. For example, a
+replacement that runs out of slots can be retried after an older lookup releases
+its cache. Allocation controls release before clearing a claimed cache.
+
 ### How statistics reads and journal batches stay consistent
 
 `ANALYZE` collects estimates used to choose query plans. Relation counts and

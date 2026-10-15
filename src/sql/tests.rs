@@ -80839,3 +80839,53 @@ fn dml_target_capture_exhaustion_releases_sources_and_allows_narrow_retry() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn dml_target_trigger_insert_conflicts_use_the_outer_command_boundary() {
+    let config = test_config("dml-target-trigger-conflict");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE dml_trigger_conflict(id integer PRIMARY KEY, value integer); \
+         CREATE FUNCTION dml_trigger_key_writer() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+           IF NEW.value < 100 THEN INSERT INTO dml_trigger_conflict VALUES (NEW.id, 101); END IF; RETURN NEW; END $$; \
+         CREATE TRIGGER dml_trigger_key_writer BEFORE INSERT ON dml_trigger_conflict \
+           FOR EACH ROW EXECUTE FUNCTION dml_trigger_key_writer()", true);
+    for clause in [
+        "DO UPDATE SET value = excluded.value",
+        "DO UPDATE SET value = excluded.value WHERE false",
+    ] {
+        let output = session.execute(
+            &mut engine,
+            &format!("INSERT INTO dml_trigger_conflict VALUES (1, 1) ON CONFLICT (id) {clause}"),
+            true,
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains("21000"),
+            "{clause}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM dml_trigger_conflict",
+                true
+            )),
+            ["0"]
+        );
+    }
+    session.success(
+        &mut engine,
+        "INSERT INTO dml_trigger_conflict VALUES (1, 1) ON CONFLICT (id) DO NOTHING",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, value FROM dml_trigger_conflict",
+            true
+        )),
+        ["1|101"]
+    );
+}

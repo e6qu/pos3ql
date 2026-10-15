@@ -47,8 +47,9 @@ impl super::Storage {
                 "selected DML table was removed"
             )
         })?;
-        let definition = table.definition();
-        if definition.created_at != original.created_at || !definition.visible_to(txid) {
+        let definition = table.definition.read();
+        let identity = definition.identity;
+        if identity.created_at != original.created_at || !identity.existence.visible_to(txid) {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "selected DML table was replaced"

@@ -126,6 +126,19 @@ def dml_target_transcript(reader, _writer) -> list[str]:
         changed = reader.execute("UPDATE dml_target_rows AS target SET value = source.value FROM dml_target_rows AS source WHERE source.id = target.id - 1 RETURNING target.id, target.value").fetchall()
         rows = reader.execute("SELECT id, value FROM dml_target_rows ORDER BY id").fetchall()
         results.append(f"dml_target_self_join=changed:{changed},rows:{rows}")
+        reader.execute("DROP TABLE dml_target_rows")
+        reader.execute("CREATE TABLE dml_target_rows(id integer PRIMARY KEY, value integer)")
+        reader.execute("CREATE FUNCTION dml_target_action() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.value < 100 THEN INSERT INTO dml_target_rows VALUES (NEW.id, 101); END IF; RETURN NEW; END $$")
+        reader.execute("CREATE TRIGGER dml_target_trigger BEFORE INSERT ON dml_target_rows FOR EACH ROW EXECUTE FUNCTION dml_target_action()")
+        for label, clause in [
+            ("update", "DO UPDATE SET value = excluded.value"),
+            ("filtered", "DO UPDATE SET value = excluded.value WHERE false"),
+            ("nothing", "DO NOTHING"),
+        ]:
+            reader.execute("TRUNCATE dml_target_rows")
+            error = sqlstate(reader, f"INSERT INTO dml_target_rows VALUES (1, 1) ON CONFLICT (id) {clause}")
+            rows = reader.execute("SELECT id, value FROM dml_target_rows").fetchall()
+            results.append(f"dml_target_trigger_conflict_{label}={error},rows:{rows}")
         return results
     finally:
         reader.execute("ROLLBACK")

@@ -5002,7 +5002,7 @@ where
                 unreachable!("conflict update does not skip locked rows")
             }
         }
-        if matches!(conflict.origin, ConflictRowOrigin::OwnCommand(command) if command == txn.command_id())
+        if matches!(conflict.origin, ConflictRowOrigin::OwnCommand(command) if command >= txn.command_id())
         {
             return Err(sql_err!(
                 sqlstate::CARDINALITY_VIOLATION,
@@ -61516,7 +61516,7 @@ pub(crate) fn delete<'a>(
         if row_has_triggers {
             let mut old_transition = [Datum::Null; MAX_COLUMNS];
             {
-                let old_bytes = match storage.row_bytes(row_table, rowid, old_home, arena) {
+                let old_bytes = match retained_rows.bytes(row_table, rowid) {
                     Ok(bytes) => bytes,
                     Err(error) => return sql_fail(error),
                 };

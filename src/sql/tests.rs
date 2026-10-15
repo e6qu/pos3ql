@@ -53824,17 +53824,17 @@ fn bool_aggregates() {
 }
 
 #[test]
-fn constraint_validation_reuses_fixed_arena_between_rows_and_inherited_tables() {
+fn constraint_validation_reuses_fixed_arena_between_rows_and_tables() {
     let config = test_config("constraint-validation-fixed-arena");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut setup = ConfiguredTransactionSession::new(&config, &mut budget);
     setup.success(
         &mut engine,
-        "CREATE TABLE constraint_capacity(id integer, value integer); \
-         CREATE TABLE constraint_capacity_a() INHERITS (constraint_capacity); \
-         CREATE TABLE constraint_capacity_b() INHERITS (constraint_capacity); \
-         CREATE TABLE constraint_capacity_c() INHERITS (constraint_capacity)",
+        "CREATE DOMAIN constraint_capacity_value AS integer; \
+         CREATE TABLE constraint_capacity_a(id integer, value constraint_capacity_value); \
+         CREATE TABLE constraint_capacity_b(id integer, value constraint_capacity_value); \
+         CREATE TABLE constraint_capacity_c(id integer, value constraint_capacity_value)",
         true,
     );
     for value in 0..256 {
@@ -53852,17 +53852,19 @@ fn constraint_validation_reuses_fixed_arena_between_rows_and_inherited_tables() 
         ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 16 << 10);
     limited.success(
         &mut engine,
-        "ALTER TABLE constraint_capacity ADD CONSTRAINT nonnegative_values CHECK (value >= 0)",
+        "ALTER DOMAIN constraint_capacity_value ADD CONSTRAINT nonnegative_values CHECK (VALUE >= 0)",
         true,
     );
     assert_eq!(
         data_rows(&setup.success(
             &mut engine,
-            "SELECT count(*), sum(value) FROM constraint_capacity; \
+            "SELECT count(*), sum(value::integer) FROM constraint_capacity_a; \
+         SELECT count(*), sum(value::integer) FROM constraint_capacity_b; \
+         SELECT count(*), sum(value::integer) FROM constraint_capacity_c; \
          SELECT count(*) FROM pg_constraint WHERE conname = 'nonnegative_values'",
             true
         )),
-        ["768|97920", "4"]
+        ["256|32640", "256|32640", "256|32640", "1"]
     );
 }
 

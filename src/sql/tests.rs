@@ -43883,7 +43883,7 @@ fn analyze_retained_sources_preserve_pending_changes_rollback_and_cold_recovery(
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
-    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let engine = Engine::new(&config, &mut budget).unwrap();
     let table = engine
         .storage
         .find_table("public", "analyzed_orders")

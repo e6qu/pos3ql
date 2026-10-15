@@ -65416,17 +65416,23 @@ fn alter_table_relation(
     let ddl_read = storage.validation_read();
     scratch.clear();
     let mut has_rows = false;
-    if let Err(error) = ddl_read.for_each_row_state(storage, table_index, &mut |rowid, state| {
-        if ddl_read
-            .visible_row_home(storage, table_index, rowid, state, txn.txid)?
-            .is_some()
-        {
-            has_rows = true;
-            Ok(core::ops::ControlFlow::Break(()))
-        } else {
-            Ok(core::ops::ControlFlow::Continue(()))
-        }
-    }) {
+    if statement
+        .actions
+        .iter()
+        .any(|action| matches!(action, AlterAction::AddColumn { .. }))
+        && let Err(error) =
+            ddl_read.for_each_row_state(storage, table_index, &mut |rowid, state| {
+                if ddl_read
+                    .visible_row_home(storage, table_index, rowid, state, txn.txid)?
+                    .is_some()
+                {
+                    has_rows = true;
+                    Ok(core::ops::ControlFlow::Break(()))
+                } else {
+                    Ok(core::ops::ControlFlow::Continue(()))
+                }
+            })
+    {
         return sql_fail(error);
     }
 

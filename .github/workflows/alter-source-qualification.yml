@@ -1,0 +1,140 @@
+name: ALTER source qualification
+
+on:
+  push:
+    branches: [retain-alter-rewrite-sources]
+
+concurrency:
+  group: alter-source-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  descriptions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Record reference and prepare server configuration
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -p 5432 -U postgres -tAc 'SELECT version()'
+          cat > "$RUNNER_TEMP/description.conf" <<CONFIG
+          listen_addr = 127.0.0.1:15599
+          data_dir = $RUNNER_TEMP/description-data
+          object_store = off
+          max_tables = 64
+          table_rows = 8192
+          max_value_indexes = 64
+          memtable_bytes = 256MiB
+          CONFIG
+          cat tests/external/differential-capacities.conf >> "$RUNNER_TEMP/description.conf"
+      - name: Reproduce metadata ALTER failure with the prior row collection
+        run: |
+          set -euo pipefail
+          cp src/sql/exec/mod.rs "$RUNNER_TEMP/alter-executor.original"
+          trap 'cp "$RUNNER_TEMP/alter-executor.original" src/sql/exec/mod.rs' EXIT
+          git fetch --no-tags --depth=1 origin 2b8f41817ccf254688e16598e997b1fbab94d8cd
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import subprocess
+          p = Path('src/sql/exec/mod.rs')
+          candidate = p.read_text()
+          legacy = subprocess.check_output(['git', 'show', '2b8f41817ccf254688e16598e997b1fbab94d8cd:src/sql/exec/mod.rs'], text=True)
+          begin = legacy.index('    // Collect current committed and own row identities:')
+          end = legacy.index('\n    // Build the new definition', begin)
+          start = candidate.index('    // An added NOT NULL column without a default only needs')
+          stop = candidate.index('\n    // Build the new definition', start)
+          p.write_text(candidate[:start] + legacy[begin:end] + candidate[stop:])
+          PYCODE
+          set +e
+          cargo test --lib --locked alter_rewrite_sources_metadata_changes_stream_saved_rows_beyond_update_capacity -- --nocapture --test-threads=1 > "$RUNNER_TEMP/legacy-alter-source.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/legacy-alter-source.log"
+          test "$result" -ne 0
+          grep -a -F 'test result: FAILED. 0 passed; 1 failed;' "$RUNNER_TEMP/legacy-alter-source.log"
+          grep -a -F 'ALTER touches more than 8 rows' "$RUNNER_TEMP/legacy-alter-source.log"
+      - name: Verify source restoration
+        run: git diff --exit-code
+      - name: Lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Retained ALTER sources and existing captured readers
+        run: |
+          set -euo pipefail
+          for filter in alter_rewrite_sources captured_resident_byte_scans owned_enum_rewrite_sources metadata_alter; do
+            cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee -a "$RUNNER_TEMP/alter-source-tests.log"
+          done
+      - name: Build candidate reference executable
+        run: cargo build --locked
+      - name: Compare ALTER behavior and full transaction transcript with PostgreSQL
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          P3_PORT: "15599"
+        run: |
+          set -euo pipefail
+          target/debug/pos3ql --config "$RUNNER_TEMP/description.conf" > "$RUNNER_TEMP/alter-source-server.log" 2>&1 &
+          qualification_pid=$!
+          trap 'kill "$qualification_pid" || true; cat "$RUNNER_TEMP/alter-source-server.log"' EXIT
+          for attempt in $(seq 1 100); do
+            kill -0 "$qualification_pid"
+            if psql -h 127.0.0.1 -p 15599 -U postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+              break
+            fi
+            test "$attempt" -lt 100
+            sleep 0.1
+          done
+          target/external-venv/bin/python - <<'PYCODE'
+          import sys
+          sys.path.insert(0, 'tests/external')
+          import mvcc_diff
+          def transcript(port):
+              with mvcc_diff.connect(port) as reader, mvcc_diff.connect(port) as writer:
+                  return mvcc_diff.alter_rewrite_source_transcript(reader, writer)
+          expected = transcript(5432)
+          observed = transcript(15599)
+          print('PostgreSQL:', expected, flush=True)
+          print('pos3ql:', observed, flush=True)
+          assert len(expected) == 4
+          assert observed == expected, 'ALTER source behavior divergence'
+          PYCODE
+          target/external-venv/bin/python tests/external/mvcc_diff.py
+      - name: Symbolicate allocation failures in one batch
+        if: failure()
+        run: |
+          python3 - <<'PYCODE'
+          import os, re, subprocess
+          from pathlib import Path
+          log = Path(os.environ['RUNNER_TEMP']) / 'alter-source-tests.log'
+          if log.exists():
+              frames = re.findall(r'(\S*/target/debug/deps/pos3ql-[0-9a-f]+)\(\+(0x[0-9a-f]+)\)', log.read_text(errors='replace'))
+              for binary in sorted({binary for binary, _ in frames}):
+                  addresses = [address for owner, address in frames if owner == binary]
+                  subprocess.run(['addr2line', '-C', '-f', '-e', binary, *addresses], check=True)
+          PYCODE

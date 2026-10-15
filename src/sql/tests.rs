@@ -53824,6 +53824,98 @@ fn bool_aggregates() {
 }
 
 #[test]
+fn constraint_validation_rewrite_uses_saved_and_new_rows_and_restores_rollback() {
+    let mut config = test_config("constraint-rewrite-current");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("constraint-rewrite-current-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut setup = ConfiguredTransactionSession::new(&config, &mut budget);
+    setup.success(&mut engine,
+        "CREATE TABLE validation_rewrite(id integer, value text); INSERT INTO validation_rewrite VALUES (1, '10'), (2, '20')", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(setup);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    reader.success(&mut engine, "BEGIN ISOLATION LEVEL REPEATABLE READ", true);
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, "SELECT count(*) FROM validation_rewrite", true)),
+        ["2"]
+    );
+    writer.success(
+        &mut engine,
+        "INSERT INTO validation_rewrite VALUES (3, 'invalid')",
+        true,
+    );
+    reader.success(&mut engine, "SAVEPOINT before_rewrite", true);
+    let failed = reader.execute(
+        &mut engine,
+        "ALTER TABLE validation_rewrite ALTER COLUMN value TYPE bigint USING value::bigint",
+        true,
+    );
+    assert!(
+        failed.windows(5).any(|field| field == b"22P02"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    reader.success(&mut engine, "ROLLBACK TO SAVEPOINT before_rewrite", true);
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, "SELECT count(*) FROM validation_rewrite", true)),
+        ["2"]
+    );
+    writer.success(
+        &mut engine,
+        "UPDATE validation_rewrite SET value = '30' WHERE id = 3",
+        true,
+    );
+    reader.success(
+        &mut engine,
+        "ALTER TABLE validation_rewrite ALTER COLUMN value TYPE bigint USING value::bigint",
+        true,
+    );
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "SELECT count(*), sum(value) FROM validation_rewrite",
+            true
+        )),
+        ["3|60"]
+    );
+    reader.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(data_rows(&writer.success(&mut engine,
+        "SELECT count(*), sum(value::bigint) FROM validation_rewrite; \
+         SELECT data_type FROM information_schema.columns WHERE table_name = 'validation_rewrite' AND column_name = 'value'", true)), ["3|60", "text"]);
+    writer.success(
+        &mut engine,
+        "ALTER TABLE validation_rewrite ALTER COLUMN value TYPE bigint USING value::bigint",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(reader);
+    drop(writer);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT count(*), sum(value) FROM validation_rewrite; \
+         SELECT data_type FROM information_schema.columns WHERE table_name = 'validation_rewrite' AND column_name = 'value'", true)), ["3|60", "bigint"]);
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn constraint_validation_reuses_fixed_arena_between_rows_and_tables() {
     let config = test_config("constraint-validation-fixed-arena");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));

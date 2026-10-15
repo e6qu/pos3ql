@@ -323,6 +323,35 @@ def constraint_partition_transcript(reader, writer) -> list[str]:
         writer.execute("DROP FUNCTION IF EXISTS validation_expression_value()")
 
 
+def constraint_rewrite_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE validation_rewrite(id integer, value text)")
+    writer.execute("INSERT INTO validation_rewrite VALUES (1, '10'), (2, '20')")
+    try:
+        reader.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        before = reader.execute("SELECT count(*) FROM validation_rewrite").fetchone()[0]
+        writer.execute("INSERT INTO validation_rewrite VALUES (3, 'invalid')")
+        reader.execute("SAVEPOINT before_rewrite")
+        command = "ALTER TABLE validation_rewrite ALTER COLUMN value TYPE bigint USING value::bigint"
+        error = sqlstate(reader, command)
+        reader.execute("ROLLBACK TO SAVEPOINT before_rewrite")
+        unchanged = reader.execute("SELECT count(*) FROM validation_rewrite").fetchone()[0]
+        writer.execute("UPDATE validation_rewrite SET value = '30' WHERE id = 3")
+        retried = sqlstate(reader, command)
+        if retried != "ok":
+            reader.execute("ROLLBACK TO SAVEPOINT before_rewrite")
+        converted = reader.execute("SELECT id, value FROM validation_rewrite ORDER BY id").fetchall()
+        reader.execute("ROLLBACK")
+        restored = writer.execute("SELECT id, value FROM validation_rewrite ORDER BY id").fetchall()
+        return [
+            f"constraint_rewrite_error={error},before:{before},after:{unchanged}",
+            f"constraint_rewrite_retry={retried},converted:{converted},restored:{restored}",
+        ]
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        writer.execute("DROP TABLE validation_rewrite")
+
+
 def analyze_snapshot_transcript(reader, writer) -> list[str]:
     writer.execute("DROP TABLE IF EXISTS analyze_snapshot_diff CASCADE")
     writer.execute("CREATE TABLE analyze_snapshot_diff (id integer, a integer, b integer, label text)")
@@ -416,7 +445,7 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
     finally:
         reader.close()
         writer.close()

@@ -42,7 +42,7 @@ jobs:
       - name: Constraint validation fixed-memory regressions
         run: |
           set -euo pipefail
-          for filter in constraint_validation captured_resident_byte_scans add_constraint domain_; do
+          for filter in constraint_validation captured_resident_byte_scans alter_add_drop_constraint alter_column_type_rewrites_and_persists transactional_alter_table attach_partition_validates_every_inherited_constraint domain_; do
             cargo test --lib --locked "$filter" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/constraint-validation-test.log"
           done
       - name: Build reference-comparison executable

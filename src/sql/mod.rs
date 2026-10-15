@@ -3017,10 +3017,6 @@ impl Engine {
         true
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "replication truncate uses its worker arena for the complete local target set"
-    )]
     pub(crate) fn apply_subscription_truncate(
         &mut self,
         txn: &mut TxnState,

@@ -60643,7 +60643,8 @@ mod tests {
                 assert!(done || cursor > prior_cursor || after < before);
                 assert!(storage.row_versions.test_write().is_ok());
                 assert!(storage.tables[first].rows.test_write().is_ok());
-                storage.commit_create(other);
+                storage.drop_table_in(other, 8);
+                storage.rollback_drop(other);
                 let rows = storage.tables[first].rows.read();
                 for (key, row) in rows.iter() {
                     assert_eq!(

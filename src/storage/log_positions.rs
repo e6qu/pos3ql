@@ -32,12 +32,19 @@ impl LogPositions {
     }
 
     pub(super) fn reserve(&self) -> ReservedLogPosition {
-        let previous = self
-            .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                value.checked_add(1)
-            });
-        ReservedLogPosition(previous.ok().map(|value| value + 1))
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(1) else {
+                return ReservedLogPosition(None);
+            };
+            match self
+                .0
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return ReservedLogPosition(Some(next)),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub(super) fn current(&self) -> u64 {

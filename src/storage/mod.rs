@@ -56891,7 +56891,7 @@ mod tests {
                 let claimed = &claimed;
                 scope.spawn(move || {
                     for _ in 0..ADVANCES_PER_WORKER {
-                        let value = sequence.next() as usize;
+                        let value = sequence.next().unwrap() as usize;
                         assert!(value <= ADVANCES);
                         assert!(!claimed[value].swap(true, std::sync::atomic::Ordering::Relaxed));
                     }
@@ -56912,7 +56912,7 @@ mod tests {
             }
         });
         assert_eq!(sequence.current(), 5_003);
-        assert_eq!(sequence.next(), 5_004);
+        assert_eq!(sequence.next().unwrap(), 5_004);
 
         let bounded = CatalogSequence::new(1);
         assert_eq!(bounded.next_bounded(2, "test").unwrap(), 2);

@@ -881,7 +881,7 @@ fn create_owned_sequence(
         Ok(())
     } else {
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txid,
             lsn,
             &WalOp::CreateSequence {
@@ -1065,7 +1065,7 @@ fn create_table_kind(
                 Ok(())
             } else {
                 let lsn = storage.bump_lsn();
-                wal.stage(txn.txid, lsn, &WalOp::CreateTable(&def))
+                wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&def))
             };
             if let Err(e) = wal_result {
                 // Nothing reached the journal; undo the in-memory apply.
@@ -5939,7 +5939,7 @@ fn drop_table_kind(
                         ));
                     }
                     let lsn = storage.bump_lsn();
-                    if let Err(error) = wal.stage(
+                    if let Err(error) = wal.stage_reserved(
                         txn.txid,
                         lsn,
                         &WalOp::DropTableFk {
@@ -5996,7 +5996,7 @@ fn drop_table_kind(
                             Ok(())
                         } else {
                             let lsn = storage.bump_lsn();
-                            wal.stage(
+                            wal.stage_reserved(
                                 txn.txid,
                                 lsn,
                                 &WalOp::DropSequence {
@@ -6043,7 +6043,7 @@ fn drop_table_kind(
                     }
                     if def.persistence != crate::storage::RelationPersistence::Temporary {
                         let lsn = storage.bump_lsn();
-                        if let Err(error) = wal.stage(
+                        if let Err(error) = wal.stage_reserved(
                             txn.txid,
                             lsn,
                             &WalOp::DropExtendedStatistics {
@@ -6083,7 +6083,7 @@ fn drop_table_kind(
                         Ok(())
                     } else {
                         let lsn = storage.bump_lsn();
-                        wal.stage(
+                        wal.stage_reserved(
                             txn.txid,
                             lsn,
                             &WalOp::DropTable {
@@ -6189,7 +6189,7 @@ pub fn create_schema(
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateSchema(name)) {
+            if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateSchema(name)) {
                 storage.rollback_schema_create(slot);
                 return sql_fail(e);
             }
@@ -6301,7 +6301,7 @@ pub fn alter_schema(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::RenameSchema {
@@ -7205,7 +7205,7 @@ pub fn create_role(
         Err(error) => return sql_fail(error),
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::UpsertRole {
@@ -7362,7 +7362,7 @@ fn stage_role_membership(
     let member_name = storage.role_name(member, txn.txid);
     let grantor_name = storage.role_name(grantor, txn.txid);
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::UpsertRoleMembership {
@@ -7453,7 +7453,7 @@ pub fn alter_role(
         Err(error) => return sql_fail(error),
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::UpsertRole {
@@ -7648,7 +7648,7 @@ fn stage_role_setting(
         }
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetRoleSetting {
@@ -7682,7 +7682,7 @@ fn stage_system_setting(
         return Ok(());
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetSystemSetting {
@@ -7818,7 +7818,7 @@ pub fn rename_role(
         Err(error) => return sql_fail(error),
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::RenameRole {
@@ -7934,7 +7934,7 @@ pub fn drop_role(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::DropRoleMembership {
@@ -7975,7 +7975,7 @@ pub fn drop_role(
             Err(error) => return sql_fail(error),
         };
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropRole {
@@ -8244,7 +8244,7 @@ pub fn grant_role(
                 grantor: grantor_name.as_str(),
                 options: membership_options,
             };
-            if let Err(error) = wal.stage(txn.txid, lsn, &operation) {
+            if let Err(error) = wal.stage_reserved(txn.txid, lsn, &operation) {
                 storage.rollback_role_membership_change(slot, prior);
                 return sql_fail(error);
             }
@@ -8431,7 +8431,7 @@ pub fn revoke_role(
                     member: member_name.as_str(),
                 }
             };
-            if let Err(error) = wal.stage(txn.txid, lsn, &operation) {
+            if let Err(error) = wal.stage_reserved(txn.txid, lsn, &operation) {
                 storage.rollback_role_membership_change(slot, prior);
                 return sql_fail(error);
             }
@@ -8505,7 +8505,7 @@ fn cascade_role_membership_grants(
             let role_name = storage.role_name(role, txn.txid);
             let member_name = storage.role_name(member, txn.txid);
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::DropRoleMembership {
@@ -9209,7 +9209,7 @@ pub fn reassign_owned(
             Err(error) => return sql_fail(error),
         };
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::SetCollation {
@@ -9241,7 +9241,7 @@ pub fn reassign_owned(
             Err(error) => return sql_fail(error),
         };
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::SetConversion {
@@ -10177,7 +10177,7 @@ pub(crate) fn drop_owned(
             Err(error) => return sql_fail(error),
         };
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropRoutine {
@@ -13068,7 +13068,7 @@ pub(crate) fn drop_schema(
                 let fk_name = def.fkeys[*fk_index].name;
                 let (schema, tname) = (def.schema, def.name);
                 let lsn = storage.bump_lsn();
-                if let Err(e) = wal.stage(
+                if let Err(e) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::DropTableFk {
@@ -13118,7 +13118,7 @@ pub(crate) fn drop_schema(
                 };
                 if !temporary {
                     let lsn = storage.bump_lsn();
-                    if let Err(e) = wal.stage(
+                    if let Err(e) = wal.stage_reserved(
                         txn.txid,
                         lsn,
                         &WalOp::DropView {
@@ -13242,7 +13242,7 @@ pub(crate) fn drop_schema(
             SchemaObject::Matview { table, catalog } => {
                 let def = *storage.table_def(*table, txn.txid);
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(
+                if let Err(error) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::DropTable {
@@ -13258,7 +13258,7 @@ pub(crate) fn drop_schema(
                 storage.drop_table_in(*table, txn.txid);
                 storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(
+                if let Err(error) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::DropMatview {
@@ -13285,7 +13285,7 @@ pub(crate) fn drop_schema(
                 let sequence = storage.sequence_for(*sequence, txn.txid);
                 let (schema, name) = (sequence.schema, sequence.name);
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(
+                if let Err(error) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::DropSequence {
@@ -13311,7 +13311,7 @@ pub(crate) fn drop_schema(
                 let domain = storage.domain(*domain);
                 let (schema, name) = (domain.schema, domain.name);
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(
+                if let Err(error) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::DropDomain {
@@ -13337,7 +13337,7 @@ pub(crate) fn drop_schema(
                 let enumeration = storage.enum_for(*enumeration, txn.txid);
                 let (schema, name) = (enumeration.schema, enumeration.name);
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(
+                if let Err(error) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::DropEnum {
@@ -13429,7 +13429,7 @@ pub(crate) fn drop_schema(
                     return sql_fail(error);
                 }
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(
+                if let Err(error) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::DropExtendedStatistics {
@@ -13478,7 +13478,7 @@ pub(crate) fn drop_schema(
                     }
                     let (schema, name) = (sequence.schema, sequence.name);
                     let lsn = storage.bump_lsn();
-                    if let Err(error) = wal.stage(
+                    if let Err(error) = wal.stage_reserved(
                         txn.txid,
                         lsn,
                         &WalOp::DropSequence {
@@ -13517,7 +13517,7 @@ pub(crate) fn drop_schema(
                     }
                 }
                 let lsn = storage.bump_lsn();
-                if let Err(e) = wal.stage(
+                if let Err(e) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::DropTable {
@@ -13545,7 +13545,7 @@ pub(crate) fn drop_schema(
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::DropSchema(name.as_str())) {
+        if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropSchema(name.as_str())) {
             storage.rollback_schema_drop(slot, txn.txid);
             return sql_fail(e);
         }
@@ -13578,7 +13578,7 @@ fn remove_schema_from_publications(
         definition.schemas[definition.schema_count] = u8::MAX;
         let (slot, prior) = storage.alter_publication(name.as_str(), definition, txn.txid)?;
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::AlterPublication {
@@ -13708,7 +13708,7 @@ pub fn create_publication(
         Ok(slot) => {
             let owner = storage.publication_owner(slot, txn.txid);
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreatePublication {
@@ -13818,7 +13818,9 @@ pub fn drop_publication(
         match storage.drop_publication(name, txn.txid) {
             Ok(Some(slot)) => {
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropPublication { name }) {
+                if let Err(error) =
+                    wal.stage_reserved(txn.txid, lsn, &WalOp::DropPublication { name })
+                {
                     storage.rollback_publication_drop(slot, txn.txid);
                     return sql_fail(error);
                 }
@@ -13981,7 +13983,7 @@ pub fn create_subscription(
         .ownership
         .owner_to(txn.txid);
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::CreateSubscription {
@@ -14063,7 +14065,7 @@ pub fn alter_subscription(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetSubscriptionEnabled { name, enabled },
@@ -14295,7 +14297,7 @@ pub fn alter_subscription(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetSubscriptionOwner {
@@ -14324,7 +14326,7 @@ pub fn alter_subscription(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::RenameSubscription {
@@ -14454,7 +14456,7 @@ fn stage_subscription_refresh(
         crate::storage::SubscriptionBootstrapChange::Changed { prior } => prior,
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetSubscriptionBootstrap { name, bootstrap },
@@ -14503,7 +14505,7 @@ fn alter_subscription_definition(
     let prior = change.prior;
     let definition = storage.subscription_definition_to(slot, txn.txid);
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::AlterSubscription {
@@ -14565,7 +14567,7 @@ pub fn drop_subscription(
             ));
         };
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropSubscription { name }) {
+        if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropSubscription { name }) {
             storage.rollback_subscription_drop(slot, txn.txid);
             return sql_fail(error);
         }
@@ -14613,7 +14615,7 @@ pub fn alter_publication(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::RenamePublication {
@@ -14679,7 +14681,7 @@ pub fn alter_publication(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetPublicationOwner {
@@ -14914,7 +14916,7 @@ pub fn alter_publication(
         Err(error) => return sql_fail(error),
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::AlterPublication {
@@ -27602,7 +27604,7 @@ pub fn create_trigger(
         Ok(())
     } else {
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::CreateTrigger {
@@ -27934,7 +27936,7 @@ pub fn create_policy(
             }
         };
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::SetPolicy {
@@ -28054,7 +28056,7 @@ pub fn alter_policy(
             }
         };
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::SetPolicy {
@@ -28158,7 +28160,7 @@ fn drop_policy_slot(
         != crate::storage::RelationPersistence::Temporary
     {
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropPolicy {
@@ -28234,7 +28236,7 @@ pub fn drop_trigger(
         Ok(())
     } else {
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropTrigger {
@@ -28393,7 +28395,7 @@ pub fn alter_trigger(
         Ok(())
     } else {
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::AlterTrigger {
@@ -29695,7 +29697,7 @@ fn stage_text_search_create(
     let stored = storage.text_search_object(slot);
     let definition = stored.definition_for(txn.txid);
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetTextSearch {
@@ -29724,7 +29726,7 @@ fn stage_text_search_alter(
     let prior = storage.alter_text_search_object(slot, definition, txn.txid)?;
     let object = storage.text_search_object(slot);
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetTextSearch {
@@ -29755,7 +29757,7 @@ fn stage_text_search_drop(
     let definition = storage.text_search_object(slot).definition_for(txn.txid);
     storage.drop_text_search_object(slot, txn.txid);
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropTextSearch {
@@ -30930,7 +30932,7 @@ pub(crate) fn drop_collation(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateComposite {
@@ -33197,7 +33199,7 @@ pub fn create_routine(
             let lsn = storage.bump_lsn();
             let wal_result = {
                 let dependencies = storage.routine_dependencies_for(slot, txn.txid);
-                wal.stage(
+                wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::CreateRoutine {
@@ -33253,7 +33255,7 @@ pub fn create_routine(
         let lsn = storage.bump_lsn();
         let wal_result = {
             let dependencies = storage.routine_dependencies_for(slot, txn.txid);
-            wal.stage(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateRoutine {
@@ -33996,7 +33998,7 @@ pub fn create_aggregate(
             let lsn = storage.bump_lsn();
             let wal_result = {
                 let dependencies = storage.routine_dependencies_for(slot, txn.txid);
-                wal.stage(
+                wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::CreateRoutine {
@@ -34053,7 +34055,7 @@ pub fn create_aggregate(
         let lsn = storage.bump_lsn();
         let wal_result = {
             let dependencies = storage.routine_dependencies_for(slot, txn.txid);
-            wal.stage(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateRoutine {
@@ -35201,7 +35203,7 @@ pub fn alter_routine(
         let lsn = storage.bump_lsn();
         let wal_result = {
             let dependencies = storage.routine_dependencies_for(slot, txn.txid);
-            wal.stage(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateRoutine {
@@ -35366,7 +35368,7 @@ pub fn alter_routine(
         Err(error) => return sql_fail(error),
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::AlterRoutineIdentity {
@@ -35779,7 +35781,7 @@ pub fn drop_routine(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::DropRoutine {
@@ -35823,7 +35825,7 @@ pub fn drop_routine(
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::DropEventTrigger {
@@ -35879,7 +35881,7 @@ pub fn drop_routine(
             Ok(signature) => signature,
             Err(error) => return sql_fail(error),
         };
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropRoutine {
@@ -36185,7 +36187,7 @@ pub fn create_view(
                 Ok(())
             } else {
                 let lsn = storage.bump_lsn();
-                wal.stage(
+                wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::CreateView {
@@ -36398,7 +36400,7 @@ pub fn alter_view(
         };
         let staged = {
             let lsn = storage.bump_lsn();
-            wal.stage(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetViewSchema {
@@ -36545,7 +36547,7 @@ pub fn alter_view(
                 Ok(())
             } else {
                 let lsn = storage.bump_lsn();
-                wal.stage(
+                wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::SetViewColumns {
@@ -36596,7 +36598,7 @@ pub fn alter_view(
                 Ok(())
             } else {
                 let lsn = storage.bump_lsn();
-                wal.stage(
+                wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::SetViewColumns {
@@ -36652,7 +36654,7 @@ pub fn alter_view(
                 Ok(())
             } else {
                 let lsn = storage.bump_lsn();
-                wal.stage(
+                wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::SetViewColumns {
@@ -36720,7 +36722,7 @@ pub fn alter_view(
                 Ok(())
             } else {
                 let lsn = storage.bump_lsn();
-                wal.stage(
+                wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::RenameView {
@@ -36763,7 +36765,7 @@ pub fn alter_view(
         Ok(())
     } else {
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::SetViewOptions {
@@ -36878,7 +36880,7 @@ fn rewrite_view_column_dependents(
             Ok(())
         } else {
             let lsn = storage.bump_lsn();
-            wal.stage(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateView {
@@ -38768,7 +38770,7 @@ fn stage_comment(
     };
     if !temporary {
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::Comment {
@@ -39002,7 +39004,7 @@ pub fn create_table_as(
                 Ok(())
             } else {
                 let lsn = storage.bump_lsn();
-                wal.stage(txn.txid, lsn, &WalOp::CreateTable(&def))
+                wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&def))
             };
             if let Err(e) = wal_result {
                 storage.rollback_create(slot);
@@ -39151,7 +39153,7 @@ pub fn create_table_as(
                 let lsn = storage.bump_lsn();
                 let wal_result = {
                     let dependencies = storage.matview_dependencies(slot);
-                    wal.stage(
+                    wal.stage_reserved(
                         txn.txid,
                         lsn,
                         &WalOp::CreateMatview {
@@ -39444,7 +39446,7 @@ pub fn refresh_materialized_view(
     // Mark it populated (durably).
     storage.set_matview_populated(slot, true);
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.stage(
+    if let Err(e) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetMatviewPopulated {
@@ -39594,7 +39596,7 @@ pub fn drop_materialized_view(
         }
         // Drop the backing table.
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage(
+        if let Err(e) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropTable {
@@ -39611,7 +39613,7 @@ pub fn drop_materialized_view(
         storage.drop_indexes_for(def.schema.as_str(), def.name.as_str(), txn.txid);
         // Drop the matview catalog entry.
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage(
+        if let Err(e) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropMatview {
@@ -39887,7 +39889,7 @@ pub fn create_sequence(
         Ok(())
     } else {
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::CreateSequence {
@@ -40095,7 +40097,7 @@ fn rewrite_sequence_default_references(
         }
         storage.write_table_def(table_slot, txn.txid, altered, &mapping, false)?;
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::BeginTableRewrite {
@@ -40106,7 +40108,7 @@ fn rewrite_sequence_default_references(
             },
         )?;
         let lsn = storage.bump_lsn();
-        wal.stage(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
+        wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
             storage.rollback_table_def(table_slot, txn.txid);
             return Err(error);
@@ -40331,13 +40333,13 @@ pub fn alter_sequence(
                 persistence: target_persistence,
             }
         };
-        if let Err(e) = wal.stage(txn.txid, lsn, &operation) {
+        if let Err(e) = wal.stage_reserved(txn.txid, lsn, &operation) {
             storage.rollback_sequence_alter(slot, prior_definition);
             return sql_fail(e);
         }
         let (last, is_called) = storage.sequence_value_for(slot, txn.txid);
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage(
+        if let Err(e) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::SequenceAdvance {
@@ -40535,7 +40537,7 @@ pub fn drop_sequence(
             Ok(())
         } else {
             let lsn = storage.bump_lsn();
-            wal.stage(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::DropSequence {
@@ -40820,7 +40822,7 @@ pub fn create_domain(
     };
     let lsn = storage.bump_lsn();
     let definition = storage.domain(slot);
-    if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateDomain(&definition)) {
+    if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateDomain(&definition)) {
         storage.rollback_domain_create(slot);
         return sql_fail(e);
     }
@@ -41182,7 +41184,7 @@ fn drop_type_dependent_routines(
         let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
         let signature = encode_routine_signature(routine.arguments(), &mut signature)?;
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropRoutine {
@@ -41446,7 +41448,7 @@ fn drop_domain_selection(
             (domain.schema, domain.name)
         };
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropDomain {
@@ -41619,7 +41621,7 @@ pub fn alter_domain(
             Err(error) => return sql_fail(error),
         };
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::AlterDomainIdentity {
@@ -41861,7 +41863,7 @@ pub fn alter_domain(
         return sql_fail(e);
     }
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.stage(
+    if let Err(e) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::CreateDomain(&storage.domain_for(slot, txn.txid)),
@@ -42133,7 +42135,7 @@ pub fn create_enum(
     };
     let lsn = storage.bump_lsn();
     let definition = storage.enum_for(slot, txn.txid);
-    if let Err(e) = wal.stage(
+    if let Err(e) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::CreateEnum {
@@ -42320,7 +42322,7 @@ pub fn create_composite(
         Err(error) => return sql_fail(error),
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::CreateComposite {
@@ -42543,7 +42545,7 @@ pub(crate) fn drop_type(
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage(
+        if let Err(e) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropEnum {
@@ -42832,7 +42834,7 @@ fn drop_composite_type(
     }
 
     let lsn = storage.bump_lsn();
-    wal.stage(
+    wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropComposite {
@@ -43091,7 +43093,7 @@ fn cascade_drop_composite_fields(
     }
     let prior = storage.stage_composite_alter(composite_slot, altered, txn.txid)?;
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::CreateComposite {
@@ -43746,7 +43748,7 @@ fn apply_column_drop_dependencies(
         let definition = storage.extended_statistics(slot).definition_for(txn.txid);
         storage.drop_extended_statistics(slot, txn.txid)?;
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropExtendedStatistics {
@@ -43900,7 +43902,7 @@ fn stage_publication_column_drop_dependencies(
         let (altered_slot, prior) =
             storage.alter_publication(name.as_str(), definition, txn.txid)?;
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::AlterPublication {
@@ -44632,7 +44634,7 @@ fn drop_selected_stored_queries(
         let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
         let signature = encode_routine_signature(routine.arguments(), &mut signature)?;
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropRoutine {
@@ -44665,7 +44667,7 @@ fn stage_rule_drop(
         crate::storage::RuleTarget::View(_) => crate::wal::TriggerTargetKind::View,
     };
     let lsn = storage.bump_lsn();
-    wal.stage(
+    wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropRule {
@@ -44701,7 +44703,7 @@ fn stage_trigger_drop(
         }
     };
     let lsn = storage.bump_lsn();
-    wal.stage(
+    wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropTrigger {
@@ -44736,7 +44738,7 @@ fn drop_view_slot(
     drop_view_trigger_dependencies(storage, wal, txn, slot)?;
     if !temporary {
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropView {
@@ -44768,7 +44770,7 @@ fn drop_view_trigger_dependencies(
         };
         if storage.view(view_slot).persistence != crate::storage::RelationPersistence::Temporary {
             let lsn = storage.bump_lsn();
-            wal.stage(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::DropTrigger {
@@ -44794,7 +44796,7 @@ fn drop_matview_slot(
     let definition = *storage.table_def(table, txn.txid);
     let (schema, name) = (definition.schema, definition.name);
     let lsn = storage.bump_lsn();
-    wal.stage(
+    wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropTable {
@@ -44806,7 +44808,7 @@ fn drop_matview_slot(
     storage.drop_table_in(table, txn.txid);
     storage.drop_indexes_for(schema.as_str(), name.as_str(), txn.txid);
     let lsn = storage.bump_lsn();
-    wal.stage(
+    wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropMatview {
@@ -44991,7 +44993,7 @@ pub fn alter_type(
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.stage(
+            if let Err(e) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateEnum {
@@ -45054,7 +45056,7 @@ pub fn alter_type(
                     Err(error) => return sql_fail(error),
                 };
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.stage(
+            if let Err(e) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::RenameEnum {
@@ -45130,7 +45132,7 @@ pub fn alter_type(
                     Err(error) => return sql_fail(error),
                 };
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::AlterEnumIdentity {
@@ -45208,7 +45210,7 @@ pub fn alter_type(
                 return sql_fail(e);
             }
             let lsn = storage.bump_lsn();
-            if let Err(e) = wal.stage(
+            if let Err(e) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateEnum {
@@ -45489,7 +45491,7 @@ fn alter_composite_type(
         Err(error) => return sql_fail(error),
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::CreateComposite {
@@ -45648,7 +45650,7 @@ fn rewrite_table_policy_column_references(
         drop(table_definition);
         let wal_roles = policy_wal_roles(storage, roles, txn.txid, arena)?;
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::SetPolicy {
@@ -45794,7 +45796,7 @@ fn remap_publication_column_projections(
         let (altered_slot, prior) =
             storage.alter_publication(name.as_str(), definition, txn.txid)?;
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::AlterPublication {
@@ -45886,7 +45888,7 @@ fn rewrite_table_publication_column_references(
         let (altered_slot, prior) =
             storage.alter_publication(name.as_str(), definition, txn.txid)?;
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::AlterPublication {
@@ -46129,7 +46131,7 @@ fn rewrite_composite_dependent_domains(
             return Err(error);
         }
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::CreateDomain(&storage.domain_for(domain_slot, txn.txid)),
@@ -46244,7 +46246,7 @@ fn rewrite_composite_dependent_tables(
                 *target = position as u16;
             }
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::BeginTableRewrite {
@@ -46258,7 +46260,7 @@ fn rewrite_composite_dependent_tables(
                 return Err(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&altered)) {
+            if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&altered)) {
                 storage.rollback_table_def(table_slot, txn.txid);
                 return Err(error);
             }
@@ -46343,7 +46345,7 @@ fn rewrite_composite_dependent_views(
             Ok(())
         } else {
             let lsn = storage.bump_lsn();
-            wal.stage(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateView {
@@ -46478,7 +46480,7 @@ fn rewrite_composite_dependent_indexes(
         preserve_object_acl(storage, txn, old_object, new_object)?;
 
         let drop_lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             drop_lsn,
             &WalOp::DropIndex {
@@ -46491,7 +46493,7 @@ fn rewrite_composite_dependent_indexes(
             return Err(error);
         }
         let create_lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             create_lsn,
             &WalOp::CreateIndex {
@@ -47134,7 +47136,7 @@ pub fn drop_view(
             }
             if !temporary {
                 let lsn = storage.bump_lsn();
-                if let Err(e) = wal.stage(
+                if let Err(e) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::DropView {
@@ -49019,7 +49021,7 @@ fn stage_index_definition(
         });
     if !temporary {
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::AlterIndexDefinition {
@@ -49065,7 +49067,7 @@ fn finish_index_creation(
             != crate::storage::RelationPersistence::Temporary
         {
             let lsn = storage.bump_lsn();
-            wal.stage(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateIndex {
@@ -49856,7 +49858,7 @@ fn stage_table_definition(
     }
     if previous.persistence != crate::storage::RelationPersistence::Temporary {
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::BeginTableRewrite {
@@ -49867,7 +49869,7 @@ fn stage_table_definition(
             },
         )?;
         let lsn = storage.bump_lsn();
-        wal.stage(txn.txid, lsn, &WalOp::CreateTable(&next))?;
+        wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&next))?;
     }
     storage.write_table_def(table, txn.txid, next, &mapping, false)?;
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table as u32)) {
@@ -50171,7 +50173,7 @@ pub fn create_database(
     };
     let oid = storage.database(slot).oid;
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::CreateDatabase {
@@ -50382,7 +50384,7 @@ pub fn alter_database(
     let prior_owner = storage.set_object_owner(object, owner, txn.txid);
     let oid = storage.database(slot).oid;
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::AlterDatabase {
@@ -50466,7 +50468,7 @@ pub fn drop_database(
     }
     storage.drop_database(slot, txn.txid);
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropDatabase { oid: oid.get() }) {
+    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropDatabase { oid: oid.get() }) {
         storage.rollback_database_drop(slot, txn.txid);
         return sql_fail(error);
     }
@@ -50538,7 +50540,7 @@ pub fn create_access_method(
         .map(|(_, method)| method.created_at)
         .expect("new access method is visible to its creator");
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::CreateAccessMethod {
@@ -50663,7 +50665,7 @@ pub fn drop_access_method(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::Comment {
@@ -50687,7 +50689,7 @@ pub fn drop_access_method(
         }
         storage.drop_access_method(slot, txn.txid);
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropAccessMethod { name }) {
+        if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropAccessMethod { name }) {
             storage.rollback_access_method_drop(slot, txn.txid);
             return sql_fail(error);
         }
@@ -50768,7 +50770,7 @@ pub fn create_tablespace(
         .map(|(_, tablespace)| tablespace.created_at)
         .expect("new tablespace is visible to its creator");
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::CreateTablespace {
@@ -50895,7 +50897,7 @@ pub fn alter_tablespace(
         }
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::AlterTablespace {
@@ -50955,7 +50957,7 @@ pub fn drop_tablespace(
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropTablespace { name }) {
+    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropTablespace { name }) {
         storage.rollback_tablespace_drop(slot, txn.txid);
         return sql_fail(error);
     }
@@ -51002,7 +51004,7 @@ fn stage_index_drop(
         });
     if !temporary {
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropIndex {
@@ -51045,7 +51047,7 @@ fn stage_index_rename(
         });
     if !temporary {
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::RenameIndex {
@@ -63197,7 +63199,7 @@ fn rename_attached_index_constraint(
         wal_mapping[column] = column as u16;
     }
     let lsn = storage.bump_lsn();
-    wal.stage(
+    wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::BeginTableRewrite {
@@ -63208,7 +63210,7 @@ fn rename_attached_index_constraint(
         },
     )?;
     let lsn = storage.bump_lsn();
-    wal.stage(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
+    wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
     storage.write_table_def(table_index, txn.txid, altered, &mapping, false)?;
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
         storage.rollback_table_def(table_index, txn.txid);
@@ -63274,7 +63276,7 @@ fn drop_dependent_foreign_keys(
             wal_mapping[column] = column as u16;
         }
         let lsn = storage.bump_lsn();
-        wal.stage(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::BeginTableRewrite {
@@ -63285,7 +63287,7 @@ fn drop_dependent_foreign_keys(
             },
         )?;
         let lsn = storage.bump_lsn();
-        wal.stage(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
+        wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
         storage.write_table_def(table_slot, txn.txid, altered, &mapping, false)?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
             storage.rollback_table_def(table_slot, txn.txid);
@@ -63774,7 +63776,7 @@ fn stage_partition_trigger_mode(
     let table_def = *storage.table_def(table, txn.txid);
     if table_def.persistence != crate::storage::RelationPersistence::Temporary {
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::AlterTrigger {
@@ -63918,7 +63920,7 @@ fn alter_trigger_enabled(
             Ok(())
         } else {
             let lsn = storage.bump_lsn();
-            wal.stage(
+            wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::AlterTrigger {
@@ -64456,7 +64458,7 @@ fn alter_table_inheritance(
         wal_mapping[column] = column as u16;
     }
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::BeginTableRewrite {
@@ -64469,7 +64471,7 @@ fn alter_table_inheritance(
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&updated)) {
+    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&updated)) {
         return sql_fail(error);
     }
     if let Err(error) = storage.write_table_def(child, txn.txid, updated, &mapping, false) {
@@ -64881,7 +64883,7 @@ fn alter_partition_attachment(
         wal_mapping[index] = index as u16;
     }
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::BeginTableRewrite {
@@ -64894,7 +64896,7 @@ fn alter_partition_attachment(
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
+    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
         return sql_fail(error);
     }
     if let Err(error) = storage.write_table_def(child, txn.txid, new_def, &mapping, false) {
@@ -64933,7 +64935,7 @@ fn alter_partition_attachment(
                     wal_mapping[column] = column as u16;
                 }
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(
+                if let Err(error) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::BeginTableRewrite {
@@ -64946,7 +64948,9 @@ fn alter_partition_attachment(
                     return sql_fail(error);
                 }
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&dependent)) {
+                if let Err(error) =
+                    wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&dependent))
+                {
                     return sql_fail(error);
                 }
                 if let Err(error) =
@@ -65486,7 +65490,7 @@ fn alter_table_relation(
             Err(e) => return sql_fail(e),
         };
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage(
+        if let Err(e) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::SetTableSchema {
@@ -65996,7 +66000,7 @@ fn alter_table_relation(
         }
         if def.persistence != crate::storage::RelationPersistence::Temporary {
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::BeginTableRewrite {
@@ -66009,7 +66013,7 @@ fn alter_table_relation(
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
+            if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
                 return sql_fail(error);
             }
         }
@@ -66037,7 +66041,7 @@ fn alter_table_relation(
             let sequence = storage.sequence_for(alteration.slot, txn.txid);
             if sequence.persistence != crate::storage::RelationPersistence::Temporary {
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(
+                if let Err(error) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::CreateSequence {
@@ -66060,7 +66064,7 @@ fn alter_table_relation(
                 }
                 let (last, is_called) = storage.sequence_value_for(alteration.slot, txn.txid);
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(
+                if let Err(error) = wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::SequenceAdvance {
@@ -67601,7 +67605,7 @@ fn alter_table_relation(
     // so before any in-memory swap.
     if new_def.persistence != crate::storage::RelationPersistence::Temporary {
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage(
+        if let Err(e) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::BeginTableRewrite {
@@ -67614,7 +67618,7 @@ fn alter_table_relation(
             return sql_fail(e);
         }
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
+        if let Err(e) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
             return sql_fail(e);
         }
         for i in 0..rewritten_rows {
@@ -67627,7 +67631,7 @@ fn alter_table_relation(
                 Ok(row) => row,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(e) = wal.stage(
+            if let Err(e) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::Upsert {
@@ -67673,7 +67677,7 @@ fn alter_table_relation(
         let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
         if sequence.persistence != crate::storage::RelationPersistence::Temporary {
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::DropSequence {
@@ -67721,7 +67725,7 @@ fn alter_table_relation(
         let sequence = storage.sequence_for(alteration.slot, txn.txid);
         if sequence.persistence != crate::storage::RelationPersistence::Temporary {
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateSequence {
@@ -67744,7 +67748,7 @@ fn alter_table_relation(
             }
             let (last, is_called) = storage.sequence_value_for(alteration.slot, txn.txid);
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SequenceAdvance {
@@ -67812,7 +67816,7 @@ fn alter_table_relation(
         let (sequence_schema, sequence_name) = (sequence.schema, sequence.name);
         if sequence.persistence != crate::storage::RelationPersistence::Temporary {
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::CreateSequence {
@@ -67891,7 +67895,7 @@ fn alter_table_relation(
             != crate::storage::RelationPersistence::Temporary
         {
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::Comment {
@@ -67937,7 +67941,7 @@ fn alter_table_relation(
         };
         if def.persistence != crate::storage::RelationPersistence::Temporary {
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::Comment {
@@ -67951,7 +67955,7 @@ fn alter_table_relation(
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::Comment {
@@ -68148,7 +68152,7 @@ fn alter_table_relation(
                 }
                 if current.persistence != crate::storage::RelationPersistence::Temporary {
                     let lsn = storage.bump_lsn();
-                    if let Err(error) = wal.stage(
+                    if let Err(error) = wal.stage_reserved(
                         txn.txid,
                         lsn,
                         &WalOp::BeginTableRewrite {
@@ -68161,7 +68165,9 @@ fn alter_table_relation(
                         return sql_fail(error);
                     }
                     let lsn = storage.bump_lsn();
-                    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&dependent)) {
+                    if let Err(error) =
+                        wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&dependent))
+                    {
                         return sql_fail(error);
                     }
                 }
@@ -68447,7 +68453,7 @@ fn alter_table_replica_identity(
     }
     if definition.persistence != crate::storage::RelationPersistence::Temporary {
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::BeginTableRewrite {
@@ -68460,7 +68466,7 @@ fn alter_table_replica_identity(
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&next)) {
+        if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::CreateTable(&next)) {
             return sql_fail(error);
         }
     }

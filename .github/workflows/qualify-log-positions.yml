@@ -1,0 +1,32 @@
+name: Qualify checked shared log positions
+
+on:
+  push:
+    branches: [share-log-positions]
+
+jobs:
+  positions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Compile and lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Checked reservations, statement cleanup, catalog atomicity and terminal cold recovery
+        run: |
+          set -eu
+          for selection in shared_log_positions shared_table_creation table_retirement catalog_object_pools_follow_their_independent_startup_capacities prepared_transactions_survive_checkpoint_and_object_cold_recovery; do
+            cargo test --lib --locked "$selection" -- --test-threads=1 --nocapture | tee "$RUNNER_TEMP/positions-$selection.log"
+            if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/positions-$selection.log"; then
+              exit 1
+            fi
+          done

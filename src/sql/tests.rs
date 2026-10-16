@@ -347,6 +347,186 @@ fn visible_row_heap_ownership_command_exhaustion_allows_rollback() {
 }
 
 #[test]
+fn shared_log_positions_exhaustion_uses_statement_rollback_and_keeps_catalogs_valid() {
+    let config = test_config("log-position-failure-cleanup");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE position_base(id integer); INSERT INTO position_base VALUES (1); CREATE VIEW position_view AS SELECT id FROM position_base", true);
+    let original = engine.storage.lsn();
+    engine.storage.set_lsn(u64::MAX);
+    for sql in [
+        "CREATE TABLE position_rejected(id integer)",
+        "CREATE TABLE position_rejected_identity(id integer GENERATED ALWAYS AS IDENTITY)",
+        "CREATE SEQUENCE position_rejected_sequence",
+        "ALTER TABLE position_base ADD COLUMN rejected integer",
+        "INSERT INTO position_base VALUES (2)",
+        "UPDATE position_base SET id = 2",
+        "DELETE FROM position_base",
+        "CREATE OR REPLACE VIEW position_view AS SELECT 99 AS id",
+    ] {
+        let output = session.execute(&mut engine, sql, true);
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("54000") && text.contains("WAL LSN space exhausted"),
+            "{sql}: {text}"
+        );
+        assert!(!session.transaction.is_active());
+        assert_eq!(engine.storage.lsn(), u64::MAX);
+        assert_eq!(engine.wal.stage_stats(session.transaction.txid), (0, 0));
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT id FROM position_base", true)),
+            ["1"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT id FROM position_view", true)),
+            ["1"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_class WHERE relname LIKE 'position_rejected%'",
+                true
+            )),
+            ["0"]
+        );
+    }
+    // Remove only the artificial test injection; failed operations published no log.
+    engine.storage.set_lsn(original);
+    session.success(
+        &mut engine,
+        "CREATE TABLE position_rejected(id integer); INSERT INTO position_rejected VALUES (3)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id FROM position_rejected", true)),
+        ["3"]
+    );
+}
+
+#[test]
+fn shared_log_positions_catalog_exhaustion_preserves_compound_view_creation_and_retry() {
+    let config = test_config("catalog-position-failure-cleanup");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE catalog_position_base(id integer); INSERT INTO catalog_position_base VALUES (1); CREATE VIEW catalog_position_view AS SELECT id FROM catalog_position_base", true);
+    let rules = data_rows(&session.success(&mut engine, "SELECT count(*) FROM pg_rewrite", true));
+    for (remaining, sql) in [
+        (0, "CREATE TABLE catalog_position_rejected(id integer)"),
+        (0, "CREATE SEQUENCE catalog_position_rejected_sequence"),
+        (
+            0,
+            "CREATE POLICY catalog_position_policy ON catalog_position_base USING (true)",
+        ),
+        (
+            0,
+            "CREATE FUNCTION catalog_position_function() RETURNS integer LANGUAGE sql AS $$SELECT 1$$",
+        ),
+        (
+            1,
+            "CREATE VIEW catalog_position_rejected_view AS SELECT 2 AS id",
+        ),
+        (
+            1,
+            "CREATE OR REPLACE VIEW catalog_position_view AS SELECT 2 AS id",
+        ),
+        (
+            1,
+            "CREATE MATERIALIZED VIEW catalog_position_rejected_mat AS SELECT 2 AS id",
+        ),
+    ] {
+        let original = engine
+            .storage
+            .replace_catalog_sequence_for_test(u64::MAX - remaining);
+        let output = session.execute(&mut engine, sql, true);
+        engine.storage.replace_catalog_sequence_for_test(original);
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("54000") && text.contains("exhausted"),
+            "{sql}: {text}"
+        );
+        assert!(!session.transaction.is_active());
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT id FROM catalog_position_view", true)),
+            ["1"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT count(*) FROM pg_rewrite", true)),
+            rules
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_class WHERE relname LIKE 'catalog_position_rejected%'",
+                true
+            )),
+            ["0"]
+        );
+    }
+    session.success(&mut engine, "CREATE VIEW catalog_position_rejected_view AS SELECT 2 AS id; CREATE OR REPLACE VIEW catalog_position_view AS SELECT 3 AS id", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id FROM catalog_position_view", true)),
+        ["3"]
+    );
+}
+
+#[test]
+fn shared_log_positions_last_commit_survives_journal_and_checkpoint_cold_recovery() {
+    let mut config = test_config("log-position-terminal-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("log-position-terminal-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE terminal_position(id integer)",
+        false,
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; INSERT INTO terminal_position VALUES (7)",
+        false,
+    );
+    let records = engine.wal.stage_stats(session.transaction.txid).0;
+    assert!(records > 0);
+    engine.storage.set_lsn(u64::MAX - records - 1);
+    session.success(&mut engine, "COMMIT", false);
+    assert_eq!(engine.storage.lsn(), u64::MAX);
+    drop(session);
+    drop(engine);
+    for pass in 0..2 {
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        assert_eq!(engine.storage.lsn(), u64::MAX);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT id FROM terminal_position", false)),
+            ["7"]
+        );
+        let output = session.execute(
+            &mut engine,
+            "INSERT INTO terminal_position VALUES (8)",
+            false,
+        );
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("54000") && text.contains("WAL LSN space exhausted"),
+            "{text}"
+        );
+        assert_eq!(engine.storage.lsn(), u64::MAX);
+        assert_eq!(engine.checkpoint().unwrap(), pass == 0);
+    }
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn shared_transaction_identity_registry_exhaustion_preserves_sessions() {
     let mut config = test_config("shared-transaction-identity-capacity");
     config.max_connections = 1;

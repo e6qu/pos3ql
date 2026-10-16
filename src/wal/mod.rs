@@ -1998,6 +1998,17 @@ impl Wal {
         }
     }
 
+    /// Resolve a shared reservation before claiming a transaction stage. Failure
+    /// must reach the caller's existing staging-error rollback path.
+    pub(crate) fn stage_reserved(
+        &mut self,
+        transaction_id: u32,
+        position: crate::storage::ReservedLogPosition,
+        operation: &WalOp,
+    ) -> Result<(), SqlError> {
+        self.stage(transaction_id, position.resolve()?, operation)
+    }
+
     /// Encodes one record into a transaction-private buffer. The LSN is
     /// provisional: commit rewrites staged records into commit order before
     /// their CRCs are finalized in the durable batch.

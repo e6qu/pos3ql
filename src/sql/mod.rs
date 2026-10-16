@@ -2427,7 +2427,7 @@ impl Engine {
         self.wal.commit();
         self.storage
             .complete_subscription_cleanup(slot, created_at)?;
-        self.storage.set_lsn(commit_lsn);
+        self.storage.observe_lsn(commit_lsn);
         Ok(())
     }
 
@@ -2464,7 +2464,7 @@ impl Engine {
         };
         self.wal.commit();
         self.storage.fail_subscription(stream, failure)?;
-        self.storage.set_lsn(commit_lsn);
+        self.storage.observe_lsn(commit_lsn);
         Ok(())
     }
 
@@ -2739,7 +2739,7 @@ impl Engine {
         self.storage
             .begin_subscription_relation_refresh(stream, txn.txid)?;
         let lsn = self.storage.bump_lsn();
-        if let Err(error) = self.wal.stage(
+        if let Err(error) = self.wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::ResetSubscriptionRelations {
@@ -2776,7 +2776,7 @@ impl Engine {
         self.storage
             .stage_subscription_relation(stream, schema, table, txn.txid)?;
         let lsn = self.storage.bump_lsn();
-        self.wal.stage(
+        self.wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::AddSubscriptionRelation {
@@ -2848,7 +2848,7 @@ impl Engine {
             self.storage
                 .set_subscription_definition(current.slot(), definition, txn.txid)?;
         let lsn = self.storage.bump_lsn();
-        if let Err(error) = self.wal.stage(
+        if let Err(error) = self.wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::AlterSubscription {
@@ -3571,7 +3571,7 @@ impl Engine {
             )?;
             let commit_lsn = wal.commit_stage(transaction_id, storage.lsn())?;
             wal.commit();
-            storage.set_lsn(commit_lsn);
+            storage.observe_lsn(commit_lsn);
         }
         storage.reconcile_serials();
         // Replay's row installs bypass the per-row value-index maintenance, so
@@ -3784,7 +3784,7 @@ impl Engine {
         self.wal.commit();
         self.storage
             .create_replication_slot(name, restart_lsn, behavior)?;
-        self.storage.set_lsn(commit_lsn);
+        self.storage.observe_lsn(commit_lsn);
         Ok(restart_lsn)
     }
 
@@ -3834,7 +3834,7 @@ impl Engine {
                     content,
                 },
             )?;
-            self.storage.set_lsn(message_lsn);
+            self.storage.observe_lsn(message_lsn);
             return Ok(message_lsn);
         }
 
@@ -3861,7 +3861,7 @@ impl Engine {
             }
         };
         self.wal.commit();
-        self.storage.set_lsn(commit_lsn);
+        self.storage.observe_lsn(commit_lsn);
         Ok(message_lsn)
     }
 
@@ -3954,7 +3954,7 @@ impl Engine {
             source.confirmed_flush_lsn,
             source.behavior,
         )?;
-        self.storage.set_lsn(commit_lsn);
+        self.storage.observe_lsn(commit_lsn);
         Ok(source.confirmed_flush_lsn)
     }
 
@@ -4003,7 +4003,7 @@ impl Engine {
         };
         self.wal.commit();
         self.storage.drop_replication_slot(name.as_str())?;
-        self.storage.set_lsn(commit_lsn);
+        self.storage.observe_lsn(commit_lsn);
         Ok(())
     }
 
@@ -4054,7 +4054,7 @@ impl Engine {
         };
         self.wal.commit();
         self.storage.alter_replication_slot(name, behavior)?;
-        self.storage.set_lsn(commit_lsn);
+        self.storage.observe_lsn(commit_lsn);
         Ok(())
     }
 
@@ -4210,7 +4210,7 @@ impl Engine {
         };
         self.wal.commit();
         self.storage.apply_replication_slot_advance(advance);
-        self.storage.set_lsn(commit_lsn);
+        self.storage.observe_lsn(commit_lsn);
         Ok(confirmed_flush_lsn)
     }
 
@@ -5130,7 +5130,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         for i in 0..txn.touched().len() {
             let (table, rowid, _) = txn.touched()[i];
@@ -5220,7 +5220,7 @@ impl Engine {
                 }
                 return Err(e);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         // Journal any sequence advances (this transaction's or ones a
         // rolled-back transaction left dirty): absolute positions, so replay
@@ -5258,7 +5258,7 @@ impl Engine {
                     self.rollback_txn(txn, guc);
                     return Err(e);
                 }
-                self.storage.set_lsn(lsn);
+                self.storage.observe_lsn(lsn);
             }
         }
         // Journal sequence advances (this transaction's or ones a rolled-back
@@ -5291,7 +5291,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(e);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
             self.storage
                 .mark_sequence_value_staged(i, txn.txid, generation);
         }
@@ -5329,7 +5329,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         // pg_statistic column rows are transactional, but PostgreSQL updates
         // pg_class reltuples/relpages in place. A later commit therefore also
@@ -5367,7 +5367,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         for slot in 0..self.storage.extended_statistics_count() {
             let Some(statistics) = self
@@ -5399,7 +5399,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         self.stage_foreign_catalog_wal(txn, guc)?;
         for (position, undo) in txn.ddl().iter().enumerate() {
@@ -5457,7 +5457,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::ExtensionDependencyChanged { slot, .. } = *undo else {
@@ -5516,7 +5516,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::ExtensionConfigChanged { slot, .. } = *undo else {
@@ -5553,7 +5553,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         for undo in txn.ddl() {
             let operation = match *undo {
@@ -5575,7 +5575,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         // Ownership and ACLs are absolute catalog images. They are staged at
         // commit from the transaction-visible overlays, so repeated GRANT,
@@ -5680,7 +5680,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::ObjectAclChanged { slot, .. } = *undo else {
@@ -5749,7 +5749,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::ColumnAclChanged { slot, .. } = *undo else {
@@ -5814,7 +5814,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::ParameterAclChanged { slot, .. } = *undo else {
@@ -5866,7 +5866,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::DefaultAclChanged { slot, .. } = *undo else {
@@ -5910,7 +5910,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         let subscription_advance_count = txn.subscription_advances().len() as u64;
         let (staged_record_count, _) = self.wal.stage_stats(txn.txid);
@@ -5940,7 +5940,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         // Keep the publication object inside its startup-reserved buffer.
         // A full preceding batch is published before adding this transaction;
@@ -6008,7 +6008,7 @@ impl Engine {
                 "subscription origin WAL must name its transaction commit LSN"
             );
         }
-        self.storage.set_lsn(commit_lsn);
+        self.storage.observe_lsn(commit_lsn);
         // Publication accepted every staged absolute sequence position.
         // Clear retry markers only now: a staging or journal-capacity error
         // rolls the transaction back but PostgreSQL sequence advances remain
@@ -6697,7 +6697,7 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.set_lsn(lsn);
+            self.storage.observe_lsn(lsn);
         }
         Ok(())
     }
@@ -6886,7 +6886,7 @@ impl Engine {
             self.prepared_transactions.release(slot);
             return Err(fail(self, txn, cursors, error));
         }
-        self.storage.set_lsn(lock_lsn);
+        self.storage.observe_lsn(lock_lsn);
         if let Err(error) = self.finish_txn(txn, guc, Some(slot)) {
             self.prepared_transactions.release(slot);
             return Err(error);
@@ -6956,7 +6956,7 @@ impl Engine {
             WalOp::RollbackPrepared { gid: gid.as_str() }
         };
         self.wal.stage(txn.txid, lsn, &operation)?;
-        self.storage.set_lsn(lsn);
+        self.storage.observe_lsn(lsn);
         self.commit_txn(txn, guc)?;
         let resolution_lsn = self.storage.lsn();
 
@@ -16976,7 +16976,7 @@ impl Engine {
                         Err(error) => return Ok(Err(error)),
                     };
                 let lsn = self.storage.bump_lsn();
-                if let Err(error) = self.wal.stage(
+                if let Err(error) = self.wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::SetViewSchema {

@@ -63,7 +63,7 @@ impl<'storage> TableCreation<'storage> {
             slot: slot as u16,
         });
         let ownership = storage.initial_ownership(transaction.unwrap_or(0));
-        let created_at = storage.catalog_sequence.next();
+        let created_at = storage.catalog_sequence.next()?;
         let stamp = created_at;
         storage.cumulative_statistics().relations[slot] = RelationCumulativeStatistics::EMPTY;
         storage.reset_implicit_index_statistics(slot);

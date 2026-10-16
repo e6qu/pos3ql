@@ -121,8 +121,11 @@ only after its change is recoverable from object storage. If the connection
 breaks during publication, the error must not falsely promise that the change
 was either saved or discarded.
 
-SQL, maintenance, and recovery share checked row and transaction identity
-counters. Creating a transaction reserves its identity and active-registry entry
+SQL, maintenance, and recovery share checked row, transaction, catalog, and log
+position counters. Log reservations reach the common journal-staging error path,
+so exhaustion preserves existing failure cleanup; later observations cannot move
+the global position backward. Catalog identities are reserved before publishing
+compound definitions. Creating a transaction reserves its identity and active-registry entry
 together; full capacities fail explicitly and leave existing owners intact.
 
 - Protect journal staging, prepared transactions, commit order, and the

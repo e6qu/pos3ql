@@ -13755,9 +13755,8 @@ pub struct Storage {
     /// checkpointer, plus owned reader scratch. `None` without object storage
     /// — then rows never spill and the heap-full error stands.
     spill: Option<std::sync::Arc<SpillReader>>,
-    /// Startup-allocated value indexes shared by every table's enforcers. Held
-    /// in an `Option` so a rebuild can take it out for the duration of a row
-    /// walk (which borrows the rest of `self`) and put it back.
+    /// Startup-allocated value indexes shared by every table's enforcers.
+    /// Retained leases keep a cache valid through replacement and row walks.
     value_indexes: ValueIndexPool,
     /// Parser/evaluator scratch for durable expression and partial-index keys.
     /// The lock retains one allocation frontier through nested evaluation;

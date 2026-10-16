@@ -161,7 +161,8 @@ ALTER DOMAIN dom_not_valid ADD CONSTRAINT dom_not_valid_lt10 CHECK (VALUE < 10);
 ALTER DOMAIN dom_not_valid ADD CONSTRAINT dom_not_valid_positive CHECK (VALUE > 0) NOT VALID;
 ALTER DOMAIN dom_not_valid ADD CONSTRAINT dom_not_valid_positive CHECK (VALUE <> 0) NOT VALID;
 SELECT conname, conenforced, convalidated
-  FROM pg_constraint WHERE contypid = 'dom_not_valid'::regtype;
+  FROM pg_constraint WHERE contypid = 'dom_not_valid'::regtype
+ ORDER BY conname;
 INSERT INTO dom_not_valid_t VALUES (9);
 ALTER DOMAIN dom_not_valid VALIDATE CONSTRAINT dom_not_valid_positive;
 ALTER DOMAIN dom_not_valid SET NOT NULL;

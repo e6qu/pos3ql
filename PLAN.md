@@ -71,6 +71,8 @@ through changes and replacement. Reservations and history limits are fixed at
 startup. Creation, cleanup and pending table edits use selected-table ownership;
 waiting for one table does not reserve shared version or comment resources.
 Row publication rechecks the database, table identity and visible existence.
+Table-name selection uses small per-table views; it waits only for the selected
+definition and rechecks its identity before returning a match.
 The [implementation guide](docs/implemented-baseline.md) owns completed contracts,
 user examples and exact capacity errors.
 

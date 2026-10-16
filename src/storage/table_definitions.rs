@@ -2,7 +2,12 @@
 
 use core::mem::size_of;
 use core::ops::Deref;
-use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, RwLock, RwLockReadGuard};
+
+use super::table_names::{
+    CommittedDefinitionWrite, DefinitionWrite, IdentityWrite, NameIdentity, TableNameScope,
+    TableNames,
+};
 
 use super::{
     CatalogDdlState, DatabaseOid, Ownership, PendingTableDef, PendingTableDefSlot, TableDef,
@@ -51,10 +56,7 @@ impl TableIdentity {
     };
 
     pub(crate) fn live(self) -> bool {
-        matches!(
-            self.existence,
-            CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. }
-        )
+        TableNameScope::Committed.visible(self.existence)
     }
 }
 
@@ -62,22 +64,41 @@ impl TableIdentity {
 pub(super) struct PendingDefinitionHead {
     pub(super) tail: u32,
     pub(super) transaction: u32,
+    pub(super) schema: super::SqlName,
+    pub(super) name: super::SqlName,
 }
 
 pub(super) struct TableDefinition {
     state: RwLock<DefinitionState>,
+    names: RwLock<TableNames>,
 }
 
 impl TableDefinition {
     pub(super) fn new(committed: TableDef) -> Self {
+        let state = DefinitionState {
+            identity: TableIdentity::EMPTY,
+            committed,
+            pending: None,
+            pending_has_rules_txid: None,
+        };
+        let names = TableNames::from_state(&state);
         Self {
-            state: RwLock::new(DefinitionState {
-                identity: TableIdentity::EMPTY,
-                committed,
-                pending: None,
-                pending_has_rules_txid: None,
-            }),
+            state: RwLock::new(state),
+            names: RwLock::new(names),
         }
+    }
+
+    pub(super) fn name_candidate(
+        &self,
+        scope: TableNameScope,
+        database: DatabaseOid,
+        schema: &str,
+        name: &str,
+    ) -> Option<NameIdentity> {
+        self.names
+            .read()
+            .expect("table name lock poisoned")
+            .candidate(scope, database, schema, name)
     }
 
     pub(super) fn read(&self) -> RwLockReadGuard<'_, DefinitionState> {
@@ -91,20 +112,50 @@ impl TableDefinition {
     }
 
     #[cfg(test)]
-    pub(super) fn test_write(
-        &self,
-    ) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, DefinitionState>> {
-        self.state.try_write()
+    pub(super) fn test_write(&self) -> std::sync::TryLockResult<DefinitionWrite<'_>> {
+        match self.state.try_write() {
+            Ok(state) => Ok(DefinitionWrite::shared(state, &self.names)),
+            Err(std::sync::TryLockError::WouldBlock) => Err(std::sync::TryLockError::WouldBlock),
+            Err(std::sync::TryLockError::Poisoned(error)) => Err(
+                std::sync::TryLockError::Poisoned(std::sync::PoisonError::new(
+                    DefinitionWrite::shared(error.into_inner(), &self.names),
+                )),
+            ),
+        }
     }
 
-    pub(super) fn write(&self) -> RwLockWriteGuard<'_, DefinitionState> {
-        self.state.write().expect("table definition lock poisoned")
+    pub(super) fn write(&self) -> DefinitionWrite<'_> {
+        DefinitionWrite::shared(
+            self.state.write().expect("table definition lock poisoned"),
+            &self.names,
+        )
     }
 
-    pub(super) fn exclusive(&mut self) -> &mut DefinitionState {
-        self.state
+    fn exclusive(&mut self) -> DefinitionWrite<'_> {
+        DefinitionWrite::exclusive(
+            self.state
+                .get_mut()
+                .expect("table definition lock poisoned"),
+            &self.names,
+        )
+    }
+
+    pub(super) fn committed_mut(&mut self) -> CommittedDefinitionWrite<'_> {
+        self.exclusive().into_committed()
+    }
+
+    pub(super) fn identity_mut(&mut self) -> IdentityWrite<'_> {
+        self.exclusive().into_identity()
+    }
+
+    // Role ownership cannot change the names, database, stamp or existence.
+    pub(super) fn ownership_mut(&mut self) -> &mut Ownership {
+        &mut self
+            .state
             .get_mut()
             .expect("table definition lock poisoned")
+            .identity
+            .ownership
     }
 }
 
@@ -146,13 +197,58 @@ impl DefinitionVersions {
         }
     }
 
-    /// Serial replay/schema rewriting already owns all storage exclusively.
-    pub(super) fn exclusive(&mut self, slot: usize) -> &mut PendingTableDefSlot {
-        self.slots[slot]
-            .get_mut()
-            .expect("definition slot lock poisoned")
-            .as_mut()
-            .expect("published definition slot exists")
+    pub(super) fn validate_schema_rename(
+        &self,
+        definition: &TableDefinition,
+        prior: super::SqlName,
+        name: super::SqlName,
+    ) -> Result<(), SqlError> {
+        let state = definition.read();
+        let mut tail = state.pending.map(|head| head.tail);
+        while let Some(slot) = tail {
+            let entry = self.read(slot as usize);
+            let mut copied = entry.version.def;
+            super::rename_table_sql_identity(&mut copied, prior, name)?;
+            tail = entry.previous;
+        }
+        Ok(())
+    }
+
+    /// Exclusive rewriting keeps the cached latest name aligned with its slot.
+    pub(super) fn rename_schema(
+        &mut self,
+        definition: &mut TableDefinition,
+        prior: super::SqlName,
+        name: super::SqlName,
+    ) -> Result<(), SqlError> {
+        let mut state = definition.exclusive();
+        let result: Result<(), SqlError> = (|| {
+            let mut tail = state.pending.map(|head| head.tail);
+            while let Some(slot) = tail {
+                let entry = self.slots[slot as usize]
+                    .get_mut()
+                    .expect("definition slot lock poisoned")
+                    .as_mut()
+                    .expect("published definition slot exists");
+                let pending = &mut entry.version;
+                super::rename_schema_name(&mut pending.def.schema, prior, name);
+                for column in pending.def.columns.iter_mut().take(pending.def.n_columns) {
+                    super::rename_user_type_schema(&mut column.user_type, prior, name);
+                }
+                for key in pending.def.fkeys.iter_mut().take(pending.def.n_fkeys) {
+                    super::rename_schema_name(&mut key.parent_schema, prior, name);
+                }
+                super::rename_table_sql_identity(&mut pending.def, prior, name)?;
+                tail = entry.previous;
+            }
+            Ok(())
+        })();
+        if let Some(head) = &mut state.pending {
+            let latest = self.read(head.tail as usize);
+            head.schema = latest.version.def.schema;
+            head.name = latest.version.def.name;
+        }
+        result
     }
 
     #[cfg(test)]
@@ -218,7 +314,12 @@ impl DefinitionVersions {
                 depth,
                 version,
             });
-            state.pending = Some(PendingDefinitionHead { tail, transaction });
+            state.pending = Some(PendingDefinitionHead {
+                tail,
+                transaction,
+                schema: version.def.schema,
+                name: version.def.name,
+            });
             *cursor = (slot + 1) % self.slots.len();
             return Ok(());
         }
@@ -253,7 +354,15 @@ impl DefinitionVersions {
             .take()
             .expect("published definition slot exists")
             .previous;
-        state.pending = previous.map(|tail| PendingDefinitionHead { tail, transaction });
+        state.pending = previous.map(|tail| {
+            let prior = self.read(tail as usize);
+            PendingDefinitionHead {
+                tail,
+                transaction,
+                schema: prior.version.def.schema,
+                name: prior.version.def.name,
+            }
+        });
         true
     }
 

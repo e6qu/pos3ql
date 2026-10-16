@@ -90,10 +90,7 @@ fn table_name_lookup_selected_writer_revalidates_name_and_incarnation() {
         held.committed.name = SqlName::parse("lookup_replacement").unwrap();
         held.identity.created_at = held.identity.created_at.checked_add(1).unwrap();
         drop(held);
-        let result = match premature {
-            Ok(result) => Some(result),
-            Err(_) => None,
-        };
+        let result = premature.ok();
         let waited = result.is_none();
         let selected = if let Some(result) = result {
             result

@@ -1,0 +1,21 @@
+name: Qualify pending table definitions
+on:
+  push:
+    branches: [share-pending-table-definitions]
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Reproduce constraint comment rollback
+        run: cargo test --lib --locked pending_table_definition_schema_rollback_preserves_constraint_comments -- --test-threads=1 --nocapture

@@ -8936,6 +8936,49 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
 }
 
 #[test]
+fn pending_table_definition_schema_rollback_preserves_constraint_comments() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA pending_comment_moved; \
+         CREATE TABLE pending_comment_target (value integer, \
+           CONSTRAINT pending_comment_positive CHECK (value > 0)); \
+         COMMENT ON CONSTRAINT pending_comment_positive ON pending_comment_target \
+           IS 'retained constraint comment'; \
+         BEGIN; SAVEPOINT before_move; \
+         ALTER TABLE pending_comment_target SET SCHEMA pending_comment_moved; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'pending_comment_moved.pending_comment_target'::regclass \
+             AND conname = 'pending_comment_positive'; \
+         ROLLBACK TO before_move; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'pending_comment_target'::regclass \
+             AND conname = 'pending_comment_positive'; \
+         COMMIT; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'pending_comment_target'::regclass \
+             AND conname = 'pending_comment_positive'; \
+         BEGIN; \
+         ALTER TABLE pending_comment_target \
+           RENAME CONSTRAINT pending_comment_positive TO pending_comment_renamed; \
+         SAVEPOINT before_second_move; \
+         ALTER TABLE pending_comment_target SET SCHEMA pending_comment_moved; \
+         ROLLBACK TO before_second_move; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'pending_comment_target'::regclass \
+             AND conname = 'pending_comment_renamed'; \
+         ROLLBACK; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'pending_comment_target'::regclass \
+             AND conname = 'pending_comment_positive'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["retained constraint comment"; 5]);
+}
+
+#[test]
 fn constraint_comments_keep_identity_through_catalog_churn_and_lifecycle() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

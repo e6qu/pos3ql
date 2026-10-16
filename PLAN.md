@@ -71,18 +71,12 @@ an already running read following reused memory or deleted objects.
 
 Readers retain the rows, definitions, trigger inputs and index caches they need
 through changes and replacement. Reservations and history limits are fixed at
-startup. Creation, cleanup and pending table edits use selected-table ownership;
-waiting for one table does not reserve shared version or comment resources.
-Row publication rechecks the database, table identity and visible existence.
-Table-name selection uses small per-table views; it waits only for the selected
-definition and rechecks its identity before returning a match.
-Type moves retain cast and operator input/output identities through journal replay,
-including edits and cast creation staged after a rename in the same transaction. Cast recovery
-uses the enclosing journal or checkpoint database scope. Type access checks use
-the transaction-visible name after a pending rename; regtype and format_type
-display that name for domains and their arrays.
-The [implementation guide](docs/implemented-baseline.md) owns completed contracts,
-user examples and exact capacity errors.
+startup. Table creation, uncommitted table edits, name lookup and changes to type
+references use ownership for each selected table. Waiting for one definition
+keeps shared allocators and catalogs available for unrelated storage work.
+Complete type commits still require exclusive storage access until transaction
+publication is coordinated. The [implementation guide](docs/implemented-baseline.md)
+owns completed contracts, user examples and exact capacity errors.
 
 Still to do:
 

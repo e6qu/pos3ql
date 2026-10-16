@@ -617,7 +617,7 @@ mod tests {
                 storage.restore_pending(table, 1, 7, undo);
                 assert!(storage.tables[table].rows.is_empty());
                 let versions = storage.row_versions.read();
-                for slot in 0..versions.pending_row_versions.capacity() {
+                for slot in 0..versions.pending_row_versions.len() {
                     assert!(!versions.pending_row_versions[slot].used);
                 }
             });

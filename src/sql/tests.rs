@@ -83092,6 +83092,10 @@ fn type_reference_setup_databases(engine: &mut Engine, budget: &mut Budget) -> V
 fn type_reference_moves_preserve_other_database_definitions_and_comments() {
     let (mut engine, mut budget) = test_engine();
     let before = type_reference_setup_databases(&mut engine, &mut budget);
+    assert_eq!(
+        before[1],
+        "type_scope.shared_domain|type_scope.shared_enum|type_scope.shared_record"
+    );
     engine
         .select_database(crate::storage::DatabaseOid::POSTGRES)
         .unwrap();
@@ -83178,6 +83182,10 @@ fn type_reference_moves_pending_images_survive_journal_and_checkpoint_cold_recov
         );
         type_reference_execute(&mut engine, &mut budget, &pending);
         let published = type_reference_execute(&mut engine, &mut budget, TYPE_REFERENCE_SNAPSHOT);
+        assert_eq!(
+            published[1],
+            "type_after.renamed_domain|type_after.renamed_enum|type_after.renamed_record"
+        );
         assert_eq!(
             type_reference_execute(
                 &mut engine,

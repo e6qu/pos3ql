@@ -6902,6 +6902,14 @@ pub(crate) fn text_view(d: Datum<'_>) -> Datum<'_> {
 /// `oid::regtype`: the canonical SQL name of the type an OID names. An OID no
 /// type carries renders as the number itself, and 0 as `-`.
 pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    regtype_of_oid_with_catalog(o, None, arena)
+}
+
+fn regtype_of_oid_with_catalog<'a>(
+    o: i64,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     let unsigned = if let Ok(value) = u32::try_from(o) {
         value
     } else if let Ok(value) = i32::try_from(o) {
@@ -6912,6 +6920,10 @@ pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, 
     let referenced_oid = unsigned as i32;
     let name = if unsigned == 0 {
         "-"
+    } else if let Some(catalog) = catalog
+        && let Some(name) = catalog.type_name(referenced_oid, arena)?
+    {
+        name
     } else if let Some(name) = regtype_builtin_name(referenced_oid) {
         name
     } else if let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(referenced_oid) {
@@ -6941,7 +6953,7 @@ pub(crate) fn regtype_cast<'a>(
         Datum::Text(name) | Datum::Bpchar(name) => {
             let name = name.trim();
             if let Ok(oid) = name.parse::<u32>() {
-                return regtype_of_oid(i64::from(oid), arena);
+                return regtype_of_oid_with_catalog(i64::from(oid), catalog, arena);
             }
             if let Some(identity) = cross_database_catalog_reference(name, false) {
                 return Err(sql_err!(
@@ -6960,9 +6972,9 @@ pub(crate) fn regtype_cast<'a>(
             }
             regtype_of_name(name)
         }
-        Datum::Oid(oid) => regtype_of_oid(i64::from(oid), arena),
-        Datum::Int4(oid) => regtype_of_oid(i64::from(oid), arena),
-        Datum::Int8(oid) => regtype_of_oid(oid, arena),
+        Datum::Oid(oid) => regtype_of_oid_with_catalog(i64::from(oid), catalog, arena),
+        Datum::Int4(oid) => regtype_of_oid_with_catalog(i64::from(oid), catalog, arena),
+        Datum::Int8(oid) => regtype_of_oid_with_catalog(oid, catalog, arena),
         Datum::Null => Ok(Datum::Null),
         value => Err(cast_unsupported(&value, "regtype")),
     }

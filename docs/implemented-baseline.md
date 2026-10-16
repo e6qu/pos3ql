@@ -367,7 +367,8 @@ conversions requiring an explicit cast remain rejected. The [PostgreSQL function
 are the upstream reference; tests compare actual PostgreSQL 18 results.
 
 A catalog type reference (regtype) converts to its numeric object identifier,
-integer or bigint. A smallint cast returns SQLSTATE 42846, including for NULL,
+integer or bigint. Converting a numeric identifier back to regtype looks up the
+current user type name in the selected database. A smallint cast returns SQLSTATE 42846, including for NULL,
 unless an explicitly registered cast provides that conversion. Schema-drop
 notices retain declared domain and array names in routine and operator signatures.
 

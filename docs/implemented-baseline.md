@@ -171,8 +171,21 @@ another table can publish, roll back, or retire its own versions while that read
 keeps its selection. Slot controls and version capacity are charged at startup.
 A full pool or version history returns `54000` before changing the published
 head. Rolling back or removing a table releases only its own chain of versions.
-This protection does not enable parallel SQL execution; fixed workers and the
-remaining table creation/removal coordination are still in [PLAN.md](../PLAN.md).
+Pending edits and savepoint rollback own only the selected table. They compose
+column mappings from the original committed layout and update comment names with
+the selected shape. Waiting for that table's readers does not reserve the shared
+version allocator or comment catalog. Rule history and pending shapes check all
+transaction owners under the same definition guard. Capacity or comment-ownership
+failure leaves the prior shape and comment names intact. Comment text publication
+preserves name changes owned by another transaction.
+
+**User example:** after moving a table to another schema and rolling back to a
+savepoint, its constraint comments remain attached under the original name. A
+constraint renamed before the savepoint keeps its new name. Both journal replay
+and checkpoint recovery preserve the committed result after local caches are lost.
+
+SQL execution is still serial. Committed definition changes, table renames,
+rewrites and maintenance coordination remain in [PLAN.md](../PLAN.md).
 A new report admitted between cleanup batches still keeps the versions it needs.
 
 Client descriptions and data-changing WITH queries use the same DML output

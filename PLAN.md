@@ -49,6 +49,9 @@ machine do not establish production availability or speed.
 - A safe storage layout needs to keep older versions until every reader and
   backup has finished with them. Copying only today's logical rows is not
   sufficient when an older transaction still needs historical object data.
+- A command can pass its SQL test because a second cleanup step repairs an
+  incomplete storage rollback. Before storage work runs independently, its
+  own rollback must restore everything it changed.
 - Testing multiple object-store implementations checks portability. Comparing
   them on a shared machine does not establish their production speed or cost.
 
@@ -63,21 +66,13 @@ and linked PRs preserve the investigations; this file keeps only current work.
 appropriate to its transaction. Dropping or rebuilding a table must not leave
 an already running read following reused memory or deleted objects.
 
-Readers retain the rows, definitions, trigger inputs, and index caches they need
-through nested changes and replacement. Their reservations are counted at
-startup. Pending definitions and cache owners do not reserve unrelated tables'
-slots. Rule changes take the target relation's lock before selecting or changing
-its definition; rollback preserves another transaction's history. Column
-descriptions and catalog checks of writable views do not acquire execution
-locks. Table cleanup uses a lock for its own table and releases shared row-version
-pools between batches; retained row values survive cleanup and slot reuse.
-Transactional table creation reserves names and slots without exclusive storage
-access. Failed initialization releases its slot and index-cache claims. Pending row
-publication rechecks database, table identity, and transaction-visible existence
-after preparation, so removal cannot leave rows in an absent table. A pending write
-waiting on one table's definition does not delay writes to other tables.
-The [implementation guide](docs/implemented-baseline.md) owns the completed
-contracts, examples, and capacity limits.
+Readers retain the rows, definitions, trigger inputs and index caches they need
+through changes and replacement. Reservations and history limits are fixed at
+startup. Creation, cleanup and pending table edits use selected-table ownership;
+waiting for one table does not reserve shared version or comment resources.
+Row publication rechecks the database, table identity and visible existence.
+The [implementation guide](docs/implemented-baseline.md) owns completed contracts,
+user examples and exact capacity errors.
 
 Still to do:
 

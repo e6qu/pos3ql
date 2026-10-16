@@ -20,6 +20,18 @@ pub(super) struct DefinitionState {
     pub(super) pending_has_rules_txid: Option<u32>,
 }
 
+impl DefinitionState {
+    pub(super) fn locked_by_other(&self, transaction: u32) -> Option<u32> {
+        self.identity
+            .existence
+            .pending_txid()
+            .into_iter()
+            .chain(self.pending.map(|head| head.transaction))
+            .chain(self.pending_has_rules_txid)
+            .find(|&owner| owner != transaction)
+    }
+}
+
 /// Identity and existence share publication ownership with the definition.
 #[derive(Clone, Copy)]
 pub(crate) struct TableIdentity {
@@ -143,6 +155,7 @@ impl DefinitionVersions {
             .expect("published definition slot exists")
     }
 
+    #[cfg(test)]
     pub(super) fn stage(
         &self,
         definition: &TableDefinition,
@@ -152,16 +165,13 @@ impl DefinitionVersions {
         self.stage_locked(&mut definition.write(), version, maximum_depth)
     }
 
-    fn stage_locked(
+    pub(super) fn stage_locked(
         &self,
         state: &mut DefinitionState,
         version: PendingTableDef,
         maximum_depth: u32,
     ) -> Result<(), SqlError> {
-        if state
-            .pending
-            .is_some_and(|head| head.transaction != version.txid)
-        {
+        if state.locked_by_other(version.txid).is_some() {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "table definition is owned by another transaction"
@@ -218,8 +228,18 @@ impl DefinitionVersions {
         ))
     }
 
+    pub(super) fn latest_locked(&self, state: &DefinitionState) -> Option<PendingTableDef> {
+        state
+            .pending
+            .map(|head| self.read(head.tail as usize).version)
+    }
+
+    #[cfg(test)]
     pub(super) fn rollback(&self, definition: &TableDefinition, transaction: u32) -> bool {
-        let mut state = definition.write();
+        self.rollback_locked(&mut definition.write(), transaction)
+    }
+
+    pub(super) fn rollback_locked(&self, state: &mut DefinitionState, transaction: u32) -> bool {
         let Some(head) = state.pending.filter(|head| head.transaction == transaction) else {
             return false;
         };
@@ -321,22 +341,7 @@ impl<'a> TableDefinitionRead<'a> {
     }
 
     pub(super) fn locked_by_other(&self, transaction: u32) -> Option<u32> {
-        self.state
-            .identity
-            .existence
-            .pending_txid()
-            .filter(|&owner| owner != transaction)
-            .or_else(|| {
-                self.state
-                    .pending
-                    .map(|head| head.transaction)
-                    .filter(|&owner| owner != transaction)
-            })
-            .or_else(|| {
-                self.state
-                    .pending_has_rules_txid
-                    .filter(|&owner| owner != transaction)
-            })
+        self.state.locked_by_other(transaction)
     }
 
     pub(super) fn committed(definition: &'a TableDefinition) -> Self {
@@ -415,6 +420,94 @@ mod tests {
             column_mapping: [None; MAX_COLUMNS],
             rewrites_rows: false,
         }
+    }
+
+    #[test]
+    fn pending_table_definition_storage_rollback_restores_constraint_schema() {
+        use super::super::tests::{make_def, test_budget, test_config};
+        use super::super::{CommentClass, Storage, comment_stackstr};
+        use crate::sql::types::ColType;
+
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "storage_comment_target",
+                &[("id", ColType::Int4, false)],
+            ))
+            .unwrap();
+        let schema = SqlName::parse("public").unwrap();
+        let original = SqlName::parse("original_check").unwrap();
+        let renamed = SqlName::parse("renamed_check").unwrap();
+        storage
+            .apply_comment(
+                CommentClass::Constraint,
+                schema,
+                original,
+                table as u32,
+                Some(comment_stackstr("retained storage comment").unwrap()),
+            )
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let (slot, prior) = storage
+                .stage_constraint_comment_rename(table, schema, original, renamed, 7)
+                .unwrap();
+            let mut changed = *storage.table_def(table, 7);
+            changed.schema = SqlName::parse("moved").unwrap();
+            let mut mapping = [None; MAX_COLUMNS];
+            mapping[0] = Some(SqlName::parse("id").unwrap());
+            storage
+                .write_table_def(table, 7, changed, &mapping, false)
+                .unwrap();
+            assert!(
+                storage
+                    .comment_text(
+                        CommentClass::Constraint,
+                        "moved",
+                        "renamed_check",
+                        table as u32,
+                        7,
+                    )
+                    .is_some()
+            );
+            storage.rollback_table_def(table, 7);
+            assert!(
+                storage
+                    .comment_text(
+                        CommentClass::Constraint,
+                        "public",
+                        "renamed_check",
+                        table as u32,
+                        7,
+                    )
+                    .is_some(),
+                "constraint comment must return to the original schema at storage rollback"
+            );
+            assert!(
+                storage
+                    .comment_text(
+                        CommentClass::Constraint,
+                        "moved",
+                        "renamed_check",
+                        table as u32,
+                        7,
+                    )
+                    .is_none()
+            );
+            storage.restore_comment_identity_pending(slot, prior);
+            assert!(
+                storage
+                    .comment_text(
+                        CommentClass::Constraint,
+                        "public",
+                        "original_check",
+                        table as u32,
+                        7,
+                    )
+                    .is_some()
+            );
+        });
     }
 
     #[test]
@@ -636,14 +729,14 @@ mod tests {
                     } else {
                         DatabaseOid::TEMPLATE1
                     };
+                    let transaction = if epoch % 2 == 0 { 7 } else { 9 };
                     state.identity.existence = match epoch % 5 {
                         0 => CatalogDdlState::Present,
-                        1 => CatalogDdlState::PendingCreate { txid: 7 },
-                        2 => CatalogDdlState::PendingDrop { txid: 7 },
-                        3 => CatalogDdlState::PendingCreateDrop { txid: 7 },
+                        1 => CatalogDdlState::PendingCreate { txid: transaction },
+                        2 => CatalogDdlState::PendingDrop { txid: transaction },
+                        3 => CatalogDdlState::PendingCreateDrop { txid: transaction },
                         _ => CatalogDdlState::Absent,
                     };
-                    let transaction = if epoch % 2 == 0 { 7 } else { 9 };
                     versions
                         .stage_locked(&mut state, pending(stamp + 1, transaction), 8)
                         .unwrap();

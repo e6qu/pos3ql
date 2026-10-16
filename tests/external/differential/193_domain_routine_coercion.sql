@@ -43,10 +43,17 @@ CREATE FUNCTION routine_domains.nested() RETURNS bigint
 LANGUAGE SQL VOLATILE AS 'SELECT nextval(''routine_domains.cast_calls'') + routine_domains.bump()';
 SELECT routine_domains.nested();
 SELECT currval('routine_domains.cast_calls');
+DROP FUNCTION routine_domains.nested();
+DROP FUNCTION routine_domains.bump();
 DROP CAST (regtype AS smallint);
 CREATE OR REPLACE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
 LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT (1 / 0)::smallint';
 CREATE CAST (regtype AS smallint) WITH FUNCTION routine_domains.small_type(regtype);
 SELECT pg_typeof(1)::smallint WHERE FALSE;
+CREATE FUNCTION routine_domains.small_type(arg boolean) RETURNS smallint
+LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT (1 / 0)::smallint';
+CREATE CAST (boolean AS smallint) WITH FUNCTION routine_domains.small_type(boolean);
+SELECT TRUE::smallint WHERE FALSE;
+DROP CAST (boolean AS smallint);
 DROP CAST (regtype AS smallint);
 DROP SCHEMA routine_domains CASCADE;

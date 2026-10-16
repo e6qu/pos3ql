@@ -83288,6 +83288,8 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
          LANGUAGE SQL VOLATILE AS 'SELECT nextval(''routine_domains.cast_calls'') + routine_domains.bump()';
          SELECT routine_domains.nested();
          SELECT currval('routine_domains.cast_calls');
+         DROP FUNCTION routine_domains.nested();
+         DROP FUNCTION routine_domains.bump();
          DROP CAST (regtype AS smallint);",
         32 << 20,
     );
@@ -83302,7 +83304,10 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
         &budget,
         "CREATE OR REPLACE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
          LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT (1 / 0)::smallint';
-         CREATE CAST (regtype AS smallint) WITH FUNCTION routine_domains.small_type(regtype);",
+         CREATE CAST (regtype AS smallint) WITH FUNCTION routine_domains.small_type(regtype);
+         CREATE FUNCTION routine_domains.small_type(arg boolean) RETURNS smallint
+         LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT (1 / 0)::smallint';
+         CREATE CAST (boolean AS smallint) WITH FUNCTION routine_domains.small_type(boolean);",
         32 << 20,
     );
     assert!(
@@ -83310,10 +83315,22 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
         "{}",
         String::from_utf8_lossy(&immutable)
     );
-    let folded = run_with_fixed_memory(
+    let skipped = run_with_fixed_memory(
         &mut engine,
         &budget,
         "SELECT pg_typeof(1)::smallint WHERE FALSE",
+        32 << 20,
+    );
+    assert!(
+        !String::from_utf8_lossy(&skipped).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&skipped)
+    );
+    assert!(data_rows(&skipped).is_empty());
+    let folded = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT TRUE::smallint WHERE FALSE",
         32 << 20,
     );
     assert!(
@@ -83321,7 +83338,11 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
         "{}",
         String::from_utf8_lossy(&folded)
     );
-    type_reference_execute(&mut engine, &mut budget, "DROP CAST (regtype AS smallint)");
+    type_reference_execute(
+        &mut engine,
+        &mut budget,
+        "DROP CAST (regtype AS smallint); DROP CAST (boolean AS smallint)",
+    );
     let dropped = run_with_fixed_memory(
         &mut engine,
         &budget,

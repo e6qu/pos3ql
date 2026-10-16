@@ -5724,6 +5724,7 @@ fn is_nonimmutable_function(name: &str) -> bool {
         "pg_current_xact_id",
         "pg_current_xact_id_if_assigned",
         "pg_current_snapshot",
+        "pg_typeof",
     ];
     is_volatile_function(name)
         || STABLE_NAMES

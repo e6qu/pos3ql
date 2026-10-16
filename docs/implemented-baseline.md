@@ -374,6 +374,12 @@ rather than while checking constant expressions. For example, a cast that calls
 nextval advances the sequence once for each evaluated value. A skipped false
 branch does not advance it, and waiting for a nested function does not advance
 it again. SQL function result queries use the connection's sequence state.
+The pg_typeof function is stable rather than immutable: an immutable cast of
+its result stays out of planning. A genuinely constant immutable cast can
+still raise a planning error even when WHERE FALSE removes all rows. These
+distinctions follow PostgreSQL 18's
+[function volatility declarations](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/catalog/pg_proc.dat)
+and are checked against the running server.
 
 Schema validation uses a current read position for the rows being checked,
 including earlier changes by the same transaction. CHECK, NOT NULL, uniqueness,

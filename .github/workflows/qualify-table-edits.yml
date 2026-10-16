@@ -27,6 +27,53 @@ jobs:
             cargo test --lib --locked "$selection" -- --test-threads=1 --nocapture | tee "$RUNNER_TEMP/pending-edits-$selection.log"
             grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/pending-edits-$selection.log"
           done
+      - name: Verify the direct storage regression against the original runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin 91bb2ed206cc2281b81f884e971483dc28cfcfcc
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import subprocess
+
+          old = "91bb2ed206cc2281b81f884e971483dc28cfcfcc"
+          storage = Path("src/storage/mod.rs")
+          definitions = Path("src/storage/table_definitions.rs")
+          original_storage = storage.read_text()
+          original_definitions = definitions.read_text()
+          marker = "#[cfg(test)]\nmod tests {"
+          assert original_definitions.count(marker) == 1
+          old_definitions = subprocess.check_output(
+              ["git", "show", f"{old}:src/storage/table_definitions.rs"], text=True
+          )
+          assert old_definitions.count(marker) == 1
+          try:
+              storage.write_text(subprocess.check_output(
+                  ["git", "show", f"{old}:src/storage/mod.rs"], text=True
+              ))
+              definitions.write_text(
+                  old_definitions.split(marker, 1)[0] + marker
+                  + original_definitions.split(marker, 1)[1]
+              )
+              result = subprocess.run(
+                  ["cargo", "test", "--lib", "--locked",
+                   "pending_table_definition_storage_rollback_restores_constraint_schema",
+                   "--", "--test-threads=1", "--nocapture"],
+                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+              )
+              print(result.stdout, flush=True)
+              Path(os.environ["RUNNER_TEMP"], "pending-table-old-runtime.log").write_text(result.stdout)
+              assert result.returncode != 0, "original runtime unexpectedly passed the storage regression"
+              assert "test result: FAILED. 0 passed; 1 failed" in result.stdout
+              assert "constraint comment must return to the original schema at storage rollback" in result.stdout
+          finally:
+              storage.write_text(original_storage)
+              definitions.write_text(original_definitions)
+          subprocess.check_call(["git", "diff", "--exit-code", "--",
+                                 "src/storage/mod.rs", "src/storage/table_definitions.rs"])
+          print("Confirmed the storage regression on the old runtime; restored the qualified source.")
+          PY
   postgresql:
     runs-on: ubuntu-latest
     timeout-minutes: 15

@@ -423,6 +423,94 @@ mod tests {
     }
 
     #[test]
+    fn pending_table_definition_storage_rollback_restores_constraint_schema() {
+        use super::super::tests::{make_def, test_budget, test_config};
+        use super::super::{CommentClass, Storage, comment_stackstr};
+        use crate::sql::types::ColType;
+
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "storage_comment_target",
+                &[("id", ColType::Int4, false)],
+            ))
+            .unwrap();
+        let schema = SqlName::parse("public").unwrap();
+        let original = SqlName::parse("original_check").unwrap();
+        let renamed = SqlName::parse("renamed_check").unwrap();
+        storage
+            .apply_comment(
+                CommentClass::Constraint,
+                schema,
+                original,
+                table as u32,
+                Some(comment_stackstr("retained storage comment").unwrap()),
+            )
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let (slot, prior) = storage
+                .stage_constraint_comment_rename(table, schema, original, renamed, 7)
+                .unwrap();
+            let mut changed = *storage.table_def(table, 7);
+            changed.schema = SqlName::parse("moved").unwrap();
+            let mut mapping = [None; MAX_COLUMNS];
+            mapping[0] = Some(SqlName::parse("id").unwrap());
+            storage
+                .write_table_def(table, 7, changed, &mapping, false)
+                .unwrap();
+            assert!(
+                storage
+                    .comment_text(
+                        CommentClass::Constraint,
+                        "moved",
+                        "renamed_check",
+                        table as u32,
+                        7,
+                    )
+                    .is_some()
+            );
+            storage.rollback_table_def(table, 7);
+            assert!(
+                storage
+                    .comment_text(
+                        CommentClass::Constraint,
+                        "public",
+                        "renamed_check",
+                        table as u32,
+                        7,
+                    )
+                    .is_some(),
+                "constraint comment must return to the original schema at storage rollback"
+            );
+            assert!(
+                storage
+                    .comment_text(
+                        CommentClass::Constraint,
+                        "moved",
+                        "renamed_check",
+                        table as u32,
+                        7,
+                    )
+                    .is_none()
+            );
+            storage.restore_comment_identity_pending(slot, prior);
+            assert!(
+                storage
+                    .comment_text(
+                        CommentClass::Constraint,
+                        "public",
+                        "original_check",
+                        table as u32,
+                        7,
+                    )
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
     fn live_definition_ownership_retains_committed_and_transaction_views() {
         let versions = versions(2);
         let table = TableDefinition::new(definition(1));

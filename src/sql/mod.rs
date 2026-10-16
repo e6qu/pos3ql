@@ -5180,7 +5180,7 @@ impl Engine {
                             )
                         })
                 }
-                (Some(loc), None) => self.wal.stage(
+                (Some(loc), None) => self.wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::Upsert {
@@ -5196,7 +5196,7 @@ impl Engine {
                 (None, Some(old_home)) => {
                     self.storage
                         .with_row_bytes(table as usize, rowid, old_home, |old_row| {
-                            self.wal.stage(
+                            self.wal.stage_reserved(
                                 txn.txid,
                                 lsn,
                                 &WalOp::Delete {
@@ -5433,7 +5433,7 @@ impl Engine {
                 };
                 let owner = self.storage.object_owner(object, txn.txid);
                 let owner = self.storage.role_name(owner, txn.txid);
-                self.wal.stage(
+                self.wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::UpsertExtension {

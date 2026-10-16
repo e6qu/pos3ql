@@ -429,10 +429,10 @@ position does not publish a durable commit: the journal still orders staged
 records at commit. Reservations share a checked startup-sized atomic counter.
 Exhaustion reaches the same staging-error handlers as a full journal buffer,
 returning `54000` with `WAL LSN space exhausted`. A rejected reservation cannot
-claim a journal stage or wrap to an older position. Completing even a read-only
-transaction currently records its assigned identity, so that completion can also
-fail when no log positions remain. An explicit read ended with `ROLLBACK` does
-not require that commit record. Observing a completed
+claim a journal stage or wrap to an older position. A query that only reads data and has not
+acquired a persistent transaction ID (a number that must survive restart) can
+finish without a new log position. Transactions that must record an ID or save
+changes still need room for their commit. Observing a completed
 publication cannot move the counter backward. Recovery can restore an exact
 position only with exclusive storage access.
 

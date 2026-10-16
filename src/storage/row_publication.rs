@@ -4,8 +4,7 @@ use super::row_versions::RowVersionState;
 use super::*;
 
 struct PreparedPendingWrite {
-    table: usize,
-    incarnation: u64,
+    target: PreparedTableTarget,
     rowid: u64,
     expected: Option<RowState>,
     pending_identity: Option<u64>,
@@ -14,6 +13,45 @@ struct PreparedPendingWrite {
     change: PendingChange,
     existed: bool,
     track_statistics: bool,
+}
+
+struct PreparedTableTarget {
+    table: usize,
+    database: DatabaseOid,
+    incarnation: u64,
+}
+
+impl PreparedTableTarget {
+    fn capture(
+        table: usize,
+        identity: table_definitions::TableIdentity,
+        txid: u32,
+    ) -> Result<Self, SqlError> {
+        let target = Self {
+            table,
+            database: identity.database,
+            incarnation: identity.created_at,
+        };
+        target.validate(identity, txid)?;
+        Ok(target)
+    }
+
+    fn validate(
+        &self,
+        identity: table_definitions::TableIdentity,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if identity.database != self.database
+            || identity.created_at != self.incarnation
+            || !identity.existence.visible_to(txid)
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "pending row belongs to a retired table incarnation"
+            ));
+        }
+        Ok(())
+    }
 }
 
 enum PendingPublication {
@@ -87,12 +125,13 @@ impl Storage {
         loc: Option<RowLoc>,
         track_statistics: bool,
     ) -> Result<PreparedPendingWrite, SqlError> {
-        // Shared Storage ownership excludes relocation and table retirement.
+        // Relocation still needs exclusive storage access. Retirement and
+        // creation can overlap this preparation; publication rechecks the target.
         // Even reconstruction paths must validate the complete heap image.
         if let Some(location) = loc {
             self.heap.get(location)?;
         }
-        let incarnation = {
+        let target = {
             let definition = self.table_def(table, txid);
             if let Some(owner) = definition.locked_by_other(txid) {
                 return Err(self.pending_write_wait(
@@ -101,7 +140,7 @@ impl Storage {
                     "statement is waiting for a concurrent table definition change",
                 ));
             }
-            definition.identity().created_at
+            PreparedTableTarget::capture(table, *definition.identity(), txid)?
         };
         let (expected, pending_identity, existed) = match self.resident_row_state(table, rowid)? {
             Some(state) => {
@@ -149,8 +188,7 @@ impl Storage {
         let (changed_columns, changes_existence) =
             self.pending_change_footprint(table, rowid, committed, loc, txid, track_statistics)?;
         Ok(PreparedPendingWrite {
-            table,
-            incarnation,
+            target,
             rowid,
             expected,
             pending_identity,
@@ -173,8 +211,7 @@ impl Storage {
         prepared: PreparedPendingWrite,
     ) -> Result<PendingPublication, SqlError> {
         let PreparedPendingWrite {
-            table,
-            incarnation,
+            target,
             rowid,
             expected,
             pending_identity,
@@ -184,14 +221,10 @@ impl Storage {
             existed,
             track_statistics,
         } = prepared;
+        let table = target.table;
         let snapshots = self.snapshot_state();
         let definition = self.tables[table].definition.read();
-        if definition.identity.created_at != incarnation {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "pending row belongs to a retired table incarnation"
-            ));
-        }
+        target.validate(definition.identity, change.txid)?;
         if let Some(owner) = definition
             .identity
             .existence
@@ -457,6 +490,126 @@ mod tests {
                 storage.restore_pending(table, 2, 7, undo);
                 assert!(storage.resident_row_state(table, 2).unwrap().is_none());
             });
+        });
+    }
+
+    #[test]
+    fn shared_row_publication_rejects_retirement_before_and_after_slot_reuse() {
+        for retirement in 0..3 {
+            let (storage, table) = fixture(&test_config());
+            let location = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                let retired = storage
+                    .prepare_pending_write(table, 1, 7, 1, Some(location), true)
+                    .unwrap();
+                let reused = storage
+                    .prepare_pending_write(table, 1, 7, 1, Some(location), false)
+                    .unwrap();
+                match retirement {
+                    0 => storage.commit_drop(table),
+                    1 => storage.rollback_create(table),
+                    _ => storage.drop_table(table),
+                }
+                let error = storage.publish_pending_write(retired).err().unwrap();
+                assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+                assert!(storage.tables[table].rows.is_empty());
+                for tracked in [true, false] {
+                    let error = storage
+                        .write_pending_inner(table, 1, 7, 1, Some(location), tracked)
+                        .unwrap_err();
+                    assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+                }
+                let next = storage
+                    .create_table_in(
+                        make_def("replacement_publication", &[("id", ColType::Int4, false)]),
+                        7,
+                    )
+                    .unwrap();
+                assert_eq!(next, table);
+                let error = storage.publish_pending_write(reused).err().unwrap();
+                assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+                assert!(storage.tables[table].rows.is_empty());
+                let undo = storage
+                    .write_pending(table, 1, 7, 1, Some(location))
+                    .unwrap();
+                storage.restore_pending(table, 1, 7, undo);
+                assert!(storage.tables[table].rows.is_empty());
+                let versions = storage.row_versions.read();
+                for slot in 0..versions.pending_row_versions.capacity() {
+                    assert!(!versions.pending_row_versions[slot].used);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn shared_row_publication_rejects_database_replacement_with_the_same_catalog_stamp() {
+        let (storage, table) = fixture(&test_config());
+        let location = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let prepared = storage
+                .prepare_pending_write(table, 1, 7, 1, Some(location), true)
+                .unwrap();
+            let stamp = storage.tables[table].created_at();
+            {
+                let mut definition = storage.tables[table].definition.write();
+                // Database cloning preserves catalog stamps; the owner must
+                // remain part of a prepared write's identity.
+                definition.identity.database =
+                    if definition.identity.database == DatabaseOid::POSTGRES {
+                        DatabaseOid::TEMPLATE1
+                    } else {
+                        DatabaseOid::POSTGRES
+                    };
+            }
+            assert_eq!(storage.tables[table].created_at(), stamp);
+            let error = storage.publish_pending_write(prepared).err().unwrap();
+            assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert!(storage.tables[table].rows.is_empty());
+        });
+    }
+
+    #[test]
+    fn shared_row_publication_admission_preserves_pending_create_and_drop_rollback() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let table = storage
+                .create_table_in(
+                    make_def("pending_admission", &[("id", ColType::Int4, false)]),
+                    7,
+                )
+                .unwrap();
+            let location = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+            let undo = storage
+                .write_pending(table, 1, 7, 1, Some(location))
+                .unwrap();
+            storage.restore_pending(table, 1, 7, undo);
+            storage.drop_table_in(table, 7);
+            assert_eq!(
+                storage
+                    .write_pending(table, 1, 7, 1, Some(location))
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            storage.rollback_drop(table);
+            storage.commit_create(table);
+            let prepared = storage
+                .prepare_pending_write(table, 1, 7, 1, Some(location), true)
+                .unwrap();
+            storage.drop_table_in(table, 8);
+            assert!(matches!(
+                storage.publish_pending_write(prepared).unwrap(),
+                PendingPublication::Wait(8, _)
+            ));
+            storage.rollback_drop(table);
+            let undo = storage
+                .write_pending(table, 1, 7, 1, Some(location))
+                .unwrap();
+            storage.restore_pending(table, 1, 7, undo);
+            assert!(storage.tables[table].rows.is_empty());
         });
     }
 

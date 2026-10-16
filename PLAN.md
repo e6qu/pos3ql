@@ -74,8 +74,10 @@ through changes and replacement. Reservations and history limits are fixed at
 startup. Table creation, uncommitted table edits, name lookup and changes to type
 references use ownership for each selected table. Waiting for one definition
 keeps shared allocators and catalogs available for unrelated storage work.
-Complete type commits still require exclusive storage access until transaction
-publication is coordinated. The [implementation guide](docs/implemented-baseline.md)
+Pending writes retain their input bytes through preparation and retries, and
+reject heap locations from a replaced buffer before publication. Complete type
+commits and heap compaction still require exclusive storage access until
+transaction publication and maintenance are coordinated. The [implementation guide](docs/implemented-baseline.md)
 owns completed contracts, user examples and exact capacity errors.
 
 Still to do:

@@ -30,6 +30,7 @@ pub(super) struct RowHeapState {
 // guard until initialization ends; relocation requires unique allocation ownership.
 unsafe impl Sync for RowHeapState {}
 
+#[derive(Clone)]
 pub(crate) struct HeapRowRead {
     state: Arc<RwLock<RowHeapState>>,
     location: RowLoc,
@@ -227,6 +228,21 @@ impl RowHeap {
             state: Arc::clone(&self.state),
             location,
         })
+    }
+
+    pub(super) fn is_current_allocation(&self, image: &HeapRowRead) -> bool {
+        Arc::ptr_eq(&self.state, &image.state)
+    }
+
+    pub(super) fn retain_for_publication(
+        &self,
+        image: &HeapRowRead,
+    ) -> Result<HeapRowRead, SqlError> {
+        if self.is_current_allocation(image) {
+            return Ok(image.clone());
+        }
+        let location = self.append_bytes(image)?;
+        self.get(location)
     }
 
     pub(crate) fn used(&self) -> usize {

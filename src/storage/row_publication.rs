@@ -4,6 +4,7 @@ use super::row_versions::RowVersionState;
 use super::*;
 
 struct PreparedPendingWrite {
+    image: Option<super::row_heap::HeapRowRead>,
     target: PreparedTableTarget,
     rowid: u64,
     expected: Option<RowState>,
@@ -112,10 +113,36 @@ impl Storage {
         loc: Option<RowLoc>,
         track_statistics: bool,
     ) -> Result<PendingWriteUndo, SqlError> {
+        let image = loc.map(|location| self.heap.get(location)).transpose()?;
+        self.write_pending_image(table_index, rowid, txid, cid, image, track_statistics)
+    }
+
+    fn write_pending_image(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        cid: u32,
+        mut image: Option<super::row_heap::HeapRowRead>,
+        track_statistics: bool,
+    ) -> Result<PendingWriteUndo, SqlError> {
         let mut original_target: Option<PreparedTableTarget> = None;
         loop {
-            let prepared =
-                self.prepare_pending_write(table_index, rowid, txid, cid, loc, track_statistics)?;
+            if let Some(target) = original_target {
+                let definition = self.tables[table_index].definition.read();
+                target.validate(definition.identity, txid)?;
+            }
+            if let Some(input) = &image {
+                image = Some(self.heap.retain_for_publication(input)?);
+            }
+            let prepared = self.prepare_pending_write_image(
+                table_index,
+                rowid,
+                txid,
+                cid,
+                image.as_ref(),
+                track_statistics,
+            )?;
             let target = prepared.target;
             if let Some(original) = original_target {
                 original.same_target(target)?;
@@ -145,6 +172,7 @@ impl Storage {
         }
     }
 
+    #[cfg(test)]
     fn prepare_pending_write(
         &self,
         table: usize,
@@ -154,12 +182,22 @@ impl Storage {
         loc: Option<RowLoc>,
         track_statistics: bool,
     ) -> Result<PreparedPendingWrite, SqlError> {
-        // Relocation still needs exclusive storage access. Retirement and
-        // creation can overlap this preparation; publication rechecks the target.
-        // Even reconstruction paths must validate the complete heap image.
-        if let Some(location) = loc {
-            self.heap.get(location)?;
-        }
+        let image = loc.map(|location| self.heap.get(location)).transpose()?;
+        self.prepare_pending_write_image(table, rowid, txid, cid, image.as_ref(), track_statistics)
+    }
+
+    fn prepare_pending_write_image(
+        &self,
+        table: usize,
+        rowid: u64,
+        txid: u32,
+        cid: u32,
+        image: Option<&super::row_heap::HeapRowRead>,
+        track_statistics: bool,
+    ) -> Result<PreparedPendingWrite, SqlError> {
+        // Keep input bytes alive across cold reads and retries. Heap relocation
+        // still needs exclusive storage access; publication checks its result.
+        let loc = image.map(super::row_heap::HeapRowRead::location);
         let target = {
             let definition = self.table_def(table, txid);
             if let Some(owner) = definition.locked_by_other(txid) {
@@ -217,6 +255,7 @@ impl Storage {
         let (changed_columns, changes_existence) =
             self.pending_change_footprint(table, rowid, committed, loc, txid, track_statistics)?;
         Ok(PreparedPendingWrite {
+            image: image.cloned(),
             target,
             rowid,
             expected,
@@ -240,6 +279,7 @@ impl Storage {
         prepared: PreparedPendingWrite,
     ) -> Result<PendingPublication, SqlError> {
         let PreparedPendingWrite {
+            image,
             target,
             rowid,
             expected,
@@ -271,6 +311,14 @@ impl Storage {
                 owner,
                 "statement is waiting for a concurrent table definition change",
             ));
+        }
+        // The owned bytes remain pinned until publication releases its owners.
+        // Never put an old allocation's location into the current row maps.
+        if image
+            .as_ref()
+            .is_some_and(|image| !self.heap.is_current_allocation(image))
+        {
+            return Ok(PendingPublication::Retry);
         }
         // Retention selection and history pruning share registry ownership.
         // A newly registered reader cannot appear between those operations.
@@ -426,6 +474,163 @@ mod tests {
             .create_table(make_def("publication", &[("id", ColType::Int4, false)]))
             .unwrap();
         (storage, table)
+    }
+
+    fn relocation_scratch() -> FixedVec<(u32, u64, RowHeapImage, RowLoc)> {
+        FixedVec::new(&mut Budget::new(4096), "publication relocation test", 16).unwrap()
+    }
+
+    #[test]
+    fn pending_image_ownership_insert_survives_relocation_before_publication() {
+        let (mut storage, table) = fixture(&test_config());
+        let mut scratch = relocation_scratch();
+        storage.heap.append_bytes(b"unpublished garbage").unwrap();
+        let location = storage.heap.append_row(&[Datum::Int4(41)]).unwrap();
+        let input = storage.heap.get(location).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let prepared = storage
+                .prepare_pending_write_image(table, 1, 7, 1, Some(&input), true)
+                .unwrap();
+            storage.compact_heap(&mut scratch).unwrap();
+            assert_eq!(storage.heap.used(), 0);
+            assert!(!storage.heap.is_current_allocation(&input));
+            assert!(matches!(
+                storage.publish_pending_write(prepared).unwrap(),
+                PendingPublication::Retry
+            ));
+            let undo = storage
+                .write_pending_image(table, 1, 7, 1, Some(input.clone()), true)
+                .unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
+            let Some(Some(RowHome::Heap(current))) = row.visible_at(7, SNAPSHOT_ALL, u64::MAX)
+            else {
+                panic!("inserted image must be visible to its writer")
+            };
+            assert_ne!(current.generation, location.generation);
+            assert_eq!(&*storage.heap.get(current).unwrap(), &*input);
+            drop(row);
+            storage.restore_pending(table, 1, 7, undo);
+            assert!(storage.resident_row_state(table, 1).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn pending_image_ownership_update_preserves_readers_and_rollback() {
+        let (mut storage, table) = fixture(&test_config());
+        let mut scratch = relocation_scratch();
+        storage
+            .heap
+            .append_bytes(b"garbage before live row")
+            .unwrap();
+        let old = storage.heap.append_row(&[Datum::Int4(10)]).unwrap();
+        storage.tables[table]
+            .rows
+            .insert(1, RowState::committed_only_at(old, 7))
+            .unwrap();
+        storage.set_lsn(7);
+        let reader = storage.heap.get(old).unwrap();
+        let location = storage.heap.append_row(&[Datum::Int4(29)]).unwrap();
+        let input = storage.heap.get(location).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let prepared = storage
+                .prepare_pending_write_image(table, 1, 8, 1, Some(&input), true)
+                .unwrap();
+            storage.compact_heap(&mut scratch).unwrap();
+            assert!(matches!(
+                storage.publish_pending_write(prepared).unwrap(),
+                PendingPublication::Retry
+            ));
+            let undo = storage
+                .write_pending_image(table, 1, 8, 1, Some(input.clone()), true)
+                .unwrap();
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
+            let Some(Some(RowHome::Heap(updated))) = row.visible_at(8, SNAPSHOT_ALL, 7) else {
+                panic!("writer must see its update")
+            };
+            let Some(Some(RowHome::Heap(committed))) = row.visible_at(9, SNAPSHOT_ALL, 7) else {
+                panic!("other reader must see the committed row")
+            };
+            assert_eq!(&*storage.heap.get(updated).unwrap(), &*input);
+            assert_eq!(&*storage.heap.get(committed).unwrap(), &*reader);
+            drop(row);
+            storage.restore_pending(table, 1, 8, undo);
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
+            assert!(row.pending.is_none());
+            assert_eq!(
+                row.visible_at(8, SNAPSHOT_ALL, 7),
+                Some(Some(RowHome::Heap(committed)))
+            );
+            assert_eq!(&*storage.heap.get(committed).unwrap(), &*reader);
+        });
+    }
+
+    #[test]
+    fn pending_image_ownership_capacity_error_releases_old_allocation() {
+        let mut config = test_config();
+        config.memtable_bytes = 128;
+        let (mut storage, table) = fixture(&config);
+        let mut scratch = relocation_scratch();
+        let filler = [0u8; 128];
+        let location = storage.heap.append_row(&[Datum::Int4(41)]).unwrap();
+        let input = storage.heap.get(location).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let prepared = storage
+                .prepare_pending_write_image(table, 1, 7, 1, Some(&input), true)
+                .unwrap();
+            storage.compact_heap(&mut scratch).unwrap();
+            assert!(matches!(
+                storage.publish_pending_write(prepared).unwrap(),
+                PendingPublication::Retry
+            ));
+            storage.heap.append_bytes(&filler).unwrap();
+            let error = storage
+                .write_pending_image(table, 1, 7, 1, Some(input), true)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(storage.resident_row_state(table, 1).unwrap().is_none());
+            assert!(
+                storage
+                    .cumulative_statistics()
+                    .relation_transactions
+                    .is_empty()
+            );
+            // Force a copy into the old allocation. A leaked input owner would
+            // prevent this reclamation even though no row was published.
+            let current = storage.heap.retain_allocation();
+            storage.compact_heap(&mut scratch).unwrap();
+            assert_eq!(storage.heap.used(), 0);
+            drop(current);
+            let versions = storage.row_versions.read();
+            for slot in 0..versions.pending_row_versions.len() {
+                assert!(!versions.pending_row_versions[slot].used);
+            }
+        });
+    }
+
+    #[test]
+    fn pending_image_ownership_reused_target_rejects_before_relocation_retry() {
+        let (mut storage, table) = fixture(&test_config());
+        let mut scratch = relocation_scratch();
+        let location = storage.heap.append_row(&[Datum::Int4(41)]).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let prepared = storage
+                .prepare_pending_write(table, 1, 7, 1, Some(location), true)
+                .unwrap();
+            storage.compact_heap(&mut scratch).unwrap();
+            storage.commit_drop(table);
+            let replacement = storage
+                .create_table(make_def("replacement", &[("id", ColType::Int4, false)]))
+                .unwrap();
+            assert_eq!(replacement, table);
+            let error = storage.publish_pending_write(prepared).err().unwrap();
+            assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            assert!(storage.tables[table].rows.is_empty());
+            // Publication failure must release the last owner of the old buffer.
+            let current = storage.heap.retain_allocation();
+            storage.compact_heap(&mut scratch).unwrap();
+            drop(current);
+            assert_eq!(storage.heap.used(), 0);
+        });
     }
 
     #[test]

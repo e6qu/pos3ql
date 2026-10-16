@@ -1,8 +1,9 @@
 //! Table-name reservation and initialization of an unused table slot.
 
 use super::{
-    AccessClass, AccessObject, CatalogDdlState, DependencyClass, Ownership, SqlError, Storage,
-    TableDef, TableSerialState, current_database, table_definitions,
+    AccessClass, AccessObject, CatalogDdlState, DependencyClass, Ownership,
+    RelationCumulativeStatistics, SqlError, Storage, TableDef, TableSerialState, TableStatistics,
+    current_database, table_definitions,
 };
 use crate::sql::eval::sqlstate;
 use crate::sql_err;

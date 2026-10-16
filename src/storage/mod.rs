@@ -20150,7 +20150,8 @@ impl Storage {
                 let ownership = self.tables[source_slot].ownership().committed();
                 let statistics = self.tables[source_slot].statistics.committed();
                 let serial_values = self.table_serial_values(source_slot);
-                let target_slot = self.alloc_table(definition, Some(txid))?;
+                let target_slot =
+                    table_creation::TableCreation::new(self).allocate(definition, Some(txid))?;
                 {
                     let target_table = &mut self.tables[target_slot];
                     target_table.identity_mut().created_at = created_at;
@@ -53778,7 +53779,7 @@ mod tests {
         let mut config = test_config();
         config.max_tables = 1;
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let definition = make_def("lifecycle_original", &[("id", ColType::Int4, true)]);
             let slot = storage.create_table_in(definition, 7).unwrap();
@@ -56445,7 +56446,7 @@ mod tests {
     fn relation_publication_retained_definition_does_not_block_another_table() {
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let storage = Storage::new(&config, &mut budget).unwrap();
         let first = storage
             .create_table_in(make_def("selected", &[]), 7)
             .unwrap();

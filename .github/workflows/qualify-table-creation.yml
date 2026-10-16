@@ -24,7 +24,7 @@ jobs:
       - name: Concurrent creation, cleanup, failure retry, retained rows and startup budget
         run: |
           set -eu
-          for selection in shared_table_creation table_retirement owned_heap_rows catalog_object_pools_follow_their_independent_startup_capacities; do
+          for selection in shared_table_creation table_retirement table_catalog_lifecycle_capacity_rollback_and_reuse_preserve_retained_identity relation_publication_retained_definition_does_not_block_another_table owned_heap_rows catalog_object_pools_follow_their_independent_startup_capacities; do
             cargo test --lib --locked "$selection" -- --test-threads=1 --nocapture | tee "$RUNNER_TEMP/creation-$selection.log"
             if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/creation-$selection.log"; then
               exit 1
@@ -33,7 +33,7 @@ jobs:
       - name: Schema rollback and prepared cold recovery
         run: |
           set -eu
-          for selection in prepared_transactions_survive_checkpoint_and_object_cold_recovery drop_schema_cascade; do
+          for selection in prepared_transactions_survive_checkpoint_and_object_cold_recovery database_template_catalogs_diverge_and_survive_object_cold_recovery database_retirement_and_failed_clone_clear_complete_images drop_schema_cascade; do
             cargo test --lib --locked "$selection" -- --test-threads=1 --nocapture | tee "$RUNNER_TEMP/creation-$selection.log"
             if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/creation-$selection.log"; then
               exit 1

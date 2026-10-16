@@ -12,6 +12,7 @@ mod log_positions;
 pub(crate) use log_positions::ReservedLogPosition;
 mod table_creation;
 mod table_definitions;
+mod table_edits;
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
 pub(crate) mod foreign;
@@ -27095,11 +27096,14 @@ impl Storage {
         let entry = &mut comments.entries[slot];
         match entry.pending {
             Some(p) if p.txid == txid => {
-                if let Some(identity) = entry
+                if entry
                     .pending_identity
-                    .take()
-                    .filter(|identity| identity.txid == txid)
+                    .is_some_and(|identity| identity.txid == txid)
                 {
+                    let identity = entry
+                        .pending_identity
+                        .take()
+                        .expect("comment identity belongs to the committing transaction");
                     entry.schema = identity.schema;
                     entry.name = identity.name;
                 }
@@ -34457,111 +34461,23 @@ impl Storage {
     /// describes the transition from the previously visible definition to
     /// `def`; the stored mapping is composed back to the committed definition.
     pub fn write_table_def(
-        &mut self,
+        &self,
         index: usize,
         txid: u32,
-        mut def: TableDef,
+        def: TableDef,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
-        if let Some(other) = self.tables[index].ddl_locked_by_other(txid) {
-            self.wait_for_transaction(txid, other)?;
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
-                "statement is waiting for concurrent DDL on \"{}\"",
-                {
-                    let definition = self.tables[index].definition();
-                    definition.name
-                }
-                .as_str()
-            ));
-        }
-        let current = *self.table_def(index, txid);
-        def.has_toast |= current.has_toast
-            || def
-                .columns()
-                .iter()
-                .any(|column| column.ctype.typlen() == -1);
-        def.has_rules |= current.has_rules;
-        let prior = self.pending_table_def(index).map(|pending| *pending);
-        let mut composed = [None; MAX_COLUMNS];
-        for (committed_column, target) in composed.iter_mut().enumerate().take({
-            let definition = self.tables[index].definition();
-            definition.n_columns
-        }) {
-            let current_name = match prior {
-                Some(version) if version.txid == txid => version.column_mapping[committed_column],
-                _ => Some(self.tables[index].definition().columns()[committed_column].name),
-            };
-            let Some(current_name) = current_name else {
-                continue;
-            };
-            let Some(current_column) = current.column_index(current_name.as_str()) else {
-                continue;
-            };
-            *target = column_mapping[current_column];
-        }
-        let version = PendingTableDef {
+        table_edits::TableDefinitionEdit::new(self, index).stage(
             txid,
             def,
-            column_mapping: composed,
-            rewrites_rows: rewrites_rows
-                || prior.is_some_and(|version| version.txid == txid && version.rewrites_rows),
-        };
-        self.pending_table_defs.stage(
-            &self.tables[index].definition,
-            version,
-            self.max_catalog_versions_per_object,
-        )?;
-        self.refresh_table_comment_identity(index, txid);
-        Ok(())
+            column_mapping,
+            rewrites_rows,
+        )
     }
 
-    pub fn rollback_table_def(&mut self, index: usize, txid: u32) {
-        if self
-            .pending_table_defs
-            .rollback(&self.tables[index].definition, txid)
-        {
-            self.refresh_table_comment_identity(index, txid);
-        }
-    }
-
-    fn refresh_table_comment_identity(&mut self, index: usize, txid: u32) {
-        let database = Some(self.tables[index].database());
-        let committed = *self.tables[index].definition();
-        let visible = *self.table_def(index, txid);
-        let changed = committed.schema != visible.schema || committed.name != visible.name;
-        for comment in self.comment_catalog().entries.iter_mut() {
-            if comment.used
-                && comment.database == database
-                && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
-                && comment.schema == committed.schema
-                && comment.name == committed.name
-            {
-                comment.pending_identity = changed.then_some(PendingCommentIdentity {
-                    txid,
-                    schema: visible.schema,
-                    name: visible.name,
-                });
-            }
-            if comment.used
-                && comment.database == database
-                && comment.class == CommentClass::Constraint
-                && comment.subid == index as u32
-                && comment.schema == committed.schema
-                && changed
-            {
-                let name = comment
-                    .pending_identity
-                    .filter(|identity| identity.txid == txid)
-                    .map_or(comment.name, |identity| identity.name);
-                comment.pending_identity = Some(PendingCommentIdentity {
-                    txid,
-                    schema: visible.schema,
-                    name,
-                });
-            }
-        }
+    pub fn rollback_table_def(&self, index: usize, txid: u32) {
+        table_edits::TableDefinitionEdit::new(self, index).rollback(txid);
     }
 
     /// Promotes the latest pending definition after its WAL batch is durable.
@@ -50877,14 +50793,7 @@ impl Storage {
             return Ok(None);
         };
         let mut state = self.tables[usize::from(table)].definition.write();
-        let other = state
-            .identity
-            .existence
-            .pending_txid()
-            .into_iter()
-            .chain(state.pending.map(|head| head.transaction))
-            .chain(state.pending_has_rules_txid)
-            .find(|&owner| owner != txid);
+        let other = state.locked_by_other(txid);
         if let Some(owner) = other {
             let name = state.committed.name;
             drop(state);

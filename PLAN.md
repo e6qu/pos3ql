@@ -76,6 +76,9 @@ access. Failed initialization releases its slot and index-cache claims. Pending 
 publication rechecks database, table identity, and transaction-visible existence
 after preparation, so removal cannot leave rows in an absent table. A pending write
 waiting on one table's definition does not delay writes to other tables.
+Pending table edits and rollback own only their selected table; column maps,
+version history and comment names change together. Committed definition changes
+and table rewrites still require exclusive storage access.
 The [implementation guide](docs/implemented-baseline.md) owns the completed
 contracts, examples, and capacity limits.
 

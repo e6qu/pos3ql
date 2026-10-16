@@ -8979,6 +8979,57 @@ fn pending_table_definition_schema_rollback_preserves_constraint_comments() {
 }
 
 #[test]
+fn pending_table_definition_comment_names_survive_journal_and_checkpoint_cold_recovery() {
+    for checkpoint in [false, true] {
+        let mut config = test_config(&format!("pending-table-comments-{checkpoint}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket =
+            format!("pending-table-comments-{}-{checkpoint}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, (1 << 29) + (112 << 20));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE SCHEMA pending_durable_moved; \
+             CREATE TABLE pending_durable_target (id integer, \
+               CONSTRAINT pending_durable_positive CHECK (id > 0)); \
+             COMMENT ON CONSTRAINT pending_durable_positive ON pending_durable_target \
+               IS 'durable pending comment'; \
+             BEGIN; \
+             ALTER TABLE pending_durable_target \
+               RENAME CONSTRAINT pending_durable_positive TO pending_durable_renamed; \
+             SAVEPOINT before_move; \
+             ALTER TABLE pending_durable_target SET SCHEMA pending_durable_moved; \
+             ROLLBACK TO before_move; COMMIT",
+        );
+        let text = String::from_utf8_lossy(&output);
+        assert!(!text.contains("ERROR"), "{text}");
+        if checkpoint {
+            assert!(engine.checkpoint().unwrap());
+        }
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut cold_budget = test_engine_budget(&config, (1 << 29) + (112 << 20));
+        let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+        let output = run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+               WHERE conrelid = 'pending_durable_target'::regclass \
+                 AND conname = 'pending_durable_renamed'",
+        );
+        assert_eq!(data_rows(&output), ["durable pending comment"]);
+        drop(cold);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+}
+
+#[test]
 fn constraint_comments_keep_identity_through_catalog_churn_and_lifecycle() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

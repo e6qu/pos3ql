@@ -20,6 +20,18 @@ pub(super) struct DefinitionState {
     pub(super) pending_has_rules_txid: Option<u32>,
 }
 
+impl DefinitionState {
+    pub(super) fn locked_by_other(&self, transaction: u32) -> Option<u32> {
+        self.identity
+            .existence
+            .pending_txid()
+            .into_iter()
+            .chain(self.pending.map(|head| head.transaction))
+            .chain(self.pending_has_rules_txid)
+            .find(|&owner| owner != transaction)
+    }
+}
+
 /// Identity and existence share publication ownership with the definition.
 #[derive(Clone, Copy)]
 pub(crate) struct TableIdentity {
@@ -143,6 +155,7 @@ impl DefinitionVersions {
             .expect("published definition slot exists")
     }
 
+    #[cfg(test)]
     pub(super) fn stage(
         &self,
         definition: &TableDefinition,
@@ -152,16 +165,13 @@ impl DefinitionVersions {
         self.stage_locked(&mut definition.write(), version, maximum_depth)
     }
 
-    fn stage_locked(
+    pub(super) fn stage_locked(
         &self,
         state: &mut DefinitionState,
         version: PendingTableDef,
         maximum_depth: u32,
     ) -> Result<(), SqlError> {
-        if state
-            .pending
-            .is_some_and(|head| head.transaction != version.txid)
-        {
+        if state.locked_by_other(version.txid).is_some() {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "table definition is owned by another transaction"
@@ -218,8 +228,18 @@ impl DefinitionVersions {
         ))
     }
 
+    pub(super) fn latest_locked(&self, state: &DefinitionState) -> Option<PendingTableDef> {
+        state
+            .pending
+            .map(|head| self.read(head.tail as usize).version)
+    }
+
+    #[cfg(test)]
     pub(super) fn rollback(&self, definition: &TableDefinition, transaction: u32) -> bool {
-        let mut state = definition.write();
+        self.rollback_locked(&mut definition.write(), transaction)
+    }
+
+    pub(super) fn rollback_locked(&self, state: &mut DefinitionState, transaction: u32) -> bool {
         let Some(head) = state.pending.filter(|head| head.transaction == transaction) else {
             return false;
         };
@@ -321,22 +341,7 @@ impl<'a> TableDefinitionRead<'a> {
     }
 
     pub(super) fn locked_by_other(&self, transaction: u32) -> Option<u32> {
-        self.state
-            .identity
-            .existence
-            .pending_txid()
-            .filter(|&owner| owner != transaction)
-            .or_else(|| {
-                self.state
-                    .pending
-                    .map(|head| head.transaction)
-                    .filter(|&owner| owner != transaction)
-            })
-            .or_else(|| {
-                self.state
-                    .pending_has_rules_txid
-                    .filter(|&owner| owner != transaction)
-            })
+        self.state.locked_by_other(transaction)
     }
 
     pub(super) fn committed(definition: &'a TableDefinition) -> Self {

@@ -1046,7 +1046,7 @@ fn execute_routine_query_under<'a>(
                     storage, txid, select, arena, params, sequences, None, emit,
                 )
             } else {
-                select_into_rows(storage, txid, select, arena, params, sequences, None, emit)
+                select_into_rows(storage, txid, select, arena, params, None, sequences, emit)
             }
         }
         RoutineQuery::Set(query) => {

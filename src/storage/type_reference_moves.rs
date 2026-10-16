@@ -1,5 +1,6 @@
 //! A type move updates only references belonging to its owning database.
 
+use super::table_definitions::TableIdentity;
 use super::{
     ArrElem, CatalogDdlState, ColType, CommentClass, DatabaseOid, DependencyClass,
     OperatorClassDefinition, OperatorDefinition, OperatorFamilyDefinition, RoutineArgumentDef,
@@ -39,10 +40,14 @@ impl TypeReferenceMove {
         }
     }
 
-    fn rewrite(self, ctype: ColType, identity: &mut Option<UserTypeName>) -> bool {
-        let matches = match self.kind {
+    pub(super) fn applies_to(self, identity: TableIdentity) -> bool {
+        identity.database == self.database && identity.existence != CatalogDdlState::Absent
+    }
+
+    fn matches(self, ctype: ColType, identity: Option<UserTypeName>) -> bool {
+        match self.kind {
             TypeReferenceKind::Domain => {
-                *identity == Some(self.prior)
+                identity == Some(self.prior)
                     || matches!(ctype, ColType::Array(ArrElem::Domain { slot, .. })
                         if usize::from(slot) == self.slot)
             }
@@ -52,15 +57,26 @@ impl TypeReferenceMove {
                         if usize::from(slot) == self.slot)
             }
             TypeReferenceKind::Composite => {
-                *identity == Some(self.prior)
+                identity == Some(self.prior)
                     && matches!(ctype, ColType::Composite(slot) | ColType::Array(ArrElem::Composite(slot))
                         if usize::from(slot) == self.slot)
             }
-        };
+        }
+    }
+
+    fn rewrite(self, ctype: ColType, identity: &mut Option<UserTypeName>) -> bool {
+        let matches = self.matches(ctype, *identity);
         if matches {
             *identity = Some(self.current);
         }
         matches
+    }
+
+    pub(super) fn references_definition(self, definition: &TableDef) -> bool {
+        definition
+            .columns()
+            .iter()
+            .any(|column| self.matches(column.ctype, column.user_type))
     }
 
     pub(super) fn rewrite_definition(self, definition: &mut TableDef) -> bool {
@@ -115,14 +131,28 @@ impl TypeReferenceMove {
 }
 
 impl Storage {
-    pub(super) fn move_type_references(&mut self, movement: TypeReferenceMove) {
-        for table in self.tables.iter_mut().filter(|table| {
-            table.database() == movement.database && table.existence() != CatalogDdlState::Absent
-        }) {
-            if self
-                .pending_table_defs
-                .move_type_references(&mut table.definition, movement)
+    // Type commit callers still retain exclusive storage ownership. The
+    // shared walk waits for one table without holding catalogs or allocators.
+    pub(super) fn move_type_references(&self, movement: TypeReferenceMove) {
+        for table in self.tables.iter() {
+            let _lifecycle = table
+                .lifecycle
+                .lock()
+                .expect("table lifecycle lock poisoned");
             {
+                let state = table.definition.read();
+                if !movement.applies_to(state.identity)
+                    || !self.pending_table_defs.references_type(&state, movement)
+                {
+                    continue;
+                }
+            }
+            let changed = {
+                let mut state = table.definition.write();
+                self.pending_table_defs
+                    .move_type_references_locked(&mut state, movement)
+            };
+            if changed {
                 table.mark_dirty();
             }
         }
@@ -181,7 +211,7 @@ impl Storage {
         );
     }
 
-    fn move_callable_type_references(&mut self, movement: TypeReferenceMove) {
+    fn move_callable_type_references(&self, movement: TypeReferenceMove) {
         {
             let mut catalog = self
                 .operator_catalog
@@ -222,7 +252,7 @@ impl Storage {
         }
     }
 
-    fn move_routine_type_references(&mut self, movement: TypeReferenceMove) {
+    fn move_routine_type_references(&self, movement: TypeReferenceMove) {
         let move_argument = |argument: &mut RoutineArgumentDef| {
             movement.rewrite(argument.ctype, &mut argument.user_type);
         };
@@ -300,6 +330,434 @@ impl Storage {
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{make_def, test_budget, test_config};
+    use super::super::{
+        CheckConstraint, CompositeFieldDef, CompositeSpec, DomainSpec, EnumMember, EnumSpec,
+        MAX_COLUMNS, MAX_COMPOSITE_FIELDS, MAX_DOMAIN_CHECKS, SqlName, comment_stackstr,
+    };
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const KINDS: [TypeReferenceKind; 3] = [
+        TypeReferenceKind::Domain,
+        TypeReferenceKind::Enum,
+        TypeReferenceKind::Composite,
+    ];
+
+    fn create_kind(
+        storage: &mut Storage,
+        kind: TypeReferenceKind,
+        identity: UserTypeName,
+    ) -> (usize, ColType, ColType) {
+        match kind {
+            TypeReferenceKind::Domain => {
+                let slot = storage
+                    .create_domain(
+                        identity.schema,
+                        identity.name,
+                        DomainSpec {
+                            base_domain: None,
+                            base_user_type: None,
+                            base: ColType::Int4,
+                            base_type_mod: -1,
+                            not_null: false,
+                            default_expr: None,
+                            checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
+                            n_checks: 0,
+                        },
+                        0,
+                    )
+                    .unwrap();
+                (
+                    slot,
+                    ColType::Int4,
+                    ColType::Array(ArrElem::domain(slot as u16, ColType::Int4).unwrap()),
+                )
+            }
+            TypeReferenceKind::Enum => {
+                let slot = storage
+                    .create_enum(
+                        identity.schema,
+                        identity.name,
+                        EnumSpec {
+                            members: &[EnumMember {
+                                label: SqlName::parse("ready").unwrap(),
+                                sort: 1.0,
+                            }],
+                        },
+                        0,
+                    )
+                    .unwrap();
+                (
+                    slot,
+                    ColType::Enum(slot as u16),
+                    ColType::Array(ArrElem::Enum(slot as u16)),
+                )
+            }
+            TypeReferenceKind::Composite => {
+                let mut fields = [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS];
+                fields[0] = CompositeFieldDef {
+                    attribute_number: 1,
+                    name: SqlName::parse("value").unwrap(),
+                    ctype: ColType::Int4,
+                    dropped: false,
+                    ..CompositeFieldDef::EMPTY
+                };
+                let slot = storage
+                    .create_composite(
+                        identity.schema,
+                        identity.name,
+                        CompositeSpec {
+                            fields,
+                            n_fields: 1,
+                        },
+                        0,
+                    )
+                    .unwrap();
+                (
+                    slot,
+                    ColType::Composite(slot as u16),
+                    ColType::Array(ArrElem::Composite(slot as u16)),
+                )
+            }
+        }
+    }
+
+    fn fixture(kind: TypeReferenceKind) -> (Storage, usize, usize, TypeReferenceMove) {
+        let mut config = test_config();
+        config.max_catalog_versions_per_object = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let prior = UserTypeName {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("prior_type").unwrap(),
+        };
+        let (slot, scalar, array) = create_kind(&mut storage, kind, prior);
+        let mut definition = make_def("related", &[("id", scalar, false), ("items", array, false)]);
+        for column in definition.columns.iter_mut().take(2) {
+            column.user_type = Some(prior);
+        }
+        let related = storage.create_table(definition).unwrap();
+        let unrelated = storage
+            .create_table(make_def("unrelated", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        storage
+            .apply_comment(
+                CommentClass::Type,
+                prior.schema,
+                prior.name,
+                0,
+                Some(comment_stackstr("type reference ownership").unwrap()),
+            )
+            .unwrap();
+        let movement = TypeReferenceMove::new(
+            DatabaseOid::POSTGRES,
+            kind,
+            slot,
+            prior,
+            UserTypeName {
+                schema: prior.schema,
+                name: SqlName::parse("current_type").unwrap(),
+            },
+        );
+        (storage, related, unrelated, movement)
+    }
+
+    fn mapping(name: &str) -> [Option<SqlName>; MAX_COLUMNS] {
+        let mut result = [None; MAX_COLUMNS];
+        result[0] = Some(SqlName::parse(name).unwrap());
+        result[1] = Some(SqlName::parse("items").unwrap());
+        result
+    }
+
+    fn publish_source(storage: &Storage, movement: TypeReferenceMove) {
+        // Reproduce the caller's completed source update before reference fanout.
+        let mut catalog = storage.type_catalog.lock().unwrap();
+        match movement.kind {
+            TypeReferenceKind::Domain => {
+                catalog.domains[movement.slot].schema = movement.current.schema;
+                catalog.domains[movement.slot].name = movement.current.name;
+            }
+            TypeReferenceKind::Enum => {
+                catalog.enums[movement.slot].schema = movement.current.schema;
+                catalog.enums[movement.slot].name = movement.current.name;
+            }
+            TypeReferenceKind::Composite => {
+                catalog.composites[movement.slot].schema = movement.current.schema;
+                catalog.composites[movement.slot].name = movement.current.name;
+            }
+        }
+    }
+
+    fn assert_identity(storage: &Storage, table: usize, transaction: u32, expected: UserTypeName) {
+        for column in storage.table_def(table, transaction).columns() {
+            assert_eq!(column.user_type, Some(expected));
+        }
+    }
+
+    #[test]
+    fn shared_type_move_skips_unrelated_retained_definitions() {
+        for kind in KINDS {
+            let (storage, related, unrelated, movement) = fixture(kind);
+            let held = storage.table_def(unrelated, 0);
+            let generation = storage.tables[unrelated].generation();
+            let (send, receive) = mpsc::sync_channel(1);
+            std::thread::scope(|scope| {
+                let storage = &storage;
+                let writer = scope.spawn(move || {
+                    crate::mem::guard::forbid_alloc(|| {
+                        publish_source(storage, movement);
+                        storage.move_type_references(movement);
+                    });
+                    send.send(()).unwrap();
+                });
+                let progress = receive.recv_timeout(Duration::from_secs(5));
+                drop(held);
+                writer.join().unwrap();
+                assert!(
+                    progress.is_ok(),
+                    "an unrelated definition blocked a type move"
+                );
+            });
+            crate::mem::guard::forbid_alloc(|| {
+                assert_identity(&storage, related, 0, movement.current);
+                assert_eq!(storage.tables[unrelated].generation(), generation);
+                assert_eq!(
+                    storage
+                        .comment_text(
+                            CommentClass::Type,
+                            movement.current.schema.as_str(),
+                            movement.current.name.as_str(),
+                            0,
+                            0,
+                        )
+                        .unwrap()
+                        .as_str(),
+                    "type reference ownership"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn shared_type_move_wait_keeps_unrelated_edits_and_catalogs_available() {
+        for kind in KINDS {
+            for pending_reader in [false, true] {
+                let (storage, related, unrelated, movement) = fixture(kind);
+                for name in ["first_id", "second_id"] {
+                    let mut definition = *storage.table_def(related, 7);
+                    definition.columns[0].name = SqlName::parse(name).unwrap();
+                    storage
+                        .write_table_def(related, 7, definition, &mapping(name), false)
+                        .unwrap();
+                }
+                let held = storage.table_def(related, if pending_reader { 7 } else { 0 });
+                let (done_send, done_receive) = mpsc::sync_channel(1);
+                let (other_send, other_receive) = mpsc::sync_channel(1);
+                std::thread::scope(|scope| {
+                    let storage = &storage;
+                    let writer = scope.spawn(move || {
+                        crate::mem::guard::forbid_alloc(|| {
+                            publish_source(storage, movement);
+                            storage.move_type_references(movement);
+                        });
+                        done_send.send(()).unwrap();
+                    });
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let waiting = loop {
+                        match storage.tables[related].lifecycle.try_lock() {
+                            Err(std::sync::TryLockError::WouldBlock) => break true,
+                            Ok(owner) => drop(owner),
+                            Err(std::sync::TryLockError::Poisoned(_)) => break false,
+                        }
+                        if Instant::now() >= deadline {
+                            break false;
+                        }
+                        std::thread::yield_now();
+                    };
+                    let other = scope.spawn(move || {
+                        let progress = crate::mem::guard::forbid_alloc(|| {
+                            if storage.type_catalog.try_lock().is_err()
+                                || storage.routines.try_lock().is_err()
+                                || storage.operator_catalog.try_lock().is_err()
+                                || storage.casts.try_lock().is_err()
+                            {
+                                return false;
+                            }
+                            for _ in 0..16 {
+                                let mut definition = *storage.table_def(unrelated, 9);
+                                definition.name = SqlName::parse("other_pending").unwrap();
+                                storage
+                                    .write_table_def(
+                                        unrelated,
+                                        9,
+                                        definition,
+                                        &mapping("id"),
+                                        false,
+                                    )
+                                    .unwrap();
+                                storage.rollback_table_def(unrelated, 9);
+                            }
+                            storage
+                                .apply_comment(
+                                    CommentClass::Relation,
+                                    SqlName::parse("public").unwrap(),
+                                    SqlName::parse("unrelated").unwrap(),
+                                    0,
+                                    Some(comment_stackstr("available during a type move").unwrap()),
+                                )
+                                .unwrap();
+                            true
+                        });
+                        other_send.send(progress).unwrap();
+                    });
+                    let progress = other_receive.recv_timeout(Duration::from_secs(5));
+                    let completed_early = done_receive.try_recv().is_ok();
+                    let retained_identity = held.columns()[0].user_type;
+                    drop(held);
+                    writer.join().unwrap();
+                    other.join().unwrap();
+                    assert_eq!(retained_identity, Some(movement.prior));
+                    assert!(
+                        waiting,
+                        "the move did not acquire its selected lifecycle owner"
+                    );
+                    assert!(
+                        !completed_early,
+                        "a type move changed a retained definition"
+                    );
+                    assert_eq!(
+                        progress,
+                        Ok(true),
+                        "a type move reserved unrelated resources"
+                    );
+                });
+                crate::mem::guard::forbid_alloc(|| {
+                    assert_identity(&storage, related, 0, movement.current);
+                    assert_identity(&storage, related, 7, movement.current);
+                    assert_eq!(
+                        storage.table_def(related, 7).columns()[0].name.as_str(),
+                        "second_id"
+                    );
+                    storage.rollback_table_def(related, 7);
+                    assert_identity(&storage, related, 7, movement.current);
+                    assert_eq!(
+                        storage.table_def(related, 7).columns()[0].name.as_str(),
+                        "first_id"
+                    );
+                    storage.rollback_table_def(related, 7);
+                    assert_identity(&storage, related, 0, movement.current);
+                    assert!(storage.pending_table_def(related).is_none());
+                    assert!(storage.pending_table_defs.test_write().is_ok());
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn shared_type_move_updates_references_found_only_in_pending_versions() {
+        for kind in KINDS {
+            let (mut storage, related, _, movement) = fixture(kind);
+            let pending = *storage.table_def(related, 0);
+            {
+                let mut definition = storage.tables[related].definition_mut();
+                definition.columns[0].ctype = ColType::Int4;
+                definition.columns[1].ctype = ColType::Array(ArrElem::Int4);
+                for column in definition.columns.iter_mut().take(2) {
+                    column.user_type = None;
+                }
+            }
+            storage
+                .write_table_def(related, 7, pending, &mapping("id"), false)
+                .unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                publish_source(&storage, movement);
+                storage.move_type_references(movement);
+                assert_identity(&storage, related, 7, movement.current);
+                assert!(
+                    storage
+                        .table_def(related, 0)
+                        .columns()
+                        .iter()
+                        .all(|column| column.user_type.is_none())
+                );
+                storage.rollback_table_def(related, 7);
+                assert!(
+                    storage
+                        .table_def(related, 0)
+                        .columns()
+                        .iter()
+                        .all(|column| column.user_type.is_none())
+                );
+                assert!(storage.pending_table_defs.test_write().is_ok());
+            });
+        }
+    }
+
+    #[test]
+    fn shared_type_move_skips_foreign_and_retired_slots_before_reuse() {
+        for kind in KINDS {
+            let (mut storage, related, _, movement) = fixture(kind);
+            let retired = storage
+                .create_table({
+                    let mut definition = *storage.table_def(related, 0);
+                    definition.name = SqlName::parse("retired").unwrap();
+                    definition
+                })
+                .unwrap();
+            let retired_stamp = storage.table(retired).created_at();
+            storage.select_database(DatabaseOid::TEMPLATE1).unwrap();
+            let (_, scalar, array) = create_kind(&mut storage, kind, movement.prior);
+            let mut definition = make_def(
+                "foreign_type_refs",
+                &[("id", scalar, false), ("items", array, false)],
+            );
+            for column in definition.columns.iter_mut().take(2) {
+                column.user_type = Some(movement.prior);
+            }
+            let foreign = storage.create_table(definition).unwrap();
+            storage.select_database(DatabaseOid::POSTGRES).unwrap();
+            storage.drop_table(retired);
+            let retired_view = storage.table_def(retired, 0);
+            let foreign_view = storage.table_def(foreign, 0);
+            let (send, receive) = mpsc::sync_channel(1);
+            std::thread::scope(|scope| {
+                let storage = &storage;
+                let writer = scope.spawn(move || {
+                    crate::mem::guard::forbid_alloc(|| {
+                        publish_source(storage, movement);
+                        storage.move_type_references(movement);
+                    });
+                    send.send(()).unwrap();
+                });
+                let progress = receive.recv_timeout(Duration::from_secs(5));
+                let retired_identity = retired_view.columns()[0].user_type;
+                let foreign_identity = foreign_view.columns()[0].user_type;
+                drop(retired_view);
+                drop(foreign_view);
+                writer.join().unwrap();
+                assert_eq!(retired_identity, Some(movement.prior));
+                assert_eq!(foreign_identity, Some(movement.prior));
+                assert!(progress.is_ok(), "an excluded table blocked a type move");
+            });
+            assert_identity(&storage, related, 0, movement.current);
+            let replacement = storage
+                .create_table(make_def("replacement", &[("id", ColType::Int4, false)]))
+                .unwrap();
+            assert_eq!(replacement, retired);
+            assert!(storage.table(replacement).created_at() > retired_stamp);
+            assert!(
+                storage.table_def(replacement, 0).columns()[0]
+                    .user_type
+                    .is_none()
+            );
         }
     }
 }

@@ -355,6 +355,13 @@ domain's current name, so recovery can resolve it. Type usage and ownership
 checks resolve the name visible inside that transaction while internal references
 retain their bound identity until commit. Converting an identifier to regtype
 or calling format_type also uses the current domain or domain-array name.
+The reference walk uses each table's existing lifecycle and definition guards.
+An unrelated definition can stay open for reading while a type move inspects it.
+Waiting for a matching definition holds no shared catalog or definition allocator;
+all pending images receive the new type name before their owner can roll back.
+No startup pool or memory reservation is added. Complete type commits still
+require exclusive storage access; coordinating their publication and enabling
+SQL workers remain planned work.
 Type comments move within the same database. Composite type renames journal only the name
 change, preserving current field references during replay. The
 [format guide](durable-format.md#composite-type-name-changes) gives the upgrade

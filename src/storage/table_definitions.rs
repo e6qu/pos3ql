@@ -214,20 +214,37 @@ impl DefinitionVersions {
         Ok(())
     }
 
-    pub(super) fn move_type_references(
-        &mut self,
-        definition: &mut TableDefinition,
+    pub(super) fn references_type(
+        &self,
+        state: &DefinitionState,
         movement: super::type_reference_moves::TypeReferenceMove,
     ) -> bool {
-        let mut state = definition.exclusive();
+        if movement.references_definition(&state.committed) {
+            return true;
+        }
+        let mut tail = state.pending.map(|head| head.tail);
+        while let Some(slot) = tail {
+            let entry = self.read(slot as usize);
+            if movement.references_definition(&entry.version.def) {
+                return true;
+            }
+            tail = entry.previous;
+        }
+        false
+    }
+
+    pub(super) fn move_type_references_locked(
+        &self,
+        state: &mut DefinitionState,
+        movement: super::type_reference_moves::TypeReferenceMove,
+    ) -> bool {
         let mut changed = movement.rewrite_definition(&mut state.committed);
         let mut tail = state.pending.map(|head| head.tail);
         while let Some(slot) = tail {
-            let entry = self.slots[slot as usize]
-                .get_mut()
-                .expect("definition slot lock poisoned")
-                .as_mut()
-                .expect("published definition slot exists");
+            let mut owner = self.slots[slot as usize]
+                .write()
+                .expect("definition slot lock poisoned");
+            let entry = owner.as_mut().expect("published definition slot exists");
             changed |= movement.rewrite_definition(&mut entry.version.def);
             tail = entry.previous;
         }

@@ -4,7 +4,7 @@ This file records defects whose repair is prevented by an external blocker
 or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
-No defects currently require an external unblock. Remaining implementation
+No externally blocked defects are currently recorded. Remaining implementation
 work and concurrency limits belong in PLAN.md.
 
 For a new entry, include a reproducer, affected boundary, observed behavior,

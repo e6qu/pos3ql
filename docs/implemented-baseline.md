@@ -434,6 +434,8 @@ TO orders DO INSTEAD NOTHING`. Until A commits or rolls back, connection B's
 an unrelated table can continue. A failed or rolled-back rule creation does not
 publish the table's rule-history flag; committed history remains set after the
 last rule is dropped. Savepoint rollback restores both the history and locks.
+`pg_rules` shows user rules; a view's internal `_RETURN` rule remains visible
+through `pg_rewrite`.
 
 Table and view slots have distinct lock identities. The lock registry reserves
 space at startup for each transaction's tables and views; exhaustion returns

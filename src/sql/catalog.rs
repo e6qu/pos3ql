@@ -30243,11 +30243,16 @@ fn pg_rules<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_rules", false);
-    let count = storage.rules_visible_to(txid).count();
+    let visible_rules = || {
+        storage
+            .rules_visible_to(txid)
+            .filter(|(_, rule)| rule.definition_for(txid).name.as_str() != "_RETURN")
+    };
+    let count = visible_rules().count();
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (index, (_, rule)) in storage.rules_visible_to(txid).enumerate() {
+    for (index, (_, rule)) in visible_rules().enumerate() {
         let definition = rule.definition_for(txid);
         let (schema, relation) = match definition.target {
             crate::storage::RuleTarget::Table(slot) => {

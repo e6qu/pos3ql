@@ -6789,7 +6789,8 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         &mut engine,
         &mut budget,
         "CREATE TABLE durable_prepared(id integer PRIMARY KEY, value text); \
-         INSERT INTO durable_prepared VALUES (1, 'checkpoint')",
+         INSERT INTO durable_prepared VALUES (1, 'checkpoint'); \
+         CREATE VIEW durable_discard_view AS SELECT 2 AS id",
     );
     assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
     let prepared = run_with(
@@ -6983,9 +6984,12 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         &mut recovered,
         &mut recovered_budget,
         "BEGIN; ALTER VIEW durable_prepared_view RENAME TO durable_renamed_view; \
+         ALTER VIEW durable_renamed_view SET (security_barrier=true); \
          CREATE RULE discarded_rule AS ON INSERT TO durable_renamed_view DO INSTEAD NOTHING; \
          DROP RULE discarded_rule ON durable_renamed_view; \
-         CREATE RULE after_recovery AS ON INSERT TO durable_renamed_view DO INSTEAD NOTHING; COMMIT",
+         CREATE RULE after_recovery AS ON INSERT TO durable_renamed_view DO INSTEAD NOTHING; \
+         ALTER VIEW durable_discard_view RENAME TO durable_drop_view; \
+         DROP VIEW durable_drop_view; COMMIT",
     );
     assert!(
         !String::from_utf8_lossy(&created_rule).contains("ERROR"),
@@ -7064,6 +7068,25 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         ["durable_renamed_view|after_recovery"],
         "{}",
         String::from_utf8_lossy(&journal_rules)
+    );
+    let removed_view = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "SELECT to_regclass('durable_discard_view') IS NULL, to_regclass('durable_drop_view') IS NULL",
+    );
+    assert_eq!(
+        data_rows(&removed_view),
+        ["t|t"],
+        "{}",
+        String::from_utf8_lossy(&removed_view)
+    );
+    let renamed = replayed
+        .storage
+        .view_slot("public", "durable_renamed_view", 0)
+        .unwrap();
+    assert_eq!(
+        replayed.storage.view(renamed).options.security_barrier,
+        crate::storage::ViewSecurityBarrier::Enabled
     );
     assert!(replayed.checkpoint().unwrap());
     drop(replayed);

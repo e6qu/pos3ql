@@ -13111,8 +13111,8 @@ pub(crate) fn drop_schema(
                 let (schema, vname, temporary) = {
                     let view = storage.view(*v);
                     (
-                        view.schema,
-                        view.name,
+                        view.schema_for(txn.txid),
+                        view.name_for(txn.txid),
                         view.persistence == crate::storage::RelationPersistence::Temporary,
                     )
                 };
@@ -36378,7 +36378,7 @@ pub fn alter_view(
         }
         let (schema, view_name) = {
             let view = storage.view(slot);
-            (view.schema_for(txn.txid), view.name)
+            view.names_for(txn.txid)
         };
         if storage.relation_name_taken(new_schema, view_name.as_str(), txn.txid) {
             return sql_fail(sql_err!(
@@ -36533,7 +36533,7 @@ pub fn alter_view(
             };
             let (schema, view_name) = {
                 let view = storage.view(slot);
-                (view.schema_for(txn.txid), view.name_for(txn.txid))
+                view.names_for(txn.txid)
             };
             let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
                 Ok(prior) => prior,
@@ -36584,7 +36584,7 @@ pub fn alter_view(
             };
             let (schema, view_name) = {
                 let view = storage.view(slot);
-                (view.schema_for(txn.txid), view.name_for(txn.txid))
+                view.names_for(txn.txid)
             };
             let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
                 Ok(prior) => prior,
@@ -36640,7 +36640,7 @@ pub fn alter_view(
             };
             let (schema, view_name) = {
                 let view = storage.view(slot);
-                (view.schema_for(txn.txid), view.name_for(txn.txid))
+                view.names_for(txn.txid)
             };
             let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
                 Ok(prior) => prior,
@@ -36693,7 +36693,7 @@ pub fn alter_view(
         AlterViewAction::RenameTo(new_name) => {
             let (schema, current_name) = {
                 let view = storage.view(slot);
-                (view.schema_for(txn.txid), view.name_for(txn.txid))
+                view.names_for(txn.txid)
             };
             if new_name == current_name.as_str() {
                 responder.command_complete("ALTER VIEW")?;
@@ -36752,7 +36752,7 @@ pub fn alter_view(
     }
     let (schema, view_name) = {
         let view = storage.view(slot);
-        (view.schema, view.name)
+        view.names_for(txn.txid)
     };
     let prior = match storage.stage_view_options(slot, options, txn.txid) {
         Ok(prior) => prior,
@@ -44728,8 +44728,8 @@ fn drop_view_slot(
     let (schema, name, temporary) = {
         let view = storage.view(slot);
         (
-            view.schema,
-            view.name,
+            view.schema_for(txn.txid),
+            view.name_for(txn.txid),
             view.persistence == crate::storage::RelationPersistence::Temporary,
         )
     };
@@ -44764,7 +44764,7 @@ fn drop_view_trigger_dependencies(
         };
         let (schema, name) = {
             let view = storage.view(view_slot);
-            (view.schema, view.name)
+            view.names_for(txn.txid)
         };
         if storage.view(view_slot).persistence != crate::storage::RelationPersistence::Temporary {
             let lsn = storage.bump_lsn();
@@ -47063,8 +47063,8 @@ pub fn drop_view(
             let (schema, view_name, temporary) = {
                 let v = storage.view(slot);
                 (
-                    v.schema,
-                    v.name,
+                    v.schema_for(txn.txid),
+                    v.name_for(txn.txid),
                     v.persistence == crate::storage::RelationPersistence::Temporary,
                 )
             };

@@ -5065,6 +5065,10 @@ impl ViewDef {
             .map_or(self.options, |pending| pending.options)
     }
 
+    pub(crate) fn names_for(&self, txid: u32) -> (SqlName, SqlName) {
+        (self.schema_for(txid), self.name_for(txid))
+    }
+
     pub(crate) fn name_for(&self, txid: u32) -> SqlName {
         self.pending_name
             .filter(|pending| pending.txid == txid)
@@ -50924,7 +50928,7 @@ impl Storage {
             }
             RuleTarget::View(slot) => {
                 let view = self.view(usize::from(slot));
-                (view.schema_for(txid), view.name_for(txid))
+                view.names_for(txid)
             }
         }
     }

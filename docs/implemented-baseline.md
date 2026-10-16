@@ -437,7 +437,8 @@ last rule is dropped. Savepoint rollback restores both the history and locks.
 `pg_rules` shows user rules; a view's internal `_RETURN` rule remains visible
 through `pg_rewrite`.
 After a view is renamed inside a transaction, rule listings use its new name.
-The same name is recorded for restart; rollback restores the old name.
+View changes and removal use those names too. The same names are recorded for
+restart; rollback restores the old names.
 
 Table and view slots have distinct lock identities. The lock registry reserves
 space at startup for each transaction's tables and views; exhaustion returns

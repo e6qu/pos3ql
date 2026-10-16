@@ -28460,7 +28460,7 @@ pub(crate) fn resolve_routine_type(
         .strip_suffix("[]")
         .map_or((written, false), |base| (base, true));
     let user_type = |schema, name| crate::storage::UserTypeName { schema, name };
-    let result = if let Some(slot) = storage.resolve_domain_slot(base, txid) {
+    let (result, usage_identity) = if let Some(slot) = storage.resolve_domain_slot(base, txid) {
         let domain = storage.domain(slot);
         let ctype = if array {
             ColType::Array(ArrElem::domain(slot as u16, domain.base).ok_or_else(|| {
@@ -28473,30 +28473,44 @@ pub(crate) fn resolve_routine_type(
         } else {
             domain.base
         };
-        crate::storage::RoutineResult {
-            ctype,
-            user_type: Some(user_type(domain.schema, domain.name)),
-        }
+        // Binding retains the committed identity until publication; access
+        // checks use the name visible to this transaction.
+        let visible = storage.domain_for(slot, txid);
+        (
+            crate::storage::RoutineResult {
+                ctype,
+                user_type: Some(user_type(domain.schema, domain.name)),
+            },
+            user_type(visible.schema, visible.name),
+        )
     } else if let Some(slot) = storage.resolve_enum_slot(base, txid) {
         let definition = storage.enum_for(slot, txid);
-        crate::storage::RoutineResult {
-            ctype: if array {
-                ColType::Array(ArrElem::Enum(slot as u16))
-            } else {
-                ColType::Enum(slot as u16)
+        let identity = user_type(definition.schema, definition.name);
+        (
+            crate::storage::RoutineResult {
+                ctype: if array {
+                    ColType::Array(ArrElem::Enum(slot as u16))
+                } else {
+                    ColType::Enum(slot as u16)
+                },
+                user_type: Some(identity),
             },
-            user_type: Some(user_type(definition.schema, definition.name)),
-        }
+            identity,
+        )
     } else if let Some(slot) = storage.resolve_composite_slot(base, txid) {
         let definition = storage.composite_for(slot, txid);
-        crate::storage::RoutineResult {
-            ctype: if array {
-                ColType::Array(ArrElem::Composite(slot as u16))
-            } else {
-                ColType::Composite(slot as u16)
+        let identity = user_type(definition.schema, definition.name);
+        (
+            crate::storage::RoutineResult {
+                ctype: if array {
+                    ColType::Array(ArrElem::Composite(slot as u16))
+                } else {
+                    ColType::Composite(slot as u16)
+                },
+                user_type: Some(identity),
             },
-            user_type: Some(user_type(definition.schema, definition.name)),
-        }
+            identity,
+        )
     } else {
         return Err(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -28504,10 +28518,11 @@ pub(crate) fn resolve_routine_type(
             written
         ));
     };
-    let identity = result
-        .user_type
-        .expect("user type resolution produced identity");
-    storage.require_type_usage(identity.schema.as_str(), identity.name.as_str(), txid)?;
+    storage.require_type_usage(
+        usage_identity.schema.as_str(),
+        usage_identity.name.as_str(),
+        txid,
+    )?;
     Ok(result)
 }
 
@@ -28638,8 +28653,15 @@ fn user_type_access_object(
     result: crate::storage::RoutineResult,
 ) -> Option<crate::storage::AccessObject> {
     let identity = result.user_type?;
+    if let Some(slot) =
+        storage.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+    {
+        return Some(crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Domain,
+            slot: slot as u16,
+        });
+    }
     [
-        crate::storage::AccessClass::Domain,
         crate::storage::AccessClass::Enum,
         crate::storage::AccessClass::Composite,
     ]

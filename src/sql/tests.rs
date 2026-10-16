@@ -83431,6 +83431,27 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
         "{}",
         String::from_utf8_lossy(&ambiguous)
     );
+    type_reference_execute(&mut engine, &mut budget, "CREATE ROLE domain_cast_owner");
+    assert_eq!(
+        type_reference_execute(
+            &mut engine,
+            &mut budget,
+            "BEGIN;
+GRANT USAGE, CREATE ON SCHEMA routine_domains TO domain_cast_owner;
+ALTER DOMAIN routine_domains.positive OWNER TO domain_cast_owner;
+SET ROLE domain_cast_owner;
+ALTER DOMAIN routine_domains.positive RENAME TO moved_positive;
+CREATE CAST (routine_domains.moved_positive AS text) WITH INOUT;
+SELECT castsource::regtype::text, casttarget::regtype::text
+FROM pg_cast
+WHERE castsource = 'routine_domains.moved_positive'::regtype::oid
+AND casttarget = 'text'::regtype::oid;
+RESET ROLE;
+ROLLBACK;"
+        ),
+        ["routine_domains.moved_positive|text"]
+    );
+    type_reference_execute(&mut engine, &mut budget, "DROP ROLE domain_cast_owner");
     let dropped = run_with_fixed_memory(
         &mut engine,
         &budget,

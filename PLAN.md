@@ -78,7 +78,8 @@ Table-name selection uses small per-table views; it waits only for the selected
 definition and rechecks its identity before returning a match.
 Type moves retain cast and operator input/output identities through journal replay,
 including edits and cast creation staged after a rename in the same transaction. Cast recovery
-uses the enclosing journal or checkpoint database scope.
+uses the enclosing journal or checkpoint database scope. Type access checks use
+the transaction-visible name after a pending rename.
 The [implementation guide](docs/implemented-baseline.md) owns completed contracts,
 user examples and exact capacity errors.
 

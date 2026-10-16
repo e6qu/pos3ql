@@ -89,4 +89,18 @@ SELECT $1::routine_domains.positive OPERATOR(routine_domains.===) $2::routine_do
 EXECUTE exact_domain_operator(7, 8);
 DEALLOCATE exact_domain_operator;
 SELECT 7 OPERATOR(routine_domains.===) 8;
+CREATE ROLE domain_cast_owner;
+BEGIN;
+GRANT USAGE, CREATE ON SCHEMA routine_domains TO domain_cast_owner;
+ALTER DOMAIN routine_domains.positive OWNER TO domain_cast_owner;
+SET ROLE domain_cast_owner;
+ALTER DOMAIN routine_domains.positive RENAME TO moved_positive;
+CREATE CAST (routine_domains.moved_positive AS text) WITH INOUT;
+SELECT castsource::regtype::text, casttarget::regtype::text
+FROM pg_cast
+WHERE castsource = 'routine_domains.moved_positive'::regtype::oid
+AND casttarget = 'text'::regtype::oid;
+RESET ROLE;
+ROLLBACK;
+DROP ROLE domain_cast_owner;
 DROP SCHEMA routine_domains CASCADE;

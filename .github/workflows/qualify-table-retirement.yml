@@ -1,0 +1,41 @@
+name: Qualify table retirement
+
+on:
+  push:
+    branches: [share-table-retirement]
+
+jobs:
+  retirement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Compile and lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Retained definitions, bounded cleanup, reuse, and exact startup budget
+        run: |
+          set -eu
+          for selection in table_retirement owned_row_lookup_selects_pending_history_and_current_after_retirement owned_heap_rows catalog_object_pools_follow_their_independent_startup_capacities; do
+            cargo test --lib --locked "$selection" -- --test-threads=1 --nocapture | tee "$RUNNER_TEMP/retirement-$selection.log"
+            if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/retirement-$selection.log"; then
+              exit 1
+            fi
+          done
+      - name: Schema cleanup and prepared recovery
+        run: |
+          set -eu
+          for selection in prepared_transactions_survive_checkpoint_and_object_cold_recovery drop_schema_cascade; do
+            cargo test --lib --locked "$selection" -- --test-threads=1 --nocapture | tee "$RUNNER_TEMP/retirement-$selection.log"
+            if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/retirement-$selection.log"; then
+              exit 1
+            fi
+          done

@@ -6982,7 +6982,10 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
     let created_rule = run_with(
         &mut recovered,
         &mut recovered_budget,
-        "CREATE RULE after_recovery AS ON INSERT TO durable_prepared_view DO INSTEAD NOTHING",
+        "BEGIN; ALTER VIEW durable_prepared_view RENAME TO durable_renamed_view; \
+         CREATE RULE discarded_rule AS ON INSERT TO durable_renamed_view DO INSTEAD NOTHING; \
+         DROP RULE discarded_rule ON durable_renamed_view; \
+         CREATE RULE after_recovery AS ON INSERT TO durable_renamed_view DO INSTEAD NOTHING; COMMIT",
     );
     assert!(
         !String::from_utf8_lossy(&created_rule).contains("ERROR"),
@@ -7047,8 +7050,23 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         "{}",
         String::from_utf8_lossy(&reused)
     );
-    assert!(recovered.checkpoint().unwrap());
     drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut replay_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let journal_rules = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "SELECT tablename,rulename FROM pg_rules WHERE tablename='durable_renamed_view'",
+    );
+    assert_eq!(
+        data_rows(&journal_rules),
+        ["durable_renamed_view|after_recovery"],
+        "{}",
+        String::from_utf8_lossy(&journal_rules)
+    );
+    assert!(replayed.checkpoint().unwrap());
+    drop(replayed);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
     let mut final_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
@@ -7066,7 +7084,7 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         data_rows(&run_with(
             &mut final_engine,
             &mut final_budget,
-            "SELECT rulename FROM pg_rules WHERE tablename='durable_prepared_view'",
+            "SELECT rulename FROM pg_rules WHERE tablename='durable_renamed_view'",
         )),
         ["after_recovery"]
     );

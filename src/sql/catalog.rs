@@ -13629,16 +13629,7 @@ pub fn rule_def_text<'a>(
         return Ok(None);
     };
     let definition = rule.definition_for(txid);
-    let (schema, relation) = match definition.target {
-        crate::storage::RuleTarget::Table(slot) => {
-            let table = storage.table_def(usize::from(slot), txid);
-            (table.schema, table.name)
-        }
-        crate::storage::RuleTarget::View(slot) => {
-            let view = storage.view(usize::from(slot));
-            (view.schema_for(txid), view.name)
-        }
-    };
+    let (schema, relation) = storage.rule_target_names(definition.target, txid);
     let rule_name = super::eval::quote_ident_str(definition.name.as_str(), arena)?;
     let schema = super::eval::quote_ident_str(schema.as_str(), arena)?;
     let relation = super::eval::quote_ident_str(relation.as_str(), arena)?;
@@ -30254,16 +30245,7 @@ fn pg_rules<'a>(
         .map_err(|_| arena_full())?;
     for (index, (_, rule)) in visible_rules().enumerate() {
         let definition = rule.definition_for(txid);
-        let (schema, relation) = match definition.target {
-            crate::storage::RuleTarget::Table(slot) => {
-                let table = storage.table_def(usize::from(slot), txid);
-                (table.schema, table.name)
-            }
-            crate::storage::RuleTarget::View(slot) => {
-                let view = storage.view(usize::from(slot));
-                (view.schema_for(txid), view.name)
-            }
-        };
+        let (schema, relation) = storage.rule_target_names(definition.target, txid);
         rows[index] = row(
             &[
                 text(schema.as_str(), arena)?,

@@ -37668,23 +37668,10 @@ pub fn drop_rule(
         ));
     }
     storage.drop_rule(slot, txn.txid);
-    let (target_kind, schema, relation) = match target {
-        crate::storage::RuleTarget::Table(slot) => {
-            let definition = storage.table_def(usize::from(slot), txn.txid);
-            (
-                crate::wal::TriggerTargetKind::Table,
-                definition.schema,
-                definition.name,
-            )
-        }
-        crate::storage::RuleTarget::View(slot) => {
-            let definition = storage.view(usize::from(slot));
-            (
-                crate::wal::TriggerTargetKind::View,
-                definition.schema_for(txn.txid),
-                definition.name,
-            )
-        }
+    let (schema, relation) = storage.rule_target_names(target, txn.txid);
+    let target_kind = match target {
+        crate::storage::RuleTarget::Table(_) => crate::wal::TriggerTargetKind::Table,
+        crate::storage::RuleTarget::View(_) => crate::wal::TriggerTargetKind::View,
     };
     let temporary = storage.access_object_is_temporary(target.access_object(), txn.txid);
     if !temporary {
@@ -37722,23 +37709,10 @@ fn stage_rule(
     if storage.access_object_is_temporary(definition.target.access_object(), txn.txid) {
         return Ok(());
     }
-    let (target, schema, relation) = match definition.target {
-        crate::storage::RuleTarget::Table(slot) => {
-            let table = storage.table_def(usize::from(slot), txn.txid);
-            (
-                crate::wal::TriggerTargetKind::Table,
-                table.schema,
-                table.name,
-            )
-        }
-        crate::storage::RuleTarget::View(slot) => {
-            let view = storage.view(usize::from(slot));
-            (
-                crate::wal::TriggerTargetKind::View,
-                view.schema_for(txn.txid),
-                view.name,
-            )
-        }
+    let (schema, relation) = storage.rule_target_names(definition.target, txn.txid);
+    let target = match definition.target {
+        crate::storage::RuleTarget::Table(_) => crate::wal::TriggerTargetKind::Table,
+        crate::storage::RuleTarget::View(_) => crate::wal::TriggerTargetKind::View,
     };
     let lsn = storage.lsn() + 1;
     wal.stage(
@@ -44685,19 +44659,10 @@ fn stage_rule_drop(
     if storage.access_object_is_temporary(definition.target.access_object(), txn.txid) {
         return Ok(());
     }
-    let (target, schema, relation) = match definition.target {
-        crate::storage::RuleTarget::Table(table) => {
-            let table = storage.table_def(usize::from(table), txn.txid);
-            (
-                crate::wal::TriggerTargetKind::Table,
-                table.schema,
-                table.name,
-            )
-        }
-        crate::storage::RuleTarget::View(view) => {
-            let view = storage.view(usize::from(view));
-            (crate::wal::TriggerTargetKind::View, view.schema, view.name)
-        }
+    let (schema, relation) = storage.rule_target_names(definition.target, txn.txid);
+    let target = match definition.target {
+        crate::storage::RuleTarget::Table(_) => crate::wal::TriggerTargetKind::Table,
+        crate::storage::RuleTarget::View(_) => crate::wal::TriggerTargetKind::View,
     };
     let lsn = storage.bump_lsn();
     wal.stage(

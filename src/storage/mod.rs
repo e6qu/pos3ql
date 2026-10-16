@@ -50915,6 +50915,20 @@ impl Storage {
         Ok(state.pending_has_rules_txid.replace(txid))
     }
 
+    /// Rule catalogs and journal staging use the same transaction-visible name.
+    pub(crate) fn rule_target_names(&self, target: RuleTarget, txid: u32) -> (SqlName, SqlName) {
+        match target {
+            RuleTarget::Table(slot) => {
+                let definition = self.table_def(usize::from(slot), txid);
+                (definition.schema, definition.name)
+            }
+            RuleTarget::View(slot) => {
+                let view = self.view(usize::from(slot));
+                (view.schema_for(txid), view.name_for(txid))
+            }
+        }
+    }
+
     pub(crate) fn table_has_rules(&self, table: usize, txid: u32) -> bool {
         let state = self.tables[table].definition.read();
         state.committed.has_rules || state.pending_has_rules_txid == Some(txid)

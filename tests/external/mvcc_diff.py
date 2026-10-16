@@ -999,6 +999,16 @@ def rule_publication_transcript(reader, writer) -> list[str]:
         ]:
             results.append(f"view_existing_reader_{label}=" + str(sqlstate(writer, statement)))
         reader.execute("ROLLBACK")
+        writer.execute("BEGIN")
+        writer.execute("ALTER VIEW rule_publication_view_diff RENAME TO rule_publication_renamed_diff")
+        renamed_rules = writer.execute("SELECT tablename,rulename FROM pg_rules WHERE tablename IN ('rule_publication_view_diff','rule_publication_renamed_diff') ORDER BY tablename,rulename").fetchall()
+        definition_renamed = writer.execute("SELECT pg_get_ruledef(oid) LIKE '%rule_publication_renamed_diff%' FROM pg_rewrite WHERE ev_class='rule_publication_renamed_diff'::regclass AND rulename='stable_view_rule'").fetchone()[0]
+        results.append(f"rule_pending_view_name={renamed_rules}")
+        results.append(f"rule_pending_view_definition={definition_renamed}")
+        writer.execute("DROP RULE stable_view_rule ON rule_publication_renamed_diff")
+        writer.execute("ROLLBACK")
+        restored_rules = reader.execute("SELECT tablename,rulename FROM pg_rules WHERE tablename='rule_publication_view_diff' ORDER BY rulename").fetchall()
+        results.append(f"rule_renamed_view_rollback={restored_rules}")
         return results
     finally:
         reader.execute("ROLLBACK")

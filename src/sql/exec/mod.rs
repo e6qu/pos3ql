@@ -12625,8 +12625,11 @@ pub(crate) fn drop_schema(
             write_identifier(out, name.as_str());
         }
     };
-    let describe =
-        |storage: &Storage, o: &SchemaObject, out: &mut crate::util::StackStr<192>| match o {
+    let describe = |storage: &Storage,
+                    o: &SchemaObject,
+                    out: &mut crate::util::StackStr<192>|
+     -> Result<(), SqlError> {
+        match o {
             SchemaObject::Table(t) => {
                 let def = storage.table_def(*t, txn.txid);
                 let _ = write!(out, "table ");
@@ -12650,16 +12653,8 @@ pub(crate) fn drop_schema(
                     &routine.schema_for(txn.txid),
                     &routine.name_for(txn.txid),
                 );
-                let _ = write!(out, "(");
-                for (index, argument) in routine.arguments().iter().enumerate() {
-                    let _ = write!(
-                        out,
-                        "{}{}",
-                        if index == 0 { "" } else { "," },
-                        argument.ctype.name()
-                    );
-                }
-                let _ = write!(out, ")");
+                let signature = routine_dependency_suffix(storage, &routine)?;
+                let _ = write!(out, "{}", signature.as_str());
             }
             SchemaObject::Collation(slot) => {
                 let definition = storage.collation(*slot).definition_for(txn.txid);
@@ -12738,7 +12733,9 @@ pub(crate) fn drop_schema(
                 );
                 write_rel(out, &def.schema, &def.name);
             }
-        };
+        }
+        Ok(())
+    };
     let independently_reported = |object: &SchemaObject| match object {
         // PostgreSQL reports the owning table and suppresses its internal
         // statistics dependents. A statistics object on a surviving table is
@@ -12773,7 +12770,9 @@ pub(crate) fn drop_schema(
             .enumerate()
         {
             let mut line = crate::util::StackStr::<192>::new();
-            describe(storage, o, &mut line);
+            if let Err(error) = describe(storage, o, &mut line) {
+                return sql_fail(error);
+            }
             let schema = match o {
                 SchemaObject::Table(t) => storage.table_def(*t, txn.txid).schema,
                 SchemaObject::View(v) => storage.view(*v).schema,
@@ -12936,7 +12935,9 @@ pub(crate) fn drop_schema(
             .flatten()
             .find(|object| independently_reported(object))
             .expect("one independently reported object");
-        describe(storage, object, &mut line);
+        if let Err(error) = describe(storage, object, &mut line) {
+            return sql_fail(error);
+        }
         responder.notice(
             crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
             stack_format!(224, "drop cascades to {}", line.as_str()).as_str(),
@@ -12951,7 +12952,9 @@ pub(crate) fn drop_schema(
             .enumerate()
         {
             let mut line = crate::util::StackStr::<192>::new();
-            describe(storage, o, &mut line);
+            if let Err(error) = describe(storage, o, &mut line) {
+                return sql_fail(error);
+            }
             let _ = write!(
                 detail,
                 "{}drop cascades to {}",
@@ -45254,6 +45257,7 @@ fn alter_composite_type(
         ));
     }
     let mut altered = storage.composite_for(slot, txn.txid);
+    let prior_names = (altered.schema, altered.name);
     let mut renamed_attribute = None;
     let wrong_type = || {
         sql_err!(
@@ -45467,15 +45471,21 @@ fn alter_composite_type(
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
-    let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage_reserved(
-        txn.txid,
-        lsn,
-        &WalOp::CreateComposite {
+    let operation = if prior_names != (altered.schema, altered.name) {
+        WalOp::AlterCompositeIdentity {
+            schema: prior_names.0.as_str(),
+            name: prior_names.1.as_str(),
+            new_schema: altered.schema.as_str(),
+            new_name: altered.name.as_str(),
+        }
+    } else {
+        WalOp::CreateComposite {
             slot: slot as u16,
             definition: &altered,
-        },
-    ) {
+        }
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &operation) {
         storage.rollback_composite_alter(slot, prior);
         return sql_fail(error);
     }

@@ -528,6 +528,17 @@ impl ColTypeResolver for CatalogCols<'_> {
         static_meta_for_column(self.storage, column, self.txid)
     }
 
+    fn validate_explicit_cast(&self, source_oid: i32, target: ColType) -> Result<(), SqlError> {
+        if self
+            .storage
+            .cast_for_oids(source_oid, target.oid(), self.txid)
+            .is_none()
+        {
+            super::super::eval::validate_catalog_reference_cast(source_oid, target)?;
+        }
+        Ok(())
+    }
+
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {
         crate::sql::catalog::user_type_oid(self.storage, self.txid, type_name)
             .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
@@ -1372,6 +1383,10 @@ pub trait ColTypeResolver {
 
     fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
         self.resolve(qualifier, name).ok().map(StaticTypeMeta::of)
+    }
+
+    fn validate_explicit_cast(&self, _source_oid: i32, _target: ColType) -> Result<(), SqlError> {
+        Ok(())
     }
 
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {
@@ -3564,10 +3579,12 @@ pub fn infer_type_res(
         }
         Expr::Collate { operand, .. } => infer_type_res(operand, columns)?,
         Expr::Cast {
-            operand: _,
-            type_name,
-            ..
+            operand, type_name, ..
         } => {
+            if ColType::from_sql_name(type_name) == Some(ColType::Int2) {
+                let source_oid = infer_routine_argument_oid(operand, columns)?;
+                columns.validate_explicit_cast(source_oid, ColType::Int2)?;
+            }
             if let Some(type_oid) = columns.named_type_oid(type_name) {
                 return Ok((
                     type_oid,

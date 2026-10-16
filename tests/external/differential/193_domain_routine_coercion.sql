@@ -1,5 +1,9 @@
-SELECT pg_typeof(1)::oid, pg_typeof(1)::smallint,
-       pg_typeof(1)::integer, pg_typeof(1)::bigint;
+SELECT pg_typeof(1)::oid, pg_typeof(1)::integer, pg_typeof(1)::bigint;
+SELECT pg_typeof(1)::smallint;
+SELECT NULL::regtype::smallint;
+SELECT 23::oid::smallint;
+SELECT 'pg_class'::regclass::smallint;
+PREPARE rejected_type_cast AS SELECT NULL::regtype::smallint;
 CREATE SCHEMA routine_domains;
 CREATE DOMAIN routine_domains.positive AS integer NOT NULL CHECK (VALUE > 0);
 CREATE DOMAIN routine_domains.other AS integer CHECK (VALUE > 0);
@@ -25,4 +29,9 @@ SELECT routine_domains.echo(-1);
 SELECT routine_domains.echo(NULL);
 SELECT routine_domains.echo(7::bigint);
 SELECT routine_domains.first(ARRAY[7, -8]);
+CREATE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
+LANGUAGE SQL STRICT AS 'SELECT 7::smallint';
+CREATE CAST (regtype AS smallint) WITH FUNCTION routine_domains.small_type(regtype);
+SELECT pg_typeof(1)::smallint, (NULL::regtype::smallint) IS NULL;
+DROP CAST (regtype AS smallint);
 DROP SCHEMA routine_domains CASCADE;

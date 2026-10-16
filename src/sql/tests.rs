@@ -83167,7 +83167,8 @@ fn type_reference_moves_pending_images_survive_journal_and_checkpoint_cold_recov
         drop(engine);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         let mut recovered_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
-        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        let mut recovered = Engine::new(&config, &mut recovered_budget)
+            .unwrap_or_else(|error| panic!("checkpoint={checkpoint}: {error:?}"));
         assert_eq!(
             type_reference_execute(
                 &mut recovered,
@@ -83254,6 +83255,14 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
         ("SELECT routine_domains.echo(NULL)", "23502"),
         ("SELECT routine_domains.echo(7::bigint)", "42883"),
         ("SELECT routine_domains.first(ARRAY[7, -8])", "23514"),
+        ("SELECT pg_typeof(1)::smallint", "42846"),
+        ("SELECT NULL::regtype::smallint", "42846"),
+        ("SELECT 23::oid::smallint", "42846"),
+        ("SELECT 'pg_class'::regclass::smallint", "42846"),
+        (
+            "PREPARE rejected_type_cast AS SELECT NULL::regtype::smallint",
+            "42846",
+        ),
     ] {
         let output = run_with_fixed_memory(&mut engine, &budget, query, 32 << 20);
         assert!(
@@ -83262,4 +83271,94 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
             String::from_utf8_lossy(&output)
         );
     }
+    let custom = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
+         LANGUAGE SQL STRICT AS 'SELECT 7::smallint';
+         CREATE CAST (regtype AS smallint) WITH FUNCTION routine_domains.small_type(regtype);
+         SELECT pg_typeof(1)::smallint, (NULL::regtype::smallint) IS NULL;
+         DROP CAST (regtype AS smallint);",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&custom),
+        ["7|t"],
+        "{}",
+        String::from_utf8_lossy(&custom)
+    );
+    let dropped = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "DROP SCHEMA routine_domains CASCADE",
+        32 << 20,
+    );
+    let notices = String::from_utf8_lossy(&dropped);
+    assert!(
+        notices.contains("routine_domains.echo(routine_domains.positive)"),
+        "{notices}"
+    );
+    assert!(
+        notices.contains("routine_domains.first(routine_domains.positive[])"),
+        "{notices}"
+    );
+}
+
+#[test]
+fn type_reference_moves_composite_names_survive_prepared_checkpoint_recovery() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("prepared-type-names-{sequence}"));
+    config.max_prepared_transactions = 2;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-prepared-type-names-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 << 10;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let untouched = type_reference_setup_databases(&mut engine, &mut budget);
+    engine
+        .select_database(crate::storage::DatabaseOid::POSTGRES)
+        .unwrap();
+    type_reference_execute(
+        &mut engine,
+        &mut budget,
+        &format!("BEGIN; {TYPE_REFERENCE_MOVES} PREPARE TRANSACTION 'type_names';"),
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    type_reference_execute(
+        &mut recovered,
+        &mut recovered_budget,
+        "COMMIT PREPARED 'type_names'",
+    );
+    let published = type_reference_execute(
+        &mut recovered,
+        &mut recovered_budget,
+        TYPE_REFERENCE_SNAPSHOT,
+    );
+    assert_eq!(
+        published[0],
+        "type_after.renamed_domain|type_after.renamed_enum[]|type_after.renamed_record"
+    );
+    recovered
+        .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+        .unwrap();
+    assert_eq!(
+        type_reference_execute(
+            &mut recovered,
+            &mut recovered_budget,
+            TYPE_REFERENCE_SNAPSHOT
+        ),
+        untouched
+    );
 }

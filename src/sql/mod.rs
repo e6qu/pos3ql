@@ -21122,6 +21122,25 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 crate::storage::SqlName::parse(new_name)?,
             )?;
         }
+        WalOp::AlterCompositeIdentity {
+            schema,
+            name,
+            new_schema,
+            new_name,
+        } => {
+            let slot = storage.composite_slot(schema, name, 0).ok_or_else(|| {
+                sql_err!(
+                    eval::sqlstate::UNDEFINED_OBJECT,
+                    "composite type \"{}\" for journal name change does not exist",
+                    name
+                )
+            })?;
+            let mut definition = storage.composite_for(slot, 0);
+            definition.schema = crate::storage::SqlName::parse(new_schema)?;
+            definition.name = crate::storage::SqlName::parse(new_name)?;
+            storage.stage_composite_alter(slot, definition, 0)?;
+            storage.commit_composite_alter(slot, 0);
+        }
         WalOp::AlterDomainIdentity {
             schema,
             name,

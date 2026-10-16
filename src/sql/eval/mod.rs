@@ -16,6 +16,7 @@ pub mod funcs;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
 pub(crate) use cast::{
     cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_uuid, validate_bits,
+    validate_catalog_reference_cast,
 };
 
 mod args;
@@ -2353,6 +2354,11 @@ fn eval_full_inner<'a>(
                     }
                     return Ok(value);
                 }
+            }
+            if ColType::from_sql_name(type_name) == Some(ColType::Int2) {
+                let source_oid =
+                    expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v);
+                validate_catalog_reference_cast(source_oid, ColType::Int2)?;
             }
             let catalog_text = matches!(v, Datum::CompositeText { .. })
                 || matches!(

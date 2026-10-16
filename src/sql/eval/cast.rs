@@ -59,10 +59,28 @@ pub fn cast<'a>(v: Datum<'a>, type_name: &str, arena: &'a Arena) -> Result<Datum
     cast_to(v, target, arena)
 }
 
+pub(crate) fn validate_catalog_reference_cast(
+    source_oid: i32,
+    target: ColType,
+) -> Result<(), SqlError> {
+    if target == ColType::Int2
+        && let Some(source) = ColType::from_oid(source_oid)
+        && (source == ColType::Oid || source == ColType::Regtype || source.is_reg_object())
+    {
+        return Err(sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast type {} to smallint",
+            source.name()
+        ));
+    }
+    Ok(())
+}
+
 pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     if v.is_null() {
         return Ok(Datum::Null);
     }
+    validate_catalog_reference_cast(v.oid(), target)?;
     let v = match v {
         Datum::Bpchar(_) if target == ColType::Bpchar => return Ok(v),
         Datum::Bpchar(s) => Datum::Text(s.trim_end_matches(' ')),
@@ -1341,7 +1359,6 @@ mod tests {
         let arena = Arena::new(&mut budget, "regtype casts", 1 << 16).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             for (target, expected) in [
-                (ColType::Int2, Datum::Int2(23)),
                 (ColType::Int4, Datum::Int4(23)),
                 (ColType::Int8, Datum::Int8(23)),
                 (ColType::Oid, Datum::Oid(23)),
@@ -1352,6 +1369,25 @@ mod tests {
                 };
                 assert_eq!(cast_to(reference, target, &arena).unwrap(), expected);
                 assert_eq!(cast_to(Datum::Null, target, &arena).unwrap(), Datum::Null);
+            }
+            for reference in [
+                Datum::Regtype {
+                    referenced_oid: 23,
+                    name: "integer",
+                },
+                Datum::RegObject {
+                    type_oid: crate::sql::types::oid::REGCLASS,
+                    referenced_oid: 1259,
+                    name: "pg_class",
+                },
+                Datum::Oid(23),
+            ] {
+                assert_eq!(
+                    cast_to(reference, ColType::Int2, &arena)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::CANNOT_COERCE
+                );
             }
         });
     }

@@ -348,8 +348,10 @@ PostgreSQL results.
 
 Type renames and schema moves update references only in the type's database,
 including pending table, domain, composite and routine definitions. Type comments
-move within the same database. The existing journal and checkpoint formats remain
-unchanged.
+move within the same database. Composite type renames journal only the name
+change, preserving current field references during replay. The
+[format guide](durable-format.md#composite-type-name-changes) gives the upgrade
+requirement for this record.
 
 **User example:** two databases can both define `app.customer_id`. Renaming that
 domain in one database leaves the other database's columns, functions and comments
@@ -361,6 +363,11 @@ a positive-integer parameter accepts 7 and rejects -1 with SQLSTATE 23514.
 Exact overloads still take priority; conversions requiring an explicit cast
 remain rejected. The [PostgreSQL function-resolution rules](https://www.postgresql.org/docs/18/typeconv-func.html)
 are the upstream reference; tests compare actual PostgreSQL 18 results.
+
+A catalog type reference (regtype) converts to its numeric object identifier,
+integer or bigint. A smallint cast returns SQLSTATE 42846, including for NULL,
+unless an explicitly registered cast provides that conversion. Schema-drop
+notices retain declared domain and array names in routine signatures.
 
 Schema validation uses a current read position for the rows being checked,
 including earlier changes by the same transaction. CHECK, NOT NULL, uniqueness,

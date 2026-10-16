@@ -1,8 +1,8 @@
 //! Transaction-private table shapes and their comment identities share one edit owner.
 
-use std::sync::{MutexGuard, RwLockWriteGuard};
+use std::sync::MutexGuard;
 
-use super::table_definitions::DefinitionState;
+use super::table_names::DefinitionWrite;
 use super::{
     CommentCatalog, CommentClass, CommentEntry, DatabaseOid, MAX_COLUMNS, PendingCommentIdentity,
     PendingTableDef, SqlError, SqlName, Storage, TableDef,
@@ -13,7 +13,7 @@ use crate::sql_err;
 pub(super) struct TableDefinitionEdit<'storage> {
     storage: &'storage Storage,
     table: usize,
-    definition: RwLockWriteGuard<'storage, DefinitionState>,
+    definition: DefinitionWrite<'storage>,
     // Release the definition before allowing retirement or slot reuse.
     _lifecycle: MutexGuard<'storage, ()>,
 }

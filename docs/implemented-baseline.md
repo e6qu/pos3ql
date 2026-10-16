@@ -188,6 +188,21 @@ SQL execution is still serial. Committed definition changes, table renames,
 rewrites and maintenance coordination remain in [PLAN.md](../PLAN.md).
 A new report admitted between cleanup batches still keeps the versions it needs.
 
+Table-name lookup first checks a small name view for each table. A definition
+writer on an unrelated table does not hold that view while doing its work.
+Only a matching candidate needs the full definition guard; lookup rechecks its
+database, creation stamp and visible name before returning it. Definition writers
+publish the updated view before releasing their definition owner. Committed,
+transaction-private and rolled-back names follow the same visibility rules as
+the definitions. Replay, database cloning and exclusive schema changes update
+the view through scoped writes. The views and pending name fields are inline in
+the table slots and included in startup memory; lookups allocate nothing.
+
+**User example:** checking an order's customer reference can find the customers
+table while an unrelated table definition is being changed. Looking for a table
+that does not exist also avoids waiting for unrelated definitions. SQL execution
+is still serial; this removes a storage-level dependency before workers are added.
+
 Client descriptions and data-changing WITH queries use the same DML output
 analysis, including view-column rewriting and original output names. Their target definition comes from
 the existing startup-owned image pool. Live table and pending-schema guards

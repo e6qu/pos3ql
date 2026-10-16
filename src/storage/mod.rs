@@ -13,6 +13,7 @@ pub(crate) use log_positions::ReservedLogPosition;
 mod table_creation;
 mod table_definitions;
 mod table_edits;
+mod table_names;
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
 pub(crate) mod foreign;
@@ -3797,8 +3798,8 @@ impl Table {
         self.definition.read().identity
     }
 
-    fn identity_mut(&mut self) -> &mut table_definitions::TableIdentity {
-        &mut self.definition.exclusive().identity
+    fn identity_mut(&mut self) -> table_names::IdentityWrite<'_> {
+        self.definition.identity_mut()
     }
 
     pub(crate) fn database(&self) -> DatabaseOid {
@@ -3810,7 +3811,7 @@ impl Table {
     }
 
     fn ownership_mut(&mut self) -> &mut Ownership {
-        &mut self.identity_mut().ownership
+        self.definition.ownership_mut()
     }
 
     pub fn created_at(&self) -> u64 {
@@ -3830,16 +3831,12 @@ impl Table {
         TableDefinitionRead::committed(&self.definition)
     }
 
-    pub(crate) fn definition_mut(&mut self) -> &mut TableDef {
-        &mut self.definition.exclusive().committed
+    pub(crate) fn definition_mut(&mut self) -> table_names::CommittedDefinitionWrite<'_> {
+        self.definition.committed_mut()
     }
 
     fn pending_definition_transaction(&self) -> Option<u32> {
         self.definition.read().pending.map(|head| head.transaction)
-    }
-
-    fn pending_definition_tail(&self) -> Option<u32> {
-        self.definition.read().pending.map(|head| head.tail)
     }
 
     /// The one place `dirty` is set: every committed change advances the
@@ -21316,7 +21313,7 @@ impl Storage {
             self.clear_pending_table_defs(slot);
             self.clear_pending_table_statistics(slot);
             self.clear_table_rows(slot);
-            let identity = self.tables[slot].identity_mut();
+            let mut identity = self.tables[slot].identity_mut();
             identity.existence = CatalogDdlState::Absent;
             identity.database = DatabaseOid::POSTGRES;
         }
@@ -21661,7 +21658,7 @@ impl Storage {
             if table.database() == database
                 && table.existence() == (CatalogDdlState::PendingCreate { txid })
             {
-                let identity = table.identity_mut();
+                let mut identity = table.identity_mut();
                 identity.existence = identity.existence.commit_create();
             }
         }
@@ -27429,13 +27426,8 @@ impl Storage {
             }
             let mut definition = *table.definition();
             rename_table_sql_identity(&mut definition, prior, name)?;
-            let mut tail = table.pending_definition_tail();
-            while let Some(pending_slot) = tail {
-                let pending = self.pending_table_defs.exclusive(pending_slot as usize);
-                let mut definition = pending.version.def;
-                rename_table_sql_identity(&mut definition, prior, name)?;
-                tail = pending.previous;
-            }
+            self.pending_table_defs
+                .validate_schema_rename(&table.definition, prior, name)?;
         }
         for (_, definition) in (DomainIter {
             catalog: &self.type_catalog,
@@ -27483,29 +27475,19 @@ impl Storage {
                 continue;
             }
             rename_schema_name(&mut table.definition_mut().schema, prior, name);
-            let definition = table.definition_mut();
+            let mut definition_owner = table.definition_mut();
+            let definition = &mut *definition_owner;
             for column in definition.columns.iter_mut().take(definition.n_columns) {
                 rename_user_type_schema(&mut column.user_type, prior, name);
             }
             for key in definition.fkeys.iter_mut().take(definition.n_fkeys) {
                 rename_schema_name(&mut key.parent_schema, prior, name);
             }
-            rename_table_sql_identity(table.definition_mut(), prior, name)?;
+            drop(definition_owner);
+            rename_table_sql_identity(&mut table.definition_mut(), prior, name)?;
             table.mark_dirty();
-            let mut tail = table.pending_definition_tail();
-            while let Some(pending_slot) = tail {
-                let entry = &mut *self.pending_table_defs.exclusive(pending_slot as usize);
-                let pending = &mut entry.version;
-                rename_schema_name(&mut pending.def.schema, prior, name);
-                for column in pending.def.columns.iter_mut().take(pending.def.n_columns) {
-                    rename_user_type_schema(&mut column.user_type, prior, name);
-                }
-                for key in pending.def.fkeys.iter_mut().take(pending.def.n_fkeys) {
-                    rename_schema_name(&mut key.parent_schema, prior, name);
-                }
-                rename_table_sql_identity(&mut pending.def, prior, name)?;
-                tail = entry.previous;
-            }
+            self.pending_table_defs
+                .rename_schema(&mut table.definition, prior, name)?;
         }
 
         {
@@ -34270,32 +34252,68 @@ impl Storage {
     /// Committed-catalog lookup (ignores uncommitted DDL): used by journal
     /// replay and any context that operates on the durable image.
     pub fn find_table(&self, schema: &str, name: &str) -> Option<usize> {
-        self.tables.iter().take(self.table_count()).position(|t| {
-            let definition = t.definition();
-            let identity = definition.identity();
-            identity.database == current_database()
-                && identity.live()
-                && definition.schema.as_str() == schema
-                && definition.name.as_str() == name
-        })
+        self.find_table_name(table_names::TableNameScope::Committed, schema, name)
     }
 
-    /// Transaction-scoped lookup: `txid` sees its own uncommitted CREATE/DROP
-    /// and every committed table, but not another transaction's uncommitted
-    /// DDL.
+    /// Transaction-scoped lookup selects its own pending name, or the committed
+    /// name when no pending definition belongs to this transaction.
     pub fn find_visible(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        self.tables
-            .iter()
-            .take(self.table_count())
-            .enumerate()
-            .position(|(index, _)| {
-                let definition = self.table_def(index, txid);
+        self.find_table_name(table_names::TableNameScope::Transaction(txid), schema, name)
+    }
+
+    fn find_table_name(
+        &self,
+        scope: table_names::TableNameScope,
+        schema: &str,
+        name: &str,
+    ) -> Option<usize> {
+        let database = current_database();
+        loop {
+            let mut changed = false;
+            for (index, table) in self.tables.iter().take(self.table_count()).enumerate() {
+                let Some(expected) = table
+                    .definition
+                    .name_candidate(scope, database, schema, name)
+                else {
+                    continue;
+                };
+                // Name ownership ends before waiting for the selected definition.
+                // Unrelated definition writers are never part of this lookup.
+                let definition = match scope {
+                    table_names::TableNameScope::Committed => table.definition(),
+                    table_names::TableNameScope::Transaction(transaction) => {
+                        self.table_def(index, transaction)
+                    }
+                };
                 let identity = definition.identity();
-                identity.database == current_database()
-                    && identity.existence.visible_to(txid)
+                if expected.matches(identity)
+                    && scope.visible(identity.existence)
                     && definition.schema.as_str() == schema
                     && definition.name.as_str() == name
-            })
+                {
+                    return Some(index);
+                }
+                let actual_match = identity.database == database
+                    && scope.visible(identity.existence)
+                    && definition.schema.as_str() == schema
+                    && definition.name.as_str() == name;
+                let current = table
+                    .definition
+                    .name_candidate(scope, database, schema, name);
+                assert!(
+                    current.is_none_or(|candidate| candidate.matches(identity))
+                        && current.is_some() == actual_match,
+                    "table name view is inconsistent with its definition"
+                );
+                if actual_match {
+                    return Some(index);
+                }
+                changed = true;
+            }
+            if !changed {
+                return None;
+            }
+        }
     }
 
     pub fn table(&self, index: usize) -> &Table {
@@ -39167,7 +39185,8 @@ impl Storage {
             .filter(|table| table.existence() != CatalogDdlState::Absent)
         {
             let mut changed = false;
-            let definition = table.definition_mut();
+            let mut definition_owner = table.definition_mut();
+            let definition = &mut *definition_owner;
             for column in definition.columns[..definition.n_columns].iter_mut() {
                 let uses_domain = column.user_type
                     == Some(UserTypeName {
@@ -39184,6 +39203,7 @@ impl Storage {
                     changed = true;
                 }
             }
+            drop(definition_owner);
             if changed {
                 table.mark_dirty();
             }
@@ -39975,7 +39995,8 @@ impl Storage {
             .filter(|table| table.existence() != CatalogDdlState::Absent)
         {
             let mut changed = false;
-            let definition = table.definition_mut();
+            let mut definition_owner = table.definition_mut();
+            let definition = &mut *definition_owner;
             for column in definition.columns[..definition.n_columns].iter_mut() {
                 let uses_enum = matches!(column.ctype, ColType::Enum(s) if s as usize == slot)
                     || matches!(
@@ -39990,6 +40011,7 @@ impl Storage {
                     changed = true;
                 }
             }
+            drop(definition_owner);
             if changed {
                 table.mark_dirty();
             }
@@ -40441,7 +40463,8 @@ impl Storage {
             .filter(|table| table.existence() != CatalogDdlState::Absent)
         {
             let mut changed = false;
-            let definition = table.definition_mut();
+            let mut definition_owner = table.definition_mut();
+            let definition = &mut *definition_owner;
             for column in definition.columns[..definition.n_columns].iter_mut() {
                 if matches!(
                     column.ctype,
@@ -40461,6 +40484,7 @@ impl Storage {
                     changed = true;
                 }
             }
+            drop(definition_owner);
             if changed {
                 table.mark_dirty();
             }
@@ -47437,7 +47461,8 @@ impl Storage {
                 continue;
             }
             let mut changed = false;
-            let definition = t.definition_mut();
+            let mut definition_owner = t.definition_mut();
+            let definition = &mut *definition_owner;
             for fk in &mut definition.fkeys[..definition.n_fkeys] {
                 if fk.parent_schema.as_str() == old_schema.as_str()
                     && fk.parent.as_str() == name.as_str()
@@ -47446,6 +47471,7 @@ impl Storage {
                     changed = true;
                 }
             }
+            drop(definition_owner);
             if changed {
                 t.mark_dirty();
             }
@@ -47468,13 +47494,15 @@ impl Storage {
     /// (DROP SCHEMA CASCADE severing an inbound reference), returning it for
     /// transactional undo.
     pub fn drop_fk(&mut self, index: usize, fk_name: &str) -> Option<ForeignKey> {
-        let def = self.tables[index].definition_mut();
+        let mut definition_owner = self.tables[index].definition_mut();
+        let def = &mut *definition_owner;
         let at = (0..def.n_fkeys).find(|&f| def.fkeys[f].name.as_str() == fk_name)?;
         let removed = def.fkeys[at];
         for f in at..def.n_fkeys - 1 {
             def.fkeys[f] = def.fkeys[f + 1];
         }
         def.n_fkeys -= 1;
+        drop(definition_owner);
         self.tables[index].mark_dirty();
         Some(removed)
     }
@@ -47507,7 +47535,8 @@ impl Storage {
                     continue;
                 }
                 let mut changed = false;
-                let definition = table.definition_mut();
+                let mut definition_owner = table.definition_mut();
+                let definition = &mut *definition_owner;
                 for foreign_key in &mut definition.fkeys[..definition.n_fkeys] {
                     if foreign_key.parent_schema == current.schema
                         && foreign_key.parent == current.name
@@ -47516,6 +47545,7 @@ impl Storage {
                         changed = true;
                     }
                 }
+                drop(definition_owner);
                 if changed {
                     table.mark_dirty();
                 }
@@ -61595,3 +61625,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod table_name_tests;

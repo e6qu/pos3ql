@@ -1,0 +1,110 @@
+name: Qualify table name visibility
+on:
+  push:
+    branches: [share-table-name-views]
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - name: Compile and lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Name visibility, ownership, accounting and recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          for selection in storage::table_name_tests:: storage::table_definitions::tests:: storage::table_edits::tests:: table_definition_images_ shared_table_creation table_retirement catalog_object_pools_follow_their_independent_startup_capacities prepared_transactions_survive_checkpoint_and_object_cold_recovery database_template_catalogs_diverge_and_survive_object_cold_recovery pending_table_definition_comment_names_survive_journal_and_checkpoint_cold_recovery live_definition_ownership_catalog_tracks_rename_schema_and_rollback; do
+            cargo test --lib --locked "$selection" -- --test-threads=1 --nocapture | tee "$RUNNER_TEMP/pending-edits-$selection.log"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/pending-edits-$selection.log"
+          done
+      - name: Verify the original lookup blocks behind unrelated definitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin 562f4a679342263b94ab10519077353bf9b38333
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import subprocess
+
+          old = "562f4a679342263b94ab10519077353bf9b38333"
+          paths = [Path("src/storage/mod.rs"), Path("src/storage/table_definitions.rs"), Path("src/storage/table_edits.rs")]
+          original = {path: path.read_text() for path in paths}
+          try:
+              for path in paths:
+                  restored = subprocess.check_output(["git", "show", f"{old}:{path}"], text=True)
+                  if str(path) == "src/storage/mod.rs":
+                      restored += "\n#[cfg(test)]\nmod table_name_tests;\n"
+                  path.write_text(restored)
+              result = subprocess.run(
+                  ["cargo", "test", "--lib", "--locked",
+                   "table_name_lookup_skips_unrelated_definition_writers",
+                   "--", "--test-threads=1", "--nocapture"],
+                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+              )
+              print(result.stdout, flush=True)
+              Path(os.environ["RUNNER_TEMP"], "table-name-old-runtime.log").write_text(result.stdout)
+              assert result.returncode != 0, "original runtime unexpectedly passed the lookup regression"
+              assert "test result: FAILED. 0 passed; 1 failed" in result.stdout
+              assert "name lookup waited for an unrelated table definition" in result.stdout
+          finally:
+              for path, content in original.items():
+                  path.write_text(content)
+          subprocess.check_call(["git", "diff", "--exit-code", "--",
+                                 "src/storage/mod.rs", "src/storage/table_definitions.rs", "src/storage/table_edits.rs"])
+          print("Confirmed the lookup dependency on the old runtime; restored the qualified source.")
+          PY
+  postgresql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Compare name visibility and schema changes with actual PostgreSQL 18
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          P3_PORT: "15599"
+          RUN_FAST: "0"
+          RUN_CORE: "0"
+          RUN_CORPUS: "1"
+          RUN_AUX: "0"
+          RUN_SLT: "0"
+          RUN_FUZZ: "0"
+          FAST_CORPUS_ONLY: "192_table_name_visibility"
+        run: bash tests/external/ci_diff.sh

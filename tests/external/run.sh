@@ -388,6 +388,7 @@ then
   ok "psycopg driver suite"
 else
   bad "psycopg driver suite"; cat "$WORK/driver.out"
+  dump_server_stack "$SERVER_PID" || true
 fi
 
 step "COPY: client-side round trip through psql \\copy"

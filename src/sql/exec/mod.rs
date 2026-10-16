@@ -28865,7 +28865,13 @@ pub(crate) fn create_cast(
             "cast will be ignored because the target data type is a domain",
         )?;
     }
-    let definition = storage.cast(slot);
+    let definition = match storage.journal_catalog_definition(storage.cast(slot), txn.txid) {
+        Ok(definition) => definition,
+        Err(error) => {
+            storage.rollback_cast_create(slot);
+            return sql_fail(error);
+        }
+    };
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::SetCast(definition)) {
         storage.rollback_cast_create(slot);

@@ -28,3 +28,6 @@ FROM pg_amproc WHERE amprocfamily = (
 SELECT castsource::regtype::text, casttarget::regtype::text FROM pg_cast
 WHERE castsource = (SELECT pg_typeof(states[1])::oid FROM type_scope.items)
 AND casttarget = 'varchar'::regtype;
+SELECT castsource::regtype::text, casttarget::regtype::text FROM pg_cast
+WHERE castsource = (SELECT pg_typeof(id)::oid FROM type_scope.items)
+AND casttarget = 'text'::regtype;

@@ -83175,6 +83175,7 @@ fn type_reference_moves_pending_images_survive_journal_and_checkpoint_cold_recov
              CREATE OR REPLACE FUNCTION type_scope.echo_domain(arg type_scope.shared_domain)
              RETURNS type_scope.shared_domain LANGUAGE SQL AS 'SELECT arg';
              {TYPE_REFERENCE_MOVES}
+             CREATE CAST (type_after.renamed_domain AS text) WITH INOUT;
              ALTER OPERATOR type_scope.## (NONE, type_after.renamed_domain) OWNER TO postgres;
              ALTER OPERATOR FAMILY type_scope.domain_ops USING btree OWNER TO postgres;
              ALTER OPERATOR CLASS type_scope.domain_ops USING btree OWNER TO postgres;
@@ -83185,6 +83186,10 @@ fn type_reference_moves_pending_images_survive_journal_and_checkpoint_cold_recov
         assert_eq!(
             published[1],
             "type_after.renamed_domain|type_after.renamed_enum|type_after.renamed_record"
+        );
+        assert_eq!(
+            published.last().map(String::as_str),
+            Some("type_after.renamed_domain|text")
         );
         assert_eq!(
             type_reference_execute(

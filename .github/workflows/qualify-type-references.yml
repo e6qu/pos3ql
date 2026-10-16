@@ -105,4 +105,6 @@ jobs:
           RUN_SLT: "0"
           RUN_FUZZ: "0"
           AUXILIARY_PHASE: "types"
-        run: bash tests/external/ci_diff.sh
+        run: |
+          bash tests/external/ci_diff.sh
+          RUN_AUX=0 RUN_CORPUS=1 FAST_CORPUS_ONLY=193_domain_routine_coercion bash tests/external/ci_diff.sh

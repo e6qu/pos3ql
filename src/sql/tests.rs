@@ -83223,3 +83223,43 @@ fn type_reference_moves_enum_drop_selects_only_its_database() {
         ["ready"]
     );
 }
+
+#[test]
+fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
+    let (mut engine, mut budget) = test_engine();
+    type_reference_execute(
+        &mut engine,
+        &mut budget,
+        include_str!("../../tests/external/type_reference_coercion_setup.sql"),
+    );
+    let accepted = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT routine_domains.echo(7), routine_domains.echo(7::smallint),
+                routine_domains.echo(7::routine_domains.other),
+                routine_domains.echo(arg => 7), routine_domains.widen(7);
+         SELECT routine_domains.choose(7),
+                routine_domains.choose(7::routine_domains.positive);
+         SELECT routine_domains.first(ARRAY[7, 8]);",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&accepted),
+        ["7|7|7|7|7", "base|domain", "7"],
+        "{}",
+        String::from_utf8_lossy(&accepted)
+    );
+    for (query, state) in [
+        ("SELECT routine_domains.echo(-1)", "23514"),
+        ("SELECT routine_domains.echo(NULL)", "23502"),
+        ("SELECT routine_domains.echo(7::bigint)", "42883"),
+        ("SELECT routine_domains.first(ARRAY[7, -8])", "23514"),
+    ] {
+        let output = run_with_fixed_memory(&mut engine, &budget, query, 32 << 20);
+        assert!(
+            String::from_utf8_lossy(&output).contains(state),
+            "{query}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}

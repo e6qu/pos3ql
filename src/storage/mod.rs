@@ -42678,15 +42678,6 @@ impl Storage {
             return true;
         }
 
-        // A domain is implicitly treated as its base type when passed out of
-        // the domain, but PostgreSQL does not implicitly manufacture a value
-        // of a different domain at routine lookup.
-        let expected_is_domain = (oid::FIRST_DOMAIN
-            ..oid::FIRST_DOMAIN + self.domain_count() as i32)
-            .contains(&expected_oid);
-        if expected_is_domain {
-            return false;
-        }
         let actual = match self.routine_result_for_oid(actual_oid, txid) {
             Some(actual) => actual,
             None => return false,
@@ -42695,8 +42686,12 @@ impl Storage {
             Some(expected) => expected,
             None => return false,
         };
-        if actual.user_type.is_some() && actual.ctype == expected.ctype {
-            return true;
+        // Resolve domain candidates through their base types. Execution still
+        // checks the declared domain before the routine receives the value.
+        let actual_base = actual.ctype.oid();
+        let expected_base = expected.ctype.oid();
+        if actual_base != actual_oid || expected_base != expected_oid {
+            return self.routine_implicit_cast(actual_base, expected_base, txid);
         }
         if let (ColType::Array(actual), ColType::Array(expected)) = (actual.ctype, expected.ctype) {
             return self.routine_implicit_cast(actual.element_oid(), expected.element_oid(), txid);

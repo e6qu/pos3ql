@@ -355,6 +355,13 @@ unchanged.
 domain in one database leaves the other database's columns, functions and comments
 unchanged, including after rollback or recovery without local caches.
 
+Routine selection permits implicit conversion through a domain's base type,
+then checks the declared domain before calling the function. For example,
+a positive-integer parameter accepts 7 and rejects -1 with SQLSTATE 23514.
+Exact overloads still take priority; conversions requiring an explicit cast
+remain rejected. The [PostgreSQL function-resolution rules](https://www.postgresql.org/docs/18/typeconv-func.html)
+are the upstream reference; tests compare actual PostgreSQL 18 results.
+
 Schema validation uses a current read position for the rows being checked,
 including earlier changes by the same transaction. CHECK, NOT NULL, uniqueness,
 foreign-key and domain rules, and partition attachment retain their original row

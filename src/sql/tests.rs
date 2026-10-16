@@ -18917,6 +18917,37 @@ fn message_types(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+fn error_sqlstates(bytes: &[u8]) -> Vec<&str> {
+    let mut states = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let tag = bytes[offset];
+        let length = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        assert!(
+            length >= 4,
+            "protocol message length includes its four-byte header"
+        );
+        if tag == b'E' {
+            let mut fields = &bytes[offset + 5..offset + 1 + length];
+            while let Some((&field, remaining)) = fields.split_first() {
+                if field == 0 {
+                    break;
+                }
+                let end = remaining
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .expect("terminated error field");
+                if field == b'C' {
+                    states.push(core::str::from_utf8(&remaining[..end]).expect("SQLSTATE is text"));
+                }
+                fields = &remaining[end + 1..];
+            }
+        }
+        offset += 1 + length;
+    }
+    states
+}
+
 fn row_description_type_oids(bytes: &[u8]) -> Vec<i32> {
     let mut offset = 0;
     while offset < bytes.len() {
@@ -29310,20 +29341,10 @@ fn generate_series_table_function() {
         &mut t,
         "SELECT generate_series(1.0::numeric, 2.0::numeric, 0::numeric)",
     );
-    assert!(
-        core::str::from_utf8(&zero_step)
-            .expect("wire response is UTF-8 outside payload values")
-            .contains("22023"),
-        "{zero_step:?}"
-    );
+    assert_eq!(error_sqlstates(&zero_step), ["22023"], "{zero_step:?}");
     let sql = "SELECT generate_series('2000-01-01'::timestamp, '2000-01-02'::timestamp)";
     let response = run_with_txn_bytes(&mut e, &mut b, &mut t, sql);
-    assert!(
-        core::str::from_utf8(&response)
-            .expect("wire response is UTF-8 outside payload values")
-            .contains("42883"),
-        "{sql}: {response:?}"
-    );
+    assert_eq!(error_sqlstates(&response), ["42883"], "{sql}: {response:?}");
     assert_eq!(
         data_rows(&run_with_txn_bytes(
             &mut e,
@@ -83359,10 +83380,16 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
         &mut budget,
         "DROP CAST (regtype AS smallint); DROP CAST (boolean AS smallint)",
     );
+    // Pending drops retain their slots until this request commits.
+    type_reference_execute(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION routine_domains.small_type(regtype); DROP FUNCTION routine_domains.small_type(boolean)",
+    );
     let exact = run_with_fixed_memory(
         &mut engine,
         &budget,
-        "DROP FUNCTION routine_domains.small_type(regtype);\nDROP FUNCTION routine_domains.small_type(boolean);\nCREATE FUNCTION routine_domains.equal_positive(a routine_domains.positive, b routine_domains.positive)\nRETURNS boolean LANGUAGE SQL IMMUTABLE RETURN TRUE;\nCREATE FUNCTION routine_domains.equal_other(a routine_domains.other, b routine_domains.other)\nRETURNS boolean LANGUAGE SQL IMMUTABLE RETURN FALSE;\nCREATE OPERATOR routine_domains.=== (\n    FUNCTION = routine_domains.equal_positive,\n    LEFTARG = routine_domains.positive, RIGHTARG = routine_domains.positive);\nCREATE OPERATOR routine_domains.=== (\n    FUNCTION = routine_domains.equal_other,\n    LEFTARG = routine_domains.other, RIGHTARG = routine_domains.other);\nSELECT 7::routine_domains.positive OPERATOR(routine_domains.===) 8::routine_domains.positive,\n       7::routine_domains.other OPERATOR(routine_domains.===) 8::routine_domains.other;\nPREPARE exact_domain_operator AS\nSELECT $1::routine_domains.positive OPERATOR(routine_domains.===) $2::routine_domains.positive;\nEXECUTE exact_domain_operator(7, 8);\nDEALLOCATE exact_domain_operator;\n",
+        "CREATE FUNCTION routine_domains.equal_positive(a routine_domains.positive, b routine_domains.positive)\nRETURNS boolean LANGUAGE SQL IMMUTABLE RETURN TRUE;\nCREATE FUNCTION routine_domains.equal_other(a routine_domains.other, b routine_domains.other)\nRETURNS boolean LANGUAGE SQL IMMUTABLE RETURN FALSE;\nCREATE OPERATOR routine_domains.=== (\n    FUNCTION = routine_domains.equal_positive,\n    LEFTARG = routine_domains.positive, RIGHTARG = routine_domains.positive);\nCREATE OPERATOR routine_domains.=== (\n    FUNCTION = routine_domains.equal_other,\n    LEFTARG = routine_domains.other, RIGHTARG = routine_domains.other);\nSELECT 7::routine_domains.positive OPERATOR(routine_domains.===) 8::routine_domains.positive,\n       7::routine_domains.other OPERATOR(routine_domains.===) 8::routine_domains.other;\nPREPARE exact_domain_operator AS\nSELECT $1::routine_domains.positive OPERATOR(routine_domains.===) $2::routine_domains.positive;\nEXECUTE exact_domain_operator(7, 8);\nDEALLOCATE exact_domain_operator;\n",
         32 << 20,
     );
     assert_eq!(

@@ -60427,8 +60427,18 @@ mod tests {
         let table = storage
             .create_table(make_def("independent_rows", &[("id", ColType::Int4, true)]))
             .unwrap();
-        let old = storage.heap.append_bytes(b"keep").unwrap();
-        let next = storage.heap.append_bytes(b"next").unwrap();
+        let old_values = [Datum::Int4(1)];
+        let (old, bytes) = storage
+            .heap
+            .append(rowenc::encoded_len(&old_values))
+            .unwrap();
+        rowenc::encode(&old_values, bytes);
+        let next_values = [Datum::Int4(2)];
+        let (next, bytes) = storage
+            .heap
+            .append(rowenc::encoded_len(&next_values))
+            .unwrap();
+        rowenc::encode(&next_values, bytes);
         let mut row = RowState::committed_only_at(old, 7);
         push_pending_version(
             &mut storage.row_versions.exclusive().pending_row_versions,
@@ -60458,13 +60468,18 @@ mod tests {
                     let retained = storage.resident_row_state(table, 1)?.unwrap();
                     storage.commit_row(table, 1, 7, 9)?;
                     assert_eq!(storage.row_state(table, 1)?.unwrap().committed_lsn, 9);
-                    let image = retained
-                        .select_owned(table, 1, 8, SNAPSHOT_ALL, 7)?
-                        .unwrap();
-                    let VisibleRowBytes::Heap(bytes) = image.bytes else {
-                        panic!("heap fixture");
-                    };
-                    assert_eq!(&*bytes, b"keep");
+                    let current = storage.resident_row_state(table, 1)?.unwrap();
+                    for (source, snapshot, expected) in [(&retained, 7, 1), (&current, 9, 2)] {
+                        let image = source
+                            .select_owned(table, 1, 8, SNAPSHOT_ALL, snapshot)?
+                            .unwrap();
+                        let VisibleRowBytes::Heap(bytes) = image.bytes else {
+                            panic!("heap fixture");
+                        };
+                        let mut values = [Datum::Null];
+                        rowenc::decode(&bytes, &[ColType::Int4], &mut values)?;
+                        assert_eq!(values, [Datum::Int4(expected)]);
+                    }
                     Ok::<_, SqlError>(())
                 });
                 sent.send(result).unwrap();

@@ -66,6 +66,7 @@ jobs:
         uses: ./.github/actions/python-test-environment
       - name: Measure
         env:
+          CARGO_PROFILE_RELEASE_DEBUG: ${{ matrix.needs_pg18_client && '1' || '0' }}
           POS3QL_VENV: ${{ github.workspace }}/venv
           POS3QL_PGBIN: /usr/lib/postgresql/18/bin
           POS3QL_PSQL: ${{ matrix.needs_pg18_client && format('{0}/.ci-bin/psql', github.workspace) || 'psql' }}

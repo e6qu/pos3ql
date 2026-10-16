@@ -2,11 +2,18 @@
 # psycopg uses the extended query protocol (Parse/Bind/Describe/Execute)
 # for parameterized queries.
 import datetime
+import faulthandler
+import sys
 import threading
 import time
 import uuid
 
 import psycopg
+
+# Keep the blocked call and completed sections when a driver request hangs;
+# the runner's outer deadline otherwise discards this redirected transcript.
+sys.stdout.reconfigure(line_buffering=True)
+faulthandler.dump_traceback_later(120, exit=True)
 
 conn = psycopg.connect(
     host="127.0.0.1", port=5433, user="postgres", dbname="postgres",
@@ -1103,4 +1110,5 @@ observer_cur.execute("SELECT count(*) FROM pg_class WHERE relpersistence = 't'")
 assert observer_cur.fetchone() == (0,)
 observer.close()
 
+faulthandler.cancel_dump_traceback_later()
 print("ALL DRIVER TESTS PASSED")

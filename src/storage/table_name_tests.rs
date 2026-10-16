@@ -244,7 +244,8 @@ fn table_name_lookup_views_are_included_in_exact_startup_memory() {
     config.query_workspace_slots = 2;
     let expected = config.memtable_bytes + Storage::extra_budget_bytes(&config);
     let mut budget = Budget::new(expected);
-    let storage = Storage::new(&config, &mut budget).unwrap();
+    let mut storage = Storage::new(&config, &mut budget).unwrap();
+    storage.configure_collation(&config, &mut budget).unwrap();
     assert_eq!(budget.remaining(), 0);
     crate::mem::guard::forbid_alloc(|| {
         assert_eq!(storage.find_table("public", "not_created"), None);

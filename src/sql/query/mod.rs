@@ -2648,6 +2648,41 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.execute_routine(slot, routine, arguments, arena)
     }
 
+    fn cast_evaluation(
+        &self,
+        source_oid: i32,
+        target_oid: i32,
+    ) -> Result<Option<super::eval::CastEvaluation>, SqlError> {
+        let Some((_, cast)) = self
+            .storage
+            .cast_for_oids(source_oid, target_oid, self.txid)
+        else {
+            return Ok(None);
+        };
+        let immutable = match cast.method {
+            crate::storage::CastMethod::Binary => true,
+            crate::storage::CastMethod::InOut => false,
+            crate::storage::CastMethod::Function(oid) => {
+                let slot = self
+                    .storage
+                    .routine_slot_by_oid(oid, self.txid)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::UNDEFINED_FUNCTION, "cast function does not exist")
+                    })?;
+                self.storage
+                    .routine_for(slot, self.txid)
+                    .attributes
+                    .volatility
+                    == crate::storage::RoutineVolatility::Immutable
+            }
+        };
+        Ok(Some(if immutable {
+            super::eval::CastEvaluation::Immutable
+        } else {
+            super::eval::CastEvaluation::Runtime
+        }))
+    }
+
     fn cast_defined<'a>(
         &self,
         source_oid: i32,
@@ -5442,23 +5477,26 @@ fn rewrite_grouped_expr<'a>(
 pub fn check_select_constants<'a>(
     statement: &Select<'a>,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<(), SqlError> {
+    let catalog = storage_catalog(storage, arena, txid);
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
-            super::eval::check_constant_errors(expression, arena)?;
+            super::eval::check_constant_errors(expression, arena, Some(&catalog))?;
         }
     }
     if let Some(w) = statement.where_clause {
-        super::eval::check_constant_errors(w, arena)?;
+        super::eval::check_constant_errors(w, arena, Some(&catalog))?;
     }
     for g in statement.group_by {
-        super::eval::check_constant_errors(g, arena)?;
+        super::eval::check_constant_errors(g, arena, Some(&catalog))?;
     }
     if let Some(h) = statement.having {
-        super::eval::check_constant_errors(h, arena)?;
+        super::eval::check_constant_errors(h, arena, Some(&catalog))?;
     }
     for ob in statement.order_by {
-        super::eval::check_constant_errors(ob.expression, arena)?;
+        super::eval::check_constant_errors(ob.expression, arena, Some(&catalog))?;
     }
     Ok(())
 }
@@ -5847,7 +5885,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
 
     // Constant folding runs after type analysis, matching PostgreSQL's
     // analyze-then-plan order: `min(boolean)` errors before `1/0` folds.
-    if let Err(e) = check_select_constants(statement, arena) {
+    if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
     }
 
@@ -6261,7 +6299,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     statement_arena: Option<&'statement Arena>,
     responder: &mut Responder,
 ) -> Outcome {
-    if let Err(e) = check_select_constants(statement, arena) {
+    if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
     }
     // A window function needs rows to compute over, and this path has no scan
@@ -6871,7 +6909,7 @@ fn select_into_rows_mode<'a>(
         }
         return Ok(());
     }
-    check_select_constants(statement, arena)?;
+    check_select_constants(statement, arena, storage, txid)?;
     let catalog = StorageCatalog {
         storage,
         routine_workspace: arena,

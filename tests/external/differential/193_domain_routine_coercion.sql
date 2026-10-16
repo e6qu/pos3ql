@@ -29,9 +29,18 @@ SELECT routine_domains.echo(-1);
 SELECT routine_domains.echo(NULL);
 SELECT routine_domains.echo(7::bigint);
 SELECT routine_domains.first(ARRAY[7, -8]);
+CREATE SEQUENCE routine_domains.cast_calls START 7;
 CREATE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
-LANGUAGE SQL STRICT AS 'SELECT 7::smallint';
+LANGUAGE SQL VOLATILE STRICT AS 'SELECT nextval(''routine_domains.cast_calls'')::smallint';
 CREATE CAST (regtype AS smallint) WITH FUNCTION routine_domains.small_type(regtype);
 SELECT pg_typeof(1)::smallint, (NULL::regtype::smallint) IS NULL;
+SELECT pg_typeof(1)::smallint = 8 AND TRUE;
+SELECT FALSE AND pg_typeof(1)::smallint > 0;
+SELECT currval('routine_domains.cast_calls');
+DROP CAST (regtype AS smallint);
+CREATE OR REPLACE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
+LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT (1 / 0)::smallint';
+CREATE CAST (regtype AS smallint) WITH FUNCTION routine_domains.small_type(regtype);
+SELECT pg_typeof(1)::smallint WHERE FALSE;
 DROP CAST (regtype AS smallint);
 DROP SCHEMA routine_domains CASCADE;

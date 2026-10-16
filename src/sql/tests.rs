@@ -83274,19 +83274,48 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
     let custom = run_with_fixed_memory(
         &mut engine,
         &budget,
-        "CREATE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
-         LANGUAGE SQL STRICT AS 'SELECT 7::smallint';
+        "CREATE SEQUENCE routine_domains.cast_calls START 7;
+         CREATE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
+         LANGUAGE SQL VOLATILE STRICT AS 'SELECT nextval(''routine_domains.cast_calls'')::smallint';
          CREATE CAST (regtype AS smallint) WITH FUNCTION routine_domains.small_type(regtype);
          SELECT pg_typeof(1)::smallint, (NULL::regtype::smallint) IS NULL;
+         SELECT pg_typeof(1)::smallint = 8 AND TRUE;
+         SELECT FALSE AND pg_typeof(1)::smallint > 0;
+         SELECT currval('routine_domains.cast_calls');
          DROP CAST (regtype AS smallint);",
         32 << 20,
     );
     assert_eq!(
         data_rows(&custom),
-        ["7|t"],
+        ["7|t", "t", "f", "8"],
         "{}",
         String::from_utf8_lossy(&custom)
     );
+    let immutable = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE OR REPLACE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
+         LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT (1 / 0)::smallint';
+         CREATE CAST (regtype AS smallint) WITH FUNCTION routine_domains.small_type(regtype);",
+        32 << 20,
+    );
+    assert!(
+        !String::from_utf8_lossy(&immutable).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&immutable)
+    );
+    let folded = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT pg_typeof(1)::smallint WHERE FALSE",
+        32 << 20,
+    );
+    assert!(
+        String::from_utf8_lossy(&folded).contains("22012"),
+        "{}",
+        String::from_utf8_lossy(&folded)
+    );
+    type_reference_execute(&mut engine, &mut budget, "DROP CAST (regtype AS smallint)");
     let dropped = run_with_fixed_memory(
         &mut engine,
         &budget,
@@ -83310,6 +83339,7 @@ fn type_reference_moves_composite_names_survive_prepared_checkpoint_recovery() {
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
     let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
     let mut config = test_config(&format!("prepared-type-names-{sequence}"));
+    config.max_ddl_per_transaction = 32;
     config.max_prepared_transactions = 2;
     config.object_store_on = true;
     config.object_store_sim = true;

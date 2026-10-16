@@ -729,14 +729,14 @@ mod tests {
                     } else {
                         DatabaseOid::TEMPLATE1
                     };
+                    let transaction = if epoch % 2 == 0 { 7 } else { 9 };
                     state.identity.existence = match epoch % 5 {
                         0 => CatalogDdlState::Present,
-                        1 => CatalogDdlState::PendingCreate { txid: 7 },
-                        2 => CatalogDdlState::PendingDrop { txid: 7 },
-                        3 => CatalogDdlState::PendingCreateDrop { txid: 7 },
+                        1 => CatalogDdlState::PendingCreate { txid: transaction },
+                        2 => CatalogDdlState::PendingDrop { txid: transaction },
+                        3 => CatalogDdlState::PendingCreateDrop { txid: transaction },
                         _ => CatalogDdlState::Absent,
                     };
-                    let transaction = if epoch % 2 == 0 { 7 } else { 9 };
                     versions
                         .stage_locked(&mut state, pending(stamp + 1, transaction), 8)
                         .unwrap();

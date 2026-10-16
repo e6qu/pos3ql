@@ -130,6 +130,8 @@ together; full capacities fail explicitly and leave existing owners intact.
 
 - Protect journal staging, prepared transactions, commit order, and the
   responses waiting for durable storage.
+- Remove the per-query journal dependency for read-only work while preserving
+  assigned identities across recovery.
 - Let execution progress without holding the whole engine locked while a
   commit waits on object storage.
 - Preserve transaction visibility, lock ordering, shared commit uploads,

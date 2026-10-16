@@ -27017,8 +27017,8 @@ fn stage_event_trigger(
     slot: usize,
     definition: crate::storage::EventTriggerDefinition,
 ) -> Result<(), SqlError> {
-    let lsn = storage.lsn() + 1;
-    wal.stage(
+    let lsn = storage.bump_lsn();
+    wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetEventTrigger {
@@ -27027,7 +27027,6 @@ fn stage_event_trigger(
             definition,
         },
     )?;
-    storage.set_lsn(lsn);
     Ok(())
 }
 
@@ -27227,12 +27226,11 @@ pub fn drop_event_trigger(
     if let Err(error) = storage.drop_event_trigger(slot, txn.txid) {
         return sql_fail(error);
     }
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropEventTrigger { name }) {
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropEventTrigger { name }) {
         storage.rollback_event_trigger_drop(slot, txn.txid);
         return sql_fail(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EventTriggerDropped(slot as u32)) {
         storage.rollback_event_trigger_drop(slot, txn.txid);
         return sql_fail(error);
@@ -28855,12 +28853,11 @@ pub(crate) fn create_cast(
         )?;
     }
     let definition = storage.cast(slot);
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::SetCast(definition)) {
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::SetCast(definition)) {
         storage.rollback_cast_create(slot);
         return sql_fail(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CastCreated(slot as u32)) {
         storage.rollback_cast_create(slot);
         return sql_fail(error);
@@ -28885,8 +28882,8 @@ fn stage_cast_drop(
             "cast catalog identity changed during drop"
         ));
     }
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropCast {
@@ -28897,7 +28894,6 @@ fn stage_cast_drop(
         storage.rollback_cast_drop(slot, txn.txid);
         return Err(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CastDropped(slot as u32)) {
         storage.rollback_cast_drop(slot, txn.txid);
         return Err(error);
@@ -29046,8 +29042,8 @@ fn operator_link_or_shell(
     }
     let slot = storage.create_operator(definition, txn.txid)?;
     let created_at = storage.operator(slot).created_at;
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetOperator {
@@ -29058,7 +29054,6 @@ fn operator_link_or_shell(
         storage.rollback_operator_create(slot);
         return Err(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorCreated(slot as u32)) {
         storage.rollback_operator_create(slot);
         return Err(error);
@@ -29187,8 +29182,8 @@ pub(crate) fn create_operator(
         };
     if created {
         let created_at = storage.operator(slot).created_at;
-        let lsn = storage.lsn() + 1;
-        if let Err(error) = wal.stage(
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::SetOperator {
@@ -29199,7 +29194,6 @@ pub(crate) fn create_operator(
             storage.rollback_operator_create(slot);
             return sql_fail(error);
         }
-        storage.set_lsn(lsn);
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorCreated(slot as u32)) {
             storage.rollback_operator_create(slot);
             return sql_fail(error);
@@ -29521,8 +29515,8 @@ pub fn create_collation(
         Ok(slot) => slot,
         Err(error) => return sql_fail(error),
     };
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetCollation {
@@ -29534,7 +29528,6 @@ pub fn create_collation(
         storage.rollback_collation_create(slot);
         return sql_fail(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CollationCreated(slot as u32)) {
         storage.rollback_collation_create(slot);
         return sql_fail(error);
@@ -29594,8 +29587,8 @@ pub fn create_conversion(
         Ok(slot) => slot,
         Err(error) => return sql_fail(error),
     };
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetConversion {
@@ -29607,7 +29600,6 @@ pub fn create_conversion(
         storage.rollback_conversion_create(slot);
         return sql_fail(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConversionCreated(slot as u32)) {
         storage.rollback_conversion_create(slot);
         return sql_fail(error);
@@ -30621,8 +30613,8 @@ pub fn alter_collation(
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetCollation {
@@ -30634,7 +30626,6 @@ pub fn alter_collation(
         storage.rollback_collation_alter(slot, prior);
         return sql_fail(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CollationAltered {
         slot: slot as u32,
         prior,
@@ -30693,8 +30684,8 @@ pub fn alter_conversion(
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetConversion {
@@ -30706,7 +30697,6 @@ pub fn alter_conversion(
         storage.rollback_conversion_alter(slot, prior);
         return sql_fail(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConversionAltered {
         slot: slot as u32,
         prior,
@@ -31001,8 +30991,8 @@ pub(crate) fn drop_collation(
         }
     }
     storage.drop_collation(slot, txn.txid);
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropCollation {
@@ -31013,7 +31003,6 @@ pub(crate) fn drop_collation(
         storage.rollback_collation_drop(slot, txn.txid);
         return sql_fail(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CollationDropped(slot as u32)) {
         storage.rollback_collation_drop(slot, txn.txid);
         return sql_fail(error);
@@ -31053,8 +31042,8 @@ pub fn drop_conversion(
         return sql_fail(error);
     }
     storage.drop_conversion(slot, txn.txid);
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropConversion {
@@ -31065,7 +31054,6 @@ pub fn drop_conversion(
         storage.rollback_conversion_drop(slot, txn.txid);
         return sql_fail(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConversionDropped(slot as u32)) {
         storage.rollback_conversion_drop(slot, txn.txid);
         return sql_fail(error);
@@ -31100,8 +31088,8 @@ fn stage_operator(
 ) -> Result<(), SqlError> {
     let prior = storage.stage_operator_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator(slot).created_at;
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetOperator {
@@ -31112,7 +31100,6 @@ fn stage_operator(
         storage.rollback_operator_alter(slot, prior);
         return Err(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorAltered {
         slot: slot as u32,
         prior,
@@ -31131,8 +31118,8 @@ fn stage_operator_drop(
 ) -> Result<(), SqlError> {
     let definition = storage.operator_for(slot, txn.txid);
     storage.drop_operator(slot, txn.txid);
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropOperator {
@@ -31144,7 +31131,6 @@ fn stage_operator_drop(
         storage.rollback_operator_drop(slot, txn.txid);
         return Err(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorDropped(slot as u32)) {
         storage.rollback_operator_drop(slot, txn.txid);
         return Err(error);
@@ -31498,8 +31484,8 @@ pub(crate) fn create_operator_family(
     };
     let created_at = storage.operator_family(slot).created_at;
     let definition = storage.operator_family_for(slot, txn.txid);
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetOperatorFamily {
@@ -31510,7 +31496,6 @@ pub(crate) fn create_operator_family(
         storage.rollback_operator_family_create(slot);
         return sql_fail(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorFamilyCreated(slot as u32)) {
         storage.rollback_operator_family_create(slot);
         return sql_fail(error);
@@ -31527,8 +31512,8 @@ fn stage_operator_family_drop(
 ) -> Result<(), SqlError> {
     let definition = storage.operator_family_for(slot, txn.txid);
     storage.drop_operator_family(slot, txn.txid);
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropOperatorFamily {
@@ -31539,7 +31524,6 @@ fn stage_operator_family_drop(
         storage.rollback_operator_family_drop(slot, txn.txid);
         return Err(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorFamilyDropped(slot as u32)) {
         storage.rollback_operator_family_drop(slot, txn.txid);
         return Err(error);
@@ -31781,8 +31765,8 @@ fn stage_operator_family(
 ) -> Result<(), SqlError> {
     let prior = storage.stage_operator_family_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator_family(slot).created_at;
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetOperatorFamily {
@@ -31793,7 +31777,6 @@ fn stage_operator_family(
         storage.rollback_operator_family_alter(slot, prior);
         return Err(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorFamilyAltered {
         slot: slot as u32,
         prior,
@@ -31984,8 +31967,8 @@ fn stage_operator_class(
 ) -> Result<(), SqlError> {
     let prior = storage.stage_operator_class_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator_class(slot).created_at;
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetOperatorClass {
@@ -31996,7 +31979,6 @@ fn stage_operator_class(
         storage.rollback_operator_class_alter(slot, prior);
         return Err(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorClassAltered {
         slot: slot as u32,
         prior,
@@ -32068,8 +32050,8 @@ fn stage_operator_class_drop(
         stage_operator_family(storage, wal, txn, family_slot, family)?;
     }
     storage.drop_operator_class(slot, txn.txid);
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::DropOperatorClass {
@@ -32080,7 +32062,6 @@ fn stage_operator_class_drop(
         storage.rollback_operator_class_drop(slot, txn.txid);
         return Err(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorClassDropped(slot as u32)) {
         storage.rollback_operator_class_drop(slot, txn.txid);
         return Err(error);
@@ -32134,8 +32115,8 @@ pub(crate) fn create_operator_class(
         }
         let created_at = storage.operator_family(slot).created_at;
         let definition = storage.operator_family_for(slot, txn.txid);
-        let lsn = storage.lsn() + 1;
-        if let Err(error) = wal.stage(
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::SetOperatorFamily {
@@ -32146,7 +32127,6 @@ pub(crate) fn create_operator_class(
             storage.rollback_operator_family_create(slot);
             return sql_fail(error);
         }
-        storage.set_lsn(lsn);
         slot
     };
     let mut operators = [crate::storage::OperatorFamilyOperator::EMPTY;
@@ -32288,8 +32268,8 @@ pub(crate) fn create_operator_class(
         Err(error) => return sql_fail(error),
     };
     let created_at = storage.operator_class(slot).created_at;
-    let lsn = storage.lsn() + 1;
-    if let Err(error) = wal.stage(
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetOperatorClass {
@@ -32300,7 +32280,6 @@ pub(crate) fn create_operator_class(
         storage.rollback_operator_class_create(slot);
         return sql_fail(error);
     }
-    storage.set_lsn(lsn);
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorClassCreated(slot as u32)) {
         storage.rollback_operator_class_create(slot);
         return sql_fail(error);
@@ -37677,8 +37656,8 @@ pub fn drop_rule(
     };
     let temporary = storage.access_object_is_temporary(target.access_object(), txn.txid);
     if !temporary {
-        let lsn = storage.lsn() + 1;
-        if let Err(error) = wal.stage(
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropRule {
@@ -37691,7 +37670,6 @@ pub fn drop_rule(
             storage.rollback_rule_drop(slot, txn.txid);
             return sql_fail(error);
         }
-        storage.set_lsn(lsn);
     }
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleDropped(slot as u32)) {
         storage.rollback_rule_drop(slot, txn.txid);
@@ -37716,8 +37694,8 @@ fn stage_rule(
         crate::storage::RuleTarget::Table(_) => crate::wal::TriggerTargetKind::Table,
         crate::storage::RuleTarget::View(_) => crate::wal::TriggerTargetKind::View,
     };
-    let lsn = storage.lsn() + 1;
-    wal.stage(
+    let lsn = storage.bump_lsn();
+    wal.stage_reserved(
         txn.txid,
         lsn,
         &WalOp::SetRule {
@@ -37741,7 +37719,6 @@ fn stage_rule(
             ),
         },
     )?;
-    storage.set_lsn(lsn);
     Ok(())
 }
 
@@ -47574,8 +47551,8 @@ pub fn drop_statistics(
         }
         let definition = storage.extended_statistics(slot).definition_for(txn.txid);
         if !temporary {
-            let lsn = storage.lsn() + 1;
-            if let Err(error) = wal.stage(
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &crate::wal::WalOp::DropExtendedStatistics {
@@ -47586,7 +47563,6 @@ pub fn drop_statistics(
                 storage.rollback_extended_statistics_drop(slot, txn.txid);
                 return sql_fail(error);
             }
-            storage.set_lsn(lsn);
         }
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(slot as u32)) {
             storage.rollback_extended_statistics_drop(slot, txn.txid);
@@ -47621,8 +47597,8 @@ fn stage_extended_statistics_definition(
             }
         };
     }
-    let lsn = storage.lsn() + 1;
-    wal.stage(
+    let lsn = storage.bump_lsn();
+    wal.stage_reserved(
         txn.txid,
         lsn,
         &crate::wal::WalOp::SetExtendedStatistics {
@@ -47638,7 +47614,6 @@ fn stage_extended_statistics_definition(
             key_count: statistics.keys_for(txn.txid).len(),
         },
     )?;
-    storage.set_lsn(lsn);
     Ok(())
 }
 

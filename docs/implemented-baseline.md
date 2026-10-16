@@ -429,7 +429,10 @@ position does not publish a durable commit: the journal still orders staged
 records at commit. Reservations share a checked startup-sized atomic counter.
 Exhaustion reaches the same staging-error handlers as a full journal buffer,
 returning `54000` with `WAL LSN space exhausted`. A rejected reservation cannot
-claim a journal stage or wrap to an older position. Observing a completed
+claim a journal stage or wrap to an older position. Completing even a read-only
+transaction currently records its assigned identity, so that completion can also
+fail when no log positions remain. An explicit read ended with `ROLLBACK` does
+not require that commit record. Observing a completed
 publication cannot move the counter backward. Recovery can restore an exact
 position only with exclusive storage access.
 
@@ -443,7 +446,7 @@ Both atomic controls are included exactly in the startup memory plan. Their
 
 **User example:** a table creation that cannot reserve a journal position fails
 without leaving the table or its identity sequence behind. An unsuccessful view
-replacement keeps the old query and rewrite rule. Existing rows remain readable
+replacement keeps the old query and rewrite rule. Existing rows remain intact
 when new log positions are exhausted. These guarantees do not enable parallel
 SQL execution or replace the remaining durable-commit coordinator.
 

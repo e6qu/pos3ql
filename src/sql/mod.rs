@@ -5115,8 +5115,8 @@ impl Engine {
             if durable_table_count == 0 {
                 continue;
             }
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
                 transaction_id,
                 lsn,
                 &WalOp::Truncate {
@@ -5130,7 +5130,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         for i in 0..txn.touched().len() {
             let (table, rowid, _) = txn.touched()[i];
@@ -5159,14 +5158,14 @@ impl Engine {
             let name = def.name;
             let schema = def.schema;
             drop(def);
-            let lsn = self.storage.lsn() + 1;
+            let lsn = self.storage.bump_lsn();
             let committed = state.committed;
             drop(state);
             let appended = match (p.loc, committed) {
                 (Some(loc), Some(old_home)) => {
                     self.storage
                         .with_row_bytes(table as usize, rowid, old_home, |old_row| {
-                            self.wal.stage(
+                            self.wal.stage_reserved(
                                 txn.txid,
                                 lsn,
                                 &WalOp::Upsert {
@@ -5220,7 +5219,6 @@ impl Engine {
                 }
                 return Err(e);
             }
-            self.storage.observe_lsn(lsn);
         }
         // Journal any sequence advances (this transaction's or ones a
         // rolled-back transaction left dirty): absolute positions, so replay
@@ -5244,8 +5242,8 @@ impl Engine {
                 if !self.storage.table_def(i, txn.txid).columns()[c].auto_increment {
                     continue;
                 }
-                let lsn = self.storage.lsn() + 1;
-                if let Err(e) = self.wal.stage(
+                let lsn = self.storage.bump_lsn();
+                if let Err(e) = self.wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::SequenceSet {
@@ -5258,7 +5256,6 @@ impl Engine {
                     self.rollback_txn(txn, guc);
                     return Err(e);
                 }
-                self.storage.observe_lsn(lsn);
             }
         }
         // Journal sequence advances (this transaction's or ones a rolled-back
@@ -5277,8 +5274,8 @@ impl Engine {
             }
             let schema = seq.schema;
             let name = seq.name;
-            let lsn = self.storage.lsn() + 1;
-            if let Err(e) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(e) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SequenceAdvance {
@@ -5291,7 +5288,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(e);
             }
-            self.storage.observe_lsn(lsn);
             self.storage
                 .mark_sequence_value_staged(i, txn.txid, generation);
         }
@@ -5314,8 +5310,8 @@ impl Engine {
             {
                 continue;
             }
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::BrinMaintenance {
@@ -5329,7 +5325,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         // pg_statistic column rows are transactional, but PostgreSQL updates
         // pg_class reltuples/relpages in place. A later commit therefore also
@@ -5354,8 +5349,8 @@ impl Engine {
             if image.persistence == crate::storage::RelationPersistence::Temporary {
                 continue;
             }
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::Analyze {
@@ -5367,7 +5362,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         for slot in 0..self.storage.extended_statistics_count() {
             let Some(statistics) = self
@@ -5386,8 +5380,8 @@ impl Engine {
                 .storage
                 .extended_statistics(slot)
                 .definition_for(txn.txid);
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::AnalyzeExtendedStatistics {
@@ -5399,7 +5393,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         self.stage_foreign_catalog_wal(txn, guc)?;
         for (position, undo) in txn.ddl().iter().enumerate() {
@@ -5422,9 +5415,9 @@ impl Engine {
                 continue;
             }
             let extension = self.storage.extension(slot);
-            let lsn = self.storage.lsn() + 1;
+            let lsn = self.storage.bump_lsn();
             let result = if dropping || !extension.visible_to(txn.txid) {
-                self.wal.stage(
+                self.wal.stage_reserved(
                     txn.txid,
                     lsn,
                     &WalOp::DropExtension {
@@ -5457,7 +5450,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::ExtensionDependencyChanged { slot, .. } = *undo else {
@@ -5491,8 +5483,8 @@ impl Engine {
             let (schema, name) = self
                 .storage
                 .access_object_name_to(dependency.object, txn.txid);
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetExtensionDependency {
@@ -5516,7 +5508,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::ExtensionConfigChanged { slot, .. } = *undo else {
@@ -5536,8 +5527,8 @@ impl Engine {
             let (schema, name) = self
                 .storage
                 .access_object_name_to(config.relation.access_object(), txn.txid);
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetExtensionConfig {
@@ -5553,7 +5544,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         for undo in txn.ddl() {
             let operation = match *undo {
@@ -5570,12 +5560,11 @@ impl Engine {
                 },
                 _ => continue,
             };
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(txn.txid, lsn, &operation) {
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(txn.txid, lsn, &operation) {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         // Ownership and ACLs are absolute catalog images. They are staged at
         // commit from the transaction-visible overlays, so repeated GRANT,
@@ -5657,8 +5646,8 @@ impl Engine {
             let (schema, name) = self.storage.access_object_name_to(object, txn.txid);
             let owner = self.storage.object_owner(object, txn.txid);
             let owner_name = self.storage.role_name(owner, txn.txid);
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetObjectOwner {
@@ -5680,7 +5669,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::ObjectAclChanged { slot, .. } = *undo else {
@@ -5723,8 +5711,8 @@ impl Engine {
             let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
                 .then(|| self.storage.role_name(grantee as usize, txn.txid));
             let grantor_name = self.storage.role_name(grantor as usize, txn.txid);
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetObjectAcl {
@@ -5749,7 +5737,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::ColumnAclChanged { slot, .. } = *undo else {
@@ -5796,8 +5783,8 @@ impl Engine {
             let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
                 .then(|| self.storage.role_name(grantee as usize, txn.txid));
             let grantor_name = self.storage.role_name(grantor as usize, txn.txid);
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetColumnAcl {
@@ -5814,7 +5801,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::ParameterAclChanged { slot, .. } = *undo else {
@@ -5851,8 +5837,8 @@ impl Engine {
             let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
                 .then(|| self.storage.role_name(grantee as usize, txn.txid));
             let grantor_name = self.storage.role_name(grantor as usize, txn.txid);
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetParameterAcl {
@@ -5866,7 +5852,6 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::DefaultAclChanged { slot, .. } = *undo else {
@@ -5893,8 +5878,8 @@ impl Engine {
             };
             let grantee = (entry.grantee != crate::storage::PUBLIC_ROLE)
                 .then(|| self.storage.role_name(entry.grantee as usize, txn.txid));
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetDefaultAcl {
@@ -5910,37 +5895,52 @@ impl Engine {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         let subscription_advance_count = txn.subscription_advances().len() as u64;
-        let (staged_record_count, _) = self.wal.stage_stats(txn.txid);
-        // finish_stage assigns every already-staged record, every advance,
-        // and the COMMIT boundary after the current provisional LSN. A fresh
-        // stage also acquires its implicit database-scope record.
-        let subscription_origin_lsn = self
-            .storage
-            .lsn()
-            .checked_add(staged_record_count.max(1))
-            .and_then(|lsn| lsn.checked_add(subscription_advance_count.saturating_mul(2)))
-            .and_then(|lsn| lsn.checked_add(1))
-            .ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted"))?;
-        for advance in txn.subscription_advances() {
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::AdvanceSubscription {
-                    name: advance.name(),
-                    created_at: advance.stream().created_at(),
-                    definition_generation: advance.stream().definition_generation(),
-                    confirmed_lsn: advance.confirmed_lsn(),
-                    local_lsn: subscription_origin_lsn,
-                },
-            ) {
-                self.rollback_txn(txn, guc);
-                return Err(error);
+        let subscription_origin_lsn = if subscription_advance_count == 0 {
+            None
+        } else {
+            let (staged_record_count, _) = self.wal.stage_stats(txn.txid);
+            // Each advance reserves a provisional position and adds a record;
+            // a fresh stage also needs its database-scope and COMMIT records.
+            let origin = subscription_advance_count
+                .checked_mul(2)
+                .and_then(|advances| {
+                    self.storage
+                        .lsn()
+                        .checked_add(staged_record_count.max(1))?
+                        .checked_add(advances)
+                })
+                .and_then(|position| position.checked_add(1));
+            match origin {
+                Some(position) => Some(position),
+                None => {
+                    self.rollback_txn(txn, guc);
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "WAL LSN space exhausted"
+                    ));
+                }
             }
-            self.storage.observe_lsn(lsn);
+        };
+        if let Some(origin_lsn) = subscription_origin_lsn {
+            for advance in txn.subscription_advances() {
+                let lsn = self.storage.bump_lsn();
+                if let Err(error) = self.wal.stage_reserved(
+                    txn.txid,
+                    lsn,
+                    &WalOp::AdvanceSubscription {
+                        name: advance.name(),
+                        created_at: advance.stream().created_at(),
+                        definition_generation: advance.stream().definition_generation(),
+                        confirmed_lsn: advance.confirmed_lsn(),
+                        local_lsn: origin_lsn,
+                    },
+                ) {
+                    self.rollback_txn(txn, guc);
+                    return Err(error);
+                }
+            }
         }
         // Keep the publication object inside its startup-reserved buffer.
         // A full preceding batch is published before adding this transaction;
@@ -6002,9 +6002,9 @@ impl Engine {
             self.storage.release_row_locks(txn.txid);
             self.storage.release_advisory_transaction_locks(txn.txid);
         }
-        if subscription_advance_count != 0 {
+        if let Some(origin_lsn) = subscription_origin_lsn {
             debug_assert_eq!(
-                subscription_origin_lsn, commit_lsn,
+                origin_lsn, commit_lsn,
                 "subscription origin WAL must name its transaction commit LSN"
             );
         }
@@ -6692,12 +6692,11 @@ impl Engine {
                     }
                 }
             };
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(txn.txid, lsn, &operation) {
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(txn.txid, lsn, &operation) {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
-            self.storage.observe_lsn(lsn);
         }
         Ok(())
     }
@@ -6877,16 +6876,15 @@ impl Engine {
             self.prepared_transactions.release(slot);
             return Err(fail(self, txn, cursors, error));
         }
-        let lock_lsn = self.storage.lsn() + 1;
+        let lock_lsn = self.storage.bump_lsn();
         let lock_record = WalOp::PreparedLocks {
             transaction_id: txn.txid,
             encoded: self.prepared_transactions.slot(slot).locks.readable(),
         };
-        if let Err(error) = self.wal.stage(txn.txid, lock_lsn, &lock_record) {
+        if let Err(error) = self.wal.stage_reserved(txn.txid, lock_lsn, &lock_record) {
             self.prepared_transactions.release(slot);
             return Err(fail(self, txn, cursors, error));
         }
-        self.storage.observe_lsn(lock_lsn);
         if let Err(error) = self.finish_txn(txn, guc, Some(slot)) {
             self.prepared_transactions.release(slot);
             return Err(error);
@@ -6949,14 +6947,13 @@ impl Engine {
             ));
         }
 
-        let lsn = self.storage.lsn() + 1;
+        let lsn = self.storage.bump_lsn();
         let operation = if commit {
             WalOp::CommitPrepared { gid: gid.as_str() }
         } else {
             WalOp::RollbackPrepared { gid: gid.as_str() }
         };
-        self.wal.stage(txn.txid, lsn, &operation)?;
-        self.storage.observe_lsn(lsn);
+        self.wal.stage_reserved(txn.txid, lsn, &operation)?;
         self.commit_txn(txn, guc)?;
         let resolution_lsn = self.storage.lsn();
 

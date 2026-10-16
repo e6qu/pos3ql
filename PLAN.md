@@ -74,8 +74,8 @@ pools between batches; retained row values survive cleanup and slot reuse.
 Transactional table creation reserves names and slots without exclusive storage
 access. Failed initialization releases its slot and index-cache claims. Pending row
 publication rechecks database, table identity, and transaction-visible existence
-after preparation, so removal cannot leave rows in an absent table. A write waiting
-on one table's definition does not reserve the shared snapshot registry.
+after preparation, so removal cannot leave rows in an absent table. A pending write
+waiting on one table's definition does not delay writes to other tables.
 The [implementation guide](docs/implemented-baseline.md) owns the completed
 contracts, examples, and capacity limits.
 

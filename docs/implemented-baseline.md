@@ -38,7 +38,7 @@ next statement.
 |---|---|---|
 | Statement buffers | Startup-sized arenas, row-selection scratch, connection/database context, and ordered dispatcher leases; COPY and subscriptions have separate buffers | Run statements on workers and coordinate all remaining shared state |
 | Transaction identities | One guarded counter serves SQL, maintenance, and recovery. Creating a SQL transaction reserves its ID and registry entry together; capacity errors leave existing transactions valid. | Coordinate journal staging, prepared transactions, and engine publication during concurrent execution. |
-| Journal positions | Checked shared reservations and monotonic observation; staging exhaustion follows ordinary rollback paths; exact replay restoration stays exclusive | Coordinate durable commit ordering and journal buffers during concurrent execution |
+| Journal positions | Checked shared reservations and observations that never move backward; staging exhaustion follows ordinary rollback paths; exact replay restoration stays exclusive | Coordinate durable commit ordering and journal buffers during concurrent execution |
 | Row identities | Shared allocation reserves unique IDs without runtime allocation. Inserts and partition moves attach deferred checks to the ID actually stored; exhaustion returns `54000` before appending bytes. | Transaction publication and execution workers remain unfinished. |
 | Catalogs and table definitions | Synchronized updates; readers retain their selected definition and identity; each table has its own cleanup lock; transactional creation reserves names and slots through shared storage access | Engine-wide publication, rewrites, and maintenance integration |
 | Sequence positions | Per-table synchronization, checked arithmetic, coherent journal/checkpoint images, and acknowledgement of unchanged staged positions | Preserve these rules through engine-wide concurrent publication |
@@ -426,7 +426,7 @@ capture guards. Cancellation and failed capture release reader registrations.
 
 A log sequence number (LSN) gives each journal record a position. Reserving a
 position does not publish a durable commit: the journal still orders staged
-records at commit. Reservations share a checked startup-sized atomic counter.
+records at commit. Each reservation updates a shared, checked counter whose memory is reserved at startup.
 Exhaustion reaches the same staging-error handlers as a full journal buffer,
 returning `54000` with `WAL LSN space exhausted`. A rejected reservation cannot
 claim a journal stage or wrap to an older position. A query that only reads data and has not
@@ -441,7 +441,7 @@ before publishing an object or its dependents; the existing catalog diagnostic
 is `catalog sequence OID range exhausted`. Lower object-specific object
 identifier (OID) limits still apply. View creation reserves its identity before
 installing the return rule, so failure preserves an existing replacement target.
-Both atomic controls are included exactly in the startup memory plan. Their
+Both counter controls are included exactly in the startup memory plan. Their
 64-bit representation is not a configurable memory reservation.
 
 **User example:** a table creation that cannot reserve a journal position fails

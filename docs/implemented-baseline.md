@@ -369,6 +369,12 @@ integer or bigint. A smallint cast returns SQLSTATE 42846, including for NULL,
 unless an explicitly registered cast provides that conversion. Schema-drop
 notices retain declared domain and array names in routine signatures.
 
+A custom cast that calls a function marked VOLATILE runs during execution,
+rather than while checking constant expressions. For example, a cast that calls
+nextval advances the sequence once for each evaluated value. A skipped false
+branch does not advance it, and waiting for a nested function does not advance
+it again. SQL function result queries use the connection's sequence state.
+
 Schema validation uses a current read position for the rows being checked,
 including earlier changes by the same transaction. CHECK, NOT NULL, uniqueness,
 foreign-key and domain rules, and partition attachment retain their original row

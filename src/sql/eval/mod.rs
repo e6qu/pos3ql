@@ -1769,9 +1769,8 @@ fn fold_check<'a>(
         return Ok(match result {
             Ok(Datum::Bool(b)) => Some(b),
             Ok(_) => None,
-            // Catalog-resolved values cannot fold without the catalog this
-            // plan-time check intentionally does not carry. Runtime resolves
-            // and validates them with the query catalog.
+            // Unresolved catalog values stay for runtime validation. Registered
+            // immutable casts above already have their catalog context.
             Err(e)
                 if e.sqlstate == sqlstate::UNDEFINED_OBJECT
                     || e.sqlstate == sqlstate::UNDEFINED_FUNCTION

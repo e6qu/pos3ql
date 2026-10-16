@@ -1043,7 +1043,7 @@ fn execute_routine_query_under<'a>(
             validate_locking(select)?;
             if recycling {
                 select_into_rows_recycling(
-                    storage, txid, select, arena, params, sequences, None, emit,
+                    storage, txid, select, arena, params, None, sequences, emit,
                 )
             } else {
                 select_into_rows(storage, txid, select, arena, params, None, sequences, emit)

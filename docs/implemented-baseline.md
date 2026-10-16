@@ -442,11 +442,13 @@ and its slot is reused. The retained order still contains its original values,
 including the version appropriate to its read position. Another table's cleanup
 can finish while removal waits for the first table's retained definition.
 
-Pending row writes capture an admitted table identity before preparing bytes or
+Pending row writes capture an admitted table identity before comparing values or
 reading saved data. Publication rechecks its database, identity and visibility
 under the table-definition guard. Removal during preparation returns `40001`
 without recreating rows or consuming pending-version slots, even before the old
-table slot is reused. A new capture after rollback can proceed normally.
+table slot is reused. A new capture after rollback can proceed normally. Waiting for one table
+definition releases the shared snapshot registry; retries retain the original
+table identity instead of adopting a replacement.
 
 These are storage-level guarantees: SQL execution is still serial and its
 transaction-level relation locks still apply. Transactional table creation takes

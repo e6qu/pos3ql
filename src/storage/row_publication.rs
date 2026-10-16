@@ -15,6 +15,7 @@ struct PreparedPendingWrite {
     track_statistics: bool,
 }
 
+#[derive(Clone, Copy)]
 struct PreparedTableTarget {
     table: usize,
     database: DatabaseOid,
@@ -22,6 +23,23 @@ struct PreparedTableTarget {
 }
 
 impl PreparedTableTarget {
+    fn same_target(self, other: Self) -> Result<(), SqlError> {
+        if self.table != other.table
+            || self.database != other.database
+            || self.incarnation != other.incarnation
+        {
+            return Err(Self::retired_error());
+        }
+        Ok(())
+    }
+
+    fn retired_error() -> SqlError {
+        sql_err!(
+            sqlstate::SERIALIZATION_FAILURE,
+            "pending row belongs to a retired table incarnation"
+        )
+    }
+
     fn capture(
         table: usize,
         identity: table_definitions::TableIdentity,
@@ -45,10 +63,7 @@ impl PreparedTableTarget {
             || identity.created_at != self.incarnation
             || !identity.existence.visible_to(txid)
         {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "pending row belongs to a retired table incarnation"
-            ));
+            return Err(Self::retired_error());
         }
         Ok(())
     }
@@ -57,6 +72,7 @@ impl PreparedTableTarget {
 enum PendingPublication {
     Written(PendingWriteUndo),
     Retry,
+    DefinitionBusy,
     Wait(u32, &'static str),
 }
 
@@ -96,12 +112,25 @@ impl Storage {
         loc: Option<RowLoc>,
         track_statistics: bool,
     ) -> Result<PendingWriteUndo, SqlError> {
+        let mut original_target: Option<PreparedTableTarget> = None;
         loop {
             let prepared =
                 self.prepare_pending_write(table_index, rowid, txid, cid, loc, track_statistics)?;
+            let target = prepared.target;
+            if let Some(original) = original_target {
+                original.same_target(target)?;
+            } else {
+                original_target = Some(target);
+            }
             match self.publish_pending_write(prepared)? {
                 PendingPublication::Written(undo) => return Ok(undo),
                 PendingPublication::Retry => continue,
+                PendingPublication::DefinitionBusy => {
+                    // Wait outside the snapshot registry and retain the original
+                    // request identity when byte preparation needs another turn.
+                    let definition = self.tables[table_index].definition.read();
+                    target.validate(definition.identity, txid)?;
+                }
                 PendingPublication::Wait(owner, message) => {
                     return Err(self.pending_write_wait(txid, owner, message));
                 }
@@ -140,7 +169,7 @@ impl Storage {
                     "statement is waiting for a concurrent table definition change",
                 ));
             }
-            PreparedTableTarget::capture(table, *definition.identity(), txid)?
+            PreparedTableTarget::capture(table, definition.identity(), txid)?
         };
         let (expected, pending_identity, existed) = match self.resident_row_state(table, rowid)? {
             Some(state) => {
@@ -223,7 +252,13 @@ impl Storage {
         } = prepared;
         let table = target.table;
         let snapshots = self.snapshot_state();
-        let definition = self.tables[table].definition.read();
+        let definition = match self.tables[table].definition.try_read() {
+            Ok(definition) => definition,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(PendingPublication::DefinitionBusy);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("table definition lock poisoned"),
+        };
         target.validate(definition.identity, change.txid)?;
         if let Some(owner) = definition
             .identity
@@ -490,6 +525,53 @@ mod tests {
                 storage.restore_pending(table, 2, 7, undo);
                 assert!(storage.resident_row_state(table, 2).unwrap().is_none());
             });
+        });
+    }
+
+    #[test]
+    fn shared_row_publication_defers_definition_waits_without_reserving_other_tables() {
+        let (mut storage, table) = fixture(&test_config());
+        let other = storage
+            .create_table(make_def(
+                "unrelated_admission",
+                &[("id", ColType::Int4, false)],
+            ))
+            .unwrap();
+        let location = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+        let prepared = storage
+            .prepare_pending_write(table, 1, 7, 1, Some(location), true)
+            .unwrap();
+        let definition = storage.tables[table].definition.write();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let storage = &storage;
+            scope.spawn(move || {
+                let result =
+                    crate::mem::guard::forbid_alloc(|| storage.publish_pending_write(prepared));
+                send.send(result).unwrap();
+            });
+            let result = receive.recv_timeout(Duration::from_secs(5));
+            // Release before assertions so even the blocking regression can
+            // finish its scope without stranding a worker.
+            if matches!(result, Ok(Ok(PendingPublication::DefinitionBusy))) {
+                crate::mem::guard::forbid_alloc(|| {
+                    let undo = storage
+                        .write_pending(other, 1, 8, 1, Some(location))
+                        .unwrap();
+                    storage.restore_pending(other, 1, 8, undo);
+                });
+            }
+            drop(definition);
+            assert!(
+                matches!(result, Ok(Ok(PendingPublication::DefinitionBusy))),
+                "a held definition must defer without retaining the global snapshot registry"
+            );
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            let undo = storage
+                .write_pending(table, 1, 7, 1, Some(location))
+                .unwrap();
+            storage.restore_pending(table, 1, 7, undo);
         });
     }
 

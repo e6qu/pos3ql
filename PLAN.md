@@ -69,9 +69,8 @@ startup. Pending definitions and cache owners do not reserve unrelated tables'
 slots. Rule changes take the target relation's lock before selecting or changing
 its definition; rollback preserves another transaction's history. Column
 descriptions and catalog checks of writable views do not acquire execution
-locks. The
-[implementation guide](docs/implemented-baseline.md) owns the completed contracts,
-examples, and capacity limits.
+locks. The [implementation guide](docs/implemented-baseline.md) owns the completed
+contracts, examples, and capacity limits.
 
 Still to do:
 

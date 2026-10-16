@@ -44,6 +44,11 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install protocol failure debugger
+        if: matrix.needs_pg18_client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gdb
       - name: Expose PostgreSQL 18 psql for protocol coverage
         if: matrix.needs_pg18_client
         run: |

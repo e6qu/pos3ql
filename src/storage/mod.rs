@@ -8,6 +8,8 @@
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
+mod log_positions;
+pub(crate) use log_positions::ReservedLogPosition;
 mod table_creation;
 mod table_definitions;
 pub(crate) use table_definitions::TableDefinitionRead;
@@ -13456,9 +13458,8 @@ impl CatalogSequence {
         Self(std::sync::atomic::AtomicU64::new(value))
     }
 
-    fn next(&self) -> u64 {
+    fn next(&self) -> Result<u64, SqlError> {
         self.next_bounded(u64::MAX, "catalog sequence")
-            .expect("catalog sequence exhausted")
     }
 
     fn next_bounded(&self, maximum: u64, object: &str) -> Result<u64, SqlError> {
@@ -13749,8 +13750,8 @@ pub struct Storage {
     /// Relation, row, and advisory locks share one wait graph and acquisition
     /// sequence. One boundary keeps cross-registry transitions atomic.
     locks: std::sync::Arc<std::sync::Mutex<LockState>>,
-    /// Log sequence number of the latest write; becomes the WAL position.
-    lsn: u64,
+    /// Shared provisional record positions; commit ordering is coordinated by WAL.
+    lsn: log_positions::LogPositions,
     /// ALTER TABLE replay is encoded as a compact identity/mapping marker
     /// followed immediately by the ordinary final table definition.
     replay_table_rewrite: Option<ReplayTableRewrite>,
@@ -16804,7 +16805,7 @@ impl Storage {
         definition: foreign::ForeignDataWrapperDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         let slot = self.foreign_catalog().create_wrapper(
             current_database(),
             created_at,
@@ -16824,7 +16825,7 @@ impl Storage {
         definition: foreign::ForeignServerDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         let slot = self.foreign_catalog().create_server(
             current_database(),
             created_at,
@@ -16844,7 +16845,7 @@ impl Storage {
         definition: foreign::UserMappingDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         self.foreign_catalog()
             .create_mapping(current_database(), created_at, definition, txid)
     }
@@ -16854,7 +16855,7 @@ impl Storage {
         definition: foreign::ForeignTableDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         self.foreign_catalog().create_table(
             current_database(),
             created_at,
@@ -17661,6 +17662,8 @@ impl Storage {
 
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
+            + log_positions::LogPositions::budget_bytes()
+            + size_of::<CatalogSequence>()
             + size_of::<std::sync::Mutex<()>>()
             + snapshot_owner_bytes()
             + config.max_connections as usize * size_of::<ExportedSnapshot>()
@@ -17798,6 +17801,7 @@ impl Storage {
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         budget.draw(size_of::<std::sync::Mutex<()>>(), "table creation controls")?;
+        budget.draw(size_of::<CatalogSequence>(), "catalog sequence controls")?;
         crate::sql::set_execution_database_oid(DatabaseOid::POSTGRES);
         let heap = RowHeap::new(budget, config.memtable_bytes)?;
         let foreign = foreign::ForeignCatalog::new(config, budget)?;
@@ -18715,7 +18719,7 @@ impl Storage {
                 sequence: 0,
             })),
             next_rowid: row_identities::RowIdentities::new(),
-            lsn: 0,
+            lsn: log_positions::LogPositions::new(budget)?,
             replay_table_rewrite: None,
             spill: None,
             value_indexes,
@@ -22366,7 +22370,7 @@ impl Storage {
             class: AccessClass::LargeObject,
             slot: slot as u16,
         });
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         let ownership = self.initial_ownership(txid);
         self.large_objects
             .lock()
@@ -27928,7 +27932,7 @@ impl Storage {
                     catalog.definitions.len()
                 )
             })?;
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         catalog.definitions[slot] = ExtensionDef {
             database: current_database(),
             created_at,
@@ -33487,7 +33491,7 @@ impl Storage {
     /// replacement that bypasses [`Self::commit_row`] (replay, rewrite,
     /// truncation, or explicit REINDEX maintenance).
     pub(crate) fn mark_value_bindings_dirty(&mut self, table_index: usize) {
-        let dirty_lsn = self.lsn.saturating_add(1);
+        let dirty_lsn = self.lsn().saturating_add(1);
         self.mark_value_bindings_rebuild_at(table_index, dirty_lsn);
     }
 
@@ -33868,7 +33872,7 @@ impl Storage {
         table_index: usize,
         txid: Option<u32>,
     ) -> Result<(), SqlError> {
-        let new_dirty_lsn = self.lsn.saturating_add(1);
+        let new_dirty_lsn = self.lsn().saturating_add(1);
         // DDL reshapes the cache slots, but an unchanged column tuple keeps
         // its manifest-published object generation.
         let (published, n_published, expected_generation) = {
@@ -35859,7 +35863,7 @@ impl Storage {
         };
         let mut publications = [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS];
         publications[..spec.publications.len()].copy_from_slice(spec.publications);
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         catalog.definitions[slot] = SubscriptionDef {
             database: current_database(),
             created_at,
@@ -36978,7 +36982,7 @@ impl Storage {
         };
         publications[slot] = PublicationDef {
             database: current_database(),
-            created_at: self.catalog_sequence.next(),
+            created_at: self.catalog_sequence.next()?,
             name: spec.name,
             pending_name: None,
             all_tables: spec.all_tables,
@@ -37312,9 +37316,9 @@ impl Storage {
             class: AccessClass::MaterializedView,
             slot: new as u16,
         });
+        let created_at = self.catalog_sequence.next()?;
         let image = self.matview_dependency_image(new);
         self.write_dependency_image(image, query.dependencies.view())?;
-        let created_at = self.catalog_sequence.next();
         self.matview_catalog()[new] = MatviewDef {
             database: current_database(),
             created_at,
@@ -37596,7 +37600,7 @@ impl Storage {
         } = create;
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid);
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         let mut catalog = self.sequence_catalog();
         if let Some(blocker) = catalog.definitions.iter().find_map(|s| {
             (s.database == current_database()
@@ -38596,7 +38600,7 @@ impl Storage {
             };
         }
         self.require_schema_create(schema.as_str(), txid)?;
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
@@ -39667,7 +39671,7 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
@@ -40790,7 +40794,7 @@ impl Storage {
                 field.ctype = ctype;
             }
         }
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
@@ -40943,7 +40947,7 @@ impl Storage {
                 field.ctype = ctype;
             }
         }
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         let ownership = self.initial_ownership(txid);
         let mut catalog = self
             .type_catalog
@@ -41135,8 +41139,9 @@ impl Storage {
             returning_action: None,
             creation_path: definition.query.creation_path,
         };
+        let created_at = self.catalog_sequence.next()?;
         // Reserve and populate the return rule before changing either view.
-        // Capacity errors must leave an existing replacement target untouched.
+        // Capacity and identity errors preserve an existing replacement target.
         let rule = self.create_new_rule_in(
             &mut catalog,
             rule_definition,
@@ -41152,7 +41157,7 @@ impl Storage {
         });
         catalog.views[new] = ViewDef {
             database: current_database(),
-            created_at: self.catalog_sequence.next(),
+            created_at,
             schema,
             name,
             persistence: definition.persistence,
@@ -43559,7 +43564,7 @@ impl Storage {
         };
         let (created_at, ownership) = match identity {
             RoutineIdentity::Allocate => (
-                self.catalog_sequence.next(),
+                self.catalog_sequence.next()?,
                 allocated_ownership.expect("allocated routine ownership was prepared"),
             ),
             RoutineIdentity::Preserve {
@@ -43958,6 +43963,7 @@ impl Storage {
                 catalog.definitions.len()
             ));
         };
+        let created_at = self.catalog_sequence.next()?;
         let role_count = Self::write_policy_role_image(
             &mut catalog,
             self.policy_roles_per_image,
@@ -43968,7 +43974,6 @@ impl Storage {
             StoredQueryDependencyOwner::Policy(slot as u16),
             dependencies.view(),
         )?;
-        let created_at = self.catalog_sequence.next();
         catalog.definitions[slot] = PolicyDef {
             database: current_database(),
             created_at,
@@ -44251,7 +44256,7 @@ impl Storage {
                     catalog.definitions.len()
                 ));
             };
-            let created_at = self.catalog_sequence.next();
+            let created_at = self.catalog_sequence.next()?;
             catalog.definitions[slot] = PolicyDef {
                 database: current_database(),
                 created_at,
@@ -45317,7 +45322,7 @@ impl Storage {
             ));
         };
         let created_at = if spec.created_at == 0 {
-            self.catalog_sequence.next()
+            self.catalog_sequence.next()?
         } else {
             self.catalog_sequence.observe(spec.created_at);
             spec.created_at
@@ -46907,7 +46912,7 @@ impl Storage {
             ));
         }
         let created_at = if created_at == 0 {
-            self.catalog_sequence.next()
+            self.catalog_sequence.next()?
         } else {
             self.catalog_sequence.observe(created_at);
             created_at
@@ -47104,7 +47109,7 @@ impl Storage {
                 owner,
             },
             txid,
-        );
+        )?;
         tablespaces[slot] = definition;
         drop(tablespaces);
         self.clear_object_acl_entries(AccessObject {
@@ -47194,7 +47199,7 @@ impl Storage {
                 owner,
             },
             0,
-        );
+        )?;
         definition.ddl_state = definition.ddl_state.commit_create();
         definition.ownership = definition.ownership.committed();
         tablespaces[slot] = definition;
@@ -47230,14 +47235,18 @@ impl Storage {
         Ok(())
     }
 
-    fn tablespace_definition(&self, image: TablespaceImage, txid: u32) -> TablespaceDef {
+    fn tablespace_definition(
+        &self,
+        image: TablespaceImage,
+        txid: u32,
+    ) -> Result<TablespaceDef, SqlError> {
         let created_at = if image.created_at == 0 {
-            self.catalog_sequence.next()
+            self.catalog_sequence.next()?
         } else {
             self.catalog_sequence.observe(image.created_at);
             image.created_at
         };
-        TablespaceDef {
+        Ok(TablespaceDef {
             created_at,
             name: image.name,
             location: image.location,
@@ -47251,7 +47260,7 @@ impl Storage {
             },
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
-        }
+        })
     }
 
     pub(crate) fn alter_tablespace_definition(
@@ -47675,13 +47684,17 @@ impl Storage {
         self.next_rowid.next()
     }
 
-    pub fn bump_lsn(&mut self) -> u64 {
-        self.lsn += 1;
-        self.lsn
+    pub(crate) fn bump_lsn(&self) -> ReservedLogPosition {
+        self.lsn.reserve()
     }
 
     pub fn lsn(&self) -> u64 {
-        self.lsn
+        self.lsn.current()
+    }
+
+    /// Observe a completed publication without moving a newer position backward.
+    pub(crate) fn observe_lsn(&self, lsn: u64) {
+        self.lsn.observe(lsn);
     }
 
     /// The current worker's command read snapshot.
@@ -49173,7 +49186,7 @@ impl Storage {
                 casts.len()
             ));
         };
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         casts[slot] = CastDef {
             database: current_database(),
             created_at,
@@ -49566,7 +49579,7 @@ impl Storage {
                     catalog.collations.len()
                 )
             })?;
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         catalog.collations[slot] = CollationDef {
             database: current_database(),
             created_at,
@@ -49628,7 +49641,7 @@ impl Storage {
                     catalog.conversions.len()
                 )
             })?;
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         catalog.conversions[slot] = ConversionDef {
             database: current_database(),
             created_at,
@@ -49688,7 +49701,7 @@ impl Storage {
             crate::sql::ast::TextSearchObjectKind::Configuration => 313_000,
         };
         definition.set_oid(base + slot as i32);
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         catalog.text_search_objects[slot] = TextSearchDef {
             database: current_database(),
             created_at,
@@ -50746,11 +50759,11 @@ impl Storage {
                     self.rule_count()
                 )
             })?;
+        let created_at = self.catalog_sequence.next()?;
         self.write_committed_dependencies(
             StoredQueryDependencyOwner::Rule(slot as u16),
             dependencies,
         )?;
-        let created_at = self.catalog_sequence.next();
         catalog.rules[slot] = RuleDef {
             database: current_database(),
             created_at,
@@ -51171,7 +51184,7 @@ impl Storage {
                     event_triggers.len()
                 )
             })?;
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         event_triggers[slot] = EventTriggerDef {
             database: current_database(),
             created_at,
@@ -51752,7 +51765,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.require_schema_create(definition.schema.as_str(), txid)?;
         self.validate_operator_definition(definition, txid, None)?;
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         let mut catalog = self
             .operator_catalog
             .lock()
@@ -52181,7 +52194,7 @@ impl Storage {
                 catalog.families.len()
             ));
         };
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         catalog.families[slot] = OperatorFamilyDef {
             database: current_database(),
             created_at,
@@ -52689,7 +52702,7 @@ impl Storage {
                 catalog.classes.len()
             ));
         };
-        let created_at = self.catalog_sequence.next();
+        let created_at = self.catalog_sequence.next()?;
         catalog.classes[slot] = OperatorClassDef {
             database: current_database(),
             created_at,
@@ -52863,9 +52876,16 @@ impl Storage {
         replace_execution_visibility(visibility);
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_catalog_sequence_for_test(&mut self, value: u64) -> u64 {
+        self.catalog_sequence
+            .0
+            .swap(value, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Recovery: pins the LSN to a replayed record's.
     pub fn set_lsn(&mut self, lsn: u64) {
-        self.lsn = lsn;
+        self.lsn.restore(lsn);
     }
 
     /// Recovery: ensures freshly assigned rowids stay above replayed ones.
@@ -56871,7 +56891,7 @@ mod tests {
                 let claimed = &claimed;
                 scope.spawn(move || {
                     for _ in 0..ADVANCES_PER_WORKER {
-                        let value = sequence.next() as usize;
+                        let value = sequence.next().unwrap() as usize;
                         assert!(value <= ADVANCES);
                         assert!(!claimed[value].swap(true, std::sync::atomic::Ordering::Relaxed));
                     }
@@ -56892,7 +56912,7 @@ mod tests {
             }
         });
         assert_eq!(sequence.current(), 5_003);
-        assert_eq!(sequence.next(), 5_004);
+        assert_eq!(sequence.next().unwrap(), 5_004);
 
         let bounded = CatalogSequence::new(1);
         assert_eq!(bounded.next_bounded(2, "test").unwrap(), 2);
@@ -59937,7 +59957,7 @@ mod tests {
                     catalog.roles[role_start] = worker as u16;
                     catalog.definitions[worker] = PolicyDef {
                         database: current_database(),
-                        created_at: storage.catalog_sequence.next(),
+                        created_at: storage.catalog_sequence.next().unwrap(),
                         name: SqlName::parse(stack_format!(63, "policy_{worker}").as_str())
                             .unwrap(),
                         table: 0,
@@ -60046,7 +60066,7 @@ mod tests {
                     let mut catalog = storage.matview_catalog();
                     catalog[worker] = MatviewDef {
                         database: current_database(),
-                        created_at: storage.catalog_sequence.next(),
+                        created_at: storage.catalog_sequence.next().unwrap(),
                         backing_table: worker as u16,
                         sql: StackStr::from_str("SELECT 1"),
                         creation_path: StackStr::from_str("public"),

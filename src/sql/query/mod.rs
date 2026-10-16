@@ -4659,6 +4659,8 @@ pub struct UpdatableView<'a> {
 /// If `name` is a view, resolve it for DML: `Ok(Some(..))` when auto-updatable,
 /// `Err` (0A000) when it is a view but not auto-updatable, `Ok(None)` when it
 /// is not a view at all (the DML then targets a table normally).
+/// Description and catalog callers share this metadata-only resolution.
+/// Execution locks its target before resolving or selecting rewrite rules.
 pub fn resolve_view_for_dml<'a>(
     storage: &Storage,
     name: QualName,
@@ -4669,14 +4671,6 @@ pub fn resolve_view_for_dml<'a>(
         Some(crate::storage::ResolvedRelation::View(slot)) => slot,
         _ => return Ok(None),
     };
-    if txid != 0 {
-        storage.lock_relation(
-            txid,
-            crate::storage::RelationLockTarget::View(view_slot),
-            crate::sql::ast::TableLockMode::RowExclusive,
-            false,
-        )?;
-    }
     let check_option = storage.view(view_slot).check_option_for(txid);
     // The body re-resolves under the view creator's search path.
     let user = crate::sql::eval::funcs::system::session_user_owned();

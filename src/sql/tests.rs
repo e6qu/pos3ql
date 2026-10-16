@@ -81475,6 +81475,127 @@ fn dml_target_returning_subqueries_keep_old_new_values_and_statement_reads() {
 }
 
 #[test]
+fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions() {
+    let config = test_config("view-description-lock-owners");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE metadata_base(id integer, value integer); \
+         INSERT INTO metadata_base VALUES (1, 10); \
+         CREATE VIEW metadata_writable AS SELECT id, value FROM metadata_base; \
+         CREATE VIEW metadata_literal AS SELECT 1 AS id; \
+         CREATE SCHEMA metadata_unrelated; CREATE TABLE metadata_unrelated.items(id integer)",
+        true,
+    );
+    assert!(!session.transaction.is_active());
+    assert_ne!(
+        session.transaction.txid, 0,
+        "idle sessions retain their last identity"
+    );
+    assert_eq!(engine.storage.table_lock_view_count(), 0);
+    for active in [false, true] {
+        if active {
+            session.success(&mut engine, "BEGIN", true);
+        }
+        for statement in [
+            "INSERT INTO metadata_writable VALUES (2, 20) RETURNING id, value",
+            "UPDATE metadata_writable SET value=value+1 RETURNING id, value",
+            "DELETE FROM metadata_writable RETURNING id, value",
+        ] {
+            session.send.clear();
+            session.arena.reset();
+            let mut responder =
+                Responder::for_describe(&mut session.send, crate::pg::respond::ResultFmt::ALL_TEXT);
+            assert!(
+                crate::mem::guard::forbid_alloc(|| engine.describe(
+                    statement,
+                    &session.arena,
+                    &session.transaction,
+                    Some(&session.cursors),
+                    &mut responder,
+                ))
+                .unwrap()
+            );
+            assert_eq!(
+                row_description_names(session.send.readable()),
+                ["id", "value"]
+            );
+            assert_eq!(
+                engine.storage.table_lock_view_count(),
+                0,
+                "describing {statement} must not acquire an execution lock"
+            );
+        }
+        for (name, expected) in [("metadata_writable", true), ("metadata_literal", false)] {
+            session.arena.reset();
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(|| query::view_is_auto_updatable(
+                    &engine.storage,
+                    "public",
+                    name,
+                    session.transaction.txid,
+                    &session.arena,
+                ))
+                .unwrap(),
+                expected
+            );
+            assert_eq!(
+                engine.storage.table_lock_view_count(),
+                0,
+                "catalog inspection must not acquire an execution lock"
+            );
+        }
+        if active {
+            session.success(&mut engine, "ROLLBACK", true);
+        }
+        assert_eq!(engine.storage.schema_lock_blocker(u32::MAX), None);
+    }
+    let view = engine
+        .storage
+        .view_slot("public", "metadata_writable", 0)
+        .unwrap();
+    session.success(
+        &mut engine,
+        "BEGIN; UPDATE metadata_writable SET value=value+1 WHERE id=1 RETURNING id, value",
+        true,
+    );
+    let mut owned = false;
+    engine.storage.visit_table_locks(|owner, _, target, mode| {
+        owned |= owner == session.transaction.txid
+            && target == crate::storage::RelationLockTarget::View(view)
+            && mode == ast::TableLockMode::RowExclusive;
+    });
+    assert!(owned, "executing a view write retains its target lock");
+    assert_eq!(
+        engine
+            .storage
+            .lock_relation(
+                u32::MAX - 1,
+                crate::storage::RelationLockTarget::View(view),
+                ast::TableLockMode::AccessExclusive,
+                true,
+            )
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::LOCK_NOT_AVAILABLE
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(engine.storage.table_lock_view_count(), 0);
+    assert_eq!(engine.storage.schema_lock_blocker(u32::MAX), None);
+    let dropped = session.success(&mut engine, "DROP SCHEMA metadata_unrelated CASCADE", true);
+    assert!(
+        message_types(&dropped).contains(&b'C'),
+        "the unrelated schema drop completes"
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, value FROM metadata_base", true)),
+        ["1|10"]
+    );
+}
+
+#[test]
 fn retained_dml_descriptions_rewrite_view_columns_in_data_changing_ctes() {
     let (mut engine, mut budget) = test_engine();
     run_with(

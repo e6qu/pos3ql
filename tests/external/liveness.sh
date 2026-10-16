@@ -38,18 +38,3 @@ choose_free_port() {
   done
   return 1
 }
-
-# A blocked client cannot explain which server lock or loop it is waiting on.
-# Hosted Linux runners permit attaching to this suite's own fixture process.
-dump_server_stack() {
-  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
-  if ! command -v gdb >/dev/null 2>&1; then
-    printf 'Server stack unavailable: gdb is not installed.\n' >&2
-    return 1
-  fi
-  printf '\n=== server stack after failed driver request ===\n'
-  sudo -n timeout 15 gdb --batch --quiet \
-    -ex 'set pagination off' \
-    -ex 'set print frame-arguments none' \
-    -ex 'thread apply all backtrace' -p "$1"
-}

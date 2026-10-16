@@ -452,6 +452,10 @@ back later. Recovery verifies its original saved batch and identities before
 applying later decisions; a missing or mismatched batch still rejects startup.
 `pg_locks` reports the actual relation
 and database identities; a recovered prepared lock has no client process ID.
+Client libraries may ask which columns a write will return before running it.
+Those descriptions and catalog checks of writable views only read metadata;
+they do not reserve execution locks for an idle connection's last transaction.
+Actual writes lock their target before selecting rules or rewriting a view.
 Statements still execute serially; these protections
 are prerequisites for the planned execution workers.
 

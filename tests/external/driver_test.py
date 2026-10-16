@@ -3,8 +3,6 @@
 # for parameterized queries.
 import datetime
 import faulthandler
-import os
-import subprocess
 import sys
 import threading
 import time
@@ -22,43 +20,6 @@ conn = psycopg.connect(
     sslmode="disable", autocommit=True,
 )
 cur = conn.cursor()
-
-
-def dump_blocked_driver_state():
-    print("=== live driver wait inventory ===")
-    try:
-        with psycopg.connect(
-            host="127.0.0.1", port=int(os.environ["POS3QL_PORT"]),
-            user="postgres", dbname="postgres", sslmode="disable",
-            autocommit=True, connect_timeout=3,
-            options="-c statement_timeout=3000",
-        ) as diagnostic:
-            for query in [
-                "SELECT pid,state,wait_event_type,wait_event,query FROM pg_stat_activity",
-                "SELECT pid,locktype,relation,mode,granted,transactionid,"
-                "pg_blocking_pids(pid) FROM pg_locks",
-                "SELECT transaction,gid FROM pg_prepared_xacts",
-            ]:
-                print(query)
-                print(diagnostic.execute(query).fetchall())
-    except Exception as error:
-        print("Live driver wait inventory unavailable:", repr(error))
-    try:
-        subprocess.run(
-            ["sh", "-c", '. "$1"; dump_server_stack "$2"',
-             "driver-watchdog", "tests/external/liveness.sh",
-             os.environ["POS3QL_DRIVER_SERVER_PID"]],
-            timeout=20, check=True,
-        )
-    except (subprocess.SubprocessError, OSError) as error:
-        print("Live server stack unavailable:", repr(error))
-
-
-server_watchdog = None
-if os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("POS3QL_DRIVER_SERVER_PID"):
-    server_watchdog = threading.Timer(90, dump_blocked_driver_state)
-    server_watchdog.daemon = True
-    server_watchdog.start()
 
 print("server version reported:", conn.info.server_version)
 
@@ -1149,7 +1110,5 @@ observer_cur.execute("SELECT count(*) FROM pg_class WHERE relpersistence = 't'")
 assert observer_cur.fetchone() == (0,)
 observer.close()
 
-if server_watchdog is not None:
-    server_watchdog.cancel()
 faulthandler.cancel_dump_traceback_later()
 print("ALL DRIVER TESTS PASSED")

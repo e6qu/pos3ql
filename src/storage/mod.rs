@@ -48359,23 +48359,6 @@ impl Storage {
             ) || matches!(right, AccessExclusive)
         }
 
-        if !self
-            .transaction_identity_state()
-            .active
-            .iter()
-            .any(|entry| entry.transaction_id == txid)
-        {
-            crate::logging::info_args(
-                "relation_owner_diagnostic",
-                format_args!(
-                    "relation lock without registered identity txid={} relation={:?} mode={:?} frontend={}",
-                    txid,
-                    relation,
-                    mode,
-                    self.current_connection_id()
-                ),
-            );
-        }
         let wait_owner = self.transaction_wait_owner(txid);
         let mut locks = self.lock_state();
         let requested = mode_bit(mode);
@@ -48845,7 +48828,7 @@ impl Storage {
     pub(crate) fn schema_lock_blocker(&self, txid: u32) -> Option<SchemaLockBlocker> {
         let snapshots = self.snapshot_state();
         let locks = self.lock_state();
-        let blocker = snapshots
+        snapshots
             .active
             .iter()
             .map(|(owner, _)| *owner)
@@ -48864,66 +48847,7 @@ impl Storage {
                     .exported
                     .first()
                     .map(|snapshot| SchemaLockBlocker::Connection(snapshot.connection))
-            });
-        if blocker.is_some() {
-            crate::logging::info_args(
-                "schema_owner_diagnostic",
-                format_args!(
-                    "schema waiter={} blocker={:?} snapshot_count={} statement_count={} relation_count={}",
-                    txid,
-                    blocker,
-                    snapshots.active.len(),
-                    snapshots.statements.len(),
-                    locks.table.len()
-                ),
-            );
-            for (owner, lsn) in snapshots.active.iter() {
-                crate::logging::info_args(
-                    "schema_owner_diagnostic",
-                    format_args!("historical snapshot owner={} lsn={}", owner, lsn),
-                );
-            }
-            for entry in snapshots
-                .statements
-                .iter()
-                .filter(|entry| entry.lsn.is_some())
-            {
-                crate::logging::info_args(
-                    "schema_owner_diagnostic",
-                    format_args!(
-                        "statement snapshot owner={} lsn={:?}",
-                        entry.transaction, entry.lsn
-                    ),
-                );
-            }
-            for entry in locks.table.iter() {
-                crate::logging::info_args(
-                    "schema_owner_diagnostic",
-                    format_args!(
-                        "held relation owner={} target={:?} mask={} wait_owner={:?}",
-                        entry.owner,
-                        entry.relation,
-                        entry.mask(),
-                        entry.wait_owner
-                    ),
-                );
-            }
-        }
-        drop(locks);
-        drop(snapshots);
-        if let Some(SchemaLockBlocker::Transaction(owner)) = blocker {
-            let identity = self
-                .transaction_identity_state()
-                .active
-                .iter()
-                .find(|entry| entry.transaction_id == owner)
-                .map(|entry| (entry.transaction_id, entry.connection_id, entry.assigned));
-            crate::logging::info_args(
-                "schema_owner_diagnostic",
-                format_args!("schema blocking identity={:?}", identity),
-            );
-        }
-        blocker
+            })
     }
 
     pub(crate) fn wait_for_schema_lock(

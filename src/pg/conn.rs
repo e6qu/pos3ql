@@ -3307,19 +3307,6 @@ impl Conn {
                 )
             };
             let pending_copy = engine.take_pending_copy();
-            if text.trim_start().starts_with("DROP SCHEMA") {
-                crate::logging::info_args(
-                    "schema_execution_diagnostic",
-                    format_args!(
-                        "schema execution pid={} txid={} result={:?} send_bytes={} pending_copy={}",
-                        self.id,
-                        self.txn.txid,
-                        result,
-                        self.send.len(),
-                        pending_copy.is_some()
-                    ),
-                );
-            }
             self.arena.reset();
             match result {
                 Ok(crate::sql::ExtendedExecutionStatus::Complete(true)) => {
@@ -3560,18 +3547,6 @@ impl Conn {
         };
         if let Some(stream) = self.stream.as_ref() {
             let _ = stream.set_nonblocking(true);
-        }
-        if text.trim_start().starts_with("DROP SCHEMA") {
-            crate::logging::info_args(
-                "schema_execution_diagnostic",
-                format_args!(
-                    "simple schema execution pid={} txid={} result={:?} send_bytes={}",
-                    self.id,
-                    self.txn.txid,
-                    result,
-                    self.send.len()
-                ),
-            );
         }
         let status = self.txn.status_byte();
         let step = match result {

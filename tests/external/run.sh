@@ -378,7 +378,7 @@ fi
 step "driver test (psycopg 3, extended protocol with binary parameters)"
 restart_main_server psycopg
 ensure_psycopg_venv || exit 1
-if POS3QL_PORT=$PG_PORT POS3QL_DRIVER_SERVER_PID=$SERVER_PID "$VENV/bin/python" - <<EOF > "$WORK/driver.out" 2>&1
+if POS3QL_PORT=$PG_PORT "$VENV/bin/python" - <<EOF > "$WORK/driver.out" 2>&1
 import os, runpy, sys
 sys.argv = ["driver_test.py"]
 src = open("$EXT/driver_test.py").read().replace("port=5433", "port=$PG_PORT")

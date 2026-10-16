@@ -2537,6 +2537,8 @@ struct TablePublication {
 }
 
 pub struct Table {
+    /// Excludes overlapping existence changes and cleanup of this table.
+    lifecycle: std::sync::Mutex<()>,
     definition: TableDefinition,
     pub rows: RowMap,
     /// Changed since the last checkpoint (drives delta checkpoints).
@@ -3777,6 +3779,12 @@ struct PendingTableDefSlot {
 }
 
 impl Table {
+    fn lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lifecycle
+            .lock()
+            .expect("table lifecycle lock poisoned")
+    }
+
     pub(crate) fn committed_statistics(&self) -> TableStatistics {
         self.statistics.committed()
     }
@@ -13747,9 +13755,8 @@ pub struct Storage {
     /// checkpointer, plus owned reader scratch. `None` without object storage
     /// — then rows never spill and the heap-full error stands.
     spill: Option<std::sync::Arc<SpillReader>>,
-    /// Startup-allocated value indexes shared by every table's enforcers. Held
-    /// in an `Option` so a rebuild can take it out for the duration of a row
-    /// walk (which borrows the rest of `self`) and put it back.
+    /// Startup-allocated value indexes shared by every table's enforcers.
+    /// Retained leases keep a cache valid through replacement and row walks.
     value_indexes: ValueIndexPool,
     /// Parser/evaluator scratch for durable expression and partial-index keys.
     /// The lock retains one allocation frontier through nested evaluation;
@@ -14891,18 +14898,32 @@ fn rename_table_sql_identity(
 }
 
 impl Storage {
-    fn clear_table_rows(&mut self, slot: usize) {
-        let row_versions = self.row_versions.exclusive();
-        let (tables, pending_versions, committed_versions) = (
-            &mut self.tables,
-            &mut row_versions.pending_row_versions,
-            &mut row_versions.committed_row_versions,
-        );
-        for (_, state) in tables[slot].rows.iter() {
-            release_pending_chain(pending_versions, state.pending.tail);
-            release_committed_chain(committed_versions, state.history.tail);
+    fn clear_table_rows(&self, slot: usize) {
+        let mut cursor = 0;
+        while !self.retire_table_row_batch(slot, &mut cursor) {}
+    }
+
+    /// Version ownership precedes map ownership, as for a row read. Bound
+    /// each turn so an unrelated relation can use the shared version pools.
+    fn retire_table_row_batch(&self, slot: usize, cursor: &mut usize) -> bool {
+        const WORK_PER_TURN: usize = 64;
+        let mut versions = self.row_versions.write();
+        let mut rows = self.tables[slot].rows.write();
+        for _ in 0..WORK_PER_TURN {
+            if *cursor == rows.backing_slot_count() {
+                debug_assert!(rows.is_empty());
+                return true;
+            }
+            let Some((&rowid, _)) = rows.entry_at_slot(*cursor) else {
+                *cursor += 1;
+                continue;
+            };
+            let state = rows.remove(&rowid).expect("selected row exists");
+            release_pending_chain(&mut versions.pending_row_versions, state.pending.tail);
+            release_committed_chain(&mut versions.committed_row_versions, state.history.tail);
+            // Backshift deletion may move the next row into this slot.
         }
-        tables[slot].rows.clear();
+        false
     }
 
     fn remove_row_state(&mut self, table: usize, rowid: u64) -> Option<RowState> {
@@ -17787,6 +17808,7 @@ impl Storage {
         for slot in 0..table_capacity {
             tables
                 .push(Table {
+                    lifecycle: std::sync::Mutex::new(()),
                     definition: TableDefinition::new(TableDef {
                         name: SqlName::parse("").expect("empty name fits"),
                         columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
@@ -33784,7 +33806,7 @@ impl Storage {
     /// Releases a table's enforcer index slots back to the pool and clears its
     /// enforcer list. Called before a slot is reused and when a table is
     /// dropped.
-    fn release_enforcers(&mut self, table_index: usize) {
+    fn release_enforcers(&self, table_index: usize) {
         let mut publication = self.tables[table_index].publication();
         publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
         publication.n_enforcers = 0;
@@ -34580,6 +34602,7 @@ impl Storage {
     /// Allocates a slot for a fresh table. Shared by replay (committed) and
     /// the executor (pending); `transaction` selects the uncommitted-CREATE
     /// state so the table is invisible to other transactions until commit.
+    /// Exclusive storage access excludes shared retirement while reusing a slot.
     fn alloc_table(&mut self, def: TableDef, transaction: Option<u32>) -> Result<usize, SqlError> {
         let Some(slot) = self
             .tables
@@ -34926,37 +34949,33 @@ impl Storage {
         })
     }
 
-    /// Committed drop (journal replay): rows are retained; the slot is freed at
-    /// checkpoint.
-    pub fn drop_table(&mut self, index: usize) {
-        let (schema, name) = (
-            {
-                let definition = self.tables[index].definition();
-                definition.schema
-            },
-            {
-                let definition = self.tables[index].definition();
-                definition.name
-            },
-        );
+    /// Committed drop (journal replay): rows are retained until checkpoint.
+    pub fn drop_table(&self, index: usize) {
+        let _lifecycle = self.tables[index].lifecycle();
+        let (schema, name) = {
+            let mut state = self.tables[index].definition.write();
+            state.identity.existence = CatalogDdlState::Absent;
+            (state.committed.schema, state.committed.name)
+        };
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
-        self.tables[index].identity_mut().existence = CatalogDdlState::Absent;
         self.tables[index].mark_dirty();
         self.commit_triggers_for_table(index);
         self.commit_policies_for_table(index);
         self.commit_extended_statistics_for_table(index);
     }
 
-    /// Transactional drop: the table stays visible to every other transaction
-    /// (committed baseline) until `txid` commits.
-    pub fn drop_table_in(&mut self, index: usize, txid: u32) {
-        let identity = self.tables[index].identity_mut();
-        identity.existence = identity.existence.drop_by(txid);
+    /// Other transactions keep the committed image until the drop commits.
+    pub fn drop_table_in(&self, index: usize, txid: u32) {
+        let _lifecycle = self.tables[index].lifecycle();
+        {
+            let mut state = self.tables[index].definition.write();
+            state.identity.existence = state.identity.existence.drop_by(txid);
+        }
         for rule in self.view_rule_catalog().rules.iter_mut().filter(|rule| {
             rule.database == current_database()
                 && rule.visible_to(txid)
@@ -34969,23 +34988,23 @@ impl Storage {
 
     /// Promotes an uncommitted CREATE to the committed image.
     pub fn commit_create(&self, index: usize) {
+        let _lifecycle = self.tables[index].lifecycle();
         let mut state = self.tables[index].definition.write();
         state.identity.existence = state.identity.existence.commit_create();
     }
 
-    /// Applies a committed DROP: the table leaves the image and its rows are
-    /// reclaimed.
-    pub fn commit_drop(&mut self, index: usize) {
-        let (schema, name) = (
-            {
-                let definition = self.tables[index].definition();
-                definition.schema
-            },
-            {
-                let definition = self.tables[index].definition();
-                definition.name
-            },
-        );
+    /// Removes the committed table before retiring its rows and dependents.
+    pub fn commit_drop(&self, index: usize) {
+        let _lifecycle = self.tables[index].lifecycle();
+        let (schema, name) = {
+            let mut state = self.tables[index].definition.write();
+            assert!(matches!(
+                state.identity.existence,
+                CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. }
+            ));
+            state.identity.existence = CatalogDdlState::Absent;
+            (state.committed.schema, state.committed.name)
+        };
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
@@ -34994,12 +35013,6 @@ impl Storage {
         self.reset_implicit_index_statistics(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
-        let identity = self.tables[index].identity_mut();
-        assert!(matches!(
-            identity.existence,
-            CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. }
-        ));
-        identity.existence = CatalogDdlState::Absent;
         self.clear_table_rows(index);
         self.tables[index].statistics.clear_wal();
         self.commit_triggers_for_table(index);
@@ -35009,28 +35022,36 @@ impl Storage {
     }
 
     /// Retires a rolled-back CREATE or a failed replay allocation.
-    pub fn rollback_create(&mut self, index: usize) {
+    pub fn rollback_create(&self, index: usize) {
+        let _lifecycle = self.tables[index].lifecycle();
+        {
+            let mut state = self.tables[index].definition.write();
+            assert!(matches!(
+                state.identity.existence,
+                CatalogDdlState::Present | CatalogDdlState::PendingCreate { .. }
+            ));
+            state.identity.existence = CatalogDdlState::Absent;
+        }
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
-        let identity = self.tables[index].identity_mut();
-        assert!(matches!(
-            identity.existence,
-            CatalogDdlState::Present | CatalogDdlState::PendingCreate { .. }
-        ));
-        identity.existence = CatalogDdlState::Absent;
         self.clear_table_rows(index);
         self.tables[index].statistics.clear_wal();
     }
 
     /// Restores the prior existence and attached rules after an uncommitted DROP.
-    pub fn rollback_drop(&mut self, index: usize) {
-        let identity = self.tables[index].identity_mut();
-        let txid = identity
-            .existence
-            .pending_txid()
-            .expect("table DROP owns catalog state");
-        identity.existence = identity.existence.rollback_drop(txid);
+    pub fn rollback_drop(&self, index: usize) {
+        let _lifecycle = self.tables[index].lifecycle();
+        let txid = {
+            let mut state = self.tables[index].definition.write();
+            let txid = state
+                .identity
+                .existence
+                .pending_txid()
+                .expect("table DROP owns catalog state");
+            state.identity.existence = state.identity.existence.rollback_drop(txid);
+            txid
+        };
         self.view_rule_catalog()
             .rollback_target_rules(RuleTarget::Table(index as u16), txid);
     }
@@ -44180,7 +44201,7 @@ impl Storage {
             catalog.definitions[slot].ddl_state.rollback_drop(txid);
     }
 
-    pub(crate) fn commit_policies_for_table(&mut self, table: usize) {
+    pub(crate) fn commit_policies_for_table(&self, table: usize) {
         for slot in 0..self.policy_count() {
             let removed = {
                 let mut catalog = self
@@ -45076,7 +45097,7 @@ impl Storage {
         }
     }
 
-    fn clear_trigger_dependents(&mut self, slot: usize, trigger: TriggerDef) {
+    fn clear_trigger_dependents(&self, slot: usize, trigger: TriggerDef) {
         self.clear_extension_dependencies_for_object(Self::trigger_access_object(slot));
         let mut comments = self.comment_catalog();
         for comment_slot in 0..comments.entries.len() {
@@ -45092,7 +45113,7 @@ impl Storage {
         }
     }
 
-    fn drop_trigger_comments_for_target(&mut self, target: TriggerTarget) {
+    fn drop_trigger_comments_for_target(&self, target: TriggerTarget) {
         let subid = target.comment_subid();
         let mut comments = self.comment_catalog();
         for slot in 0..comments.entries.len() {
@@ -45106,7 +45127,7 @@ impl Storage {
 
     /// Triggers are internal relation dependents. A committed table drop
     /// retires them in the same catalog transition.
-    pub(crate) fn commit_triggers_for_table(&mut self, table: usize) {
+    pub(crate) fn commit_triggers_for_table(&self, table: usize) {
         let target = TriggerTarget::Table(table as u16);
         self.drop_trigger_comments_for_target(target);
         let capacity = self.trigger_capacity();
@@ -45560,7 +45581,7 @@ impl Storage {
         self.retire_extended_statistics(slot);
     }
 
-    fn retire_extended_statistics(&mut self, slot: usize) {
+    fn retire_extended_statistics(&self, slot: usize) {
         {
             let mut catalog = self
                 .extended_statistics_catalog
@@ -45572,7 +45593,7 @@ impl Storage {
         self.drop_comments_by_subid(CommentClass::Statistics, slot as u32);
     }
 
-    fn commit_extended_statistics_for_table(&mut self, table: usize) {
+    fn commit_extended_statistics_for_table(&self, table: usize) {
         let capacity = self.extended_statistics_count();
         for slot in 0..capacity {
             // A PendingDrop has its own DdlUndo entry and must be promoted by
@@ -51031,7 +51052,7 @@ impl Storage {
     /// Rules are internal relation dependents. Session teardown drops a
     /// temporary table directly rather than first staging every dependent, so
     /// remove both present and transactionally dropped rules here.
-    fn commit_rules_for_table(&mut self, table: usize) {
+    fn commit_rules_for_table(&self, table: usize) {
         let mut catalog = self.view_rule_catalog();
         for slot in 0..self.rule_count() {
             let rule = catalog.rules[slot];
@@ -60456,6 +60477,247 @@ mod tests {
             CatalogDdlState::Present.drop_by(1),
             CatalogDdlState::PendingDrop { txid: 1 }
         );
+    }
+
+    #[test]
+    fn table_retirement_waits_for_its_definition_without_reserving_unrelated_tables() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let first = storage.create_table(make_def("held_cleanup", &[])).unwrap();
+        let second = storage
+            .create_table(make_def("other_cleanup", &[]))
+            .unwrap();
+        let third = storage
+            .create_table_in(make_def("pending_cleanup", &[]), 11)
+            .unwrap();
+        let replay = storage
+            .create_table(make_def("replay_cleanup", &[]))
+            .unwrap();
+        let mut updated = *storage.table_def(first, 7);
+        updated.name = SqlName::parse("held_pending_cleanup").unwrap();
+        storage
+            .write_table_def(first, 7, updated, &[None; MAX_COLUMNS], false)
+            .unwrap();
+        let target = RuleTarget::Table(second as u16);
+        let (rule, _) = storage
+            .create_rule(
+                RuleDefinition {
+                    name: SqlName::parse("cleanup_rule").unwrap(),
+                    target,
+                    event: RewriteEvent::Insert,
+                    ..RuleDefinition::EMPTY
+                },
+                StoredQueryDependencies::EMPTY.view(),
+                false,
+                7,
+            )
+            .unwrap();
+        storage.begin_rule_history(target, 7).unwrap();
+        storage.commit_rule_create(rule);
+        let held = storage.table_def(first, 7);
+        assert_eq!(held.name.as_str(), "held_pending_cleanup");
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        let storage = &storage;
+        std::thread::scope(|scope| {
+            scope.spawn(|| crate::mem::guard::forbid_alloc(|| storage.commit_drop(first)));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut selected_is_waiting = false;
+            loop {
+                match storage.tables[first].lifecycle.try_lock() {
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        selected_is_waiting = true;
+                        break;
+                    }
+                    Ok(guard) => drop(guard),
+                    Err(std::sync::TryLockError::Poisoned(_)) => break,
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            scope.spawn(move || {
+                crate::mem::guard::forbid_alloc(|| {
+                    storage.drop_table_in(second, 7);
+                    storage.rollback_drop(second);
+                    storage.drop_table_in(second, 8);
+                    storage.commit_drop(second);
+                    storage.commit_create(third);
+                    storage.rollback_create(third);
+                    storage.drop_table(replay);
+                });
+                sent.send(()).unwrap();
+            });
+            let unrelated = received.recv_timeout(std::time::Duration::from_secs(5));
+            // Release the selected definition before any assertion can unwind
+            // the scope while its retiring writer is still waiting.
+            drop(held);
+            assert!(
+                selected_is_waiting,
+                "selected retirement owns its lifecycle while waiting"
+            );
+            assert!(
+                unrelated.is_ok(),
+                "unrelated cleanup and existence changes must progress"
+            );
+        });
+        for slot in [first, second, third, replay] {
+            assert!(!storage.tables[slot].live());
+            assert!(storage.tables[slot].lifecycle.try_lock().is_ok());
+        }
+        assert_eq!(storage.rule(rule).ddl_state, CatalogDdlState::Absent);
+        assert!(storage.pending_table_defs.test_write().is_ok());
+    }
+
+    #[test]
+    fn table_retirement_batches_keep_maps_valid_and_preserve_retained_versions_through_reuse() {
+        const ROWS: usize = 128;
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let first = storage
+            .create_table(make_def("retiring_rows", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        let other = storage
+            .create_table_in(make_def("unrelated_rows", &[]), 8)
+            .unwrap();
+        let created_at = storage.tables[first].created_at();
+        let mut keys = [0; ROWS];
+        let mut pending_slots = [0; ROWS];
+        let mut history_slots = [0; ROWS];
+        let retained = crate::mem::guard::forbid_alloc(|| {
+            let history = storage.heap.append_bytes(b"hist").unwrap();
+            let committed = storage.heap.append_bytes(b"keep").unwrap();
+            let pending = storage.heap.append_bytes(b"pend").unwrap();
+            for (ordinal, key) in keys.iter_mut().enumerate() {
+                *key = ordinal as u64 * 65537 + 7;
+                let mut row = RowState::committed_only_at(committed, 7);
+                {
+                    let versions = storage.row_versions.exclusive();
+                    push_committed_version(
+                        &mut versions.committed_row_versions,
+                        &mut row.history,
+                        8,
+                        CommittedVersion {
+                            lsn: 6,
+                            home: Some(RowHome::Heap(history)),
+                        },
+                    )
+                    .unwrap();
+                    push_pending_version(
+                        &mut versions.pending_row_versions,
+                        &mut row.pending,
+                        8,
+                        PendingChange {
+                            txid: 7,
+                            cid: 1,
+                            loc: Some(pending),
+                            changed_columns: ColumnSet::EMPTY,
+                            changes_existence: false,
+                        },
+                    )
+                    .unwrap();
+                }
+                pending_slots[ordinal] = row.pending.tail.unwrap();
+                history_slots[ordinal] = row.history.tail.unwrap();
+                storage.tables[first].rows.insert(*key, row).unwrap();
+            }
+            storage.resident_row_state(first, keys[0]).unwrap().unwrap()
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            let mut cursor = 0;
+            let mut done = false;
+            let mut turns = 0;
+            while !done {
+                let before = storage.tables[first].rows.len();
+                let prior_cursor = cursor;
+                done = storage.retire_table_row_batch(first, &mut cursor);
+                turns += 1;
+                let after = storage.tables[first].rows.len();
+                assert!(
+                    before - after <= 64,
+                    "one turn retires at most its fixed work allowance"
+                );
+                assert!(done || cursor > prior_cursor || after < before);
+                assert!(storage.row_versions.test_write().is_ok());
+                assert!(storage.tables[first].rows.test_write().is_ok());
+                storage.drop_table_in(other, 8);
+                storage.rollback_drop(other);
+                let rows = storage.tables[first].rows.read();
+                for (key, row) in rows.iter() {
+                    assert_eq!(
+                        rows.get(key),
+                        Some(row),
+                        "backshift preserves every remaining lookup"
+                    );
+                    assert_eq!(row.committed_lsn, 7);
+                }
+                assert!(turns <= ROWS * 4, "the fixed map drain must terminate");
+            }
+            assert!(turns > 1);
+            assert!(storage.tables[first].rows.is_empty());
+            {
+                let versions = storage.row_versions.read();
+                for ordinal in 0..ROWS {
+                    assert!(!versions.pending_row_versions[pending_slots[ordinal]].used);
+                    assert!(!versions.committed_row_versions[history_slots[ordinal]].used);
+                }
+            }
+            storage.commit_drop(first);
+            let replacement = storage
+                .create_table(make_def("reused_rows", &[("id", ColType::Int4, true)]))
+                .unwrap();
+            assert_eq!(replacement, first);
+            assert_ne!(storage.tables[first].created_at(), created_at);
+            let history = storage.heap.append_bytes(b"newh").unwrap();
+            let committed = storage.heap.append_bytes(b"newc").unwrap();
+            let pending = storage.heap.append_bytes(b"newp").unwrap();
+            for key in keys {
+                let mut row = RowState::committed_only_at(committed, 9);
+                {
+                    let versions = storage.row_versions.exclusive();
+                    push_committed_version(
+                        &mut versions.committed_row_versions,
+                        &mut row.history,
+                        8,
+                        CommittedVersion {
+                            lsn: 8,
+                            home: Some(RowHome::Heap(history)),
+                        },
+                    )
+                    .unwrap();
+                    push_pending_version(
+                        &mut versions.pending_row_versions,
+                        &mut row.pending,
+                        8,
+                        PendingChange {
+                            txid: 9,
+                            cid: 1,
+                            loc: Some(pending),
+                            changed_columns: ColumnSet::EMPTY,
+                            changes_existence: false,
+                        },
+                    )
+                    .unwrap();
+                }
+                storage.tables[first].rows.insert(key, row).unwrap();
+            }
+            drop(storage);
+            for (transaction, snapshot, expected) in
+                [(7, 0, b"pend"), (8, 6, b"hist"), (8, 7, b"keep")]
+            {
+                let image = retained
+                    .select_owned(first, keys[0], transaction, SNAPSHOT_ALL, snapshot)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(image.snapshot().created_at, created_at);
+                let VisibleRowBytes::Heap(bytes) = image.bytes else {
+                    panic!("heap fixture");
+                };
+                assert_eq!(&*bytes, expected);
+            }
+        });
     }
 
     #[test]

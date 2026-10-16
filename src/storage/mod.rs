@@ -51107,50 +51107,52 @@ impl Storage {
         right_oid: Option<i32>,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        let mut exact = None;
-        let mut coercible = None;
-        for (slot, definition) in self.operators_visible_to(txid) {
-            if definition.name.as_str() != name
-                || schema.is_some_and(|schema| definition.schema.as_str() != schema)
-                || (schema.is_none() && !self.operator_schema_matches_path(definition.schema))
-                || definition.signature.arity()
-                    != left_oid.is_some() as usize + right_oid.is_some() as usize
-            {
-                continue;
-            }
-            let left_expected = definition.signature.left.and_then(|argument| {
-                self.routine_type_oid(argument.ctype, argument.user_type, txid)
-            });
-            let right_expected = definition.signature.right.and_then(|argument| {
-                self.routine_type_oid(argument.ctype, argument.user_type, txid)
-            });
-            let is_exact = left_expected == left_oid && right_expected == right_oid;
-            let accepts = [(left_oid, left_expected), (right_oid, right_expected)]
-                .into_iter()
-                .all(|(actual, expected)| match (actual, expected) {
-                    (None, None) => true,
-                    (Some(actual), Some(expected)) => {
-                        actual == expected || self.routine_implicit_cast(actual, expected, txid)
-                    }
-                    _ => false,
+        // Resolve exact signatures before considering coercions. A later exact
+        // match must not be hidden by two earlier coercible domain overloads.
+        for exact_only in [true, false] {
+            let mut found = None;
+            for (slot, definition) in self.operators_visible_to(txid) {
+                if definition.name.as_str() != name
+                    || schema.is_some_and(|schema| definition.schema.as_str() != schema)
+                    || (schema.is_none() && !self.operator_schema_matches_path(definition.schema))
+                    || definition.signature.arity()
+                        != left_oid.is_some() as usize + right_oid.is_some() as usize
+                {
+                    continue;
+                }
+                let left_expected = definition.signature.left.and_then(|argument| {
+                    self.routine_type_oid(argument.ctype, argument.user_type, txid)
                 });
-            if is_exact {
-                if exact.replace(slot).is_some() {
+                let right_expected = definition.signature.right.and_then(|argument| {
+                    self.routine_type_oid(argument.ctype, argument.user_type, txid)
+                });
+                let accepts = if exact_only {
+                    left_expected == left_oid && right_expected == right_oid
+                } else {
+                    [(left_oid, left_expected), (right_oid, right_expected)]
+                        .into_iter()
+                        .all(|(actual, expected)| match (actual, expected) {
+                            (None, None) => true,
+                            (Some(actual), Some(expected)) => {
+                                actual == expected
+                                    || self.routine_implicit_cast(actual, expected, txid)
+                            }
+                            _ => false,
+                        })
+                };
+                if accepts && found.replace(slot).is_some() {
                     return Err(sql_err!(
                         sqlstate::AMBIGUOUS_FUNCTION,
                         "operator is not unique: {}",
                         name
                     ));
                 }
-            } else if accepts && coercible.replace(slot).is_some() {
-                return Err(sql_err!(
-                    sqlstate::AMBIGUOUS_FUNCTION,
-                    "operator is not unique: {}",
-                    name
-                ));
+            }
+            if found.is_some() {
+                return Ok(found);
             }
         }
-        Ok(exact.or(coercible))
+        Ok(None)
     }
 
     /// Resolves the binary input contract for Parse parameters before their

@@ -83359,6 +83359,34 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
         &mut budget,
         "DROP CAST (regtype AS smallint); DROP CAST (boolean AS smallint)",
     );
+    let exact = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "DROP FUNCTION routine_domains.small_type(regtype);\nDROP FUNCTION routine_domains.small_type(boolean);\nCREATE FUNCTION routine_domains.equal_positive(a routine_domains.positive, b routine_domains.positive)\nRETURNS boolean LANGUAGE SQL IMMUTABLE RETURN TRUE;\nCREATE FUNCTION routine_domains.equal_other(a routine_domains.other, b routine_domains.other)\nRETURNS boolean LANGUAGE SQL IMMUTABLE RETURN FALSE;\nCREATE OPERATOR routine_domains.=== (\n    FUNCTION = routine_domains.equal_positive,\n    LEFTARG = routine_domains.positive, RIGHTARG = routine_domains.positive);\nCREATE OPERATOR routine_domains.=== (\n    FUNCTION = routine_domains.equal_other,\n    LEFTARG = routine_domains.other, RIGHTARG = routine_domains.other);\nSELECT 7::routine_domains.positive OPERATOR(routine_domains.===) 8::routine_domains.positive,\n       7::routine_domains.other OPERATOR(routine_domains.===) 8::routine_domains.other;\nPREPARE exact_domain_operator AS\nSELECT $1::routine_domains.positive OPERATOR(routine_domains.===) $2::routine_domains.positive;\nEXECUTE exact_domain_operator(7, 8);\nDEALLOCATE exact_domain_operator;\n",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&exact),
+        ["t|f", "t"],
+        "{}",
+        String::from_utf8_lossy(&exact)
+    );
+    assert!(
+        !String::from_utf8_lossy(&exact).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&exact)
+    );
+    let ambiguous = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT 7 OPERATOR(routine_domains.===) 8",
+        32 << 20,
+    );
+    assert!(
+        String::from_utf8_lossy(&ambiguous).contains("42725"),
+        "{}",
+        String::from_utf8_lossy(&ambiguous)
+    );
     let dropped = run_with_fixed_memory(
         &mut engine,
         &budget,

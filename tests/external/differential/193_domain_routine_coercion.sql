@@ -70,4 +70,23 @@ CREATE CAST (boolean AS smallint) WITH FUNCTION routine_domains.small_type(boole
 SELECT TRUE::smallint WHERE FALSE;
 DROP CAST (boolean AS smallint);
 DROP CAST (regtype AS smallint);
+DROP FUNCTION routine_domains.small_type(regtype);
+DROP FUNCTION routine_domains.small_type(boolean);
+CREATE FUNCTION routine_domains.equal_positive(a routine_domains.positive, b routine_domains.positive)
+RETURNS boolean LANGUAGE SQL IMMUTABLE RETURN TRUE;
+CREATE FUNCTION routine_domains.equal_other(a routine_domains.other, b routine_domains.other)
+RETURNS boolean LANGUAGE SQL IMMUTABLE RETURN FALSE;
+CREATE OPERATOR routine_domains.=== (
+    FUNCTION = routine_domains.equal_positive,
+    LEFTARG = routine_domains.positive, RIGHTARG = routine_domains.positive);
+CREATE OPERATOR routine_domains.=== (
+    FUNCTION = routine_domains.equal_other,
+    LEFTARG = routine_domains.other, RIGHTARG = routine_domains.other);
+SELECT 7::routine_domains.positive OPERATOR(routine_domains.===) 8::routine_domains.positive,
+       7::routine_domains.other OPERATOR(routine_domains.===) 8::routine_domains.other;
+PREPARE exact_domain_operator AS
+SELECT $1::routine_domains.positive OPERATOR(routine_domains.===) $2::routine_domains.positive;
+EXECUTE exact_domain_operator(7, 8);
+DEALLOCATE exact_domain_operator;
+SELECT 7 OPERATOR(routine_domains.===) 8;
 DROP SCHEMA routine_domains CASCADE;

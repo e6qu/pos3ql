@@ -39188,10 +39188,7 @@ impl Storage {
                 schema: old_schema,
                 name: old_name,
             },
-            UserTypeName {
-                schema: schema,
-                name: name,
-            },
+            UserTypeName { schema, name },
         );
         self.move_type_references(movement);
     }

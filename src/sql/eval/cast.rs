@@ -80,7 +80,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
     if v.is_null() {
         return Ok(Datum::Null);
     }
-    validate_catalog_reference_cast(v.oid(), target)?;
+    validate_catalog_reference_cast(v.type_oid(), target)?;
     let v = match v {
         Datum::Bpchar(_) if target == ColType::Bpchar => return Ok(v),
         Datum::Bpchar(s) => Datum::Text(s.trim_end_matches(' ')),

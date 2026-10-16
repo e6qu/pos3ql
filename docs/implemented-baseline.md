@@ -348,8 +348,9 @@ PostgreSQL results.
 
 Type renames and schema moves update references only in the type's database,
 including pending table, domain, composite and routine definitions. Casts, operators,
-operator families and operator classes retain their input and result types too. Type comments
-move within the same database. Composite type renames journal only the name
+operator families and operator classes retain their input and result types too.
+Restoring casts from the journal or a checkpoint retains their owning database.
+Type comments move within the same database. Composite type renames journal only the name
 change, preserving current field references during replay. The
 [format guide](durable-format.md#composite-type-name-changes) gives the upgrade
 requirement for this record.

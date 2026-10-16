@@ -48816,6 +48816,8 @@ impl Storage {
         &mut self,
         mut definition: CastDef,
     ) -> Result<usize, SqlError> {
+        // The enclosing journal or manifest record carries the database scope.
+        definition.database = current_database();
         definition.source = self.bind_routine_result(definition.source, 0)?;
         definition.target = self.bind_routine_result(definition.target, 0)?;
         self.validate_cast_definition(definition, 0)?;

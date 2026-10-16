@@ -447,6 +447,9 @@ restart and recovery without local caches. Saved commit and rollback decisions
 release the transaction's private rows and catalog entries before replay, so
 recovery cannot wait on its own unfinished table or sequence creation. Live
 resolution, startup recovery, and savepoint rollback share catalog undo.
+A transaction listed as prepared in a checkpoint may have committed or rolled
+back later. Recovery verifies its original saved batch and identities before
+applying later decisions; a missing or mismatched batch still rejects startup.
 `pg_locks` reports the actual relation
 and database identities; a recovered prepared lock has no client process ID.
 Statements still execute serially; these protections

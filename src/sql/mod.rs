@@ -3477,10 +3477,8 @@ impl Engine {
                 .unwrap_or(floor)
                 .min(floor)
         });
-        let expected_prepared: Vec<crate::util::StackStr<199>> = storage
-            .with_prepared_transaction_catalog(|entries| {
-                entries.iter().map(|prepared| prepared.gid).collect()
-            });
+        let expected_prepared =
+            storage.with_prepared_transaction_catalog(|entries| entries.to_vec());
         let mut wal = Wal::open(config, budget)?;
         let mut prepared_transactions = two_phase::PreparedTransactions::new(config, budget)?;
         // Recovery merges two partial sources by LSN and applies the merge in
@@ -3511,21 +3509,8 @@ impl Engine {
             })
             .map_err(EngineSetupError::Checkpoint)?;
         }
+        validate_checkpoint_prepared_batches(&expected_prepared, &recovered)?;
         replay_transaction_batches(&mut storage, &mut prepared_transactions, &recovered, floor)?;
-        for expected in expected_prepared {
-            let gid = ast::PreparedTransactionId::parse(expected.as_str()).ok_or({
-                EngineSetupError::Checkpoint(crate::checkpoint::CheckpointSetupError::Corrupt(
-                    "manifest prepared transaction identifier is invalid",
-                ))
-            })?;
-            if prepared_transactions.find(gid).is_none() {
-                return Err(EngineSetupError::Checkpoint(
-                    crate::checkpoint::CheckpointSetupError::Corrupt(
-                        "manifest prepared transaction has no retained commit batch",
-                    ),
-                ));
-            }
-        }
         u32::try_from(storage.latest_transaction_identity()).map_err(|_| {
             EngineSetupError::Checkpoint(crate::checkpoint::CheckpointSetupError::Corrupt(
                 "recovered transaction identity exceeds the internal counter",
@@ -19006,6 +18991,58 @@ fn apply_prepared_table_wal_payload(
             .slot_mut(prepared_slot)
             .transaction
             .record_ddl(DdlUndo::Created(table as u32))?;
+    }
+    Ok(())
+}
+
+// A checkpoint's inventory describes its own boundary. Later journal batches
+// may resolve those transactions or reuse their GIDs before startup finishes.
+fn validate_checkpoint_prepared_batches(
+    expected: &[crate::storage::PreparedTransactionCatalogEntry],
+    recovered: &std::collections::BTreeMap<u64, Vec<u8>>,
+) -> Result<(), crate::checkpoint::CheckpointSetupError> {
+    use crate::checkpoint::CheckpointSetupError::Corrupt;
+
+    for entry in expected {
+        ast::PreparedTransactionId::parse(entry.gid.as_str()).ok_or(Corrupt(
+            "manifest prepared transaction identifier is invalid",
+        ))?;
+        let Some(WalOp::PrepareTransaction {
+            transaction_id,
+            owner,
+            database,
+            prepared_at,
+            gid,
+        }) = recovered
+            .get(&entry.prepared_lsn)
+            .and_then(|record| crate::wal::decode_record(record))
+        else {
+            return Err(Corrupt(
+                "manifest prepared transaction has no retained commit batch",
+            ));
+        };
+        let first_lsn = recovered
+            .range(..entry.prepared_lsn)
+            .rev()
+            .take_while(|(_, record)| {
+                !matches!(
+                    crate::wal::decode_record(record),
+                    Some(WalOp::Commit { .. } | WalOp::PrepareTransaction { .. })
+                )
+            })
+            .last()
+            .map_or(entry.prepared_lsn, |(lsn, _)| *lsn);
+        if transaction_id != entry.transaction_id
+            || owner != entry.owner
+            || database != entry.database.get()
+            || prepared_at != entry.prepared_at
+            || gid != entry.gid.as_str()
+            || first_lsn != entry.first_lsn
+        {
+            return Err(Corrupt(
+                "manifest prepared transaction does not match its retained batch",
+            ));
+        }
     }
     Ok(())
 }

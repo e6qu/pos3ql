@@ -6773,6 +6773,152 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
 }
 
 #[test]
+fn prepared_manifest_validation_keeps_resolved_batches_and_rejects_corruption() {
+    let mut config = test_config("prepared-manifest-validation");
+    config.max_connections = 1;
+    config.wal_buffer_bytes = 4096;
+    let mut budget = Budget::new(1 << 20);
+    let mut wal = Wal::open(&config, &mut budget).unwrap();
+    let expected = crate::storage::PreparedTransactionCatalogEntry {
+        transaction_id: 7,
+        gid: crate::util::StackStr::from_str("reused-gid"),
+        prepared_at: 123,
+        owner: 0,
+        database: crate::storage::DatabaseOid::POSTGRES,
+        first_lsn: 10,
+        prepared_lsn: 11,
+    };
+    wal.append_committed(
+        10,
+        &WalOp::DatabaseScope {
+            oid: expected.database.get(),
+        },
+    )
+    .unwrap();
+    wal.append_committed(
+        11,
+        &WalOp::PrepareTransaction {
+            transaction_id: expected.transaction_id,
+            owner: expected.owner,
+            database: expected.database.get(),
+            prepared_at: expected.prepared_at,
+            gid: expected.gid.as_str(),
+        },
+    )
+    .unwrap();
+    wal.append_committed(
+        12,
+        &WalOp::CommitPrepared {
+            gid: expected.gid.as_str(),
+        },
+    )
+    .unwrap();
+    wal.append_committed(
+        13,
+        &WalOp::Commit {
+            transaction_id: 8,
+            assigned_transaction_identity: false,
+            committed_at: Some(124),
+        },
+    )
+    .unwrap();
+    // The same GID can name a later transaction; validation must find the
+    // checkpoint's exact batch, not the last live owner of that name.
+    wal.append_committed(
+        14,
+        &WalOp::DatabaseScope {
+            oid: expected.database.get(),
+        },
+    )
+    .unwrap();
+    wal.append_committed(
+        15,
+        &WalOp::PrepareTransaction {
+            transaction_id: 9,
+            owner: expected.owner,
+            database: expected.database.get(),
+            prepared_at: 125,
+            gid: expected.gid.as_str(),
+        },
+    )
+    .unwrap();
+    wal.commit();
+    let mut records = std::collections::BTreeMap::new();
+    wal.replay(0, |lsn, raw| {
+        records.insert(lsn, raw.to_vec());
+        Ok(())
+    })
+    .unwrap();
+    validate_checkpoint_prepared_batches(&[expected], &records).unwrap();
+    validate_checkpoint_prepared_batches(
+        &[crate::storage::PreparedTransactionCatalogEntry {
+            transaction_id: 9,
+            prepared_at: 125,
+            first_lsn: 14,
+            prepared_lsn: 15,
+            ..expected
+        }],
+        &records,
+    )
+    .unwrap();
+    for invalid in [
+        crate::storage::PreparedTransactionCatalogEntry {
+            transaction_id: 9,
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            owner: 1,
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            database: crate::storage::DatabaseOid::TEMPLATE1,
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            prepared_at: 125,
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            gid: crate::util::StackStr::from_str("other-gid"),
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            gid: crate::util::StackStr::from_str("bad\0gid"),
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            first_lsn: 11,
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            prepared_lsn: 15,
+            ..expected
+        },
+    ] {
+        assert!(
+            matches!(
+                validate_checkpoint_prepared_batches(&[invalid], &records),
+                Err(CheckpointSetupError::Corrupt(_))
+            ),
+            "{invalid:?}"
+        );
+    }
+    let first = records.remove(&10).unwrap();
+    assert!(matches!(
+        validate_checkpoint_prepared_batches(&[expected], &records),
+        Err(CheckpointSetupError::Corrupt(_))
+    ));
+    records.insert(10, first);
+    records.remove(&11).unwrap();
+    assert!(matches!(
+        validate_checkpoint_prepared_batches(&[expected], &records),
+        Err(CheckpointSetupError::Corrupt(
+            "manifest prepared transaction has no retained commit batch"
+        ))
+    ));
+}
+
+#[test]
 fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
     let mut config = test_config("prepared-object-cold-recovery");
     config.max_prepared_transactions = 4;

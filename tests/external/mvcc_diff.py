@@ -938,6 +938,98 @@ def analyze_snapshot_transcript(reader, writer) -> list[str]:
         writer.execute("DROP TABLE analyze_snapshot_diff CASCADE")
 
 
+def rule_publication_transcript(reader, writer) -> list[str]:
+    results = []
+    writer.execute("CREATE TABLE rule_publication_diff(id integer)")
+    writer.execute("CREATE TABLE rule_publication_other_diff(id integer)")
+    writer.execute("CREATE VIEW rule_publication_view_diff AS SELECT id FROM rule_publication_diff")
+    reader.execute("SET lock_timeout = '50ms'")
+    writer.execute("SET lock_timeout = '50ms'")
+    try:
+        for relation in ["rule_publication_diff", "rule_publication_view_diff"]:
+            writer.execute("BEGIN")
+            writer.execute(f"CREATE RULE first_rule AS ON INSERT TO {relation} DO INSTEAD NOTHING")
+            results.append(f"rule_create_competes_{relation}=" + str(sqlstate(reader, f"CREATE RULE second_rule AS ON INSERT TO {relation} DO INSTEAD NOTHING")))
+            results.append(f"rule_read_competes_{relation}=" + str(sqlstate(reader, f"SELECT * FROM {relation}")))
+            results.append(f"rule_write_competes_{relation}=" + str(sqlstate(reader, f"INSERT INTO {relation} VALUES (1)")))
+            reader.execute("CREATE RULE unrelated_rule AS ON INSERT TO rule_publication_other_diff DO INSTEAD NOTHING")
+            reader.execute("DROP RULE unrelated_rule ON rule_publication_other_diff")
+            results.append(f"rule_unrelated_{relation}=ok")
+            writer.execute("ROLLBACK")
+            results.append(f"rule_after_rollback_{relation}=" + str(reader.execute("SELECT relhasrules FROM pg_class WHERE relname = %s", (relation,)).fetchone()[0]))
+            reader.execute(f"DROP RULE IF EXISTS second_rule ON {relation}")
+
+        writer.execute("BEGIN")
+        writer.execute("SAVEPOINT before_rule")
+        writer.execute("CREATE RULE savepoint_rule AS ON INSERT TO rule_publication_diff DO INSTEAD NOTHING")
+        results.append("rule_before_savepoint_rollback=" + str(sqlstate(reader, "CREATE RULE retry_rule AS ON INSERT TO rule_publication_diff DO INSTEAD NOTHING")))
+        writer.execute("ROLLBACK TO SAVEPOINT before_rule")
+        reader.execute("DROP RULE IF EXISTS retry_rule ON rule_publication_diff")
+        results.append("rule_savepoint_history=" + str(writer.execute("SELECT relhasrules FROM pg_class WHERE relname = 'rule_publication_diff'").fetchone()[0]))
+        reader.execute("CREATE RULE retry_rule AS ON INSERT TO rule_publication_diff DO INSTEAD NOTHING")
+        reader.execute("DROP RULE retry_rule ON rule_publication_diff")
+        writer.execute("ROLLBACK")
+        results.append("rule_committed_history=" + str(reader.execute("SELECT relhasrules FROM pg_class WHERE relname = 'rule_publication_diff'").fetchone()[0]))
+
+        reader.execute("CREATE RULE stable_rule AS ON INSERT TO rule_publication_diff DO INSTEAD NOTHING")
+        for label, statement in [
+            ("replace", "CREATE OR REPLACE RULE stable_rule AS ON INSERT TO rule_publication_diff DO INSTEAD NOTHING"),
+            ("rename", "ALTER RULE stable_rule ON rule_publication_diff RENAME TO renamed_rule"),
+            ("drop", "DROP RULE stable_rule ON rule_publication_diff"),
+            ("disable", "ALTER TABLE rule_publication_diff DISABLE RULE stable_rule"),
+        ]:
+            reader.execute("BEGIN")
+            reader.execute("SELECT * FROM rule_publication_diff")
+            results.append(f"rule_existing_reader_{label}=" + str(sqlstate(writer, statement)))
+            reader.execute("ROLLBACK")
+        reader.execute("CREATE RULE stable_view_rule AS ON INSERT TO rule_publication_view_diff DO INSTEAD NOTHING")
+        user_rules = reader.execute("SELECT rulename FROM pg_rules WHERE tablename='rule_publication_view_diff' ORDER BY rulename").fetchall()
+        all_rules = reader.execute("SELECT rulename FROM pg_rewrite WHERE ev_class='rule_publication_view_diff'::regclass ORDER BY rulename").fetchall()
+        results.append(f"rule_view_user_catalog={user_rules}")
+        results.append(f"rule_view_rewrite_catalog={all_rules}")
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM rule_publication_view_diff")
+        view_locks = reader.execute("SELECT mode, database=(SELECT oid FROM pg_database WHERE datname=current_database()) FROM pg_locks WHERE pid=pg_backend_pid() AND relation='rule_publication_view_diff'::regclass ORDER BY mode").fetchall()
+        results.append(f"rule_view_lock_identity={view_locks}")
+        for label, statement in [
+            ("replace", "CREATE OR REPLACE VIEW rule_publication_view_diff AS SELECT id FROM rule_publication_diff"),
+            ("rename", "ALTER VIEW rule_publication_view_diff RENAME TO renamed_view"),
+            ("drop", "DROP VIEW rule_publication_view_diff"),
+            ("disable-rule", "ALTER TABLE rule_publication_view_diff DISABLE RULE stable_view_rule"),
+        ]:
+            results.append(f"view_existing_reader_{label}=" + str(sqlstate(writer, statement)))
+        reader.execute("ROLLBACK")
+        writer.execute("BEGIN")
+        writer.execute("ALTER VIEW rule_publication_view_diff RENAME TO rule_publication_renamed_diff")
+        renamed_rules = writer.execute("SELECT tablename,rulename FROM pg_rules WHERE tablename IN ('rule_publication_view_diff','rule_publication_renamed_diff') ORDER BY tablename,rulename").fetchall()
+        definition_renamed = writer.execute("SELECT pg_get_ruledef(oid) LIKE '%rule_publication_renamed_diff%' FROM pg_rewrite WHERE ev_class='rule_publication_renamed_diff'::regclass AND rulename='stable_view_rule'").fetchone()[0]
+        results.append(f"rule_pending_view_name={renamed_rules}")
+        results.append(f"rule_pending_view_definition={definition_renamed}")
+        writer.execute("ALTER VIEW rule_publication_renamed_diff SET (security_barrier=true)")
+        visible_options = writer.execute("SELECT 'security_barrier=true'=ANY(reloptions) FROM pg_class WHERE relname='rule_publication_renamed_diff'").fetchone()[0]
+        results.append(f"rule_pending_view_options={visible_options}")
+        writer.execute("DROP RULE stable_view_rule ON rule_publication_renamed_diff")
+        writer.execute("ROLLBACK")
+        restored_rules = reader.execute("SELECT tablename,rulename FROM pg_rules WHERE tablename='rule_publication_view_diff' ORDER BY rulename").fetchall()
+        results.append(f"rule_renamed_view_rollback={restored_rules}")
+        writer.execute("BEGIN")
+        writer.execute("ALTER VIEW rule_publication_view_diff RENAME TO rule_publication_renamed_diff")
+        writer.execute("ALTER VIEW rule_publication_renamed_diff RENAME TO rule_publication_final_diff")
+        writer.execute("DROP VIEW rule_publication_final_diff")
+        missing = writer.execute("SELECT to_regclass('rule_publication_final_diff') IS NULL").fetchone()[0]
+        results.append(f"rule_twice_renamed_view_drop={missing}")
+        writer.execute("ROLLBACK")
+        return results
+    finally:
+        reader.execute("ROLLBACK")
+        writer.execute("ROLLBACK")
+        reader.execute("RESET lock_timeout")
+        writer.execute("RESET lock_timeout")
+        writer.execute("DROP VIEW rule_publication_view_diff")
+        writer.execute("DROP TABLE rule_publication_diff")
+        writer.execute("DROP TABLE rule_publication_other_diff")
+
+
 def exercise(port: int) -> list[str]:
     reader = connect(port)
     writer = connect(port)
@@ -976,7 +1068,33 @@ def exercise(port: int) -> list[str]:
             f"read_only={read_only_error}",
             f"lock={lock_error}",
             "ddl_after_unlock=ok",
-        ] + dml_target_transcript(reader, writer) + dml_description_transcript(reader, writer) + prepared_statement_cleanup_transcript(reader) + on_conflict_snapshot_transcript(reader, writer) + upsert_write_transcript(reader, writer) + generated_write_transcript(reader, writer) + merge_write_transcript(reader, writer) + merge_lock_transcript(reader, writer) + partition_move_transcript(reader, writer) + partition_move_transcript(reader, writer, reordered=True) + partition_attachment_transcript(reader, writer) + wide_partition_transcript(reader, writer) + index_validation_transcript(reader, writer) + partition_index_validation_transcript(reader, writer) + constraint_validation_transcript(reader, writer) + constraint_partition_transcript(reader, writer) + constraint_rewrite_transcript(reader, writer) + alter_rewrite_source_transcript(reader, writer) + copy_transition_value_transcript(reader, writer) + analyze_snapshot_transcript(reader, writer)
+        ] + [
+            line
+            for transcript in [
+                dml_target_transcript(reader, writer),
+                dml_description_transcript(reader, writer),
+                prepared_statement_cleanup_transcript(reader),
+                on_conflict_snapshot_transcript(reader, writer),
+                upsert_write_transcript(reader, writer),
+                generated_write_transcript(reader, writer),
+                merge_write_transcript(reader, writer),
+                merge_lock_transcript(reader, writer),
+                partition_move_transcript(reader, writer),
+                partition_move_transcript(reader, writer, reordered=True),
+                partition_attachment_transcript(reader, writer),
+                wide_partition_transcript(reader, writer),
+                index_validation_transcript(reader, writer),
+                partition_index_validation_transcript(reader, writer),
+                constraint_validation_transcript(reader, writer),
+                constraint_partition_transcript(reader, writer),
+                constraint_rewrite_transcript(reader, writer),
+                alter_rewrite_source_transcript(reader, writer),
+                copy_transition_value_transcript(reader, writer),
+                analyze_snapshot_transcript(reader, writer),
+                rule_publication_transcript(reader, writer),
+            ]
+            for line in transcript
+        ]
     finally:
         reader.close()
         writer.close()

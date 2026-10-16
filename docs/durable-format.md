@@ -141,6 +141,22 @@ before catalog mutation. Raising this boundary would renumber durable catalog
 identities, so it requires an explicit format and OID migration rather than a
 constant change.
 
+### Prepared relation locks
+
+Prepared-transaction lock payloads identify each entry with a kind byte. Readers
+retain kinds 0 (stored-table relation lock), 1 (row lock), and 2 (advisory lock),
+and also accept kind 3 for a view relation lock. Writers use kind 3 only for
+views; its remaining fields retain the mode and qualified relation name grammar.
+Recovery resolves the view's current catalog slot before reinstalling the lock.
+Unknown kinds and invalid modes stop recovery explicitly.
+
+For example, a prepared transaction that read a view continues to block a
+conflicting rule change after the server loses its local caches. Committing or
+rolling back that prepared transaction releases the recovered lock. A binary
+that predates kind 3 cannot recover a prepared transaction containing a view
+lock; resolve those transactions before downgrading. Old table, row, and
+advisory lock payloads remain readable without rewriting their records.
+
 ## Compatible online changes
 
 A compatible format change must add a distinct identity and a reader before a

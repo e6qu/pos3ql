@@ -421,6 +421,44 @@ rows. The report continues with its original file set and read position; a new
 scan captures the replacement. Downloads and callbacks hold none of the table
 capture guards. Cancellation and failed capture release reader registrations.
 
+### Changing rewrite rules
+
+A rewrite rule changes what a command does before it runs. For example, a rule
+can redirect an insert into an audit table. Changing that rule takes the target
+table or view's exclusive relation lock, shared with ordinary reads and writes.
+Unrelated relations remain usable.
+
+For example, connection A can run `BEGIN; CREATE RULE ignore_insert AS ON INSERT
+TO orders DO INSTEAD NOTHING`. Until A commits or rolls back, connection B's
+`SET lock_timeout = '50ms'; SELECT * FROM orders` returns `55P03`. A query against
+an unrelated table can continue. A failed or rolled-back rule creation does not
+publish the table's rule-history flag; committed history remains set after the
+last rule is dropped. Savepoint rollback restores both the history and locks.
+`pg_rules` shows user rules; a view's internal `_RETURN` rule remains visible
+through `pg_rewrite`.
+After a view is renamed inside a transaction, rule listings use its new name.
+View changes and removal use those names too. The same names are recorded for
+restart; rollback restores the old names.
+
+Table and view slots have distinct lock identities. The lock registry reserves
+space at startup for each transaction's tables and views; exhaustion returns
+`54000` naming the registry. Prepared transactions retain view locks through
+restart and recovery without local caches. Saved commit and rollback decisions
+release the transaction's private rows and catalog entries before replay, so
+recovery cannot wait on its own unfinished table or sequence creation. Live
+resolution, startup recovery, and savepoint rollback share catalog undo.
+A transaction listed as prepared in a checkpoint may have committed or rolled
+back later. Recovery verifies its original saved batch and identities before
+applying later decisions; a missing or mismatched batch still rejects startup.
+`pg_locks` reports the actual relation
+and database identities; a recovered prepared lock has no client process ID.
+Client libraries may ask which columns a write will return before running it.
+Those descriptions and catalog checks of writable views only read metadata;
+they do not reserve execution locks for an idle connection's last transaction.
+Actual writes lock their target before selecting rules or rewriting a view.
+Statements still execute serially; these protections
+are prerequisites for the planned execution workers.
+
 ### Reading index caches during replacement
 
 A selected in-memory index cache owns its storage. Rebuilding or dropping a table

@@ -2539,9 +2539,6 @@ struct TablePublication {
 pub struct Table {
     definition: TableDefinition,
     pub rows: RowMap,
-    /// Transaction-local `relhasrules` history. The committed bit never
-    /// clears, but an aborted CREATE RULE must not publish it.
-    pending_has_rules_txid: Option<u32>,
     /// Changed since the last checkpoint (drives delta checkpoints).
     publication: std::sync::Mutex<TablePublication>,
     /// Planner estimates, transaction-private column versions, and save markers.
@@ -5066,6 +5063,10 @@ impl ViewDef {
         self.pending_options
             .filter(|pending| pending.txid == txid)
             .map_or(self.options, |pending| pending.options)
+    }
+
+    pub(crate) fn names_for(&self, txid: u32) -> (SqlName, SqlName) {
+        (self.schema_for(txid), self.name_for(txid))
     }
 
     pub(crate) fn name_for(&self, txid: u32) -> SqlName {
@@ -12810,11 +12811,32 @@ pub enum ResolvedRelation {
     Catalog,
 }
 
+/// A view and a stored table can use the same numeric slot without sharing a lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelationLockTarget {
+    Table(usize),
+    View(usize),
+}
+
+impl From<RuleTarget> for RelationLockTarget {
+    fn from(target: RuleTarget) -> Self {
+        match target {
+            RuleTarget::Table(slot) => Self::Table(usize::from(slot)),
+            RuleTarget::View(slot) => Self::View(usize::from(slot)),
+        }
+    }
+}
+
+fn relation_lock_capacity(config: &Config) -> usize {
+    (config.max_connections as usize + config.max_prepared_transactions)
+        * (table_slot_capacity(config) + config.max_views)
+}
+
 #[derive(Clone, Copy)]
 struct TableLock {
     owner: u32,
     wait_owner: crate::sql::lock::WaitOwner,
-    table: u32,
+    relation: RelationLockTarget,
     /// Acquisition sequence for each table-lock mode. PostgreSQL permits a
     /// transaction to hold multiple incomparable modes on one relation.
     modes: [u64; 8],
@@ -17729,9 +17751,7 @@ impl Storage {
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * config.max_routines
                 * size_of::<FunctionTransactionStatistics>()
-            + (config.max_connections as usize + config.max_prepared_transactions)
-                * table_slot_capacity(config)
-                * size_of::<TableLock>()
+            + relation_lock_capacity(config) * size_of::<TableLock>()
             + crate::sql::lock::LockManager::budget_bytes(
                 (config.max_connections as usize + config.max_prepared_transactions)
                     * config.txn_rows,
@@ -17782,7 +17802,6 @@ impl Storage {
                             config.table_rows
                         },
                     )?,
-                    pending_has_rules_txid: None,
                     publication: std::sync::Mutex::new(TablePublication {
                         dirty: false,
                         generation: 1,
@@ -18485,8 +18504,7 @@ impl Storage {
             "function_transaction_statistics",
             transaction_capacity * config.max_routines,
         )?;
-        let table_locks =
-            FixedVec::new(budget, "table_locks", transaction_capacity * table_capacity)?;
+        let table_locks = FixedVec::new(budget, "table_locks", relation_lock_capacity(config))?;
         let row_locks = crate::sql::lock::LockManager::new(
             budget,
             transaction_capacity * config.txn_rows,
@@ -34593,6 +34611,7 @@ impl Storage {
         {
             let state = table.definition.exclusive();
             state.committed = def;
+            state.pending_has_rules_txid = None;
             state.identity = table_definitions::TableIdentity {
                 database: current_database(),
                 ownership,
@@ -34602,7 +34621,6 @@ impl Storage {
                 }),
             };
         }
-        table.pending_has_rules_txid = None;
         table.mark_dirty();
         table
             .statistics
@@ -34950,9 +34968,9 @@ impl Storage {
     }
 
     /// Promotes an uncommitted CREATE to the committed image.
-    pub fn commit_create(&mut self, index: usize) {
-        let identity = self.tables[index].identity_mut();
-        identity.existence = identity.existence.commit_create();
+    pub fn commit_create(&self, index: usize) {
+        let mut state = self.tables[index].definition.write();
+        state.identity.existence = state.identity.existence.commit_create();
     }
 
     /// Applies a committed DROP: the table leaves the image and its rows are
@@ -37166,8 +37184,17 @@ impl Storage {
         publication.ddl_state = publication.ddl_state.rollback_drop(txid);
     }
 
-    /// The stored SELECT text of a view visible to `txid`, if `name` names one
-    /// (own uncommitted CREATE/DROP included; another transaction's excluded).
+    /// Resolves one qualified view name within the transaction's database.
+    pub(crate) fn view_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.view_rule_catalog().views.iter().position(|view| {
+            view.database == current_database()
+                && view.visible_to(txid)
+                && view.schema_for(txid).as_str() == schema
+                && view.name_for(txid).as_str() == name
+        })
+    }
+
+    /// An owned catalog image, including this transaction's pending changes.
     pub fn find_view(&self, schema: &str, name: &str, txid: u32) -> Option<ViewDef> {
         self.view_rule_catalog()
             .views
@@ -47789,6 +47816,24 @@ impl Storage {
             .register(transaction_id, self.current_connection_id())
     }
 
+    /// Recovery must never attach a prepared transaction to the caller's
+    /// thread-local frontend identity.
+    pub(crate) fn begin_prepared_transaction_identity(
+        &self,
+        transaction_id: u32,
+    ) -> Result<(), SqlError> {
+        let mut identities = self.transaction_identity_state();
+        if identities.active.iter().any(|identity| {
+            identity.transaction_id == transaction_id && identity.connection_id.is_some()
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "recovered prepared identity belongs to a connection"
+            ));
+        }
+        identities.register(transaction_id, 0)
+    }
+
     fn transaction_wait_owner(&self, transaction_id: u32) -> crate::sql::lock::WaitOwner {
         self.transaction_identity_state()
             .active
@@ -48167,9 +48212,20 @@ impl Storage {
 
     pub(crate) fn visit_table_locks(
         &self,
-        mut visit: impl FnMut(u32, crate::sql::lock::WaitOwner, usize, crate::sql::ast::TableLockMode),
+        mut visit: impl FnMut(
+            u32,
+            crate::sql::lock::WaitOwner,
+            RelationLockTarget,
+            crate::sql::ast::TableLockMode,
+        ),
     ) {
-        for lock in self.lock_state().table.iter() {
+        // Monitoring visits detached entries; callbacks cannot retain the
+        // registry while reading relation metadata or other catalogs.
+        let capacity = self.lock_state().table.capacity();
+        for index in 0..capacity {
+            let Some(lock) = self.lock_state().table.get(index).copied() else {
+                break;
+            };
             for (mode, acquired_at) in lock.modes.iter().enumerate() {
                 if *acquired_at == 0 {
                     continue;
@@ -48184,7 +48240,7 @@ impl Storage {
                     6 => crate::sql::ast::TableLockMode::Exclusive,
                     _ => crate::sql::ast::TableLockMode::AccessExclusive,
                 };
-                visit(lock.owner, lock.wait_owner, lock.table as usize, mode);
+                visit(lock.owner, lock.wait_owner, lock.relation, mode);
             }
         }
     }
@@ -48201,6 +48257,16 @@ impl Storage {
         &self,
         txid: u32,
         table: usize,
+        mode: crate::sql::ast::TableLockMode,
+        nowait: bool,
+    ) -> Result<(), SqlError> {
+        self.lock_relation(txid, RelationLockTarget::Table(table), mode, nowait)
+    }
+
+    pub(crate) fn lock_relation(
+        &self,
+        txid: u32,
+        relation: RelationLockTarget,
         mode: crate::sql::ast::TableLockMode,
         nowait: bool,
     ) -> Result<(), SqlError> {
@@ -48299,7 +48365,7 @@ impl Storage {
         let own_index = locks
             .table
             .iter()
-            .position(|lock| lock.owner == txid && lock.table == table as u32);
+            .position(|lock| lock.owner == txid && lock.relation == relation);
         if own_index.is_some_and(|index| locks.table[index].mask() & requested != 0) {
             return Ok(());
         }
@@ -48311,7 +48377,7 @@ impl Storage {
             .iter()
             .find(|lock| {
                 lock.owner != txid
-                    && lock.table == table as u32
+                    && lock.relation == relation
                     && modes_conflict(combined, lock.mask())
             })
             .map(|lock| lock.wait_owner);
@@ -48342,7 +48408,7 @@ impl Storage {
             .push(TableLock {
                 owner: txid,
                 wait_owner,
-                table: table as u32,
+                relation,
                 modes,
             })
             .map_err(|_| {
@@ -48391,28 +48457,29 @@ impl Storage {
         output.clear();
         let locks = self.lock_state();
         for lock in locks.table.iter().filter(|lock| lock.owner == txid) {
-            let table = &self.tables[lock.table as usize];
-            if !table.live() {
-                continue;
-            }
+            let (kind, schema, name) = match lock.relation {
+                RelationLockTarget::Table(slot) => {
+                    let table = &self.tables[slot];
+                    let definition = table.definition();
+                    if !definition.identity().live() {
+                        continue;
+                    }
+                    (0, definition.schema, definition.name)
+                }
+                RelationLockTarget::View(slot) => {
+                    let view = self.view(slot);
+                    if !matches!(
+                        view.ddl_state,
+                        CatalogDdlState::Present | CatalogDdlState::PendingDrop { .. }
+                    ) {
+                        continue;
+                    }
+                    (3, view.schema, view.name)
+                }
+            };
             for (mode, acquired_at) in lock.modes.iter().enumerate() {
                 if *acquired_at != 0 {
-                    append_lock(
-                        output,
-                        0,
-                        mode as u8,
-                        0,
-                        {
-                            let definition = table.definition();
-                            definition.schema
-                        }
-                        .as_str(),
-                        {
-                            let definition = table.definition();
-                            definition.name
-                        }
-                        .as_str(),
-                    )?;
+                    append_lock(output, kind, mode as u8, 0, schema.as_str(), name.as_str())?;
                 }
             }
         }
@@ -48509,8 +48576,15 @@ impl Storage {
             .map_err(|_| sql_err!(sqlstate::DATA_EXCEPTION, "prepared lock WAL is not UTF-8"))?;
             at += table_len;
             match kind {
-                0 => {
-                    let slot = self.find_visible(schema, table, 0).ok_or_else(|| {
+                0 | 3 => {
+                    let relation = if kind == 0 {
+                        self.find_visible(schema, table, 0)
+                            .map(RelationLockTarget::Table)
+                    } else {
+                        self.view_slot(schema, table, 0)
+                            .map(RelationLockTarget::View)
+                    }
+                    .ok_or_else(|| {
                         sql_err!(
                             sqlstate::DATA_EXCEPTION,
                             "prepared lock WAL targets missing relation \"{}.{}\"",
@@ -48534,7 +48608,7 @@ impl Storage {
                             ));
                         }
                     };
-                    self.lock_table(txid, slot, table_mode, false)?;
+                    self.lock_relation(txid, relation, table_mode, false)?;
                 }
                 1 => {
                     let slot = self.find_visible(schema, table, 0).ok_or_else(|| {
@@ -50797,35 +50871,71 @@ impl Storage {
             catalog.rules[slot].definition.target
         };
         if let RuleTarget::Table(table) = target {
-            let table = &mut self.tables[usize::from(table)];
-            table.definition_mut().has_rules = true;
-            table.pending_has_rules_txid = None;
+            let mut state = self.tables[usize::from(table)].definition.write();
+            state.committed.has_rules = true;
+            state.pending_has_rules_txid = None;
         }
     }
 
     pub(crate) fn rollback_rule_create(&mut self, slot: usize, prior_table_rule_txid: Option<u32>) {
         if let RuleTarget::Table(table) = self.rule(slot).definition.target {
-            self.tables[usize::from(table)].pending_has_rules_txid = prior_table_rule_txid;
+            self.tables[usize::from(table)]
+                .definition
+                .write()
+                .pending_has_rules_txid = prior_table_rule_txid;
         }
+        self.discard_rule_create(slot);
+    }
+
+    /// A rejected history claim never acquired the table flag it would undo.
+    pub(crate) fn discard_rule_create(&self, slot: usize) {
         let mut catalog = self.view_rule_catalog();
         let _ = catalog.rules[slot].ddl_state.rollback_create();
         self.clear_rule_slot_in(&mut catalog, slot);
     }
 
-    pub(crate) fn begin_rule_history(&mut self, target: RuleTarget, txid: u32) -> Option<u32> {
+    pub(crate) fn begin_rule_history(
+        &self,
+        target: RuleTarget,
+        txid: u32,
+    ) -> Result<Option<u32>, SqlError> {
         let RuleTarget::Table(table) = target else {
-            return None;
+            return Ok(None);
         };
-        self.tables[usize::from(table)]
-            .pending_has_rules_txid
-            .replace(txid)
+        let mut state = self.tables[usize::from(table)].definition.write();
+        let other = state
+            .identity
+            .existence
+            .pending_txid()
+            .into_iter()
+            .chain(state.pending.map(|head| head.transaction))
+            .chain(state.pending_has_rules_txid)
+            .find(|&owner| owner != txid);
+        if let Some(owner) = other {
+            let name = state.committed.name;
+            drop(state);
+            return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
+        }
+        Ok(state.pending_has_rules_txid.replace(txid))
+    }
+
+    /// Rule catalogs and journal staging use the same transaction-visible name.
+    pub(crate) fn rule_target_names(&self, target: RuleTarget, txid: u32) -> (SqlName, SqlName) {
+        match target {
+            RuleTarget::Table(slot) => {
+                let definition = self.table_def(usize::from(slot), txid);
+                (definition.schema, definition.name)
+            }
+            RuleTarget::View(slot) => {
+                let view = self.view(usize::from(slot));
+                view.names_for(txid)
+            }
+        }
     }
 
     pub(crate) fn table_has_rules(&self, table: usize, txid: u32) -> bool {
-        ({
-            let definition = self.tables[table].definition();
-            definition.has_rules
-        }) || self.tables[table].pending_has_rules_txid == Some(txid)
+        let state = self.tables[table].definition.read();
+        state.committed.has_rules || state.pending_has_rules_txid == Some(txid)
     }
 
     pub(crate) fn commit_rule_alter(&mut self, slot: usize, txid: u32) {
@@ -56250,6 +56360,349 @@ mod tests {
     }
 
     #[test]
+    fn relation_publication_recovered_identity_never_belongs_to_a_connection() {
+        let mut config = test_config();
+        config.max_connections = 1;
+        config.max_prepared_transactions = 1;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let previous = crate::sql::execution_connection_id();
+        crate::sql::set_execution_connection_id(42);
+        crate::mem::guard::forbid_alloc(|| {
+            storage.begin_prepared_transaction_identity(7).unwrap();
+            storage
+                .lock_relation(
+                    7,
+                    RelationLockTarget::View(0),
+                    crate::sql::ast::TableLockMode::AccessShare,
+                    false,
+                )
+                .unwrap();
+            storage.visit_table_locks(|_, owner, _, _| {
+                assert_eq!(crate::sql::lock::wait_owner_pid(owner), None)
+            });
+            let ordinary = storage.start_transaction_identity().unwrap();
+            assert_eq!(ordinary, 8);
+            assert_eq!(
+                storage
+                    .begin_prepared_transaction_identity(ordinary)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(
+                storage.transaction_wait_owner(ordinary),
+                crate::sql::lock::connection_wait_owner(42)
+            );
+            assert_eq!(
+                storage
+                    .begin_prepared_transaction_identity(9)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(storage.latest_transaction_identity(), 8);
+            assert_eq!(
+                storage
+                    .begin_prepared_transaction_identity(0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            storage.release_table_locks(7);
+            storage.finish_transaction_identity(7, false);
+            storage.finish_transaction_identity(ordinary, false);
+        });
+        crate::sql::set_execution_connection_id(previous);
+    }
+
+    #[test]
+    fn relation_publication_rule_history_rejects_foreign_owners_and_restores_savepoints() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("rule_history", &[])).unwrap();
+        let target = RuleTarget::Table(table as u16);
+        let first = RuleDefinition {
+            name: SqlName::parse("first").unwrap(),
+            target,
+            ..RuleDefinition::EMPTY
+        };
+        let second = RuleDefinition {
+            name: SqlName::parse("second").unwrap(),
+            target,
+            ..RuleDefinition::EMPTY
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let (a, _) = storage
+                .create_rule(first, StoredQueryDependencies::EMPTY.view(), false, 7)
+                .unwrap();
+            let prior_a = storage.begin_rule_history(target, 7).unwrap();
+            assert_eq!(prior_a, None);
+            assert!(storage.table_has_rules(table, 7));
+            assert!(!storage.table_has_rules(table, 8));
+            let (rejected, _) = storage
+                .create_rule(second, StoredQueryDependencies::EMPTY.view(), false, 8)
+                .unwrap();
+            assert_eq!(
+                storage.begin_rule_history(target, 8).unwrap_err().sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            storage.discard_rule_create(rejected);
+            assert_eq!(storage.rule(rejected).ddl_state, CatalogDdlState::Absent);
+            assert!(storage.table_has_rules(table, 7));
+            assert!(!storage.table_has_rules(table, 8));
+            assert_eq!(storage.tables[table].ddl_locked_by_other(8), Some(7));
+            storage.release_row_locks(8);
+            let (b, _) = storage
+                .create_rule(second, StoredQueryDependencies::EMPTY.view(), false, 7)
+                .unwrap();
+            let prior_b = storage.begin_rule_history(target, 7).unwrap();
+            assert_eq!(prior_b, Some(7));
+            storage.rollback_rule_create(b, prior_b);
+            assert!(storage.table_has_rules(table, 7));
+            storage.rollback_rule_create(a, prior_a);
+            assert!(!storage.table_has_rules(table, 7));
+            assert_eq!(storage.tables[table].ddl_locked_by_other(8), None);
+            let (reused, _) = storage
+                .create_rule(second, StoredQueryDependencies::EMPTY.view(), false, 8)
+                .unwrap();
+            assert_eq!(reused, a);
+            assert_eq!(storage.begin_rule_history(target, 8).unwrap(), None);
+            storage.commit_rule_create(reused);
+            assert!(storage.table_has_rules(table, 0));
+            assert_eq!(
+                storage.tables[table]
+                    .definition
+                    .read()
+                    .pending_has_rules_txid,
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn relation_publication_retained_definition_does_not_block_another_table() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let first = storage
+            .create_table_in(make_def("selected", &[]), 7)
+            .unwrap();
+        let second = storage
+            .create_table_in(make_def("published", &[]), 8)
+            .unwrap();
+        let selected = storage.table(first).definition();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let shared = &storage;
+            scope.spawn(move || {
+                crate::mem::guard::forbid_alloc(|| {
+                    assert_eq!(
+                        shared
+                            .begin_rule_history(RuleTarget::Table(second as u16), 8)
+                            .unwrap(),
+                        None
+                    );
+                    shared.commit_create(second);
+                    assert!(shared.table_has_rules(second, 8));
+                    assert!(!shared.table_has_rules(second, 7));
+                });
+                sender.send(()).unwrap();
+            });
+            let progress = receiver.recv_timeout(std::time::Duration::from_secs(2));
+            assert_eq!(
+                selected.identity().existence,
+                CatalogDdlState::PendingCreate { txid: 7 }
+            );
+            drop(selected);
+            progress
+                .expect("unrelated table publication must finish while a definition is selected");
+        });
+        assert_eq!(storage.table(second).existence(), CatalogDdlState::Present);
+    }
+
+    #[test]
+    fn relation_publication_table_and_view_slots_are_distinct_and_bounded() {
+        use crate::sql::ast::TableLockMode;
+        let mut config = test_config();
+        config.max_connections = 2;
+        config.max_prepared_transactions = 0;
+        config.max_views = 2;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .lock_table(7, 0, TableLockMode::AccessExclusive, false)
+                .unwrap();
+            storage
+                .lock_relation(
+                    8,
+                    RelationLockTarget::View(0),
+                    TableLockMode::AccessShare,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                storage
+                    .lock_table(9, 0, TableLockMode::AccessShare, true)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::LOCK_NOT_AVAILABLE
+            );
+            assert_eq!(
+                storage
+                    .lock_relation(
+                        9,
+                        RelationLockTarget::View(0),
+                        TableLockMode::AccessExclusive,
+                        true
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::LOCK_NOT_AVAILABLE
+            );
+            let mut visited = 0;
+            storage.visit_table_locks(|_, _, _, _| {
+                assert!(storage.locks.try_lock().is_ok());
+                visited += 1;
+            });
+            assert_eq!(visited, 2);
+            storage.release_table_locks(7);
+            storage.release_table_locks(8);
+            let capacity = storage.lock_state().table.capacity();
+            for owner in 1..=capacity as u32 {
+                storage
+                    .lock_relation(
+                        owner,
+                        RelationLockTarget::View(0),
+                        TableLockMode::AccessShare,
+                        false,
+                    )
+                    .unwrap();
+            }
+            let error = storage
+                .lock_table(capacity as u32 + 1, 0, TableLockMode::AccessShare, false)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("table-lock registry"));
+            assert_eq!(storage.lock_state().table.len(), capacity);
+            storage.release_table_locks(1);
+            storage
+                .lock_table(capacity as u32 + 1, 0, TableLockMode::AccessShare, false)
+                .unwrap();
+            assert_eq!(storage.lock_state().table.len(), capacity);
+        });
+    }
+
+    #[test]
+    fn relation_publication_prepared_view_locks_round_trip_and_reject_corruption() {
+        use crate::sql::ast::TableLockMode;
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage.create_table(make_def("lock_table", &[])).unwrap();
+        let (view, _) = storage
+            .create_view(
+                SqlName::parse("public").unwrap(),
+                SqlName::parse("lock_view").unwrap(),
+                test_view_definition(StoredQueryDependencies::EMPTY),
+                false,
+                7,
+            )
+            .unwrap();
+        storage.commit_view_create(view);
+        let mut encoded = FixedBuf::new(&mut budget, "prepared relation locks", 512).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .lock_table(7, table, TableLockMode::AccessShare, false)
+                .unwrap();
+            let before_view = storage.lock_mark();
+            storage
+                .lock_relation(
+                    7,
+                    RelationLockTarget::View(view),
+                    TableLockMode::AccessExclusive,
+                    false,
+                )
+                .unwrap();
+            storage.encode_transaction_locks(7, &mut encoded).unwrap();
+            let table_record_bytes = 12 + "public".len() + "lock_table".len();
+            assert_eq!(encoded.readable()[0], 0);
+            assert_eq!(encoded.readable()[table_record_bytes], 3);
+            storage.rollback_locks_to(7, before_view);
+            storage
+                .lock_relation(
+                    8,
+                    RelationLockTarget::View(view),
+                    TableLockMode::AccessShare,
+                    false,
+                )
+                .unwrap();
+            storage.release_table_locks(7);
+            storage.release_table_locks(8);
+            storage
+                .restore_transaction_locks(9, encoded.readable())
+                .unwrap();
+            assert_eq!(
+                storage
+                    .lock_table(10, table, TableLockMode::AccessExclusive, true)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::LOCK_NOT_AVAILABLE
+            );
+            assert_eq!(
+                storage
+                    .lock_relation(
+                        10,
+                        RelationLockTarget::View(view),
+                        TableLockMode::AccessShare,
+                        true
+                    )
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::LOCK_NOT_AVAILABLE
+            );
+            storage.release_table_locks(9);
+            for invalid in [254, 255] {
+                encoded.filled_mut()[table_record_bytes] = invalid;
+                assert_eq!(
+                    storage
+                        .restore_transaction_locks(9, encoded.readable())
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                storage.release_table_locks(9);
+            }
+            encoded.filled_mut()[table_record_bytes] = 3;
+            encoded.filled_mut()[table_record_bytes + 1] = 255;
+            assert_eq!(
+                storage
+                    .restore_transaction_locks(9, encoded.readable())
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            storage.release_table_locks(9);
+            encoded.filled_mut()[table_record_bytes + 1] = TableLockMode::AccessExclusive as u8;
+            let bytes = encoded.readable();
+            assert_eq!(
+                storage
+                    .restore_transaction_locks(9, &bytes[..bytes.len() - 1])
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            storage.release_table_locks(9);
+            storage
+                .restore_transaction_locks(9, encoded.readable())
+                .unwrap();
+            storage.release_table_locks(9);
+        });
+    }
+
+    #[test]
     fn lock_state_is_synchronized_and_startup_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<LockState>();
@@ -56275,7 +56728,7 @@ mod tests {
                                 .push(TableLock {
                                     owner,
                                     wait_owner: crate::sql::lock::prepared_wait_owner(owner),
-                                    table: 0,
+                                    relation: RelationLockTarget::Table(0),
                                     modes,
                                 })
                                 .unwrap();
@@ -56289,7 +56742,7 @@ mod tests {
         assert_eq!(locks.table.len(), 4);
         assert_eq!(
             locks.table.capacity(),
-            transaction_capacity * table_slot_capacity(&config)
+            transaction_capacity * (table_slot_capacity(&config) + config.max_views)
         );
         assert!(locks.table.iter().all(|lock| lock.modes[0] != 0));
     }

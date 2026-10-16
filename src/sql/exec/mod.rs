@@ -13100,11 +13100,19 @@ pub(crate) fn drop_schema(
                 }
             }
             SchemaObject::View(v) => {
+                if let Err(error) = storage.lock_relation(
+                    txn.txid,
+                    crate::storage::RelationLockTarget::View(*v),
+                    crate::sql::ast::TableLockMode::AccessExclusive,
+                    false,
+                ) {
+                    return sql_fail(error);
+                }
                 let (schema, vname, temporary) = {
                     let view = storage.view(*v);
                     (
-                        view.schema,
-                        view.name,
+                        view.schema_for(txn.txid),
+                        view.name_for(txn.txid),
                         view.persistence == crate::storage::RelationPersistence::Temporary,
                     )
                 };
@@ -36027,6 +36035,14 @@ pub fn create_view(
                 .then_some(slot)
         })
     {
+        if let Err(error) = storage.lock_relation(
+            txn.txid,
+            crate::storage::RelationLockTarget::View(slot),
+            crate::sql::ast::TableLockMode::AccessExclusive,
+            false,
+        ) {
+            return sql_fail(error);
+        }
         let prior = *storage.view(slot).columns_for(txn.txid);
         if prior.len() > columns.len() {
             return sql_fail(sql_err!(
@@ -36318,6 +36334,14 @@ pub fn alter_view(
             },
         );
     };
+    if let Err(error) = storage.lock_relation(
+        txn.txid,
+        crate::storage::RelationLockTarget::View(slot),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.require_owner(
         crate::storage::AccessObject {
             class: crate::storage::AccessClass::View,
@@ -36354,7 +36378,7 @@ pub fn alter_view(
         }
         let (schema, view_name) = {
             let view = storage.view(slot);
-            (view.schema_for(txn.txid), view.name)
+            view.names_for(txn.txid)
         };
         if storage.relation_name_taken(new_schema, view_name.as_str(), txn.txid) {
             return sql_fail(sql_err!(
@@ -36509,7 +36533,7 @@ pub fn alter_view(
             };
             let (schema, view_name) = {
                 let view = storage.view(slot);
-                (view.schema_for(txn.txid), view.name_for(txn.txid))
+                view.names_for(txn.txid)
             };
             let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
                 Ok(prior) => prior,
@@ -36560,7 +36584,7 @@ pub fn alter_view(
             };
             let (schema, view_name) = {
                 let view = storage.view(slot);
-                (view.schema_for(txn.txid), view.name_for(txn.txid))
+                view.names_for(txn.txid)
             };
             let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
                 Ok(prior) => prior,
@@ -36616,7 +36640,7 @@ pub fn alter_view(
             };
             let (schema, view_name) = {
                 let view = storage.view(slot);
-                (view.schema_for(txn.txid), view.name_for(txn.txid))
+                view.names_for(txn.txid)
             };
             let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
                 Ok(prior) => prior,
@@ -36669,7 +36693,7 @@ pub fn alter_view(
         AlterViewAction::RenameTo(new_name) => {
             let (schema, current_name) = {
                 let view = storage.view(slot);
-                (view.schema_for(txn.txid), view.name_for(txn.txid))
+                view.names_for(txn.txid)
             };
             if new_name == current_name.as_str() {
                 responder.command_complete("ALTER VIEW")?;
@@ -36728,7 +36752,7 @@ pub fn alter_view(
     }
     let (schema, view_name) = {
         let view = storage.view(slot);
-        (view.schema, view.name)
+        view.names_for(txn.txid)
     };
     let prior = match storage.stage_view_options(slot, options, txn.txid) {
         Ok(prior) => prior,
@@ -37409,6 +37433,14 @@ pub fn create_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = storage.lock_relation(
+        txn.txid,
+        target.into(),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
     }
@@ -37423,10 +37455,17 @@ pub fn create_rule(
             Ok(created) => created,
             Err(error) => return sql_fail(error),
         };
-    let prior_table_rule_txid = existing
-        .is_none()
-        .then(|| storage.begin_rule_history(target, txn.txid))
-        .flatten();
+    let prior_table_rule_txid = if existing.is_none() {
+        match storage.begin_rule_history(target, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => {
+                storage.discard_rule_create(slot);
+                return sql_fail(error);
+            }
+        }
+    } else {
+        None
+    };
     if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
         if existing.is_some() {
             storage.rollback_rule_alter(slot, prior);
@@ -37471,6 +37510,14 @@ pub fn alter_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = storage.lock_relation(
+        txn.txid,
+        target.into(),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
     }
@@ -37519,6 +37566,14 @@ fn alter_table_rule_enabled(
     emit_completion: bool,
     tag: &'static str,
 ) -> Outcome {
+    if let Err(error) = storage.lock_relation(
+        txn.txid,
+        target.into(),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let Some(slot) = storage.rule_slot(target, name, txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -37572,6 +37627,14 @@ pub fn drop_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = storage.lock_relation(
+        txn.txid,
+        target.into(),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
     }
@@ -37605,23 +37668,10 @@ pub fn drop_rule(
         ));
     }
     storage.drop_rule(slot, txn.txid);
-    let (target_kind, schema, relation) = match target {
-        crate::storage::RuleTarget::Table(slot) => {
-            let definition = storage.table_def(usize::from(slot), txn.txid);
-            (
-                crate::wal::TriggerTargetKind::Table,
-                definition.schema,
-                definition.name,
-            )
-        }
-        crate::storage::RuleTarget::View(slot) => {
-            let definition = storage.view(usize::from(slot));
-            (
-                crate::wal::TriggerTargetKind::View,
-                definition.schema_for(txn.txid),
-                definition.name,
-            )
-        }
+    let (schema, relation) = storage.rule_target_names(target, txn.txid);
+    let target_kind = match target {
+        crate::storage::RuleTarget::Table(_) => crate::wal::TriggerTargetKind::Table,
+        crate::storage::RuleTarget::View(_) => crate::wal::TriggerTargetKind::View,
     };
     let temporary = storage.access_object_is_temporary(target.access_object(), txn.txid);
     if !temporary {
@@ -37659,23 +37709,10 @@ fn stage_rule(
     if storage.access_object_is_temporary(definition.target.access_object(), txn.txid) {
         return Ok(());
     }
-    let (target, schema, relation) = match definition.target {
-        crate::storage::RuleTarget::Table(slot) => {
-            let table = storage.table_def(usize::from(slot), txn.txid);
-            (
-                crate::wal::TriggerTargetKind::Table,
-                table.schema,
-                table.name,
-            )
-        }
-        crate::storage::RuleTarget::View(slot) => {
-            let view = storage.view(usize::from(slot));
-            (
-                crate::wal::TriggerTargetKind::View,
-                view.schema_for(txn.txid),
-                view.name,
-            )
-        }
+    let (schema, relation) = storage.rule_target_names(definition.target, txn.txid);
+    let target = match definition.target {
+        crate::storage::RuleTarget::Table(_) => crate::wal::TriggerTargetKind::Table,
+        crate::storage::RuleTarget::View(_) => crate::wal::TriggerTargetKind::View,
     };
     let lsn = storage.lsn() + 1;
     wal.stage(
@@ -44622,19 +44659,10 @@ fn stage_rule_drop(
     if storage.access_object_is_temporary(definition.target.access_object(), txn.txid) {
         return Ok(());
     }
-    let (target, schema, relation) = match definition.target {
-        crate::storage::RuleTarget::Table(table) => {
-            let table = storage.table_def(usize::from(table), txn.txid);
-            (
-                crate::wal::TriggerTargetKind::Table,
-                table.schema,
-                table.name,
-            )
-        }
-        crate::storage::RuleTarget::View(view) => {
-            let view = storage.view(usize::from(view));
-            (crate::wal::TriggerTargetKind::View, view.schema, view.name)
-        }
+    let (schema, relation) = storage.rule_target_names(definition.target, txn.txid);
+    let target = match definition.target {
+        crate::storage::RuleTarget::Table(_) => crate::wal::TriggerTargetKind::Table,
+        crate::storage::RuleTarget::View(_) => crate::wal::TriggerTargetKind::View,
     };
     let lsn = storage.bump_lsn();
     wal.stage(
@@ -44691,11 +44719,17 @@ fn drop_view_slot(
     txn: &mut TxnState,
     slot: usize,
 ) -> Result<(), SqlError> {
+    storage.lock_relation(
+        txn.txid,
+        crate::storage::RelationLockTarget::View(slot),
+        crate::sql::ast::TableLockMode::AccessExclusive,
+        false,
+    )?;
     let (schema, name, temporary) = {
         let view = storage.view(slot);
         (
-            view.schema,
-            view.name,
+            view.schema_for(txn.txid),
+            view.name_for(txn.txid),
             view.persistence == crate::storage::RelationPersistence::Temporary,
         )
     };
@@ -44730,7 +44764,7 @@ fn drop_view_trigger_dependencies(
         };
         let (schema, name) = {
             let view = storage.view(view_slot);
-            (view.schema, view.name)
+            view.names_for(txn.txid)
         };
         if storage.view(view_slot).persistence != crate::storage::RelationPersistence::Temporary {
             let lsn = storage.bump_lsn();
@@ -46998,6 +47032,14 @@ pub fn drop_view(
             _ => None,
         };
         if let Some(slot) = found {
+            if let Err(error) = storage.lock_relation(
+                txn.txid,
+                crate::storage::RelationLockTarget::View(slot),
+                crate::sql::ast::TableLockMode::AccessExclusive,
+                false,
+            ) {
+                return sql_fail(error);
+            }
             if let Err(error) = storage.require_not_extension_member(
                 crate::storage::AccessObject {
                     class: crate::storage::AccessClass::View,
@@ -47021,8 +47063,8 @@ pub fn drop_view(
             let (schema, view_name, temporary) = {
                 let v = storage.view(slot);
                 (
-                    v.schema,
-                    v.name,
+                    v.schema_for(txn.txid),
+                    v.name_for(txn.txid),
                     v.persistence == crate::storage::RelationPersistence::Temporary,
                 )
             };

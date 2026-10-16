@@ -63,18 +63,14 @@ and linked PRs preserve the investigations; this file keeps only current work.
 appropriate to its transaction. Dropping or rebuilding a table must not leave
 an already running read following reused memory or deleted objects.
 
-Statements, transactions, uploads, and imported snapshots retain the versions
-they need. Selected rows, table definitions, and statement-trigger inputs stay
-valid through nested changes and table replacement. Reader cleanup rechecks
-active readers in small batches. Metadata-only ALTER does not reserve a rewrite
-record for every saved row. Attached partitions map matching columns by name
-through reads, constraints, writes, and replication; subscription descriptors
-recheck local tables after schema changes. Pending table definitions retain one
-startup slot rather than the whole pool; unrelated tables can publish and retire
-their own versions while that definition remains selected. Selected index caches
-retain their own storage; replacements publish their binding list and count
-together after population. The [implementation guide](docs/implemented-baseline.md)
-owns the detailed completed contracts, examples, and capacity limits.
+Readers retain the rows, definitions, trigger inputs, and index caches they need
+through nested changes and replacement. Their reservations are counted at
+startup. Pending definitions and cache owners do not reserve unrelated tables'
+slots. Rule changes take the target relation's lock before selecting or changing
+its definition; rollback preserves another transaction's history. Column
+descriptions and catalog checks of writable views do not acquire execution
+locks. The [implementation guide](docs/implemented-baseline.md) owns the completed
+contracts, examples, and capacity limits.
 
 Still to do:
 

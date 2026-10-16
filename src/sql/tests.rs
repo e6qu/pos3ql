@@ -6773,9 +6773,155 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
 }
 
 #[test]
+fn prepared_manifest_validation_keeps_resolved_batches_and_rejects_corruption() {
+    let mut config = test_config("prepared-manifest-validation");
+    config.max_connections = 1;
+    config.wal_buffer_bytes = 4096;
+    let mut budget = Budget::new(1 << 20);
+    let mut wal = Wal::open(&config, &mut budget).unwrap();
+    let expected = crate::storage::PreparedTransactionCatalogEntry {
+        transaction_id: 7,
+        gid: crate::util::StackStr::from_str("reused-gid"),
+        prepared_at: 123,
+        owner: 0,
+        database: crate::storage::DatabaseOid::POSTGRES,
+        first_lsn: 10,
+        prepared_lsn: 11,
+    };
+    wal.append_committed(
+        10,
+        &WalOp::DatabaseScope {
+            oid: expected.database.get(),
+        },
+    )
+    .unwrap();
+    wal.append_committed(
+        11,
+        &WalOp::PrepareTransaction {
+            transaction_id: expected.transaction_id,
+            owner: expected.owner,
+            database: expected.database.get(),
+            prepared_at: expected.prepared_at,
+            gid: expected.gid.as_str(),
+        },
+    )
+    .unwrap();
+    wal.append_committed(
+        12,
+        &WalOp::CommitPrepared {
+            gid: expected.gid.as_str(),
+        },
+    )
+    .unwrap();
+    wal.append_committed(
+        13,
+        &WalOp::Commit {
+            transaction_id: 8,
+            assigned_transaction_identity: false,
+            committed_at: Some(124),
+        },
+    )
+    .unwrap();
+    // The same GID can name a later transaction; validation must find the
+    // checkpoint's exact batch, not the last live owner of that name.
+    wal.append_committed(
+        14,
+        &WalOp::DatabaseScope {
+            oid: expected.database.get(),
+        },
+    )
+    .unwrap();
+    wal.append_committed(
+        15,
+        &WalOp::PrepareTransaction {
+            transaction_id: 9,
+            owner: expected.owner,
+            database: expected.database.get(),
+            prepared_at: 125,
+            gid: expected.gid.as_str(),
+        },
+    )
+    .unwrap();
+    wal.commit();
+    let mut records = std::collections::BTreeMap::new();
+    wal.replay(0, |lsn, raw| {
+        records.insert(lsn, raw.to_vec());
+        Ok(())
+    })
+    .unwrap();
+    validate_checkpoint_prepared_batches(&[expected], &records).unwrap();
+    validate_checkpoint_prepared_batches(
+        &[crate::storage::PreparedTransactionCatalogEntry {
+            transaction_id: 9,
+            prepared_at: 125,
+            first_lsn: 14,
+            prepared_lsn: 15,
+            ..expected
+        }],
+        &records,
+    )
+    .unwrap();
+    for invalid in [
+        crate::storage::PreparedTransactionCatalogEntry {
+            transaction_id: 9,
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            owner: 1,
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            database: crate::storage::DatabaseOid::TEMPLATE1,
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            prepared_at: 125,
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            gid: crate::util::StackStr::from_str("other-gid"),
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            gid: crate::util::StackStr::from_str("bad\0gid"),
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            first_lsn: 11,
+            ..expected
+        },
+        crate::storage::PreparedTransactionCatalogEntry {
+            prepared_lsn: 15,
+            ..expected
+        },
+    ] {
+        assert!(
+            matches!(
+                validate_checkpoint_prepared_batches(&[invalid], &records),
+                Err(CheckpointSetupError::Corrupt(_))
+            ),
+            "{invalid:?}"
+        );
+    }
+    let first = records.remove(&10).unwrap();
+    assert!(matches!(
+        validate_checkpoint_prepared_batches(&[expected], &records),
+        Err(CheckpointSetupError::Corrupt(_))
+    ));
+    records.insert(10, first);
+    records.remove(&11).unwrap();
+    assert!(matches!(
+        validate_checkpoint_prepared_batches(&[expected], &records),
+        Err(CheckpointSetupError::Corrupt(
+            "manifest prepared transaction has no retained commit batch"
+        ))
+    ));
+}
+
+#[test]
 fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
     let mut config = test_config("prepared-object-cold-recovery");
-    config.max_prepared_transactions = 3;
+    config.max_prepared_transactions = 4;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.wal_upload = true;
@@ -6789,7 +6935,8 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         &mut engine,
         &mut budget,
         "CREATE TABLE durable_prepared(id integer PRIMARY KEY, value text); \
-         INSERT INTO durable_prepared VALUES (1, 'checkpoint')",
+         INSERT INTO durable_prepared VALUES (1, 'checkpoint'); \
+         CREATE VIEW durable_discard_view AS SELECT 2 AS id",
     );
     assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
     let prepared = run_with(
@@ -6831,6 +6978,18 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         !String::from_utf8_lossy(&prepared_rollback).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&prepared_rollback)
+    );
+    let prepared_view = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW durable_prepared_view AS SELECT 1 AS id; \
+         BEGIN; SELECT * FROM durable_prepared_view; \
+         PREPARE TRANSACTION 'object-view-lock'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&prepared_view).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&prepared_view)
     );
     assert!(engine.checkpoint().unwrap());
     engine.commit_wal().unwrap();
@@ -6889,7 +7048,8 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
             "1|checkpoint",
             "object-cold",
             "object-ddl",
-            "object-ddl-rollback"
+            "object-ddl-rollback",
+            "object-view-lock"
         ]
     );
     for statement in [
@@ -6914,6 +7074,73 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         String::from_utf8_lossy(&lock).contains("55P03"),
         "{}",
         String::from_utf8_lossy(&lock)
+    );
+    let table_locks = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT mode, granted, pid IS NULL FROM pg_locks \
+         WHERE locktype='relation' AND relation='durable_prepared'::regclass AND mode='RowExclusiveLock'",
+    );
+    assert_eq!(
+        data_rows(&table_locks),
+        ["RowExclusiveLock|t|t"],
+        "{}",
+        String::from_utf8_lossy(&table_locks)
+    );
+    let view_locks = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT mode, granted, pid IS NULL FROM pg_locks \
+         WHERE locktype='relation' AND relation='durable_prepared_view'::regclass",
+    );
+    assert_eq!(
+        data_rows(&view_locks),
+        ["AccessShareLock|t|t"],
+        "{}",
+        String::from_utf8_lossy(&view_locks)
+    );
+    let view = recovered
+        .storage
+        .view_slot("public", "durable_prepared_view", 0)
+        .unwrap();
+    assert_eq!(
+        recovered
+            .storage
+            .lock_relation(
+                u32::MAX - 1,
+                crate::storage::RelationLockTarget::View(view),
+                ast::TableLockMode::AccessExclusive,
+                true
+            )
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::LOCK_NOT_AVAILABLE
+    );
+    let resolved_view = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "COMMIT PREPARED 'object-view-lock'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&resolved_view).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&resolved_view)
+    );
+    let created_rule = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "BEGIN; ALTER VIEW durable_prepared_view RENAME TO durable_renamed_view; \
+         ALTER VIEW durable_renamed_view SET (security_barrier=true); \
+         CREATE RULE discarded_rule AS ON INSERT TO durable_renamed_view DO INSTEAD NOTHING; \
+         DROP RULE discarded_rule ON durable_renamed_view; \
+         CREATE RULE after_recovery AS ON INSERT TO durable_renamed_view DO INSTEAD NOTHING; \
+         ALTER VIEW durable_discard_view RENAME TO durable_drop_view; \
+         DROP VIEW durable_drop_view; COMMIT",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created_rule).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created_rule)
     );
     let committed = run_with(
         &mut recovered,
@@ -6973,8 +7200,42 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         "{}",
         String::from_utf8_lossy(&reused)
     );
-    assert!(recovered.checkpoint().unwrap());
     drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut replay_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let journal_rules = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "SELECT tablename,rulename FROM pg_rules WHERE tablename='durable_renamed_view'",
+    );
+    assert_eq!(
+        data_rows(&journal_rules),
+        ["durable_renamed_view|after_recovery"],
+        "{}",
+        String::from_utf8_lossy(&journal_rules)
+    );
+    let removed_view = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "SELECT to_regclass('durable_discard_view') IS NULL, to_regclass('durable_drop_view') IS NULL",
+    );
+    assert_eq!(
+        data_rows(&removed_view),
+        ["t|t"],
+        "{}",
+        String::from_utf8_lossy(&removed_view)
+    );
+    let renamed = replayed
+        .storage
+        .view_slot("public", "durable_renamed_view", 0)
+        .unwrap();
+    assert_eq!(
+        replayed.storage.view(renamed).options.security_barrier,
+        crate::storage::ViewSecurityBarrier::Enabled
+    );
+    assert!(replayed.checkpoint().unwrap());
+    drop(replayed);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
     let mut final_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
@@ -6987,6 +7248,14 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
              SELECT count(*) FROM pg_prepared_xacts",
         )),
         ["1|resolved", "2|new", "0"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut final_engine,
+            &mut final_budget,
+            "SELECT rulename FROM pg_rules WHERE tablename='durable_renamed_view'",
+        )),
+        ["after_recovery"]
     );
     drop(final_engine);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -81203,6 +81472,127 @@ fn dml_target_returning_subqueries_keep_old_new_values_and_statement_reads() {
     drop(session);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions() {
+    let config = test_config("view-description-lock-owners");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE metadata_base(id integer, value integer); \
+         INSERT INTO metadata_base VALUES (1, 10); \
+         CREATE VIEW metadata_writable AS SELECT id, value FROM metadata_base; \
+         CREATE VIEW metadata_literal AS SELECT 1 AS id; \
+         CREATE SCHEMA metadata_unrelated; CREATE TABLE metadata_unrelated.items(id integer)",
+        true,
+    );
+    assert!(!session.transaction.is_active());
+    assert_ne!(
+        session.transaction.txid, 0,
+        "idle sessions retain their last identity"
+    );
+    assert_eq!(engine.storage.table_lock_view_count(), 0);
+    for active in [false, true] {
+        if active {
+            session.success(&mut engine, "BEGIN", true);
+        }
+        for statement in [
+            "INSERT INTO metadata_writable VALUES (2, 20) RETURNING id, value",
+            "UPDATE metadata_writable SET value=value+1 RETURNING id, value",
+            "DELETE FROM metadata_writable RETURNING id, value",
+        ] {
+            session.send.clear();
+            session.arena.reset();
+            let mut responder =
+                Responder::for_describe(&mut session.send, crate::pg::respond::ResultFmt::ALL_TEXT);
+            assert!(
+                crate::mem::guard::forbid_alloc(|| engine.describe(
+                    statement,
+                    &session.arena,
+                    &session.transaction,
+                    Some(&session.cursors),
+                    &mut responder,
+                ))
+                .unwrap()
+            );
+            assert_eq!(
+                row_description_names(session.send.readable()),
+                ["id", "value"]
+            );
+            assert_eq!(
+                engine.storage.table_lock_view_count(),
+                0,
+                "describing {statement} must not acquire an execution lock"
+            );
+        }
+        for (name, expected) in [("metadata_writable", true), ("metadata_literal", false)] {
+            session.arena.reset();
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(|| query::view_is_auto_updatable(
+                    &engine.storage,
+                    "public",
+                    name,
+                    session.transaction.txid,
+                    &session.arena,
+                ))
+                .unwrap(),
+                expected
+            );
+            assert_eq!(
+                engine.storage.table_lock_view_count(),
+                0,
+                "catalog inspection must not acquire an execution lock"
+            );
+        }
+        if active {
+            session.success(&mut engine, "ROLLBACK", true);
+        }
+        assert_eq!(engine.storage.schema_lock_blocker(u32::MAX), None);
+    }
+    let view = engine
+        .storage
+        .view_slot("public", "metadata_writable", 0)
+        .unwrap();
+    session.success(
+        &mut engine,
+        "BEGIN; UPDATE metadata_writable SET value=value+1 WHERE id=1 RETURNING id, value",
+        true,
+    );
+    let mut owned = false;
+    engine.storage.visit_table_locks(|owner, _, target, mode| {
+        owned |= owner == session.transaction.txid
+            && target == crate::storage::RelationLockTarget::View(view)
+            && mode == ast::TableLockMode::RowExclusive;
+    });
+    assert!(owned, "executing a view write retains its target lock");
+    assert_eq!(
+        engine
+            .storage
+            .lock_relation(
+                u32::MAX - 1,
+                crate::storage::RelationLockTarget::View(view),
+                ast::TableLockMode::AccessExclusive,
+                true,
+            )
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::LOCK_NOT_AVAILABLE
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(engine.storage.table_lock_view_count(), 0);
+    assert_eq!(engine.storage.schema_lock_blocker(u32::MAX), None);
+    let dropped = session.success(&mut engine, "DROP SCHEMA metadata_unrelated CASCADE", true);
+    assert!(
+        message_types(&dropped).contains(&b'C'),
+        "the unrelated schema drop completes"
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id, value FROM metadata_base", true)),
+        ["1|10"]
+    );
 }
 
 #[test]

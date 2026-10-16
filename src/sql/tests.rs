@@ -83256,6 +83256,8 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
         ("SELECT routine_domains.echo(7::bigint)", "42883"),
         ("SELECT routine_domains.first(ARRAY[7, -8])", "23514"),
         ("SELECT pg_typeof(1)::smallint", "42846"),
+        ("SELECT 1 WHERE FALSE LIMIT -1", "2201W"),
+        ("SELECT 1 WHERE FALSE OFFSET -1", "2201X"),
         ("SELECT NULL::regtype::smallint", "42846"),
         ("SELECT 23::oid::smallint", "42846"),
         ("SELECT 'pg_class'::regclass::smallint", "42846"),
@@ -83290,12 +83292,26 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
          SELECT currval('routine_domains.cast_calls');
          DROP FUNCTION routine_domains.nested();
          DROP FUNCTION routine_domains.bump();
+         SELECT nextval('routine_domains.cast_calls') WHERE FALSE;
+         SELECT generate_series(1, 3) WHERE nextval('routine_domains.cast_calls') > 0;
+         SELECT currval('routine_domains.cast_calls');
+         SELECT generate_series(1, nextval('routine_domains.cast_calls')::integer) WHERE FALSE;
+         SELECT currval('routine_domains.cast_calls');
+         SELECT nextval('routine_domains.cast_calls') LIMIT 0;
+         SELECT currval('routine_domains.cast_calls');
+         CREATE TABLE routine_domains.filtered(value integer);
+         INSERT INTO routine_domains.filtered SELECT generate_series(1, 3)
+         WHERE nextval('routine_domains.cast_calls') > 0;
+         SELECT value FROM routine_domains.filtered ORDER BY value;
+         SELECT currval('routine_domains.cast_calls');
          DROP CAST (regtype AS smallint);",
         32 << 20,
     );
     assert_eq!(
         data_rows(&custom),
-        ["7|t", "t", "f", "8", "19", "10"],
+        [
+            "7|t", "t", "f", "8", "19", "10", "1", "2", "3", "11", "11", "11", "1", "2", "3", "12"
+        ],
         "{}",
         String::from_utf8_lossy(&custom)
     );

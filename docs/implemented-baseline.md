@@ -372,7 +372,9 @@ notices retain declared domain and array names in routine signatures.
 A custom cast that calls a function marked VOLATILE runs during execution,
 rather than while checking constant expressions. For example, a cast that calls
 nextval advances the sequence once for each evaluated value. A skipped false
-branch does not advance it, and waiting for a nested function does not advance
+branch or WHERE condition does not advance it. Filtering a SELECT without FROM
+happens once before evaluating its outputs or expanding a set-returning function.
+Waiting for a nested function does not advance
 it again. SQL function result queries use the connection's sequence state.
 The pg_typeof function is stable rather than immutable: an immutable cast of
 its result stays out of planning. A genuinely constant immutable cast can

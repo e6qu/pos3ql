@@ -747,6 +747,14 @@ pub(super) struct ProjectSet<'a> {
 }
 
 impl ProjectSet<'_> {
+    pub(super) const fn empty() -> Self {
+        Self {
+            count: 0,
+            values: &[],
+            any: false,
+        }
+    }
+
     pub(super) const fn single() -> Self {
         Self {
             count: 1,

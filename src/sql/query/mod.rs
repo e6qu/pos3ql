@@ -6302,6 +6302,25 @@ fn over_one_row<'a>(
         .map_err(|_| arena_full())?)
 }
 
+/// Admit the virtual input row once before scalar projection or set expansion.
+/// Both wire results and INSERT/function row sources use this boundary.
+fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
+    statement: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<srf::ProjectSet<'a>, SqlError> {
+    if let Some(predicate) = statement.where_clause
+        && !where_passes(predicate, arena, params, row, hooks)?
+    {
+        return Ok(srf::ProjectSet::empty());
+    }
+    prepare_project_set(statement.items, storage, txid, arena, params, row, hooks)
+}
+
 /// FROM-less `SELECT` (one virtual row, no columns). Item and WHERE
 /// expressions may still contain subqueries — always uncorrelated here, since
 /// there is no outer row to reference — so they are prepared once and injected
@@ -6534,18 +6553,6 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     // A set-returning function in the select list expands the single virtual
     // row into one output row per element/value.
     let srf_call = find_srf(statement.items);
-    let project_set = match prepare_project_set(
-        statement.items,
-        storage,
-        txid,
-        arena,
-        params,
-        &super::eval::NoColumns,
-        &hooks,
-    ) {
-        Ok(project_set) => project_set,
-        Err(e) => return sql_fail(e),
-    };
     responder.row_description(&columns[..n])?;
     // Resolve ORDER BY targets against the select list: ordinals and output
     // names/expressions bind to an item (whose computed value is the key —
@@ -6615,6 +6622,31 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         }
     }
 
+    let limit = match super::exec::eval_limit_pub(statement.limit, arena, params) {
+        Ok(l) => l,
+        Err(e) => return sql_fail(e),
+    };
+    let offset = match super::exec::eval_offset_pub(statement.offset, arena, params) {
+        Ok(o) => o,
+        Err(e) => return sql_fail(e),
+    };
+    let project_set = if limit == 0 {
+        srf::ProjectSet::empty()
+    } else {
+        match prepare_fromless_projection(
+            statement,
+            storage,
+            txid,
+            arena,
+            params,
+            &super::eval::NoColumns,
+            &hooks,
+        ) {
+            Ok(project_set) => project_set,
+            Err(error) => return sql_fail(error),
+        }
+    };
+
     // Materialize every output row (visible values + hidden sort keys).
     let mut n_rows = 0usize;
     let max_rows = project_set.count;
@@ -6659,13 +6691,6 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
                     }
                 }
                 _ => unreachable!("wildcard rejected by describe_items in a FROM-less select"),
-            }
-        }
-        if let Some(w) = statement.where_clause {
-            match where_passes(w, arena, params, &super::eval::NoColumns, &khooks) {
-                Ok(false) => continue,
-                Ok(true) => {}
-                Err(e) => return sql_fail(e),
             }
         }
         for (j, ob) in statement.order_by.iter().enumerate() {
@@ -6767,14 +6792,6 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         });
     }
 
-    let limit = match super::exec::eval_limit_pub(statement.limit, arena, params) {
-        Ok(l) => l,
-        Err(e) => return sql_fail(e),
-    };
-    let offset = match super::exec::eval_offset_pub(statement.offset, arena, params) {
-        Ok(o) => o,
-        Err(e) => return sql_fail(e),
-    };
     let start = (offset as usize).min(out_rows.len());
     let mut end = offset.saturating_add(limit).min(out_rows.len() as u64) as usize;
     // FETCH FIRST ... WITH TIES over a FROM-less SRF result: keep rows tying
@@ -7194,7 +7211,7 @@ fn select_into_rows_mode<'a>(
         };
         let srf_call = find_srf(statement.items);
         let project_set =
-            prepare_project_set(statement.items, storage, txid, arena, params, &cols, &hooks)?;
+            prepare_fromless_projection(statement, storage, txid, arena, params, &cols, &hooks)?;
         let mut produced = 0u64;
         for k in 1..=project_set.count {
             let khooks = if srf_call.is_some() || project_set.any {
@@ -7206,11 +7223,6 @@ fn select_into_rows_mode<'a>(
             } else {
                 hooks
             };
-            if let Some(w) = statement.where_clause
-                && !where_passes(w, arena, params, &cols, &khooks)?
-            {
-                continue;
-            }
             let mut vals = [Datum::Null; MAX_PROJ];
             let mut n = 0;
             for item in statement.items {

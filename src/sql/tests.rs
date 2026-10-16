@@ -83442,14 +83442,18 @@ ALTER DOMAIN routine_domains.positive OWNER TO domain_cast_owner;
 SET ROLE domain_cast_owner;
 ALTER DOMAIN routine_domains.positive RENAME TO moved_positive;
 CREATE CAST (routine_domains.moved_positive AS text) WITH INOUT;
-SELECT castsource::regtype::text, casttarget::regtype::text
+SELECT castsource::regtype::text, casttarget::regtype::text,
+       format_type(castsource, NULL),
+       'routine_domains.moved_positive[]'::regtype::oid::regtype::text
 FROM pg_cast
 WHERE castsource = 'routine_domains.moved_positive'::regtype::oid
 AND casttarget = 'text'::regtype::oid;
 RESET ROLE;
 ROLLBACK;"
         ),
-        ["routine_domains.moved_positive|text"]
+        [
+            "routine_domains.moved_positive|text|routine_domains.moved_positive|routine_domains.moved_positive[]"
+        ]
     );
     type_reference_execute(&mut engine, &mut budget, "DROP ROLE domain_cast_owner");
     let dropped = run_with_fixed_memory(

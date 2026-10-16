@@ -96,7 +96,9 @@ ALTER DOMAIN routine_domains.positive OWNER TO domain_cast_owner;
 SET ROLE domain_cast_owner;
 ALTER DOMAIN routine_domains.positive RENAME TO moved_positive;
 CREATE CAST (routine_domains.moved_positive AS text) WITH INOUT;
-SELECT castsource::regtype::text, casttarget::regtype::text
+SELECT castsource::regtype::text, casttarget::regtype::text,
+       format_type(castsource, NULL),
+       'routine_domains.moved_positive[]'::regtype::oid::regtype::text
 FROM pg_cast
 WHERE castsource = 'routine_domains.moved_positive'::regtype::oid
 AND casttarget = 'text'::regtype::oid;

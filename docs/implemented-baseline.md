@@ -353,7 +353,8 @@ Restoring casts from the journal or a checkpoint retains their owning database.
 Creating a cast after renaming a domain in the same transaction journals the
 domain's current name, so recovery can resolve it. Type usage and ownership
 checks resolve the name visible inside that transaction while internal references
-retain their bound identity until commit.
+retain their bound identity until commit. Converting an identifier to regtype
+or calling format_type also uses the current domain or domain-array name.
 Type comments move within the same database. Composite type renames journal only the name
 change, preserving current field references during replay. The
 [format guide](durable-format.md#composite-type-name-changes) gives the upgrade

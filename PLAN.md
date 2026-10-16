@@ -84,7 +84,7 @@ Still to do:
   maintenance scheduling. Complete rewrites must preserve historical object
   versions needed by active readers.
 - Verify release after errors, rollback, and transaction end, and prevent
-  reused identities from being mistaken for older data.
+  reused identities or names in another database from being mistaken for older data.
 
 Done when: an unrelated write can complete while a reader retains old data;
 maintenance preserves that data; failed publication leaves the prior state

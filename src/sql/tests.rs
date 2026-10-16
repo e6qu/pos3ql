@@ -83040,3 +83040,186 @@ fn dml_target_partition_constraint_flags_cover_columns_past_sixty_four() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+const TYPE_REFERENCE_SETUP: &str = include_str!("../../tests/external/type_reference_setup.sql");
+const TYPE_REFERENCE_MOVES: &str = include_str!("../../tests/external/type_reference_moves.sql");
+const TYPE_REFERENCE_SNAPSHOT: &str =
+    include_str!("../../tests/external/type_reference_snapshot.sql");
+
+fn type_reference_execute(engine: &mut Engine, budget: &mut Budget, sql: &str) -> Vec<String> {
+    let output = run_with(engine, budget, sql);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    data_rows(&output)
+}
+
+fn type_reference_setup_databases(engine: &mut Engine, budget: &mut Budget) -> Vec<String> {
+    for database in [
+        crate::storage::DatabaseOid::POSTGRES,
+        crate::storage::DatabaseOid::TEMPLATE1,
+    ] {
+        engine.select_database(database).unwrap();
+        type_reference_execute(engine, budget, TYPE_REFERENCE_SETUP);
+    }
+    type_reference_execute(engine, budget, TYPE_REFERENCE_SNAPSHOT)
+}
+
+#[test]
+fn type_reference_moves_preserve_other_database_definitions_and_comments() {
+    let (mut engine, mut budget) = test_engine();
+    let before = type_reference_setup_databases(&mut engine, &mut budget);
+    engine
+        .select_database(crate::storage::DatabaseOid::POSTGRES)
+        .unwrap();
+    let moved = run_with_fixed_memory(&mut engine, &budget, TYPE_REFERENCE_MOVES, 32 << 20);
+    assert!(
+        !String::from_utf8_lossy(&moved).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&moved)
+    );
+    engine
+        .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+        .unwrap();
+    let table = engine
+        .storage
+        .find_visible("type_scope", "items", 0)
+        .unwrap();
+    {
+        let definition = engine.storage.table_def(table, 0);
+        assert_eq!(
+            definition.columns()[0].user_type,
+            Some(crate::storage::UserTypeName {
+                schema: SqlName::parse("type_scope").unwrap(),
+                name: SqlName::parse("shared_domain").unwrap(),
+            }),
+            "type rename changed another database"
+        );
+    }
+    assert_eq!(
+        type_reference_execute(&mut engine, &mut budget, TYPE_REFERENCE_SNAPSHOT),
+        before,
+        "type rename changed another database"
+    );
+    assert_eq!(
+        type_reference_execute(
+            &mut engine,
+            &mut budget,
+            "SELECT type_scope.echo_domain(7), 7::type_scope.child_domain"
+        ),
+        ["7|7"]
+    );
+}
+
+#[test]
+fn type_reference_moves_pending_images_survive_journal_and_checkpoint_cold_recovery() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    for checkpoint in [false, true] {
+        let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+        let mut config = test_config(&format!("type-reference-{sequence}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket =
+            format!("sql-type-reference-{}-{sequence}", std::process::id());
+        config.object_store_response_bytes = 1 << 20;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.wal_upload_buffer_bytes = 256 << 10;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let untouched = type_reference_setup_databases(&mut engine, &mut budget);
+        engine
+            .select_database(crate::storage::DatabaseOid::POSTGRES)
+            .unwrap();
+        let original = type_reference_execute(&mut engine, &mut budget, TYPE_REFERENCE_SNAPSHOT);
+        let rolled_back = format!("BEGIN; {TYPE_REFERENCE_MOVES} ROLLBACK;");
+        type_reference_execute(&mut engine, &mut budget, &rolled_back);
+        assert_eq!(
+            type_reference_execute(&mut engine, &mut budget, TYPE_REFERENCE_SNAPSHOT),
+            original
+        );
+        let pending = format!(
+            "BEGIN;
+             ALTER TABLE type_scope.items ADD COLUMN pending type_scope.shared_domain;
+             ALTER TYPE type_scope.shared_record ADD ATTRIBUTE pending type_scope.shared_domain;
+             ALTER DOMAIN type_scope.child_domain SET NOT NULL;
+             CREATE OR REPLACE FUNCTION type_scope.echo_domain(arg type_scope.shared_domain)
+             RETURNS type_scope.shared_domain LANGUAGE SQL AS 'SELECT arg';
+             {TYPE_REFERENCE_MOVES} COMMIT;"
+        );
+        type_reference_execute(&mut engine, &mut budget, &pending);
+        let published = type_reference_execute(&mut engine, &mut budget, TYPE_REFERENCE_SNAPSHOT);
+        assert_eq!(
+            type_reference_execute(
+                &mut engine,
+                &mut budget,
+                "SELECT type_scope.echo_domain(7), 7::type_scope.child_domain"
+            ),
+            ["7|7"]
+        );
+        if checkpoint {
+            assert!(engine.checkpoint().unwrap());
+        }
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        assert_eq!(
+            type_reference_execute(
+                &mut recovered,
+                &mut recovered_budget,
+                TYPE_REFERENCE_SNAPSHOT
+            ),
+            published
+        );
+        recovered
+            .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+            .unwrap();
+        assert_eq!(
+            type_reference_execute(
+                &mut recovered,
+                &mut recovered_budget,
+                TYPE_REFERENCE_SNAPSHOT
+            ),
+            untouched,
+            "type rename changed another database after cold recovery"
+        );
+    }
+}
+
+#[test]
+fn type_reference_moves_enum_drop_selects_only_its_database() {
+    let (mut engine, mut budget) = test_engine();
+    type_reference_setup_databases(&mut engine, &mut budget);
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "DROP TYPE type_scope.drop_enum",
+        32 << 20,
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    assert_eq!(
+        type_reference_execute(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_type WHERE typname = 'drop_enum'"
+        ),
+        ["0"],
+        "enum drop selected another database"
+    );
+    engine
+        .select_database(crate::storage::DatabaseOid::POSTGRES)
+        .unwrap();
+    assert_eq!(
+        type_reference_execute(
+            &mut engine,
+            &mut budget,
+            "SELECT 'ready'::type_scope.drop_enum::text"
+        ),
+        ["ready"]
+    );
+}

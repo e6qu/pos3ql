@@ -214,6 +214,26 @@ impl DefinitionVersions {
         Ok(())
     }
 
+    pub(super) fn move_type_references(
+        &mut self,
+        definition: &mut TableDefinition,
+        movement: super::type_reference_moves::TypeReferenceMove,
+    ) -> bool {
+        let mut state = definition.exclusive();
+        let mut changed = movement.rewrite_definition(&mut state.committed);
+        let mut tail = state.pending.map(|head| head.tail);
+        while let Some(slot) = tail {
+            let entry = self.slots[slot as usize]
+                .get_mut()
+                .expect("definition slot lock poisoned")
+                .as_mut()
+                .expect("published definition slot exists");
+            changed |= movement.rewrite_definition(&mut entry.version.def);
+            tail = entry.previous;
+        }
+        changed
+    }
+
     /// Exclusive rewriting keeps the cached latest name aligned with its slot.
     pub(super) fn rename_schema(
         &mut self,

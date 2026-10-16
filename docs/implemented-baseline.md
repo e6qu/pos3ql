@@ -346,6 +346,15 @@ later committed duplicates. The [PostgreSQL 18 index-build implementation](https
 is the upstream visibility reference; the differential suite checks actual
 PostgreSQL results.
 
+Type renames and schema moves update references only in the type's database,
+including pending table, domain, composite and routine definitions. Type comments
+move within the same database. The existing journal and checkpoint formats remain
+unchanged.
+
+**User example:** two databases can both define `app.customer_id`. Renaming that
+domain in one database leaves the other database's columns, functions and comments
+unchanged, including after rollback or recovery without local caches.
+
 Schema validation uses a current read position for the rows being checked,
 including earlier changes by the same transaction. CHECK, NOT NULL, uniqueness,
 foreign-key and domain rules, and partition attachment retain their original row

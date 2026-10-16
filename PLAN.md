@@ -71,13 +71,15 @@ its definition; rollback preserves another transaction's history. Column
 descriptions and catalog checks of writable views do not acquire execution
 locks. Table cleanup uses a lock for its own table and releases shared row-version
 pools between batches; retained row values survive cleanup and slot reuse.
+Transactional table creation reserves names and slots without exclusive storage
+access. Failed initialization releases its slot and index-cache claims.
 The [implementation guide](docs/implemented-baseline.md) owns the completed
 contracts, examples, and capacity limits.
 
 Still to do:
 
-- Finish shared-state protection for table creation and slot reuse, and for
-  engine-wide publication.
+- Finish shared-state protection for engine-wide publication and remaining
+  table rewrites and maintenance paths.
 - Integrate bounded heap relocation with concurrent table publication and
   maintenance scheduling. Complete rewrites must preserve historical object
   versions needed by active readers.

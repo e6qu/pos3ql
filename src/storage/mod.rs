@@ -8,6 +8,7 @@
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
+mod table_creation;
 mod table_definitions;
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
@@ -13663,6 +13664,8 @@ impl Iterator for MatviewIter<'_> {
 pub struct Storage {
     pub(crate) heap: RowHeap,
     tables: FixedVec<Table>,
+    /// Serializes table-name checks and empty-slot initialization, never row I/O.
+    table_creation: std::sync::Mutex<()>,
     table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
     row_versions: RowVersionPools,
@@ -14899,6 +14902,9 @@ fn rename_table_sql_identity(
 
 impl Storage {
     fn clear_table_rows(&self, slot: usize) {
+        if self.tables[slot].rows.is_empty() {
+            return;
+        }
         let mut cursor = 0;
         while !self.retire_table_row_batch(slot, &mut cursor) {}
     }
@@ -17529,7 +17535,7 @@ impl Storage {
     }
 
     fn rename_stored_query_dependency(
-        &mut self,
+        &self,
         class: DependencyClass,
         slot: usize,
         old_identity: Option<(SqlName, SqlName)>,
@@ -17655,6 +17661,7 @@ impl Storage {
 
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
+            + size_of::<std::sync::Mutex<()>>()
             + snapshot_owner_bytes()
             + config.max_connections as usize * size_of::<ExportedSnapshot>()
             + statement_snapshot_capacity(config) * size_of::<StatementSnapshot>()
@@ -17790,6 +17797,7 @@ impl Storage {
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+        budget.draw(size_of::<std::sync::Mutex<()>>(), "table creation controls")?;
         crate::sql::set_execution_database_oid(DatabaseOid::POSTGRES);
         let heap = RowHeap::new(budget, config.memtable_bytes)?;
         let foreign = foreign::ForeignCatalog::new(config, budget)?;
@@ -18545,6 +18553,7 @@ impl Storage {
         let storage = Self {
             heap,
             tables,
+            table_creation: std::sync::Mutex::new(()),
             table_definition_images,
             max_row_versions_per_row: config.max_row_versions_per_row,
             row_versions,
@@ -33846,7 +33855,7 @@ impl Storage {
     }
 
     fn refresh_enforcers_visible(
-        &mut self,
+        &self,
         table_index: usize,
         txid: Option<u32>,
     ) -> Result<(), SqlError> {
@@ -33854,7 +33863,7 @@ impl Storage {
     }
 
     fn build_enforcers_visible(
-        &mut self,
+        &self,
         table_index: usize,
         txid: Option<u32>,
     ) -> Result<(), SqlError> {
@@ -34599,84 +34608,6 @@ impl Storage {
         }
     }
 
-    /// Allocates a slot for a fresh table. Shared by replay (committed) and
-    /// the executor (pending); `transaction` selects the uncommitted-CREATE
-    /// state so the table is invisible to other transactions until commit.
-    /// Exclusive storage access excludes shared retirement while reusing a slot.
-    fn alloc_table(&mut self, def: TableDef, transaction: Option<u32>) -> Result<usize, SqlError> {
-        let Some(slot) = self
-            .tables
-            .iter()
-            .take(self.table_count())
-            .position(Table::is_free)
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many tables (limit {})",
-                self.table_count()
-            ));
-        };
-        // A reused slot must not keep the dropped table's value indexes.
-        self.release_enforcers(slot);
-        self.clear_pending_table_defs(slot);
-        self.clear_pending_table_statistics(slot);
-        self.clear_object_acl_entries(AccessObject {
-            class: AccessClass::Table,
-            slot: slot as u16,
-        });
-        let ownership = self.initial_ownership(transaction.unwrap_or(0));
-        let created_at = self.catalog_sequence.next();
-        let stamp = created_at;
-        self.cumulative_statistics().relations[slot] = RelationCumulativeStatistics::EMPTY;
-        self.reset_implicit_index_statistics(slot);
-        self.clear_table_rows(slot);
-        let table = &mut self.tables[slot];
-        {
-            let state = table.definition.exclusive();
-            state.committed = def;
-            state.pending_has_rules_txid = None;
-            state.identity = table_definitions::TableIdentity {
-                database: current_database(),
-                ownership,
-                created_at: stamp,
-                existence: transaction.map_or(CatalogDdlState::Present, |txid| {
-                    CatalogDdlState::PendingCreate { txid }
-                }),
-            };
-        }
-        table.mark_dirty();
-        table
-            .statistics
-            .set_image(TableStatistics::EMPTY, Some(false), true);
-        // A reused slot must not inherit the dropped table's sequences or
-        // spilled rows.
-        *table
-            .serial
-            .get_mut()
-            .expect("table serial state lock poisoned") = TableSerialState::EMPTY;
-        table.spill_generations.write().clear();
-        let schema = {
-            let definition = table.definition();
-            definition.schema
-        };
-        let name = {
-            let definition = table.definition();
-            definition.name
-        };
-        if let Err(error) = self.refresh_enforcers(slot) {
-            self.rollback_create(slot);
-            let table = &mut self.tables[slot];
-            *table.definition_mut() = TableDef::empty();
-            table.identity_mut().ownership = Ownership::BOOTSTRAP;
-            table.identity_mut().created_at = 0;
-            return Err(error);
-        }
-        self.rename_stored_query_dependency(DependencyClass::Table, slot, None, schema, name);
-        Ok(slot)
-    }
-
-    /// Committed create (journal replay): the table is immediately part of the
-    /// durable image.
     /// Rebinds every persisted user-defined column type from its stable name to
     /// the current catalog slot. Slots are runtime identities and may change
     /// across restart; scalar enums and enum/domain arrays therefore never
@@ -34784,7 +34715,9 @@ impl Storage {
         self.bind_user_type_columns_to(def, 0)
     }
 
+    /// Journal replay installs a committed table under exclusive storage access.
     pub fn create_table(&mut self, mut def: TableDef) -> Result<usize, SqlError> {
+        let creation = table_creation::TableCreation::new(self);
         if def.n_columns > MAX_RELATION_COLUMNS {
             return Err(sql_err!(
                 sqlstate::TOO_MANY_COLUMNS,
@@ -34810,7 +34743,7 @@ impl Storage {
         // enum's name (in `domain`); bind it to the live catalog slot now that
         // the enum has itself been loaded (WAL/checkpoint order guarantees it).
         self.bind_user_type_columns(&mut def)?;
-        let slot = self.alloc_table(def, None)?;
+        let slot = creation.allocate(def, None)?;
         Ok(slot)
     }
 
@@ -34901,7 +34834,8 @@ impl Storage {
     /// Transactional create: the table exists only for `txid` until commit.
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
     /// another transaction's uncommitted DDL joins the shared wait graph.
-    pub fn create_table_in(&mut self, mut def: TableDef, txid: u32) -> Result<usize, SqlError> {
+    pub fn create_table_in(&self, mut def: TableDef, txid: u32) -> Result<usize, SqlError> {
+        let creation = table_creation::TableCreation::new(self);
         def.has_toast |= def
             .columns()
             .iter()
@@ -34927,7 +34861,7 @@ impl Storage {
                 def.name.as_str()
             ));
         }
-        let slot = self.alloc_table(def, Some(txid))?;
+        let slot = creation.allocate(def, Some(txid))?;
         if def.persistence == RelationPersistence::Temporary {
             self.mark_temporary_transaction(txid);
         }
@@ -35024,6 +34958,11 @@ impl Storage {
     /// Retires a rolled-back CREATE or a failed replay allocation.
     pub fn rollback_create(&self, index: usize) {
         let _lifecycle = self.tables[index].lifecycle();
+        self.rollback_create_locked(index);
+    }
+
+    /// The caller retains this table's lifecycle through failure cleanup.
+    fn rollback_create_locked(&self, index: usize) {
         {
             let mut state = self.tables[index].definition.write();
             assert!(matches!(
@@ -60477,6 +60416,207 @@ mod tests {
             CatalogDdlState::Present.drop_by(1),
             CatalogDdlState::PendingDrop { txid: 1 }
         );
+    }
+
+    #[test]
+    fn shared_table_creation_wait_does_not_reserve_row_reads_or_publication() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("independent_rows", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        let old = storage.heap.append_bytes(b"keep").unwrap();
+        let next = storage.heap.append_bytes(b"next").unwrap();
+        let mut row = RowState::committed_only_at(old, 7);
+        push_pending_version(
+            &mut storage.row_versions.exclusive().pending_row_versions,
+            &mut row.pending,
+            8,
+            PendingChange {
+                txid: 7,
+                cid: 1,
+                loc: Some(next),
+                changed_columns: ColumnSet::EMPTY,
+                changes_existence: false,
+            },
+        )
+        .unwrap();
+        storage.tables[table].rows.insert(1, row).unwrap();
+        let creation = storage.table_creation.lock().unwrap();
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        let storage = &storage;
+        std::thread::scope(|scope| {
+            let creator = scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    storage.create_table_in(make_def("waiting_creation", &[]), 8)
+                })
+            });
+            scope.spawn(move || {
+                let result = crate::mem::guard::forbid_alloc(|| {
+                    let retained = storage.resident_row_state(table, 1)?.unwrap();
+                    storage.commit_row(table, 1, 7, 9)?;
+                    assert_eq!(storage.row_state(table, 1)?.unwrap().committed_lsn, 9);
+                    let image = retained
+                        .select_owned(table, 1, 8, SNAPSHOT_ALL, 7)?
+                        .unwrap();
+                    let VisibleRowBytes::Heap(bytes) = image.bytes else {
+                        panic!("heap fixture");
+                    };
+                    assert_eq!(&*bytes, b"keep");
+                    Ok::<_, SqlError>(())
+                });
+                sent.send(result).unwrap();
+            });
+            let progress = received.recv_timeout(std::time::Duration::from_secs(5));
+            // Unblock creation before asserting, so scope teardown cannot
+            // strand the waiting worker if publication failed.
+            drop(creation);
+            assert!(
+                progress.is_ok(),
+                "row work must progress while creation waits"
+            );
+            progress.unwrap().unwrap();
+            let created = creator.join().unwrap().unwrap();
+            assert_ne!(created, table);
+        });
+    }
+
+    #[test]
+    fn shared_table_creation_reserves_distinct_slots_and_one_owner_per_name() {
+        let mut config = test_config();
+        config.max_tables = 5;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        let names = ["parallel_a", "parallel_b", "parallel_c", "parallel_d"];
+        let ready = std::sync::Barrier::new(5);
+        let storage = &storage;
+        let ready = &ready;
+        let slots = std::thread::scope(|scope| {
+            let handles: [_; 4] = core::array::from_fn(|ordinal| {
+                scope.spawn(move || {
+                    ready.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        storage.create_table_in(make_def(names[ordinal], &[]), 7 + ordinal as u32)
+                    })
+                })
+            });
+            ready.wait();
+            handles.map(|handle| handle.join().unwrap().unwrap())
+        });
+        for (ordinal, slot) in slots.iter().copied().enumerate() {
+            assert!(!slots[..ordinal].contains(&slot));
+            assert_eq!(
+                storage.find_visible("public", names[ordinal], 7 + ordinal as u32),
+                Some(slot)
+            );
+            assert_eq!(storage.find_visible("public", names[ordinal], 99), None);
+        }
+        let ready = std::sync::Barrier::new(3);
+        let ready = &ready;
+        let results = std::thread::scope(|scope| {
+            let handles: [_; 2] = core::array::from_fn(|_| {
+                scope.spawn(move || {
+                    ready.wait();
+                    crate::mem::guard::forbid_alloc(|| {
+                        storage.create_table_in(make_def("same_race", &[]), 17)
+                    })
+                })
+            });
+            ready.wait();
+            handles.map(|handle| handle.join().unwrap())
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .is_err_and(|error| error.sqlstate == sqlstate::DUPLICATE_TABLE))
+                .count(),
+            1
+        );
+        for slot in slots {
+            crate::mem::guard::forbid_alloc(|| storage.commit_create(slot));
+        }
+    }
+
+    #[test]
+    fn shared_table_creation_skips_retiring_slots_and_retries_capacity_after_release() {
+        let mut config = test_config();
+        config.max_tables = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let old = storage
+            .create_table(make_def("retired_creation", &[]))
+            .unwrap();
+        let identity = storage.tables[old].created_at();
+        storage.commit_drop(old);
+        let retiring = storage.tables[old].lifecycle();
+        crate::mem::guard::forbid_alloc(|| {
+            let other = storage
+                .create_table_in(make_def("other_creation", &[]), 7)
+                .unwrap();
+            assert_ne!(other, old);
+            let error = storage
+                .create_table_in(make_def("full_creation", &[]), 8)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.find_visible("public", "full_creation", 8), None);
+            storage.rollback_create(other);
+        });
+        drop(retiring);
+        crate::mem::guard::forbid_alloc(|| {
+            let reused = storage
+                .create_table_in(make_def("full_creation", &[]), 8)
+                .unwrap();
+            assert_eq!(reused, old);
+            assert_ne!(storage.tables[reused].created_at(), identity);
+            storage.commit_create(reused);
+            assert_eq!(
+                storage.find_visible("public", "full_creation", 99),
+                Some(reused)
+            );
+        });
+    }
+
+    #[test]
+    fn shared_table_creation_failure_releases_name_slot_lifecycle_and_index_claims() {
+        let mut config = test_config();
+        config.max_value_indexes = 1;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut def = make_def(
+                "retry_creation",
+                &[("id", ColType::Int4, true), ("other", ColType::Int4, true)],
+            );
+            def.columns[0].unique = true;
+            def.columns[1].unique = true;
+            let error = storage.create_table_in(def, 7).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(
+                error
+                    .message
+                    .as_str()
+                    .contains("value index pool exhausted")
+            );
+            assert_eq!(storage.find_visible("public", "retry_creation", 7), None);
+            assert!(
+                storage
+                    .tables
+                    .iter()
+                    .all(|table| table.lifecycle.try_lock().is_ok())
+            );
+            assert!(storage.value_indexes.acquire().is_some());
+            assert!(storage.pending_table_defs.test_write().is_ok());
+            let mut retry = make_def("retry_creation", &[("id", ColType::Int4, true)]);
+            retry.columns[0].unique = true;
+            let slot = storage.create_table_in(retry, 7).unwrap();
+            storage.commit_create(slot);
+            storage.commit_drop(slot);
+            assert!(storage.value_indexes.acquire().is_some());
+        });
     }
 
     #[test]

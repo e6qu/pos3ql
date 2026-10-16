@@ -2,7 +2,8 @@
 
 use super::{
     ArrElem, CatalogDdlState, ColType, CommentClass, DatabaseOid, DependencyClass,
-    RoutineArgumentDef, RoutineKind, RoutineResult, Storage, TableDef, UserTypeName,
+    OperatorClassDefinition, OperatorDefinition, OperatorFamilyDefinition, RoutineArgumentDef,
+    RoutineKind, RoutineResult, Storage, TableDef, UserTypeName,
 };
 
 #[derive(Clone, Copy)]
@@ -85,6 +86,25 @@ impl TypeReferenceMove {
         }
     }
 
+    fn rewrite_result(self, result: &mut RoutineResult) {
+        self.rewrite(result.ctype, &mut result.user_type);
+    }
+
+    fn rewrite_operator(self, definition: &mut OperatorDefinition) {
+        super::type_contracts::CatalogTypes::Operator(definition)
+            .for_each(|result| self.rewrite_result(result));
+    }
+
+    fn rewrite_family(self, definition: &mut OperatorFamilyDefinition) {
+        super::type_contracts::CatalogTypes::Family(definition)
+            .for_each(|result| self.rewrite_result(result));
+    }
+
+    fn rewrite_class(self, definition: &mut OperatorClassDefinition) {
+        super::type_contracts::CatalogTypes::Class(definition)
+            .for_each(|result| self.rewrite_result(result));
+    }
+
     fn class(self) -> DependencyClass {
         match self.kind {
             TypeReferenceKind::Domain => DependencyClass::Domain,
@@ -151,6 +171,7 @@ impl Storage {
             comment.name = movement.current.name;
         }
         self.move_routine_type_references(movement);
+        self.move_callable_type_references(movement);
         self.rename_stored_query_dependency(
             movement.class(),
             movement.slot,
@@ -160,12 +181,53 @@ impl Storage {
         );
     }
 
+    fn move_callable_type_references(&mut self, movement: TypeReferenceMove) {
+        {
+            let mut catalog = self
+                .operator_catalog
+                .lock()
+                .expect("operator catalog lock poisoned");
+            for operator in catalog.operators.iter_mut().filter(|operator| {
+                operator.database == movement.database
+                    && operator.ddl_state != CatalogDdlState::Absent
+            }) {
+                movement.rewrite_operator(&mut operator.definition);
+                if let Some(pending) = &mut operator.pending {
+                    movement.rewrite_operator(&mut pending.definition);
+                }
+            }
+            for family in catalog.families.iter_mut().filter(|family| {
+                family.database == movement.database && family.ddl_state != CatalogDdlState::Absent
+            }) {
+                movement.rewrite_family(&mut family.definition);
+                if let Some(pending) = &mut family.pending {
+                    movement.rewrite_family(&mut pending.definition);
+                }
+            }
+            for class in catalog.classes.iter_mut().filter(|class| {
+                class.database == movement.database && class.ddl_state != CatalogDdlState::Absent
+            }) {
+                movement.rewrite_class(&mut class.definition);
+                if let Some(pending) = &mut class.pending {
+                    movement.rewrite_class(&mut pending.definition);
+                }
+            }
+        }
+        let mut casts = self.casts.lock().expect("cast catalog lock poisoned");
+        for cast in casts.iter_mut().filter(|cast| {
+            cast.database == movement.database && cast.ddl_state != CatalogDdlState::Absent
+        }) {
+            super::type_contracts::CatalogTypes::Cast(cast)
+                .for_each(|result| movement.rewrite_result(result));
+        }
+    }
+
     fn move_routine_type_references(&mut self, movement: TypeReferenceMove) {
         let move_argument = |argument: &mut RoutineArgumentDef| {
             movement.rewrite(argument.ctype, &mut argument.user_type);
         };
         let move_result = |result: &mut RoutineResult| {
-            movement.rewrite(result.ctype, &mut result.user_type);
+            movement.rewrite_result(result);
         };
         let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
         for routine in routines

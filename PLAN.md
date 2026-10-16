@@ -76,6 +76,8 @@ waiting for one table does not reserve shared version or comment resources.
 Row publication rechecks the database, table identity and visible existence.
 Table-name selection uses small per-table views; it waits only for the selected
 definition and rechecks its identity before returning a match.
+Type moves retain cast and operator input/output identities through journal replay,
+including edits staged after a rename in the same transaction.
 The [implementation guide](docs/implemented-baseline.md) owns completed contracts,
 user examples and exact capacity errors.
 

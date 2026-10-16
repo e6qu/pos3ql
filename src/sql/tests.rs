@@ -83170,7 +83170,11 @@ fn type_reference_moves_pending_images_survive_journal_and_checkpoint_cold_recov
              ALTER DOMAIN type_scope.child_domain SET NOT NULL;
              CREATE OR REPLACE FUNCTION type_scope.echo_domain(arg type_scope.shared_domain)
              RETURNS type_scope.shared_domain LANGUAGE SQL AS 'SELECT arg';
-             {TYPE_REFERENCE_MOVES} COMMIT;"
+             {TYPE_REFERENCE_MOVES}
+             ALTER OPERATOR type_scope.## (NONE, type_after.renamed_domain) OWNER TO postgres;
+             ALTER OPERATOR FAMILY type_scope.domain_ops USING btree OWNER TO postgres;
+             ALTER OPERATOR CLASS type_scope.domain_ops USING btree OWNER TO postgres;
+             COMMIT;"
         );
         type_reference_execute(&mut engine, &mut budget, &pending);
         let published = type_reference_execute(&mut engine, &mut budget, TYPE_REFERENCE_SNAPSHOT);

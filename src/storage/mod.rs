@@ -14,6 +14,7 @@ mod table_creation;
 mod table_definitions;
 mod table_edits;
 mod table_names;
+mod type_contracts;
 mod type_reference_moves;
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};

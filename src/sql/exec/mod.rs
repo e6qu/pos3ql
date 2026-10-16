@@ -28886,6 +28886,7 @@ fn stage_cast_drop(
     slot: usize,
 ) -> Result<(), SqlError> {
     let definition = storage.cast(slot);
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     let dropped_slot = storage
         .drop_cast(definition.source, definition.target, txn.txid)?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "cast does not exist"))?;
@@ -28900,8 +28901,8 @@ fn stage_cast_drop(
         txn.txid,
         lsn,
         &WalOp::DropCast {
-            source: definition.source,
-            target: definition.target,
+            source: durable.source,
+            target: durable.target,
         },
     ) {
         storage.rollback_cast_drop(slot, txn.txid);
@@ -29053,6 +29054,7 @@ fn operator_link_or_shell(
     } else {
         definition.negator = Some(request.source_oid);
     }
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     let slot = storage.create_operator(definition, txn.txid)?;
     let created_at = storage.operator(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -29061,7 +29063,7 @@ fn operator_link_or_shell(
         lsn,
         &WalOp::SetOperator {
             created_at,
-            definition,
+            definition: durable,
         },
     ) {
         storage.rollback_operator_create(slot);
@@ -29162,6 +29164,10 @@ pub(crate) fn create_operator(
         merges: operator.merges,
         owner: storage.initial_catalog_owner(txn.txid),
     };
+    let durable = match storage.journal_catalog_definition(definition, txn.txid) {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
     let (slot, created) =
         match storage.operator_slot_exact(schema.as_str(), name.as_str(), signature, txn.txid) {
             Some(slot)
@@ -29201,7 +29207,7 @@ pub(crate) fn create_operator(
             lsn,
             &WalOp::SetOperator {
                 created_at,
-                definition,
+                definition: durable,
             },
         ) {
             storage.rollback_operator_create(slot);
@@ -31099,6 +31105,7 @@ fn stage_operator(
     slot: usize,
     definition: crate::storage::OperatorDefinition,
 ) -> Result<(), SqlError> {
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     let prior = storage.stage_operator_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -31107,7 +31114,7 @@ fn stage_operator(
         lsn,
         &WalOp::SetOperator {
             created_at,
-            definition,
+            definition: durable,
         },
     ) {
         storage.rollback_operator_alter(slot, prior);
@@ -31130,6 +31137,7 @@ fn stage_operator_drop(
     slot: usize,
 ) -> Result<(), SqlError> {
     let definition = storage.operator_for(slot, txn.txid);
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     storage.drop_operator(slot, txn.txid);
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(
@@ -31138,7 +31146,7 @@ fn stage_operator_drop(
         &WalOp::DropOperator {
             schema: definition.schema.as_str(),
             name: definition.name.as_str(),
-            signature: definition.signature,
+            signature: durable.signature,
         },
     ) {
         storage.rollback_operator_drop(slot, txn.txid);
@@ -31776,6 +31784,7 @@ fn stage_operator_family(
     slot: usize,
     definition: crate::storage::OperatorFamilyDefinition,
 ) -> Result<(), SqlError> {
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     let prior = storage.stage_operator_family_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator_family(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -31784,7 +31793,7 @@ fn stage_operator_family(
         lsn,
         &WalOp::SetOperatorFamily {
             created_at,
-            definition: &definition,
+            definition: &durable,
         },
     ) {
         storage.rollback_operator_family_alter(slot, prior);
@@ -31978,6 +31987,7 @@ fn stage_operator_class(
     slot: usize,
     definition: crate::storage::OperatorClassDefinition,
 ) -> Result<(), SqlError> {
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     let prior = storage.stage_operator_class_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator_class(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -31986,7 +31996,7 @@ fn stage_operator_class(
         lsn,
         &WalOp::SetOperatorClass {
             created_at,
-            definition: &definition,
+            definition: &durable,
         },
     ) {
         storage.rollback_operator_class_alter(slot, prior);
@@ -32276,6 +32286,10 @@ pub(crate) fn create_operator_class(
         operators,
         functions,
     };
+    let durable = match storage.journal_catalog_definition(definition, txn.txid) {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
     let slot = match storage.create_operator_class(definition, txn.txid) {
         Ok(slot) => slot,
         Err(error) => return sql_fail(error),
@@ -32287,7 +32301,7 @@ pub(crate) fn create_operator_class(
         lsn,
         &WalOp::SetOperatorClass {
             created_at,
-            definition: &definition,
+            definition: &durable,
         },
     ) {
         storage.rollback_operator_class_create(slot);

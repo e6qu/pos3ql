@@ -159,6 +159,12 @@ all recovery and replacement candidates before executing composite type renames
 or schema moves; do not downgrade that prefix afterward. Existing manifest,
 composite definition and name-change record grammars remain readable.
 
+Full cast and operator catalog records freeze the transaction's current type
+names before journal staging. A domain rename followed by an operator, family
+or class owner edit must not restore an old input or result name during replay.
+The field inventory is shared with database-scoped type moves. Existing record
+grammars are unchanged.
+
 ### Prepared relation locks
 
 Prepared-transaction lock payloads identify each entry with a kind byte. Readers

@@ -7047,415 +7047,7 @@ impl Engine {
     /// savepoint rollback share this choke point so new DDL cannot accidentally
     /// acquire different rollback semantics on the two paths.
     fn rollback_ddl(&mut self, undo: DdlUndo, txid: u32) {
-        match undo {
-            DdlUndo::Created(slot) => self.storage.rollback_create(slot as usize),
-            DdlUndo::Dropped(slot) => {
-                self.storage.rollback_drop(slot as usize);
-                let name = self.storage.table(slot as usize).definition().name;
-                let schema = self.storage.table(slot as usize).definition().schema;
-                self.storage
-                    .rollback_indexes_for(schema.as_str(), name.as_str(), txid);
-            }
-            DdlUndo::TableAltered(slot) => {
-                self.storage.rollback_table_def(slot as usize, txid);
-            }
-            DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
-            DdlUndo::RuleCreated {
-                slot,
-                prior_table_rule_txid,
-            } => self
-                .storage
-                .rollback_rule_create(slot as usize, prior_table_rule_txid),
-            DdlUndo::RuleAltered { slot, prior } => {
-                self.storage.rollback_rule_alter(slot as usize, prior)
-            }
-            DdlUndo::RuleDropped(slot) => self.storage.rollback_rule_drop(slot as usize, txid),
-            DdlUndo::RoutineCreated(slot) => self.storage.rollback_routine_create(slot as usize),
-            DdlUndo::RoutineDropped(slot) => {
-                self.storage.rollback_routine_drop(slot as usize, txid)
-            }
-            DdlUndo::RoutineReplaced { slot, prior } => {
-                self.storage.rollback_routine_replace(slot as usize, prior)
-            }
-            DdlUndo::CastCreated(slot) => self.storage.rollback_cast_create(slot as usize),
-            DdlUndo::CastDropped(slot) => self.storage.rollback_cast_drop(slot as usize, txid),
-            DdlUndo::OperatorCreated(slot) => self.storage.rollback_operator_create(slot as usize),
-            DdlUndo::CollationCreated(slot) => {
-                self.storage.rollback_collation_create(slot as usize)
-            }
-            DdlUndo::CollationAltered { slot, prior } => {
-                self.storage.rollback_collation_alter(slot as usize, prior)
-            }
-            DdlUndo::CollationDropped(slot) => {
-                self.storage.rollback_collation_drop(slot as usize, txid)
-            }
-            DdlUndo::ConversionCreated(slot) => {
-                self.storage.rollback_conversion_create(slot as usize)
-            }
-            DdlUndo::ConversionAltered { slot, prior } => {
-                self.storage.rollback_conversion_alter(slot as usize, prior)
-            }
-            DdlUndo::ConversionDropped(slot) => {
-                self.storage.rollback_conversion_drop(slot as usize, txid)
-            }
-            DdlUndo::TextSearchCreated(slot) => {
-                self.storage.rollback_text_search_create(slot as usize)
-            }
-            DdlUndo::TextSearchAltered { slot, prior } => self
-                .storage
-                .rollback_text_search_alter(slot as usize, prior),
-            DdlUndo::TextSearchDropped(slot) => {
-                self.storage.rollback_text_search_drop(slot as usize, txid)
-            }
-            DdlUndo::EventTriggerCreated(slot) => {
-                self.storage.rollback_event_trigger_create(slot as usize)
-            }
-            DdlUndo::EventTriggerAltered { slot, prior } => self
-                .storage
-                .rollback_event_trigger_alter(slot as usize, prior),
-            DdlUndo::EventTriggerDropped(slot) => self
-                .storage
-                .rollback_event_trigger_drop(slot as usize, txid),
-            DdlUndo::OperatorAltered { slot, prior } => {
-                self.storage.rollback_operator_alter(slot as usize, prior)
-            }
-            DdlUndo::OperatorDropped(slot) => {
-                self.storage.rollback_operator_drop(slot as usize, txid)
-            }
-            DdlUndo::OperatorFamilyCreated(slot) => {
-                self.storage.rollback_operator_family_create(slot as usize)
-            }
-            DdlUndo::OperatorFamilyAltered { slot, prior } => self
-                .storage
-                .rollback_operator_family_alter(slot as usize, prior),
-            DdlUndo::OperatorFamilyDropped(slot) => self
-                .storage
-                .rollback_operator_family_drop(slot as usize, txid),
-            DdlUndo::OperatorClassCreated(slot) => {
-                self.storage.rollback_operator_class_create(slot as usize)
-            }
-            DdlUndo::OperatorClassAltered { slot, prior } => self
-                .storage
-                .rollback_operator_class_alter(slot as usize, prior),
-            DdlUndo::OperatorClassDropped(slot) => self
-                .storage
-                .rollback_operator_class_drop(slot as usize, txid),
-            DdlUndo::TriggerCreated(slot) => self.storage.rollback_trigger_create(slot as usize),
-            DdlUndo::TriggerDropped(slot) => {
-                self.storage.rollback_trigger_drop(slot as usize, txid)
-            }
-            DdlUndo::TriggerAltered { slot, prior } => {
-                self.storage.rollback_trigger_alter(slot as usize, prior)
-            }
-            DdlUndo::PartitionTriggerAltered { slot, prior } => self
-                .storage
-                .rollback_partition_trigger_state(slot as usize, prior),
-            DdlUndo::PolicyCreated(slot) => self.storage.rollback_policy_create(slot as usize),
-            DdlUndo::PolicyDropped(slot) => self.storage.rollback_policy_drop(slot as usize, txid),
-            DdlUndo::PolicyAltered { slot, prior } => {
-                self.storage.rollback_policy_alter(slot as usize, prior)
-            }
-            DdlUndo::StatisticsCreated(slot) => self
-                .storage
-                .rollback_extended_statistics_create(slot as usize),
-            DdlUndo::StatisticsDropped(slot) => self
-                .storage
-                .rollback_extended_statistics_drop(slot as usize, txid),
-            DdlUndo::StatisticsAltered { slot, prior } => self
-                .storage
-                .rollback_extended_statistics_alter(slot as usize, prior),
-            DdlUndo::StatisticsKeysAltered { slot, prior } => self
-                .storage
-                .rollback_extended_statistics_keys(slot as usize, prior),
-            DdlUndo::RoutineIdentityAltered { slot, prior } => {
-                self.storage.restore_routine_identity(slot as usize, prior)
-            }
-            DdlUndo::ViewDropped(slot) => {
-                self.storage.rollback_view_drop(slot as usize, txid);
-            }
-            DdlUndo::ViewReplaced { old, new } => {
-                self.storage
-                    .retarget_view_dependents(new as usize, old as usize);
-                self.storage.rollback_view_drop(old as usize, txid);
-            }
-            DdlUndo::ViewSchemaChanged { slot, prior } => {
-                self.storage.rollback_view_schema(slot as usize, prior)
-            }
-            DdlUndo::ViewRenamed { slot, prior } => {
-                self.storage.rollback_view_rename(slot as usize, prior)
-            }
-            DdlUndo::ViewOptionsChanged { slot, prior } => {
-                self.storage.rollback_view_options(slot as usize, prior)
-            }
-            DdlUndo::ViewColumnsChanged { slot, prior } => {
-                self.storage.rollback_view_columns(slot as usize, prior)
-            }
-            DdlUndo::PublicationCreated(slot) => {
-                self.storage.rollback_publication_create(slot as usize)
-            }
-            DdlUndo::PublicationDropped(slot) => {
-                self.storage.rollback_publication_drop(slot as usize, txid)
-            }
-            DdlUndo::PublicationAltered { slot, prior } => self
-                .storage
-                .rollback_publication_alter(slot as usize, prior),
-            DdlUndo::PublicationOwnerChanged { slot, prior } => self
-                .storage
-                .restore_publication_owner_pending(slot as usize, prior),
-            DdlUndo::PublicationRenamed { slot, prior } => self
-                .storage
-                .rollback_publication_rename(slot as usize, prior),
-            DdlUndo::ForeignDataWrapperCreated(slot) => {
-                self.storage.foreign_catalog_rollback_create(
-                    crate::storage::foreign::ForeignObjectClass::Wrapper,
-                    slot as usize,
-                )
-            }
-            DdlUndo::ForeignDataWrapperAltered { slot, prior } => self
-                .storage
-                .rollback_foreign_wrapper_alter(slot as usize, prior),
-            DdlUndo::ForeignDataWrapperDropped(slot) => self.storage.foreign_catalog_rollback_drop(
-                crate::storage::foreign::ForeignObjectClass::Wrapper,
-                slot as usize,
-                txid,
-            ),
-            DdlUndo::ForeignServerCreated(slot) => self.storage.foreign_catalog_rollback_create(
-                crate::storage::foreign::ForeignObjectClass::Server,
-                slot as usize,
-            ),
-            DdlUndo::ForeignServerAltered { slot, prior } => self
-                .storage
-                .rollback_foreign_server_alter(slot as usize, prior),
-            DdlUndo::ForeignServerDropped(slot) => self.storage.foreign_catalog_rollback_drop(
-                crate::storage::foreign::ForeignObjectClass::Server,
-                slot as usize,
-                txid,
-            ),
-            DdlUndo::UserMappingCreated(slot) => self.storage.foreign_catalog_rollback_create(
-                crate::storage::foreign::ForeignObjectClass::Mapping,
-                slot as usize,
-            ),
-            DdlUndo::UserMappingAltered { slot, prior } => self
-                .storage
-                .rollback_foreign_mapping_alter(slot as usize, prior),
-            DdlUndo::UserMappingDropped(slot) => self.storage.foreign_catalog_rollback_drop(
-                crate::storage::foreign::ForeignObjectClass::Mapping,
-                slot as usize,
-                txid,
-            ),
-            DdlUndo::ForeignTableCreated(slot) => self.storage.foreign_catalog_rollback_create(
-                crate::storage::foreign::ForeignObjectClass::Table,
-                slot as usize,
-            ),
-            DdlUndo::ForeignTableAltered { slot, prior } => self
-                .storage
-                .rollback_foreign_table_alter(slot as usize, prior),
-            DdlUndo::ForeignTableDropped(slot) => self.storage.foreign_catalog_rollback_drop(
-                crate::storage::foreign::ForeignObjectClass::Table,
-                slot as usize,
-                txid,
-            ),
-            DdlUndo::ForeignOwnerChanged { class, slot, prior } => self
-                .storage
-                .rollback_foreign_catalog_owner(class, slot as usize, prior),
-            DdlUndo::SubscriptionCreated(slot) => {
-                self.storage.rollback_subscription_create(slot as usize)
-            }
-            DdlUndo::SubscriptionDropped(slot) => {
-                self.storage.rollback_subscription_drop(slot as usize, txid)
-            }
-            DdlUndo::SubscriptionEnabled { slot, prior } => self
-                .storage
-                .restore_subscription_enabled(slot as usize, prior),
-            DdlUndo::SubscriptionBootstrapChanged { slot, prior } => self
-                .storage
-                .restore_subscription_bootstrap(slot as usize, prior),
-            DdlUndo::SubscriptionRelationsChanged => {
-                self.storage.rollback_subscription_relation_refresh(txid)
-            }
-            DdlUndo::SubscriptionDefinitionChanged { slot, prior } => self
-                .storage
-                .restore_subscription_definition(slot as usize, prior),
-            DdlUndo::SubscriptionOwnerChanged { slot, prior } => self
-                .storage
-                .restore_subscription_owner_pending(slot as usize, prior),
-            DdlUndo::SubscriptionRenamed { slot, prior } => self
-                .storage
-                .rollback_subscription_rename(slot as usize, prior),
-            DdlUndo::MatviewCreated(slot) => self.storage.rollback_matview_create(slot as usize),
-            DdlUndo::MatviewDropped(slot) => {
-                self.storage.rollback_matview_drop(slot as usize, txid);
-            }
-            DdlUndo::SequenceCreated(slot) => {
-                self.storage.rollback_sequence_create(slot as usize);
-            }
-            DdlUndo::SequenceDropped(slot) => {
-                self.storage.rollback_sequence_drop(slot as usize, txid);
-            }
-            DdlUndo::SequenceAltered { slot, prior } => {
-                self.storage.rollback_sequence_alter(slot as usize, prior);
-            }
-            DdlUndo::LargeObjectCreated(slot) => {
-                self.storage.rollback_large_object_create(slot as usize)
-            }
-            DdlUndo::LargeObjectDropped(slot) => {
-                self.storage.rollback_large_object_drop(slot as usize, txid)
-            }
-            DdlUndo::DomainCreated(slot) => self.storage.rollback_domain_create(slot as usize),
-            DdlUndo::DomainDropped(slot) => {
-                self.storage.rollback_domain_drop(slot as usize, txid);
-            }
-            DdlUndo::DomainAltered { slot, prior } => {
-                self.storage.rollback_domain_alter(slot as usize, prior)
-            }
-            DdlUndo::EnumCreated(slot) => self.storage.rollback_enum_create(slot as usize),
-            DdlUndo::CompositeCreated(slot) => {
-                self.storage.rollback_composite_create(slot as usize)
-            }
-            DdlUndo::CompositeAltered { slot, prior } => {
-                self.storage.rollback_composite_alter(slot as usize, prior)
-            }
-            DdlUndo::CompositeDropped(slot) => {
-                self.storage.rollback_composite_drop(slot as usize, txid)
-            }
-            DdlUndo::EnumDropped(slot) => {
-                self.storage.rollback_enum_drop(slot as usize, txid);
-            }
-            DdlUndo::EnumAltered { slot, prior } => {
-                self.storage.rollback_enum_alter(slot as usize, prior);
-            }
-            DdlUndo::IndexCreated(slot) => {
-                let slot = slot as usize;
-                let table = self.storage.index_table_slot(slot);
-                self.storage.rollback_index_create(slot);
-                if let Some(table) = table {
-                    self.storage
-                        .refresh_enforcers(table)
-                        .expect("rolling back CREATE INDEX restores its cache binding");
-                }
-            }
-            DdlUndo::IndexDropped(slot) => {
-                self.storage.rollback_index_drop(slot as usize, txid);
-            }
-            DdlUndo::IndexRenamed { slot, prior } => {
-                self.storage.rollback_index_rename(slot as usize, prior)
-            }
-            DdlUndo::IndexAltered { slot, prior } => {
-                self.storage.rollback_index_definition(slot as usize, prior)
-            }
-            DdlUndo::TablespaceCreated(slot) => {
-                self.storage.rollback_tablespace_create(slot as usize)
-            }
-            DdlUndo::TablespaceAltered {
-                slot,
-                prior_definition,
-                prior_owner,
-            } => {
-                let object = crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Tablespace,
-                    slot: slot as u16,
-                };
-                self.storage
-                    .rollback_tablespace_alter(slot as usize, prior_definition);
-                self.storage.restore_object_owner(object, prior_owner);
-            }
-            DdlUndo::TablespaceDropped(slot) => {
-                self.storage.rollback_tablespace_drop(slot as usize, txid)
-            }
-            DdlUndo::AccessMethodCreated(slot) => {
-                self.storage.rollback_access_method_create(slot as usize)
-            }
-            DdlUndo::AccessMethodDropped(slot) => self
-                .storage
-                .rollback_access_method_drop(slot as usize, txid),
-            DdlUndo::DatabaseCreated(slot) => self.storage.rollback_database_create(slot as usize),
-            DdlUndo::DatabaseAltered {
-                slot,
-                prior_definition,
-                prior_owner,
-            } => {
-                let object = crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Database,
-                    slot: slot as u16,
-                };
-                self.storage
-                    .rollback_database_alter(slot as usize, prior_definition);
-                self.storage.restore_object_owner(object, prior_owner);
-            }
-            DdlUndo::DatabaseDropped(slot) => {
-                self.storage.rollback_database_drop(slot as usize, txid)
-            }
-            DdlUndo::SequenceReset {
-                table,
-                column,
-                prior,
-            } => {
-                self.storage
-                    .set_table_serial_value(table as usize, column as usize, prior);
-            }
-            DdlUndo::OwnedSequenceReset { sequence, prior } => {
-                self.storage
-                    .restore_sequence_value(sequence as usize, prior);
-            }
-            DdlUndo::SchemaCreated(slot) => self.storage.rollback_schema_create(slot as usize),
-            DdlUndo::SchemaDropped(slot) => self.storage.rollback_schema_drop(slot as usize, txid),
-            DdlUndo::SchemaRenamed { slot, prior } => {
-                let _ = self.storage.rename_schema(slot as usize, prior);
-            }
-            DdlUndo::ExtensionCreated(slot) => {
-                self.storage.rollback_extension_create(slot as usize)
-            }
-            DdlUndo::ExtensionDropped(slot) => {
-                self.storage.rollback_extension_drop(slot as usize, txid)
-            }
-            DdlUndo::ExtensionAltered { slot, prior } => {
-                self.storage.rollback_extension_alter(slot as usize, prior)
-            }
-            DdlUndo::ExtensionDependencyChanged { slot, prior } => self
-                .storage
-                .rollback_extension_dependency(slot as usize, prior),
-            DdlUndo::ExtensionConfigChanged { slot, prior } => {
-                self.storage.rollback_extension_config(slot as usize, prior)
-            }
-            DdlUndo::RoleChanged { slot, prior } => {
-                self.storage.rollback_role_change(slot as usize, prior);
-            }
-            DdlUndo::RoleMembershipChanged { slot, prior } => {
-                self.storage
-                    .rollback_role_membership_change(slot as usize, prior);
-            }
-            DdlUndo::RoleSettingChanged { slot, prior } => {
-                self.storage.rollback_role_setting(slot as usize, prior);
-            }
-            DdlUndo::SystemSettingChanged { slot, prior } => {
-                self.storage.rollback_system_setting(slot as usize, prior);
-            }
-            DdlUndo::ObjectOwnerChanged { object, prior } => {
-                self.storage.restore_object_owner(object, prior);
-            }
-            DdlUndo::ObjectAclChanged { slot, prior } => {
-                self.storage.restore_acl_pending(slot as usize, prior);
-            }
-            DdlUndo::ColumnAclChanged { slot, prior } => {
-                self.storage
-                    .restore_column_acl_pending(slot as usize, prior);
-            }
-            DdlUndo::DefaultAclChanged { slot, prior } => {
-                self.storage
-                    .restore_default_acl_pending(slot as usize, prior);
-            }
-            DdlUndo::ParameterAclChanged { slot, prior } => {
-                self.storage
-                    .restore_parameter_acl_pending(slot as usize, prior);
-            }
-            DdlUndo::CommentSet { slot, prior } => {
-                self.storage.restore_comment_pending(slot as usize, prior);
-            }
-            DdlUndo::ConstraintCommentRenamed { slot, prior } => {
-                self.storage
-                    .restore_comment_identity_pending(slot as usize, prior);
-            }
-        }
+        rollback_catalog_change(&mut self.storage, undo, txid);
     }
 
     /// Discards every uncommitted change and journal byte of the
@@ -7466,37 +7058,9 @@ impl Engine {
             return;
         }
         foreign::abort_session(&self.storage, txn.txid);
-        self.storage.end_transaction_snapshots(txn.txid);
-        self.storage.release_serializable(txn.txid);
-        self.storage.release_table_locks(txn.txid);
-        self.storage.release_row_locks(txn.txid);
-        self.storage.release_advisory_transaction_locks(txn.txid);
-        // Reverse-replay every write to its prior image (newest first), so a
-        // row written multiple times unwinds to its pre-transaction state.
-        for &(table, rowid, prior) in txn.touched().iter().rev() {
-            self.storage
-                .restore_pending(table as usize, rowid, txn.txid, prior);
-        }
-        for &undo in txn.ddl().iter().rev() {
-            self.rollback_ddl(undo, txn.txid);
-        }
-        for undo in txn.statistics_undo().iter().rev() {
-            match *undo {
-                StatisticsUndo::Table(table) => self
-                    .storage
-                    .rollback_table_statistics(table as usize, txn.txid),
-                StatisticsUndo::Extended(statistics) => self
-                    .storage
-                    .rollback_extended_statistics_data(statistics as usize, txn.txid),
-            }
-        }
+        rollback_transaction_overlays(&mut self.storage, txn);
         self.wal.discard_stage(txn.txid);
-        self.storage.clear_temporary_transaction(txn.txid);
-        self.storage
-            .finish_cumulative_transaction(txn.txid, committed);
-        self.storage
-            .finish_transaction_identity(txn.txid, committed);
-        txn.clear();
+        finish_transaction_cleanup(&mut self.storage, txn, committed);
     }
 
     pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
@@ -19022,6 +18586,390 @@ fn decode_wal_routine_signature(
     Ok((arguments, count))
 }
 
+// Live rollback, savepoints, and recovered prepared resolution share the
+// exhaustive catalog undo boundary.
+fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
+    match undo {
+        DdlUndo::Created(slot) => storage.rollback_create(slot as usize),
+        DdlUndo::Dropped(slot) => {
+            storage.rollback_drop(slot as usize);
+            let name = storage.table(slot as usize).definition().name;
+            let schema = storage.table(slot as usize).definition().schema;
+            storage.rollback_indexes_for(schema.as_str(), name.as_str(), txid);
+        }
+        DdlUndo::TableAltered(slot) => {
+            storage.rollback_table_def(slot as usize, txid);
+        }
+        DdlUndo::ViewCreated(slot) => storage.rollback_view_create(slot as usize),
+        DdlUndo::RuleCreated {
+            slot,
+            prior_table_rule_txid,
+        } => storage.rollback_rule_create(slot as usize, prior_table_rule_txid),
+        DdlUndo::RuleAltered { slot, prior } => storage.rollback_rule_alter(slot as usize, prior),
+        DdlUndo::RuleDropped(slot) => storage.rollback_rule_drop(slot as usize, txid),
+        DdlUndo::RoutineCreated(slot) => storage.rollback_routine_create(slot as usize),
+        DdlUndo::RoutineDropped(slot) => storage.rollback_routine_drop(slot as usize, txid),
+        DdlUndo::RoutineReplaced { slot, prior } => {
+            storage.rollback_routine_replace(slot as usize, prior)
+        }
+        DdlUndo::CastCreated(slot) => storage.rollback_cast_create(slot as usize),
+        DdlUndo::CastDropped(slot) => storage.rollback_cast_drop(slot as usize, txid),
+        DdlUndo::OperatorCreated(slot) => storage.rollback_operator_create(slot as usize),
+        DdlUndo::CollationCreated(slot) => storage.rollback_collation_create(slot as usize),
+        DdlUndo::CollationAltered { slot, prior } => {
+            storage.rollback_collation_alter(slot as usize, prior)
+        }
+        DdlUndo::CollationDropped(slot) => storage.rollback_collation_drop(slot as usize, txid),
+        DdlUndo::ConversionCreated(slot) => storage.rollback_conversion_create(slot as usize),
+        DdlUndo::ConversionAltered { slot, prior } => {
+            storage.rollback_conversion_alter(slot as usize, prior)
+        }
+        DdlUndo::ConversionDropped(slot) => storage.rollback_conversion_drop(slot as usize, txid),
+        DdlUndo::TextSearchCreated(slot) => storage.rollback_text_search_create(slot as usize),
+        DdlUndo::TextSearchAltered { slot, prior } => {
+            storage.rollback_text_search_alter(slot as usize, prior)
+        }
+        DdlUndo::TextSearchDropped(slot) => storage.rollback_text_search_drop(slot as usize, txid),
+        DdlUndo::EventTriggerCreated(slot) => storage.rollback_event_trigger_create(slot as usize),
+        DdlUndo::EventTriggerAltered { slot, prior } => {
+            storage.rollback_event_trigger_alter(slot as usize, prior)
+        }
+        DdlUndo::EventTriggerDropped(slot) => {
+            storage.rollback_event_trigger_drop(slot as usize, txid)
+        }
+        DdlUndo::OperatorAltered { slot, prior } => {
+            storage.rollback_operator_alter(slot as usize, prior)
+        }
+        DdlUndo::OperatorDropped(slot) => storage.rollback_operator_drop(slot as usize, txid),
+        DdlUndo::OperatorFamilyCreated(slot) => {
+            storage.rollback_operator_family_create(slot as usize)
+        }
+        DdlUndo::OperatorFamilyAltered { slot, prior } => {
+            storage.rollback_operator_family_alter(slot as usize, prior)
+        }
+        DdlUndo::OperatorFamilyDropped(slot) => {
+            storage.rollback_operator_family_drop(slot as usize, txid)
+        }
+        DdlUndo::OperatorClassCreated(slot) => {
+            storage.rollback_operator_class_create(slot as usize)
+        }
+        DdlUndo::OperatorClassAltered { slot, prior } => {
+            storage.rollback_operator_class_alter(slot as usize, prior)
+        }
+        DdlUndo::OperatorClassDropped(slot) => {
+            storage.rollback_operator_class_drop(slot as usize, txid)
+        }
+        DdlUndo::TriggerCreated(slot) => storage.rollback_trigger_create(slot as usize),
+        DdlUndo::TriggerDropped(slot) => storage.rollback_trigger_drop(slot as usize, txid),
+        DdlUndo::TriggerAltered { slot, prior } => {
+            storage.rollback_trigger_alter(slot as usize, prior)
+        }
+        DdlUndo::PartitionTriggerAltered { slot, prior } => {
+            storage.rollback_partition_trigger_state(slot as usize, prior)
+        }
+        DdlUndo::PolicyCreated(slot) => storage.rollback_policy_create(slot as usize),
+        DdlUndo::PolicyDropped(slot) => storage.rollback_policy_drop(slot as usize, txid),
+        DdlUndo::PolicyAltered { slot, prior } => {
+            storage.rollback_policy_alter(slot as usize, prior)
+        }
+        DdlUndo::StatisticsCreated(slot) => {
+            storage.rollback_extended_statistics_create(slot as usize)
+        }
+        DdlUndo::StatisticsDropped(slot) => {
+            storage.rollback_extended_statistics_drop(slot as usize, txid)
+        }
+        DdlUndo::StatisticsAltered { slot, prior } => {
+            storage.rollback_extended_statistics_alter(slot as usize, prior)
+        }
+        DdlUndo::StatisticsKeysAltered { slot, prior } => {
+            storage.rollback_extended_statistics_keys(slot as usize, prior)
+        }
+        DdlUndo::RoutineIdentityAltered { slot, prior } => {
+            storage.restore_routine_identity(slot as usize, prior)
+        }
+        DdlUndo::ViewDropped(slot) => {
+            storage.rollback_view_drop(slot as usize, txid);
+        }
+        DdlUndo::ViewReplaced { old, new } => {
+            storage.retarget_view_dependents(new as usize, old as usize);
+            storage.rollback_view_drop(old as usize, txid);
+        }
+        DdlUndo::ViewSchemaChanged { slot, prior } => {
+            storage.rollback_view_schema(slot as usize, prior)
+        }
+        DdlUndo::ViewRenamed { slot, prior } => storage.rollback_view_rename(slot as usize, prior),
+        DdlUndo::ViewOptionsChanged { slot, prior } => {
+            storage.rollback_view_options(slot as usize, prior)
+        }
+        DdlUndo::ViewColumnsChanged { slot, prior } => {
+            storage.rollback_view_columns(slot as usize, prior)
+        }
+        DdlUndo::PublicationCreated(slot) => storage.rollback_publication_create(slot as usize),
+        DdlUndo::PublicationDropped(slot) => storage.rollback_publication_drop(slot as usize, txid),
+        DdlUndo::PublicationAltered { slot, prior } => {
+            storage.rollback_publication_alter(slot as usize, prior)
+        }
+        DdlUndo::PublicationOwnerChanged { slot, prior } => {
+            storage.restore_publication_owner_pending(slot as usize, prior)
+        }
+        DdlUndo::PublicationRenamed { slot, prior } => {
+            storage.rollback_publication_rename(slot as usize, prior)
+        }
+        DdlUndo::ForeignDataWrapperCreated(slot) => storage.foreign_catalog_rollback_create(
+            crate::storage::foreign::ForeignObjectClass::Wrapper,
+            slot as usize,
+        ),
+        DdlUndo::ForeignDataWrapperAltered { slot, prior } => {
+            storage.rollback_foreign_wrapper_alter(slot as usize, prior)
+        }
+        DdlUndo::ForeignDataWrapperDropped(slot) => storage.foreign_catalog_rollback_drop(
+            crate::storage::foreign::ForeignObjectClass::Wrapper,
+            slot as usize,
+            txid,
+        ),
+        DdlUndo::ForeignServerCreated(slot) => storage.foreign_catalog_rollback_create(
+            crate::storage::foreign::ForeignObjectClass::Server,
+            slot as usize,
+        ),
+        DdlUndo::ForeignServerAltered { slot, prior } => {
+            storage.rollback_foreign_server_alter(slot as usize, prior)
+        }
+        DdlUndo::ForeignServerDropped(slot) => storage.foreign_catalog_rollback_drop(
+            crate::storage::foreign::ForeignObjectClass::Server,
+            slot as usize,
+            txid,
+        ),
+        DdlUndo::UserMappingCreated(slot) => storage.foreign_catalog_rollback_create(
+            crate::storage::foreign::ForeignObjectClass::Mapping,
+            slot as usize,
+        ),
+        DdlUndo::UserMappingAltered { slot, prior } => {
+            storage.rollback_foreign_mapping_alter(slot as usize, prior)
+        }
+        DdlUndo::UserMappingDropped(slot) => storage.foreign_catalog_rollback_drop(
+            crate::storage::foreign::ForeignObjectClass::Mapping,
+            slot as usize,
+            txid,
+        ),
+        DdlUndo::ForeignTableCreated(slot) => storage.foreign_catalog_rollback_create(
+            crate::storage::foreign::ForeignObjectClass::Table,
+            slot as usize,
+        ),
+        DdlUndo::ForeignTableAltered { slot, prior } => {
+            storage.rollback_foreign_table_alter(slot as usize, prior)
+        }
+        DdlUndo::ForeignTableDropped(slot) => storage.foreign_catalog_rollback_drop(
+            crate::storage::foreign::ForeignObjectClass::Table,
+            slot as usize,
+            txid,
+        ),
+        DdlUndo::ForeignOwnerChanged { class, slot, prior } => {
+            storage.rollback_foreign_catalog_owner(class, slot as usize, prior)
+        }
+        DdlUndo::SubscriptionCreated(slot) => storage.rollback_subscription_create(slot as usize),
+        DdlUndo::SubscriptionDropped(slot) => {
+            storage.rollback_subscription_drop(slot as usize, txid)
+        }
+        DdlUndo::SubscriptionEnabled { slot, prior } => {
+            storage.restore_subscription_enabled(slot as usize, prior)
+        }
+        DdlUndo::SubscriptionBootstrapChanged { slot, prior } => {
+            storage.restore_subscription_bootstrap(slot as usize, prior)
+        }
+        DdlUndo::SubscriptionRelationsChanged => {
+            storage.rollback_subscription_relation_refresh(txid)
+        }
+        DdlUndo::SubscriptionDefinitionChanged { slot, prior } => {
+            storage.restore_subscription_definition(slot as usize, prior)
+        }
+        DdlUndo::SubscriptionOwnerChanged { slot, prior } => {
+            storage.restore_subscription_owner_pending(slot as usize, prior)
+        }
+        DdlUndo::SubscriptionRenamed { slot, prior } => {
+            storage.rollback_subscription_rename(slot as usize, prior)
+        }
+        DdlUndo::MatviewCreated(slot) => storage.rollback_matview_create(slot as usize),
+        DdlUndo::MatviewDropped(slot) => {
+            storage.rollback_matview_drop(slot as usize, txid);
+        }
+        DdlUndo::SequenceCreated(slot) => {
+            storage.rollback_sequence_create(slot as usize);
+        }
+        DdlUndo::SequenceDropped(slot) => {
+            storage.rollback_sequence_drop(slot as usize, txid);
+        }
+        DdlUndo::SequenceAltered { slot, prior } => {
+            storage.rollback_sequence_alter(slot as usize, prior);
+        }
+        DdlUndo::LargeObjectCreated(slot) => storage.rollback_large_object_create(slot as usize),
+        DdlUndo::LargeObjectDropped(slot) => {
+            storage.rollback_large_object_drop(slot as usize, txid)
+        }
+        DdlUndo::DomainCreated(slot) => storage.rollback_domain_create(slot as usize),
+        DdlUndo::DomainDropped(slot) => {
+            storage.rollback_domain_drop(slot as usize, txid);
+        }
+        DdlUndo::DomainAltered { slot, prior } => {
+            storage.rollback_domain_alter(slot as usize, prior)
+        }
+        DdlUndo::EnumCreated(slot) => storage.rollback_enum_create(slot as usize),
+        DdlUndo::CompositeCreated(slot) => storage.rollback_composite_create(slot as usize),
+        DdlUndo::CompositeAltered { slot, prior } => {
+            storage.rollback_composite_alter(slot as usize, prior)
+        }
+        DdlUndo::CompositeDropped(slot) => storage.rollback_composite_drop(slot as usize, txid),
+        DdlUndo::EnumDropped(slot) => {
+            storage.rollback_enum_drop(slot as usize, txid);
+        }
+        DdlUndo::EnumAltered { slot, prior } => {
+            storage.rollback_enum_alter(slot as usize, prior);
+        }
+        DdlUndo::IndexCreated(slot) => {
+            let slot = slot as usize;
+            let table = storage.index_table_slot(slot);
+            storage.rollback_index_create(slot);
+            if let Some(table) = table {
+                storage
+                    .refresh_enforcers(table)
+                    .expect("rolling back CREATE INDEX restores its cache binding");
+            }
+        }
+        DdlUndo::IndexDropped(slot) => {
+            storage.rollback_index_drop(slot as usize, txid);
+        }
+        DdlUndo::IndexRenamed { slot, prior } => {
+            storage.rollback_index_rename(slot as usize, prior)
+        }
+        DdlUndo::IndexAltered { slot, prior } => {
+            storage.rollback_index_definition(slot as usize, prior)
+        }
+        DdlUndo::TablespaceCreated(slot) => storage.rollback_tablespace_create(slot as usize),
+        DdlUndo::TablespaceAltered {
+            slot,
+            prior_definition,
+            prior_owner,
+        } => {
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Tablespace,
+                slot: slot as u16,
+            };
+            storage.rollback_tablespace_alter(slot as usize, prior_definition);
+            storage.restore_object_owner(object, prior_owner);
+        }
+        DdlUndo::TablespaceDropped(slot) => storage.rollback_tablespace_drop(slot as usize, txid),
+        DdlUndo::AccessMethodCreated(slot) => storage.rollback_access_method_create(slot as usize),
+        DdlUndo::AccessMethodDropped(slot) => {
+            storage.rollback_access_method_drop(slot as usize, txid)
+        }
+        DdlUndo::DatabaseCreated(slot) => storage.rollback_database_create(slot as usize),
+        DdlUndo::DatabaseAltered {
+            slot,
+            prior_definition,
+            prior_owner,
+        } => {
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Database,
+                slot: slot as u16,
+            };
+            storage.rollback_database_alter(slot as usize, prior_definition);
+            storage.restore_object_owner(object, prior_owner);
+        }
+        DdlUndo::DatabaseDropped(slot) => storage.rollback_database_drop(slot as usize, txid),
+        DdlUndo::SequenceReset {
+            table,
+            column,
+            prior,
+        } => {
+            storage.set_table_serial_value(table as usize, column as usize, prior);
+        }
+        DdlUndo::OwnedSequenceReset { sequence, prior } => {
+            storage.restore_sequence_value(sequence as usize, prior);
+        }
+        DdlUndo::SchemaCreated(slot) => storage.rollback_schema_create(slot as usize),
+        DdlUndo::SchemaDropped(slot) => storage.rollback_schema_drop(slot as usize, txid),
+        DdlUndo::SchemaRenamed { slot, prior } => {
+            let _ = storage.rename_schema(slot as usize, prior);
+        }
+        DdlUndo::ExtensionCreated(slot) => storage.rollback_extension_create(slot as usize),
+        DdlUndo::ExtensionDropped(slot) => storage.rollback_extension_drop(slot as usize, txid),
+        DdlUndo::ExtensionAltered { slot, prior } => {
+            storage.rollback_extension_alter(slot as usize, prior)
+        }
+        DdlUndo::ExtensionDependencyChanged { slot, prior } => {
+            storage.rollback_extension_dependency(slot as usize, prior)
+        }
+        DdlUndo::ExtensionConfigChanged { slot, prior } => {
+            storage.rollback_extension_config(slot as usize, prior)
+        }
+        DdlUndo::RoleChanged { slot, prior } => {
+            storage.rollback_role_change(slot as usize, prior);
+        }
+        DdlUndo::RoleMembershipChanged { slot, prior } => {
+            storage.rollback_role_membership_change(slot as usize, prior);
+        }
+        DdlUndo::RoleSettingChanged { slot, prior } => {
+            storage.rollback_role_setting(slot as usize, prior);
+        }
+        DdlUndo::SystemSettingChanged { slot, prior } => {
+            storage.rollback_system_setting(slot as usize, prior);
+        }
+        DdlUndo::ObjectOwnerChanged { object, prior } => {
+            storage.restore_object_owner(object, prior);
+        }
+        DdlUndo::ObjectAclChanged { slot, prior } => {
+            storage.restore_acl_pending(slot as usize, prior);
+        }
+        DdlUndo::ColumnAclChanged { slot, prior } => {
+            storage.restore_column_acl_pending(slot as usize, prior);
+        }
+        DdlUndo::DefaultAclChanged { slot, prior } => {
+            storage.restore_default_acl_pending(slot as usize, prior);
+        }
+        DdlUndo::ParameterAclChanged { slot, prior } => {
+            storage.restore_parameter_acl_pending(slot as usize, prior);
+        }
+        DdlUndo::CommentSet { slot, prior } => {
+            storage.restore_comment_pending(slot as usize, prior);
+        }
+        DdlUndo::ConstraintCommentRenamed { slot, prior } => {
+            storage.restore_comment_identity_pending(slot as usize, prior);
+        }
+    }
+}
+
+fn rollback_transaction_overlays(storage: &mut Storage, txn: &TxnState) {
+    storage.end_transaction_snapshots(txn.txid);
+    storage.release_serializable(txn.txid);
+    storage.release_table_locks(txn.txid);
+    storage.release_row_locks(txn.txid);
+    storage.release_advisory_transaction_locks(txn.txid);
+    // Reverse-replay every write to its prior image (newest first), so a
+    // row written multiple times unwinds to its pre-transaction state.
+    for &(table, rowid, prior) in txn.touched().iter().rev() {
+        storage.restore_pending(table as usize, rowid, txn.txid, prior);
+    }
+    for &undo in txn.ddl().iter().rev() {
+        rollback_catalog_change(storage, undo, txn.txid);
+    }
+    for undo in txn.statistics_undo().iter().rev() {
+        match *undo {
+            StatisticsUndo::Table(table) => {
+                storage.rollback_table_statistics(table as usize, txn.txid)
+            }
+            StatisticsUndo::Extended(statistics) => {
+                storage.rollback_extended_statistics_data(statistics as usize, txn.txid)
+            }
+        }
+    }
+}
+
+fn finish_transaction_cleanup(storage: &mut Storage, txn: &mut TxnState, committed: bool) {
+    storage.clear_temporary_transaction(txn.txid);
+    storage.finish_cumulative_transaction(txn.txid, committed);
+    storage.finish_transaction_identity(txn.txid, committed);
+    txn.clear();
+}
+
 #[inline(never)]
 fn apply_prepared_table_wal_payload(
     storage: &mut Storage,
@@ -19385,7 +19333,16 @@ fn replay_transaction_batches(
                             gid.as_str()
                         )
                     })?;
-                    let prepared_transaction_id = prepared.slot(slot).metadata().transaction_id;
+                    storage
+                        .select_database_for_recovery(prepared.slot(slot).metadata().database)?;
+                    // Discard the reconstructed private image before applying
+                    // its saved commit, or before releasing a saved rollback.
+                    rollback_transaction_overlays(storage, &prepared.slot(slot).transaction);
+                    finish_transaction_cleanup(
+                        storage,
+                        &mut prepared.slot_mut(slot).transaction,
+                        commit,
+                    );
                     if commit && *lsn > apply_floor {
                         prepared.slot(slot).visit_records(|_, raw| {
                             let operation = crate::wal::decode_record(raw).ok_or_else(|| {
@@ -19397,7 +19354,6 @@ fn replay_transaction_batches(
                             apply_wal_op(storage, *lsn, operation)
                         })?;
                     }
-                    storage.finish_transaction_identity(prepared_transaction_id, commit);
                     prepared.release(slot);
                     storage.set_lsn(*lsn);
                 } else {

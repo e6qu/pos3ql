@@ -443,7 +443,11 @@ restart; rollback restores the old names.
 Table and view slots have distinct lock identities. The lock registry reserves
 space at startup for each transaction's tables and views; exhaustion returns
 `54000` naming the registry. Prepared transactions retain view locks through
-restart and recovery without local caches. `pg_locks` reports the actual relation
+restart and recovery without local caches. Saved commit and rollback decisions
+release the transaction's private rows and catalog entries before replay, so
+recovery cannot wait on its own unfinished table or sequence creation. Live
+resolution, startup recovery, and savepoint rollback share catalog undo.
+`pg_locks` reports the actual relation
 and database identities; a recovered prepared lock has no client process ID.
 Statements still execute serially; these protections
 are prerequisites for the planned execution workers.

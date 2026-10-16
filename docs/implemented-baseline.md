@@ -161,6 +161,7 @@ begin. It rechecks current readers before each batch. Capturing the next
 table's identities holds neither the registry nor the shared version pool while
 waiting for its row map. New statement admission coalesces cleanup already in
 progress and leaves later release notifications pending for the next attempt.
+A new report admitted between cleanup batches still keeps the versions it needs.
 
 **User example:** finishing a report can reclaim its old order versions without
 keeping an unrelated customer update waiting for every table to be visited.
@@ -184,10 +185,6 @@ savepoint, its constraint comments remain attached under the original name. A
 constraint renamed before the savepoint keeps its new name. Both journal replay
 and checkpoint recovery preserve the committed result after local caches are lost.
 
-SQL execution is still serial. Committed definition changes, table renames,
-rewrites and maintenance coordination remain in [PLAN.md](../PLAN.md).
-A new report admitted between cleanup batches still keeps the versions it needs.
-
 Table-name lookup first checks a small name view for each table. A definition
 writer on an unrelated table does not hold that view while doing its work.
 Only a matching candidate needs the full definition guard; lookup rechecks its
@@ -202,6 +199,8 @@ the table slots and included in startup memory; lookups allocate nothing.
 table while an unrelated table definition is being changed. Looking for a table
 that does not exist also avoids waiting for unrelated definitions. SQL execution
 is still serial; this removes a storage-level dependency before workers are added.
+Committed definition changes, table renames, rewrites and maintenance coordination
+remain in [PLAN.md](../PLAN.md).
 
 Client descriptions and data-changing WITH queries use the same DML output
 analysis, including view-column rewriting and original output names. Their target definition comes from

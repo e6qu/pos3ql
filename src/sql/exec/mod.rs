@@ -12699,7 +12699,17 @@ pub(crate) fn drop_schema(
             SchemaObject::Operator(operator) => {
                 let definition = storage.operator_for(*operator, txn.txid);
                 let _ = write!(out, "operator ");
-                write_rel(out, &definition.schema, &definition.name);
+                if !in_path(storage, definition.schema.as_str()) {
+                    write_identifier(out, definition.schema.as_str());
+                    let _ = out.write_char('.');
+                }
+                let _ = out.write_str(definition.name.as_str());
+                let signature = dependency_signature_suffix(
+                    storage,
+                    "operator",
+                    [definition.signature.left, definition.signature.right],
+                )?;
+                let _ = out.write_str(signature.as_str());
             }
             SchemaObject::OperatorFamily(family) => {
                 let definition = storage.operator_family_for(*family, txn.txid);
@@ -43933,24 +43943,42 @@ fn routine_dependency_suffix(
     storage: &Storage,
     routine: &crate::storage::RoutineDef,
 ) -> Result<crate::util::StackStr<192>, SqlError> {
+    dependency_signature_suffix(
+        storage,
+        "routine",
+        routine.arguments().iter().map(|argument| {
+            Some(crate::storage::RoutineResult {
+                ctype: argument.ctype,
+                user_type: argument.user_type,
+            })
+        }),
+    )
+}
+
+fn dependency_signature_suffix(
+    storage: &Storage,
+    kind: &str,
+    arguments: impl IntoIterator<Item = Option<crate::storage::RoutineResult>>,
+) -> Result<crate::util::StackStr<192>, SqlError> {
     use core::fmt::Write as _;
-    let mut suffix = crate::util::StackStr::<192>::new();
-    suffix.write_char('(').map_err(|_| {
+    let too_long = || {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "routine signature too long"
+            "{} signature too long",
+            kind
         )
-    })?;
-    for (index, argument) in routine.arguments().iter().enumerate() {
+    };
+    let mut suffix = crate::util::StackStr::<192>::new();
+    suffix.write_char('(').map_err(|_| too_long())?;
+    for (index, argument) in arguments.into_iter().enumerate() {
         if index != 0 {
-            suffix.write_char(',').map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "routine signature too long"
-                )
-            })?;
+            suffix.write_char(',').map_err(|_| too_long())?;
         }
-        let write_result = match argument.user_type {
+        let Some(argument) = argument else {
+            suffix.write_str("NONE").map_err(|_| too_long())?;
+            continue;
+        };
+        match argument.user_type {
             Some(identity) if storage.schema_is_on_path(identity.schema) => {
                 suffix.write_str(identity.name.as_str())
             }
@@ -43961,28 +43989,13 @@ fn routine_dependency_suffix(
                 identity.name.as_str()
             ),
             None => suffix.write_str(argument.ctype.name()),
-        };
-        write_result.map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "routine signature too long"
-            )
-        })?;
+        }
+        .map_err(|_| too_long())?;
         if argument.user_type.is_some() && matches!(argument.ctype, ColType::Array(_)) {
-            suffix.write_str("[]").map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "routine signature too long"
-                )
-            })?;
+            suffix.write_str("[]").map_err(|_| too_long())?;
         }
     }
-    suffix.write_char(')').map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "routine signature too long"
-        )
-    })?;
+    suffix.write_char(')').map_err(|_| too_long())?;
     Ok(suffix)
 }
 

@@ -83395,6 +83395,12 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
     );
     let notices = String::from_utf8_lossy(&dropped);
     assert!(
+        notices.contains(
+            "operator routine_domains.===(routine_domains.positive,routine_domains.positive)"
+        ),
+        "{notices}"
+    );
+    assert!(
         notices.contains("routine_domains.echo(routine_domains.positive)"),
         "{notices}"
     );

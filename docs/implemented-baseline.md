@@ -367,7 +367,7 @@ are the upstream reference; tests compare actual PostgreSQL 18 results.
 A catalog type reference (regtype) converts to its numeric object identifier,
 integer or bigint. A smallint cast returns SQLSTATE 42846, including for NULL,
 unless an explicitly registered cast provides that conversion. Schema-drop
-notices retain declared domain and array names in routine signatures.
+notices retain declared domain and array names in routine and operator signatures.
 
 A custom cast that calls a function marked VOLATILE runs during execution,
 rather than while checking constant expressions. For example, a cast that calls

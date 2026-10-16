@@ -39,7 +39,7 @@ next statement.
 | Statement buffers | Startup-sized arenas, row-selection scratch, connection/database context, and ordered dispatcher leases; COPY and subscriptions have separate buffers | Run statements on workers and coordinate all remaining shared state |
 | Transaction identities | One guarded counter serves SQL, maintenance, and recovery. Creating a SQL transaction reserves its ID and registry entry together; capacity errors leave existing transactions valid. | Coordinate journal staging, prepared transactions, and engine publication during concurrent execution. |
 | Row identities | Shared allocation reserves unique IDs without runtime allocation. Inserts and partition moves attach deferred checks to the ID actually stored; exhaustion returns `54000` before appending bytes. | Transaction publication and execution workers remain unfinished. |
-| Catalogs and table definitions | Synchronized updates; readers retain their selected definition and identity; each table has its own cleanup lock | Concurrent creation and slot reuse, and engine-wide publication |
+| Catalogs and table definitions | Synchronized updates; readers retain their selected definition and identity; each table has its own cleanup lock; transactional creation reserves names and slots through shared storage access | Engine-wide publication, rewrites, and maintenance integration |
 | Sequence positions | Per-table synchronization, checked arithmetic, coherent journal/checkpoint images, and acknowledgement of unchanged staged positions | Preserve these rules through engine-wide concurrent publication |
 | Row versions | Pending writes, rollback, committed publication, row maps, and visibility caches use guarded state. Point metadata reads own bounded copies of their chains and byte sources, allowing unrelated publication and later selection after removal or shutdown | Safe movement and reclamation while readers remain active |
 | Planner statistics | Readers copy their visible estimates; private versions and saved-state markers use guarded cells and fixed pools | Integrate these captures with concurrent engine publication |
@@ -441,9 +441,33 @@ The table's cleanup lock is included in the existing startup charge for each
 and its slot is reused. The retained order still contains its original values,
 including the version appropriate to its read position. Another table's cleanup
 can finish while removal waits for the first table's retained definition.
+
+Pending row writes capture an admitted table identity before comparing values or
+reading saved data. Publication rechecks its database, identity and visibility
+under the table-definition guard. Removal during preparation returns `40001`
+without recreating rows or consuming pending-version slots, even before the old
+table slot is reused. A new capture after rollback can proceed normally. Waiting for one table
+definition releases the shared snapshot registry; retries retain the original
+table identity instead of adopting a replacement.
+
 These are storage-level guarantees: SQL execution is still serial and its
-transaction-level relation locks still apply. Table creation and slot reuse
-continue to require exclusive storage access, excluding overlapping cleanup.
+transaction-level relation locks still apply. Transactional table creation takes
+a separate name-reservation guard and the selected slot's cleanup lock. A slot undergoing cleanup cannot be reused;
+when every slot is live or busy, creation returns `54000` with the table limit.
+Retry after cleanup releases a slot can succeed. Initialization of an empty
+slot resets prior rows, saved-file references, statistics, sequences, permissions,
+and index-cache bindings before returning. Failed cache initialization releases
+its claims and allows retry with the same name. The name-reservation guard
+covers empty-slot initialization, without object I/O, and does not guard ordinary
+row reads or committed row publication. Committed journal-replay creation still
+requires exclusive storage access. Its startup memory plan includes the exact
+size of the name-reservation mutex.
+
+**User example:** two connections creating the same table cannot claim separate
+slots for its name. Each connection sees only its own uncommitted creation.
+A read and an update of an existing order can progress while table creation
+waits for its reservation guard; this storage-level test does not enable
+parallel SQL execution.
 
 ### Changing rewrite rules
 
@@ -559,7 +583,7 @@ use statement memory. Physical reclamation still requires exclusive table
 metadata, but retained byte readers can continue using the old heap buffer.
 
 Transaction-wide durable publication, concurrent cache/object I/O and
-maintenance, concurrent table creation and reuse, and execution workers are still open.
+maintenance, remaining table rewrites, and execution workers are still open.
 A retained reader must remain safe across all of those changes.
 
 ## What the tests establish

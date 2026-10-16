@@ -27,7 +27,7 @@ jobs:
             cargo test --lib --locked "$selection" -- --test-threads=1 --nocapture | tee "$RUNNER_TEMP/pending-edits-$selection.log"
             grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/pending-edits-$selection.log"
           done
-      - name: Verify the original type move modifies another database
+      - name: Verify original storage modifies another database
         shell: bash
         run: |
           set -euo pipefail
@@ -60,7 +60,7 @@ jobs:
                   path.write_text(content)
           subprocess.check_call(["git", "diff", "--exit-code", "--",
                                  "src/storage/mod.rs", "src/storage/table_definitions.rs", "src/storage/table_edits.rs"])
-          print("Confirmed the cross-database mutation on the old runtime; restored the qualified source.")
+          print("Confirmed the cross-database mutation in original storage; restored the qualified source.")
           PY
   postgresql:
     runs-on: ubuntu-latest

@@ -1,3 +1,5 @@
+SELECT pg_typeof(1)::oid, pg_typeof(1)::smallint,
+       pg_typeof(1)::integer, pg_typeof(1)::bigint;
 CREATE SCHEMA routine_domains;
 CREATE DOMAIN routine_domains.positive AS integer NOT NULL CHECK (VALUE > 0);
 CREATE DOMAIN routine_domains.other AS integer CHECK (VALUE > 0);

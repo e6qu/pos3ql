@@ -250,7 +250,9 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 Datum::Int4(
                     parse_int_bounded(s, i32::MIN as i64, i32::MAX as i64, "integer")? as i32,
                 )
-            } else if let Datum::RegObject { referenced_oid, .. } = v {
+            } else if let Datum::Regtype { referenced_oid, .. }
+            | Datum::RegObject { referenced_oid, .. } = v
+            {
                 Datum::Int4(referenced_oid)
             } else {
                 let x = to_i64_for_cast(&v, "integer")?;
@@ -262,6 +264,9 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Xid8(value) if target == ColType::Xid => Datum::Oid(value as u32),
             Datum::Bit { bits, .. } => Datum::Oid(bits_to_uint(bits, 32, target.name())? as u32),
             Datum::Text(s) => Datum::Oid(parse_oid(s)?),
+            Datum::Regtype { referenced_oid, .. } if target == ColType::Oid => {
+                Datum::Oid(referenced_oid as u32)
+            }
             Datum::RegObject { referenced_oid, .. } => Datum::Oid(referenced_oid as u32),
             Datum::Int2(value) => {
                 Datum::Oid(u32::try_from(value).map_err(|_| overflow(target.name()))?)
@@ -1195,7 +1200,9 @@ fn to_i64_for_cast(v: &Datum, target: &'static str) -> Result<i64, SqlError> {
         Datum::Int4(x) => Ok(i64::from(*x)),
         Datum::Oid(x) => Ok(i64::from(*x)),
         Datum::Int8(x) => Ok(*x),
-        Datum::RegObject { referenced_oid, .. } => Ok(i64::from(*referenced_oid)),
+        Datum::Regtype { referenced_oid, .. } | Datum::RegObject { referenced_oid, .. } => {
+            Ok(i64::from(*referenced_oid))
+        }
         Datum::Bool(b) => Ok(i64::from(*b)),
         // PostgreSQL rounds a float to the nearest integer, ties to even
         // (`rint`): 0.5→0, 2.5→2, 3.5→4. real widens to f64 first, which is
@@ -1326,6 +1333,27 @@ mod tests {
     fn err(s: &str, lo: i64, hi: i64, ty: &'static str) -> (String, String) {
         let e = parse_int_bounded(s, lo, hi, ty).unwrap_err();
         (e.sqlstate.to_string(), e.message.as_str().to_string())
+    }
+
+    #[test]
+    fn type_reference_moves_regtype_numeric_casts_use_the_identifier() {
+        let mut budget = crate::mem::Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "regtype casts", 1 << 16).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (target, expected) in [
+                (ColType::Int2, Datum::Int2(23)),
+                (ColType::Int4, Datum::Int4(23)),
+                (ColType::Int8, Datum::Int8(23)),
+                (ColType::Oid, Datum::Oid(23)),
+            ] {
+                let reference = Datum::Regtype {
+                    referenced_oid: 23,
+                    name: "renamed_customer_type",
+                };
+                assert_eq!(cast_to(reference, target, &arena).unwrap(), expected);
+                assert_eq!(cast_to(Datum::Null, target, &arena).unwrap(), Datum::Null);
+            }
+        });
     }
 
     #[test]

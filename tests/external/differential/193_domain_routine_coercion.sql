@@ -37,6 +37,12 @@ SELECT pg_typeof(1)::smallint, (NULL::regtype::smallint) IS NULL;
 SELECT pg_typeof(1)::smallint = 8 AND TRUE;
 SELECT FALSE AND pg_typeof(1)::smallint > 0;
 SELECT currval('routine_domains.cast_calls');
+CREATE FUNCTION routine_domains.bump() RETURNS bigint
+LANGUAGE SQL VOLATILE AS 'SELECT nextval(''routine_domains.cast_calls'')';
+CREATE FUNCTION routine_domains.nested() RETURNS bigint
+LANGUAGE SQL VOLATILE AS 'SELECT nextval(''routine_domains.cast_calls'') + routine_domains.bump()';
+SELECT routine_domains.nested();
+SELECT currval('routine_domains.cast_calls');
 DROP CAST (regtype AS smallint);
 CREATE OR REPLACE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
 LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT (1 / 0)::smallint';

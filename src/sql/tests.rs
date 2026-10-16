@@ -83047,7 +83047,7 @@ const TYPE_REFERENCE_SNAPSHOT: &str =
     include_str!("../../tests/external/type_reference_snapshot.sql");
 
 fn type_reference_execute(engine: &mut Engine, budget: &mut Budget, sql: &str) -> Vec<String> {
-    let output = run_with(engine, budget, sql);
+    let output = run_with_ddl_capacity(engine, budget, sql, 32, 4 << 20);
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
         "{}",
@@ -83282,12 +83282,18 @@ fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
          SELECT pg_typeof(1)::smallint = 8 AND TRUE;
          SELECT FALSE AND pg_typeof(1)::smallint > 0;
          SELECT currval('routine_domains.cast_calls');
+         CREATE FUNCTION routine_domains.bump() RETURNS bigint
+         LANGUAGE SQL VOLATILE AS 'SELECT nextval(''routine_domains.cast_calls'')';
+         CREATE FUNCTION routine_domains.nested() RETURNS bigint
+         LANGUAGE SQL VOLATILE AS 'SELECT nextval(''routine_domains.cast_calls'') + routine_domains.bump()';
+         SELECT routine_domains.nested();
+         SELECT currval('routine_domains.cast_calls');
          DROP CAST (regtype AS smallint);",
         32 << 20,
     );
     assert_eq!(
         data_rows(&custom),
-        ["7|t", "t", "f", "8"],
+        ["7|t", "t", "f", "8", "19", "10"],
         "{}",
         String::from_utf8_lossy(&custom)
     );
@@ -83391,4 +83397,37 @@ fn type_reference_moves_composite_names_survive_prepared_checkpoint_recovery() {
         ),
         untouched
     );
+}
+
+#[test]
+fn type_reference_moves_sequence_programs_use_engine_execution() {
+    let mut budget = Budget::new(1 << 20);
+    let arena = Arena::new(&mut budget, "routine sequence classification", 1 << 20).unwrap();
+    for body in [
+        "SELECT nextval('s')",
+        "SELECT currval('s')",
+        "SELECT lastval()",
+        "SELECT setval('s', 9)",
+        "SELECT (SELECT nextval('s'))",
+        "SELECT CASE WHEN TRUE THEN nextval('s') ELSE 0 END",
+        "SELECT v FROM (SELECT nextval('s') AS v) AS q",
+        "SELECT * FROM nextval('s')",
+        "WITH q AS (SELECT nextval('s') AS v) SELECT v FROM q",
+        "SELECT nextval('s') UNION ALL SELECT 0",
+        "SELECT 0 UNION ALL SELECT nextval('s')",
+        "SELECT currval('s'); SELECT 0",
+    ] {
+        let program = query::parse_routine_function_program(body, &arena, false, "f", &[]).unwrap();
+        assert!(
+            query::routine_program_requires_mutable_execution(&program),
+            "{body}"
+        );
+    }
+    for body in ["SELECT 1", "SELECT abs(-1)", "SELECT random()"] {
+        let program = query::parse_routine_function_program(body, &arena, false, "f", &[]).unwrap();
+        assert!(
+            !query::routine_program_requires_mutable_execution(&program),
+            "{body}"
+        );
+    }
 }

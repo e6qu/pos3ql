@@ -825,26 +825,47 @@ fn routine_statement_forbidden(statement: &Stmt<'_>) -> Option<&'static str> {
     })
 }
 
-pub(crate) fn routine_statement_is_query(statement: &Stmt<'_>) -> bool {
-    matches!(statement, Stmt::Select(_) | Stmt::SetQuery(_))
-}
-
 /// Whether a scalar routine needs the engine-owned executor rather than the
 /// read-only evaluator bridge. This is a property of the parsed program, not
 /// a spelling heuristic at an individual call site.
 pub(crate) fn routine_program_requires_mutable_execution(
     program: &RoutineFunctionProgram<'_>,
 ) -> bool {
+    let needs_sequences = |name: &str, _arguments: usize| {
+        matches!(name, "nextval" | "currval" | "lastval" | "setval")
+    };
+    let query_needs_engine = |query: &RoutineQuery<'_>| match query {
+        RoutineQuery::Select(select) => cte::select_contains_function(select, &needs_sequences),
+        RoutineQuery::Set(query) => {
+            query
+                .with
+                .iter()
+                .any(|cte| cte::select_contains_function(cte.query, &needs_sequences))
+                || cte::set_tree_contains_function(query.body, &needs_sequences)
+                || query.order_by.iter().any(|order| {
+                    cte::expression_contains_function(order.expression, &needs_sequences)
+                })
+                || query
+                    .limit
+                    .is_some_and(|expr| cte::expression_contains_function(expr, &needs_sequences))
+                || query
+                    .offset
+                    .is_some_and(|expr| cte::expression_contains_function(expr, &needs_sequences))
+        }
+    };
+    let statement_needs_engine = |statement: &Stmt<'_>| match statement {
+        Stmt::Select(select) => query_needs_engine(&RoutineQuery::Select(select)),
+        Stmt::SetQuery(query) => query_needs_engine(&RoutineQuery::Set(query)),
+        _ => true,
+    };
     program.preceding.iter().any(|step| match step {
-        RoutinePrelude::Statement(statement) => !routine_statement_is_query(statement),
+        RoutinePrelude::Statement(statement) => statement_needs_engine(statement),
         RoutinePrelude::Forbidden(_) => true,
-    }) || matches!(
-        program.result,
-        RoutineFunctionResult::DataModification(_) | RoutineFunctionResult::Forbidden(_)
-    ) || matches!(
-        program.result,
-        RoutineFunctionResult::Void(statement) if !routine_statement_is_query(statement)
-    )
+    }) || match program.result {
+        RoutineFunctionResult::Query(query) => query_needs_engine(query),
+        RoutineFunctionResult::Void(statement) => statement_needs_engine(statement),
+        RoutineFunctionResult::DataModification(_) | RoutineFunctionResult::Forbidden(_) => true,
+    }
 }
 
 pub(crate) fn routine_forbidden_statement_error(statement: &str) -> SqlError {
@@ -879,7 +900,9 @@ pub(crate) fn execute_routine_query<'a>(
     recycling: bool,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    execute_routine_query_under(query, storage, txid, arena, params, recycling, None, emit)
+    execute_routine_query_under(
+        query, storage, txid, arena, params, recycling, None, None, emit,
+    )
 }
 
 #[expect(
@@ -895,10 +918,13 @@ pub(crate) fn execute_bound_routine_query<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     recycling: bool,
+    sequences: Option<&dyn SequenceAccess>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     if routine.body_kind == crate::storage::RoutineBodyKind::String {
-        return execute_routine_query(query, storage, txid, arena, params, recycling, emit);
+        return execute_routine_query_under(
+            query, storage, txid, arena, params, recycling, sequences, None, emit,
+        );
     }
     let user = super::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(routine.creation_path.as_str(), user.as_str(), txid);
@@ -910,6 +936,7 @@ pub(crate) fn execute_bound_routine_query<'a>(
         arena,
         params,
         recycling,
+        sequences,
         Some((path, dependencies.view())),
         emit,
     )
@@ -991,6 +1018,7 @@ fn execute_routine_query_under<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     recycling: bool,
+    sequences: Option<&dyn SequenceAccess>,
     stored: Option<(
         crate::storage::PathContext,
         crate::storage::StoredQueryDependencyView<'a>,
@@ -1008,21 +1036,23 @@ fn execute_routine_query_under<'a>(
                     dependencies,
                     arena,
                     params,
-                    None,
+                    sequences,
                 )?,
-                None => expand_ctes_exec(select, storage, txid, arena, params, &[], None)?,
+                None => expand_ctes_exec(select, storage, txid, arena, params, &[], sequences)?,
             };
             validate_locking(select)?;
             if recycling {
-                select_into_rows_recycling(storage, txid, select, arena, params, None, None, emit)
+                select_into_rows_recycling(
+                    storage, txid, select, arena, params, sequences, None, emit,
+                )
             } else {
-                select_into_rows(storage, txid, select, arena, params, None, None, emit)
+                select_into_rows(storage, txid, select, arena, params, sequences, None, emit)
             }
         }
         RoutineQuery::Set(query) => {
             let Some((path, dependencies)) = stored else {
                 return setops::set_query_into_rows(
-                    storage, txid, query, arena, params, None, emit,
+                    storage, txid, query, arena, params, sequences, emit,
                 );
             };
             let body = cte::expand_stored_set_tree_exec(
@@ -1030,7 +1060,7 @@ fn execute_routine_query_under<'a>(
                 query.body,
                 storage,
                 txid,
-                cte::StoredExecutionContext::new(path, dependencies, params, None),
+                cte::StoredExecutionContext::new(path, dependencies, params, sequences),
                 arena,
             )?;
             let rebound = SetQuery {
@@ -1039,7 +1069,7 @@ fn execute_routine_query_under<'a>(
                 ..**query
             };
             let rebound = arena.alloc(rebound).map_err(|_| arena_full())?;
-            setops::set_query_into_rows(storage, txid, rebound, arena, params, None, emit)
+            setops::set_query_into_rows(storage, txid, rebound, arena, params, sequences, emit)
         }
     }
 }
@@ -1584,6 +1614,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     self.routine_workspace,
                     &parameters[..arguments.len()],
                     true,
+                    None,
                     &mut |_| Ok(()),
                 )?;
             }
@@ -1616,6 +1647,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         self.routine_workspace,
                         &parameters[..arguments.len()],
                         true,
+                        None,
                         &mut |_| Ok(()),
                     )?;
                     return Ok(Some(Datum::Text("")));
@@ -1633,6 +1665,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 self.routine_workspace,
                 &parameters[..arguments.len()],
                 true,
+                None,
                 &mut |values| {
                     let expected = record_columns.map_or(1, <[_]>::len);
                     if values.len() != expected {

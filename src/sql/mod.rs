@@ -12040,10 +12040,16 @@ impl Engine {
             }
             Ok(())
         };
+        let sequence_replay = sequence::SequenceReplayState::new(arena);
         let outcome = match program.result {
             query::RoutineFunctionResult::Query(result_query) => loop {
                 self.work.reset();
                 nested_invocations.begin_attempt();
+                sequence_replay.begin_attempt();
+                let sequence = sequence::ReplaySeqEval::new(
+                    sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
+                    &sequence_replay,
+                );
                 let outcome = query::execute_bound_routine_query(
                     result_query,
                     &self.storage,
@@ -12053,6 +12059,7 @@ impl Engine {
                     &self.work,
                     arguments,
                     true,
+                    Some(&sequence),
                     &mut capture_result,
                 );
                 let Err(error) = outcome else { break outcome };
@@ -12531,11 +12538,17 @@ impl Engine {
             len.set(len.get() + 1);
             Ok(())
         };
+        let sequence_replay = sequence::SequenceReplayState::new(arena);
         let outcome = match program.result {
             query::RoutineFunctionResult::Query(result) => loop {
                 self.work.reset();
                 nested_invocations.begin_attempt();
                 len.set(0);
+                sequence_replay.begin_attempt();
+                let sequence = sequence::ReplaySeqEval::new(
+                    sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
+                    &sequence_replay,
+                );
                 let outcome = query::execute_bound_routine_query(
                     result,
                     &self.storage,
@@ -12545,6 +12558,7 @@ impl Engine {
                     &self.work,
                     &arguments[..pending.argument_count],
                     true,
+                    Some(&sequence),
                     &mut capture_rows,
                 );
                 let Err(error) = outcome else { break outcome };
@@ -13306,6 +13320,7 @@ impl Engine {
                         "SQL procedure with output parameters must end with a query"
                     )));
                 };
+                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                 if let Err(error) = query::execute_bound_routine_query(
                     &output_query,
                     &self.storage,
@@ -13315,6 +13330,7 @@ impl Engine {
                     arena,
                     &completed[..declared.argument_count],
                     false,
+                    Some(&sequence),
                     &mut |values| {
                         if values.len() != output_count {
                             return Err(sql_err!(

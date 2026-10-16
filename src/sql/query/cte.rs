@@ -2430,25 +2430,33 @@ fn frame_bound_mentions_column(
     }
 }
 
-fn expression_contains_volatile(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
-    if expression.contains_volatile_function().is_some()
-        || matches!(expression, Expr::Call { name, args, .. }
-            if storage.has_volatile_function_routine_candidate(name, args.len(), txid))
-    {
+fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+    select_contains_function(select, &|name, arguments| {
+        super::super::ast::is_volatile_function(name)
+            || storage.has_volatile_function_routine_candidate(name, arguments, txid)
+    })
+}
+
+pub(super) fn expression_contains_function(
+    expression: &Expr<'_>,
+    matches: &impl Fn(&str, usize) -> bool,
+) -> bool {
+    if matches!(expression, Expr::Call { name, args, .. } if matches(name, args.len())) {
         return true;
     }
     let nested = match expression {
-        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
-            select_contains_volatile(select, storage, txid)
-        }
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. } => select_contains_function(select, matches),
         Expr::InSubquery {
             operand, select, ..
         }
         | Expr::QuantifiedSubquery {
             operand, select, ..
         } => {
-            expression_contains_volatile(operand, storage, txid)
-                || select_contains_volatile(select, storage, txid)
+            expression_contains_function(operand, matches)
+                || select_contains_function(select, matches)
         }
         _ => false,
     };
@@ -2457,16 +2465,19 @@ fn expression_contains_volatile(expression: &Expr<'_>, storage: &Storage, txid: 
     }
     let mut found = false;
     super::walk_children(expression, &mut |child| {
-        found |= expression_contains_volatile(child, storage, txid);
+        found |= expression_contains_function(child, matches);
         Ok(())
     })
     .expect("expression visitor cannot fail");
     found
 }
 
-fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+pub(super) fn select_contains_function(
+    select: &Select<'_>,
+    matches: &impl Fn(&str, usize) -> bool,
+) -> bool {
     let expression_has_it =
-        |expression: &Expr<'_>| expression_contains_volatile(expression, storage, txid);
+        |expression: &Expr<'_>| expression_contains_function(expression, matches);
     if select.items.iter().any(|item| match item {
         SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
             expression_has_it(expression)
@@ -2495,17 +2506,19 @@ fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -
         let table_has_it = |table: &TableRef<'_>| {
             table
                 .subquery
-                .is_some_and(|query| select_contains_volatile(query, storage, txid))
+                .is_some_and(|query| select_contains_function(query, matches))
                 || table.func_args.is_some_and(|arguments| {
-                    arguments.iter().any(|argument| expression_has_it(argument))
+                    matches(table.table, arguments.len())
+                        || arguments.iter().any(|argument| expression_has_it(argument))
                 })
                 || table.rows_from.is_some_and(|tables| {
                     tables.iter().any(|table| {
                         table.func_args.is_some_and(|arguments| {
-                            arguments.iter().any(|argument| expression_has_it(argument))
+                            matches(table.table, arguments.len())
+                                || arguments.iter().any(|argument| expression_has_it(argument))
                         }) || table
                             .subquery
-                            .is_some_and(|query| select_contains_volatile(query, storage, txid))
+                            .is_some_and(|query| select_contains_function(query, matches))
                     })
                 })
                 || table.sample.is_some_and(|sample| {
@@ -2524,19 +2537,21 @@ fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -
     }
     select
         .set_body
-        .is_some_and(|tree| set_tree_contains_volatile(tree, storage, txid))
+        .is_some_and(|tree| set_tree_contains_function(tree, matches))
         || select
             .with
             .iter()
-            .any(|cte| select_contains_volatile(cte.query, storage, txid))
+            .any(|cte| select_contains_function(cte.query, matches))
 }
 
-fn set_tree_contains_volatile(tree: &SetTree<'_>, storage: &Storage, txid: u32) -> bool {
+pub(super) fn set_tree_contains_function(
+    tree: &SetTree<'_>,
+    matches: &impl Fn(&str, usize) -> bool,
+) -> bool {
     match tree {
-        SetTree::Select(select) => select_contains_volatile(select, storage, txid),
+        SetTree::Select(select) => select_contains_function(select, matches),
         SetTree::Op { left, right, .. } => {
-            set_tree_contains_volatile(left, storage, txid)
-                || set_tree_contains_volatile(right, storage, txid)
+            set_tree_contains_function(left, matches) || set_tree_contains_function(right, matches)
         }
     }
 }

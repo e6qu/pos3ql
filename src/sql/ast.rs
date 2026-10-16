@@ -5618,7 +5618,7 @@ pub enum Expr<'a> {
     },
 }
 
-fn is_volatile_function(name: &str) -> bool {
+pub(crate) fn is_volatile_function(name: &str) -> bool {
     const NAMES: &[&str] = &[
         "clock_timestamp",
         "timeofday",

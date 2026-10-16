@@ -36,6 +36,10 @@ machine do not establish production availability or speed.
 
 ## What recent work taught us
 
+- A function used by a cast can still change sequence state. Planning must
+  respect its declared volatility, and a suspended function must not advance
+  the same sequence twice when execution resumes.
+
 - Protecting a reader's selected data and releasing it at the right time is
   necessary before allowing concurrent writes. A running statement, a
   transaction, and a streaming upload can keep data alive for different periods.

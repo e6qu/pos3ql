@@ -9020,6 +9020,15 @@ impl Engine {
                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
+                    crate::logging::info_args(
+                        "statement_wait_diagnostic",
+                        format_args!(
+                            "statement paused txid={} code={} reason={}",
+                            txn.txid,
+                            e.sqlstate,
+                            e.message.as_str()
+                        ),
+                    );
                     if txn.owns_statement_mark(statement_mark) {
                         self.storage.preserve_advisory_statement();
                         self.rollback_waiting_statement(txn, statement_mark);
@@ -9257,6 +9266,15 @@ impl Engine {
                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
+                    crate::logging::info_args(
+                        "statement_wait_diagnostic",
+                        format_args!(
+                            "statement paused txid={} code={} reason={}",
+                            txn.txid,
+                            e.sqlstate,
+                            e.message.as_str()
+                        ),
+                    );
                     if txn.owns_statement_mark(statement_mark) {
                         self.storage.preserve_advisory_statement();
                         self.rollback_waiting_statement(txn, statement_mark);

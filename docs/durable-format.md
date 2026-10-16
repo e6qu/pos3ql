@@ -141,6 +141,30 @@ before catalog mutation. Raising this boundary would renumber durable catalog
 identities, so it requires an explicit format and OID migration rather than a
 constant change.
 
+### Composite type name changes
+
+Renaming a composite type or moving it to another schema writes journal kind
+148. It contains the prior name, prior schema, new schema and new name, using
+the existing length-prefixed name grammar. Replay changes the name while
+preserving the current fields. It cannot restore field type names copied before
+an earlier domain rename in the same transaction. Attribute edits continue to
+use the existing full composite definition records; readers retain those records.
+
+For example, changing a customer identifier domain and then renaming a record
+that contains it must recover the new domain reference after losing local caches.
+Prepared transactions retain the same name-change records through checkpoints.
+
+Binaries that predate kind 148 cannot recover a journal containing it. Upgrade
+all recovery and replacement candidates before executing composite type renames
+or schema moves; do not downgrade that prefix afterward. Existing manifest,
+composite definition and name-change record grammars remain readable.
+
+Full cast and operator catalog records freeze the transaction's current type
+names before journal staging. A domain rename followed by an operator, family
+or class owner edit must not restore an old input or result name during replay.
+The field inventory is shared with database-scoped type moves. Existing record
+grammars are unchanged.
+
 ### Prepared relation locks
 
 Prepared-transaction lock payloads identify each entry with a kind byte. Readers

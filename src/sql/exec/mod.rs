@@ -12625,8 +12625,11 @@ pub(crate) fn drop_schema(
             write_identifier(out, name.as_str());
         }
     };
-    let describe =
-        |storage: &Storage, o: &SchemaObject, out: &mut crate::util::StackStr<192>| match o {
+    let describe = |storage: &Storage,
+                    o: &SchemaObject,
+                    out: &mut crate::util::StackStr<192>|
+     -> Result<(), SqlError> {
+        match o {
             SchemaObject::Table(t) => {
                 let def = storage.table_def(*t, txn.txid);
                 let _ = write!(out, "table ");
@@ -12650,16 +12653,8 @@ pub(crate) fn drop_schema(
                     &routine.schema_for(txn.txid),
                     &routine.name_for(txn.txid),
                 );
-                let _ = write!(out, "(");
-                for (index, argument) in routine.arguments().iter().enumerate() {
-                    let _ = write!(
-                        out,
-                        "{}{}",
-                        if index == 0 { "" } else { "," },
-                        argument.ctype.name()
-                    );
-                }
-                let _ = write!(out, ")");
+                let signature = routine_dependency_suffix(storage, &routine)?;
+                let _ = write!(out, "{}", signature.as_str());
             }
             SchemaObject::Collation(slot) => {
                 let definition = storage.collation(*slot).definition_for(txn.txid);
@@ -12704,7 +12699,17 @@ pub(crate) fn drop_schema(
             SchemaObject::Operator(operator) => {
                 let definition = storage.operator_for(*operator, txn.txid);
                 let _ = write!(out, "operator ");
-                write_rel(out, &definition.schema, &definition.name);
+                if !in_path(storage, definition.schema.as_str()) {
+                    write_identifier(out, definition.schema.as_str());
+                    let _ = out.write_char('.');
+                }
+                let _ = out.write_str(definition.name.as_str());
+                let signature = dependency_signature_suffix(
+                    storage,
+                    "operator",
+                    [definition.signature.left, definition.signature.right],
+                )?;
+                let _ = out.write_str(signature.as_str());
             }
             SchemaObject::OperatorFamily(family) => {
                 let definition = storage.operator_family_for(*family, txn.txid);
@@ -12738,7 +12743,9 @@ pub(crate) fn drop_schema(
                 );
                 write_rel(out, &def.schema, &def.name);
             }
-        };
+        }
+        Ok(())
+    };
     let independently_reported = |object: &SchemaObject| match object {
         // PostgreSQL reports the owning table and suppresses its internal
         // statistics dependents. A statistics object on a surviving table is
@@ -12773,7 +12780,9 @@ pub(crate) fn drop_schema(
             .enumerate()
         {
             let mut line = crate::util::StackStr::<192>::new();
-            describe(storage, o, &mut line);
+            if let Err(error) = describe(storage, o, &mut line) {
+                return sql_fail(error);
+            }
             let schema = match o {
                 SchemaObject::Table(t) => storage.table_def(*t, txn.txid).schema,
                 SchemaObject::View(v) => storage.view(*v).schema,
@@ -12936,7 +12945,9 @@ pub(crate) fn drop_schema(
             .flatten()
             .find(|object| independently_reported(object))
             .expect("one independently reported object");
-        describe(storage, object, &mut line);
+        if let Err(error) = describe(storage, object, &mut line) {
+            return sql_fail(error);
+        }
         responder.notice(
             crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
             stack_format!(224, "drop cascades to {}", line.as_str()).as_str(),
@@ -12951,7 +12962,9 @@ pub(crate) fn drop_schema(
             .enumerate()
         {
             let mut line = crate::util::StackStr::<192>::new();
-            describe(storage, o, &mut line);
+            if let Err(error) = describe(storage, o, &mut line) {
+                return sql_fail(error);
+            }
             let _ = write!(
                 detail,
                 "{}drop cascades to {}",
@@ -28447,7 +28460,7 @@ pub(crate) fn resolve_routine_type(
         .strip_suffix("[]")
         .map_or((written, false), |base| (base, true));
     let user_type = |schema, name| crate::storage::UserTypeName { schema, name };
-    let result = if let Some(slot) = storage.resolve_domain_slot(base, txid) {
+    let (result, usage_identity) = if let Some(slot) = storage.resolve_domain_slot(base, txid) {
         let domain = storage.domain(slot);
         let ctype = if array {
             ColType::Array(ArrElem::domain(slot as u16, domain.base).ok_or_else(|| {
@@ -28460,30 +28473,44 @@ pub(crate) fn resolve_routine_type(
         } else {
             domain.base
         };
-        crate::storage::RoutineResult {
-            ctype,
-            user_type: Some(user_type(domain.schema, domain.name)),
-        }
+        // Binding retains the committed identity until publication; access
+        // checks use the name visible to this transaction.
+        let visible = storage.domain_for(slot, txid);
+        (
+            crate::storage::RoutineResult {
+                ctype,
+                user_type: Some(user_type(domain.schema, domain.name)),
+            },
+            user_type(visible.schema, visible.name),
+        )
     } else if let Some(slot) = storage.resolve_enum_slot(base, txid) {
         let definition = storage.enum_for(slot, txid);
-        crate::storage::RoutineResult {
-            ctype: if array {
-                ColType::Array(ArrElem::Enum(slot as u16))
-            } else {
-                ColType::Enum(slot as u16)
+        let identity = user_type(definition.schema, definition.name);
+        (
+            crate::storage::RoutineResult {
+                ctype: if array {
+                    ColType::Array(ArrElem::Enum(slot as u16))
+                } else {
+                    ColType::Enum(slot as u16)
+                },
+                user_type: Some(identity),
             },
-            user_type: Some(user_type(definition.schema, definition.name)),
-        }
+            identity,
+        )
     } else if let Some(slot) = storage.resolve_composite_slot(base, txid) {
         let definition = storage.composite_for(slot, txid);
-        crate::storage::RoutineResult {
-            ctype: if array {
-                ColType::Array(ArrElem::Composite(slot as u16))
-            } else {
-                ColType::Composite(slot as u16)
+        let identity = user_type(definition.schema, definition.name);
+        (
+            crate::storage::RoutineResult {
+                ctype: if array {
+                    ColType::Array(ArrElem::Composite(slot as u16))
+                } else {
+                    ColType::Composite(slot as u16)
+                },
+                user_type: Some(identity),
             },
-            user_type: Some(user_type(definition.schema, definition.name)),
-        }
+            identity,
+        )
     } else {
         return Err(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -28491,10 +28518,11 @@ pub(crate) fn resolve_routine_type(
             written
         ));
     };
-    let identity = result
-        .user_type
-        .expect("user type resolution produced identity");
-    storage.require_type_usage(identity.schema.as_str(), identity.name.as_str(), txid)?;
+    storage.require_type_usage(
+        usage_identity.schema.as_str(),
+        usage_identity.name.as_str(),
+        txid,
+    )?;
     Ok(result)
 }
 
@@ -28625,8 +28653,15 @@ fn user_type_access_object(
     result: crate::storage::RoutineResult,
 ) -> Option<crate::storage::AccessObject> {
     let identity = result.user_type?;
+    if let Some(slot) =
+        storage.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+    {
+        return Some(crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Domain,
+            slot: slot as u16,
+        });
+    }
     [
-        crate::storage::AccessClass::Domain,
         crate::storage::AccessClass::Enum,
         crate::storage::AccessClass::Composite,
     ]
@@ -28852,7 +28887,13 @@ pub(crate) fn create_cast(
             "cast will be ignored because the target data type is a domain",
         )?;
     }
-    let definition = storage.cast(slot);
+    let definition = match storage.journal_catalog_definition(storage.cast(slot), txn.txid) {
+        Ok(definition) => definition,
+        Err(error) => {
+            storage.rollback_cast_create(slot);
+            return sql_fail(error);
+        }
+    };
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::SetCast(definition)) {
         storage.rollback_cast_create(slot);
@@ -28873,6 +28914,7 @@ fn stage_cast_drop(
     slot: usize,
 ) -> Result<(), SqlError> {
     let definition = storage.cast(slot);
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     let dropped_slot = storage
         .drop_cast(definition.source, definition.target, txn.txid)?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "cast does not exist"))?;
@@ -28887,8 +28929,8 @@ fn stage_cast_drop(
         txn.txid,
         lsn,
         &WalOp::DropCast {
-            source: definition.source,
-            target: definition.target,
+            source: durable.source,
+            target: durable.target,
         },
     ) {
         storage.rollback_cast_drop(slot, txn.txid);
@@ -29040,6 +29082,7 @@ fn operator_link_or_shell(
     } else {
         definition.negator = Some(request.source_oid);
     }
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     let slot = storage.create_operator(definition, txn.txid)?;
     let created_at = storage.operator(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -29048,7 +29091,7 @@ fn operator_link_or_shell(
         lsn,
         &WalOp::SetOperator {
             created_at,
-            definition,
+            definition: durable,
         },
     ) {
         storage.rollback_operator_create(slot);
@@ -29149,6 +29192,10 @@ pub(crate) fn create_operator(
         merges: operator.merges,
         owner: storage.initial_catalog_owner(txn.txid),
     };
+    let durable = match storage.journal_catalog_definition(definition, txn.txid) {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
     let (slot, created) =
         match storage.operator_slot_exact(schema.as_str(), name.as_str(), signature, txn.txid) {
             Some(slot)
@@ -29188,7 +29235,7 @@ pub(crate) fn create_operator(
             lsn,
             &WalOp::SetOperator {
                 created_at,
-                definition,
+                definition: durable,
             },
         ) {
             storage.rollback_operator_create(slot);
@@ -31086,6 +31133,7 @@ fn stage_operator(
     slot: usize,
     definition: crate::storage::OperatorDefinition,
 ) -> Result<(), SqlError> {
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     let prior = storage.stage_operator_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -31094,7 +31142,7 @@ fn stage_operator(
         lsn,
         &WalOp::SetOperator {
             created_at,
-            definition,
+            definition: durable,
         },
     ) {
         storage.rollback_operator_alter(slot, prior);
@@ -31117,6 +31165,7 @@ fn stage_operator_drop(
     slot: usize,
 ) -> Result<(), SqlError> {
     let definition = storage.operator_for(slot, txn.txid);
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     storage.drop_operator(slot, txn.txid);
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(
@@ -31125,7 +31174,7 @@ fn stage_operator_drop(
         &WalOp::DropOperator {
             schema: definition.schema.as_str(),
             name: definition.name.as_str(),
-            signature: definition.signature,
+            signature: durable.signature,
         },
     ) {
         storage.rollback_operator_drop(slot, txn.txid);
@@ -31763,6 +31812,7 @@ fn stage_operator_family(
     slot: usize,
     definition: crate::storage::OperatorFamilyDefinition,
 ) -> Result<(), SqlError> {
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     let prior = storage.stage_operator_family_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator_family(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -31771,7 +31821,7 @@ fn stage_operator_family(
         lsn,
         &WalOp::SetOperatorFamily {
             created_at,
-            definition: &definition,
+            definition: &durable,
         },
     ) {
         storage.rollback_operator_family_alter(slot, prior);
@@ -31965,6 +32015,7 @@ fn stage_operator_class(
     slot: usize,
     definition: crate::storage::OperatorClassDefinition,
 ) -> Result<(), SqlError> {
+    let durable = storage.journal_catalog_definition(definition, txn.txid)?;
     let prior = storage.stage_operator_class_definition(slot, definition, txn.txid)?;
     let created_at = storage.operator_class(slot).created_at;
     let lsn = storage.bump_lsn();
@@ -31973,7 +32024,7 @@ fn stage_operator_class(
         lsn,
         &WalOp::SetOperatorClass {
             created_at,
-            definition: &definition,
+            definition: &durable,
         },
     ) {
         storage.rollback_operator_class_alter(slot, prior);
@@ -32263,6 +32314,10 @@ pub(crate) fn create_operator_class(
         operators,
         functions,
     };
+    let durable = match storage.journal_catalog_definition(definition, txn.txid) {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
     let slot = match storage.create_operator_class(definition, txn.txid) {
         Ok(slot) => slot,
         Err(error) => return sql_fail(error),
@@ -32274,7 +32329,7 @@ pub(crate) fn create_operator_class(
         lsn,
         &WalOp::SetOperatorClass {
             created_at,
-            definition: &definition,
+            definition: &durable,
         },
     ) {
         storage.rollback_operator_class_create(slot);
@@ -43930,24 +43985,42 @@ fn routine_dependency_suffix(
     storage: &Storage,
     routine: &crate::storage::RoutineDef,
 ) -> Result<crate::util::StackStr<192>, SqlError> {
+    dependency_signature_suffix(
+        storage,
+        "routine",
+        routine.arguments().iter().map(|argument| {
+            Some(crate::storage::RoutineResult {
+                ctype: argument.ctype,
+                user_type: argument.user_type,
+            })
+        }),
+    )
+}
+
+fn dependency_signature_suffix(
+    storage: &Storage,
+    kind: &str,
+    arguments: impl IntoIterator<Item = Option<crate::storage::RoutineResult>>,
+) -> Result<crate::util::StackStr<192>, SqlError> {
     use core::fmt::Write as _;
-    let mut suffix = crate::util::StackStr::<192>::new();
-    suffix.write_char('(').map_err(|_| {
+    let too_long = || {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "routine signature too long"
+            "{} signature too long",
+            kind
         )
-    })?;
-    for (index, argument) in routine.arguments().iter().enumerate() {
+    };
+    let mut suffix = crate::util::StackStr::<192>::new();
+    suffix.write_char('(').map_err(|_| too_long())?;
+    for (index, argument) in arguments.into_iter().enumerate() {
         if index != 0 {
-            suffix.write_char(',').map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "routine signature too long"
-                )
-            })?;
+            suffix.write_char(',').map_err(|_| too_long())?;
         }
-        let write_result = match argument.user_type {
+        let Some(argument) = argument else {
+            suffix.write_str("NONE").map_err(|_| too_long())?;
+            continue;
+        };
+        match argument.user_type {
             Some(identity) if storage.schema_is_on_path(identity.schema) => {
                 suffix.write_str(identity.name.as_str())
             }
@@ -43958,28 +44031,13 @@ fn routine_dependency_suffix(
                 identity.name.as_str()
             ),
             None => suffix.write_str(argument.ctype.name()),
-        };
-        write_result.map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "routine signature too long"
-            )
-        })?;
+        }
+        .map_err(|_| too_long())?;
         if argument.user_type.is_some() && matches!(argument.ctype, ColType::Array(_)) {
-            suffix.write_str("[]").map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "routine signature too long"
-                )
-            })?;
+            suffix.write_str("[]").map_err(|_| too_long())?;
         }
     }
-    suffix.write_char(')').map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "routine signature too long"
-        )
-    })?;
+    suffix.write_char(')').map_err(|_| too_long())?;
     Ok(suffix)
 }
 
@@ -45254,6 +45312,7 @@ fn alter_composite_type(
         ));
     }
     let mut altered = storage.composite_for(slot, txn.txid);
+    let prior_names = (altered.schema, altered.name);
     let mut renamed_attribute = None;
     let wrong_type = || {
         sql_err!(
@@ -45467,15 +45526,21 @@ fn alter_composite_type(
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
-    let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage_reserved(
-        txn.txid,
-        lsn,
-        &WalOp::CreateComposite {
+    let operation = if prior_names != (altered.schema, altered.name) {
+        WalOp::AlterCompositeIdentity {
+            schema: prior_names.0.as_str(),
+            name: prior_names.1.as_str(),
+            new_schema: altered.schema.as_str(),
+            new_name: altered.name.as_str(),
+        }
+    } else {
+        WalOp::CreateComposite {
             slot: slot as u16,
             definition: &altered,
-        },
-    ) {
+        }
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &operation) {
         storage.rollback_composite_alter(slot, prior);
         return sql_fail(error);
     }

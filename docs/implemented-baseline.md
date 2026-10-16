@@ -346,6 +346,51 @@ later committed duplicates. The [PostgreSQL 18 index-build implementation](https
 is the upstream visibility reference; the differential suite checks actual
 PostgreSQL results.
 
+Type renames and schema moves update references only in the type's database,
+including pending table, domain, composite and routine definitions. Casts, operators,
+operator families and operator classes retain their input and result types too.
+Restoring casts from the journal or a checkpoint retains their owning database.
+Creating a cast after renaming a domain in the same transaction journals the
+domain's current name, so recovery can resolve it. Type usage and ownership
+checks resolve the name visible inside that transaction while internal references
+retain their bound identity until commit. Converting an identifier to regtype
+or calling format_type also uses the current domain or domain-array name.
+Type comments move within the same database. Composite type renames journal only the name
+change, preserving current field references during replay. The
+[format guide](durable-format.md#composite-type-name-changes) gives the upgrade
+requirement for this record.
+
+**User example:** two databases can both define `app.customer_id`. Renaming that
+domain in one database leaves the other database's columns, functions and comments
+unchanged, including after rollback or recovery without local caches.
+
+Routine selection permits implicit conversion through a domain's base type,
+then checks the declared domain before calling the function. For example,
+a positive-integer parameter accepts 7 and rejects -1 with SQLSTATE 23514.
+Exact overloads still take priority, including domain operator signatures;
+conversions requiring an explicit cast remain rejected. The [PostgreSQL function-resolution rules](https://www.postgresql.org/docs/18/typeconv-func.html)
+are the upstream reference; tests compare actual PostgreSQL 18 results.
+
+A catalog type reference (regtype) converts to its numeric object identifier,
+integer or bigint. Converting a numeric identifier back to regtype looks up the
+current user type name in the selected database. A smallint cast returns SQLSTATE 42846, including for NULL,
+unless an explicitly registered cast provides that conversion. Schema-drop
+notices retain declared domain and array names in routine and operator signatures.
+
+A custom cast that calls a function marked VOLATILE runs during execution,
+rather than while checking constant expressions. For example, a cast that calls
+nextval advances the sequence once for each evaluated value. A skipped false
+branch or WHERE condition does not advance it. Filtering a SELECT without FROM
+happens once before evaluating its outputs or expanding a set-returning function.
+Waiting for a nested function does not advance
+it again. SQL function result queries use the connection's sequence state.
+The pg_typeof function is stable rather than immutable: an immutable cast of
+its result stays out of planning. A genuinely constant immutable cast can
+still raise a planning error even when WHERE FALSE removes all rows. These
+distinctions follow PostgreSQL 18's
+[function volatility declarations](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/catalog/pg_proc.dat)
+and are checked against the running server.
+
 Schema validation uses a current read position for the rows being checked,
 including earlier changes by the same transaction. CHECK, NOT NULL, uniqueness,
 foreign-key and domain rules, and partition attachment retain their original row

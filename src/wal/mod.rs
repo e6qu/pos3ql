@@ -162,6 +162,7 @@ wal_record_kinds! {
     KIND_CREATE_COMPOSITE = 58;
     KIND_DROP_COMPOSITE = 59;
     KIND_ALTER_ENUM_IDENTITY = 60;
+    KIND_ALTER_COMPOSITE_IDENTITY = 148;
     KIND_SET_SUBSCRIPTION_BOOTSTRAP = 61;
     KIND_RESET_SUBSCRIPTION_RELATIONS = 62;
     KIND_ADD_SUBSCRIPTION_RELATION = 63;
@@ -1404,6 +1405,12 @@ pub(crate) enum WalOp<'a> {
         new_schema: &'a str,
         new_name: &'a str,
     },
+    AlterCompositeIdentity {
+        schema: &'a str,
+        name: &'a str,
+        new_schema: &'a str,
+        new_name: &'a str,
+    },
     /// CREATE TYPE ... AS (...). Each field carries its durable user-type
     /// identity beside the representation code, so recovery never trusts a
     /// catalog slot from a prior process.
@@ -2516,6 +2523,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
         WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
         WalOp::AlterEnumIdentity { .. } => KIND_ALTER_ENUM_IDENTITY,
+        WalOp::AlterCompositeIdentity { .. } => KIND_ALTER_COMPOSITE_IDENTITY,
         WalOp::CreateComposite { .. }
         | WalOp::RestoreComposite {
             wide_fields: true, ..
@@ -3308,6 +3316,12 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             new_name,
         } => 1 + old_name.len() + 1 + schema.len() + 1 + new_name.len(),
         WalOp::AlterEnumIdentity {
+            schema,
+            name,
+            new_schema,
+            new_name,
+        }
+        | WalOp::AlterCompositeIdentity {
             schema,
             name,
             new_schema,
@@ -5362,6 +5376,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, new_name)
         }
         WalOp::AlterEnumIdentity {
+            schema,
+            name,
+            new_schema,
+            new_name,
+        }
+        | WalOp::AlterCompositeIdentity {
             schema,
             name,
             new_schema,
@@ -10387,6 +10407,18 @@ fn decode_op_inner<'a>(
                 new_name,
             })
         }),
+        KIND_ALTER_COMPOSITE_IDENTITY => decode_large_op(|| {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let new_schema = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::AlterCompositeIdentity {
+                schema,
+                name,
+                new_schema,
+                new_name,
+            })
+        }),
         KIND_CREATE_SCHEMA => decode_large_op(|| {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::CreateSchema(name))
@@ -14106,6 +14138,41 @@ mod tests {
         assert!(decode_op(42, &[]).is_none());
         assert_ne!(KIND_CREATE_PUBLICATION_V2, 35);
         assert_ne!(KIND_ALTER_PUBLICATION_V2, 42);
+    }
+
+    #[test]
+    fn type_reference_moves_composite_name_journal_has_a_bounded_grammar() {
+        let operation = WalOp::AlterCompositeIdentity {
+            schema: "before",
+            name: "old_type",
+            new_schema: "after",
+            new_name: "new_type",
+        };
+        let bytes = encoded_payload_len(&operation);
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "composite names", bytes + 1).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(op_kind(&operation), KIND_ALTER_COMPOSITE_IDENTITY);
+            assert!(record_kind_known(KIND_ALTER_COMPOSITE_IDENTITY));
+            assert!(append_payload(&mut payload, &operation));
+            assert_eq!(payload.len(), bytes);
+            assert!(matches!(
+                decode_op(KIND_ALTER_COMPOSITE_IDENTITY, payload.readable()),
+                Some(WalOp::AlterCompositeIdentity {
+                    schema: "before",
+                    name: "old_type",
+                    new_schema: "after",
+                    new_name: "new_type",
+                })
+            ));
+            for end in 0..bytes {
+                assert!(
+                    decode_op(KIND_ALTER_COMPOSITE_IDENTITY, &payload.readable()[..end]).is_none()
+                );
+            }
+            assert!(payload.append(&[0]));
+            assert!(decode_op(KIND_ALTER_COMPOSITE_IDENTITY, payload.readable()).is_none());
+        });
     }
 
     #[test]

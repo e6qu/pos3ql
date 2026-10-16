@@ -747,6 +747,14 @@ pub(super) struct ProjectSet<'a> {
 }
 
 impl ProjectSet<'_> {
+    pub(super) const fn empty() -> Self {
+        Self {
+            count: 0,
+            values: &[],
+            any: false,
+        }
+    }
+
     pub(super) const fn single() -> Self {
         Self {
             count: 1,
@@ -5009,6 +5017,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 arena,
                 &routine_params[..routine.argument_count],
                 false,
+                None,
                 &mut |_| Ok(()),
             )?;
         }
@@ -5035,6 +5044,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 arena,
                 &routine_params[..routine.argument_count],
                 false,
+                None,
                 &mut |_| Ok(()),
             )?;
             return Ok(&[]);
@@ -5052,6 +5062,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             arena,
             &routine_params[..routine.argument_count],
             false,
+            None,
             &mut |values| {
                 let expected_columns = table_columns.map_or(1, <[_]>::len);
                 if values.len() != expected_columns {

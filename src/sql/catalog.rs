@@ -14235,7 +14235,7 @@ pub fn user_type_name_text<'a>(
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_DOMAIN) as usize;
-        let definition = storage.domain(slot);
+        let definition = storage.domain_for(slot, txid);
         (
             definition.schema,
             definition.name,
@@ -14248,7 +14248,7 @@ pub fn user_type_name_text<'a>(
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_DOMAIN_ARRAY) as usize;
-        let definition = storage.domain(slot);
+        let definition = storage.domain_for(slot, txid);
         (
             definition.schema,
             definition.name,

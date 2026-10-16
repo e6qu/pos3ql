@@ -14,6 +14,8 @@ mod table_creation;
 mod table_definitions;
 mod table_edits;
 mod table_names;
+mod type_contracts;
+mod type_reference_moves;
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
 pub(crate) mod foreign;
@@ -39179,62 +39181,17 @@ impl Storage {
         schema: SqlName,
         name: SqlName,
     ) {
-        for table in self
-            .tables
-            .iter_mut()
-            .filter(|table| table.existence() != CatalogDdlState::Absent)
-        {
-            let mut changed = false;
-            let mut definition_owner = table.definition_mut();
-            let definition = &mut *definition_owner;
-            for column in definition.columns[..definition.n_columns].iter_mut() {
-                let uses_domain = column.user_type
-                    == Some(UserTypeName {
-                        schema: old_schema,
-                        name: old_name,
-                    })
-                    || matches!(
-                        column.ctype,
-                        ColType::Array(ArrElem::Domain { slot: domain_slot, .. })
-                            if domain_slot as usize == slot
-                    );
-                if uses_domain {
-                    column.user_type = Some(UserTypeName { schema, name });
-                    changed = true;
-                }
-            }
-            drop(definition_owner);
-            if changed {
-                table.mark_dirty();
-            }
-        }
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        for domain in catalog.domains.iter_mut() {
-            if domain.base_domain
-                == Some(UserTypeName {
-                    schema: old_schema,
-                    name: old_name,
-                })
-            {
-                domain.base_domain = Some(UserTypeName { schema, name });
-            }
-        }
-        drop(catalog);
-        for comment in self.comment_catalog().entries.iter_mut() {
-            if comment.used
-                && comment.class == CommentClass::Type
-                && comment.schema == old_schema
-                && comment.name == old_name
-            {
-                comment.schema = schema;
-                comment.name = name;
-            }
-        }
-        self.move_routine_type_references(old_schema, old_name, schema, name, |_| true);
-        self.rename_stored_query_dependency(DependencyClass::Domain, slot, None, schema, name);
+        let movement = type_reference_moves::TypeReferenceMove::new(
+            self.domain(slot).database,
+            type_reference_moves::TypeReferenceKind::Domain,
+            slot,
+            UserTypeName {
+                schema: old_schema,
+                name: old_name,
+            },
+            UserTypeName { schema, name },
+        );
+        self.move_type_references(movement);
     }
 
     pub fn drop_domain(
@@ -39989,100 +39946,20 @@ impl Storage {
         new_schema: SqlName,
         new_name: SqlName,
     ) {
-        for table in self
-            .tables
-            .iter_mut()
-            .filter(|table| table.existence() != CatalogDdlState::Absent)
-        {
-            let mut changed = false;
-            let mut definition_owner = table.definition_mut();
-            let definition = &mut *definition_owner;
-            for column in definition.columns[..definition.n_columns].iter_mut() {
-                let uses_enum = matches!(column.ctype, ColType::Enum(s) if s as usize == slot)
-                    || matches!(
-                        column.ctype,
-                        ColType::Array(ArrElem::Enum(s)) if s as usize == slot
-                    );
-                if uses_enum {
-                    if let Some(identity) = &mut column.user_type {
-                        identity.schema = new_schema;
-                        identity.name = new_name;
-                    }
-                    changed = true;
-                }
-            }
-            drop(definition_owner);
-            if changed {
-                table.mark_dirty();
-            }
-        }
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        for composite in catalog
-            .composites
-            .iter_mut()
-            .filter(|composite| composite.ddl_state != CatalogDdlState::Absent)
-        {
-            for field in composite.fields.iter_mut().take(composite.n_fields) {
-                if matches!(field.ctype, ColType::Enum(candidate) | ColType::Array(ArrElem::Enum(candidate)) if candidate as usize == slot)
-                    && let Some(identity) = &mut field.user_type
-                {
-                    identity.schema = new_schema;
-                    identity.name = new_name;
-                }
-            }
-            if let Some(pending) = &mut composite.pending_definition {
-                for field in pending.fields.iter_mut().take(pending.n_fields) {
-                    if matches!(field.ctype, ColType::Enum(candidate) | ColType::Array(ArrElem::Enum(candidate)) if candidate as usize == slot)
-                        && let Some(identity) = &mut field.user_type
-                    {
-                        identity.schema = new_schema;
-                        identity.name = new_name;
-                    }
-                }
-            }
-        }
-        for domain in catalog
-            .domains
-            .iter_mut()
-            .filter(|domain| domain.ddl_state != CatalogDdlState::Absent)
-        {
-            if matches!(domain.base, ColType::Enum(candidate) if candidate as usize == slot)
-                && domain.base_user_type
-                    == Some(UserTypeName {
-                        schema: old_schema,
-                        name: old_name,
-                    })
-            {
-                domain.base_user_type = Some(UserTypeName {
-                    schema: new_schema,
-                    name: new_name,
-                });
-            }
-        }
-        drop(catalog);
-        for comment in self.comment_catalog().entries.iter_mut() {
-            if comment.used
-                && comment.class == CommentClass::Type
-                && comment.schema == old_schema
-                && comment.name == old_name
-            {
-                comment.schema = new_schema;
-                comment.name = new_name;
-            }
-        }
-        self.move_routine_type_references(old_schema, old_name, new_schema, new_name, |ctype| {
-            matches!(ctype, ColType::Enum(candidate) | ColType::Array(ArrElem::Enum(candidate)) if candidate as usize == slot)
-        });
-        self.rename_stored_query_dependency(
-            DependencyClass::Enum,
+        let movement = type_reference_moves::TypeReferenceMove::new(
+            self.enum_for(slot, 0).database,
+            type_reference_moves::TypeReferenceKind::Enum,
             slot,
-            None,
-            new_schema,
-            new_name,
+            UserTypeName {
+                schema: old_schema,
+                name: old_name,
+            },
+            UserTypeName {
+                schema: new_schema,
+                name: new_name,
+            },
         );
+        self.move_type_references(movement);
     }
 
     pub fn drop_enum(
@@ -40095,7 +39972,13 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if let Some(blocker) = catalog.enums.iter().find_map(|e| {
+        let database = current_database();
+        let mut scoped = catalog
+            .enums
+            .iter()
+            .enumerate()
+            .filter(|(_, enumeration)| enumeration.database == database);
+        if let Some(blocker) = scoped.clone().find_map(|(_, e)| {
             let same_name = e.schema.as_str() == schema
                 && (e.name.as_str() == name
                     || e.pending_definition
@@ -40111,10 +39994,11 @@ impl Storage {
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
-        let Some(i) = catalog.enums.iter().position(|e| {
-            e.visible_to(txid)
-                && e.schema.as_str() == schema
-                && e.definition_for(txid).name.as_str() == name
+        let Some((i, _)) = scoped.find(|(_, enumeration)| {
+            let visible = enumeration.definition_for(txid);
+            enumeration.visible_to(txid)
+                && visible.schema.as_str() == schema
+                && visible.name.as_str() == name
         }) else {
             return Ok(None);
         };
@@ -40457,232 +40341,20 @@ impl Storage {
         new_schema: SqlName,
         new_name: SqlName,
     ) {
-        for table in self
-            .tables
-            .iter_mut()
-            .filter(|table| table.existence() != CatalogDdlState::Absent)
-        {
-            let mut changed = false;
-            let mut definition_owner = table.definition_mut();
-            let definition = &mut *definition_owner;
-            for column in definition.columns[..definition.n_columns].iter_mut() {
-                if matches!(
-                    column.ctype,
-                    ColType::Composite(candidate)
-                        | ColType::Array(ArrElem::Composite(candidate))
-                        if candidate as usize == slot
-                ) && column.user_type
-                    == Some(UserTypeName {
-                        schema: old_schema,
-                        name: old_name,
-                    })
-                {
-                    column.user_type = Some(UserTypeName {
-                        schema: new_schema,
-                        name: new_name,
-                    });
-                    changed = true;
-                }
-            }
-            drop(definition_owner);
-            if changed {
-                table.mark_dirty();
-            }
-        }
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        for composite in catalog
-            .composites
-            .iter_mut()
-            .filter(|composite| composite.ddl_state != CatalogDdlState::Absent)
-        {
-            for field in composite.fields.iter_mut().take(composite.n_fields) {
-                if matches!(
-                    field.ctype,
-                    ColType::Composite(candidate)
-                        | ColType::Array(ArrElem::Composite(candidate))
-                        if candidate as usize == slot
-                ) && field.user_type
-                    == Some(UserTypeName {
-                        schema: old_schema,
-                        name: old_name,
-                    })
-                {
-                    field.user_type = Some(UserTypeName {
-                        schema: new_schema,
-                        name: new_name,
-                    });
-                }
-            }
-            if let Some(pending) = &mut composite.pending_definition {
-                for field in pending.fields.iter_mut().take(pending.n_fields) {
-                    if matches!(
-                        field.ctype,
-                        ColType::Composite(candidate)
-                            | ColType::Array(ArrElem::Composite(candidate))
-                            if candidate as usize == slot
-                    ) && field.user_type
-                        == Some(UserTypeName {
-                            schema: old_schema,
-                            name: old_name,
-                        })
-                    {
-                        field.user_type = Some(UserTypeName {
-                            schema: new_schema,
-                            name: new_name,
-                        });
-                    }
-                }
-            }
-        }
-        for domain in catalog
-            .domains
-            .iter_mut()
-            .filter(|domain| domain.ddl_state != CatalogDdlState::Absent)
-        {
-            if matches!(domain.base, ColType::Composite(candidate) if candidate as usize == slot)
-                && domain.base_user_type
-                    == Some(UserTypeName {
-                        schema: old_schema,
-                        name: old_name,
-                    })
-            {
-                domain.base_user_type = Some(UserTypeName {
-                    schema: new_schema,
-                    name: new_name,
-                });
-            }
-        }
-        drop(catalog);
-        for comment in self.comment_catalog().entries.iter_mut() {
-            if comment.used
-                && comment.class == CommentClass::Type
-                && comment.schema == old_schema
-                && comment.name == old_name
-            {
-                comment.schema = new_schema;
-                comment.name = new_name;
-            }
-        }
-        self.move_routine_type_references(old_schema, old_name, new_schema, new_name, |ctype| {
-            matches!(ctype, ColType::Composite(candidate) | ColType::Array(ArrElem::Composite(candidate)) if candidate as usize == slot)
-        });
-        self.rename_stored_query_dependency(
-            DependencyClass::Composite,
+        let movement = type_reference_moves::TypeReferenceMove::new(
+            self.composite(slot).database,
+            type_reference_moves::TypeReferenceKind::Composite,
             slot,
-            None,
-            new_schema,
-            new_name,
+            UserTypeName {
+                schema: old_schema,
+                name: old_name,
+            },
+            UserTypeName {
+                schema: new_schema,
+                name: new_name,
+            },
         );
-    }
-
-    fn move_routine_type_references(
-        &mut self,
-        old_schema: SqlName,
-        old_name: SqlName,
-        new_schema: SqlName,
-        new_name: SqlName,
-        uses: impl Fn(ColType) -> bool,
-    ) {
-        let move_argument = |argument: &mut RoutineArgumentDef| {
-            if uses(argument.ctype)
-                && argument.user_type
-                    == Some(UserTypeName {
-                        schema: old_schema,
-                        name: old_name,
-                    })
-            {
-                argument.user_type = Some(UserTypeName {
-                    schema: new_schema,
-                    name: new_name,
-                });
-            }
-        };
-        let move_result = |result: &mut RoutineResult| {
-            if uses(result.ctype)
-                && result.user_type
-                    == Some(UserTypeName {
-                        schema: old_schema,
-                        name: old_name,
-                    })
-            {
-                result.user_type = Some(UserTypeName {
-                    schema: new_schema,
-                    name: new_name,
-                });
-            }
-        };
-        let mut routines = self.routines.lock().expect("routine catalog lock poisoned");
-        for routine in routines.iter_mut() {
-            for argument in routine.arguments.iter_mut().take(routine.argument_count) {
-                move_argument(argument);
-            }
-            for column in routine
-                .result_columns
-                .iter_mut()
-                .take(routine.result_column_count)
-            {
-                move_argument(column);
-            }
-            for parameter in routine.parameters.iter_mut().take(routine.parameter_count) {
-                let mut argument = RoutineArgumentDef {
-                    name: parameter.name,
-                    ctype: parameter.ctype,
-                    user_type: parameter.user_type,
-                };
-                move_argument(&mut argument);
-                parameter.user_type = argument.user_type;
-            }
-            match &mut routine.kind {
-                RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
-                    move_result(result)
-                }
-                RoutineKind::Aggregate(aggregate) => {
-                    move_result(&mut aggregate.state_type);
-                    move_result(&mut aggregate.result_type);
-                    if let Some(moving) = &mut aggregate.moving {
-                        move_result(&mut moving.state_type);
-                    }
-                }
-                _ => {}
-            }
-            if let Some(pending) = &mut routine.pending_definition {
-                for argument in pending.arguments.iter_mut().take(pending.argument_count) {
-                    move_argument(argument);
-                }
-                for column in pending
-                    .result_columns
-                    .iter_mut()
-                    .take(pending.result_column_count)
-                {
-                    move_argument(column);
-                }
-                for parameter in pending.parameters.iter_mut().take(pending.parameter_count) {
-                    let mut argument = RoutineArgumentDef {
-                        name: parameter.name,
-                        ctype: parameter.ctype,
-                        user_type: parameter.user_type,
-                    };
-                    move_argument(&mut argument);
-                    parameter.user_type = argument.user_type;
-                }
-                match &mut pending.kind {
-                    RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
-                        move_result(result)
-                    }
-                    RoutineKind::Aggregate(aggregate) => {
-                        move_result(&mut aggregate.state_type);
-                        move_result(&mut aggregate.result_type);
-                        if let Some(moving) = &mut aggregate.moving {
-                            move_result(&mut moving.state_type);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        self.move_type_references(movement);
     }
 
     pub(crate) fn rollback_composite_alter(
@@ -43007,15 +42679,6 @@ impl Storage {
             return true;
         }
 
-        // A domain is implicitly treated as its base type when passed out of
-        // the domain, but PostgreSQL does not implicitly manufacture a value
-        // of a different domain at routine lookup.
-        let expected_is_domain = (oid::FIRST_DOMAIN
-            ..oid::FIRST_DOMAIN + self.domain_count() as i32)
-            .contains(&expected_oid);
-        if expected_is_domain {
-            return false;
-        }
         let actual = match self.routine_result_for_oid(actual_oid, txid) {
             Some(actual) => actual,
             None => return false,
@@ -43024,8 +42687,12 @@ impl Storage {
             Some(expected) => expected,
             None => return false,
         };
-        if actual.user_type.is_some() && actual.ctype == expected.ctype {
-            return true;
+        // Resolve domain candidates through their base types. Execution still
+        // checks the declared domain before the routine receives the value.
+        let actual_base = actual.ctype.oid();
+        let expected_base = expected.ctype.oid();
+        if actual_base != actual_oid || expected_base != expected_oid {
+            return self.routine_implicit_cast(actual_base, expected_base, txid);
         }
         if let (ColType::Array(actual), ColType::Array(expected)) = (actual.ctype, expected.ctype) {
             return self.routine_implicit_cast(actual.element_oid(), expected.element_oid(), txid);
@@ -49149,6 +48816,8 @@ impl Storage {
         &mut self,
         mut definition: CastDef,
     ) -> Result<usize, SqlError> {
+        // The enclosing journal or manifest record carries the database scope.
+        definition.database = current_database();
         definition.source = self.bind_routine_result(definition.source, 0)?;
         definition.target = self.bind_routine_result(definition.target, 0)?;
         self.validate_cast_definition(definition, 0)?;
@@ -51441,50 +51110,52 @@ impl Storage {
         right_oid: Option<i32>,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
-        let mut exact = None;
-        let mut coercible = None;
-        for (slot, definition) in self.operators_visible_to(txid) {
-            if definition.name.as_str() != name
-                || schema.is_some_and(|schema| definition.schema.as_str() != schema)
-                || (schema.is_none() && !self.operator_schema_matches_path(definition.schema))
-                || definition.signature.arity()
-                    != left_oid.is_some() as usize + right_oid.is_some() as usize
-            {
-                continue;
-            }
-            let left_expected = definition.signature.left.and_then(|argument| {
-                self.routine_type_oid(argument.ctype, argument.user_type, txid)
-            });
-            let right_expected = definition.signature.right.and_then(|argument| {
-                self.routine_type_oid(argument.ctype, argument.user_type, txid)
-            });
-            let is_exact = left_expected == left_oid && right_expected == right_oid;
-            let accepts = [(left_oid, left_expected), (right_oid, right_expected)]
-                .into_iter()
-                .all(|(actual, expected)| match (actual, expected) {
-                    (None, None) => true,
-                    (Some(actual), Some(expected)) => {
-                        actual == expected || self.routine_implicit_cast(actual, expected, txid)
-                    }
-                    _ => false,
+        // Resolve exact signatures before considering coercions. A later exact
+        // match must not be hidden by two earlier coercible domain overloads.
+        for exact_only in [true, false] {
+            let mut found = None;
+            for (slot, definition) in self.operators_visible_to(txid) {
+                if definition.name.as_str() != name
+                    || schema.is_some_and(|schema| definition.schema.as_str() != schema)
+                    || (schema.is_none() && !self.operator_schema_matches_path(definition.schema))
+                    || definition.signature.arity()
+                        != left_oid.is_some() as usize + right_oid.is_some() as usize
+                {
+                    continue;
+                }
+                let left_expected = definition.signature.left.and_then(|argument| {
+                    self.routine_type_oid(argument.ctype, argument.user_type, txid)
                 });
-            if is_exact {
-                if exact.replace(slot).is_some() {
+                let right_expected = definition.signature.right.and_then(|argument| {
+                    self.routine_type_oid(argument.ctype, argument.user_type, txid)
+                });
+                let accepts = if exact_only {
+                    left_expected == left_oid && right_expected == right_oid
+                } else {
+                    [(left_oid, left_expected), (right_oid, right_expected)]
+                        .into_iter()
+                        .all(|(actual, expected)| match (actual, expected) {
+                            (None, None) => true,
+                            (Some(actual), Some(expected)) => {
+                                actual == expected
+                                    || self.routine_implicit_cast(actual, expected, txid)
+                            }
+                            _ => false,
+                        })
+                };
+                if accepts && found.replace(slot).is_some() {
                     return Err(sql_err!(
                         sqlstate::AMBIGUOUS_FUNCTION,
                         "operator is not unique: {}",
                         name
                     ));
                 }
-            } else if accepts && coercible.replace(slot).is_some() {
-                return Err(sql_err!(
-                    sqlstate::AMBIGUOUS_FUNCTION,
-                    "operator is not unique: {}",
-                    name
-                ));
+            }
+            if found.is_some() {
+                return Ok(found);
             }
         }
-        Ok(exact.or(coercible))
+        Ok(None)
     }
 
     /// Resolves the binary input contract for Parse parameters before their

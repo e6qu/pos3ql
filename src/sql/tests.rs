@@ -18917,6 +18917,37 @@ fn message_types(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+fn error_sqlstates(bytes: &[u8]) -> Vec<&str> {
+    let mut states = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let tag = bytes[offset];
+        let length = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        assert!(
+            length >= 4,
+            "protocol message length includes its four-byte header"
+        );
+        if tag == b'E' {
+            let mut fields = &bytes[offset + 5..offset + 1 + length];
+            while let Some((&field, remaining)) = fields.split_first() {
+                if field == 0 {
+                    break;
+                }
+                let end = remaining
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .expect("terminated error field");
+                if field == b'C' {
+                    states.push(core::str::from_utf8(&remaining[..end]).expect("SQLSTATE is text"));
+                }
+                fields = &remaining[end + 1..];
+            }
+        }
+        offset += 1 + length;
+    }
+    states
+}
+
 fn row_description_type_oids(bytes: &[u8]) -> Vec<i32> {
     let mut offset = 0;
     while offset < bytes.len() {
@@ -29310,20 +29341,10 @@ fn generate_series_table_function() {
         &mut t,
         "SELECT generate_series(1.0::numeric, 2.0::numeric, 0::numeric)",
     );
-    assert!(
-        core::str::from_utf8(&zero_step)
-            .expect("wire response is UTF-8 outside payload values")
-            .contains("22023"),
-        "{zero_step:?}"
-    );
+    assert_eq!(error_sqlstates(&zero_step), ["22023"], "{zero_step:?}");
     let sql = "SELECT generate_series('2000-01-01'::timestamp, '2000-01-02'::timestamp)";
     let response = run_with_txn_bytes(&mut e, &mut b, &mut t, sql);
-    assert!(
-        core::str::from_utf8(&response)
-            .expect("wire response is UTF-8 outside payload values")
-            .contains("42883"),
-        "{sql}: {response:?}"
-    );
+    assert_eq!(error_sqlstates(&response), ["42883"], "{sql}: {response:?}");
     assert_eq!(
         data_rows(&run_with_txn_bytes(
             &mut e,
@@ -83039,4 +83060,514 @@ fn dml_target_partition_constraint_flags_cover_columns_past_sixty_four() {
     drop(session);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+const TYPE_REFERENCE_SETUP: &str = include_str!("../../tests/external/type_reference_setup.sql");
+const TYPE_REFERENCE_MOVES: &str = include_str!("../../tests/external/type_reference_moves.sql");
+const TYPE_REFERENCE_SNAPSHOT: &str =
+    include_str!("../../tests/external/type_reference_snapshot.sql");
+
+fn type_reference_execute(engine: &mut Engine, budget: &mut Budget, sql: &str) -> Vec<String> {
+    let output = run_with_ddl_capacity(engine, budget, sql, 32, 4 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    data_rows(&output)
+}
+
+fn type_reference_setup_databases(engine: &mut Engine, budget: &mut Budget) -> Vec<String> {
+    for database in [
+        crate::storage::DatabaseOid::POSTGRES,
+        crate::storage::DatabaseOid::TEMPLATE1,
+    ] {
+        engine.select_database(database).unwrap();
+        type_reference_execute(engine, budget, TYPE_REFERENCE_SETUP);
+    }
+    type_reference_execute(engine, budget, TYPE_REFERENCE_SNAPSHOT)
+}
+
+#[test]
+fn type_reference_moves_preserve_other_database_definitions_and_comments() {
+    let (mut engine, mut budget) = test_engine();
+    let before = type_reference_setup_databases(&mut engine, &mut budget);
+    assert_eq!(
+        before[1],
+        "type_scope.shared_domain|type_scope.shared_enum|type_scope.shared_record"
+    );
+    engine
+        .select_database(crate::storage::DatabaseOid::POSTGRES)
+        .unwrap();
+    let moved = run_with_fixed_memory(&mut engine, &budget, TYPE_REFERENCE_MOVES, 32 << 20);
+    assert!(
+        !String::from_utf8_lossy(&moved).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&moved)
+    );
+    engine
+        .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+        .unwrap();
+    let table = engine
+        .storage
+        .find_visible("type_scope", "items", 0)
+        .unwrap();
+    {
+        let definition = engine.storage.table_def(table, 0);
+        assert_eq!(
+            definition.columns()[0].user_type,
+            Some(crate::storage::UserTypeName {
+                schema: SqlName::parse("type_scope").unwrap(),
+                name: SqlName::parse("shared_domain").unwrap(),
+            }),
+            "type rename changed another database"
+        );
+    }
+    assert_eq!(
+        type_reference_execute(&mut engine, &mut budget, TYPE_REFERENCE_SNAPSHOT),
+        before,
+        "type rename changed another database"
+    );
+    assert_eq!(
+        type_reference_execute(
+            &mut engine,
+            &mut budget,
+            "SELECT type_scope.echo_domain(7), 7::type_scope.child_domain"
+        ),
+        ["7|7"]
+    );
+}
+
+#[test]
+fn type_reference_moves_pending_images_survive_journal_and_checkpoint_cold_recovery() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    for checkpoint in [false, true] {
+        let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+        let mut config = test_config(&format!("type-reference-{sequence}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket =
+            format!("sql-type-reference-{}-{sequence}", std::process::id());
+        config.object_store_response_bytes = 1 << 20;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.wal_upload_buffer_bytes = 256 << 10;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let untouched = type_reference_setup_databases(&mut engine, &mut budget);
+        engine
+            .select_database(crate::storage::DatabaseOid::POSTGRES)
+            .unwrap();
+        let original = type_reference_execute(&mut engine, &mut budget, TYPE_REFERENCE_SNAPSHOT);
+        let rolled_back = format!("BEGIN; {TYPE_REFERENCE_MOVES} ROLLBACK;");
+        type_reference_execute(&mut engine, &mut budget, &rolled_back);
+        assert_eq!(
+            type_reference_execute(&mut engine, &mut budget, TYPE_REFERENCE_SNAPSHOT),
+            original
+        );
+        let pending = format!(
+            "BEGIN;
+             ALTER TABLE type_scope.items ADD COLUMN pending type_scope.shared_domain;
+             ALTER TYPE type_scope.shared_record ADD ATTRIBUTE pending type_scope.shared_domain;
+             ALTER DOMAIN type_scope.child_domain SET NOT NULL;
+             CREATE OR REPLACE FUNCTION type_scope.echo_domain(arg type_scope.shared_domain)
+             RETURNS type_scope.shared_domain LANGUAGE SQL AS 'SELECT arg';
+             {TYPE_REFERENCE_MOVES}
+             CREATE CAST (type_after.renamed_domain AS text) WITH INOUT;
+             ALTER OPERATOR type_scope.## (NONE, type_after.renamed_domain) OWNER TO postgres;
+             ALTER OPERATOR FAMILY type_scope.domain_ops USING btree OWNER TO postgres;
+             ALTER OPERATOR CLASS type_scope.domain_ops USING btree OWNER TO postgres;
+             COMMIT;"
+        );
+        type_reference_execute(&mut engine, &mut budget, &pending);
+        let published = type_reference_execute(&mut engine, &mut budget, TYPE_REFERENCE_SNAPSHOT);
+        assert_eq!(
+            published[1],
+            "type_after.renamed_domain|type_after.renamed_enum|type_after.renamed_record"
+        );
+        assert_eq!(
+            published.last().map(String::as_str),
+            Some("type_after.renamed_domain|text")
+        );
+        assert_eq!(
+            type_reference_execute(
+                &mut engine,
+                &mut budget,
+                "SELECT type_scope.echo_domain(7), 7::type_scope.child_domain"
+            ),
+            ["7|7"]
+        );
+        if checkpoint {
+            assert!(engine.checkpoint().unwrap());
+        }
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+        let mut recovered = Engine::new(&config, &mut recovered_budget)
+            .unwrap_or_else(|error| panic!("checkpoint={checkpoint}: {error:?}"));
+        assert_eq!(
+            type_reference_execute(
+                &mut recovered,
+                &mut recovered_budget,
+                TYPE_REFERENCE_SNAPSHOT
+            ),
+            published
+        );
+        recovered
+            .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+            .unwrap();
+        assert_eq!(
+            type_reference_execute(
+                &mut recovered,
+                &mut recovered_budget,
+                TYPE_REFERENCE_SNAPSHOT
+            ),
+            untouched,
+            "type rename changed another database after cold recovery"
+        );
+    }
+}
+
+#[test]
+fn type_reference_moves_enum_drop_selects_only_its_database() {
+    let (mut engine, mut budget) = test_engine();
+    type_reference_setup_databases(&mut engine, &mut budget);
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "DROP TYPE type_scope.drop_enum",
+        32 << 20,
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    assert_eq!(
+        type_reference_execute(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_type WHERE typname = 'drop_enum'"
+        ),
+        ["0"],
+        "enum drop selected another database"
+    );
+    engine
+        .select_database(crate::storage::DatabaseOid::POSTGRES)
+        .unwrap();
+    assert_eq!(
+        type_reference_execute(
+            &mut engine,
+            &mut budget,
+            "SELECT 'ready'::type_scope.drop_enum::text"
+        ),
+        ["ready"]
+    );
+}
+
+#[test]
+fn type_reference_moves_domain_calls_preserve_cast_context_and_constraints() {
+    let (mut engine, mut budget) = test_engine();
+    type_reference_execute(
+        &mut engine,
+        &mut budget,
+        include_str!("../../tests/external/type_reference_coercion_setup.sql"),
+    );
+    let accepted = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT routine_domains.echo(7), routine_domains.echo(7::smallint),
+                routine_domains.echo(7::routine_domains.other),
+                routine_domains.echo(arg => 7), routine_domains.widen(7);
+         SELECT routine_domains.choose(7),
+                routine_domains.choose(7::routine_domains.positive);
+         SELECT routine_domains.first(ARRAY[7, 8]);",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&accepted),
+        ["7|7|7|7|7", "base|domain", "7"],
+        "{}",
+        String::from_utf8_lossy(&accepted)
+    );
+    for (query, state) in [
+        ("SELECT routine_domains.echo(-1)", "23514"),
+        ("SELECT routine_domains.echo(NULL)", "23502"),
+        ("SELECT routine_domains.echo(7::bigint)", "42883"),
+        ("SELECT routine_domains.first(ARRAY[7, -8])", "23514"),
+        ("SELECT pg_typeof(1)::smallint", "42846"),
+        ("SELECT 1 WHERE FALSE LIMIT -1", "2201W"),
+        ("SELECT 1 WHERE FALSE OFFSET -1", "2201X"),
+        ("SELECT NULL::regtype::smallint", "42846"),
+        ("SELECT 23::oid::smallint", "42846"),
+        ("SELECT 'pg_class'::regclass::smallint", "42846"),
+        (
+            "PREPARE rejected_type_cast AS SELECT NULL::regtype::smallint",
+            "42846",
+        ),
+    ] {
+        let output = run_with_fixed_memory(&mut engine, &budget, query, 32 << 20);
+        assert!(
+            String::from_utf8_lossy(&output).contains(state),
+            "{query}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let custom = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE SEQUENCE routine_domains.cast_calls START 7;
+         CREATE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
+         LANGUAGE SQL VOLATILE STRICT AS 'SELECT nextval(''routine_domains.cast_calls'')::smallint';
+         CREATE CAST (regtype AS smallint) WITH FUNCTION routine_domains.small_type(regtype);
+         SELECT pg_typeof(1)::smallint, (NULL::regtype::smallint) IS NULL;
+         SELECT pg_typeof(1)::smallint = 8 AND TRUE;
+         SELECT FALSE AND pg_typeof(1)::smallint > 0;
+         SELECT currval('routine_domains.cast_calls');
+         CREATE FUNCTION routine_domains.bump() RETURNS bigint
+         LANGUAGE SQL VOLATILE AS 'SELECT nextval(''routine_domains.cast_calls'')';
+         CREATE FUNCTION routine_domains.nested() RETURNS bigint
+         LANGUAGE SQL VOLATILE AS 'SELECT nextval(''routine_domains.cast_calls'') + routine_domains.bump()';
+         SELECT routine_domains.nested();
+         SELECT currval('routine_domains.cast_calls');
+         DROP FUNCTION routine_domains.nested();
+         DROP FUNCTION routine_domains.bump();
+         SELECT nextval('routine_domains.cast_calls') WHERE FALSE;
+         SELECT generate_series(1, 3) WHERE nextval('routine_domains.cast_calls') > 0;
+         SELECT currval('routine_domains.cast_calls');
+         SELECT generate_series(1, nextval('routine_domains.cast_calls')::integer) WHERE FALSE;
+         SELECT currval('routine_domains.cast_calls');
+         SELECT nextval('routine_domains.cast_calls') LIMIT 0;
+         SELECT currval('routine_domains.cast_calls');
+         CREATE TABLE routine_domains.filtered(value integer);
+         INSERT INTO routine_domains.filtered SELECT generate_series(1, 3)
+         WHERE nextval('routine_domains.cast_calls') > 0;
+         SELECT value FROM routine_domains.filtered ORDER BY value;
+         SELECT currval('routine_domains.cast_calls');
+         DROP CAST (regtype AS smallint);",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&custom),
+        [
+            "7|t", "t", "f", "8", "19", "10", "1", "2", "3", "11", "11", "11", "1", "2", "3", "12"
+        ],
+        "{}",
+        String::from_utf8_lossy(&custom)
+    );
+    let immutable = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE OR REPLACE FUNCTION routine_domains.small_type(arg regtype) RETURNS smallint
+         LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT (1 / 0)::smallint';
+         CREATE CAST (regtype AS smallint) WITH FUNCTION routine_domains.small_type(regtype);
+         CREATE FUNCTION routine_domains.small_type(arg boolean) RETURNS smallint
+         LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT (1 / 0)::smallint';
+         CREATE CAST (boolean AS smallint) WITH FUNCTION routine_domains.small_type(boolean);",
+        32 << 20,
+    );
+    assert!(
+        !String::from_utf8_lossy(&immutable).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&immutable)
+    );
+    let skipped = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT pg_typeof(1)::smallint WHERE FALSE",
+        32 << 20,
+    );
+    assert!(
+        !String::from_utf8_lossy(&skipped).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&skipped)
+    );
+    assert!(data_rows(&skipped).is_empty());
+    let folded = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT TRUE::smallint WHERE FALSE",
+        32 << 20,
+    );
+    assert!(
+        String::from_utf8_lossy(&folded).contains("22012"),
+        "{}",
+        String::from_utf8_lossy(&folded)
+    );
+    type_reference_execute(
+        &mut engine,
+        &mut budget,
+        "DROP CAST (regtype AS smallint); DROP CAST (boolean AS smallint)",
+    );
+    // Pending drops retain their slots until this request commits.
+    type_reference_execute(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION routine_domains.small_type(regtype); DROP FUNCTION routine_domains.small_type(boolean)",
+    );
+    let exact = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE FUNCTION routine_domains.equal_positive(a routine_domains.positive, b routine_domains.positive)\nRETURNS boolean LANGUAGE SQL IMMUTABLE RETURN TRUE;\nCREATE FUNCTION routine_domains.equal_other(a routine_domains.other, b routine_domains.other)\nRETURNS boolean LANGUAGE SQL IMMUTABLE RETURN FALSE;\nCREATE OPERATOR routine_domains.=== (\n    FUNCTION = routine_domains.equal_positive,\n    LEFTARG = routine_domains.positive, RIGHTARG = routine_domains.positive);\nCREATE OPERATOR routine_domains.=== (\n    FUNCTION = routine_domains.equal_other,\n    LEFTARG = routine_domains.other, RIGHTARG = routine_domains.other);\nSELECT 7::routine_domains.positive OPERATOR(routine_domains.===) 8::routine_domains.positive,\n       7::routine_domains.other OPERATOR(routine_domains.===) 8::routine_domains.other;\nPREPARE exact_domain_operator AS\nSELECT $1::routine_domains.positive OPERATOR(routine_domains.===) $2::routine_domains.positive;\nEXECUTE exact_domain_operator(7, 8);\nDEALLOCATE exact_domain_operator;\n",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&exact),
+        ["t|f", "t"],
+        "{}",
+        String::from_utf8_lossy(&exact)
+    );
+    assert!(
+        !String::from_utf8_lossy(&exact).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&exact)
+    );
+    let ambiguous = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT 7 OPERATOR(routine_domains.===) 8",
+        32 << 20,
+    );
+    assert!(
+        String::from_utf8_lossy(&ambiguous).contains("42725"),
+        "{}",
+        String::from_utf8_lossy(&ambiguous)
+    );
+    type_reference_execute(&mut engine, &mut budget, "CREATE ROLE domain_cast_owner");
+    assert_eq!(
+        type_reference_execute(
+            &mut engine,
+            &mut budget,
+            "BEGIN;
+GRANT USAGE, CREATE ON SCHEMA routine_domains TO domain_cast_owner;
+ALTER DOMAIN routine_domains.positive OWNER TO domain_cast_owner;
+SET ROLE domain_cast_owner;
+ALTER DOMAIN routine_domains.positive RENAME TO moved_positive;
+CREATE CAST (routine_domains.moved_positive AS text) WITH INOUT;
+SELECT castsource::regtype::text, casttarget::regtype::text,
+       format_type(castsource, NULL),
+       'routine_domains.moved_positive[]'::regtype::oid::regtype::text
+FROM pg_cast
+WHERE castsource = 'routine_domains.moved_positive'::regtype::oid
+AND casttarget = 'text'::regtype::oid;
+RESET ROLE;
+ROLLBACK;"
+        ),
+        [
+            "routine_domains.moved_positive|text|routine_domains.moved_positive|routine_domains.moved_positive[]"
+        ]
+    );
+    type_reference_execute(&mut engine, &mut budget, "DROP ROLE domain_cast_owner");
+    let dropped = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "DROP SCHEMA routine_domains CASCADE",
+        32 << 20,
+    );
+    let notices = String::from_utf8_lossy(&dropped);
+    assert!(
+        notices.contains(
+            "operator routine_domains.===(routine_domains.positive,routine_domains.positive)"
+        ),
+        "{notices}"
+    );
+    assert!(
+        notices.contains("routine_domains.echo(routine_domains.positive)"),
+        "{notices}"
+    );
+    assert!(
+        notices.contains("routine_domains.first(routine_domains.positive[])"),
+        "{notices}"
+    );
+}
+
+#[test]
+fn type_reference_moves_composite_names_survive_prepared_checkpoint_recovery() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("prepared-type-names-{sequence}"));
+    config.max_ddl_per_transaction = 32;
+    config.max_prepared_transactions = 2;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-prepared-type-names-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 << 10;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let untouched = type_reference_setup_databases(&mut engine, &mut budget);
+    engine
+        .select_database(crate::storage::DatabaseOid::POSTGRES)
+        .unwrap();
+    type_reference_execute(
+        &mut engine,
+        &mut budget,
+        &format!("BEGIN; {TYPE_REFERENCE_MOVES} PREPARE TRANSACTION 'type_names';"),
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    type_reference_execute(
+        &mut recovered,
+        &mut recovered_budget,
+        "COMMIT PREPARED 'type_names'",
+    );
+    let published = type_reference_execute(
+        &mut recovered,
+        &mut recovered_budget,
+        TYPE_REFERENCE_SNAPSHOT,
+    );
+    assert_eq!(
+        published[0],
+        "type_after.renamed_domain|type_after.renamed_enum[]|type_after.renamed_record"
+    );
+    recovered
+        .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+        .unwrap();
+    assert_eq!(
+        type_reference_execute(
+            &mut recovered,
+            &mut recovered_budget,
+            TYPE_REFERENCE_SNAPSHOT
+        ),
+        untouched
+    );
+}
+
+#[test]
+fn type_reference_moves_sequence_programs_use_engine_execution() {
+    let mut budget = Budget::new(1 << 20);
+    let arena = Arena::new(&mut budget, "routine sequence classification", 1 << 20).unwrap();
+    for body in [
+        "SELECT nextval('s')",
+        "SELECT currval('s')",
+        "SELECT lastval()",
+        "SELECT setval('s', 9)",
+        "SELECT (SELECT nextval('s'))",
+        "SELECT CASE WHEN TRUE THEN nextval('s') ELSE 0 END",
+        "SELECT v FROM (SELECT nextval('s') AS v) AS q",
+        "SELECT * FROM nextval('s')",
+        "WITH q AS (SELECT nextval('s') AS v) SELECT v FROM q",
+        "SELECT nextval('s') UNION ALL SELECT 0",
+        "SELECT 0 UNION ALL SELECT nextval('s')",
+        "SELECT currval('s'); SELECT 0",
+    ] {
+        let program = query::parse_routine_function_program(body, &arena, false, "f", &[]).unwrap();
+        assert!(
+            query::routine_program_requires_mutable_execution(&program),
+            "{body}"
+        );
+    }
+    for body in ["SELECT 1", "SELECT abs(-1)", "SELECT random()"] {
+        let program = query::parse_routine_function_program(body, &arena, false, "f", &[]).unwrap();
+        assert!(
+            !query::routine_program_requires_mutable_execution(&program),
+            "{body}"
+        );
+    }
 }

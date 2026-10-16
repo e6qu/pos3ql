@@ -36,6 +36,9 @@ machine do not establish production availability or speed.
 
 ## What recent work taught us
 
+- A function used by a cast can still change sequence state. Planning must
+  respect its declared volatility, and a suspended function must not advance
+  the same sequence twice when execution resumes.
 - Protecting a reader's selected data and releasing it at the right time is
   necessary before allowing concurrent writes. A running statement, a
   transaction, and a streaming upload can keep data alive for different periods.
@@ -73,6 +76,11 @@ waiting for one table does not reserve shared version or comment resources.
 Row publication rechecks the database, table identity and visible existence.
 Table-name selection uses small per-table views; it waits only for the selected
 definition and rechecks its identity before returning a match.
+Type moves retain cast and operator input/output identities through journal replay,
+including edits and cast creation staged after a rename in the same transaction. Cast recovery
+uses the enclosing journal or checkpoint database scope. Type access checks use
+the transaction-visible name after a pending rename; regtype and format_type
+display that name for domains and their arrays.
 The [implementation guide](docs/implemented-baseline.md) owns completed contracts,
 user examples and exact capacity errors.
 
@@ -84,7 +92,7 @@ Still to do:
   maintenance scheduling. Complete rewrites must preserve historical object
   versions needed by active readers.
 - Verify release after errors, rollback, and transaction end, and prevent
-  reused identities from being mistaken for older data.
+  reused identities or names in another database from being mistaken for older data.
 
 Done when: an unrelated write can complete while a reader retains old data;
 maintenance preserves that data; failed publication leaves the prior state

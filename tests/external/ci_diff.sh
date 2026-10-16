@@ -1577,6 +1577,11 @@ if "$PY" "$EXT/join_capacity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/jo
 else
   bad "join capacity differential"; cat "$WORK/join-capacity.out"
 fi
+if "$PY" "$EXT/type_database_isolation_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --user "$PGUSER" > "$WORK/type-database-isolation.out" 2>&1; then
+  ok "database-local type moves ($(tail -1 "$WORK/type-database-isolation.out"))"
+else
+  bad "database-local type moves"; cat "$WORK/type-database-isolation.out"
+fi
 if "$PY" "$EXT/type_fidelity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/type_fidelity.out" 2>&1; then
   ok "accepted-type fidelity matrix ($(tail -1 "$WORK/type_fidelity.out"))"
 else

@@ -825,26 +825,47 @@ fn routine_statement_forbidden(statement: &Stmt<'_>) -> Option<&'static str> {
     })
 }
 
-pub(crate) fn routine_statement_is_query(statement: &Stmt<'_>) -> bool {
-    matches!(statement, Stmt::Select(_) | Stmt::SetQuery(_))
-}
-
 /// Whether a scalar routine needs the engine-owned executor rather than the
 /// read-only evaluator bridge. This is a property of the parsed program, not
 /// a spelling heuristic at an individual call site.
 pub(crate) fn routine_program_requires_mutable_execution(
     program: &RoutineFunctionProgram<'_>,
 ) -> bool {
+    let needs_sequences = |name: &str, _arguments: usize| {
+        matches!(name, "nextval" | "currval" | "lastval" | "setval")
+    };
+    let query_needs_engine = |query: &RoutineQuery<'_>| match query {
+        RoutineQuery::Select(select) => cte::select_contains_function(select, &needs_sequences),
+        RoutineQuery::Set(query) => {
+            query
+                .with
+                .iter()
+                .any(|cte| cte::select_contains_function(cte.query, &needs_sequences))
+                || cte::set_tree_contains_function(query.body, &needs_sequences)
+                || query.order_by.iter().any(|order| {
+                    cte::expression_contains_function(order.expression, &needs_sequences)
+                })
+                || query
+                    .limit
+                    .is_some_and(|expr| cte::expression_contains_function(expr, &needs_sequences))
+                || query
+                    .offset
+                    .is_some_and(|expr| cte::expression_contains_function(expr, &needs_sequences))
+        }
+    };
+    let statement_needs_engine = |statement: &Stmt<'_>| match statement {
+        Stmt::Select(select) => query_needs_engine(&RoutineQuery::Select(select)),
+        Stmt::SetQuery(query) => query_needs_engine(&RoutineQuery::Set(query)),
+        _ => true,
+    };
     program.preceding.iter().any(|step| match step {
-        RoutinePrelude::Statement(statement) => !routine_statement_is_query(statement),
+        RoutinePrelude::Statement(statement) => statement_needs_engine(statement),
         RoutinePrelude::Forbidden(_) => true,
-    }) || matches!(
-        program.result,
-        RoutineFunctionResult::DataModification(_) | RoutineFunctionResult::Forbidden(_)
-    ) || matches!(
-        program.result,
-        RoutineFunctionResult::Void(statement) if !routine_statement_is_query(statement)
-    )
+    }) || match program.result {
+        RoutineFunctionResult::Query(query) => query_needs_engine(query),
+        RoutineFunctionResult::Void(statement) => statement_needs_engine(statement),
+        RoutineFunctionResult::DataModification(_) | RoutineFunctionResult::Forbidden(_) => true,
+    }
 }
 
 pub(crate) fn routine_forbidden_statement_error(statement: &str) -> SqlError {
@@ -879,7 +900,9 @@ pub(crate) fn execute_routine_query<'a>(
     recycling: bool,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    execute_routine_query_under(query, storage, txid, arena, params, recycling, None, emit)
+    execute_routine_query_under(
+        query, storage, txid, arena, params, recycling, None, None, emit,
+    )
 }
 
 #[expect(
@@ -895,10 +918,13 @@ pub(crate) fn execute_bound_routine_query<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     recycling: bool,
+    sequences: Option<&dyn SequenceAccess>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     if routine.body_kind == crate::storage::RoutineBodyKind::String {
-        return execute_routine_query(query, storage, txid, arena, params, recycling, emit);
+        return execute_routine_query_under(
+            query, storage, txid, arena, params, recycling, sequences, None, emit,
+        );
     }
     let user = super::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(routine.creation_path.as_str(), user.as_str(), txid);
@@ -910,6 +936,7 @@ pub(crate) fn execute_bound_routine_query<'a>(
         arena,
         params,
         recycling,
+        sequences,
         Some((path, dependencies.view())),
         emit,
     )
@@ -991,6 +1018,7 @@ fn execute_routine_query_under<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     recycling: bool,
+    sequences: Option<&dyn SequenceAccess>,
     stored: Option<(
         crate::storage::PathContext,
         crate::storage::StoredQueryDependencyView<'a>,
@@ -1008,21 +1036,23 @@ fn execute_routine_query_under<'a>(
                     dependencies,
                     arena,
                     params,
-                    None,
+                    sequences,
                 )?,
-                None => expand_ctes_exec(select, storage, txid, arena, params, &[], None)?,
+                None => expand_ctes_exec(select, storage, txid, arena, params, &[], sequences)?,
             };
             validate_locking(select)?;
             if recycling {
-                select_into_rows_recycling(storage, txid, select, arena, params, None, None, emit)
+                select_into_rows_recycling(
+                    storage, txid, select, arena, params, None, sequences, emit,
+                )
             } else {
-                select_into_rows(storage, txid, select, arena, params, None, None, emit)
+                select_into_rows(storage, txid, select, arena, params, None, sequences, emit)
             }
         }
         RoutineQuery::Set(query) => {
             let Some((path, dependencies)) = stored else {
                 return setops::set_query_into_rows(
-                    storage, txid, query, arena, params, None, emit,
+                    storage, txid, query, arena, params, sequences, emit,
                 );
             };
             let body = cte::expand_stored_set_tree_exec(
@@ -1030,7 +1060,7 @@ fn execute_routine_query_under<'a>(
                 query.body,
                 storage,
                 txid,
-                cte::StoredExecutionContext::new(path, dependencies, params, None),
+                cte::StoredExecutionContext::new(path, dependencies, params, sequences),
                 arena,
             )?;
             let rebound = SetQuery {
@@ -1039,7 +1069,7 @@ fn execute_routine_query_under<'a>(
                 ..**query
             };
             let rebound = arena.alloc(rebound).map_err(|_| arena_full())?;
-            setops::set_query_into_rows(storage, txid, rebound, arena, params, None, emit)
+            setops::set_query_into_rows(storage, txid, rebound, arena, params, sequences, emit)
         }
     }
 }
@@ -1584,6 +1614,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     self.routine_workspace,
                     &parameters[..arguments.len()],
                     true,
+                    None,
                     &mut |_| Ok(()),
                 )?;
             }
@@ -1616,6 +1647,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         self.routine_workspace,
                         &parameters[..arguments.len()],
                         true,
+                        None,
                         &mut |_| Ok(()),
                     )?;
                     return Ok(Some(Datum::Text("")));
@@ -1633,6 +1665,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 self.routine_workspace,
                 &parameters[..arguments.len()],
                 true,
+                None,
                 &mut |values| {
                     let expected = record_columns.map_or(1, <[_]>::len);
                     if values.len() != expected {
@@ -2646,6 +2679,41 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 )
             })?;
         self.execute_routine(slot, routine, arguments, arena)
+    }
+
+    fn cast_evaluation(
+        &self,
+        source_oid: i32,
+        target_oid: i32,
+    ) -> Result<Option<super::eval::CastEvaluation>, SqlError> {
+        let Some((_, cast)) = self
+            .storage
+            .cast_for_oids(source_oid, target_oid, self.txid)
+        else {
+            return Ok(None);
+        };
+        let immutable = match cast.method {
+            crate::storage::CastMethod::Binary => true,
+            crate::storage::CastMethod::InOut => false,
+            crate::storage::CastMethod::Function(oid) => {
+                let slot = self
+                    .storage
+                    .routine_slot_by_oid(oid, self.txid)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::UNDEFINED_FUNCTION, "cast function does not exist")
+                    })?;
+                self.storage
+                    .routine_for(slot, self.txid)
+                    .attributes
+                    .volatility
+                    == crate::storage::RoutineVolatility::Immutable
+            }
+        };
+        Ok(Some(if immutable {
+            super::eval::CastEvaluation::Immutable
+        } else {
+            super::eval::CastEvaluation::Runtime
+        }))
     }
 
     fn cast_defined<'a>(
@@ -5442,23 +5510,26 @@ fn rewrite_grouped_expr<'a>(
 pub fn check_select_constants<'a>(
     statement: &Select<'a>,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<(), SqlError> {
+    let catalog = storage_catalog(storage, arena, txid);
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
-            super::eval::check_constant_errors(expression, arena)?;
+            super::eval::check_constant_errors(expression, arena, Some(&catalog))?;
         }
     }
     if let Some(w) = statement.where_clause {
-        super::eval::check_constant_errors(w, arena)?;
+        super::eval::check_constant_errors(w, arena, Some(&catalog))?;
     }
     for g in statement.group_by {
-        super::eval::check_constant_errors(g, arena)?;
+        super::eval::check_constant_errors(g, arena, Some(&catalog))?;
     }
     if let Some(h) = statement.having {
-        super::eval::check_constant_errors(h, arena)?;
+        super::eval::check_constant_errors(h, arena, Some(&catalog))?;
     }
     for ob in statement.order_by {
-        super::eval::check_constant_errors(ob.expression, arena)?;
+        super::eval::check_constant_errors(ob.expression, arena, Some(&catalog))?;
     }
     Ok(())
 }
@@ -5847,7 +5918,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
 
     // Constant folding runs after type analysis, matching PostgreSQL's
     // analyze-then-plan order: `min(boolean)` errors before `1/0` folds.
-    if let Err(e) = check_select_constants(statement, arena) {
+    if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
     }
 
@@ -6231,6 +6302,25 @@ fn over_one_row<'a>(
         .map_err(|_| arena_full())?)
 }
 
+/// Admit the virtual input row once before scalar projection or set expansion.
+/// Both wire results and INSERT/function row sources use this boundary.
+fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
+    statement: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<srf::ProjectSet<'a>, SqlError> {
+    if let Some(predicate) = statement.where_clause
+        && !where_passes(predicate, arena, params, row, hooks)?
+    {
+        return Ok(srf::ProjectSet::empty());
+    }
+    prepare_project_set(statement.items, storage, txid, arena, params, row, hooks)
+}
+
 /// FROM-less `SELECT` (one virtual row, no columns). Item and WHERE
 /// expressions may still contain subqueries — always uncorrelated here, since
 /// there is no outer row to reference — so they are prepared once and injected
@@ -6261,7 +6351,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     statement_arena: Option<&'statement Arena>,
     responder: &mut Responder,
 ) -> Outcome {
-    if let Err(e) = check_select_constants(statement, arena) {
+    if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
     }
     // A window function needs rows to compute over, and this path has no scan
@@ -6463,18 +6553,6 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     // A set-returning function in the select list expands the single virtual
     // row into one output row per element/value.
     let srf_call = find_srf(statement.items);
-    let project_set = match prepare_project_set(
-        statement.items,
-        storage,
-        txid,
-        arena,
-        params,
-        &super::eval::NoColumns,
-        &hooks,
-    ) {
-        Ok(project_set) => project_set,
-        Err(e) => return sql_fail(e),
-    };
     responder.row_description(&columns[..n])?;
     // Resolve ORDER BY targets against the select list: ordinals and output
     // names/expressions bind to an item (whose computed value is the key —
@@ -6544,6 +6622,31 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         }
     }
 
+    let limit = match super::exec::eval_limit_pub(statement.limit, arena, params) {
+        Ok(l) => l,
+        Err(e) => return sql_fail(e),
+    };
+    let offset = match super::exec::eval_offset_pub(statement.offset, arena, params) {
+        Ok(o) => o,
+        Err(e) => return sql_fail(e),
+    };
+    let project_set = if limit == 0 {
+        srf::ProjectSet::empty()
+    } else {
+        match prepare_fromless_projection(
+            statement,
+            storage,
+            txid,
+            arena,
+            params,
+            &super::eval::NoColumns,
+            &hooks,
+        ) {
+            Ok(project_set) => project_set,
+            Err(error) => return sql_fail(error),
+        }
+    };
+
     // Materialize every output row (visible values + hidden sort keys).
     let mut n_rows = 0usize;
     let max_rows = project_set.count;
@@ -6588,13 +6691,6 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
                     }
                 }
                 _ => unreachable!("wildcard rejected by describe_items in a FROM-less select"),
-            }
-        }
-        if let Some(w) = statement.where_clause {
-            match where_passes(w, arena, params, &super::eval::NoColumns, &khooks) {
-                Ok(false) => continue,
-                Ok(true) => {}
-                Err(e) => return sql_fail(e),
             }
         }
         for (j, ob) in statement.order_by.iter().enumerate() {
@@ -6696,14 +6792,6 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         });
     }
 
-    let limit = match super::exec::eval_limit_pub(statement.limit, arena, params) {
-        Ok(l) => l,
-        Err(e) => return sql_fail(e),
-    };
-    let offset = match super::exec::eval_offset_pub(statement.offset, arena, params) {
-        Ok(o) => o,
-        Err(e) => return sql_fail(e),
-    };
     let start = (offset as usize).min(out_rows.len());
     let mut end = offset.saturating_add(limit).min(out_rows.len() as u64) as usize;
     // FETCH FIRST ... WITH TIES over a FROM-less SRF result: keep rows tying
@@ -6871,7 +6959,7 @@ fn select_into_rows_mode<'a>(
         }
         return Ok(());
     }
-    check_select_constants(statement, arena)?;
+    check_select_constants(statement, arena, storage, txid)?;
     let catalog = StorageCatalog {
         storage,
         routine_workspace: arena,
@@ -7123,7 +7211,7 @@ fn select_into_rows_mode<'a>(
         };
         let srf_call = find_srf(statement.items);
         let project_set =
-            prepare_project_set(statement.items, storage, txid, arena, params, &cols, &hooks)?;
+            prepare_fromless_projection(statement, storage, txid, arena, params, &cols, &hooks)?;
         let mut produced = 0u64;
         for k in 1..=project_set.count {
             let khooks = if srf_call.is_some() || project_set.any {
@@ -7135,11 +7223,6 @@ fn select_into_rows_mode<'a>(
             } else {
                 hooks
             };
-            if let Some(w) = statement.where_clause
-                && !where_passes(w, arena, params, &cols, &khooks)?
-            {
-                continue;
-            }
             let mut vals = [Datum::Null; MAX_PROJ];
             let mut n = 0;
             for item in statement.items {

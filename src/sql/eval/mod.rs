@@ -16,6 +16,7 @@ pub mod funcs;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
 pub(crate) use cast::{
     cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_uuid, validate_bits,
+    validate_catalog_reference_cast,
 };
 
 mod args;
@@ -1072,6 +1073,14 @@ pub trait CatalogAccess {
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
+    /// Registered casts expose whether planning may evaluate them.
+    fn cast_evaluation(
+        &self,
+        _source_oid: i32,
+        _target_oid: i32,
+    ) -> Result<Option<CastEvaluation>, SqlError> {
+        Ok(None)
+    }
     /// Applies a catalog-defined cast in the context that selected it.
     /// `None` means no visible cast has this exact source/target identity.
     fn cast_defined<'a>(
@@ -1580,6 +1589,12 @@ pub trait CatalogAccess {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CastEvaluation {
+    Immutable,
+    Runtime,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DefinedCastContext {
     Explicit,
@@ -1676,8 +1691,47 @@ pub fn eval<'a>(
 /// `... OR 0.0/0.0 > 1` error even when no row would reach them. Constant
 /// subtrees are evaluated once here; per-row evaluation (with short-circuit)
 /// handles the rest.
-pub fn check_constant_errors<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<(), SqlError> {
-    fold_check(expression, arena).map(|_| ())
+pub fn check_constant_errors<'a>(
+    expression: &Expr<'a>,
+    arena: &'a Arena,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Result<(), SqlError> {
+    fold_check(expression, arena, catalog).map(|_| ())
+}
+
+fn catalog_cast_evaluation(
+    expression: &Expr<'_>,
+    catalog: &dyn CatalogAccess,
+) -> Result<Option<CastEvaluation>, SqlError> {
+    let mut found = None;
+    if let Expr::Cast {
+        operand, type_name, ..
+    } = expression
+    {
+        let hooks = EvalHooks {
+            catalog: Some(catalog),
+            ..NO_HOOKS
+        };
+        let source = expression_type_identity(operand, &NoColumns, &hooks)?
+            .routine_argument_oid(&Datum::Null);
+        let target = ColType::from_sql_name(type_name)
+            .map(ColType::oid)
+            .or_else(|| catalog.user_type_oid(type_name));
+        if let Some(target) = target
+            && let Some(evaluation) = catalog.cast_evaluation(source, target)?
+        {
+            found = Some(evaluation);
+        }
+    }
+    super::query::walk_children(expression, &mut |child| {
+        if found != Some(CastEvaluation::Runtime)
+            && let Some(evaluation) = catalog_cast_evaluation(child, catalog)?
+        {
+            found = Some(evaluation);
+        }
+        Ok(())
+    })?;
+    Ok(found)
 }
 
 /// The simplification-aware core of [`check_constant_errors`], mirroring
@@ -1688,16 +1742,35 @@ pub fn check_constant_errors<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Res
 /// `... WHERE FALSE AND (id > (-1 % 0))` to no rows, never folding `-1 % 0`).
 /// Returns the folded boolean value when the expression provably reduces to
 /// one, else `None`.
-fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool>, SqlError> {
+fn fold_check<'a>(
+    expression: &Expr<'a>,
+    arena: &'a Arena,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Result<Option<bool>, SqlError> {
     use super::ast::BinaryOp;
-    if expression.is_constant() {
-        // A fully-constant subtree folds eagerly; its error surfaces here.
-        return Ok(match eval(expression, arena, NO_PARAMS, &NoColumns) {
+    let evaluation = if expression.is_constant() {
+        match catalog {
+            Some(catalog) => catalog_cast_evaluation(expression, catalog)?,
+            None => None,
+        }
+    } else {
+        Some(CastEvaluation::Runtime)
+    };
+    if evaluation != Some(CastEvaluation::Runtime) {
+        let result = if evaluation == Some(CastEvaluation::Immutable) {
+            let hooks = EvalHooks {
+                catalog,
+                ..NO_HOOKS
+            };
+            eval_full(expression, arena, NO_PARAMS, &NoColumns, &hooks)
+        } else {
+            eval(expression, arena, NO_PARAMS, &NoColumns)
+        };
+        return Ok(match result {
             Ok(Datum::Bool(b)) => Some(b),
             Ok(_) => None,
-            // Catalog-resolved values cannot fold without the catalog this
-            // plan-time check intentionally does not carry. Runtime resolves
-            // and validates them with the query catalog.
+            // Unresolved catalog values stay for runtime validation. Registered
+            // immutable casts above already have their catalog context.
             Err(e)
                 if e.sqlstate == sqlstate::UNDEFINED_OBJECT
                     || e.sqlstate == sqlstate::UNDEFINED_FUNCTION
@@ -1733,11 +1806,11 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         } => {
             // FALSE settles AND; otherwise the result is known only when both
             // sides fold to TRUE (`TRUE AND TRUE` = TRUE).
-            let l = fold_check(left, arena)?;
+            let l = fold_check(left, arena, catalog)?;
             if l == Some(false) {
                 return Ok(Some(false));
             }
-            let r = fold_check(right, arena)?;
+            let r = fold_check(right, arena, catalog)?;
             if r == Some(false) {
                 return Ok(Some(false));
             }
@@ -1754,11 +1827,11 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             // TRUE settles OR; otherwise the result is known only when both
             // sides fold to FALSE (`FALSE OR FALSE` = FALSE) — so a constant
             // OR of dead predicates lets a CASE arm drop.
-            let l = fold_check(left, arena)?;
+            let l = fold_check(left, arena, catalog)?;
             if l == Some(true) {
                 return Ok(Some(true));
             }
-            let r = fold_check(right, arena)?;
+            let r = fold_check(right, arena, catalog)?;
             if r == Some(true) {
                 return Ok(Some(true));
             }
@@ -1773,32 +1846,32 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         Expr::Unary {
             operator: super::ast::UnaryOp::Not,
             operand,
-        } => Ok(fold_check(operand, arena)?.map(|b| !b)),
+        } => Ok(fold_check(operand, arena, catalog)?.map(|b| !b)),
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. } => {
-            fold_check(operand, arena)?;
+            fold_check(operand, arena, catalog)?;
             Ok(None)
         }
         Expr::Binary { left, right, .. } => {
-            fold_check(left, arena)?;
-            fold_check(right, arena)?;
+            fold_check(left, arena, catalog)?;
+            fold_check(right, arena, catalog)?;
             Ok(None)
         }
         Expr::InList { operand, list, .. } => {
-            fold_check(operand, arena)?;
+            fold_check(operand, arena, catalog)?;
             for e in *list {
-                fold_check(e, arena)?;
+                fold_check(e, arena, catalog)?;
             }
             Ok(None)
         }
         Expr::Between {
             operand, low, high, ..
         } => {
-            fold_check(operand, arena)?;
-            fold_check(low, arena)?;
-            fold_check(high, arena)?;
+            fold_check(operand, arena, catalog)?;
+            fold_check(low, arena, catalog)?;
+            fold_check(high, arena, catalog)?;
             Ok(None)
         }
         Expr::Like {
@@ -1807,8 +1880,8 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         | Expr::Match {
             operand, pattern, ..
         } => {
-            fold_check(operand, arena)?;
-            fold_check(pattern, arena)?;
+            fold_check(operand, arena, catalog)?;
+            fold_check(pattern, arena, catalog)?;
             Ok(None)
         }
         Expr::Case {
@@ -1820,10 +1893,10 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             if let Some(o) = operand {
                 // Operand form (`CASE x WHEN v ...`): the WHENs are compared to
                 // x, not boolean conditions, so no arm is dropped by folding.
-                fold_check(o, arena)?;
+                fold_check(o, arena, catalog)?;
                 for (c, r) in *whens {
-                    fold_check(c, arena)?;
-                    fold_check(r, arena)?;
+                    fold_check(c, arena, catalog)?;
+                    fold_check(r, arena, catalog)?;
                 }
             } else {
                 // Searched form: a constant-FALSE WHEN drops its THEN; a
@@ -1831,26 +1904,26 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
                 // rest — matching PostgreSQL, so a division in a dead arm
                 // (`WHEN 'a' LIKE 'b' THEN 2/0`) is never folded.
                 for (c, r) in *whens {
-                    match fold_check(c, arena)? {
+                    match fold_check(c, arena, catalog)? {
                         Some(false) => continue,
                         Some(true) => {
-                            fold_check(r, arena)?;
+                            fold_check(r, arena, catalog)?;
                             return Ok(None);
                         }
                         None => {
-                            fold_check(r, arena)?;
+                            fold_check(r, arena, catalog)?;
                         }
                     }
                 }
             }
             if let Some(e) = otherwise {
-                fold_check(e, arena)?;
+                fold_check(e, arena, catalog)?;
             }
             Ok(None)
         }
         Expr::Call { args, .. } => {
             for a in *args {
-                fold_check(a, arena)?;
+                fold_check(a, arena, catalog)?;
             }
             Ok(None)
         }
@@ -1862,32 +1935,32 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         | Expr::ArraySubquery(_) => Ok(None),
         Expr::Array(items) => {
             for e in *items {
-                fold_check(e, arena)?;
+                fold_check(e, arena, catalog)?;
             }
             Ok(None)
         }
         Expr::Subscript { base, index } => {
-            fold_check(base, arena)?;
-            fold_check(index, arena)?;
+            fold_check(base, arena, catalog)?;
+            fold_check(index, arena, catalog)?;
             Ok(None)
         }
         Expr::Slice { base, lower, upper } => {
-            fold_check(base, arena)?;
+            fold_check(base, arena, catalog)?;
             if let Some(e) = lower {
-                fold_check(e, arena)?;
+                fold_check(e, arena, catalog)?;
             }
             if let Some(e) = upper {
-                fold_check(e, arena)?;
+                fold_check(e, arena, catalog)?;
             }
             Ok(None)
         }
         Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => {
-            fold_check(base, arena)?;
+            fold_check(base, arena, catalog)?;
             Ok(None)
         }
         Expr::AnyAll { operand, array, .. } => {
-            fold_check(operand, arena)?;
-            fold_check(array, arena)?;
+            fold_check(operand, arena, catalog)?;
+            fold_check(array, arena, catalog)?;
             Ok(None)
         }
     }
@@ -2353,6 +2426,11 @@ fn eval_full_inner<'a>(
                     }
                     return Ok(value);
                 }
+            }
+            if ColType::from_sql_name(type_name) == Some(ColType::Int2) {
+                let source_oid =
+                    expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v);
+                validate_catalog_reference_cast(source_oid, ColType::Int2)?;
             }
             let catalog_text = matches!(v, Datum::CompositeText { .. })
                 || matches!(
@@ -6299,14 +6377,14 @@ fn eval_logic_short_circuit<'a>(
     let context = if absorbing { "OR" } else { "AND" };
     check_boolean_operand(left, row, context)?;
     check_boolean_operand(right, row, context)?;
-    match fold_check(left, arena)? {
+    match fold_check(left, arena, hooks.catalog)? {
         Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
         Some(_) => return boolean_argument(eval_full(right, arena, params, row, hooks)?, context),
         None => {}
     }
     // Left is runtime; if the right statically folds to the absorbing value it
     // settles the result and drops the (possibly-erroring) left.
-    match fold_check(right, arena)? {
+    match fold_check(right, arena, hooks.catalog)? {
         Some(b) if b == absorbing => return Ok(Datum::Bool(absorbing)),
         Some(_) => return boolean_argument(eval_full(left, arena, params, row, hooks)?, context),
         None => {}
@@ -6824,6 +6902,14 @@ pub(crate) fn text_view(d: Datum<'_>) -> Datum<'_> {
 /// `oid::regtype`: the canonical SQL name of the type an OID names. An OID no
 /// type carries renders as the number itself, and 0 as `-`.
 pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    regtype_of_oid_with_catalog(o, None, arena)
+}
+
+fn regtype_of_oid_with_catalog<'a>(
+    o: i64,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
     let unsigned = if let Ok(value) = u32::try_from(o) {
         value
     } else if let Ok(value) = i32::try_from(o) {
@@ -6834,6 +6920,10 @@ pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, 
     let referenced_oid = unsigned as i32;
     let name = if unsigned == 0 {
         "-"
+    } else if let Some(catalog) = catalog
+        && let Some(name) = catalog.type_name(referenced_oid, arena)?
+    {
+        name
     } else if let Some(name) = regtype_builtin_name(referenced_oid) {
         name
     } else if let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(referenced_oid) {
@@ -6863,7 +6953,7 @@ pub(crate) fn regtype_cast<'a>(
         Datum::Text(name) | Datum::Bpchar(name) => {
             let name = name.trim();
             if let Ok(oid) = name.parse::<u32>() {
-                return regtype_of_oid(i64::from(oid), arena);
+                return regtype_of_oid_with_catalog(i64::from(oid), catalog, arena);
             }
             if let Some(identity) = cross_database_catalog_reference(name, false) {
                 return Err(sql_err!(
@@ -6882,9 +6972,9 @@ pub(crate) fn regtype_cast<'a>(
             }
             regtype_of_name(name)
         }
-        Datum::Oid(oid) => regtype_of_oid(i64::from(oid), arena),
-        Datum::Int4(oid) => regtype_of_oid(i64::from(oid), arena),
-        Datum::Int8(oid) => regtype_of_oid(oid, arena),
+        Datum::Oid(oid) => regtype_of_oid_with_catalog(i64::from(oid), catalog, arena),
+        Datum::Int4(oid) => regtype_of_oid_with_catalog(i64::from(oid), catalog, arena),
+        Datum::Int8(oid) => regtype_of_oid_with_catalog(oid, catalog, arena),
         Datum::Null => Ok(Datum::Null),
         value => Err(cast_unsupported(&value, "regtype")),
     }

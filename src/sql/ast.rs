@@ -5618,7 +5618,7 @@ pub enum Expr<'a> {
     },
 }
 
-fn is_volatile_function(name: &str) -> bool {
+pub(crate) fn is_volatile_function(name: &str) -> bool {
     const NAMES: &[&str] = &[
         "clock_timestamp",
         "timeofday",
@@ -5724,6 +5724,7 @@ fn is_nonimmutable_function(name: &str) -> bool {
         "pg_current_xact_id",
         "pg_current_xact_id_if_assigned",
         "pg_current_snapshot",
+        "pg_typeof",
     ];
     is_volatile_function(name)
         || STABLE_NAMES

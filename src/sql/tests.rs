@@ -84021,12 +84021,13 @@ fn check_cleanup_during_download(name: &str, fail_read: bool, retain_both: bool)
     config.object_store_access_key = "test-access".to_string();
     config.object_store_secret_key = "test-secret".to_string();
     config.object_store_get_slots = 1;
-    config.block_cache_bytes = 0;
+    config.block_cache_bytes = 2 * crate::store::MAX_PAYLOAD;
     config.disk_cache_bytes = 0;
     let mut io_budget = Budget::new(256 << 20);
     engine.ckpt = Some(crate::checkpoint::Checkpointer::new(&config, &mut io_budget).unwrap());
     let blocks = engine.ckpt.as_ref().unwrap().block_stack();
     engine.enable_async_block_reads();
+    assert!(blocks.lock().unwrap().async_gets_enabled());
     let payload = b"the download still belongs to its waiting reader";
     let mut framed = [0u8; crate::store::BLOCK_SIZE];
     let (id, framed_len) =
@@ -84122,7 +84123,7 @@ fn check_cleanup_during_download(name: &str, fail_read: bool, retain_both: bool)
     } else {
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: {framed_len}\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nETag: \"cleanup-read\"\r\nContent-Length: {framed_len}\r\nConnection: close\r\n\r\n"
         )
         .unwrap();
         stream.write_all(&framed[..framed_len]).unwrap();
@@ -84213,7 +84214,8 @@ fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhausti
     let older = retain_row(&engine);
     let lsn = engine.storage.lsn();
     start_sliced_cleanup(&mut engine, lsn);
-    finish_sliced_cleanup(&mut engine);
+    crate::mem::guard::forbid_alloc(|| engine.finish_post_publish_cleanup())
+        .expect("initial setup can reclaim the unretained active buffer in place");
     let current = retain_row(&engine);
     crate::mem::guard::forbid_alloc(|| {
         for _ in 0..4 {

@@ -98,7 +98,7 @@ impl TypeCatalog {
 impl Storage {
     // The caller keeps this catalog locked through validation and publication.
     // Other transactions reserve both names until a rename commits or rolls back.
-    fn require_named_type_name(
+    pub(super) fn require_named_type_name(
         &self,
         catalog: &TypeCatalog,
         schema: SqlName,

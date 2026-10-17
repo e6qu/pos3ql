@@ -29822,30 +29822,6 @@ impl Storage {
         cursor: &mut MemberCursor,
         context: &mut ScanContext,
     ) -> Result<(), SqlError> {
-        #[cfg(debug_assertions)]
-        {
-            let handle = relation.handle(member);
-            let text = crate::stack_format!(
-                384,
-                "DEBUG_READ scan context={:p} frames={} index={:02x?} member={} ordinal={} loaded={:?}\n",
-                &*context as *const ScanContext,
-                context
-                    .member_images
-                    .iter()
-                    .flatten()
-                    .filter(|image| image.bytes.is_some())
-                    .count(),
-                &handle.index.0[..4],
-                member,
-                cursor.ordinal,
-                cursor.loaded
-            );
-            let bytes = text.as_str().as_bytes();
-            // SAFETY: the fixed stack message remains live for this write.
-            unsafe {
-                libc::write(2, bytes.as_ptr().cast(), bytes.len());
-            }
-        }
         cursor.head = None;
         if cursor.done {
             return Ok(());

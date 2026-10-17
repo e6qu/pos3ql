@@ -2275,55 +2275,6 @@ impl<'a> SstReader<'a> {
     }
 
     /// The caller retains the same index bytes and their verified identity.
-    #[cfg(debug_assertions)]
-    fn trace_point_read(&self, kind: &str, handle: &SstHandle, rowid: u64, snapshot: u64) {
-        let brief = |handle: SstHandle| {
-            (
-                [
-                    handle.index.0[0],
-                    handle.index.0[1],
-                    handle.index.0[2],
-                    handle.index.0[3],
-                ],
-                [
-                    handle.filter.0[0],
-                    handle.filter.0[1],
-                    handle.filter.0[2],
-                    handle.filter.0[3],
-                ],
-                [
-                    handle.roster.0[0],
-                    handle.roster.0[1],
-                    handle.roster.0[2],
-                    handle.roster.0[3],
-                ],
-                handle.format,
-            )
-        };
-        let text = crate::stack_format!(
-            768,
-            "DEBUG_READ point kind={} buffer={:p} target={:?} cached={:?} row={} snapshot={} phase={} decoded={}\n",
-            kind,
-            self.index_scratch.as_ptr(),
-            brief(*handle),
-            self.index_leaf
-                .map(|leaf| (brief(leaf.handle), leaf.lower, leaf.upper)),
-            rowid,
-            snapshot,
-            match self.point_read.stage {
-                SstPointReadStage::Filter => "filter",
-                SstPointReadStage::Index => "index",
-                SstPointReadStage::Data(_) => "data",
-            },
-            self.loaded_ref.is_some()
-        );
-        let bytes = text.as_str().as_bytes();
-        // SAFETY: the fixed stack message remains live for this write.
-        unsafe {
-            libc::write(2, bytes.as_ptr().cast(), bytes.len());
-        }
-    }
-
     pub(crate) fn restore_cached_index_leaf(&mut self, leaf: Option<SstIndexLeaf>) {
         self.index_leaf = leaf;
     }
@@ -2431,8 +2382,6 @@ impl<'a> SstReader<'a> {
         snapshot: u64,
         into: &mut [u8],
     ) -> Result<Option<SstProbe>, SstError> {
-        #[cfg(debug_assertions)]
-        self.trace_point_read("row", handle, rowid, snapshot);
         let result = self.get_at_inner(store, handle, rowid, snapshot, into);
         self.finish_point_read(&result);
         result
@@ -2508,8 +2457,6 @@ impl<'a> SstReader<'a> {
         rowid: u64,
         snapshot: u64,
     ) -> Result<Option<SstProbe>, SstError> {
-        #[cfg(debug_assertions)]
-        self.trace_point_read("probe", handle, rowid, snapshot);
         let result = self.probe_at_inner(store, handle, rowid, snapshot);
         self.finish_point_read(&result);
         result

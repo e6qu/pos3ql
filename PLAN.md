@@ -118,7 +118,8 @@ A checkpoint or storage merge should allow ordinary queries to keep progressing.
 
 Local heap cleanup progresses during pending downloads without using an object
 client. Failed maintenance has a one-second retry deadline even under continuous
-client traffic; local progress does not clear a failed durable-publication status.
+client traffic or when idle; local progress does not clear a failed
+durable-publication status.
 Checkpoint publication and object merges still wait for downloads to finish.
 
 - Reserve independent request slots and scratch buffers at startup. Keep cache

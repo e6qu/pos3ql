@@ -39,8 +39,12 @@ impl CheckpointSchedule {
         self.retry_at.is_none_or(|deadline| now >= deadline)
     }
 
-    fn timeout(&self, can_progress: bool, now: Instant) -> Option<Duration> {
-        can_progress.then(|| {
+    fn should_run(&self, requested: bool, now: Instant) -> bool {
+        (requested || self.retry_at.is_some()) && self.due(now)
+    }
+
+    fn timeout(&self, requested: bool, can_progress: bool, now: Instant) -> Option<Duration> {
+        ((requested || self.retry_at.is_some()) && can_progress).then(|| {
             self.retry_at.map_or(Duration::ZERO, |deadline| {
                 deadline.saturating_duration_since(now)
             })
@@ -54,8 +58,10 @@ impl CheckpointSchedule {
             | CheckpointBeat::DurableWithLocalFailure => {
                 self.retry_at = Some(now + Duration::from_secs(1));
             }
-            CheckpointBeat::Advanced | CheckpointBeat::Durable => self.retry_at = None,
-            CheckpointBeat::Idle | CheckpointBeat::WaitingForReads => {}
+            CheckpointBeat::Idle | CheckpointBeat::Advanced | CheckpointBeat::Durable => {
+                self.retry_at = None;
+            }
+            CheckpointBeat::WaitingForReads => {}
         }
         match beat {
             CheckpointBeat::Durable | CheckpointBeat::DurableWithLocalFailure => {
@@ -1147,8 +1153,11 @@ impl Server {
         while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             // Local cleanup runs while downloads wait. Once only object I/O
             // remains, socket readiness wakes the reactor instead of polling.
-            let checkpoint_timeout =
-                checkpoint_schedule.timeout(self.engine.checkpoint_can_progress(), Instant::now());
+            let checkpoint_timeout = checkpoint_schedule.timeout(
+                self.engine.checkpoint_work_pending(),
+                self.engine.checkpoint_can_progress(),
+                Instant::now(),
+            );
             let hedge_timeout = self
                 .engine
                 .next_block_read_hedge_deadline()
@@ -1253,9 +1262,10 @@ impl Server {
             // regardless of traffic. Work is paced unless critical cache
             // pressure requires publication before dispatch resumes; bucket
             // errors back off.
-            if (self.engine.checkpoint_work_pending() || (had_responses && responses_durable))
-                && checkpoint_schedule.due(Instant::now())
-            {
+            if checkpoint_schedule.should_run(
+                self.engine.checkpoint_work_pending() || (had_responses && responses_durable),
+                Instant::now(),
+            ) {
                 let beat = self.engine.checkpoint_beat();
                 checkpoint_schedule.observe(beat, Instant::now(), &mut self.durability_ready);
             }
@@ -3533,18 +3543,52 @@ mod tests {
         let mut ready = true;
         schedule.observe(CheckpointBeat::StorageFailure, now, &mut ready);
         assert!(!ready);
-        for beat in [CheckpointBeat::WaitingForReads, CheckpointBeat::Idle] {
-            schedule.observe(beat, now, &mut ready);
-            assert!(!ready);
-            assert!(!schedule.due(now));
-        }
-        assert_eq!(schedule.timeout(false, now), None);
-        assert_eq!(schedule.timeout(true, now), Some(Duration::from_secs(1)));
+        schedule.observe(CheckpointBeat::WaitingForReads, now, &mut ready);
+        assert!(!ready);
+        assert!(!schedule.due(now));
+        assert_eq!(schedule.timeout(true, false, now), None);
+        assert_eq!(
+            schedule.timeout(true, true, now),
+            Some(Duration::from_secs(1))
+        );
         schedule.observe(CheckpointBeat::Advanced, now, &mut ready);
         assert!(!ready, "local progress cannot confirm durable publication");
         assert!(schedule.due(now));
         schedule.observe(CheckpointBeat::Durable, now, &mut ready);
         assert!(ready);
+    }
+
+    #[test]
+    fn cleanup_download_overlap_idle_failure_retries_without_a_started_checkpoint() {
+        use crate::sql::CheckpointBeat;
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let mut schedule = super::CheckpointSchedule::default();
+        let mut ready = true;
+        assert_eq!(schedule.timeout(false, true, now), None);
+        assert!(!schedule.should_run(false, now));
+        schedule.observe(CheckpointBeat::StorageFailure, now, &mut ready);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                schedule.timeout(false, true, now),
+                Some(Duration::from_secs(1))
+            );
+            assert_eq!(schedule.timeout(false, false, now), None);
+            assert!(!schedule.should_run(false, now));
+            let deadline = now + Duration::from_secs(1);
+            assert!(schedule.should_run(false, deadline));
+            schedule.observe(CheckpointBeat::WaitingForReads, deadline, &mut ready);
+            assert_eq!(schedule.timeout(false, false, deadline), None);
+            assert_eq!(
+                schedule.timeout(false, true, deadline),
+                Some(Duration::ZERO)
+            );
+            schedule.observe(CheckpointBeat::Idle, deadline, &mut ready);
+            assert_eq!(schedule.timeout(false, true, deadline), None);
+            assert!(!schedule.should_run(false, deadline));
+            assert!(!ready, "an empty retry does not acknowledge a publication");
+        });
     }
 
     #[test]
@@ -3561,15 +3605,15 @@ mod tests {
                 let event_at = now + Duration::from_millis(milliseconds);
                 assert!(!schedule.due(event_at));
                 assert_eq!(
-                    schedule.timeout(true, event_at),
+                    schedule.timeout(true, true, event_at),
                     Some(Duration::from_millis(1000 - milliseconds))
                 );
             }
             let retry = now + Duration::from_secs(1);
             assert!(schedule.due(retry));
             schedule.observe(CheckpointBeat::Advanced, retry, &mut ready);
-            assert_eq!(schedule.timeout(true, retry), Some(Duration::ZERO));
-            assert_eq!(schedule.timeout(false, retry), None);
+            assert_eq!(schedule.timeout(true, true, retry), Some(Duration::ZERO));
+            assert_eq!(schedule.timeout(true, false, retry), None);
         });
         assert!(!ready);
     }
@@ -3585,7 +3629,10 @@ mod tests {
             let mut ready = initial;
             schedule.observe(CheckpointBeat::LocalFailure, now, &mut ready);
             assert_eq!(ready, initial);
-            assert_eq!(schedule.timeout(true, now), Some(Duration::from_secs(1)));
+            assert_eq!(
+                schedule.timeout(true, true, now),
+                Some(Duration::from_secs(1))
+            );
             schedule.observe(CheckpointBeat::DurableWithLocalFailure, now, &mut ready);
             assert!(ready);
             assert!(!schedule.due(now));

@@ -62,8 +62,10 @@ failed publication status. For example, a cached report can succeed while
 `/readyz` still reports that the last durable publication failed.
 
 Failed maintenance retries no sooner than one second later. Client traffic
-does not shorten that delay. This pacing applies to background maintenance;
-the commit barrier still decides when client responses are durable.
+does not shorten that delay. An idle server also retries a failure that happened
+before a checkpoint started. An empty retry releases its wakeup without changing
+publication readiness. This pacing applies to background maintenance; the commit
+barrier still decides when client responses are durable.
 
 ## Metrics and alerts
 

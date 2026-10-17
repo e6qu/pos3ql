@@ -8737,8 +8737,7 @@ impl Engine {
     /// Local cleanup can progress without borrowing any object-store client.
     /// Other maintenance waits for all statement-owned block reads to finish.
     pub(crate) fn checkpoint_can_progress(&self) -> bool {
-        self.post_publish_cleanup.is_some()
-            || (self.checkpoint_work_pending() && !self.block_reads_pending())
+        self.post_publish_cleanup.is_some() || !self.block_reads_pending()
     }
 
     /// Advances one maintenance turn; false requests retry backoff.

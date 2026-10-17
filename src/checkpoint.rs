@@ -13130,114 +13130,115 @@ impl Checkpointer {
                 .expect("block store lock poisoned")
                 .io_stats();
             self.ensure_backup_names_loaded()?;
-            let mut keep = BlockKeepSet::new(&mut self.roster_scratch, &mut self.garbage_seen);
-            self.sst_arena.reset();
-            let scratch = self
-                .sst_arena
-                .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
-                .map_err(|_| sql_err!(SQLSTATE_IO, "gc scratch"))?;
-            // A merge mid-flight has written blocks no published roster names
-            // yet; sweeping them would destroy the job's progress.
-            if self.merge_job.is_some() {
-                for id in self.merge_writer.roster_so_far() {
-                    keep.insert(*id)?;
-                }
-            }
-            storage.copy_retained_spill_roots(true, &mut self.garbage_sst_roots)?;
-            for prev in self.prev_ssts.iter().flat_map(SlotList::iter) {
-                if self.garbage_sst_roots.len() == self.garbage_sst_roots.capacity() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "garbage collection SST roots exceed fixed scratch capacity"
-                    ));
-                }
-                self.garbage_sst_roots.push(prev.handle);
-            }
-            self.garbage_sst_roots
-                .sort_unstable_by_key(|handle| handle.roster);
-            self.garbage_sst_roots.dedup_by_key(|handle| handle.roster);
-            for h in self.garbage_sst_roots.iter().copied() {
-                keep.insert(h.roster)?;
-                let n = self
-                    .blocks
-                    .lock()
-                    .expect("block store lock poisoned")
-                    .get(&h.roster, scratch)
-                    .map(|(n, _)| n)
-                    .map_err(|e| sql_err!(SQLSTATE_IO, "gc roster read: {:?}", e))?;
-                for id_bytes in scratch[..n].chunks(32) {
-                    if id_bytes.len() != 32 {
-                        return Err(sql_err!(
-                            SQLSTATE_IO,
-                            "gc roster is not a multiple of 32 bytes"
-                        ));
+            {
+                let mut keep = BlockKeepSet::new(&mut self.roster_scratch, &mut self.garbage_seen);
+                self.sst_arena.reset();
+                let scratch = self
+                    .sst_arena
+                    .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+                    .map_err(|_| sql_err!(SQLSTATE_IO, "gc scratch"))?;
+                // A merge mid-flight has written blocks no published roster names
+                // yet; sweeping them would destroy the job's progress.
+                if self.merge_job.is_some() {
+                    for id in self.merge_writer.roster_so_far() {
+                        keep.insert(*id)?;
                     }
-
-                    let mut id = [0u8; 32];
-                    id.copy_from_slice(id_bytes);
-                    keep.insert(BlockId(id))?;
                 }
-            }
-            storage.copy_retained_index_roots(&mut self.garbage_index_roots)?;
-            for slot in 0..storage.physical_table_count() {
-                for binding in 0..storage.value_binding_count(slot) {
-                    let Some(handle) = storage.value_binding_handle(slot, binding) else {
-                        continue;
-                    };
-                    if self.garbage_index_roots.contains(&handle.roster) {
-                        continue;
-                    }
-                    if self.garbage_index_roots.len() == self.garbage_index_roots.capacity() {
+                storage.copy_retained_spill_roots(true, &mut self.garbage_sst_roots)?;
+                for prev in self.prev_ssts.iter().flat_map(SlotList::iter) {
+                    if self.garbage_sst_roots.len() == self.garbage_sst_roots.capacity() {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "garbage collection index roots exceed fixed scratch capacity"
+                            "garbage collection SST roots exceed fixed scratch capacity"
                         ));
                     }
-                    self.garbage_index_roots.push(handle.roster);
+                    self.garbage_sst_roots.push(prev.handle);
                 }
-            }
-            self.garbage_index_roots.sort_unstable();
-            self.garbage_index_roots.dedup();
-            for roster in self.garbage_index_roots.iter().copied() {
-                let complete = crate::store::walk_value_roster(
-                    &mut *self.blocks.lock().expect("block store lock poisoned"),
-                    roster,
-                    scratch,
-                    |id, _| keep.insert(id).is_ok(),
-                )
-                .map_err(|error| {
-                    sql_err!(
-                        SQLSTATE_IO,
-                        "corrupt persistent value-index roster: {:?}",
-                        error
+                self.garbage_sst_roots
+                    .sort_unstable_by_key(|handle| handle.roster);
+                self.garbage_sst_roots.dedup_by_key(|handle| handle.roster);
+                for h in self.garbage_sst_roots.iter().copied() {
+                    keep.insert(h.roster)?;
+                    let n = self
+                        .blocks
+                        .lock()
+                        .expect("block store lock poisoned")
+                        .get(&h.roster, scratch)
+                        .map(|(n, _)| n)
+                        .map_err(|e| sql_err!(SQLSTATE_IO, "gc roster read: {:?}", e))?;
+                    for id_bytes in scratch[..n].chunks(32) {
+                        if id_bytes.len() != 32 {
+                            return Err(sql_err!(
+                                SQLSTATE_IO,
+                                "gc roster is not a multiple of 32 bytes"
+                            ));
+                        }
+
+                        let mut id = [0u8; 32];
+                        id.copy_from_slice(id_bytes);
+                        keep.insert(BlockId(id))?;
+                    }
+                }
+                storage.copy_retained_index_roots(&mut self.garbage_index_roots)?;
+                for slot in 0..storage.physical_table_count() {
+                    for binding in 0..storage.value_binding_count(slot) {
+                        let Some(handle) = storage.value_binding_handle(slot, binding) else {
+                            continue;
+                        };
+                        if self.garbage_index_roots.contains(&handle.roster) {
+                            continue;
+                        }
+                        if self.garbage_index_roots.len() == self.garbage_index_roots.capacity() {
+                            return Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "garbage collection index roots exceed fixed scratch capacity"
+                            ));
+                        }
+                        self.garbage_index_roots.push(handle.roster);
+                    }
+                }
+                self.garbage_index_roots.sort_unstable();
+                self.garbage_index_roots.dedup();
+                for roster in self.garbage_index_roots.iter().copied() {
+                    let complete = crate::store::walk_value_roster(
+                        &mut *self.blocks.lock().expect("block store lock poisoned"),
+                        roster,
+                        scratch,
+                        |id, _| keep.insert(id).is_ok(),
                     )
-                })?;
-                if !complete {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
-                        keep.capacity()
-                    ));
+                    .map_err(|error| {
+                        sql_err!(
+                            SQLSTATE_IO,
+                            "corrupt persistent value-index roster: {:?}",
+                            error
+                        )
+                    })?;
+                    if !complete {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
+                            keep.capacity()
+                        ));
+                    }
+                }
+                for index in 0..self.backup_scratch.len() {
+                    let name = self.backup_scratch[index];
+                    let key = stack_format!(128, "backups/{}/manifest", name.as_str());
+                    self.client
+                        .get(key.as_str(), None)
+                        .map_err(object_store_to_sql)?;
+                    self.manifest_buf.clear();
+                    if !self.manifest_buf.append(self.client.body_bytes()) {
+                        return Err(manifest_full());
+                    }
+                    retain_manifest_blocks(
+                        &self.blocks,
+                        &mut keep,
+                        scratch,
+                        self.manifest_buf.readable(),
+                    )?;
                 }
             }
-            for index in 0..self.backup_scratch.len() {
-                let name = self.backup_scratch[index];
-                let key = stack_format!(128, "backups/{}/manifest", name.as_str());
-                self.client
-                    .get(key.as_str(), None)
-                    .map_err(object_store_to_sql)?;
-                self.manifest_buf.clear();
-                if !self.manifest_buf.append(self.client.body_bytes()) {
-                    return Err(manifest_full());
-                }
-                retain_manifest_blocks(
-                    &self.blocks,
-                    &mut keep,
-                    scratch,
-                    self.manifest_buf.readable(),
-                )?;
-            }
-            drop(keep);
             // Listing may visit many obsolete objects. Sort the fixed keep-set
             // once so each membership probe is logarithmic rather than scanning
             // every live block for every listed key.
@@ -17457,20 +17458,21 @@ mod stored_dependency_tests {
         let mut seen = FixedMap::new(&mut budget, "test block membership", 2).unwrap();
         let mut blocks = Vec::with_capacity(2);
         crate::mem::guard::forbid_alloc(|| {
-            let mut keep = BlockKeepSet::new(&mut blocks, &mut seen);
-            for _ in 0..128 {
-                for tag in [1, 2, 1, 2] {
-                    retain_block(&mut keep, BlockId([tag; 32])).unwrap();
+            {
+                let mut keep = BlockKeepSet::new(&mut blocks, &mut seen);
+                for _ in 0..128 {
+                    for tag in [1, 2, 1, 2] {
+                        retain_block(&mut keep, BlockId([tag; 32])).unwrap();
+                    }
                 }
+                let error = keep.insert(BlockId([3; 32])).unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(keep.blocks.len(), 2);
+                assert_eq!(keep.seen.len(), 2);
+                assert_eq!(keep.blocks[0].0, BlockId([1; 32]));
+                assert_eq!(keep.blocks[1].0, BlockId([2; 32]));
+                keep.insert(BlockId([1; 32])).unwrap();
             }
-            let error = keep.insert(BlockId([3; 32])).unwrap_err();
-            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(keep.blocks.len(), 2);
-            assert_eq!(keep.seen.len(), 2);
-            assert_eq!(keep.blocks[0].0, BlockId([1; 32]));
-            assert_eq!(keep.blocks[1].0, BlockId([2; 32]));
-            keep.insert(BlockId([1; 32])).unwrap();
-            drop(keep);
             let mut retry = BlockKeepSet::new(&mut blocks, &mut seen);
             retry.insert(BlockId([3; 32])).unwrap();
             assert_eq!(retry.blocks.len(), 1);
@@ -18039,6 +18041,15 @@ mod stored_dependency_tests {
             Checkpointer::budget_bytes(&live_blocks) - base_bytes,
             core::mem::size_of::<(BlockId, Option<BlockType>)>()
                 + core::mem::size_of::<(BlockId, bool)>()
+                + FixedMap::<BlockId, ()>::budget_bytes(live_blocks.checkpoint_live_blocks)
+                - FixedMap::<BlockId, ()>::budget_bytes(base.checkpoint_live_blocks)
+        );
+
+        let mut value_indexes = base.clone();
+        value_indexes.max_value_indexes += 1;
+        assert_eq!(
+            Checkpointer::budget_bytes(&value_indexes) - base_bytes,
+            3 * core::mem::size_of::<BlockId>()
         );
 
         let mut table_rows = base.clone();

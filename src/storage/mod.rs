@@ -14042,13 +14042,15 @@ struct ScanBlockImage {
     bytes: Option<ScanBlockBytes>,
 }
 
+type ScanColumnExtents = [Option<(usize, usize)>; MAX_COLUMNS];
+
 /// Startup-owned images survive walk restarts and nested source callbacks.
 /// A cursor validates its immutable identity before using a reused frame.
 struct ScanContext {
     member_blocks: Box<[Box<[u8]>]>,
     member_raw_blocks: Box<[Box<[u8]>]>,
     member_images: Box<[Option<ScanBlockImage>]>,
-    member_extents: Box<[[Option<(usize, usize)>; MAX_COLUMNS]]>,
+    member_extents: Box<[ScanColumnExtents]>,
     replacement: usize,
     pax_column_buf: Box<[u8]>,
     pax_extent_buf: Box<[u8]>,
@@ -14062,7 +14064,7 @@ impl ScanContext {
             + capacity
                 * (2 * size_of::<Box<[u8]>>()
                     + size_of::<Option<ScanBlockImage>>()
-                    + size_of::<[Option<(usize, usize)>; MAX_COLUMNS]>())
+                    + size_of::<ScanColumnExtents>())
             + size_of::<std::sync::Mutex<Self>>()
     }
 

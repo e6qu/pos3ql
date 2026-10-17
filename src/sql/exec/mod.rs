@@ -51685,7 +51685,7 @@ impl CopySetup {
         let snapshot = lease.as_ref().map(|lease| lease.snapshot());
         let files = lease
             .as_ref()
-            .map(|lease| lease.enter_files())
+            .map(|lease| lease.enter_files(storage))
             .transpose()?;
         drop(lease);
         if let Some(snapshot) = snapshot {

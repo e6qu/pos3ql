@@ -2181,7 +2181,7 @@ mod tests {
         let mut retained = Vec::with_capacity(3);
         let lease = crate::mem::guard::forbid_alloc(|| {
             let lease = storage.retain_statement_snapshot(71, |_| 7).unwrap();
-            let scope = lease.enter_files().unwrap();
+            let scope = lease.enter_files(&storage).unwrap();
             // Repeated source aliases use the statement arena, not the point-source pool.
             for _ in 0..super::super::MAX_ROW_WALK_NESTING * 2 {
                 drop(storage.row_scan_in(table, &arena).unwrap());
@@ -2195,7 +2195,7 @@ mod tests {
             storage.set_spill_list(table, &[roots[2]]);
             registry.copy_roots(false, &mut retained).unwrap();
             assert_eq!(retained, roots[..2]);
-            let scope = lease.enter_files().unwrap();
+            let scope = lease.enter_files(&storage).unwrap();
             drop(storage.row_scan_in(table, &arena).unwrap());
             drop(scope);
             registry.copy_roots(false, &mut retained).unwrap();
@@ -2222,7 +2222,7 @@ mod tests {
         let mut retained = Vec::with_capacity(3);
         let lease = crate::mem::guard::forbid_alloc(|| {
             let lease = storage.retain_statement_snapshot(71, |_| 7).unwrap();
-            let scope = lease.enter_files().unwrap();
+            let scope = lease.enter_files(&storage).unwrap();
             let scan = storage.row_scan_in(table, &arena).unwrap();
             let result = scan.roots.with_view::<()>(|_| {
                 Err(sql_err!(
@@ -2281,6 +2281,35 @@ mod tests {
             assert_eq!(error.message.as_str(), "statement file identity exhausted");
             assert_eq!(storage.snapshot_state().next_statement, before);
             assert!(!storage.has_active_snapshots());
+        });
+    }
+
+    #[test]
+    fn statement_files_reject_a_foreign_snapshot_before_changing_execution_context() {
+        let config = test_config();
+        let first = Storage::new(&config, &mut test_budget(&config)).unwrap();
+        let second = Storage::new(&config, &mut test_budget(&config)).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let first_lease = first.retain_statement_snapshot(71, |_| 7).unwrap();
+            let second_lease = second.retain_statement_snapshot(71, |_| 9).unwrap();
+            let scope = second_lease.enter_files(&second).unwrap();
+            let selected = SELECTED_STATEMENT_FILES.with(Cell::get).unwrap();
+            let error = first_lease.enter_files(&second).err().unwrap();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
+            assert_eq!(
+                error.message.as_str(),
+                "statement snapshot belongs to another storage instance"
+            );
+            let after = SELECTED_STATEMENT_FILES.with(Cell::get).unwrap();
+            assert_eq!(after.registry, selected.registry);
+            assert_eq!(after.identity.serial, selected.identity.serial);
+            assert_eq!(STATEMENT_FILE_SCOPE_DEPTH.with(Cell::get), 1);
+            assert_eq!(first.oldest_snapshot(), Some(7));
+            assert_eq!(second.oldest_snapshot(), Some(9));
+            drop(scope);
+            drop((first_lease, second_lease));
+            assert!(SELECTED_STATEMENT_FILES.with(Cell::get).is_none());
+            assert!(!first.has_active_snapshots() && !second.has_active_snapshots());
         });
     }
 

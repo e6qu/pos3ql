@@ -97,7 +97,21 @@ impl StatementSnapshotLease {
         self.lsn
     }
 
-    pub(crate) fn enter_files(&self) -> Result<super::StatementFileScope, SqlError> {
+    pub(crate) fn validate_storage(&self, storage: &Storage) -> Result<(), SqlError> {
+        if !Arc::ptr_eq(&self.snapshots, &storage.snapshots) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "statement snapshot belongs to another storage instance"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn enter_files(
+        &self,
+        storage: &Storage,
+    ) -> Result<super::StatementFileScope, SqlError> {
+        self.validate_storage(storage)?;
         self.files.enter()
     }
 }

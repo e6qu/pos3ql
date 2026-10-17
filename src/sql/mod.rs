@@ -5078,6 +5078,9 @@ impl Engine {
         } else {
             None
         };
+        if let Some(lease) = &resumed {
+            lease.validate_storage(&self.storage)?;
+        }
         if advance_command && resumed.is_none() {
             txn.begin_command()?;
         }
@@ -5113,7 +5116,7 @@ impl Engine {
         self.storage.set_commit_snapshot(snapshot);
         let files = lease
             .as_ref()
-            .map(|lease| lease.enter_files())
+            .map(|lease| lease.enter_files(&self.storage))
             .transpose()?;
         Ok(CommandSnapshot {
             lease,

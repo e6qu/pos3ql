@@ -688,6 +688,8 @@ at startup; repeated aliases share that bit. SQLSTATE `54000` reports
 "statement file references exhausted" or "statement file scope nesting exhausted".
 File-owner exhaustion fails before selecting or registering a snapshot; it does
 not grow memory or partly pin another file.
+A snapshot used with another storage instance returns `XX000`, "statement
+snapshot belongs to another storage instance", before selecting its file context.
 
 ### What publication may change
 

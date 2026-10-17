@@ -826,9 +826,13 @@ impl TemporarySpiller {
             .finish(&mut *blocks.lock().expect("block store lock poisoned"))
             .map_err(temporary_sst_to_sql)?;
         match (delta, handle) {
-            (true, Some(handle)) => storage.append_spill(slot, handle)?,
+            (true, Some(handle)) => {
+                storage.install_temporary_spill(slot, handle, generation, true)?
+            }
             (true, None) => {}
-            (false, Some(handle)) => storage.collapse_spill(slot, handle)?,
+            (false, Some(handle)) => {
+                storage.install_temporary_spill(slot, handle, generation, false)?
+            }
             (false, None) => storage.set_spill_list(slot, &[]),
         }
         storage.clear_tombstones(slot);

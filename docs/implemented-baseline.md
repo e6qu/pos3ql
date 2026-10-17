@@ -722,7 +722,39 @@ buffers are retained by readers", or "row heap relocation is already active".
 Cancellation releases the private buffer and capture boundary. Exclusive
 callers can still compact an unretained active buffer in place when an older
 reader retains the other buffer. Shared callers always use the private copy
-path. Engine-wide scheduling and SQL execution workers remain unfinished.
+path.
+
+Ordinary automatic checkpoint cleanup copies at most 64 KiB of heap bytes per
+cleanup step. The server advances one step between messages or while idle. Each SQL
+statement also advances at most one step before executing; it does not drain
+the complete copy. For
+example, a large cleanup can remain pending while a client reads an order,
+updates another order, and reads the result. Later appends join the copied tail.
+An explicit CHECKPOINT waits for all cleanup phases and preserves exclusive
+in-place reclamation when the active buffer has no retained readers. At the
+existing 85% critical heap threshold, automatic checkpointing also finishes
+publication and cleanup before dispatch resumes, preserving headroom for the
+next write. This pressure path can still delay connections.
+
+The startup relocation workspace owns its scratch and private copy controls
+across turns. Moving the engine does not invalidate them; cancellation or a copy
+error releases the reservation. Using a workspace with a different storage
+instance returns XX000, "heap relocation belongs to another storage instance",
+without publishing either instance. Journal cleanup runs once for the published
+prefix; writes after it keep their journal suffix for recovery. Heap capture,
+sorting, final remapping, eviction, and other maintenance still run within server
+turns. Fixed execution workers and independent object I/O remain unfinished.
+
+Eviction requires an installed object's recorded boundary to cover the row's
+commit position. A later update stays in the heap; history newer than that
+boundary stays resident too. Recovered roots have no eviction boundary and do
+not justify discarding newer heap bytes. A temporary spill records the table
+generation it copied, because temporary commits may share a zero journal
+position. Only that exact table generation can evict to the temporary snapshot;
+a later spill names its own object. These witnesses are distinct states in the
+startup-sized root metadata. For example, if a checkpoint saved an order before its price
+changed, cleanup keeps the new price in memory until another checkpoint saves
+it; it never redirects that row to the older object.
 
 Table rewrites retain each transformed image until validation, journaling and
 publication finish. The owner array uses the existing statement arena; its

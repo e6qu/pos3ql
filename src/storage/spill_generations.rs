@@ -18,8 +18,39 @@ use crate::store::SstHandle;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SpillGeneration {
     pub(crate) handle: SstHandle,
-    /// Cold recovery leaves this zero: recovered rows already name their exact member.
-    pub(crate) through_lsn: u64,
+    coverage: SpillCoverage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SpillCoverage {
+    Unknown,
+    CommittedThrough(u64),
+    ResidentAtGeneration(u64),
+}
+
+impl SpillCoverage {
+    fn compatible(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Unknown, _)
+                | (_, Self::Unknown)
+                | (Self::CommittedThrough(_), Self::CommittedThrough(_))
+                | (Self::ResidentAtGeneration(_), Self::ResidentAtGeneration(_))
+        )
+    }
+
+    fn merged(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unknown, coverage) | (coverage, Self::Unknown) => coverage,
+            (Self::CommittedThrough(left), Self::CommittedThrough(right)) => {
+                Self::CommittedThrough(left.max(right))
+            }
+            (Self::ResidentAtGeneration(left), Self::ResidentAtGeneration(right)) => {
+                Self::ResidentAtGeneration(left.max(right))
+            }
+            _ => panic!("temporary and durable SST coverage cannot mix"),
+        }
+    }
 }
 
 pub(crate) struct SpillGenerationList {
@@ -46,6 +77,27 @@ impl SpillGenerationList {
 
     pub(crate) fn handle(&self, index: usize) -> Option<SstHandle> {
         self.members.get(index).map(|member| member.handle)
+    }
+
+    pub(super) fn eviction_member(&self, commit_lsn: u64, table_generation: u64) -> Option<u32> {
+        self.members
+            .iter()
+            .position(|member| match member.coverage {
+                SpillCoverage::Unknown => false,
+                SpillCoverage::CommittedThrough(through) => commit_lsn <= through,
+                SpillCoverage::ResidentAtGeneration(generation) => generation == table_generation,
+            })
+            .map(|index| index as u32)
+    }
+
+    pub(super) fn published_through(&self) -> Option<u64> {
+        self.members
+            .iter()
+            .filter_map(|member| match member.coverage {
+                SpillCoverage::CommittedThrough(through) => Some(through),
+                _ => None,
+            })
+            .max()
     }
 
     pub(super) fn clear(&mut self) {
@@ -77,7 +129,7 @@ impl SpillGenerationList {
             self.staging
                 .push(SpillGeneration {
                     handle,
-                    through_lsn: 0,
+                    coverage: SpillCoverage::Unknown,
                 })
                 .expect("validated generation capacity");
         }
@@ -109,11 +161,26 @@ impl SpillGenerationList {
     }
 
     pub(super) fn append(&mut self, handle: SstHandle, through_lsn: u64) -> Result<(), SqlError> {
+        self.append_covered(handle, SpillCoverage::CommittedThrough(through_lsn))
+    }
+
+    pub(super) fn append_covered(
+        &mut self,
+        handle: SstHandle,
+        coverage: SpillCoverage,
+    ) -> Result<(), SqlError> {
+        if self
+            .members
+            .iter()
+            .any(|member| !member.coverage.compatible(coverage))
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "temporary and durable SST coverage cannot mix"
+            ));
+        }
         self.members
-            .push(SpillGeneration {
-                handle,
-                through_lsn,
-            })
+            .push(SpillGeneration { handle, coverage })
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -123,7 +190,16 @@ impl SpillGenerationList {
             })
     }
 
+    #[cfg(test)]
     pub(super) fn collapse(&mut self, handle: SstHandle, through_lsn: u64) -> Result<(), SqlError> {
+        self.collapse_covered(handle, SpillCoverage::CommittedThrough(through_lsn))
+    }
+
+    pub(super) fn collapse_covered(
+        &mut self,
+        handle: SstHandle,
+        coverage: SpillCoverage,
+    ) -> Result<(), SqlError> {
         if self.capacity() == 0 {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -131,7 +207,7 @@ impl SpillGenerationList {
             ));
         }
         self.clear();
-        self.append(handle, through_lsn)
+        self.append_covered(handle, coverage)
     }
 
     pub(super) fn merge_pair(&mut self, at: usize, handle: Option<SstHandle>) {
@@ -139,14 +215,11 @@ impl SpillGenerationList {
             at.checked_add(1).is_some_and(|next| next < self.len()),
             "merge pair is outside the installed generation list"
         );
-        let through_lsn = self.members[at]
-            .through_lsn
-            .max(self.members[at + 1].through_lsn);
+        let coverage = self.members[at]
+            .coverage
+            .merged(self.members[at + 1].coverage);
         let removed = if let Some(handle) = handle {
-            self.members[at] = SpillGeneration {
-                handle,
-                through_lsn,
-            };
+            self.members[at] = SpillGeneration { handle, coverage };
             1
         } else {
             2
@@ -1214,6 +1287,36 @@ mod tests {
     }
 
     #[test]
+    fn sliced_heap_cleanup_zero_commit_and_temporary_snapshot_coverage_are_distinct() {
+        let mut budget = Budget::new(SpillGenerationRoster::member_budget_bytes(3));
+        let roster = SpillGenerationRoster::new(&mut budget, 3).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut list = roster.write();
+            list.replace(1, core::iter::once(handle(1))).unwrap();
+            assert_eq!(list.eviction_member(0, 7), None);
+            list.append_covered(handle(5), SpillCoverage::ResidentAtGeneration(7))
+                .unwrap();
+            assert_eq!(list.eviction_member(0, 7), Some(1));
+            assert_eq!(list.eviction_member(0, 8), None);
+            let error = list.append(handle(9), 0).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
+            assert_eq!(list.len(), 2);
+            list.append_covered(handle(9), SpillCoverage::ResidentAtGeneration(8))
+                .unwrap();
+            assert_eq!(list.eviction_member(0, 8), Some(2));
+            assert_eq!(list.published_through(), None);
+            list.merge_pair(1, Some(handle(13)));
+            assert_eq!(list.eviction_member(0, 8), Some(1));
+            list.clear();
+            list.append(handle(17), 0).unwrap();
+            assert_eq!(list.eviction_member(0, 8), Some(0));
+            assert_eq!(list.eviction_member(1, 8), None);
+            assert_eq!(list.published_through(), Some(0));
+        });
+    }
+
+    #[test]
     fn guarded_spill_generations_preserve_previous_list_on_failed_install() {
         let bytes = SpillGenerationRoster::member_budget_bytes(3);
         let mut budget = Budget::new(bytes);
@@ -1234,8 +1337,8 @@ mod tests {
                 assert_eq!(list.len(), 2);
                 assert_eq!(list.handle(0), Some(handle(1)));
                 assert_eq!(list.handle(1), Some(handle(5)));
-                assert_eq!(list.members[0].through_lsn, 7);
-                assert_eq!(list.members[1].through_lsn, 9);
+                assert_eq!(list.members[0].coverage, SpillCoverage::CommittedThrough(7));
+                assert_eq!(list.members[1].coverage, SpillCoverage::CommittedThrough(9));
                 assert!(list.staging.is_empty());
             }
             list.append(handle(9), 11).unwrap();
@@ -1246,7 +1349,7 @@ mod tests {
                 list.members[2],
                 SpillGeneration {
                     handle: handle(9),
-                    through_lsn: 11
+                    coverage: SpillCoverage::CommittedThrough(11)
                 }
             );
             list.merge_pair(0, Some(handle(13)));
@@ -1255,14 +1358,14 @@ mod tests {
                 list.members[0],
                 SpillGeneration {
                     handle: handle(13),
-                    through_lsn: 9
+                    coverage: SpillCoverage::CommittedThrough(9)
                 }
             );
             assert_eq!(
                 list.members[1],
                 SpillGeneration {
                     handle: handle(9),
-                    through_lsn: 11
+                    coverage: SpillCoverage::CommittedThrough(11)
                 }
             );
             list.merge_pair(0, None);
@@ -1275,7 +1378,10 @@ mod tests {
             list.replace(0, [].into_iter()).unwrap();
             assert!(list.is_empty());
             list.collapse(handle(17), 19).unwrap();
-            assert_eq!(list.members[0].through_lsn, 19);
+            assert_eq!(
+                list.members[0].coverage,
+                SpillCoverage::CommittedThrough(19)
+            );
         });
     }
 

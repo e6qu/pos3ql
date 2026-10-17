@@ -63831,7 +63831,11 @@ fn temporary_rows_spill_with_durable_object_storage_disabled() {
              SELECT value, repeat('q', 200) FROM generate_series({first}, {last}) AS g(value)"
         );
         let inserted = run_as(&mut engine, &mut budget, 51, &statement);
-        assert!(!String::from_utf8_lossy(&inserted).contains("ERROR"));
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&inserted)
+        );
         assert!(engine.maybe_checkpoint());
     }
     let crate::storage::ResolvedRelation::Table(table) = engine
@@ -83576,12 +83580,314 @@ fn assert_owned_rewrite_inputs_released(engine: &mut Engine) {
         for _ in 0..2 {
             let probe = engine.storage.heap.append_image(b"release probe").unwrap();
             engine
-                .storage
-                .compact_heap(&mut engine.compact_scratch)
+                .compact_scratch
+                .compact_exclusive(&mut engine.storage)
                 .unwrap();
             drop(probe);
         }
     });
+}
+
+fn sliced_cleanup_fixture(name: &str, durable: bool) -> (Engine, Budget, Config) {
+    let mut config = test_config(name);
+    config.object_store_on = durable;
+    config.object_store_sim = durable;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("{name}-{}", std::process::id());
+    if durable {
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE TABLE cleanup_orders(id integer PRIMARY KEY, note text); \
+         INSERT INTO cleanup_orders SELECT i, repeat('x', 8192) \
+         FROM generate_series(1, 80) AS g(i)",
+        32 << 20,
+    );
+    assert!(!message_types(&output).contains(&b'E'));
+    (engine, budget, config)
+}
+
+fn start_sliced_cleanup(engine: &mut Engine, lsn: u64) {
+    crate::mem::guard::forbid_alloc(|| {
+        engine.begin_post_publish_cleanup(lsn);
+        assert!(engine.maybe_checkpoint());
+        assert!(engine.maybe_checkpoint());
+        assert!(engine.compact_scratch.active());
+    });
+}
+
+fn finish_sliced_cleanup(engine: &mut Engine) -> usize {
+    let mut turns = 0;
+    crate::mem::guard::forbid_alloc(|| {
+        while engine.post_publish_cleanup.is_some() {
+            assert!(turns < 64, "bounded fixture cleanup did not finish");
+            assert!(engine.maybe_checkpoint());
+            turns += 1;
+        }
+        assert!(!engine.compact_scratch.active());
+    });
+    turns
+}
+
+#[test]
+fn sliced_heap_cleanup_queries_and_late_writes_progress_between_server_turns() {
+    let (mut engine, budget, _config) = sliced_cleanup_fixture("sliced-heap-queries", false);
+    let table = engine
+        .storage
+        .find_table("public", "cleanup_orders")
+        .unwrap();
+    let location = engine
+        .storage
+        .resident_rows(table)
+        .iter()
+        .next()
+        .unwrap()
+        .1
+        .committed;
+    let Some(crate::storage::RowHome::Heap(location)) = location else {
+        panic!("fixture row is resident")
+    };
+    let retained = engine.storage.heap.get(location).unwrap();
+    let lsn = engine.storage.lsn();
+    start_sliced_cleanup(&mut engine, lsn);
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*), sum(id) FROM cleanup_orders",
+            4 << 20,
+        )),
+        ["80|3240"]
+    );
+    assert!(engine.compact_scratch.active());
+    let mut request_budget = Budget::new(budget.remaining());
+    let arena = Arena::new(&mut request_budget, "sliced extended query", 4 << 20).unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut request_budget, "sliced extended send", 1 << 16).unwrap();
+    let mut txn = TxnState::new(&mut request_budget, 128).unwrap();
+    let mut pool = test_pool(&mut request_budget);
+    let mut cursors = test_cursors(&mut request_budget);
+    let mut guc = GucState::new();
+    {
+        let mut responder =
+            Responder::for_execute(&mut send, crate::pg::respond::ResultFmt::ALL_TEXT);
+        assert!(matches!(
+            crate::mem::guard::forbid_alloc(|| engine.execute_extended(
+                "SELECT count(*) FROM cleanup_orders",
+                &arena,
+                &[],
+                &[],
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+                false,
+            ))
+            .unwrap(),
+            ExtendedExecutionStatus::Complete(true)
+        ));
+    }
+    crate::mem::guard::forbid_alloc(|| engine.commit_txn(&mut txn, &guc)).unwrap();
+    assert_eq!(data_rows(send.readable()), ["80"]);
+    assert!(engine.compact_scratch.active());
+    let changed = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "INSERT INTO cleanup_orders VALUES (81, 'new'); \
+         UPDATE cleanup_orders SET note = 'changed' WHERE id = 1",
+        4 << 20,
+    );
+    assert!(!message_types(&changed).contains(&b'E'));
+    assert!(engine.compact_scratch.active());
+    assert!(finish_sliced_cleanup(&mut engine) > 1);
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*), sum(id) FROM cleanup_orders; \
+             SELECT note FROM cleanup_orders WHERE id IN (1, 81) ORDER BY id",
+            4 << 20,
+        )),
+        ["81|3321", "changed", "new"]
+    );
+    let mut values = [Datum::Null; 2];
+    crate::storage::rowenc::decode(&retained, &[ColType::Int4, ColType::Text], &mut values)
+        .unwrap();
+    assert!(
+        matches!(values[1], Datum::Text(value) if value.len() == 8192 && value.bytes().all(|byte| byte == b'x'))
+    );
+}
+
+#[test]
+fn sliced_heap_cleanup_explicit_checkpoint_finishes_a_paused_copy() {
+    let (mut engine, budget, _config) = sliced_cleanup_fixture("sliced-heap-explicit", false);
+    let lsn = engine.storage.lsn();
+    start_sliced_cleanup(&mut engine, lsn);
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CHECKPOINT; SELECT count(*), sum(length(note)) FROM cleanup_orders",
+        4 << 20,
+    );
+    assert!(!message_types(&output).contains(&b'E'));
+    assert_eq!(data_rows(&output), ["80|655360"]);
+    assert!(engine.post_publish_cleanup.is_none());
+    assert!(!engine.compact_scratch.active());
+}
+
+#[test]
+fn sliced_heap_cleanup_retained_buffers_fail_explicitly_and_resume_after_release() {
+    let (mut engine, budget, _config) = sliced_cleanup_fixture("sliced-heap-full", false);
+    let retain_row = |engine: &Engine| {
+        let table = engine
+            .storage
+            .find_table("public", "cleanup_orders")
+            .unwrap();
+        let home = engine
+            .storage
+            .resident_rows(table)
+            .iter()
+            .next()
+            .unwrap()
+            .1
+            .committed;
+        let Some(crate::storage::RowHome::Heap(location)) = home else {
+            panic!("fixture row is resident")
+        };
+        engine.storage.heap.get(location).unwrap()
+    };
+    let older = retain_row(&engine);
+    let lsn = engine.storage.lsn();
+    start_sliced_cleanup(&mut engine, lsn);
+    finish_sliced_cleanup(&mut engine);
+    let current = retain_row(&engine);
+    crate::mem::guard::forbid_alloc(|| {
+        engine.begin_post_publish_cleanup(lsn);
+        assert!(!engine.post_publish_cleanup_step(false).unwrap());
+        let error = engine.post_publish_cleanup_step(false).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(
+            error.message.as_str(),
+            "row heap relocation buffers are retained by readers"
+        );
+        assert!(!engine.compact_scratch.active());
+    });
+    let blocked = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT count(*) FROM cleanup_orders",
+        4 << 20,
+    );
+    assert_eq!(error_sqlstates(&blocked), ["54000"]);
+    drop(older);
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*) FROM cleanup_orders",
+            4 << 20,
+        )),
+        ["80"]
+    );
+    assert!(engine.compact_scratch.active());
+    finish_sliced_cleanup(&mut engine);
+    let mut values = [Datum::Null; 2];
+    crate::storage::rowenc::decode(&current, &[ColType::Int4, ColType::Text], &mut values).unwrap();
+    assert!(matches!(values[1], Datum::Text(value) if value.len() == 8192));
+}
+
+#[test]
+fn sliced_heap_cleanup_savepoint_and_rollback_preserve_captured_versions() {
+    let (mut engine, mut budget, config) = sliced_cleanup_fixture("sliced-heap-rollback", false);
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "BEGIN; UPDATE cleanup_orders SET note = 'private' WHERE id = 1; \
+         SAVEPOINT before_insert; INSERT INTO cleanup_orders VALUES (81, 'private')",
+        true,
+    );
+    let lsn = engine.storage.lsn();
+    start_sliced_cleanup(&mut engine, lsn);
+    session.success(
+        &mut engine,
+        "ROLLBACK TO before_insert; UPDATE cleanup_orders SET note = 'again' WHERE id = 1",
+        true,
+    );
+    assert!(engine.compact_scratch.active());
+    session.success(&mut engine, "ROLLBACK", true);
+    finish_sliced_cleanup(&mut engine);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*), sum(length(note)) FROM cleanup_orders",
+            true
+        )),
+        ["80|655360"]
+    );
+}
+
+#[test]
+fn sliced_heap_cleanup_preserves_journal_suffix_and_empty_cache_recovery() {
+    let (mut engine, mut budget, config) = sliced_cleanup_fixture("sliced-heap-recovery", true);
+    engine.wal.commit();
+    let published = loop {
+        match engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap()
+        {
+            crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+            crate::checkpoint::CheckpointStep::Working => {}
+            crate::checkpoint::CheckpointStep::Idle => panic!("fixture was not checkpointed"),
+        }
+    };
+    start_sliced_cleanup(&mut engine, published);
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO cleanup_orders VALUES (81, 'after publication'); \
+         UPDATE cleanup_orders SET note = 'after copy began' WHERE id = 1",
+    );
+    assert!(!message_types(&changed).contains(&b'E'));
+    assert!(engine.compact_scratch.active());
+    finish_sliced_cleanup(&mut engine);
+    assert!(engine.wal.last_lsn() > published);
+    drop(engine);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, note FROM cleanup_orders WHERE id IN (1, 81) ORDER BY id"
+        )),
+        ["1|after copy began", "81|after publication"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*), sum(id) FROM cleanup_orders; \
+         SELECT id, note FROM cleanup_orders WHERE id IN (1, 81) ORDER BY id"
+        )),
+        ["81|3321", "1|after copy began", "81|after publication"]
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]

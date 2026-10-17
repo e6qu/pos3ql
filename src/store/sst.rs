@@ -1095,6 +1095,20 @@ impl SstWriter {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SstPointReadProgress {
+    request: Option<(SstHandle, SstKey)>,
+    stage: SstPointReadStage,
+}
+
+#[derive(Clone, Copy, Default)]
+enum SstPointReadStage {
+    #[default]
+    Filter,
+    Index,
+    Data(Option<DataBlockRef>),
+}
+
 /// Reads rows out of an SST by its root. Holds one block of scratch for the
 /// index and one for a data block, so a lookup borrows no memory from the
 /// caller beyond the buffer the row is copied into.
@@ -1103,6 +1117,7 @@ pub(crate) struct SstReader<'a> {
     data_scratch: &'a mut [u8],
     decoded_scratch: &'a mut [u8],
     column_scratch: &'a mut [u8],
+    point_read: SstPointReadProgress,
     loaded_ref: Option<DataBlockRef>,
     loaded_format: Option<RowSstFormat>,
     decoded_len: usize,
@@ -2160,6 +2175,7 @@ impl<'a> SstReader<'a> {
             data_scratch,
             decoded_scratch,
             column_scratch,
+            point_read: SstPointReadProgress::default(),
             loaded_ref: None,
             loaded_format: None,
             decoded_len: 0,
@@ -2183,6 +2199,7 @@ impl<'a> SstReader<'a> {
             data_scratch: data,
             decoded_scratch: decoded,
             column_scratch: column,
+            point_read: SstPointReadProgress::default(),
             loaded_ref: None,
             loaded_format: None,
             decoded_len: 0,
@@ -2235,6 +2252,59 @@ impl<'a> SstReader<'a> {
         Ok(decoded_len)
     }
 
+    pub(crate) fn restore_point_read(&mut self, progress: SstPointReadProgress) {
+        self.point_read = progress;
+    }
+
+    pub(crate) fn point_read_progress(&self) -> SstPointReadProgress {
+        self.point_read
+    }
+
+    fn point_reference(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &SstHandle,
+        rowid: u64,
+        snapshot: u64,
+    ) -> Result<Option<DataBlockRef>, SstError> {
+        let target = SstKey::at(rowid, snapshot);
+        if self.point_read.request != Some((*handle, target)) {
+            self.point_read = SstPointReadProgress {
+                request: Some((*handle, target)),
+                stage: SstPointReadStage::Filter,
+            };
+        }
+        if matches!(self.point_read.stage, SstPointReadStage::Filter) {
+            let (len, _) = store.get(&handle.filter, self.index_scratch)?;
+            if !bloom::maybe_contains(&self.index_scratch[..len], rowid) {
+                self.point_read.stage = SstPointReadStage::Data(None);
+                return Ok(None);
+            }
+            self.point_read.stage = SstPointReadStage::Index;
+        }
+        if matches!(self.point_read.stage, SstPointReadStage::Index) {
+            let count = self.load_covering_leaf(store, handle, target)?;
+            let reference = block_containing(
+                self.index_scratch,
+                count,
+                target,
+                handle.uses_packed_references(),
+            )
+            .map(|entry| block_ref_at(self.index_scratch, entry, handle.uses_packed_references()));
+            self.point_read.stage = SstPointReadStage::Data(reference);
+        }
+        match self.point_read.stage {
+            SstPointReadStage::Data(reference) => Ok(reference),
+            _ => unreachable!("a completed point lookup has selected its data reference"),
+        }
+    }
+
+    fn finish_point_read(&mut self, result: &Result<Option<SstProbe>, SstError>) {
+        if !matches!(result, Err(SstError::Store(StoreError::NotReady))) {
+            self.point_read = SstPointReadProgress::default();
+        }
+    }
+
     /// Finds `rowid`, copying its row into `into` and returning the length, or
     /// `None` when the SST does not hold it. Checks the filter first: a key the
     /// filter rejects returns without the index or a data block being read at
@@ -2264,23 +2334,22 @@ impl<'a> SstReader<'a> {
         snapshot: u64,
         into: &mut [u8],
     ) -> Result<Option<SstProbe>, SstError> {
-        // The filter reuses the index buffer: it is consulted and done with
-        // before the index is read, so the two never coexist.
-        let (filter_len, _) = store.get(&handle.filter, self.index_scratch)?;
-        if !bloom::maybe_contains(&self.index_scratch[..filter_len], rowid) {
-            return Ok(None);
-        }
-        let target = SstKey::at(rowid, snapshot);
-        let count = self.load_covering_leaf(store, handle, target)?;
-        let Some(entry) = block_containing(
-            self.index_scratch,
-            count,
-            target,
-            handle.uses_packed_references(),
-        ) else {
+        let result = self.get_at_inner(store, handle, rowid, snapshot, into);
+        self.finish_point_read(&result);
+        result
+    }
+
+    fn get_at_inner(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &SstHandle,
+        rowid: u64,
+        snapshot: u64,
+        into: &mut [u8],
+    ) -> Result<Option<SstProbe>, SstError> {
+        let Some(block_ref) = self.point_reference(store, handle, rowid, snapshot)? else {
             return Ok(None);
         };
-        let block_ref = block_ref_at(self.index_scratch, entry, handle.uses_packed_references());
 
         // Scan the one data block for the row. The block is small and bounded,
         // so a linear scan of it is the read the sparse index traded for not
@@ -2340,21 +2409,21 @@ impl<'a> SstReader<'a> {
         rowid: u64,
         snapshot: u64,
     ) -> Result<Option<SstProbe>, SstError> {
-        let (filter_len, _) = store.get(&handle.filter, self.index_scratch)?;
-        if !bloom::maybe_contains(&self.index_scratch[..filter_len], rowid) {
-            return Ok(None);
-        }
-        let target = SstKey::at(rowid, snapshot);
-        let count = self.load_covering_leaf(store, handle, target)?;
-        let Some(entry) = block_containing(
-            self.index_scratch,
-            count,
-            target,
-            handle.uses_packed_references(),
-        ) else {
+        let result = self.probe_at_inner(store, handle, rowid, snapshot);
+        self.finish_point_read(&result);
+        result
+    }
+
+    fn probe_at_inner(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &SstHandle,
+        rowid: u64,
+        snapshot: u64,
+    ) -> Result<Option<SstProbe>, SstError> {
+        let Some(block_ref) = self.point_reference(store, handle, rowid, snapshot)? else {
             return Ok(None);
         };
-        let block_ref = block_ref_at(self.index_scratch, entry, handle.uses_packed_references());
         let data_len = self.load_data_block(store, handle.format, block_ref)?;
         for entry in (DataBlock {
             bytes: &self.decoded_scratch[..data_len],
@@ -3140,6 +3209,74 @@ mod tests {
     fn arena() -> Arena {
         let mut budget = Budget::new(64 << 20);
         Arena::new(&mut budget, "sst test arena", 32 << 20).expect("arena fits")
+    }
+
+    #[test]
+    fn atomic_block_reads_point_lookup_resumes_completed_filter_and_index_steps() {
+        struct WaitingStore {
+            inner: MemoryBlockStore,
+            pending: Option<BlockId>,
+            requests: usize,
+        }
+        impl BlockStore for WaitingStore {
+            fn put(
+                &mut self,
+                bytes: &[u8],
+                kind: BlockType,
+                lsn: u64,
+            ) -> Result<BlockId, StoreError> {
+                self.inner.put(bytes, kind, lsn)
+            }
+            fn get(
+                &mut self,
+                id: &BlockId,
+                into: &mut [u8],
+            ) -> Result<(usize, BlockType), StoreError> {
+                self.requests += 1;
+                if self.pending == Some(*id) {
+                    self.pending = None;
+                    self.inner.get(id, into)
+                } else {
+                    self.pending = Some(*id);
+                    into[0] = 0xee;
+                    Err(StoreError::NotReady)
+                }
+            }
+        }
+        let (_budget, mut inner) = store();
+        let arena = arena();
+        let mut writer = SstWriter::new();
+        writer
+            .append_version(&mut inner, SstKey::at(1, 7), b"order")
+            .unwrap();
+        let handle = writer.finish(&mut inner).unwrap().unwrap();
+        let mut store = WaitingStore {
+            inner,
+            pending: None,
+            requests: 0,
+        };
+        let mut progress = SstPointReadProgress::default();
+        let mut output = [0; 32];
+        crate::mem::guard::forbid_alloc(|| {
+            for attempt in 0..4 {
+                // Scratch and the reader can be rebuilt; the selected source
+                // and completed lookup steps are owned values across waits.
+                let mut reader = SstReader::new(&arena).unwrap();
+                reader.restore_point_read(progress);
+                let result = reader.get_at(&mut store, &handle, 1, 7, &mut output);
+                progress = reader.point_read_progress();
+                if attempt < 3 {
+                    assert!(matches!(result, Err(SstError::Store(StoreError::NotReady))));
+                } else {
+                    let probe = result.unwrap().unwrap();
+                    assert_eq!(probe.key, SstKey::at(1, 7));
+                    assert_eq!(probe.len, Some(5));
+                    assert_eq!(&output[..5], b"order");
+                    assert!(progress.request.is_none());
+                }
+            }
+            assert_eq!(store.requests, 6);
+        });
     }
 
     #[test]

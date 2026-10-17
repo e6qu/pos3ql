@@ -14211,6 +14211,7 @@ struct SpillScratch {
     assembly_buf: Box<[u8]>,
     bounce_buf: Box<[u8]>,
     decoded_data_ref: Option<(crate::store::SstHandle, crate::store::DataBlockRef, usize)>,
+    point_read: crate::store::SstPointReadProgress,
 }
 
 struct ValueIndexScratch {
@@ -14309,6 +14310,7 @@ impl SpillReader {
                 assembly_buf: vec![0u8; crate::store::MAX_ASSEMBLED].into_boxed_slice(),
                 bounce_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 decoded_data_ref: None,
+                point_read: crate::store::SstPointReadProgress::default(),
             })
         };
         let context = || {
@@ -14443,6 +14445,7 @@ impl SpillReader {
             column_buf,
             assembly_buf,
             decoded_data_ref,
+            point_read,
             ..
         } = &mut *scratch;
         let mut reader = crate::store::SstReader::over(
@@ -14452,6 +14455,7 @@ impl SpillReader {
             column_buf,
             assembly_buf,
         );
+        reader.restore_point_read(*point_read);
         reader.restore_cached_data_block(
             handle.format,
             decoded_data_ref
@@ -14461,6 +14465,7 @@ impl SpillReader {
                 }),
         );
         let got = reader.get_at(&mut *blocks, &handle, rowid, commit_lsn, out);
+        *point_read = reader.point_read_progress();
         *decoded_data_ref = reader
             .cached_data_block()
             .map(|(reference, cached_len)| (handle, reference, cached_len));
@@ -14502,6 +14507,7 @@ impl SpillReader {
             assembly_buf,
             bounce_buf,
             decoded_data_ref,
+            point_read,
         } = &mut *scratch;
         // The assembly buffer doubles as the row destination: `get`
         // assembles a chained row into the caller buffer directly, so
@@ -14525,6 +14531,7 @@ impl SpillReader {
                 column_buf,
                 bounce_buf,
             );
+            reader.restore_point_read(*point_read);
             reader.restore_cached_data_block(
                 handle.format,
                 decoded_data_ref
@@ -14534,6 +14541,7 @@ impl SpillReader {
                     }),
             );
             let got = reader.get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf);
+            *point_read = reader.point_read_progress();
             *decoded_data_ref = reader
                 .cached_data_block()
                 .map(|(reference, cached_len)| (handle, reference, cached_len));
@@ -29907,23 +29915,44 @@ impl Storage {
             ));
         };
         let scratch = &mut *scratch;
-        // This probe reuses the decoded buffer across members.
-        scratch.decoded_data_ref = None;
-        let mut reader = crate::store::SstReader::over(
-            &mut scratch.index_buf,
-            &mut scratch.data_buf,
-            &mut scratch.decoded_buf,
-            &mut scratch.column_buf,
-            &mut scratch.assembly_buf,
-        );
         let mut best: Option<SpillVersion> = None;
         for member in 0..relation.len() {
             let handle = relation.handle(member);
+            let SpillScratch {
+                index_buf,
+                data_buf,
+                decoded_buf,
+                column_buf,
+                assembly_buf,
+                decoded_data_ref,
+                point_read,
+                ..
+            } = &mut *scratch;
+            let mut reader = crate::store::SstReader::over(
+                index_buf,
+                data_buf,
+                decoded_buf,
+                column_buf,
+                assembly_buf,
+            );
+            reader.restore_point_read(*point_read);
+            reader.restore_cached_data_block(
+                handle.format,
+                decoded_data_ref
+                    .take()
+                    .and_then(|(cached_handle, reference, len)| {
+                        (cached_handle == handle).then_some((reference, len))
+                    }),
+            );
             let verdict = {
                 let mut blocks = spill.relation_blocks_for(relation.persistence);
                 reader.probe_at(&mut *blocks, &handle, rowid, snapshot)
-            }
-            .map_err(spill_read_error)?;
+            };
+            *point_read = reader.point_read_progress();
+            *decoded_data_ref = reader
+                .cached_data_block()
+                .map(|(reference, len)| (handle, reference, len));
+            let verdict = verdict.map_err(spill_read_error)?;
             if let Some(probe) = verdict
                 && best.is_none_or(|current| {
                     probe.key.commit_lsn > current.commit_lsn

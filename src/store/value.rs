@@ -578,6 +578,7 @@ impl core::ops::DerefMut for RetainedBlockBuffer {
 }
 
 enum ValueReadBuffer<'a> {
+    #[cfg(test)]
     Borrowed(&'a mut [u8]),
     Retained(&'a mut RetainedBlockBuffer),
 }
@@ -589,6 +590,7 @@ impl ValueReadBuffer<'_> {
         id: &BlockId,
     ) -> Result<(usize, BlockType), StoreError> {
         match self {
+            #[cfg(test)]
             Self::Borrowed(bytes) => store.get(id, bytes),
             Self::Retained(buffer) => buffer.load(store, id),
         }
@@ -599,6 +601,7 @@ impl core::ops::Deref for ValueReadBuffer<'_> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         match self {
+            #[cfg(test)]
             Self::Borrowed(bytes) => bytes,
             Self::Retained(buffer) => buffer,
         }
@@ -608,6 +611,7 @@ impl core::ops::Deref for ValueReadBuffer<'_> {
 impl core::ops::DerefMut for ValueReadBuffer<'_> {
     fn deref_mut(&mut self) -> &mut [u8] {
         match self {
+            #[cfg(test)]
             Self::Borrowed(bytes) => bytes,
             Self::Retained(buffer) => buffer,
         }
@@ -864,6 +868,7 @@ impl ValueIndexStream {
 }
 
 impl<'a> ValueIndexReader<'a> {
+    #[cfg(test)]
     pub(crate) fn over(roster: &'a mut [u8], data: &'a mut [u8]) -> Self {
         Self {
             roster: ValueReadBuffer::Borrowed(roster),

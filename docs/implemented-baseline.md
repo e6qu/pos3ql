@@ -772,6 +772,11 @@ Row lookups retain the verified sparse-index page already in their own buffer,
 including the row and version bounds where it is valid. A resumed report can
 reuse navigation across rows and snapshots without downloading the same page
 again; another source or an out-of-range key requires a new verified page.
+Scans retain verified blocks and completed columns by immutable source and block
+position in their existing frames. A nested order scan can reuse another frame
+without discarding an invoice scan's work. Cursors check a frame's source before
+reusing it after another walk. Startup sizing charges the per-frame identities
+and column metadata; byte-buffer counts do not grow.
 Index readers keep verified metadata and entries in their existing startup
 buffers when a later row read waits for a download. Selected-column scans keep
 completed columns in the same way. Their identities follow the immutable source,

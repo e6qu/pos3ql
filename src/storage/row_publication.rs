@@ -220,8 +220,8 @@ impl Storage {
         image: Option<&super::row_heap::HeapRowRead>,
         track_statistics: bool,
     ) -> Result<PreparedPendingWrite, SqlError> {
-        // Keep input bytes alive across cold reads and retries. Heap relocation
-        // still needs exclusive storage access; publication checks its result.
+        // Own input bytes across cold reads and movement. Publication rechecks
+        // placement under the same version ownership as relocation.
         let loc = image.map(super::row_heap::HeapRowRead::location);
         let target = {
             let definition = self.table_def(table, txid);
@@ -234,51 +234,71 @@ impl Storage {
             }
             PreparedTableTarget::capture(table, definition.identity(), txid)?
         };
-        let (expected, pending_identity, existed) = match self.resident_row_state(table, rowid)? {
-            Some(state) => {
-                if let Some(owner) = state.locked_by_other(txid) {
-                    drop(state);
-                    return Err(self.pending_write_wait(
-                        txid,
-                        owner,
-                        "statement is waiting for a concurrent row update",
-                    ));
-                }
-                (
-                    Some(*state),
-                    state.pending_head_identity(),
-                    state
-                        .visible_at(txid, SNAPSHOT_ALL, u64::MAX)
-                        .flatten()
-                        .is_some(),
-                )
-            }
+        let resident = self.resident_row_state(table, rowid)?;
+        if let Some(owner) = resident
+            .as_ref()
+            .and_then(|state| state.locked_by_other(txid))
+        {
+            drop(resident);
+            return Err(self.pending_write_wait(
+                txid,
+                owner,
+                "statement is waiting for a concurrent row update",
+            ));
+        }
+        let (expected, pending_identity, existed) = match resident.as_ref() {
+            Some(state) => (
+                Some(**state),
+                state.pending_head_identity(),
+                state
+                    .visible_at(txid, SNAPSHOT_ALL, u64::MAX)
+                    .flatten()
+                    .is_some(),
+            ),
             None => (None, None, false),
         };
         // No chain/map guard survives into a cold point read or comparison.
         let spilled = if expected.is_none() {
-            self.spill_probe_at(table, rowid, u64::MAX)?
+            self.spill_row_state_at(table, rowid, u64::MAX)?
         } else {
             None
         };
         let committed = expected.map_or_else(
-            || {
-                spilled.and_then(|version| {
-                    version.len.map(|len| RowHome::Spilled {
-                        len,
-                        sst: version.member,
-                        commit_lsn: version.commit_lsn,
-                    })
-                })
-            },
+            || spilled.as_ref().and_then(|source| source.state().committed),
             |state| state.committed,
         );
         let committed_lsn = expected.map_or_else(
-            || spilled.map_or(0, |version| version.commit_lsn),
+            || {
+                spilled
+                    .as_ref()
+                    .map_or(0, |source| source.state().committed_lsn)
+            },
             |state| state.committed_lsn,
         );
-        let (changed_columns, changes_existence) =
-            self.pending_change_footprint(table, rowid, committed, loc, txid, track_statistics)?;
+        let changes_existence = committed.is_some() != image.is_some();
+        let changed_columns = if track_statistics
+            && self.tables[table].pending_definition_transaction() != Some(txid)
+            && committed.is_some()
+            && let Some(input) = image
+        {
+            let committed_image = match resident {
+                Some(state) => self.committed_row_home(table, rowid, state)?,
+                None => match spilled {
+                    Some(source) => source.visible_at(u64::MAX)?.map(VisibleRowHome::spilled),
+                    None => None,
+                },
+            }
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "committed update has no retained row source"
+                )
+            })?;
+            self.pending_change_footprint(table, rowid, committed_image, input)?
+        } else {
+            let columns = self.tables[table].definition().n_columns;
+            ColumnSet::all(columns)
+        };
         Ok(PreparedPendingWrite {
             image: image.cloned(),
             target,
@@ -337,20 +357,20 @@ impl Storage {
                 "statement is waiting for a concurrent table definition change",
             ));
         }
-        // The owned bytes remain pinned until publication releases its owners.
-        // Never put an old allocation's location into the current row maps.
-        if image
-            .as_ref()
-            .is_some_and(|image| !self.heap.is_current_allocation(image))
-        {
-            return Ok(PendingPublication::Retry);
-        }
         // Retention selection and history pruning share registry ownership.
         // A newly registered reader cannot appear between those operations.
         let oldest = snapshots.oldest();
         // Match reader lock ordering. Never perform byte or object reads while
         // owning these locks; statistics failure is undone before release.
         let mut versions = self.row_versions.write();
+        // The owned bytes remain pinned until publication releases its owners.
+        // Never put an old allocation's location into the current row maps.
+        if image
+            .as_ref()
+            .is_some_and(|image| !self.heap.accepts_publication(image))
+        {
+            return Ok(PendingPublication::Retry);
+        }
         let mut rows = self.tables[table].rows.write();
         let current = rows.get(&rowid).copied();
         if let Some(owner) = current.and_then(|state| {
@@ -501,7 +521,7 @@ mod tests {
         (storage, table)
     }
 
-    fn relocation_scratch() -> FixedVec<(u32, u64, RowHeapImage, RowLoc)> {
+    fn relocation_scratch() -> FixedVec<HeapRelocationEntry> {
         FixedVec::new(&mut Budget::new(4096), "publication relocation test", 16).unwrap()
     }
 

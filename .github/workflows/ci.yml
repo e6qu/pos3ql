@@ -25,6 +25,8 @@ jobs:
         run: cargo miri test --lib --locked shared_heap_append -- --test-threads=1
       - name: Scoped arena ownership and destruction
         run: cargo miri test --lib --locked owned_write_inputs_scoped_arena -- --test-threads=1
+      - name: Private heap copy ownership and publication
+        run: cargo miri test --lib --locked shared_heap_relocation_heap_ -- --test-threads=1
       - name: Ordered row source pointer provenance
         run: cargo miri test --lib --locked owned_ordered_source_tags -- --test-threads=1
 

@@ -76,18 +76,21 @@ references use ownership for each selected table. Waiting for one definition
 keeps shared allocators and catalogs available for unrelated storage work.
 SQL writes and replay retain row bytes from append through publication and
 retries. Table rewrites keep transformed images in the fixed statement arena,
-release owners after errors, and reject replaced heap buffers before publication. Complete type
-commits and heap compaction still require exclusive storage access until
-transaction publication and maintenance are coordinated. The [implementation guide](docs/implemented-baseline.md)
-owns completed contracts, user examples and exact capacity errors.
+release owners after errors, and reject replaced heap buffers before publication.
+Heap relocation captures and publishes under row-version ownership while copying
+privately in bounded turns; unrelated storage reads and writes can progress
+during copying. Complete type commits and engine-wide maintenance scheduling
+still require the remaining publication coordination. The
+[implementation guide](docs/implemented-baseline.md) owns completed contracts,
+user examples and exact capacity errors.
 
 Still to do:
 
 - Finish shared-state protection for engine-wide publication and remaining
   table rewrites and maintenance paths.
-- Integrate bounded heap relocation with concurrent table publication and
-  maintenance scheduling. Complete rewrites must preserve historical object
-  versions needed by active readers.
+- Schedule private heap relocation alongside engine work, including fair
+  retries when both heap buffers are retained. Complete rewrites must preserve
+  historical object versions needed by active readers.
 - Verify release after errors, rollback, and transaction end, and prevent
   reused identities or names in another database from being mistaken for older data.
 

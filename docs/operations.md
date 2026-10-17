@@ -56,7 +56,14 @@ reads. The request uses the existing fixed object client and allocates no
 runtime memory, but it can wait on object-store latency. `/livez` remains a
 local event-loop probe for separating process failure from durable-tier
 failure. Readiness also turns false when commit publication or checkpoint work
-fails and returns true after the pending durable work succeeds.
+fails and returns true after a successful durable publication. A skipped
+maintenance turn, local heap cleanup, or temporary-file spill cannot clear a
+failed publication status. For example, a cached report can succeed while
+`/readyz` still reports that the last durable publication failed.
+
+Failed maintenance retries no sooner than one second later. Client traffic
+does not shorten that delay. This pacing applies to background maintenance;
+the commit barrier still decides when client responses are durable.
 
 ## Metrics and alerts
 

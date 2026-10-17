@@ -4,7 +4,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::io::reactor::Reactor;
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::pg::auth::{AuthMode, SCRAM_ITERATIONS, ScramServer};
 use crate::pg::conn::{After, AuthContext, CancelRequest, Conn, PendingResponse};
-use crate::sql::{Engine, ExecutionIdentity, QueryWorkspaceId};
+use crate::sql::{CheckpointBeat, Engine, ExecutionIdentity, QueryWorkspaceId};
 
 const LISTENER_TOKEN: u64 = u64::MAX;
 const SHUTDOWN_TOKEN: u64 = u64::MAX - 1;
@@ -27,6 +27,45 @@ const OPERATIONS_LISTENER_TOKEN: u64 = u64::MAX - 2_000_000;
 const OPERATIONS_TOKEN_BASE: u64 = 1 << 63;
 const OPERATIONS_REQUEST_BYTES: usize = 2048;
 const OPERATIONS_RESPONSE_BYTES: usize = 16 * 1024;
+
+/// A deadline prevents incoming traffic from bypassing maintenance backoff.
+#[derive(Default)]
+struct CheckpointSchedule {
+    retry_at: Option<Instant>,
+}
+
+impl CheckpointSchedule {
+    fn due(&self, now: Instant) -> bool {
+        self.retry_at.is_none_or(|deadline| now >= deadline)
+    }
+
+    fn timeout(&self, can_progress: bool, now: Instant) -> Option<Duration> {
+        can_progress.then(|| {
+            self.retry_at.map_or(Duration::ZERO, |deadline| {
+                deadline.saturating_duration_since(now)
+            })
+        })
+    }
+
+    fn observe(&mut self, beat: CheckpointBeat, now: Instant, durability_ready: &mut bool) {
+        match beat {
+            CheckpointBeat::LocalFailure
+            | CheckpointBeat::StorageFailure
+            | CheckpointBeat::DurableWithLocalFailure => {
+                self.retry_at = Some(now + Duration::from_secs(1));
+            }
+            CheckpointBeat::Advanced | CheckpointBeat::Durable => self.retry_at = None,
+            CheckpointBeat::Idle | CheckpointBeat::WaitingForReads => {}
+        }
+        match beat {
+            CheckpointBeat::Durable | CheckpointBeat::DurableWithLocalFailure => {
+                *durability_ready = true;
+            }
+            CheckpointBeat::StorageFailure => *durability_ready = false,
+            _ => {}
+        }
+    }
+}
 
 /// Set by the signal handler; the loop drains and exits when it sees this.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -1104,20 +1143,12 @@ impl Server {
     pub fn run(&mut self) -> std::io::Result<()> {
         self.engine.enable_async_block_reads();
         self.reconcile_subscriptions()?;
-        // Checkpoint beats run eagerly while healthy and back off for one
-        // second after an object-store failure.
-        let mut beat_backoff = Duration::ZERO;
+        let mut checkpoint_schedule = CheckpointSchedule::default();
         while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-            // While a checkpoint sweep is mid-flight, poll with the backoff
-            // timeout so the loop returns to that work; otherwise block until
-            // the next event.
-            let checkpoint_timeout = if self.block_read_fds.iter().all(Option::is_none)
-                && self.engine.checkpoint_work_pending()
-            {
-                Some(beat_backoff)
-            } else {
-                None
-            };
+            // Local cleanup runs while downloads wait. Once only object I/O
+            // remains, socket readiness wakes the reactor instead of polling.
+            let checkpoint_timeout =
+                checkpoint_schedule.timeout(self.engine.checkpoint_can_progress(), Instant::now());
             let hedge_timeout = self
                 .engine
                 .next_block_read_hedge_deadline()
@@ -1222,17 +1253,11 @@ impl Server {
             // regardless of traffic. Work is paced unless critical cache
             // pressure requires publication before dispatch resumes; bucket
             // errors back off.
-            if self.engine.checkpoint_work_pending() || (had_responses && responses_durable) {
-                let checkpoint_was_pending = self.engine.checkpoint_work_pending();
-                beat_backoff = if self.engine.maybe_checkpoint() {
-                    if checkpoint_was_pending {
-                        self.durability_ready = true;
-                    }
-                    Duration::ZERO
-                } else {
-                    self.durability_ready = false;
-                    Duration::from_secs(1)
-                };
+            if (self.engine.checkpoint_work_pending() || (had_responses && responses_durable))
+                && checkpoint_schedule.due(Instant::now())
+            {
+                let beat = self.engine.checkpoint_beat();
+                checkpoint_schedule.observe(beat, Instant::now(), &mut self.durability_ready);
             }
         }
         self.shutdown();
@@ -3497,6 +3522,78 @@ mod tests {
         Server, SubscriptionBinding, SubscriptionBootstrapStage, SubscriptionBootstrapWork,
         bind_listener, parse_operations_request,
     };
+
+    #[test]
+    fn cleanup_download_overlap_storage_failure_survives_local_work_and_skipped_turns() {
+        use crate::sql::CheckpointBeat;
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let mut schedule = super::CheckpointSchedule::default();
+        let mut ready = true;
+        schedule.observe(CheckpointBeat::StorageFailure, now, &mut ready);
+        assert!(!ready);
+        for beat in [CheckpointBeat::WaitingForReads, CheckpointBeat::Idle] {
+            schedule.observe(beat, now, &mut ready);
+            assert!(!ready);
+            assert!(!schedule.due(now));
+        }
+        assert_eq!(schedule.timeout(false, now), None);
+        assert_eq!(schedule.timeout(true, now), Some(Duration::from_secs(1)));
+        schedule.observe(CheckpointBeat::Advanced, now, &mut ready);
+        assert!(!ready, "local progress cannot confirm durable publication");
+        assert!(schedule.due(now));
+        schedule.observe(CheckpointBeat::Durable, now, &mut ready);
+        assert!(ready);
+    }
+
+    #[test]
+    fn cleanup_download_overlap_retry_deadline_applies_during_continuous_traffic() {
+        use crate::sql::CheckpointBeat;
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let mut schedule = super::CheckpointSchedule::default();
+        let mut ready = true;
+        schedule.observe(CheckpointBeat::StorageFailure, now, &mut ready);
+        crate::mem::guard::forbid_alloc(|| {
+            for milliseconds in 0..1000 {
+                let event_at = now + Duration::from_millis(milliseconds);
+                assert!(!schedule.due(event_at));
+                assert_eq!(
+                    schedule.timeout(true, event_at),
+                    Some(Duration::from_millis(1000 - milliseconds))
+                );
+            }
+            let retry = now + Duration::from_secs(1);
+            assert!(schedule.due(retry));
+            schedule.observe(CheckpointBeat::Advanced, retry, &mut ready);
+            assert_eq!(schedule.timeout(true, retry), Some(Duration::ZERO));
+            assert_eq!(schedule.timeout(false, retry), None);
+        });
+        assert!(!ready);
+    }
+
+    #[test]
+    fn cleanup_download_overlap_local_failure_keeps_publication_acknowledgement() {
+        use crate::sql::CheckpointBeat;
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let mut schedule = super::CheckpointSchedule::default();
+        for initial in [false, true] {
+            let mut ready = initial;
+            schedule.observe(CheckpointBeat::LocalFailure, now, &mut ready);
+            assert_eq!(ready, initial);
+            assert_eq!(schedule.timeout(true, now), Some(Duration::from_secs(1)));
+            schedule.observe(CheckpointBeat::DurableWithLocalFailure, now, &mut ready);
+            assert!(ready);
+            assert!(!schedule.due(now));
+            schedule.observe(CheckpointBeat::Advanced, now, &mut ready);
+            assert!(ready);
+            assert!(schedule.due(now));
+        }
+    }
 
     fn discovery_row<'a>(
         publication: &'a [u8],

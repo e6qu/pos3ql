@@ -83980,3 +83980,265 @@ fn owned_write_inputs_rewrite_undo_exhaustion_releases_images_and_restores_defin
     assert_eq!(data_rows(&retry), ["1|bigint", "2|bigint"]);
     assert_owned_rewrite_inputs_released(&mut engine);
 }
+
+fn check_cleanup_during_download(name: &str, fail_read: bool, retain_both: bool) {
+    use crate::io::reactor::Reactor;
+    use crate::store::{BlockStore, StoreError};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let (mut engine, budget, mut config) = sliced_cleanup_fixture(name, false);
+    let retain_row = |engine: &Engine| {
+        let table = engine
+            .storage
+            .find_table("public", "cleanup_orders")
+            .unwrap();
+        let home = engine
+            .storage
+            .resident_rows(table)
+            .iter()
+            .next()
+            .unwrap()
+            .1
+            .committed;
+        let Some(crate::storage::RowHome::Heap(location)) = home else {
+            panic!("fixture row is resident")
+        };
+        engine.storage.heap.get(location).unwrap()
+    };
+    let older = retain_row(&engine);
+    let lsn = engine.storage.lsn();
+    if retain_both {
+        start_sliced_cleanup(&mut engine, lsn);
+        finish_sliced_cleanup(&mut engine);
+    }
+    let current = retain_row(&engine);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    config.object_store_on = true;
+    config.object_store_sim = false;
+    config.object_store_endpoint = listener.local_addr().unwrap().to_string();
+    config.object_store_access_key = "test-access".to_string();
+    config.object_store_secret_key = "test-secret".to_string();
+    config.object_store_get_slots = 1;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    let mut io_budget = Budget::new(256 << 20);
+    engine.ckpt = Some(crate::checkpoint::Checkpointer::new(&config, &mut io_budget).unwrap());
+    let blocks = engine.ckpt.as_ref().unwrap().block_stack();
+    engine.enable_async_block_reads();
+    let payload = b"the download still belongs to its waiting reader";
+    let mut framed = [0u8; crate::store::BLOCK_SIZE];
+    let (id, framed_len) =
+        crate::store::encode(payload, crate::store::BlockType::SstData, 0, &mut framed).unwrap();
+    let mut output = [0u8; 128];
+    assert_eq!(
+        crate::mem::guard::forbid_alloc(|| blocks.lock().unwrap().get(&id, &mut output)),
+        Err(StoreError::NotReady)
+    );
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "GET did not open its socket");
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("accept GET: {error}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut request = [0u8; 4096];
+    let mut received = 0;
+    while !request[..received]
+        .windows(4)
+        .any(|bytes| bytes == b"\r\n\r\n")
+    {
+        let n = stream.read(&mut request[received..]).unwrap();
+        assert!(n > 0 && received + n < request.len());
+        received += n;
+    }
+    assert!(request[..received].starts_with(b"GET "));
+    let fd = engine.pending_block_read_fd(0).expect("GET is suspended");
+    let mut reactor = Reactor::new(&mut io_budget, 4).unwrap();
+    reactor.register_read(fd, 7).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        engine.begin_post_publish_cleanup(lsn);
+        assert!(engine.checkpoint_can_progress());
+        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
+        assert_eq!(reactor.poll(Some(Duration::ZERO)).unwrap(), 0);
+        if retain_both {
+            assert_eq!(engine.checkpoint_beat(), CheckpointBeat::LocalFailure);
+            assert!(!engine.compact_scratch.active());
+            assert_eq!(engine.pending_block_read_fd(0), Some(fd));
+        }
+    });
+    drop(older);
+    let mut turns = 0;
+    crate::mem::guard::forbid_alloc(|| {
+        while engine.post_publish_cleanup.is_some() {
+            assert!(turns < 64, "cleanup must finish without the GET response");
+            assert!(engine.checkpoint_can_progress());
+            assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
+            assert_eq!(engine.pending_block_read_fd(0), Some(fd));
+            assert!(engine.object_store_reads_busy());
+            turns += 1;
+        }
+        assert!(turns > 2, "the fixture must exercise sliced copying");
+        assert!(!engine.compact_scratch.active());
+        assert!(!engine.checkpoint_can_progress());
+        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::WaitingForReads);
+        assert_eq!(reactor.poll(Some(Duration::ZERO)).unwrap(), 0);
+        let stats = blocks.lock().unwrap().io_stats();
+        assert_eq!(stats.object_gets, 1);
+        assert_eq!(stats.object_puts, 0);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    });
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*), sum(length(note)) FROM cleanup_orders",
+            4 << 20,
+        )),
+        ["80|655360"]
+    );
+    let mut values = [Datum::Null; 2];
+    crate::storage::rowenc::decode(&current, &[ColType::Int4, ColType::Text], &mut values).unwrap();
+    assert!(matches!(values[1], Datum::Text(value) if value.len() == 8192));
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    if fail_read {
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    } else {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {framed_len}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.write_all(&framed[..framed_len]).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    crate::mem::guard::forbid_alloc(|| {
+        loop {
+            assert!(Instant::now() < deadline, "released GET did not complete");
+            let count = reactor.poll(Some(Duration::from_millis(10))).unwrap();
+            if count != 0 && engine.advance_pending_block_read(0).unwrap() {
+                break;
+            }
+        }
+        let result = blocks.lock().unwrap().get(&id, &mut output);
+        if fail_read {
+            assert_eq!(result, Err(StoreError::NotFound));
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                (payload.len(), crate::store::BlockType::SstData)
+            );
+            assert_eq!(&output[..payload.len()], payload);
+        }
+        assert!(!engine.object_store_reads_busy());
+    });
+}
+
+#[test]
+fn cleanup_download_overlap_finishes_cleanup_and_preserves_the_pending_response() {
+    check_cleanup_during_download("cleanup-download-success", false, false);
+}
+
+#[test]
+fn cleanup_download_overlap_finishes_cleanup_without_hiding_a_download_error() {
+    check_cleanup_during_download("cleanup-download-error", true, false);
+}
+
+#[test]
+fn cleanup_download_overlap_retained_buffer_failure_retries_without_cancelling_the_get() {
+    check_cleanup_during_download("cleanup-download-retained", false, true);
+}
+
+#[test]
+fn cleanup_download_overlap_distinguishes_durable_publication_from_local_cleanup() {
+    let (mut engine, _budget, _config) = sliced_cleanup_fixture("cleanup-outcomes", true);
+    engine.wal.commit();
+    let mut published = false;
+    for _ in 0..64 {
+        match engine.checkpoint_beat() {
+            CheckpointBeat::Advanced => {}
+            CheckpointBeat::Durable => {
+                published = true;
+                break;
+            }
+            other => panic!("unexpected publication outcome: {other:?}"),
+        }
+    }
+    assert!(published);
+    assert!(engine.post_publish_cleanup.is_some());
+    crate::mem::guard::forbid_alloc(|| {
+        while engine.post_publish_cleanup.is_some() {
+            assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
+        }
+    });
+}
+
+#[test]
+fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhaustion() {
+    let (mut engine, budget, _config) = sliced_cleanup_fixture("cleanup-published-full", true);
+    let retain_row = |engine: &Engine| {
+        let table = engine
+            .storage
+            .find_table("public", "cleanup_orders")
+            .unwrap();
+        let home = engine
+            .storage
+            .resident_rows(table)
+            .iter()
+            .next()
+            .unwrap()
+            .1
+            .committed;
+        let Some(crate::storage::RowHome::Heap(location)) = home else {
+            panic!("fixture row is resident")
+        };
+        engine.storage.heap.get(location).unwrap()
+    };
+    let older = retain_row(&engine);
+    let lsn = engine.storage.lsn();
+    start_sliced_cleanup(&mut engine, lsn);
+    finish_sliced_cleanup(&mut engine);
+    let current = retain_row(&engine);
+    crate::mem::guard::forbid_alloc(|| {
+        for _ in 0..4 {
+            drop(engine.storage.heap.append_image(&[0u8; 64 << 10]).unwrap());
+        }
+    });
+    assert!(engine.storage.heap.used() * 100 >= engine.storage.heap.capacity() * 85);
+    assert_eq!(
+        engine.checkpoint_beat(),
+        CheckpointBeat::DurableWithLocalFailure
+    );
+    assert!(engine.post_publish_cleanup.is_some());
+    assert!(!engine.compact_scratch.active());
+    drop(older);
+    finish_sliced_cleanup(&mut engine);
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*), sum(length(note)) FROM cleanup_orders",
+            4 << 20,
+        )),
+        ["80|655360"]
+    );
+    let mut values = [Datum::Null; 2];
+    crate::storage::rowenc::decode(&current, &[ColType::Int4, ColType::Text], &mut values).unwrap();
+    assert!(matches!(values[1], Datum::Text(value) if value.len() == 8192));
+}

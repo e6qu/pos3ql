@@ -725,7 +725,11 @@ reader retains the other buffer. Shared callers always use the private copy
 path.
 
 Ordinary automatic checkpoint cleanup copies at most 64 KiB of heap bytes per
-cleanup step. The server advances one step between messages or while idle. Each SQL
+cleanup step. The server advances one step between messages or while idle,
+including while an unrelated object download is waiting. For example, a slow
+invoice download does not prevent the server from reclaiming unused row memory.
+After local cleanup finishes, the reactor waits for download readiness rather
+than repeatedly polling maintenance that needs that download to finish. Each SQL
 statement also advances at most one step before executing; it does not drain
 the complete copy. For
 example, a large cleanup can remain pending while a client reads an order,
@@ -743,7 +747,9 @@ instance returns XX000, "heap relocation belongs to another storage instance",
 without publishing either instance. Journal cleanup runs once for the published
 prefix; writes after it keep their journal suffix for recovery. Heap capture,
 sorting, final remapping, eviction, and other maintenance still run within server
-turns. Fixed execution workers and independent object I/O remain unfinished.
+turns. Checkpoint publication, merges, and temporary spilling still wait for
+pending durable-block downloads. Fixed execution workers and independent storage
+publication remain unfinished.
 
 Eviction requires an installed object's recorded boundary to cover the row's
 commit position. A later update stays in the heap; history newer than that

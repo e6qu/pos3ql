@@ -409,6 +409,27 @@ enum PostPublishPhase {
     Finish,
 }
 
+/// Local progress does not prove that a failed durable publication recovered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointBeat {
+    Idle,
+    WaitingForReads,
+    Advanced,
+    Durable,
+    DurableWithLocalFailure,
+    LocalFailure,
+    StorageFailure,
+}
+
+impl CheckpointBeat {
+    pub(crate) fn failed(self) -> bool {
+        matches!(
+            self,
+            Self::LocalFailure | Self::StorageFailure | Self::DurableWithLocalFailure
+        )
+    }
+}
+
 /// The query engine: catalog, memtable storage, WAL, object-storage
 /// checkpointing, and statement execution.
 pub struct Engine {
@@ -8713,30 +8734,22 @@ impl Engine {
             })
     }
 
-    /// One checkpoint beat: a trigger (heap or journal filling) starts a
-    /// sweep, and an active sweep advances one slice per call until its
-    /// manifest publishes — so a checkpoint never stalls the connections for
-    /// its whole duration, only for one table's write. Called after each
-    /// query message and by the idle event loop. Failures are reported on
-    /// stderr and the beat retried rather than failing unrelated statements;
-    /// the return is false on a failed beat so the idle driver can back off
-    /// a persistently-down bucket.
+    /// Local cleanup can progress without borrowing any object-store client.
+    /// Other maintenance waits for all statement-owned block reads to finish.
+    pub(crate) fn checkpoint_can_progress(&self) -> bool {
+        self.post_publish_cleanup.is_some()
+            || (self.checkpoint_work_pending() && !self.block_reads_pending())
+    }
+
+    /// Advances one maintenance turn; false requests retry backoff.
     pub fn maybe_checkpoint(&mut self) -> bool {
-        // A suspended read owns the sole block client until the reactor
-        // completes it. Checkpoint publication uses that client synchronously.
-        if self.block_reads_pending() {
-            return true;
-        }
-        if let Err(error) = self.retry_pending_wal_upload() {
-            let message = stack_format!(
-                512,
-                "auto-checkpoint failed ({}): {}\n",
-                error.sqlstate,
-                error.message.as_str()
-            );
-            crate::util::stderr_line(message.as_str());
-            return false;
-        }
+        !self.checkpoint_beat().failed()
+    }
+
+    /// Copy at most 64 KiB during ordinary local cleanup. Critical heap
+    /// pressure retains the existing synchronous cleanup contract. Publication
+    /// and merge beats still use synchronous object I/O after reads finish.
+    pub(crate) fn checkpoint_beat(&mut self) -> CheckpointBeat {
         if self.post_publish_cleanup.is_some() {
             let cleanup = if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
                 self.finish_post_publish_cleanup()
@@ -8744,7 +8757,7 @@ impl Engine {
                 self.post_publish_cleanup_step(false).map(|_| ())
             };
             return match cleanup {
-                Ok(_) => true,
+                Ok(_) => CheckpointBeat::Advanced,
                 Err(e) => {
                     let message = stack_format!(
                         512,
@@ -8753,10 +8766,31 @@ impl Engine {
                         e.message.as_str()
                     );
                     crate::util::stderr_line(message.as_str());
-                    false
+                    CheckpointBeat::LocalFailure
                 }
             };
         }
+        // The read pool has independent requests, but checkpoint reads must
+        // switch it to synchronous mode without interrupting an owned GET.
+        if self.block_reads_pending() {
+            return CheckpointBeat::WaitingForReads;
+        }
+        let retried_upload = self.durable_retry_pending();
+        if let Err(error) = self.retry_pending_wal_upload() {
+            let message = stack_format!(
+                512,
+                "auto-checkpoint failed ({}): {}\n",
+                error.sqlstate,
+                error.message.as_str()
+            );
+            crate::util::stderr_line(message.as_str());
+            return CheckpointBeat::StorageFailure;
+        }
+        let progress = if retried_upload {
+            CheckpointBeat::Durable
+        } else {
+            CheckpointBeat::Idle
+        };
         let heap_full = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 65;
         let history_full = self.storage.history_pressure();
         let temporary_map_full = self.storage.temporary_map_pressure();
@@ -8772,7 +8806,11 @@ impl Engine {
                         error.message.as_str()
                     );
                     crate::util::stderr_line(message.as_str());
-                    return false;
+                    return if retried_upload {
+                        CheckpointBeat::DurableWithLocalFailure
+                    } else {
+                        CheckpointBeat::LocalFailure
+                    };
                 }
             }
         {
@@ -8788,13 +8826,21 @@ impl Engine {
                     error.message.as_str()
                 );
                 crate::util::stderr_line(message.as_str());
-                return false;
+                return if retried_upload {
+                    CheckpointBeat::DurableWithLocalFailure
+                } else {
+                    CheckpointBeat::LocalFailure
+                };
             }
             self.storage.evict_redundant_entries(slot);
-            return true;
+            return if retried_upload {
+                CheckpointBeat::Durable
+            } else {
+                CheckpointBeat::Advanced
+            };
         }
         let Some(ckpt) = self.ckpt.as_mut() else {
-            return true;
+            return progress;
         };
         let wal_full = self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50;
         if !(ckpt.sweep_active()
@@ -8804,11 +8850,11 @@ impl Engine {
             || wal_full
             || history_full)
         {
-            return true;
+            return progress;
         }
         self.wal.commit();
         if ckpt.block_reads_busy() {
-            return true;
+            return CheckpointBeat::WaitingForReads;
         }
         // A checkpoint beat advances publication state that cannot be replayed
         // after yielding. Its block reads therefore own the store
@@ -8844,11 +8890,18 @@ impl Engine {
                         e.message.as_str()
                     );
                     crate::util::stderr_line(message.as_str());
-                    return false;
+                    return CheckpointBeat::DurableWithLocalFailure;
                 }
-                true
+                CheckpointBeat::Durable
             }
-            Ok(_) => true,
+            Ok(CheckpointStep::Working) => {
+                if retried_upload {
+                    CheckpointBeat::Durable
+                } else {
+                    CheckpointBeat::Advanced
+                }
+            }
+            Ok(CheckpointStep::Idle) => progress,
             Err(e) => {
                 let message = stack_format!(
                     512,
@@ -8857,7 +8910,7 @@ impl Engine {
                     e.message.as_str()
                 );
                 crate::util::stderr_line(message.as_str());
-                false
+                CheckpointBeat::StorageFailure
             }
         }
     }

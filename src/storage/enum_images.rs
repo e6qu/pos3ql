@@ -685,26 +685,48 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let source = create(&mut storage, "state");
             let source_view = storage.enum_for(source, 0);
-            let database = storage
-                .create_database(
-                    None,
-                    DatabaseOid::POSTGRES,
-                    test_database_definition("enum_clone"),
-                    0,
-                    77,
-                )
-                .unwrap();
-            let oid = storage.database(database).oid;
-            storage.select_database(oid).unwrap();
-            let cloned = storage.enum_slot("public", "state", 77).unwrap();
-            let selected = storage.enum_for(cloned, 77);
-            assert_ne!(cloned, source);
-            assert_eq!(selected.database, oid);
-            storage.retire_database(database, true);
-            storage.select_database(DatabaseOid::POSTGRES).unwrap();
-            assert_eq!(source_view.sort_of("new"), Some(1.0));
-            assert_eq!(selected.sort_of("new"), Some(1.0));
-            assert_eq!(storage.enum_for(source, 0).sort_of("new"), Some(1.0));
+            // Repeat beyond spare image capacity; retirement must release owners.
+            for rollback in [false, true, false, true] {
+                let database = storage
+                    .create_database(
+                        None,
+                        DatabaseOid::POSTGRES,
+                        test_database_definition("enum_clone"),
+                        0,
+                        77,
+                    )
+                    .unwrap();
+                let oid = storage.database(database).oid;
+                let cloned = if rollback {
+                    let catalog = storage.type_catalog.lock().unwrap();
+                    catalog
+                        .enums
+                        .iter()
+                        .enumerate()
+                        .find_map(|(slot, definition)| {
+                            (definition.database == oid && definition.visible_to(77))
+                                .then_some(slot)
+                        })
+                        .unwrap()
+                } else {
+                    storage.commit_database_create(database);
+                    storage.select_database(oid).unwrap();
+                    storage.enum_slot("public", "state", 0).unwrap()
+                };
+                let selected = storage.enum_for(cloned, 77);
+                assert_ne!(cloned, source);
+                assert_eq!(selected.database, oid);
+                storage.select_database(DatabaseOid::POSTGRES).unwrap();
+                if rollback {
+                    storage.rollback_database_create(database);
+                } else {
+                    storage.drop_database(database, 77);
+                    storage.commit_database_drop(database);
+                }
+                assert_eq!(source_view.sort_of("new"), Some(1.0));
+                assert_eq!(selected.sort_of("new"), Some(1.0));
+                assert_eq!(storage.enum_for(source, 0).sort_of("new"), Some(1.0));
+            }
         });
     }
 }

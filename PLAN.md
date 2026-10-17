@@ -74,6 +74,9 @@ through changes and replacement. Reservations and history limits are fixed at
 startup. Table creation, uncommitted table edits, name lookup and changes to type
 references use ownership for each selected table. Waiting for one definition
 keeps shared allocators and catalogs available for unrelated storage work.
+Domain, enum and composite creation and moves share one name-reservation check,
+including transaction waits and journal replay. This does not yet coordinate
+publication of a complete type change and all its references.
 Selected enum definitions retain their label images through alteration,
 rollback, drop, slot reuse, replay and database retirement. Readers and
 iterators keep the fixed label buffers alive independently of storage; type commits

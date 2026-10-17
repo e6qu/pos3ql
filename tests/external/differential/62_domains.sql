@@ -197,6 +197,26 @@ SELECT typname, nspname, rolname
 -- An unknown type name is 42704.
 CREATE TABLE dom_bad (a nonesuch);
 
+-- Domains, enums and named composites share names during creation and moves.
+CREATE TYPE dom_name_target AS (value integer);
+CREATE DOMAIN dom_name_source AS integer;
+ALTER DOMAIN dom_name_source RENAME TO dom_name_target;
+CREATE SCHEMA dom_name_destination;
+CREATE TYPE dom_name_destination.dom_name_source AS (value integer);
+ALTER DOMAIN dom_name_source SET SCHEMA dom_name_destination;
+BEGIN;
+ALTER DOMAIN dom_name_source RENAME TO dom_name_moved;
+CREATE TYPE dom_name_source AS ENUM ('ready');
+ROLLBACK;
+SELECT t.typname, t.typtype, n.nspname
+  FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+ WHERE t.typname IN ('dom_name_source', 'dom_name_moved', 'dom_name_target')
+ ORDER BY t.typname, n.nspname;
+DROP DOMAIN dom_name_source;
+DROP TYPE dom_name_target;
+DROP TYPE dom_name_destination.dom_name_source;
+DROP SCHEMA dom_name_destination;
+
 DROP TABLE dom_t;
 DROP TABLE dom_t2;
 DROP TABLE dom_nested;

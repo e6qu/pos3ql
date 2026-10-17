@@ -346,6 +346,16 @@ later committed duplicates. The [PostgreSQL 18 index-build implementation](https
 is the upstream visibility reference; the differential suite checks actual
 PostgreSQL results.
 
+Domains, enums and named composite types share one namespace in each schema.
+Creation, renaming, schema moves and journal replay use the same name check.
+A conflicting visible name returns `42710`; another transaction's pending
+creation, rename or drop waits through the existing transaction wait path.
+A pending rename reserves both names for other transactions. Its owner can
+reuse the old name, and rollback releases the proposed name. No memory
+reservation or catalog lock is added.
+For example, after `CREATE TYPE order_code AS (value integer)`, renaming a
+domain to `order_code` fails instead of creating two types with that name.
+
 Type renames and schema moves update references only in the type's database,
 including pending table, domain, composite and routine definitions. Casts, operators,
 operator families and operator classes retain their input and result types too.

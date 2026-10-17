@@ -16,10 +16,12 @@ mod table_definitions;
 mod table_edits;
 mod table_names;
 mod type_contracts;
+mod type_names;
 mod type_reference_moves;
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
+use type_names::NamedTypeSlot;
 pub(crate) mod foreign;
 mod partition_rows;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
@@ -38695,92 +38697,7 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if let Some(blocker) = catalog.domains.iter().find_map(|d| {
-            (d.database == current_database()
-                && (d.schema == schema && d.name == name
-                    || d.pending_definition
-                        .and_then(|pending| pending.identity)
-                        .is_some_and(|identity| {
-                            identity.schema == schema && identity.name == name
-                        })))
-            .then(|| {
-                d.pending_definition
-                    .map(|pending| pending.txid)
-                    .or_else(|| d.ddl_state.pending_txid())
-            })
-            .flatten()
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if let Some(blocker) = catalog.enums.iter().find_map(|e| {
-            (e.database == current_database()
-                && (e.schema == schema && e.name == name
-                    || e.pending_definition
-                        .is_some_and(|pending| pending.schema == schema && pending.name == name)))
-            .then(|| {
-                e.pending_definition
-                    .map(|pending| pending.txid)
-                    .or_else(|| e.ddl_state.pending_txid())
-            })
-            .flatten()
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if let Some(blocker) = catalog.composites.iter().find_map(|composite| {
-            (composite.database == current_database()
-                && (composite.schema == schema && composite.name == name
-                    || composite
-                        .pending_definition
-                        .is_some_and(|pending| pending.schema == schema && pending.name == name)))
-            .then(|| {
-                composite
-                    .pending_definition
-                    .map(|pending| pending.txid)
-                    .or_else(|| composite.ddl_state.pending_txid())
-            })
-            .flatten()
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if catalog.domains.iter().any(|domain| {
-            domain.database == current_database()
-                && domain.visible_to(txid)
-                && domain.definition_for(txid).schema == schema
-                && domain.definition_for(txid).name == name
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                name.as_str()
-            ));
-        }
-        if catalog.enums.iter().any(|e| {
-            e.database == current_database()
-                && e.visible_to(txid)
-                && e.definition_for(txid).schema == schema
-                && e.definition_for(txid).name == name
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                name.as_str()
-            ));
-        }
-        if catalog.composites.iter().any(|composite| {
-            composite.database == current_database()
-                && composite.visible_to(txid)
-                && composite.definition_for(txid).schema == schema
-                && composite.definition_for(txid).name == name
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                name.as_str()
-            ));
-        }
+        self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(new) = catalog
             .domains
             .iter()
@@ -39200,53 +39117,13 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if let Some(blocker) =
-            catalog
-                .domains
-                .iter()
-                .enumerate()
-                .find_map(|(other_slot, domain)| {
-                    let definition = domain.definition_for(txid);
-                    (other_slot != slot
-                        && domain.database == current_database()
-                        && definition.schema == schema
-                        && definition.name == name)
-                        .then(|| {
-                            domain
-                                .pending_definition
-                                .map(|pending| pending.txid)
-                                .or_else(|| domain.ddl_state.pending_txid())
-                        })
-                        .flatten()
-                        .filter(|&owner| owner != txid)
-                })
-        {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if catalog
-            .domains
-            .iter()
-            .enumerate()
-            .any(|(other_slot, domain)| {
-                other_slot != slot
-                    && domain.database == current_database()
-                    && domain.visible_to(txid)
-                    && domain.definition_for(txid).schema == schema
-                    && domain.definition_for(txid).name == name
-            })
-            || catalog.enums.iter().any(|enumeration| {
-                enumeration.database == current_database()
-                    && enumeration.visible_to(txid)
-                    && enumeration.schema == schema
-                    && enumeration.definition_for(txid).name == name
-            })
-        {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                name.as_str()
-            ));
-        }
+        self.require_named_type_name(
+            &catalog,
+            schema,
+            name,
+            txid,
+            Some(NamedTypeSlot::Domain(slot)),
+        )?;
         let domain = &mut catalog.domains[slot];
         if let Some(pending) = domain.pending_definition
             && pending.txid != txid
@@ -39665,7 +39542,7 @@ impl Storage {
 
     /// Registers an enum as an uncommitted CREATE owned by `txid` (or, for
     /// replay/checkpoint with `txid == 0`, committed directly). The caller has
-    /// validated the labels and checked the name is free.
+    /// validated the labels. Storage checks the shared named-type namespace.
     pub fn create_enum(
         &mut self,
         schema: SqlName,
@@ -39680,71 +39557,7 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if let Some(blocker) = catalog.enums.iter().find_map(|e| {
-            let same_name = e.database == current_database()
-                && (e.schema == schema && e.name == name
-                    || e.pending_definition
-                        .is_some_and(|pending| pending.schema == schema && pending.name == name));
-            same_name
-                .then(|| {
-                    e.pending_definition
-                        .map(|pending| pending.txid)
-                        .or_else(|| e.ddl_state.pending_txid())
-                })
-                .flatten()
-                .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if catalog.enums.iter().any(|e| {
-            e.database == current_database()
-                && e.visible_to(txid)
-                && e.definition_for(txid).schema == schema
-                && e.definition_for(txid).name == name
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                name.as_str()
-            ));
-        }
-        if let Some(blocker) = catalog.domains.iter().find_map(|d| {
-            (d.database == current_database()
-                && (d.schema == schema && d.name == name
-                    || d.pending_definition
-                        .and_then(|pending| pending.identity)
-                        .is_some_and(|identity| {
-                            identity.schema == schema && identity.name == name
-                        })))
-            .then_some(d.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if catalog.domains.iter().any(|d| {
-            d.database == current_database()
-                && d.visible_to(txid)
-                && d.definition_for(txid).schema == schema
-                && d.definition_for(txid).name == name
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                name.as_str()
-            ));
-        }
-        if catalog.composites.iter().any(|composite| {
-            composite.database == current_database()
-                && composite.visible_to(txid)
-                && composite.definition_for(txid).schema == schema
-                && composite.definition_for(txid).name == name
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                name.as_str()
-            ));
-        }
+        self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(new) = catalog
             .enums
             .iter()
@@ -39792,66 +39605,13 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if let Some(blocker) = catalog
-            .enums
-            .iter()
-            .enumerate()
-            .find_map(|(other_slot, other)| {
-                (other_slot != slot
-                    && other.database == current_database()
-                    && (other.schema == schema && other.name == name
-                        || other.pending_definition.is_some_and(|pending| {
-                            pending.schema == schema && pending.name == name
-                        })))
-                .then(|| {
-                    other
-                        .pending_definition
-                        .map(|pending| pending.txid)
-                        .or_else(|| other.ddl_state.pending_txid())
-                })
-                .flatten()
-                .filter(|&owner| owner != txid)
-            })
-        {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if let Some(blocker) = catalog.domains.iter().find_map(|domain| {
-            (domain.database == current_database()
-                && (domain.schema == schema && domain.name == name
-                    || domain
-                        .pending_definition
-                        .and_then(|pending| pending.identity)
-                        .is_some_and(|identity| {
-                            identity.schema == schema && identity.name == name
-                        })))
-            .then_some(domain.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        if catalog.enums.iter().enumerate().any(|(other_slot, other)| {
-            other_slot != slot
-                && other.database == current_database()
-                && other.visible_to(txid)
-                && other.definition_for(txid).schema == schema
-                && other.definition_for(txid).name == name
-        }) || catalog.domains.iter().any(|domain| {
-            domain.database == current_database()
-                && domain.visible_to(txid)
-                && domain.definition_for(txid).schema == schema
-                && domain.definition_for(txid).name == name
-        }) || catalog.composites.iter().any(|composite| {
-            composite.database == current_database()
-                && composite.visible_to(txid)
-                && composite.definition_for(txid).schema == schema
-                && composite.definition_for(txid).name == name
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                name.as_str()
-            ));
-        }
+        self.require_named_type_name(
+            &catalog,
+            schema,
+            name,
+            txid,
+            Some(NamedTypeSlot::Enum(slot)),
+        )?;
         if let Some(pending) = catalog.enums[slot].pending_definition
             && pending.txid != txid
         {
@@ -40029,29 +39789,7 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if catalog.enums.iter().enumerate().any(|(other_slot, other)| {
-            other_slot != slot
-                && other.database == current_database()
-                && other.visible_to(0)
-                && other.schema == schema
-                && other.name == name
-        }) || catalog.domains.iter().any(|domain| {
-            domain.database == current_database()
-                && domain.visible_to(0)
-                && domain.schema == schema
-                && domain.name == name
-        }) || catalog.composites.iter().any(|composite| {
-            composite.database == current_database()
-                && composite.visible_to(0)
-                && composite.schema == schema
-                && composite.name == name
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                name.as_str()
-            ));
-        }
+        self.require_named_type_name(&catalog, schema, name, 0, Some(NamedTypeSlot::Enum(slot)))?;
         let previous = catalog.enums[slot];
         if schema != previous.schema || name != previous.name {
             catalog.enums[slot].schema = schema;
@@ -40341,90 +40079,13 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if let Some(blocker) = catalog.enums.iter().find_map(|enumeration| {
-            (enumeration.database == current_database()
-                && (enumeration.schema == definition.schema && enumeration.name == definition.name
-                    || enumeration.pending_definition.is_some_and(|pending| {
-                        pending.schema == definition.schema && pending.name == definition.name
-                    })))
-            .then(|| {
-                enumeration
-                    .pending_definition
-                    .map(|pending| pending.txid)
-                    .or_else(|| enumeration.ddl_state.pending_txid())
-            })
-            .flatten()
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
-        }
-        if let Some(blocker) = catalog.domains.iter().find_map(|domain| {
-            (domain.database == current_database()
-                && (domain.schema == definition.schema && domain.name == definition.name
-                    || domain
-                        .pending_definition
-                        .and_then(|pending| pending.identity)
-                        .is_some_and(|identity| {
-                            identity.schema == definition.schema && identity.name == definition.name
-                        })))
-            .then_some(domain.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
-        }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
-        }
-        if let Some(blocker) =
-            catalog
-                .composites
-                .iter()
-                .enumerate()
-                .find_map(|(other_slot, other)| {
-                    (other_slot != slot
-                        && other.database == current_database()
-                        && (other.schema == definition.schema && other.name == definition.name
-                            || other.pending_definition.is_some_and(|pending| {
-                                pending.schema == definition.schema
-                                    && pending.name == definition.name
-                            })))
-                    .then(|| {
-                        other
-                            .pending_definition
-                            .map(|pending| pending.txid)
-                            .or_else(|| other.ddl_state.pending_txid())
-                    })
-                    .flatten()
-                    .filter(|&owner| owner != txid)
-                })
-        {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
-        }
-        if catalog.enums.iter().any(|enumeration| {
-            enumeration.database == current_database()
-                && enumeration.visible_to(txid)
-                && enumeration.definition_for(txid).schema == definition.schema
-                && enumeration.definition_for(txid).name == definition.name
-        }) || catalog.domains.iter().any(|domain| {
-            domain.database == current_database()
-                && domain.visible_to(txid)
-                && domain.definition_for(txid).schema == definition.schema
-                && domain.definition_for(txid).name == definition.name
-        }) || catalog
-            .composites
-            .iter()
-            .enumerate()
-            .any(|(other_slot, other)| {
-                other_slot != slot
-                    && other.database == current_database()
-                    && other.visible_to(txid)
-                    && other.definition_for(txid).schema == definition.schema
-                    && other.definition_for(txid).name == definition.name
-            })
-        {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                definition.name.as_str()
-            ));
-        }
+        self.require_named_type_name(
+            &catalog,
+            definition.schema,
+            definition.name,
+            txid,
+            Some(NamedTypeSlot::Composite(slot)),
+        )?;
         let name = catalog.composites[slot].name;
         let composite = &mut catalog.composites[slot];
         if let Some(pending) = composite.pending_definition
@@ -40557,81 +40218,7 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        let blocker = catalog
-            .domains
-            .iter()
-            .filter_map(|domain| {
-                (domain.database == current_database()
-                    && (domain.schema == schema && domain.name == name
-                        || domain
-                            .pending_definition
-                            .and_then(|pending| pending.identity)
-                            .is_some_and(|identity| {
-                                identity.schema == schema && identity.name == name
-                            })))
-                .then(|| {
-                    domain
-                        .pending_definition
-                        .map(|pending| pending.txid)
-                        .or_else(|| domain.ddl_state.pending_txid())
-                })
-                .flatten()
-            })
-            .chain(catalog.enums.iter().filter_map(|enumeration| {
-                (enumeration.database == current_database()
-                    && (enumeration.schema == schema && enumeration.name == name
-                        || enumeration.pending_definition.is_some_and(|pending| {
-                            pending.schema == schema && pending.name == name
-                        })))
-                .then(|| {
-                    enumeration
-                        .pending_definition
-                        .map(|pending| pending.txid)
-                        .or_else(|| enumeration.ddl_state.pending_txid())
-                })
-                .flatten()
-            }))
-            .chain(catalog.composites.iter().filter_map(|composite| {
-                (composite.database == current_database()
-                    && (composite.schema == schema && composite.name == name
-                        || composite.pending_definition.is_some_and(|pending| {
-                            pending.schema == schema && pending.name == name
-                        })))
-                .then(|| {
-                    composite
-                        .pending_definition
-                        .map(|pending| pending.txid)
-                        .or_else(|| composite.ddl_state.pending_txid())
-                })
-                .flatten()
-            }))
-            .find(|&owner| owner != txid);
-        if let Some(blocker) = blocker {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
-        }
-        let exists = catalog.domains.iter().any(|domain| {
-            domain.database == current_database()
-                && domain.visible_to(txid)
-                && domain.definition_for(txid).schema == schema
-                && domain.definition_for(txid).name == name
-        }) || catalog.enums.iter().any(|enumeration| {
-            enumeration.database == current_database()
-                && enumeration.visible_to(txid)
-                && enumeration.definition_for(txid).schema == schema
-                && enumeration.definition_for(txid).name == name
-        }) || catalog.composites.iter().any(|composite| {
-            composite.database == current_database()
-                && composite.visible_to(txid)
-                && composite.definition_for(txid).schema == schema
-                && composite.definition_for(txid).name == name
-        });
-        if exists {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "type \"{}\" already exists",
-                name.as_str()
-            ));
-        }
+        self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(slot) = catalog
             .composites
             .iter()
@@ -40718,6 +40305,7 @@ impl Storage {
                 "journal composite catalog identity is unavailable"
             ));
         }
+        self.require_named_type_name(&catalog, schema, name, txid, None)?;
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::Composite,
             slot: slot as u16,

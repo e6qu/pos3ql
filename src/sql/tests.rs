@@ -49470,6 +49470,42 @@ fn named_composites_reserve_the_shared_type_namespace() {
             String::from_utf8_lossy(&bytes)
         );
     }
+    for statement in [
+        "CREATE DOMAIN shared_domain_source AS integer",
+        "CREATE TYPE shared_enum_source AS ENUM ('ready')",
+        "CREATE SCHEMA shared_type_destination",
+        "CREATE TYPE shared_type_destination.shared_domain_source AS (value integer)",
+    ] {
+        let bytes = run_with(&mut engine, &mut budget, statement);
+        assert!(!message_types(&bytes).contains(&b'E'), "{statement}");
+    }
+    for statement in [
+        "ALTER DOMAIN shared_domain_source RENAME TO shared_composite_name",
+        "ALTER DOMAIN shared_domain_source SET SCHEMA shared_type_destination",
+        "ALTER TYPE shared_enum_source RENAME TO shared_composite_name",
+    ] {
+        let bytes = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("42710"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER DOMAIN shared_domain_source RENAME TO shared_domain_moved; \
+         CREATE TYPE shared_domain_source AS ENUM ('ready'); ROLLBACK",
+    );
+    assert!(!message_types(&bytes).contains(&b'E'));
+    assert_eq!(
+        rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_type WHERE typname = 'shared_domain_source'",
+        ))[0],
+        ["2"]
+    );
 }
 
 #[test]

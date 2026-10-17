@@ -30,6 +30,7 @@ class DownloadGate:
         self.armed_key = None
         self.missing = False
         self.key = None
+        self.observed_keys = set()
 
     def arm(self, key, missing):
         with self.lock:
@@ -37,6 +38,7 @@ class DownloadGate:
             self.started.clear()
             self.release.clear()
             self.failure_sent.clear()
+            self.observed_keys.clear()
 
     def disarm(self):
         with self.lock:
@@ -44,6 +46,8 @@ class DownloadGate:
 
     def wait(self, command, key):
         with self.lock:
+            if command == "GET" and self.armed_key is not None:
+                self.observed_keys.add(key)
             claimed = command == "GET" and key == self.armed_key
             missing = self.missing
         if not claimed:
@@ -164,7 +168,9 @@ class Node:
             "object_store_region": "test-region", "object_store_access_key": "test-access",
             "object_store_secret_key": "test-secret", "object_store_get_slots": 2,
             "object_store_response_bytes": "256KiB", "wal_upload": "on", "wal_upload_sync": "on",
-            "block_cache_bytes": "4MiB", "disk_cache_bytes": 0,
+            # Recovery verifies each table's last data block. Two frames let
+            # the warm order's index and data evict that cached invoice block.
+            "block_cache_bytes": "512KiB", "disk_cache_bytes": 0,
             "max_tables": 8, "table_rows": 128, "txn_rows": 256,
             "max_ddl_per_transaction": 16, "max_value_indexes": 8, "value_index_rows": 256,
             "max_views": 4, "max_materialized_views": 4, "max_routines": 8,
@@ -251,7 +257,12 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
         with ThreadPoolExecutor(max_workers=2) as workers:
             pending = workers.submit(result, reader, report)
             try:
-                assert gate.started.wait(5), "cold report did not start an object GET"
+                if not gate.started.wait(5):
+                    observed = pending.result(timeout=0) if pending.done() else "still pending"
+                    with gate.lock:
+                        keys = sorted(gate.observed_keys)
+                    raise AssertionError({"required_invoice_object": target_key,
+                        "report": observed, "observed_gets": keys})
                 write = workers.submit(exercise, writer, schema)
                 actual_write = write.result(timeout=5)
                 assert actual_write == expected_write, (actual_write, expected_write)

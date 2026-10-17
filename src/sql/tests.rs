@@ -74048,15 +74048,17 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut full_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut full = Engine::new(&config, &mut full_budget).unwrap();
+    // Both cold paths read id and payload, so their request counts compare
+    // the same physical column work.
     let before_full = full.storage.block_io_stats();
     let full_result = run_with(
         &mut full,
         &mut full_budget,
-        "SELECT sum(length(payload)) FROM pruning_rows",
+        "SELECT sum(length(payload)), sum(id) FROM pruning_rows",
     );
     assert_eq!(
         data_rows(&full_result),
-        ["307200"],
+        ["307200|180300"],
         "{}",
         String::from_utf8_lossy(&full_result)
     );

@@ -423,6 +423,14 @@ pub fn arm_timeout(timeout_ms: u64) {
     DEADLINE.with(|d| d.set(dl));
 }
 
+pub(crate) fn statement_deadline() -> i64 {
+    DEADLINE.with(Cell::get)
+}
+
+pub(crate) fn restore_statement_deadline(deadline: i64) {
+    DEADLINE.with(|value| value.set(deadline));
+}
+
 /// Clears any armed statement deadline.
 pub fn disarm_timeout() {
     DEADLINE.with(|d| d.set(0));

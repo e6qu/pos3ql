@@ -1039,6 +1039,7 @@ impl Conn {
     }
 
     fn finish_lock_wait(&mut self) {
+        self.txn.release_suspended_statement();
         self.parked = false;
         self.parked_generation = 0;
         self.parked_for_io = false;

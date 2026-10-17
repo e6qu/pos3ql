@@ -757,7 +757,13 @@ UPDATE, DELETE, COPY, trigger execution and commit use the existing separate
 block client for any reads that must finish without restarting the operation.
 They preserve the suspended reader's socket, response bytes and error, including
 across nested calls and SQL errors. The reader keeps its original statement
-snapshot. A write that needs an uncached block still waits synchronously; it can
+snapshot and command identity across suspension, while a later READ COMMITTED
+statement selects a fresh view. Its statement timestamp and absolute timeout
+are restored too; transaction timestamps remain owned by their transaction
+when connections take turns. The wait state is inline in startup-owned
+transaction controls and retains an existing fixed snapshot slot. Cancellation,
+rollback, completion and errors release it. A write that needs an uncached block
+still waits synchronously; it can
 issue another GET even if a reader is already downloading that block. SQL
 execution remains serial, and this does not enable independent checkpoint
 publication or worker threads.

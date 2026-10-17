@@ -179,6 +179,13 @@ impl Drop for TriggerSqlScope<'_> {
     }
 }
 
+struct SuspendedStatementSnapshot {
+    lease: crate::storage::StatementSnapshotLease,
+    command: u32,
+    clock: super::datetime::StatementClock,
+    deadline: i64,
+}
+
 pub struct TxnState {
     pub mode: TxnMode,
     /// An error occurred inside an explicit block: everything until
@@ -199,6 +206,8 @@ pub struct TxnState {
     extension_script: bool,
     snapshot_lsn: Option<u64>,
     snapshot_taken: bool,
+    transaction_start: Option<i64>,
+    suspended_statement: Option<SuspendedStatementSnapshot>,
     /// Current statement identity. Snapshot K sees own writes with identifiers
     /// below K. Nested SQL temporarily uses a separately issued identity.
     command_id: u32,
@@ -895,6 +904,8 @@ impl TxnState {
             extension_script: false,
             snapshot_lsn: None,
             snapshot_taken: false,
+            transaction_start: None,
+            suspended_statement: None,
             command_id: 1,
             command_counter: 1,
             trigger_depth: 0,
@@ -1109,6 +1120,56 @@ impl TxnState {
                     "transaction command identity space is exhausted"
                 )
             })
+    }
+
+    pub(crate) fn begin_statement_clock(&self) {
+        if let Some(suspended) = &self.suspended_statement {
+            super::datetime::restore_statement_clock(suspended.clock);
+        } else {
+            super::datetime::begin_statement();
+            if let Some(start) = self.transaction_start {
+                super::datetime::restore_transaction_clock(start);
+            }
+        }
+    }
+
+    pub(crate) fn activate_transaction_clock(&mut self) {
+        let start = *self
+            .transaction_start
+            .get_or_insert_with(super::datetime::statement_micros);
+        super::datetime::restore_transaction_clock(start);
+    }
+
+    pub(crate) fn suspended_statement_deadline(&self) -> Option<i64> {
+        self.suspended_statement
+            .as_ref()
+            .map(|suspended| suspended.deadline)
+    }
+
+    pub(crate) fn suspend_statement_snapshot(
+        &mut self,
+        lease: crate::storage::StatementSnapshotLease,
+        clock: super::datetime::StatementClock,
+        deadline: i64,
+    ) {
+        self.suspended_statement = Some(SuspendedStatementSnapshot {
+            lease,
+            command: self.command_id,
+            clock,
+            deadline,
+        });
+    }
+
+    pub(crate) fn resume_statement_snapshot(
+        &mut self,
+    ) -> Option<crate::storage::StatementSnapshotLease> {
+        let suspended = self.suspended_statement.take()?;
+        self.command_id = suspended.command;
+        Some(suspended.lease)
+    }
+
+    pub(crate) fn release_suspended_statement(&mut self) {
+        self.suspended_statement = None;
     }
 
     pub fn begin_command(&mut self) -> Result<(), SqlError> {
@@ -2285,6 +2346,8 @@ impl TxnState {
         self.extension_script = false;
         self.snapshot_lsn = None;
         self.snapshot_taken = false;
+        self.transaction_start = None;
+        self.suspended_statement = None;
         self.touched.clear();
         self.truncates.clear();
         self.truncate_wal_tables.clear();

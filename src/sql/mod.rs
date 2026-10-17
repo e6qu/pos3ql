@@ -5034,6 +5034,7 @@ impl Engine {
         guc: &GucState,
     ) -> Result<(), SqlError> {
         if txn.is_active() {
+            txn.activate_transaction_clock();
             if mode == TxnMode::Explicit {
                 txn.mode = TxnMode::Explicit;
             }
@@ -5042,6 +5043,7 @@ impl Engine {
         txn.txid = self.storage.start_transaction_identity()?;
         txn.mode = mode;
         datetime::begin_transaction();
+        txn.activate_transaction_clock();
         guc.begin_transaction();
         let (isolation, read_only, deferrable) = guc.transaction_defaults();
         txn.set_characteristics(isolation, read_only, deferrable);
@@ -5059,17 +5061,25 @@ impl Engine {
         takes_snapshot: bool,
         advance_command: bool,
         retain_snapshot: bool,
+        resume_statement: bool,
     ) -> Result<Option<crate::storage::StatementSnapshotLease>, SqlError> {
         self.storage.set_foreign_statement_context(
             txn.txid,
             txn.isolation == TransactionIsolation::Serializable,
             txn.savepoint_names(),
         )?;
-        if advance_command {
+        let resumed = if resume_statement {
+            txn.resume_statement_snapshot()
+        } else {
+            None
+        };
+        if advance_command && resumed.is_none() {
             txn.begin_command()?;
         }
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
-        let lease = if takes_snapshot && retain_snapshot {
+        let lease = if resumed.is_some() {
+            resumed
+        } else if takes_snapshot && retain_snapshot {
             Some(
                 self.storage
                     .retain_statement_snapshot(txn.txid, |lsn| txn.statement_snapshot(lsn))?,
@@ -9057,7 +9067,7 @@ impl Engine {
         // Freeze this statement's clock before anything anchors a transaction
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
-        datetime::begin_statement();
+        txn.begin_statement_clock();
         if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
             responder.error(error.sqlstate, error.message.as_str())?;
             return Ok(ExecutionStatus::Complete);
@@ -9342,7 +9352,7 @@ impl Engine {
         // Freeze this statement's clock before anything anchors a transaction
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
-        datetime::begin_statement();
+        txn.begin_statement_clock();
         let routine_transaction_context = if txn.is_active() {
             exec::PlpgsqlTransactionContext::Atomic
         } else {
@@ -9481,7 +9491,7 @@ impl Engine {
     ) -> Result<bool, WireFull> {
         let _atomic_reads = self.atomic_block_read_scope();
         self.work.bind_connection(conn_id);
-        datetime::begin_statement();
+        txn.begin_statement_clock();
         if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
             responder.error(error.sqlstate, error.message.as_str())?;
             responder.ready_for_query(txn.status_byte())?;
@@ -9495,7 +9505,7 @@ impl Engine {
             responder.ready_for_query(txn.status_byte())?;
             return Ok(false);
         }
-        let _snapshot_lease = match self.begin_command_snapshot(txn, true, true, true) {
+        let _snapshot_lease = match self.begin_command_snapshot(txn, true, true, true, false) {
             Ok(lease) => lease,
             Err(error) => {
                 if txn.is_explicit() {
@@ -13856,6 +13866,12 @@ impl Engine {
             None,
         );
         txn.leave_ddl_origin(prior_origin);
+        if !matches!(&result, Ok(Err(error)) if
+            error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+            || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+        {
+            txn.release_suspended_statement();
+        }
         result
     }
 
@@ -13959,6 +13975,7 @@ impl Engine {
             true,
             true,
             !matches!(statement, Stmt::Checkpoint | Stmt::Vacuum { .. }),
+            false,
         ) {
             Ok(lease) => lease,
             Err(error) => return Ok(Err(error)),
@@ -14122,9 +14139,13 @@ impl Engine {
         if let Err(error) = self.publish_session_context(guc, txn, current_role.as_str()) {
             return Ok(Err(error));
         }
-        // Arm this statement's `statement_timeout` deadline (0 clears it); each
-        // statement re-arms, so no explicit disarm is needed.
-        query::arm_timeout(guc.statement_timeout_ms());
+        if reset_workspace && let Some(deadline) = txn.suspended_statement_deadline() {
+            query::restore_statement_deadline(deadline);
+        } else {
+            query::arm_timeout(guc.statement_timeout_ms());
+        }
+        let statement_clock = datetime::statement_clock();
+        let statement_deadline = query::statement_deadline();
         // Publish the session zone for the same span, so a cast that has to
         // supply one (`'12:00'::timetz`) sees what the client set.
         timezone::set_session(guc.timezone());
@@ -14209,10 +14230,54 @@ impl Engine {
             takes_snapshot,
             !matches!(statement, Stmt::Commit | Stmt::Rollback),
             !matches!(statement, Stmt::Checkpoint | Stmt::Vacuum { .. }),
+            reset_workspace,
         ) {
             Ok(lease) => lease,
             Err(error) => return Ok(Err(error)),
         };
+        let result = self.execute_stmt_with_snapshot(
+            statement,
+            arena,
+            params,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            routine_transaction_context,
+            responder,
+            reset_workspace,
+            capture,
+            &mut snapshot_lease,
+        );
+        if reset_workspace
+            && matches!(&result, Ok(Err(error)) if
+                error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+            && let Some(lease) = snapshot_lease.take()
+        {
+            // Transfer ownership before returning to the reactor. The next
+            // attempt resumes this command and view; it is not a new statement.
+            txn.suspend_statement_snapshot(lease, statement_clock, statement_deadline);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_stmt_with_snapshot<'capture>(
+        &mut self,
+        statement: &Stmt,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        routine_transaction_context: exec::PlpgsqlTransactionContext,
+        responder: &mut Responder,
+        reset_workspace: bool,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
+        snapshot_lease: &mut Option<crate::storage::StatementSnapshotLease>,
+    ) -> Result<Result<(), SqlError>, WireFull> {
         if statement_writes(statement) {
             self.storage.assign_transaction_identity(txn.txid);
         }

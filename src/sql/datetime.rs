@@ -2339,6 +2339,28 @@ std::thread_local! {
     static TRANSACTION_START: Cell<i64> = const { Cell::new(0) };
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct StatementClock {
+    statement: i64,
+    transaction: i64,
+}
+
+pub(crate) fn statement_clock() -> StatementClock {
+    StatementClock {
+        statement: statement_micros(),
+        transaction: transaction_micros(),
+    }
+}
+
+pub(crate) fn restore_statement_clock(clock: StatementClock) {
+    STATEMENT_START.with(|value| value.set(clock.statement));
+    restore_transaction_clock(clock.transaction);
+}
+
+pub(crate) fn restore_transaction_clock(start: i64) {
+    TRANSACTION_START.with(|value| value.set(start));
+}
+
 /// Marks the start of a statement.
 pub fn begin_statement() {
     STATEMENT_START.with(|t| t.set(now_micros()));

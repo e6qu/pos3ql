@@ -278,14 +278,14 @@ mod tests {
                         assert_eq!(
                             create(&mut storage, requested, "occupied", txid)
                                 .unwrap_err()
-                                .code,
+                                .sqlstate,
                             sqlstate::DUPLICATE_OBJECT
                         );
                         if txid == 7 {
                             assert_eq!(
                                 create(&mut storage, requested, "occupied", 9)
                                     .unwrap_err()
-                                    .code,
+                                    .sqlstate,
                                 sqlstate::INTERNAL_LOCK_WAIT
                             );
                         }
@@ -306,7 +306,7 @@ mod tests {
                     assert_eq!(
                         rename(&mut storage, source, "occupied", 7)
                             .unwrap_err()
-                            .code,
+                            .sqlstate,
                         sqlstate::DUPLICATE_OBJECT
                     );
                     // A failed attempt leaves no staged definition or label image.
@@ -330,11 +330,15 @@ mod tests {
                     rename(&mut storage, source, "after", 7).unwrap();
                     for name in ["before", "after"] {
                         assert_eq!(
-                            create(&mut storage, requested, name, 9).unwrap_err().code,
+                            create(&mut storage, requested, name, 9)
+                                .unwrap_err()
+                                .sqlstate,
                             sqlstate::INTERNAL_LOCK_WAIT
                         );
                         assert_eq!(
-                            rename(&mut storage, contender, name, 9).unwrap_err().code,
+                            rename(&mut storage, contender, name, 9)
+                                .unwrap_err()
+                                .sqlstate,
                             sqlstate::INTERNAL_LOCK_WAIT
                         );
                     }
@@ -343,7 +347,7 @@ mod tests {
                     assert_eq!(
                         create(&mut storage, requested, "before", 9)
                             .unwrap_err()
-                            .code,
+                            .sqlstate,
                         sqlstate::DUPLICATE_OBJECT
                     );
                 });
@@ -363,7 +367,7 @@ mod tests {
                     assert_eq!(
                         create(&mut storage, requested, "after", 7)
                             .unwrap_err()
-                            .code,
+                            .sqlstate,
                         sqlstate::DUPLICATE_OBJECT
                     );
                 });
@@ -387,7 +391,7 @@ mod tests {
                     storage
                         .replay_enum_identity(source, target.schema, target.name)
                         .unwrap_err()
-                        .code,
+                        .sqlstate,
                     sqlstate::DUPLICATE_OBJECT
                 );
                 let free = storage
@@ -411,7 +415,7 @@ mod tests {
                             0,
                         )
                         .unwrap_err()
-                        .code,
+                        .sqlstate,
                     sqlstate::DUPLICATE_OBJECT
                 );
             });
@@ -453,7 +457,7 @@ mod tests {
                     assert_eq!(
                         create(&mut storage, requested, "occupied", 9)
                             .unwrap_err()
-                            .code,
+                            .sqlstate,
                         sqlstate::INTERNAL_LOCK_WAIT
                     );
                 }

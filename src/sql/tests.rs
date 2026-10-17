@@ -49499,11 +49499,11 @@ fn named_composites_reserve_the_shared_type_namespace() {
     );
     assert!(!message_types(&bytes).contains(&b'E'));
     assert_eq!(
-        rows(&run_with(
+        data_rows(&run_with(
             &mut engine,
             &mut budget,
             "SELECT count(*) FROM pg_type WHERE typname = 'shared_domain_source'",
-        ))[0],
+        )),
         ["2"]
     );
 }

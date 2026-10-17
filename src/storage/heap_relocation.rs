@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn shared_heap_relocation_private_copy_allows_readers_and_unrelated_writes() {
-        let (storage, table, original) = fixture();
+        let (mut storage, table, original) = fixture();
         let other = storage
             .create_table(make_def(
                 "heap_job_other",
@@ -664,10 +664,10 @@ mod tests {
             job.copy_step(NonZeroUsize::MIN).unwrap();
             storage.commit_drop(table);
             let replacement = storage
-                .create_table(make_def(
-                    "heap_replacement",
-                    &[("active", ColType::Bool, false)],
-                ))
+                .create_table_in(
+                    make_def("heap_replacement", &[("active", ColType::Bool, false)]),
+                    8,
+                )
                 .unwrap();
             assert_eq!(replacement, table);
             assert_ne!(storage.tables[table].created_at(), stamp);
@@ -693,6 +693,7 @@ mod tests {
             rowenc::decode(&old, &[ColType::Int4, ColType::Text], &mut original_values).unwrap();
             assert_eq!(original_values, [Datum::Int4(10), Datum::Text("old")]);
             storage.restore_pending(table, 1, 8, undo);
+            storage.rollback_create(table);
         });
     }
 
@@ -747,7 +748,7 @@ mod tests {
 
     #[test]
     fn shared_heap_relocation_does_not_wait_for_definition_owners() {
-        let (storage, table, _) = fixture();
+        let (mut storage, table, _) = fixture();
         let other = storage
             .create_table(make_def(
                 "heap_definition_other",

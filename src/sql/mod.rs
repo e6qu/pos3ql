@@ -22296,16 +22296,20 @@ fn validate_recovered_enabled_subscription(
     connection.require_endpoint_for(subscription).map(|_| ())
 }
 
-// Reader metadata and the spare heap have exact startup charges. Preserve
-// each fixture's SQL/workspace headroom, including deliberate undersizing
-// of other resources, as table, heap, and workspace capacities change.
+// Keep fixture SQL/workspace headroom separate from the retained-storage,
+// checkpoint workspace and block scratch reservations charged at startup.
 #[cfg(test)]
 pub(crate) fn test_engine_budget(config: &Config, base: usize) -> Budget {
     Budget::new(
         base + Storage::table_definition_image_budget_bytes(config)
             + Storage::retained_row_walk_budget_bytes(config)
             + Storage::retained_row_metadata_budget_bytes(config)
-            + Storage::row_heap_relocation_budget_bytes(config),
+            + Storage::row_heap_relocation_budget_bytes(config)
+            + if config.object_store_on {
+                Checkpointer::workspace_budget_bytes(config) + crate::store::BLOCK_SIZE
+            } else {
+                0
+            },
     )
 }
 

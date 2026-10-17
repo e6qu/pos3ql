@@ -1097,7 +1097,7 @@ impl Checkpointer {
         );
     }
 
-    fn workspace_budget_bytes(config: &Config) -> usize {
+    pub(crate) fn workspace_budget_bytes(config: &Config) -> usize {
         let table_capacity = crate::storage::table_slot_capacity(config);
         let table_bookkeeping = table_capacity
             * (2 * core::mem::size_of::<SlotList>()

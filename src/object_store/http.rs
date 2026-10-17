@@ -1973,7 +1973,10 @@ mod tests {
         while matches!(result, Err(S3Error::WouldBlock)) {
             result = client.advance_pending();
         }
-        assert!(matches!(result, Err(S3Error::Protocol("not HTTP/1.x"))));
+        assert!(matches!(
+            result,
+            Err(S3Error::Protocol("unsupported HTTP version"))
+        ));
         assert!(!client.has_pending());
         assert!(client.pending_fd().is_none());
         server.join().unwrap();

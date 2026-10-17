@@ -159,6 +159,8 @@ so exhaustion preserves existing failure cleanup; later observations cannot move
 the global position backward. Catalog identities are reserved before publishing
 compound definitions. Creating a transaction reserves its identity and active-registry entry
 together; full capacities fail explicitly and leave existing owners intact.
+Simple queries, protocol synchronization and COPY run queued deferred triggers
+before an implicit commit; trigger failures roll back before durable success.
 
 - Protect journal staging, prepared transactions, commit order, and the
   responses waiting for durable storage.

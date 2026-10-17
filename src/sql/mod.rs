@@ -6751,13 +6751,16 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
-        self.fire_constraint_trigger_boundary(
+        if let Err(error) = self.fire_constraint_trigger_boundary(
             txn,
             guc,
             arena,
             responder,
             exec::TriggerQueueBoundary::Transaction,
-        )?;
+        ) {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         self.commit_txn(txn, guc)
     }
 
@@ -8660,7 +8663,10 @@ impl Engine {
             inserted,
         );
         setup.release_snapshot();
-        result?;
+        if let Err(error) = result {
+            self.copy_abort(txn, guc);
+            return Err(error);
+        }
         if txn.mode == TxnMode::Implicit {
             return self.commit_txn(txn, guc);
         }
@@ -8718,6 +8724,11 @@ impl Engine {
             inserted,
         )?;
         exec::constraints::validate_deferred_constraints(storage, txn, true, arena)?;
+        let boundary = if txn.mode == TxnMode::Implicit {
+            exec::TriggerQueueBoundary::Transaction
+        } else {
+            exec::TriggerQueueBoundary::Statement
+        };
         exec::fire_constraint_triggers(
             storage,
             txn,
@@ -8725,7 +8736,7 @@ impl Engine {
             guc.seq_session(),
             responder,
             scratch,
-            exec::TriggerQueueBoundary::Statement,
+            boundary,
         )?;
         txn.compact_completed_constraints();
         Ok(())
@@ -9130,7 +9141,7 @@ impl Engine {
             }
             if matches!(statement, Stmt::Begin(_))
                 && txn.mode == TxnMode::Implicit
-                && let Err(error) = self.commit_txn(txn, guc)
+                && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
             {
                 responder.error(error.sqlstate, error.message.as_str())?;
                 return Ok(ExecutionStatus::Complete);
@@ -9213,7 +9224,7 @@ impl Engine {
                 return Ok(ExecutionStatus::Complete);
             }
             if txn.take_concurrent_partition_detach() {
-                if let Err(error) = self.commit_txn(txn, guc) {
+                if let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder) {
                     responder.error(error.sqlstate, error.message.as_str())?;
                     return Ok(ExecutionStatus::Complete);
                 }
@@ -9232,7 +9243,7 @@ impl Engine {
         // FROM in flight, whose statement does not end until CopyDone.
         if txn.mode == TxnMode::Implicit
             && self.pending_copy.is_none()
-            && let Err(e) = self.commit_txn(txn, guc)
+            && let Err(e) = self.commit_txn_with_triggers(txn, guc, arena, responder)
         {
             responder.error(e.sqlstate, e.message.as_str())?;
         }
@@ -9400,7 +9411,7 @@ impl Engine {
         match outcome {
             Ok(()) => {
                 if txn.take_concurrent_partition_detach() {
-                    if let Err(error) = self.commit_txn(txn, guc) {
+                    if let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder) {
                         responder.error(error.sqlstate, error.message.as_str())?;
                         return Ok(ExtendedExecutionStatus::Complete(false));
                     }
@@ -9524,7 +9535,7 @@ impl Engine {
         };
         txn.compact_completed_constraints();
         if txn.mode == TxnMode::Implicit
-            && let Err(error) = self.commit_txn(txn, guc)
+            && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
         {
             responder.error(error.sqlstate, error.message.as_str())?;
             responder.ready_for_query(txn.status_byte())?;
@@ -13706,7 +13717,7 @@ impl Engine {
                     responder,
                 },
             )?;
-            self.commit_txn(txn, guc)?;
+            self.commit_txn_with_triggers(txn, guc, arena, responder)?;
             self.commit_wal()
         })();
         if result.is_err() && txn.is_active() {

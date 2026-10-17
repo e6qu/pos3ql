@@ -91,9 +91,12 @@ def setup(connection, schema):
         f"""CREATE FUNCTION {schema}.count_constraint() RETURNS trigger LANGUAGE plpgsql AS $$
             BEGIN
                 PERFORM nextval('{schema}.write_calls');
+                IF NEW.id < 0 THEN
+                    RAISE EXCEPTION 'negative order' USING ERRCODE = '23514';
+                END IF;
                 RETURN NEW;
             END $$""",
-        f"CREATE CONSTRAINT TRIGGER count_constraint AFTER UPDATE ON {schema}.warm_orders "
+        f"CREATE CONSTRAINT TRIGGER count_constraint AFTER INSERT OR UPDATE ON {schema}.warm_orders "
         f"DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {schema}.count_constraint()",
     ]
     for statement in statements:
@@ -119,6 +122,19 @@ def exercise(connection, schema):
         with cursor.copy(f"COPY {schema}.warm_orders(id, note) FROM STDIN") as copy:
             copy.write_row((5, "copied"))
         observed.append({"copy_tag": cursor.statusmessage})
+    for copy_input in [False, True]:
+        try:
+            if copy_input:
+                with connection.cursor() as cursor:
+                    with cursor.copy(f"COPY {schema}.warm_orders(id, note) FROM STDIN") as copy:
+                        copy.write_row((-2, "rejected copy"))
+            else:
+                connection.execute(f"INSERT INTO {schema}.warm_orders VALUES (-1, 'rejected insert')")
+        except psycopg.Error as error:
+            assert error.sqlstate == "23514", error
+            observed.append({"copy_input": copy_input, "error": error.sqlstate})
+        else:
+            raise AssertionError("deferred trigger failure was acknowledged as a commit")
     observed.append(result(connection, "BEGIN"))
     observed.append(result(connection,
         f"UPDATE {schema}.warm_orders SET note = 'rollback' WHERE id = 1 RETURNING id, note"))

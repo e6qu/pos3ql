@@ -762,6 +762,12 @@ issue another GET even if a reader is already downloading that block. SQL
 execution remains serial, and this does not enable independent checkpoint
 publication or worker threads.
 
+Deferred constraint triggers run before an implicit commit at the end of a
+simple query, extended-protocol Sync or COPY. For example, if a deferred order
+check rejects a copied row, COPY fails and its transaction rolls back; the
+connection can issue another command. These commits use the same trigger-aware
+boundary as explicit COMMIT and preserve pending downloads throughout.
+
 Object-read byte counters include each successfully completed HTTP response
 body, including its block header, even if block verification rejects it.
 Reusing a completed response does not count it twice. The HTTP client discards

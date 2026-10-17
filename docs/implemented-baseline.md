@@ -751,8 +751,57 @@ turns. Checkpoint publication, merges, and temporary spilling still wait for
 pending durable-block downloads. Fixed execution workers and independent storage
 publication remain unfinished.
 
+For example, while one connection downloads an uncached invoice, another can
+update a cached order and receive its durable commit acknowledgement. INSERT,
+UPDATE, DELETE, COPY, trigger execution and commit use the existing separate
+block client for any reads that must finish without restarting the operation.
+They preserve the suspended reader's socket, response bytes and error, including
+across nested calls and SQL errors. The reader keeps its original statement
+snapshot and command identity across suspension, while a later READ COMMITTED
+statement selects a fresh view. Its statement timestamp and absolute timeout
+are restored too; transaction timestamps remain owned by their transaction
+when connections take turns. The wait state is inline in startup-owned
+transaction controls and retains an existing fixed snapshot slot. Cancellation,
+rollback, completion and errors release it. A write that needs an uncached block
+still waits synchronously; it can
+issue another GET even if a reader is already downloading that block. SQL
+execution remains serial, and this does not enable independent checkpoint
+publication or worker threads.
+
+Row lookups retain the verified sparse-index page already in their own buffer,
+including the row and version bounds where it is valid. A resumed report can
+reuse navigation across rows and snapshots without downloading the same page
+again; another source or an out-of-range key requires a new verified page.
+Scans retain verified blocks and completed columns by immutable source and block
+position in their existing frames. A nested order scan can reuse another frame
+without discarding an invoice scan's work. Cursors check a frame's source before
+reusing it after another walk. Startup sizing charges the per-frame identities
+and column metadata; byte-buffer counts do not grow.
+Index readers keep verified metadata and entries in their existing startup
+buffers when a later row read waits for a download. Selected-column scans keep
+completed columns in the same way. Their identities follow the immutable source,
+so another attempt can reuse the bytes even after shared-cache eviction.
+The fixed pools prefer buffers already used for the same source, then unused
+buffers, so reading a second table does not overwrite the first table's work
+while another buffer sits idle. Point lookups also retain completed membership checks and the selected data
+reference while that data downloads. A metadata probe leaves decoded rows
+available for the following fetch. Overwriting scratch or failing a replacement
+clears its previous identity.
+
+Deferred constraint triggers run before an implicit commit at the end of a
+simple query, extended-protocol Sync or COPY. For example, if a deferred order
+check rejects a copied row, COPY fails and its transaction rolls back; the
+connection can issue another command. These commits use the same trigger-aware
+boundary as explicit COMMIT and preserve pending downloads throughout.
+
+Object-read byte counters include each successfully completed HTTP response
+body, including its block header, even if block verification rejects it.
+Reusing a completed response does not count it twice. The HTTP client discards
+a connection when the server advertises that it will close it, while retaining
+the completed response for its owner.
+
 The object-request reservation includes every configured read client, the
-separate block write and metadata clients, read-slot controls, and the 256 KiB
+separate atomic block and metadata clients, read-slot controls, and the 256 KiB
 block scratch buffer. Checkpoint writer buffers and workspace arrays are charged
 when constructed too. For example, increasing `object_store_get_slots` reserves
 another complete request/response buffer before accepting connections; it cannot

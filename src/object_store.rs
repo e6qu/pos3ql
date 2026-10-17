@@ -533,12 +533,6 @@ impl Client {
         }
     }
 
-    pub(crate) fn disable_async_gets(&mut self) {
-        if let Self::S3(client) = self {
-            client.disable_async_gets();
-        }
-    }
-
     /// Advances a pending non-blocking GET. Returns `Ok(())` when the GET
     /// completed (body is in [`Self::body_bytes`]), or `Err(WouldBlock)` when
     /// more data is needed.

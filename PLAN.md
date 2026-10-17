@@ -121,6 +121,14 @@ client. Failed maintenance has a one-second retry deadline even under continuous
 client traffic or when idle; local progress does not clear a storage failure
 status. Completing a published checkpoint's remote cleanup can
 restore readiness without requiring another write.
+An unrelated cached write, including COPY and commit, can complete while a cold
+read waits. Atomic writes use the existing separate block client without
+replacing a suspended reader's socket, bytes or error. A write that needs an
+uncached block still waits synchronously and can download the same block again.
+A paused report keeps the same data view, start time and timeout until it
+finishes; resuming does not start a fresh statement.
+Index and selected-column read buffers retain completed data across waits;
+their verified identities do not depend on shared-cache residency.
 Checkpoint publication and object merges still wait for downloads to finish.
 Startup sizing and construction charge every object client, request-slot record,
 block scratch buffer and checkpoint workspace before serving queries.
@@ -128,8 +136,8 @@ Commit-history cleanup follows the published chain one descriptor per turn;
 unpublished uploads cannot replace the boundary needed for recovery. Unacknowledged
 journal batches remain available until their publication retry completes.
 
-- Reserve independent request slots and scratch buffers at startup. Keep cache
-  checks and updates brief; do not hold broad locks during slow object I/O.
+- Keep cache checks and updates brief; release broad locks during slow object
+  I/O and reserve any additional independent request workspaces at startup.
 - Coordinate requests for the same missing block, allow bounded parallel reads
   and prefetch, and release requests correctly on cancellation.
 - Build checkpoint and merge output separately, then publish the new object
@@ -155,6 +163,8 @@ so exhaustion preserves existing failure cleanup; later observations cannot move
 the global position backward. Catalog identities are reserved before publishing
 compound definitions. Creating a transaction reserves its identity and active-registry entry
 together; full capacities fail explicitly and leave existing owners intact.
+Simple queries, protocol synchronization and COPY run queued deferred triggers
+before an implicit commit; trigger failures roll back before durable success.
 
 - Protect journal staging, prepared transactions, commit order, and the
   responses waiting for durable storage.

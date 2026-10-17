@@ -64,47 +64,75 @@ fn put_block(
     Ok(id)
 }
 
+struct PackedBlockRange {
+    range: ByteRange,
+    length: usize,
+}
+
+impl PackedBlockRange {
+    fn new(offset: usize, length: usize) -> Result<Self, StoreError> {
+        let range = HEADER_LEN
+            .checked_add(offset)
+            .and_then(|start| {
+                start
+                    .checked_add(length)
+                    .and_then(|end| end.checked_sub(1))
+                    .and_then(|end| ByteRange::new(start as u64, end as u64).ok())
+            })
+            .ok_or(StoreError::Corrupt(super::BlockError::Truncated))?;
+        Ok(Self { range, length })
+    }
+}
+
+enum ObjectBlockRead {
+    Pending,
+    Failed(StoreError),
+    Complete {
+        bytes: usize,
+        result: Result<(usize, BlockType), StoreError>,
+    },
+}
+
 fn get_block(
     client: &mut ObjectStore,
     prefix: &str,
     id: &BlockId,
     into: &mut [u8],
-) -> Result<(usize, BlockType), StoreError> {
+) -> ObjectBlockRead {
     let mut key_buffer = [0u8; 128];
     let key = key_of(prefix, id, &mut key_buffer);
-    let result = client.get(key, None).map_err(store_error)?;
-    let body = &client.body_bytes()[..result.len];
-    decode_block_body(body, id, into)
+    match client.get(key, None) {
+        Ok(response) => ObjectBlockRead::Complete {
+            bytes: response.len,
+            result: decode_block_body(&client.body_bytes()[..response.len], id, into),
+        },
+        Err(ObjectError::WouldBlock) => ObjectBlockRead::Pending,
+        Err(error) => ObjectBlockRead::Failed(store_error(error)),
+    }
 }
 
 fn get_packed_block(
     client: &mut ObjectStore,
     prefix: &str,
     container: &BlockId,
-    offset: usize,
-    length: usize,
+    range: PackedBlockRange,
     expected: &BlockId,
     into: &mut [u8],
-) -> Result<(usize, BlockType), StoreError> {
-    let start = HEADER_LEN
-        .checked_add(offset)
-        .ok_or(StoreError::Corrupt(super::BlockError::Truncated))?;
-    let end = start
-        .checked_add(length)
-        .and_then(|end| end.checked_sub(1))
-        .ok_or(StoreError::Corrupt(super::BlockError::Truncated))?;
+) -> ObjectBlockRead {
     let mut key_buffer = [0u8; 128];
     let key = key_of(prefix, container, &mut key_buffer);
-    let result = client
-        .get(
-            key,
-            Some(ByteRange::new(start as u64, end as u64).expect("packed range is ordered")),
-        )
-        .map_err(store_error)?;
-    if result.len != length {
-        return Err(StoreError::Corrupt(super::BlockError::Truncated));
+    match client.get(key, Some(range.range)) {
+        Ok(response) => ObjectBlockRead::Complete {
+            bytes: response.len,
+            result: if response.len == range.length {
+                decode_packed_block(client.body_bytes(), expected, into)
+            } else {
+                Err(StoreError::Corrupt(super::BlockError::Truncated))
+            },
+        },
+        Err(ObjectError::WouldBlock) => ObjectBlockRead::Pending,
+        Err(error) => ObjectBlockRead::Failed(store_error(error)),
     }
-    decode_packed_block(&client.body_bytes()[..result.len], expected, into)
 }
 
 fn decode_block_body(
@@ -126,15 +154,21 @@ fn decode_block_body(
     Ok((block.payload.len(), block.block_type))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObjectReadMode {
+    Atomic,
+    Restartable,
+}
+
 /// The namespace store that owns its client and scratch — the long-lived form a
 /// cache stack sits over, where a borrowed client would tangle lifetimes.
 pub(crate) struct OwnedObjectStore {
-    write_client: ObjectStore,
+    atomic_client: ObjectStore,
     slots: FixedVec<ObjectReadSlot>,
     prefix: &'static str,
     scratch: Vec<u8>,
     stats: BlockIoStats,
-    async_gets_enabled: bool,
+    read_mode: ObjectReadMode,
     hedge_after: Option<Duration>,
 }
 
@@ -172,9 +206,9 @@ impl OwnedObjectStore {
         prefix: &'static str,
     ) -> Result<Self, crate::object_store::SetupError> {
         // A completed async read retains its response until its consumer
-        // verifies it. Writes must never share that client: sending a PUT
-        // clears the response buffer while the read identity is still live.
-        let write_client = ObjectStore::new(config, budget)?;
+        // verifies it. Atomic reads and writes use another client so they
+        // cannot replace a response still owned by a suspended reader.
+        let atomic_client = ObjectStore::new(config, budget)?;
         let mut slots = FixedVec::new(
             budget,
             "object_store_get_slots",
@@ -200,19 +234,19 @@ impl OwnedObjectStore {
             .draw(super::BLOCK_SIZE, "object_store_block_scratch")
             .map_err(crate::object_store::SetupError::Budget)?;
         Ok(Self {
-            write_client,
+            atomic_client,
             slots,
             prefix,
             scratch: vec![0u8; super::BLOCK_SIZE],
             stats: BlockIoStats::default(),
-            async_gets_enabled: false,
+            read_mode: ObjectReadMode::Atomic,
             hedge_after: (config.object_store_hedge_after_ms != 0)
                 .then(|| Duration::from_millis(config.object_store_hedge_after_ms)),
         })
     }
 
     pub(crate) fn replace_credentials(&mut self, credentials: crate::object_store::Credentials) {
-        self.write_client.replace_credentials(credentials);
+        self.atomic_client.replace_credentials(credentials);
         for slot in self.slots.as_mut_slice() {
             debug_assert!(slot.pending_id.is_none());
             slot.client.replace_credentials(credentials);
@@ -223,7 +257,24 @@ impl OwnedObjectStore {
         for slot in self.slots.as_mut_slice() {
             slot.client.enable_async_gets();
         }
-        self.async_gets_enabled = true;
+        self.read_mode = ObjectReadMode::Restartable;
+    }
+
+    fn finish_read(
+        &mut self,
+        started: Instant,
+        read: ObjectBlockRead,
+    ) -> Result<(usize, BlockType), StoreError> {
+        let result = match read {
+            ObjectBlockRead::Pending => Err(StoreError::NotReady),
+            ObjectBlockRead::Failed(error) => Err(error),
+            ObjectBlockRead::Complete { bytes, result } => {
+                self.record_completed_read(started, bytes);
+                result
+            }
+        };
+        self.stats.object_gets = self.stats.object_gets.saturating_add(1);
+        result
     }
 
     fn record_completed_read(&mut self, started: Instant, bytes: usize) {
@@ -236,20 +287,9 @@ impl OwnedObjectStore {
     }
 
     fn disable_async_gets(&mut self) {
-        for slot in self.slots.as_mut_slice() {
-            if slot.speculative {
-                // A speculative response has no demand owner. A later reader
-                // can issue its own GET if its lookahead was discarded.
-                slot.ready_id = None;
-                slot.error_id = None;
-                slot.pending_error = None;
-                slot.started_at = None;
-                slot.hedge_issued = false;
-                slot.speculative = false;
-            }
-            slot.client.disable_async_gets();
-        }
-        self.async_gets_enabled = false;
+        // Atomic misses use the separate synchronous client. An existing
+        // reactor request keeps its socket, body, error and demand ownership.
+        self.read_mode = ObjectReadMode::Atomic;
     }
 
     fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
@@ -426,7 +466,7 @@ impl BlockStore for OwnedObjectStore {
         lsn: u64,
     ) -> Result<BlockId, StoreError> {
         let result = put_block(
-            &mut self.write_client,
+            &mut self.atomic_client,
             self.prefix,
             &mut self.scratch,
             payload,
@@ -451,10 +491,11 @@ impl BlockStore for OwnedObjectStore {
             slot.packed = false;
             return decode_block_body(slot.client.body_bytes(), id, into);
         }
-        if let Some(slot) = self
-            .slots
-            .iter_mut()
-            .find(|slot| slot.pending_id == Some(*id) && !slot.packed)
+        if self.read_mode == ObjectReadMode::Restartable
+            && let Some(slot) = self
+                .slots
+                .iter_mut()
+                .find(|slot| slot.pending_id == Some(*id) && !slot.packed)
         {
             slot.speculative = false;
             return Err(StoreError::NotReady);
@@ -474,23 +515,21 @@ impl BlockStore for OwnedObjectStore {
         }
         let started = Instant::now();
         let prefix = self.prefix;
-        let result = {
+        let read = if self.read_mode == ObjectReadMode::Atomic {
+            get_block(&mut self.atomic_client, prefix, id, into)
+        } else {
             let Some(slot) = self.demand_slot() else {
                 return Err(StoreError::NotReady);
             };
-            let result = get_block(&mut slot.client, prefix, id, into);
-            if matches!(result, Err(StoreError::NotReady)) {
+            let read = get_block(&mut slot.client, prefix, id, into);
+            if matches!(&read, ObjectBlockRead::Pending) {
                 slot.pending_id = Some(*id);
                 slot.started_at = Some(started);
                 slot.packed = false;
             }
-            result
+            read
         };
-        if let Ok((len, _)) = result {
-            self.record_completed_read(started, len);
-        }
-        self.stats.object_gets = self.stats.object_gets.saturating_add(1);
-        result
+        self.finish_read(started, read)
     }
 
     fn get_packed(
@@ -502,6 +541,7 @@ impl BlockStore for OwnedObjectStore {
         into: &mut [u8],
         _scratch: &mut [u8],
     ) -> Result<(usize, BlockType), StoreError> {
+        let range = PackedBlockRange::new(offset, length)?;
         if let Some(winner) = self
             .slots
             .iter()
@@ -517,10 +557,11 @@ impl BlockStore for OwnedObjectStore {
             }
             return decode_packed_block(slot.client.body_bytes(), expected, into);
         }
-        if self
-            .slots
-            .iter()
-            .any(|slot| slot.pending_id == Some(*expected) && slot.packed)
+        if self.read_mode == ObjectReadMode::Restartable
+            && self
+                .slots
+                .iter()
+                .any(|slot| slot.pending_id == Some(*expected) && slot.packed)
         {
             return Err(StoreError::NotReady);
         }
@@ -538,28 +579,28 @@ impl BlockStore for OwnedObjectStore {
         }
         let started = Instant::now();
         let prefix = self.prefix;
-        let Some(slot) = self.demand_slot() else {
-            return Err(StoreError::NotReady);
+        let read = if self.read_mode == ObjectReadMode::Atomic {
+            get_packed_block(
+                &mut self.atomic_client,
+                prefix,
+                container,
+                range,
+                expected,
+                into,
+            )
+        } else {
+            let Some(slot) = self.demand_slot() else {
+                return Err(StoreError::NotReady);
+            };
+            let read = get_packed_block(&mut slot.client, prefix, container, range, expected, into);
+            if matches!(&read, ObjectBlockRead::Pending) {
+                slot.pending_id = Some(*expected);
+                slot.started_at = Some(started);
+                slot.packed = true;
+            }
+            read
         };
-        let result = get_packed_block(
-            &mut slot.client,
-            prefix,
-            container,
-            offset,
-            length,
-            expected,
-            into,
-        );
-        if matches!(result, Err(StoreError::NotReady)) {
-            slot.pending_id = Some(*expected);
-            slot.started_at = Some(started);
-            slot.packed = true;
-        }
-        if result.is_ok() {
-            self.record_completed_read(started, length);
-        }
-        self.stats.object_gets = self.stats.object_gets.saturating_add(1);
-        result
+        self.finish_read(started, read)
     }
 
     fn prefetch(&mut self, id: &BlockId) -> Result<PrefetchState, StoreError> {
@@ -665,7 +706,7 @@ impl BlockStore for OwnedObjectStore {
     }
 
     fn async_gets_enabled(&self) -> bool {
-        self.async_gets_enabled
+        self.read_mode == ObjectReadMode::Restartable
     }
 
     fn async_read_slots(&self) -> usize {
@@ -760,6 +801,359 @@ mod tests {
         }
     }
 
+    fn atomic_read_frame(payload: &[u8]) -> (BlockId, Vec<u8>) {
+        let mut bytes = vec![0u8; super::super::BLOCK_SIZE];
+        let (id, length) = encode(payload, BlockType::SstData, 0, &mut bytes).unwrap();
+        bytes.truncate(length);
+        (id, bytes)
+    }
+
+    fn atomic_read_request(listener: &TcpListener) -> (std::net::TcpStream, Vec<u8>) {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "expected block request did not arrive"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("accept block request: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut bytes = [0u8; 2048];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let length = stream.read(&mut bytes).unwrap();
+            assert!(length > 0 && request.len() + length <= 4096);
+            request.extend_from_slice(&bytes[..length]);
+        }
+        assert!(request.starts_with(b"GET "));
+        (stream, request)
+    }
+
+    fn atomic_read_response(
+        stream: &mut std::net::TcpStream,
+        bytes: &[u8],
+        packed: bool,
+        missing: bool,
+    ) {
+        if missing {
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            return;
+        }
+        let status = if packed {
+            "206 Partial Content"
+        } else {
+            "200 OK"
+        };
+        write!(stream, "HTTP/1.1 {status}\r\nETag: \"atomic-read\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+        stream.write_all(bytes).unwrap();
+    }
+
+    #[derive(Clone, Copy)]
+    enum AtomicReply {
+        Data,
+        MissingWhole,
+        CorruptWhole,
+        CorruptPacked,
+    }
+
+    fn check_atomic_reads_preserve_pending(
+        packed_pending: bool,
+        missing_pending: bool,
+        atomic_reply: AtomicReply,
+        same_atomic: bool,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pending_payload = b"this response still belongs to the suspended reader";
+        let atomic_payload: &[u8] = if same_atomic {
+            pending_payload
+        } else {
+            b"the writer needs this different block"
+        };
+        let packed_payload = b"the writer also needs this packed extent";
+        let (pending_id, pending_frame) = atomic_read_frame(pending_payload);
+        let (atomic_id, atomic_frame) = atomic_read_frame(atomic_payload);
+        let (packed_id, packed_frame) = atomic_read_frame(packed_payload);
+        let pending_length = pending_frame.len();
+        let atomic_length = atomic_frame.len();
+        let packed_length = packed_frame.len();
+        let (started, request_started) = mpsc::channel();
+        let (release, response_released) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut pending, request) = atomic_read_request(&listener);
+            assert_eq!(
+                request.windows(6).any(|bytes| bytes == b"range:"),
+                packed_pending
+            );
+            started.send(()).unwrap();
+            let (mut atomic, _) = atomic_read_request(&listener);
+            if matches!(atomic_reply, AtomicReply::CorruptWhole) {
+                let mut damaged = atomic_frame.clone();
+                *damaged.last_mut().unwrap() ^= 0x80;
+                atomic_read_response(&mut atomic, &damaged, false, false);
+            } else {
+                atomic_read_response(
+                    &mut atomic,
+                    &atomic_frame,
+                    false,
+                    matches!(atomic_reply, AtomicReply::MissingWhole),
+                );
+            }
+            drop(atomic);
+            let (mut packed, request) = atomic_read_request(&listener);
+            assert!(request.windows(6).any(|bytes| bytes == b"range:"));
+            if matches!(atomic_reply, AtomicReply::CorruptPacked) {
+                let mut damaged = packed_frame.clone();
+                *damaged.last_mut().unwrap() ^= 0x80;
+                atomic_read_response(&mut packed, &damaged, true, false);
+            } else {
+                atomic_read_response(&mut packed, &packed_frame, true, false);
+            }
+            drop(packed);
+            response_released
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            atomic_read_response(
+                &mut pending,
+                &pending_frame,
+                packed_pending,
+                missing_pending,
+            );
+            drop(pending);
+            let (mut reused, _) = atomic_read_request(&listener);
+            atomic_read_response(&mut reused, &atomic_frame, false, false);
+        });
+        let mut config = network_config(port, "atomic-read-ownership");
+        config.object_store_get_slots = 1;
+        let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        store.enable_async_gets();
+        let pending_container = BlockId::of(b"pending packed container");
+        let packed_container = BlockId::of(b"atomic packed container");
+        let mut output = [0u8; 128];
+        let initial = crate::mem::guard::forbid_alloc(|| {
+            if packed_pending {
+                store.get_packed(
+                    &pending_container,
+                    0,
+                    pending_length,
+                    &pending_id,
+                    &mut output,
+                    &mut [],
+                )
+            } else {
+                store.get(&pending_id, &mut output)
+            }
+        });
+        assert_eq!(initial, Err(StoreError::NotReady));
+        request_started
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let fd = store.pending_read_fd(0).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            store.disable_async_gets();
+            assert!(!store.async_gets_enabled());
+            assert_eq!(store.pending_read_fd(0), Some(fd));
+            let atomic = store.get(&atomic_id, &mut output);
+            if matches!(atomic_reply, AtomicReply::MissingWhole) {
+                assert_eq!(atomic, Err(StoreError::NotFound));
+            } else if matches!(atomic_reply, AtomicReply::CorruptWhole) {
+                assert_eq!(
+                    atomic,
+                    Err(StoreError::Corrupt(
+                        super::super::BlockError::ChecksumMismatch
+                    ))
+                );
+            } else {
+                assert_eq!(atomic.unwrap(), (atomic_payload.len(), BlockType::SstData));
+                assert_eq!(&output[..atomic_payload.len()], atomic_payload);
+            }
+            assert_eq!(store.pending_read_fd(0), Some(fd));
+            let packed = store.get_packed(
+                &packed_container,
+                0,
+                packed_length,
+                &packed_id,
+                &mut output,
+                &mut [],
+            );
+            if matches!(atomic_reply, AtomicReply::CorruptPacked) {
+                assert_eq!(
+                    packed,
+                    Err(StoreError::Corrupt(
+                        super::super::BlockError::ChecksumMismatch
+                    ))
+                );
+            } else {
+                assert_eq!(packed.unwrap(), (packed_payload.len(), BlockType::SstData));
+                assert_eq!(&output[..packed_payload.len()], packed_payload);
+            }
+            assert_eq!(store.pending_read_fd(0), Some(fd));
+            assert!(store.async_reads_busy());
+            store.enable_async_gets();
+        });
+        release.send(()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        crate::mem::guard::forbid_alloc(|| {
+            while !store.advance_pending_read(0).unwrap() {
+                assert!(
+                    Instant::now() < deadline,
+                    "released response did not complete"
+                );
+                std::thread::yield_now();
+            }
+            store.disable_async_gets();
+            let pending = if packed_pending {
+                store.get_packed(
+                    &pending_container,
+                    0,
+                    pending_length,
+                    &pending_id,
+                    &mut output,
+                    &mut [],
+                )
+            } else {
+                store.get(&pending_id, &mut output)
+            };
+            if missing_pending {
+                assert_eq!(pending, Err(StoreError::NotFound));
+            } else {
+                assert_eq!(
+                    pending.unwrap(),
+                    (pending_payload.len(), BlockType::SstData)
+                );
+                assert_eq!(&output[..pending_payload.len()], pending_payload);
+            }
+            assert!(!store.async_reads_busy());
+            assert_eq!(store.io_stats().object_gets, 3);
+            let expected_bytes = packed_length
+                + if matches!(atomic_reply, AtomicReply::MissingWhole) {
+                    0
+                } else {
+                    atomic_length
+                }
+                + if missing_pending { 0 } else { pending_length };
+            assert_eq!(store.io_stats().object_read_bytes, expected_bytes as u64);
+            store.enable_async_gets();
+            let mut result = store.get(&atomic_id, &mut output);
+            while result == Err(StoreError::NotReady) {
+                assert!(
+                    Instant::now() < deadline,
+                    "released slot could not serve the next read"
+                );
+                if store.advance_pending_read(0).unwrap() {
+                    result = store.get(&atomic_id, &mut output);
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(result.unwrap(), (atomic_payload.len(), BlockType::SstData));
+            assert_eq!(&output[..atomic_payload.len()], atomic_payload);
+            assert_eq!(store.io_stats().object_gets, 4);
+            assert_eq!(
+                store.io_stats().object_read_bytes,
+                (expected_bytes + atomic_length) as u64
+            );
+        });
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn atomic_block_reads_whole_misses_preserve_a_pending_whole_response() {
+        check_atomic_reads_preserve_pending(false, false, AtomicReply::Data, false);
+    }
+
+    #[test]
+    fn atomic_block_reads_whole_and_packed_misses_preserve_a_pending_packed_response() {
+        check_atomic_reads_preserve_pending(true, false, AtomicReply::Data, false);
+    }
+
+    #[test]
+    fn atomic_block_reads_preserve_a_pending_error_and_reuse_the_released_slot() {
+        check_atomic_reads_preserve_pending(false, true, AtomicReply::Data, false);
+    }
+
+    #[test]
+    fn atomic_block_reads_atomic_error_preserves_the_unrelated_pending_response() {
+        check_atomic_reads_preserve_pending(true, false, AtomicReply::MissingWhole, false);
+    }
+
+    #[test]
+    fn atomic_block_reads_same_block_miss_never_borrows_the_pending_read_slot() {
+        for packed in [false, true] {
+            check_atomic_reads_preserve_pending(packed, false, AtomicReply::Data, true);
+        }
+    }
+
+    #[test]
+    fn atomic_block_reads_corrupt_whole_response_keeps_bytes_and_pending_owner() {
+        check_atomic_reads_preserve_pending(false, false, AtomicReply::CorruptWhole, false);
+    }
+
+    #[test]
+    fn atomic_block_reads_corrupt_packed_response_keeps_bytes_and_pending_owner() {
+        check_atomic_reads_preserve_pending(true, false, AtomicReply::CorruptPacked, false);
+    }
+
+    #[test]
+    fn atomic_block_reads_invalid_packed_ranges_do_not_touch_owned_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = network_config(
+            listener.local_addr().unwrap().port(),
+            "atomic-invalid-range",
+        );
+        config.object_store_get_slots = 1;
+        let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        store.enable_async_gets();
+        let id = BlockId::of(b"owned pending request");
+        let mut output = [0u8; 32];
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| store.get(&id, &mut output)),
+            Err(StoreError::NotReady)
+        );
+        let (accepted, _) = atomic_read_request(&listener);
+        let fd = store.pending_read_fd(0).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for restartable in [true, false] {
+                if restartable {
+                    store.enable_async_gets();
+                } else {
+                    store.disable_async_gets();
+                }
+                for (offset, length) in [(usize::MAX, 1), (0, 0), (0, usize::MAX)] {
+                    assert_eq!(
+                        store.get_packed(&id, offset, length, &id, &mut output, &mut []),
+                        Err(StoreError::Corrupt(super::super::BlockError::Truncated))
+                    );
+                    assert_eq!(store.pending_read_fd(0), Some(fd));
+                    assert!(store.async_reads_busy());
+                    assert_eq!(store.io_stats().object_gets, 1);
+                }
+            }
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+        drop(accepted);
+    }
+
     #[test]
     fn async_pool_owns_two_independent_block_requests() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -808,7 +1202,7 @@ mod tests {
             assert!(request_len > 0, "client sent an empty request");
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nETag: \"prefetch-read\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nETag: \"prefetch-read\"\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
                 body.len()
             )
             .unwrap();
@@ -916,6 +1310,11 @@ mod tests {
         assert_eq!(store.prefetch(&second).unwrap(), PrefetchState::Scheduled);
         assert!(!store.async_reads_busy());
         store.disable_async_gets();
+        assert_eq!(store.slots[0].ready_id, Some(second));
+        assert_eq!(
+            store.take_prefetch(&second, &mut output).unwrap(),
+            Some((6, BlockType::SstData))
+        );
         assert!(store.slots[0].ready_id.is_none());
         drop(store);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);

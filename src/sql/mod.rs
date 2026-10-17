@@ -2946,6 +2946,7 @@ impl Engine {
         arena: &Arena,
         trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let role = self.subscription_apply_role(stream, binding.table_slot(), txn.txid)?;
         let prior = eval::funcs::system::current_user_owned();
         eval::funcs::system::set_current_user(role.as_str());
@@ -2973,6 +2974,7 @@ impl Engine {
         arena: &Arena,
         trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let role = self.subscription_apply_role(stream, binding.table_slot(), txn.txid)?;
         let prior = eval::funcs::system::current_user_owned();
         eval::funcs::system::set_current_user(role.as_str());
@@ -3000,6 +3002,7 @@ impl Engine {
         arena: &Arena,
         trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let role = self.subscription_apply_role(stream, binding.table_slot(), txn.txid)?;
         let prior = eval::funcs::system::current_user_owned();
         eval::funcs::system::set_current_user(role.as_str());
@@ -3062,6 +3065,7 @@ impl Engine {
         restart_identity: bool,
         arena: &Arena,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         if tables.is_empty() {
             return Err(sql_err!(
                 sqlstate::PROTOCOL_VIOLATION,
@@ -5030,6 +5034,7 @@ impl Engine {
         guc: &GucState,
     ) -> Result<(), SqlError> {
         if txn.is_active() {
+            txn.activate_transaction_clock();
             if mode == TxnMode::Explicit {
                 txn.mode = TxnMode::Explicit;
             }
@@ -5038,6 +5043,7 @@ impl Engine {
         txn.txid = self.storage.start_transaction_identity()?;
         txn.mode = mode;
         datetime::begin_transaction();
+        txn.activate_transaction_clock();
         guc.begin_transaction();
         let (isolation, read_only, deferrable) = guc.transaction_defaults();
         txn.set_characteristics(isolation, read_only, deferrable);
@@ -5055,17 +5061,25 @@ impl Engine {
         takes_snapshot: bool,
         advance_command: bool,
         retain_snapshot: bool,
+        resume_statement: bool,
     ) -> Result<Option<crate::storage::StatementSnapshotLease>, SqlError> {
         self.storage.set_foreign_statement_context(
             txn.txid,
             txn.isolation == TransactionIsolation::Serializable,
             txn.savepoint_names(),
         )?;
-        if advance_command {
+        let resumed = if resume_statement {
+            txn.resume_statement_snapshot()
+        } else {
+            None
+        };
+        if advance_command && resumed.is_none() {
             txn.begin_command()?;
         }
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
-        let lease = if takes_snapshot && retain_snapshot {
+        let lease = if resumed.is_some() {
+            resumed
+        } else if takes_snapshot && retain_snapshot {
             Some(
                 self.storage
                     .retain_statement_snapshot(txn.txid, |lsn| txn.statement_snapshot(lsn))?,
@@ -5096,6 +5110,7 @@ impl Engine {
     }
 
     pub fn commit_txn(&mut self, txn: &mut TxnState, guc: &GucState) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         self.finish_txn(txn, guc, None)
     }
 
@@ -6745,13 +6760,17 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
-        self.fire_constraint_trigger_boundary(
+        let _atomic_reads = self.atomic_block_read_scope();
+        if let Err(error) = self.fire_constraint_trigger_boundary(
             txn,
             guc,
             arena,
             responder,
             exec::TriggerQueueBoundary::Transaction,
-        )?;
+        ) {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         self.commit_txn(txn, guc)
     }
 
@@ -6782,6 +6801,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let fail =
             |engine: &mut Self, txn: &mut TxnState, cursors: &mut cursor::CursorPool, error| {
                 if txn.is_explicit() {
@@ -6951,6 +6971,7 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let Some(slot) = self.prepared_transactions.find(gid) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -7037,6 +7058,7 @@ impl Engine {
         responder: &mut Responder,
         boundary: exec::TriggerQueueBoundary,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         exec::fire_constraint_triggers(
             &mut self.storage,
             txn,
@@ -7286,17 +7308,17 @@ impl Engine {
         self.ckpt.is_some()
     }
 
+    fn atomic_block_read_scope(&self) -> Option<crate::checkpoint::AtomicBlockReadScope> {
+        self.ckpt
+            .as_ref()
+            .map(Checkpointer::atomic_block_read_scope)
+    }
+
     /// Enables reactor-driven reads only for the durable block stack. Manifest
     /// and WAL clients retain their synchronous, statement-atomic contracts.
     pub(crate) fn enable_async_block_reads(&mut self) {
         if let Some(checkpointer) = self.ckpt.as_mut() {
             checkpointer.enable_async_block_reads();
-        }
-    }
-
-    pub(crate) fn disable_async_block_reads(&mut self) {
-        if let Some(checkpointer) = self.ckpt.as_mut() {
-            checkpointer.disable_async_block_reads();
         }
     }
 
@@ -7895,6 +7917,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let _atomic_reads = self.atomic_block_read_scope();
         if !txn.is_explicit() {
             responder.warning(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
@@ -8235,9 +8258,10 @@ impl Engine {
         }
         // A checkpoint owns the block stack synchronously: its publication
         // state machine cannot be rewound as a client statement can.
-        ckpt.disable_async_block_reads();
-        let checkpoint = ckpt.checkpoint(&mut self.storage, &mut self.scratch);
-        ckpt.enable_async_block_reads();
+        let checkpoint = {
+            let _atomic_reads = ckpt.atomic_block_read_scope();
+            ckpt.checkpoint(&mut self.storage, &mut self.scratch)
+        };
         match checkpoint? {
             Some(lsn) => {
                 self.begin_post_publish_cleanup(lsn);
@@ -8246,9 +8270,10 @@ impl Engine {
                     .ckpt
                     .as_mut()
                     .expect("checkpoint target remains attached");
-                ckpt.disable_async_block_reads();
-                let maintenance = ckpt.finish_maintenance(&self.storage);
-                ckpt.enable_async_block_reads();
+                let maintenance = {
+                    let _atomic_reads = ckpt.atomic_block_read_scope();
+                    ckpt.finish_maintenance(&self.storage)
+                };
                 maintenance?;
                 Ok(true)
             }
@@ -8507,6 +8532,7 @@ impl Engine {
         line: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let scratch = match context.dml_scratch {
             CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
             CopyDmlScratch::SubscriptionWorker(scratch) => scratch,
@@ -8542,6 +8568,7 @@ impl Engine {
         row: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let scratch = match context.dml_scratch {
             CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
             CopyDmlScratch::SubscriptionWorker(scratch) => scratch,
@@ -8567,6 +8594,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         Self::copy_start_with_scratch(
             &mut self.storage,
             setup,
@@ -8587,6 +8615,7 @@ impl Engine {
         responder: &mut Responder,
         scratch: &mut exec::DmlScratch,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         Self::copy_start_with_scratch(
             &mut self.storage,
             setup,
@@ -8631,6 +8660,7 @@ impl Engine {
         responder: &mut Responder,
         inserted: &exec::CopyTransitionRows,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         self.work.reset();
         let result = Self::copy_finish_with_scratch(
             &mut self.storage,
@@ -8643,7 +8673,10 @@ impl Engine {
             inserted,
         );
         setup.release_snapshot();
-        result?;
+        if let Err(error) = result {
+            self.copy_abort(txn, guc);
+            return Err(error);
+        }
         if txn.mode == TxnMode::Implicit {
             return self.commit_txn(txn, guc);
         }
@@ -8658,6 +8691,7 @@ impl Engine {
         responder: &mut Responder,
         workspace: SubscriptionCopyWorkspace<'_>,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         workspace.arena.reset();
         Self::copy_finish_with_scratch(
             &mut self.storage,
@@ -8700,6 +8734,11 @@ impl Engine {
             inserted,
         )?;
         exec::constraints::validate_deferred_constraints(storage, txn, true, arena)?;
+        let boundary = if txn.mode == TxnMode::Implicit {
+            exec::TriggerQueueBoundary::Transaction
+        } else {
+            exec::TriggerQueueBoundary::Statement
+        };
         exec::fire_constraint_triggers(
             storage,
             txn,
@@ -8707,7 +8746,7 @@ impl Engine {
             guc.seq_session(),
             responder,
             scratch,
-            exec::TriggerQueueBoundary::Statement,
+            boundary,
         )?;
         txn.compact_completed_constraints();
         Ok(())
@@ -8870,7 +8909,7 @@ impl Engine {
         // A checkpoint beat advances publication state that cannot be replayed
         // after yielding. Its block reads therefore own the store
         // synchronously, just as an explicit CHECKPOINT does.
-        ckpt.disable_async_block_reads();
+        let atomic_reads = ckpt.atomic_block_read_scope();
         // A wide sweep can lose headroom faster than one beat reclaims it.
         // Complete publication under critical pressure before dispatch resumes.
         let critical = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85;
@@ -8885,7 +8924,7 @@ impl Engine {
         } else {
             ckpt.checkpoint_step(&mut self.storage, &mut self.scratch)
         };
-        ckpt.enable_async_block_reads();
+        drop(atomic_reads);
         let remote_maintenance_finished =
             remote_maintenance_was_pending && !ckpt.published_maintenance_pending();
         match checkpoint {
@@ -9028,7 +9067,7 @@ impl Engine {
         // Freeze this statement's clock before anything anchors a transaction
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
-        datetime::begin_statement();
+        txn.begin_statement_clock();
         if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
             responder.error(error.sqlstate, error.message.as_str())?;
             return Ok(ExecutionStatus::Complete);
@@ -9112,7 +9151,7 @@ impl Engine {
             }
             if matches!(statement, Stmt::Begin(_))
                 && txn.mode == TxnMode::Implicit
-                && let Err(error) = self.commit_txn(txn, guc)
+                && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
             {
                 responder.error(error.sqlstate, error.message.as_str())?;
                 return Ok(ExecutionStatus::Complete);
@@ -9195,7 +9234,7 @@ impl Engine {
                 return Ok(ExecutionStatus::Complete);
             }
             if txn.take_concurrent_partition_detach() {
-                if let Err(error) = self.commit_txn(txn, guc) {
+                if let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder) {
                     responder.error(error.sqlstate, error.message.as_str())?;
                     return Ok(ExecutionStatus::Complete);
                 }
@@ -9214,7 +9253,7 @@ impl Engine {
         // FROM in flight, whose statement does not end until CopyDone.
         if txn.mode == TxnMode::Implicit
             && self.pending_copy.is_none()
-            && let Err(e) = self.commit_txn(txn, guc)
+            && let Err(e) = self.commit_txn_with_triggers(txn, guc, arena, responder)
         {
             responder.error(e.sqlstate, e.message.as_str())?;
         }
@@ -9313,7 +9352,7 @@ impl Engine {
         // Freeze this statement's clock before anything anchors a transaction
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
-        datetime::begin_statement();
+        txn.begin_statement_clock();
         let routine_transaction_context = if txn.is_active() {
             exec::PlpgsqlTransactionContext::Atomic
         } else {
@@ -9382,7 +9421,7 @@ impl Engine {
         match outcome {
             Ok(()) => {
                 if txn.take_concurrent_partition_detach() {
-                    if let Err(error) = self.commit_txn(txn, guc) {
+                    if let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder) {
                         responder.error(error.sqlstate, error.message.as_str())?;
                         return Ok(ExtendedExecutionStatus::Complete(false));
                     }
@@ -9450,8 +9489,9 @@ impl Engine {
         responder: &mut Responder,
         conn_id: i32,
     ) -> Result<bool, WireFull> {
+        let _atomic_reads = self.atomic_block_read_scope();
         self.work.bind_connection(conn_id);
-        datetime::begin_statement();
+        txn.begin_statement_clock();
         if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
             responder.error(error.sqlstate, error.message.as_str())?;
             responder.ready_for_query(txn.status_byte())?;
@@ -9465,7 +9505,7 @@ impl Engine {
             responder.ready_for_query(txn.status_byte())?;
             return Ok(false);
         }
-        let _snapshot_lease = match self.begin_command_snapshot(txn, true, true, true) {
+        let _snapshot_lease = match self.begin_command_snapshot(txn, true, true, true, false) {
             Ok(lease) => lease,
             Err(error) => {
                 if txn.is_explicit() {
@@ -9505,7 +9545,7 @@ impl Engine {
         };
         txn.compact_completed_constraints();
         if txn.mode == TxnMode::Implicit
-            && let Err(error) = self.commit_txn(txn, guc)
+            && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
         {
             responder.error(error.sqlstate, error.message.as_str())?;
             responder.ready_for_query(txn.status_byte())?;
@@ -13654,6 +13694,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         self.ensure_txn(txn, TxnMode::Implicit, guc)?;
         let result = (|| {
             let _guc_scope = guc::enter_eval_scope(guc, txn);
@@ -13686,7 +13727,7 @@ impl Engine {
                     responder,
                 },
             )?;
-            self.commit_txn(txn, guc)?;
+            self.commit_txn_with_triggers(txn, guc, arena, responder)?;
             self.commit_wal()
         })();
         if result.is_err() && txn.is_active() {
@@ -13825,6 +13866,12 @@ impl Engine {
             None,
         );
         txn.leave_ddl_origin(prior_origin);
+        if !matches!(&result, Ok(Err(error)) if
+            error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+            || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+        {
+            txn.release_suspended_statement();
+        }
         result
     }
 
@@ -13928,6 +13975,7 @@ impl Engine {
             true,
             true,
             !matches!(statement, Stmt::Checkpoint | Stmt::Vacuum { .. }),
+            false,
         ) {
             Ok(lease) => lease,
             Err(error) => return Ok(Err(error)),
@@ -14039,15 +14087,13 @@ impl Engine {
         reset_workspace: bool,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if statement_writes(statement) && self.block_reads_pending() {
-            return Ok(Err(sql_err!(
-                sqlstate::INTERNAL_IO_WAIT,
-                "durable block reads in progress"
-            )));
-        }
-        if statement_writes(statement) {
-            self.disable_async_block_reads();
-        }
+        let _atomic_reads = if statement_writes(statement) {
+            self.ckpt
+                .as_ref()
+                .map(Checkpointer::atomic_block_read_scope)
+        } else {
+            None
+        };
         let _configuration_reload_scope = ConfigurationReloadScope::new(self, guc);
         let _guc_eval_scope = guc::enter_eval_scope(guc, txn);
         // Reclaim the shared execution arena from the previous top-level
@@ -14093,9 +14139,13 @@ impl Engine {
         if let Err(error) = self.publish_session_context(guc, txn, current_role.as_str()) {
             return Ok(Err(error));
         }
-        // Arm this statement's `statement_timeout` deadline (0 clears it); each
-        // statement re-arms, so no explicit disarm is needed.
-        query::arm_timeout(guc.statement_timeout_ms());
+        if reset_workspace && let Some(deadline) = txn.suspended_statement_deadline() {
+            query::restore_statement_deadline(deadline);
+        } else {
+            query::arm_timeout(guc.statement_timeout_ms());
+        }
+        let statement_clock = datetime::statement_clock();
+        let statement_deadline = query::statement_deadline();
         // Publish the session zone for the same span, so a cast that has to
         // supply one (`'12:00'::timetz`) sees what the client set.
         timezone::set_session(guc.timezone());
@@ -14180,10 +14230,54 @@ impl Engine {
             takes_snapshot,
             !matches!(statement, Stmt::Commit | Stmt::Rollback),
             !matches!(statement, Stmt::Checkpoint | Stmt::Vacuum { .. }),
+            reset_workspace,
         ) {
             Ok(lease) => lease,
             Err(error) => return Ok(Err(error)),
         };
+        let result = self.execute_stmt_with_snapshot(
+            statement,
+            arena,
+            params,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            routine_transaction_context,
+            responder,
+            reset_workspace,
+            capture,
+            &mut snapshot_lease,
+        );
+        if reset_workspace
+            && matches!(&result, Ok(Err(error)) if
+                error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+            && let Some(lease) = snapshot_lease.take()
+        {
+            // Transfer ownership before returning to the reactor. The next
+            // attempt resumes this command and view; it is not a new statement.
+            txn.suspend_statement_snapshot(lease, statement_clock, statement_deadline);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_stmt_with_snapshot<'capture>(
+        &mut self,
+        statement: &Stmt,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        routine_transaction_context: exec::PlpgsqlTransactionContext,
+        responder: &mut Responder,
+        reset_workspace: bool,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
+        snapshot_lease: &mut Option<crate::storage::StatementSnapshotLease>,
+    ) -> Result<Result<(), SqlError>, WireFull> {
         if statement_writes(statement) {
             self.storage.assign_transaction_identity(txn.txid);
         }

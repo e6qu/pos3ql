@@ -74048,15 +74048,17 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut full_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut full = Engine::new(&config, &mut full_budget).unwrap();
+    // Both cold paths read id and payload, so their request counts compare
+    // the same physical column work.
     let before_full = full.storage.block_io_stats();
     let full_result = run_with(
         &mut full,
         &mut full_budget,
-        "SELECT sum(length(payload)) FROM pruning_rows",
+        "SELECT sum(length(payload)), sum(id) FROM pruning_rows",
     );
     assert_eq!(
         data_rows(&full_result),
-        ["307200"],
+        ["307200|180300"],
         "{}",
         String::from_utf8_lossy(&full_result)
     );
@@ -83989,7 +83991,12 @@ fn owned_write_inputs_rewrite_undo_exhaustion_releases_images_and_restores_defin
     assert_owned_rewrite_inputs_released(&mut engine);
 }
 
-fn check_cleanup_during_download(name: &str, fail_read: bool, retain_both: bool) {
+fn check_cleanup_during_download(
+    name: &str,
+    fail_read: bool,
+    retain_both: bool,
+    during: impl FnOnce(&mut Engine, &Budget),
+) {
     use crate::io::reactor::Reactor;
     use crate::store::{BlockStore, StoreError};
     use std::io::{Read, Write};
@@ -84118,6 +84125,9 @@ fn check_cleanup_during_download(name: &str, fail_read: bool, retain_both: bool)
         )),
         ["80|655360"]
     );
+    during(&mut engine, &budget);
+    assert_eq!(engine.pending_block_read_fd(0), Some(fd));
+    assert!(blocks.lock().unwrap().async_gets_enabled());
     let mut values = [Datum::Null; 2];
     crate::storage::rowenc::decode(&current, &[ColType::Int4, ColType::Text], &mut values).unwrap();
     assert!(matches!(values[1], Datum::Text(value) if value.len() == 8192));
@@ -84161,17 +84171,17 @@ fn check_cleanup_during_download(name: &str, fail_read: bool, retain_both: bool)
 
 #[test]
 fn cleanup_download_overlap_finishes_cleanup_and_preserves_the_pending_response() {
-    check_cleanup_during_download("cleanup-download-success", false, false);
+    check_cleanup_during_download("cleanup-download-success", false, false, |_, _| {});
 }
 
 #[test]
 fn cleanup_download_overlap_finishes_cleanup_without_hiding_a_download_error() {
-    check_cleanup_during_download("cleanup-download-error", true, false);
+    check_cleanup_during_download("cleanup-download-error", true, false, |_, _| {});
 }
 
 #[test]
 fn cleanup_download_overlap_retained_buffer_failure_retries_without_cancelling_the_get() {
-    check_cleanup_during_download("cleanup-download-retained", false, true);
+    check_cleanup_during_download("cleanup-download-retained", false, true, |_, _| {});
 }
 
 #[test]
@@ -84431,4 +84441,223 @@ fn cleanup_download_overlap_commit_pruning_ignores_newer_unpublished_orphans() {
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn atomic_block_reads_cached_simple_writes_and_sql_errors_preserve_pending_get() {
+    check_cleanup_during_download("atomic-simple-write", false, false, |engine, budget| {
+        let failed = run_with_fixed_memory(
+            engine,
+            budget,
+            "UPDATE cleanup_orders SET missing_column = 1 WHERE id = 1",
+            4 << 20,
+        );
+        assert_eq!(error_sqlstates(&failed), ["42703"]);
+        let output = run_with_fixed_memory(
+            engine,
+            budget,
+            "UPDATE cleanup_orders SET note = 'paid' WHERE id = 1; \
+             INSERT INTO cleanup_orders VALUES (81, 'new'); \
+             DELETE FROM cleanup_orders WHERE id = 2; \
+             SELECT count(*), sum(id) FROM cleanup_orders; \
+             SELECT note FROM cleanup_orders WHERE id = 1",
+            4 << 20,
+        );
+        assert!(!message_types(&output).contains(&b'E'));
+        assert_eq!(data_rows(&output), ["80|3319", "paid"]);
+    });
+}
+
+#[test]
+fn atomic_block_reads_cached_extended_write_preserves_pending_get() {
+    check_cleanup_during_download("atomic-extended-write", false, false, |engine, budget| {
+        let mut request_budget = Budget::new(budget.remaining());
+        let arena = Arena::new(&mut request_budget, "atomic extended query", 4 << 20).unwrap();
+        let mut send =
+            crate::mem::FixedBuf::new(&mut request_budget, "atomic extended send", 1 << 16)
+                .unwrap();
+        let mut txn = TxnState::new(&mut request_budget, 128).unwrap();
+        let mut pool = test_pool(&mut request_budget);
+        let mut cursors = test_cursors(&mut request_budget);
+        let mut guc = GucState::new();
+        {
+            let mut responder =
+                Responder::for_execute(&mut send, crate::pg::respond::ResultFmt::ALL_TEXT);
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| engine.execute_extended(
+                    "UPDATE cleanup_orders SET note = 'extended' WHERE id = 1 RETURNING id, note",
+                    &arena,
+                    &[],
+                    &[],
+                    &mut txn,
+                    &mut pool,
+                    &mut cursors,
+                    &mut guc,
+                    &mut responder,
+                    1,
+                    false,
+                ))
+                .unwrap(),
+                ExtendedExecutionStatus::Complete(true)
+            ));
+        }
+        crate::mem::guard::forbid_alloc(|| engine.commit_txn(&mut txn, &guc)).unwrap();
+        assert_eq!(data_rows(send.readable()), ["1|extended"]);
+    });
+}
+
+fn atomic_snapshot_execute(
+    session: &mut ConfiguredTransactionSession,
+    engine: &mut Engine,
+    identity: i32,
+    sql: &str,
+) -> Vec<u8> {
+    session.send.clear();
+    session.arena.reset();
+    let mut responder = Responder::new(&mut session.send);
+    crate::mem::guard::forbid_alloc(|| {
+        engine.execute_simple(
+            sql,
+            &session.arena,
+            &mut session.transaction,
+            &mut session.pool,
+            &mut session.cursors,
+            &mut session.guc,
+            &mut responder,
+            identity,
+        )
+    })
+    .unwrap();
+    session.send.readable().to_vec()
+}
+
+#[test]
+fn atomic_block_reads_suspended_snapshot_keeps_its_view_command_and_clocks() {
+    let config = test_config("atomic-snapshot-resume");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let setup = atomic_snapshot_execute(
+        &mut writer,
+        &mut engine,
+        22,
+        "CREATE TABLE atomic_snapshot_orders(id integer, note text); \
+         INSERT INTO atomic_snapshot_orders VALUES (1, 'before')",
+    );
+    assert!(error_sqlstates(&setup).is_empty());
+    atomic_snapshot_execute(&mut reader, &mut engine, 11, "BEGIN");
+    reader.transaction.begin_statement_clock();
+    let clock = datetime::statement_clock();
+    let statement_start = datetime::statement_micros();
+    let transaction_start = datetime::transaction_micros();
+    crate::mem::guard::forbid_alloc(|| {
+        let lease = engine
+            .begin_command_snapshot(&mut reader.transaction, true, true, true, false)
+            .unwrap()
+            .unwrap();
+        reader
+            .transaction
+            .suspend_statement_snapshot(lease, clock, 0);
+    });
+    let command = reader.transaction.command_id();
+    let write = atomic_snapshot_execute(
+        &mut writer,
+        &mut engine,
+        22,
+        "UPDATE atomic_snapshot_orders SET note = 'after' WHERE id = 1",
+    );
+    assert!(error_sqlstates(&write).is_empty());
+    assert!(engine.storage.has_active_snapshots());
+    let resumed = atomic_snapshot_execute(
+        &mut reader,
+        &mut engine,
+        11,
+        "SELECT note FROM atomic_snapshot_orders WHERE id = 1",
+    );
+    assert_eq!(data_rows(&resumed), ["before"]);
+    assert_eq!(reader.transaction.command_id(), command);
+    assert_eq!(datetime::statement_micros(), statement_start);
+    assert_eq!(datetime::transaction_micros(), transaction_start);
+    assert!(reader.transaction.resume_statement_snapshot().is_none());
+    let next = atomic_snapshot_execute(
+        &mut reader,
+        &mut engine,
+        11,
+        "SELECT note FROM atomic_snapshot_orders WHERE id = 1",
+    );
+    assert_eq!(data_rows(&next), ["after"]);
+    assert!(reader.transaction.command_id() > command);
+    assert_eq!(datetime::transaction_micros(), transaction_start);
+    atomic_snapshot_execute(&mut reader, &mut engine, 11, "ROLLBACK");
+    assert!(!engine.storage.has_active_snapshots());
+}
+
+#[test]
+fn atomic_block_reads_suspended_snapshot_releases_on_cancel_rollback_and_retirement() {
+    for exit in 0..3 {
+        let (mut engine, mut budget) = test_engine();
+        let mut transaction = TxnState::new(&mut budget, 128).unwrap();
+        let guc = GucState::new();
+        crate::mem::guard::forbid_alloc(|| {
+            transaction.begin_statement_clock();
+            engine
+                .ensure_txn(&mut transaction, TxnMode::Explicit, &guc)
+                .unwrap();
+            let lease = engine
+                .begin_command_snapshot(&mut transaction, true, true, true, false)
+                .unwrap()
+                .unwrap();
+            transaction.suspend_statement_snapshot(lease, datetime::statement_clock(), 0);
+        });
+        assert!(engine.storage.has_active_snapshots());
+        if exit == 2 {
+            drop(engine);
+            crate::mem::guard::forbid_alloc(|| transaction.release_suspended_statement());
+        } else {
+            crate::mem::guard::forbid_alloc(|| {
+                if exit == 0 {
+                    transaction.release_suspended_statement();
+                } else {
+                    engine.rollback_txn(&mut transaction, &guc);
+                }
+            });
+            assert!(!engine.storage.has_active_snapshots());
+        }
+        assert!(transaction.resume_statement_snapshot().is_none());
+    }
+}
+
+#[test]
+fn atomic_block_reads_resuming_keeps_the_original_expired_timeout() {
+    let config = test_config("atomic-snapshot-timeout");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    atomic_snapshot_execute(&mut reader, &mut engine, 11, "BEGIN");
+    crate::mem::guard::forbid_alloc(|| {
+        let lease = engine
+            .begin_command_snapshot(&mut reader.transaction, true, true, true, false)
+            .unwrap()
+            .unwrap();
+        reader
+            .transaction
+            .suspend_statement_snapshot(lease, datetime::statement_clock(), 1);
+    });
+    assert!(
+        error_sqlstates(&atomic_snapshot_execute(
+            &mut writer,
+            &mut engine,
+            22,
+            "SELECT 1"
+        ))
+        .is_empty()
+    );
+    let expired = atomic_snapshot_execute(&mut reader, &mut engine, 11, "SELECT 1");
+    assert_eq!(error_sqlstates(&expired), ["57014"]);
+    assert!(reader.transaction.resume_statement_snapshot().is_none());
+    assert!(!engine.storage.has_active_snapshots());
+    atomic_snapshot_execute(&mut reader, &mut engine, 11, "ROLLBACK");
+    assert_eq!(reader.transaction.mode, TxnMode::Idle);
 }

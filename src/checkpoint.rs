@@ -918,6 +918,24 @@ enum CommitPruneProgress {
     },
 }
 
+/// Restores the caller's mode after errors and nested atomic execution.
+#[must_use]
+pub(crate) struct AtomicBlockReadScope {
+    blocks: std::sync::Arc<std::sync::Mutex<TieredStore<OwnedObjectStore>>>,
+    restartable: bool,
+}
+
+impl Drop for AtomicBlockReadScope {
+    fn drop(&mut self) {
+        let mut blocks = self.blocks.lock().expect("block store lock poisoned");
+        if self.restartable {
+            blocks.enable_async_gets();
+        } else {
+            blocks.disable_async_gets();
+        }
+    }
+}
+
 pub(crate) struct Checkpointer {
     pub(crate) client: ObjectStore,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
@@ -1907,6 +1925,20 @@ impl Checkpointer {
             .and_then(|install| install.handle)
     }
 
+    pub(crate) fn atomic_block_read_scope(&self) -> AtomicBlockReadScope {
+        let blocks = std::sync::Arc::clone(&self.blocks);
+        let restartable = {
+            let mut blocks = blocks.lock().expect("block store lock poisoned");
+            let restartable = blocks.async_gets_enabled();
+            blocks.disable_async_gets();
+            restartable
+        };
+        AtomicBlockReadScope {
+            blocks,
+            restartable,
+        }
+    }
+
     pub(crate) fn enable_async_block_reads(&mut self) {
         self.blocks
             .lock()
@@ -1914,6 +1946,7 @@ impl Checkpointer {
             .enable_async_gets();
     }
 
+    #[cfg(test)]
     pub(crate) fn disable_async_block_reads(&mut self) {
         self.blocks
             .lock()
@@ -17373,6 +17406,65 @@ mod stored_dependency_tests {
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;
     use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependencies};
+
+    fn atomic_scope_fixture(name: &str) -> (Checkpointer, Config) {
+        let mut config = Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_get_slots = 1;
+        config.block_cache_bytes = 2 * crate::store::MAX_PAYLOAD;
+        config.disk_cache_bytes = 0;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        config.data_dir = std::env::temp_dir()
+            .join(&config.object_store_bucket)
+            .to_str()
+            .unwrap()
+            .to_owned();
+        config.remove_test_data_dir_on_drop();
+        let mut budget = Budget::new(Checkpointer::budget_bytes(&config) + (4 << 20));
+        let checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+        (checkpointer, config)
+    }
+
+    #[test]
+    fn atomic_block_reads_nested_scope_restores_outer_mode_after_an_error() {
+        let (mut checkpointer, config) = atomic_scope_fixture("atomic-scope-nested");
+        let blocks = checkpointer.block_stack();
+        crate::mem::guard::forbid_alloc(|| {
+            let initial = checkpointer.atomic_block_read_scope();
+            assert!(!blocks.lock().unwrap().async_gets_enabled());
+            drop(initial);
+            assert!(!blocks.lock().unwrap().async_gets_enabled());
+            checkpointer.enable_async_block_reads();
+            let outer = checkpointer.atomic_block_read_scope();
+            let fail = || -> Result<(), ()> {
+                let _nested = checkpointer.atomic_block_read_scope();
+                assert!(!blocks.lock().unwrap().async_gets_enabled());
+                Err(())
+            };
+            assert_eq!(fail(), Err(()));
+            assert!(!blocks.lock().unwrap().async_gets_enabled());
+            drop(outer);
+            assert!(blocks.lock().unwrap().async_gets_enabled());
+        });
+        drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn atomic_block_reads_scope_owns_its_controls_after_checkpointer_drop() {
+        let (mut checkpointer, config) = atomic_scope_fixture("atomic-scope-owner");
+        checkpointer.enable_async_block_reads();
+        let blocks = checkpointer.block_stack();
+        let scope = crate::mem::guard::forbid_alloc(|| checkpointer.atomic_block_read_scope());
+        drop(checkpointer);
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(!blocks.lock().unwrap().async_gets_enabled());
+            drop(scope);
+            assert!(blocks.lock().unwrap().async_gets_enabled());
+        });
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
 
     #[test]
     fn cleanup_download_overlap_pruning_walk_yields_retries_and_preserves_late_appends() {

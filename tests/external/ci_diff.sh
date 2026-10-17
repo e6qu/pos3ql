@@ -1556,6 +1556,14 @@ if "$PY" "$EXT/copy_binary_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/copy
 else
   bad "COPY binary round-trip"; cat "$WORK/copybin.out"
 fi
+if (set -o pipefail
+    "$PY" -u "$EXT/atomic_writes_diff.py" --pg "$PGPORT" --host "$PGHOST" --user "$PGUSER" \
+      --binary "${POS3QL_BIN:-./target/release/pos3ql}" --work "$WORK/atomic-writes" \
+      2>&1 | tee "$WORK/atomic-writes.out"); then
+  ok "atomic writes during held object GETs ($(tail -1 "$WORK/atomic-writes.out"))"
+else
+  bad "atomic writes during held object GETs"
+fi
 fi
 
 # --- generated type fidelity matrix ----------------------------------------

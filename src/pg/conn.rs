@@ -1039,6 +1039,7 @@ impl Conn {
     }
 
     fn finish_lock_wait(&mut self) {
+        self.txn.release_suspended_statement();
         self.parked = false;
         self.parked_generation = 0;
         self.parked_for_io = false;
@@ -1757,10 +1758,16 @@ impl Conn {
             wire::FMSG_QUERY => self.handle_query(engine, total),
             wire::FMSG_TERMINATE => Step::Close,
             wire::FMSG_SYNC => {
+                let mut responder = Responder::new(&mut self.send);
                 if self.txn.mode == crate::sql::txn::TxnMode::Implicit
-                    && let Err(error) = engine.commit_txn(&mut self.txn, &self.guc)
+                    && let Err(error) = engine.commit_txn_with_triggers(
+                        &mut self.txn,
+                        &self.guc,
+                        &self.arena,
+                        &mut responder,
+                    )
                 {
-                    let mut responder = Responder::new(&mut self.send);
+                    self.cursors.on_rollback();
                     if responder
                         .error(error.sqlstate, error.message.as_str())
                         .is_err()
@@ -1774,7 +1781,6 @@ impl Conn {
                     }
                 }
                 let status = self.txn.status_byte();
-                let mut responder = Responder::new(&mut self.send);
                 match responder.ready_for_query(status) {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
@@ -5241,6 +5247,137 @@ mod tests {
             bytes = &bytes[1 + length as usize..];
         }
         false
+    }
+
+    #[test]
+    fn atomic_block_reads_implicit_commit_fires_deferred_triggers_and_rolls_back_errors() {
+        fn message(
+            conn: &mut Conn,
+            engine: &mut Engine,
+            kind: u8,
+            payload: &[u8],
+            error: bool,
+        ) -> Vec<u8> {
+            conn.send.clear();
+            assert!(conn.recv.append(&frontend(kind, payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            let response = conn.send.readable().to_vec();
+            assert_eq!(
+                has_backend_message(&response, wire::MSG_ERROR_RESPONSE),
+                error,
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            if error {
+                assert!(response.windows(5).any(|bytes| bytes == b"23514"));
+            }
+            response
+        }
+        fn query(conn: &mut Conn, engine: &mut Engine, sql: &str, error: bool) -> Vec<u8> {
+            let mut payload = sql.as_bytes().to_vec();
+            payload.push(0);
+            message(conn, engine, wire::FMSG_QUERY, &payload, error)
+        }
+        fn first_value(mut response: &[u8]) -> &str {
+            while response.len() >= 5 {
+                let length = i32::from_be_bytes(response[1..5].try_into().unwrap()) as usize + 1;
+                if response[0] == wire::MSG_DATA_ROW {
+                    let bytes = i32::from_be_bytes(response[7..11].try_into().unwrap()) as usize;
+                    return core::str::from_utf8(&response[11..11 + bytes]).unwrap();
+                }
+                response = &response[length..];
+            }
+            panic!("expected one result row")
+        }
+        let directory =
+            std::env::temp_dir().join(format!("pos3ql-implicit-deferred-{}", std::process::id()));
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.max_tables = 8;
+        config.table_rows = 128;
+        config.wal_bytes = 1 << 20;
+        config.wal_buffer_bytes = 1 << 16;
+        config.remove_test_data_dir_on_drop();
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        conn.phase = Phase::Ready;
+        query(
+            &mut conn,
+            &mut engine,
+            "CREATE TABLE atomic_commit_rows (id integer); \
+             CREATE TABLE atomic_commit_audit (id integer CHECK (id > 0)); \
+             CREATE FUNCTION atomic_commit_check() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN INSERT INTO atomic_commit_audit VALUES (NEW.id); RETURN NEW; END $$; \
+             CREATE CONSTRAINT TRIGGER atomic_commit_check AFTER INSERT ON atomic_commit_rows \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION atomic_commit_check()",
+            false,
+        );
+        for protocol in 0..3 {
+            for (id, failed) in [(1, false), (-1, true), (2, false)] {
+                let sql = format!("INSERT INTO atomic_commit_rows VALUES ({id})");
+                match protocol {
+                    0 => {
+                        query(&mut conn, &mut engine, &sql, failed);
+                    }
+                    1 => {
+                        let mut parse = vec![0];
+                        parse.extend_from_slice(sql.as_bytes());
+                        parse.extend_from_slice(&[0, 0, 0]);
+                        message(&mut conn, &mut engine, wire::FMSG_PARSE, &parse, false);
+                        message(&mut conn, &mut engine, wire::FMSG_BIND, &[0; 8], false);
+                        message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+                        let output = message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], failed);
+                        assert!(output.ends_with(b"Z\0\0\0\x05I"));
+                    }
+                    _ => {
+                        query(
+                            &mut conn,
+                            &mut engine,
+                            "COPY atomic_commit_rows FROM STDIN",
+                            false,
+                        );
+                        message(
+                            &mut conn,
+                            &mut engine,
+                            wire::FMSG_COPY_DATA,
+                            format!("{id}\n").as_bytes(),
+                            false,
+                        );
+                        let output =
+                            message(&mut conn, &mut engine, wire::FMSG_COPY_DONE, &[], failed);
+                        assert!(output.ends_with(b"Z\0\0\0\x05I"));
+                    }
+                }
+                assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::Idle);
+            }
+            let expected = ((protocol + 1) * 2).to_string();
+            for table in ["atomic_commit_rows", "atomic_commit_audit"] {
+                let output = query(
+                    &mut conn,
+                    &mut engine,
+                    &format!("SELECT count(*) FROM {table}"),
+                    false,
+                );
+                assert_eq!(first_value(&output), expected);
+            }
+        }
+        query(
+            &mut conn,
+            &mut engine,
+            "INSERT INTO atomic_commit_rows VALUES (3); BEGIN; ROLLBACK",
+            false,
+        );
+        let output = query(
+            &mut conn,
+            &mut engine,
+            "SELECT count(*) FROM atomic_commit_audit",
+            false,
+        );
+        assert_eq!(first_value(&output), "7");
     }
 
     #[test]

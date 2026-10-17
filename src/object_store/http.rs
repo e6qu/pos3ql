@@ -180,6 +180,7 @@ struct PendingResponse {
 struct Response {
     len: usize,
     etag: Option<EntityTag>,
+    close: bool,
 }
 
 /// A parsed HTTP response head. A body has exactly one framing rule.
@@ -187,6 +188,7 @@ struct ResponseHead {
     status: u16,
     etag: Option<EntityTag>,
     framing: BodyFraming,
+    close: bool,
 }
 
 enum BodyFraming {
@@ -570,15 +572,15 @@ impl S3Client {
         }
 
         // Phase 4: complete. Deregister from the reactor and restore blocking.
-        if self
-            .stream
-            .as_ref()
-            .unwrap()
-            .set_nonblocking(false)
-            .is_err()
+        if response_head.close
+            || self
+                .stream
+                .as_ref()
+                .unwrap()
+                .set_nonblocking(false)
+                .is_err()
         {
-            // The response is complete, but this connection is no longer safe
-            // for a later blocking request.
+            // Completed bytes remain owned even when this transport closes.
             self.stream = None;
         }
         self.pending = None;
@@ -814,7 +816,12 @@ impl S3Client {
         self.body.clear();
         let result = read_response(stream, &mut self.head, &mut self.body);
         match result {
-            Ok(r) => Ok(r),
+            Ok(response) => {
+                if response.close {
+                    self.stream = None;
+                }
+                Ok(response)
+            }
             Err(e) => {
                 self.stream = None;
                 Err(e)
@@ -1054,6 +1061,7 @@ fn read_response(
     Ok(Response {
         len: body.readable().len(),
         etag: response_head.etag,
+        close: response_head.close,
     })
 }
 
@@ -1320,9 +1328,11 @@ fn parse_head(head: &[u8]) -> Result<ResponseHead, S3Error> {
     let status_line = lines.next().ok_or(S3Error::Protocol("empty response"))?;
     let mut parts = status_line.splitn(3, ' ');
     let version = parts.next().unwrap_or("");
-    if !version.starts_with("HTTP/1.") {
-        return Err(S3Error::Protocol("not HTTP/1.x"));
-    }
+    let persistent = match version {
+        "HTTP/1.1" => true,
+        "HTTP/1.0" => false,
+        _ => return Err(S3Error::Protocol("unsupported HTTP version")),
+    };
     let status: u16 = parts
         .next()
         .and_then(|s| s.parse().ok())
@@ -1331,6 +1341,8 @@ fn parse_head(head: &[u8]) -> Result<ResponseHead, S3Error> {
     let mut content_length = None;
     let mut etag = None;
     let mut chunked = false;
+    let mut close = false;
+    let mut keep_alive = false;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -1338,6 +1350,13 @@ fn parse_head(head: &[u8]) -> Result<ResponseHead, S3Error> {
         let (name, value) = line
             .split_once(':')
             .ok_or(S3Error::Protocol("malformed response header"))?;
+        if name.is_empty()
+            || name
+                .bytes()
+                .any(|byte| !byte.is_ascii_alphanumeric() && !b"!#$%&'*+-.^_`|~".contains(&byte))
+        {
+            return Err(S3Error::Protocol("malformed response header name"));
+        }
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
@@ -1353,6 +1372,14 @@ fn parse_head(head: &[u8]) -> Result<ResponseHead, S3Error> {
                 return Err(S3Error::Protocol("duplicate ETag header"));
             }
             etag = Some(EntityTag::parse(value).map_err(S3Error::Protocol)?);
+        } else if name.eq_ignore_ascii_case("connection") {
+            for option in value.split(',').map(str::trim) {
+                if option.is_empty() {
+                    return Err(S3Error::Protocol("empty connection option"));
+                }
+                close |= option.eq_ignore_ascii_case("close");
+                keep_alive |= option.eq_ignore_ascii_case("keep-alive");
+            }
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             if chunked || !value.eq_ignore_ascii_case("chunked") {
                 return Err(S3Error::Protocol("unsupported transfer-encoding"));
@@ -1371,6 +1398,7 @@ fn parse_head(head: &[u8]) -> Result<ResponseHead, S3Error> {
         status,
         etag,
         framing,
+        close: close || !(persistent || keep_alive),
     })
 }
 
@@ -1378,6 +1406,42 @@ fn parse_head(head: &[u8]) -> Result<ResponseHead, S3Error> {
 mod tests {
     use super::*;
     use std::io::BufRead;
+
+    #[test]
+    fn atomic_block_reads_http_persistence_uses_version_and_connection_options() {
+        for (head, close) in [
+            ("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", false),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                true,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\ncOnNeCtIoN: keep-alive, CLOSE\r\n\r\n",
+                true,
+            ),
+            ("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n", true),
+            (
+                "HTTP/1.0 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                false,
+            ),
+            (
+                "HTTP/1.0 200 OK\r\nContent-Length: 0\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n",
+                true,
+            ),
+        ] {
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(parse_head(head.as_bytes()).unwrap().close, close)
+            });
+        }
+        for head in [
+            "HTTP/1.9 200 OK\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.x 200 OK\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection : close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: ,close\r\n\r\n",
+        ] {
+            crate::mem::guard::forbid_alloc(|| assert!(parse_head(head.as_bytes()).is_err()));
+        }
+    }
 
     fn test_config(port: u16) -> Config {
         let mut c = Config::default_dev();
@@ -1909,7 +1973,10 @@ mod tests {
         while matches!(result, Err(S3Error::WouldBlock)) {
             result = client.advance_pending();
         }
-        assert!(matches!(result, Err(S3Error::Protocol("not HTTP/1.x"))));
+        assert!(matches!(
+            result,
+            Err(S3Error::Protocol("unsupported HTTP version"))
+        ));
         assert!(!client.has_pending());
         assert!(client.pending_fd().is_none());
         server.join().unwrap();

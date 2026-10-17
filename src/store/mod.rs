@@ -83,8 +83,8 @@ pub(crate) use memory::MemoryBlockStore;
 pub(crate) use object::OwnedObjectStore;
 pub(crate) use sst::copy_pax_v2_row_from_extents;
 pub(crate) use sst::{
-    DataBlockLookahead, DataBlockRef, PaxLayout, RowSstFormat, SstCursor, SstHandle, SstKey,
-    SstReader, SstVersionCursor,
+    DataBlockLookahead, DataBlockRef, PaxLayout, RowSstFormat, SstCursor, SstHandle, SstIndexLeaf,
+    SstKey, SstPointReadProgress, SstReader, SstVersionCursor,
 };
 pub(crate) use sst::{MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstWriter};
 pub(crate) use sst::{
@@ -95,9 +95,9 @@ pub(crate) use sst::{
 pub(crate) use tiered::TieredStore;
 pub(crate) use tiered::{StackPlan, build as build_tiers};
 pub(crate) use value::{
-    VALUE_INDEX_KEY_MAX, VALUE_INDEX_TUPLE_MAX, ValueIndexError, ValueIndexHandle,
-    ValueIndexPosition, ValueIndexReader, ValueIndexStream, ValueIndexStreamStep, ValueIndexWriter,
-    walk_value_roster,
+    RetainedBlockBuffer, VALUE_INDEX_KEY_MAX, VALUE_INDEX_TUPLE_MAX, ValueIndexError,
+    ValueIndexHandle, ValueIndexPosition, ValueIndexReader, ValueIndexStream, ValueIndexStreamStep,
+    ValueIndexWriter, walk_value_roster,
 };
 
 use crate::wal::crc32c::crc32c;
@@ -471,7 +471,8 @@ pub(crate) struct BlockIoStats {
     /// Completed durable-block response bodies. This differs from issued GETs:
     /// a hedge or failed request may never deliver a body.
     pub(crate) object_read_completions: u64,
-    /// Payload bytes carried by completed durable-block GET responses.
+    /// Completed successful object-response body bytes, including block
+    /// headers. Later frame verification can still reject those bytes.
     pub(crate) object_read_bytes: u64,
     /// Elapsed wall time awaiting completed durable-block GET responses.
     /// Telemetry calibrates future plans only; it is not durable state.

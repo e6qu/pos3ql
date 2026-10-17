@@ -14204,6 +14204,7 @@ enum SpillOverlayMode<'scan> {
 /// The reader's owned block buffers (index, data, physical column, chain
 /// assembly, and packed-range staging).
 struct SpillScratch {
+    source: Option<crate::store::BlockId>,
     index_buf: Box<[u8]>,
     data_buf: Box<[u8]>,
     decoded_buf: Box<[u8]>,
@@ -14215,8 +14216,56 @@ struct SpillScratch {
 }
 
 struct ValueIndexScratch {
+    source: Option<crate::store::BlockId>,
     roster: crate::store::RetainedBlockBuffer,
     data: crate::store::RetainedBlockBuffer,
+}
+
+trait ReadScratch {
+    fn source(&mut self) -> &mut Option<crate::store::BlockId>;
+}
+
+impl ReadScratch for SpillScratch {
+    fn source(&mut self) -> &mut Option<crate::store::BlockId> {
+        &mut self.source
+    }
+}
+
+impl ReadScratch for ValueIndexScratch {
+    fn source(&mut self) -> &mut Option<crate::store::BlockId> {
+        &mut self.source
+    }
+}
+
+/// Prefer the source's existing bytes, then an unused context. Taking the first
+/// free context on every retry would overwrite one source while another sits idle.
+fn try_source_scratch<'a, T: ReadScratch>(
+    pool: &'a [std::sync::Mutex<T>],
+    name: &str,
+    source: Option<crate::store::BlockId>,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    for preference in 0..3 {
+        for candidate in pool {
+            match candidate.try_lock() {
+                Ok(mut lease) => {
+                    let selected = match preference {
+                        0 => *lease.source() == source,
+                        1 => lease.source().is_none(),
+                        _ => true,
+                    };
+                    if selected {
+                        *lease.source() = source;
+                        return Some(lease);
+                    }
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    panic!("{name} lock poisoned: {error}")
+                }
+            }
+        }
+    }
+    None
 }
 
 fn try_mutex_pool<'a, T>(
@@ -14303,6 +14352,7 @@ impl SpillReader {
         };
         let fresh = || {
             std::sync::Mutex::new(SpillScratch {
+                source: None,
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 data_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 decoded_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -14334,6 +14384,7 @@ impl SpillReader {
         };
         let value = || {
             std::sync::Mutex::new(ValueIndexScratch {
+                source: None,
                 roster: crate::store::RetainedBlockBuffer::new(),
                 data: crate::store::RetainedBlockBuffer::new(),
             })
@@ -14431,7 +14482,9 @@ impl SpillReader {
         })?;
         // Both borrows are per-fetch; the copy into the arena ends
         // them before returning.
-        let Some(mut scratch) = try_mutex_pool(&self.scratch, "spill row scratch") else {
+        let Some(mut scratch) =
+            try_source_scratch(&self.scratch, "spill row scratch", Some(handle.index))
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "spill row scratch exhausted (maximum nested fetches 2)"
@@ -14493,7 +14546,9 @@ impl SpillReader {
         commit_lsn: u64,
         f: impl FnOnce(&[u8]) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        let Some(mut scratch) = try_mutex_pool(&self.scratch, "spill row scratch") else {
+        let Some(mut scratch) =
+            try_source_scratch(&self.scratch, "spill row scratch", Some(handle.index))
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "spill row scratch exhausted (maximum nested fetches 2)"
@@ -14508,6 +14563,7 @@ impl SpillReader {
             bounce_buf,
             decoded_data_ref,
             point_read,
+            ..
         } = &mut *scratch;
         // The assembly buffer doubles as the row destination: `get`
         // assembles a chained row into the caller buffer directly, so
@@ -29901,13 +29957,20 @@ impl Storage {
         snapshot: u64,
     ) -> Result<Option<SpillVersion>, SqlError> {
         let relation = source.relation();
+        if relation.len() == 0 {
+            return Ok(None);
+        }
         let spill = source.reader.ok_or_else(|| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "retained SST source has no spill reader"
             )
         })?;
-        let Some(mut scratch) = try_mutex_pool(&spill.scratch, "spill row scratch") else {
+        let Some(mut scratch) = try_source_scratch(
+            &spill.scratch,
+            "spill row scratch",
+            Some(relation.handle(0).index),
+        ) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "spill row scratch exhausted (maximum nested fetches {})",
@@ -32223,12 +32286,13 @@ impl Storage {
             let Some(spill) = &self.spill else {
                 return Ok(false);
             };
-            let Some(mut scratch) = try_mutex_pool(
+            let Some(mut scratch) = try_source_scratch(
                 spill
                     .value_scratch
                     .as_ref()
                     .expect("durable value indexes have reader scratch"),
                 "persistent value scratch",
+                Some(handle.roster),
             ) else {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -32237,7 +32301,7 @@ impl Storage {
             };
             let scratch = &mut *scratch;
             {
-                let ValueIndexScratch { roster, data } = scratch;
+                let ValueIndexScratch { roster, data, .. } = scratch;
                 let mut callback_error = None;
                 crate::store::ValueIndexReader::over_retained(roster, data)
                     .probe(
@@ -32839,12 +32903,13 @@ impl Storage {
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
-        let Some(mut scratch) = try_mutex_pool(
+        let Some(mut scratch) = try_source_scratch(
             spill
                 .value_scratch
                 .as_ref()
                 .expect("durable value indexes have reader scratch"),
             "persistent value scratch",
+            Some(handle.roster),
         ) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -32955,12 +33020,13 @@ impl Storage {
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
-        let Some(mut scratch) = try_mutex_pool(
+        let Some(mut scratch) = try_source_scratch(
             spill
                 .value_scratch
                 .as_ref()
                 .expect("durable value indexes have reader scratch"),
             "persistent value scratch",
+            Some(handle.roster),
         ) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -33055,12 +33121,13 @@ impl Storage {
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
-        let Some(mut scratch) = try_mutex_pool(
+        let Some(mut scratch) = try_source_scratch(
             spill
                 .value_scratch
                 .as_ref()
                 .expect("durable value indexes have reader scratch"),
             "persistent value scratch",
+            Some(handle.roster),
         ) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -33135,15 +33202,20 @@ impl Storage {
         lsn: u64,
         mut visit: impl FnMut(&[u8], &[u8]),
     ) -> Result<bool, SqlError> {
+        let root = self.tables[table_index]
+            .enforcer(binding)
+            .and_then(|enforcer| enforcer.durable)
+            .map(|handle| handle.roster);
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
-        let Some(mut scratch) = try_mutex_pool(
+        let Some(mut scratch) = try_source_scratch(
             spill
                 .value_scratch
                 .as_ref()
                 .expect("durable value indexes have reader scratch"),
             "persistent value scratch",
+            root,
         ) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -33220,12 +33292,13 @@ impl Storage {
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
-        let Some(mut scratch) = try_mutex_pool(
+        let Some(mut scratch) = try_source_scratch(
             spill
                 .value_scratch
                 .as_ref()
                 .expect("durable value indexes have reader scratch"),
             "persistent value scratch",
+            Some(handle.roster),
         ) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -58295,6 +58368,33 @@ mod tests {
                 1_000
             );
         }
+    }
+
+    #[test]
+    fn atomic_block_reads_scratch_reuses_two_sources_and_preserves_live_leases() {
+        let mut budget = Budget::new(SpillReader::budget_bytes(false, 1));
+        let reader = SpillReader::new(&mut budget, 1, None, None).unwrap();
+        let first = Some(crate::store::BlockId([1; 32]));
+        let second = Some(crate::store::BlockId([2; 32]));
+        crate::mem::guard::forbid_alloc(|| {
+            let mut lease = try_source_scratch(&reader.scratch, "row scratch", first).unwrap();
+            lease.index_buf[0] = 11;
+            drop(lease);
+            let mut lease = try_source_scratch(&reader.scratch, "row scratch", second).unwrap();
+            lease.index_buf[0] = 22;
+            drop(lease);
+            let first_lease = try_source_scratch(&reader.scratch, "row scratch", first).unwrap();
+            assert_eq!(first_lease.index_buf[0], 11);
+            let second_lease = try_source_scratch(&reader.scratch, "row scratch", second).unwrap();
+            assert_eq!(second_lease.index_buf[0], 22);
+            assert!(try_source_scratch(&reader.scratch, "row scratch", first).is_none());
+            assert!(try_source_scratch(&reader.scratch, "row scratch", None).is_none());
+            drop(first_lease);
+            let mut available = try_source_scratch(&reader.scratch, "row scratch", None).unwrap();
+            available.index_buf[0] = 33;
+            assert_eq!(second_lease.index_buf[0], 22);
+        });
+        assert_eq!(budget.used(), SpillReader::budget_bytes(false, 1));
     }
 
     #[test]

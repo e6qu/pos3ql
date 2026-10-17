@@ -40,6 +40,7 @@ class DownloadGate:
             self.release.clear()
             self.failure_sent.clear()
             self.observed_keys.clear()
+            self.get_counts.clear()
 
     def disarm(self):
         with self.lock:
@@ -239,6 +240,20 @@ class Node:
         shutil.rmtree(self.data)
 
 
+def trace_reads(gate, blocks):
+    with gate.lock:
+        counts = dict(gate.get_counts)
+        target = gate.key
+    objects = {}
+    for path in blocks.iterdir():
+        if path.is_file():
+            body = path.read_bytes()
+            objects[path.name] = {"type": body[4] if len(body) > 4 else None,
+                "has_order": b"warm one" in body, "has_invoice": b"cold ten" in body}
+    print(json.dumps({"read_trace": counts, "objects": objects,
+        "required_invoice_object": target}), flush=True)
+
+
 def scenario(reference, node, gate, object_root, prefix, missing, schema):
     report = (f"SELECT c.id, c.note, (SELECT note FROM {schema}.warm_orders WHERE id = 1) "
         f"FROM {schema}.cold_invoices AS c ORDER BY c.id")
@@ -266,12 +281,7 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
         try:
             writer.execute(f"SELECT id, note FROM {schema}.warm_orders ORDER BY id").fetchall()
         except BaseException:
-            with gate.lock:
-                print(json.dumps({"warm_get_counts": gate.get_counts,
-                    "warm_blocks": {path.name: {"header": path.read_bytes()[:32].hex(),
-                        "has_order": b"warm one" in path.read_bytes(),
-                        "has_invoice": b"cold ten" in path.read_bytes()}
-                        for path in blocks.iterdir() if path.is_file()}}), flush=True)
+            trace_reads(gate, blocks)
             raise
         writer.execute(f"SELECT note FROM {schema}.warm_orders WHERE id = 1").fetchall()
         head = object_root / "atomic-write-test" / prefix / "commit-head"
@@ -316,6 +326,7 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
             except BaseException:
                 progress("scenario:failed; stopping owned server before joining SQL threads")
                 gate.release.set()
+                trace_reads(gate, blocks)
                 node.stop(crash=True)
                 raise
     node.stop(crash=True)

@@ -772,7 +772,9 @@ Index readers keep verified metadata and entries in their existing startup
 buffers when a later row read waits for a download. Selected-column scans keep
 completed columns in the same way. Their identities follow the immutable source,
 so another attempt can reuse the bytes even after shared-cache eviction.
-Point lookups also retain completed membership checks and the selected data
+The fixed pools prefer buffers already used for the same source, then unused
+buffers, so reading a second table does not overwrite the first table's work
+while another buffer sits idle. Point lookups also retain completed membership checks and the selected data
 reference while that data downloads. A metadata probe leaves decoded rows
 available for the following fetch. Overwriting scratch or failing a replacement
 clears its previous identity.

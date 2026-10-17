@@ -116,6 +116,7 @@ jobs:
           tools/tests/test_benchmark_report.py
           tools/tests/test_run_performance.py
           tools/tests/test_test_ports.py
+          tools/tests/test_test_command.py
           tools/tests/test_python_env.py
 
       - name: Duplicate-code guard

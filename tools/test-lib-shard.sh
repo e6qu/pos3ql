@@ -49,4 +49,4 @@ if [ "$selected" -eq 0 ] || [ "$ordinal" -eq "$selected" ]; then
     exit 1
 fi
 echo "library test partition $partition: $selected of $ordinal tests"
-cargo test --locked --lib -- "$@"
+python3 tools/test_command.py cargo test --locked --lib -- "$@"

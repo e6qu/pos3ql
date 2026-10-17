@@ -2226,6 +2226,12 @@ impl<'a> SstReader<'a> {
         }
     }
 
+    fn invalidate_data_block(&mut self) {
+        self.loaded_ref = None;
+        self.loaded_format = None;
+        self.decoded_len = 0;
+    }
+
     fn load_data_block(
         &mut self,
         store: &mut dyn BlockStore,
@@ -2235,10 +2241,7 @@ impl<'a> SstReader<'a> {
         if self.loaded_ref == Some(reference) && self.loaded_format == Some(format) {
             return Ok(self.decoded_len);
         }
-        // A failed replacement may already have overwritten decoded bytes.
-        self.loaded_ref = None;
-        self.loaded_format = None;
-        self.decoded_len = 0;
+        self.invalidate_data_block();
         let (raw_len, block_type) =
             read_data_block_raw_ref(store, reference, self.data_scratch, self.assembly)?;
         let decoded_len = match (format, block_type) {
@@ -2272,6 +2275,55 @@ impl<'a> SstReader<'a> {
     }
 
     /// The caller retains the same index bytes and their verified identity.
+    #[cfg(debug_assertions)]
+    fn trace_point_read(&self, kind: &str, handle: &SstHandle, rowid: u64, snapshot: u64) {
+        let brief = |handle: SstHandle| {
+            (
+                [
+                    handle.index.0[0],
+                    handle.index.0[1],
+                    handle.index.0[2],
+                    handle.index.0[3],
+                ],
+                [
+                    handle.filter.0[0],
+                    handle.filter.0[1],
+                    handle.filter.0[2],
+                    handle.filter.0[3],
+                ],
+                [
+                    handle.roster.0[0],
+                    handle.roster.0[1],
+                    handle.roster.0[2],
+                    handle.roster.0[3],
+                ],
+                handle.format,
+            )
+        };
+        let text = crate::stack_format!(
+            768,
+            "DEBUG_READ point kind={} buffer={:p} target={:?} cached={:?} row={} snapshot={} phase={} decoded={}\n",
+            kind,
+            self.index_scratch.as_ptr(),
+            brief(*handle),
+            self.index_leaf
+                .map(|leaf| (brief(leaf.handle), leaf.lower, leaf.upper)),
+            rowid,
+            snapshot,
+            match self.point_read.stage {
+                SstPointReadStage::Filter => "filter",
+                SstPointReadStage::Index => "index",
+                SstPointReadStage::Data(_) => "data",
+            },
+            self.loaded_ref.is_some()
+        );
+        let bytes = text.as_str().as_bytes();
+        // SAFETY: the fixed stack message remains live for this write.
+        unsafe {
+            libc::write(2, bytes.as_ptr().cast(), bytes.len());
+        }
+    }
+
     pub(crate) fn restore_cached_index_leaf(&mut self, leaf: Option<SstIndexLeaf>) {
         self.index_leaf = leaf;
     }
@@ -2379,6 +2431,8 @@ impl<'a> SstReader<'a> {
         snapshot: u64,
         into: &mut [u8],
     ) -> Result<Option<SstProbe>, SstError> {
+        #[cfg(debug_assertions)]
+        self.trace_point_read("row", handle, rowid, snapshot);
         let result = self.get_at_inner(store, handle, rowid, snapshot, into);
         self.finish_point_read(&result);
         result
@@ -2454,6 +2508,8 @@ impl<'a> SstReader<'a> {
         rowid: u64,
         snapshot: u64,
     ) -> Result<Option<SstProbe>, SstError> {
+        #[cfg(debug_assertions)]
+        self.trace_point_read("probe", handle, rowid, snapshot);
         let result = self.probe_at_inner(store, handle, rowid, snapshot);
         self.finish_point_read(&result);
         result
@@ -2657,6 +2713,7 @@ impl<'a> SstReader<'a> {
         lo: SstKey,
         emit: &mut dyn FnMut(SstKey, bool),
     ) -> Result<Option<SstKey>, SstError> {
+        self.invalidate_data_block();
         let (raw_len, block_type) =
             read_data_block_raw_ref(store, reference, self.data_scratch, self.assembly)?;
         match (handle.format, block_type) {
@@ -3280,6 +3337,45 @@ mod tests {
     fn arena() -> Arena {
         let mut budget = Budget::new(64 << 20);
         Arena::new(&mut budget, "sst test arena", 32 << 20).expect("arena fits")
+    }
+
+    #[test]
+    fn atomic_block_reads_version_walk_invalidates_previous_decoded_bytes() {
+        let (_budget, mut store) = store();
+        let mut writer = SstWriter::new();
+        writer
+            .append_version(&mut store, SstKey::at(1, 7), b"one")
+            .unwrap();
+        let first = writer.finish(&mut store).unwrap().unwrap();
+        writer.reset();
+        writer
+            .append_version(&mut store, SstKey::at(2, 9), b"two")
+            .unwrap();
+        let second = writer.finish(&mut store).unwrap().unwrap();
+        let arena = arena();
+        let mut reader = SstReader::new(&arena).unwrap();
+        let mut output = [0; 16];
+        crate::mem::guard::forbid_alloc(|| {
+            reader
+                .get_at(&mut store, &first, 1, 100, &mut output)
+                .unwrap()
+                .unwrap();
+            let mut seen = 0;
+            let _ = reader
+                .scan_versions_bounded(&mut store, &second, SstKey::MIN, 1, &mut |key, deleted| {
+                    assert_eq!(key, SstKey::at(2, 9));
+                    assert!(!deleted);
+                    seen += 1;
+                })
+                .unwrap();
+            assert_eq!(seen, 1);
+            assert!(reader.cached_data_block().is_none());
+            reader
+                .get_at(&mut store, &first, 1, 100, &mut output)
+                .unwrap()
+                .unwrap();
+            assert_eq!(&output[..3], b"one");
+        });
     }
 
     #[test]

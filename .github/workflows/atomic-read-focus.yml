@@ -38,7 +38,7 @@ jobs:
       - name: Build checked-out source
         run: |
           cargo clean -p pos3ql
-          cargo build --release --locked
+          cargo build --locked
       - uses: ./.github/actions/python-test-environment
         with:
           venv: target/external-venv
@@ -46,4 +46,4 @@ jobs:
         run: >-
           target/external-venv/bin/python -u tests/external/atomic_writes_diff.py
           --pg 5432 --host 127.0.0.1 --user postgres
-          --binary target/release/pos3ql --work "${{ runner.temp }}/atomic-focus"
+          --binary target/debug/pos3ql --work "${{ runner.temp }}/atomic-focus"

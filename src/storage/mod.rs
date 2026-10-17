@@ -14030,7 +14030,7 @@ struct ScanContext {
     pax_column_buf: Box<[u8]>,
     pax_values_buf: Box<[u8]>,
     pax_value_extents: [Option<(usize, usize)>; MAX_COLUMNS],
-    pax_values_owner: Option<(usize, usize)>,
+    pax_values_owner: Option<(crate::store::SstHandle, usize)>,
     pax_row_buf: Box<[u8]>,
     index_buf: Box<[u8]>,
 }
@@ -29046,7 +29046,6 @@ impl Storage {
                     ));
                 };
                 context.owner = walk_id;
-                context.pax_values_owner = None;
                 for (member, cursor) in cursors[..n].iter_mut().enumerate() {
                     Self::cursor_advance(spill, &relation, member, cursor, &mut context)?;
                 }
@@ -29076,7 +29075,6 @@ impl Storage {
                         cursor.loaded_type = None;
                     }
                     context.owner = walk_id;
-                    context.pax_values_owner = None;
                 }
                 // Consume every version of this row from every member. The
                 // greatest commit LSN admitted by the statement snapshot wins;
@@ -29247,7 +29245,6 @@ impl Storage {
                 }
             }
             context.owner = *walk_id;
-            context.pax_values_owner = None;
             while *initialized < n {
                 Self::cursor_advance(
                     spill,
@@ -29293,7 +29290,6 @@ impl Storage {
                     cursor.pax_layout = None;
                 }
                 context.owner = *walk_id;
-                context.pax_values_owner = None;
             }
             // A merged member can carry newer versions before this snapshot's
             // admissible image. Advance only those heads before choosing bytes;
@@ -29363,24 +29359,35 @@ impl Storage {
                             "PAX descriptor has no validated layout"
                         )
                     })?;
-                    let owner = (member as usize, cursor.ordinal);
+                    let owner = (relation.handle(member as usize), cursor.ordinal);
                     if context.pax_values_owner != Some(owner) {
+                        context.pax_values_owner = Some(owner);
+                        context.pax_value_extents.fill(None);
+                    }
+                    {
                         let ScanContext {
                             member_blocks,
                             member_raw_blocks,
                             pax_column_buf,
                             pax_values_buf,
                             pax_value_extents,
-                            pax_values_owner,
                             pax_row_buf,
                             ..
                         } = &mut *context;
                         let mut blocks = spill.relation_blocks_for(relation.persistence);
-                        let mut at = 0usize;
+                        // Completed columns belong to this immutable block, not
+                        // to a walk attempt. Keep them when a later GET yields.
+                        let mut at = pax_value_extents
+                            .iter()
+                            .flatten()
+                            .map(|(_, end)| *end)
+                            .max()
+                            .unwrap_or(0);
                         let mut loaded_container = None;
-                        pax_value_extents.fill(None);
                         for column in 0..layout.columns() {
-                            if decoded_columns.is_some_and(|columns| !columns[column]) {
+                            if decoded_columns.is_some_and(|columns| !columns[column])
+                                || pax_value_extents[column].is_some()
+                            {
                                 continue;
                             }
                             let reference = layout
@@ -29459,7 +29466,6 @@ impl Storage {
                             pax_value_extents[column] = Some((at, end));
                             at = end;
                         }
-                        *pax_values_owner = Some(owner);
                         let _ = (member_raw_blocks, pax_row_buf);
                     }
                     let encoded_len = {

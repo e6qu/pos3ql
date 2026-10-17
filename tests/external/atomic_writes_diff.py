@@ -267,7 +267,11 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
             writer.execute(f"SELECT id, note FROM {schema}.warm_orders ORDER BY id").fetchall()
         except BaseException:
             with gate.lock:
-                print(json.dumps({"warm_get_counts": gate.get_counts}), flush=True)
+                print(json.dumps({"warm_get_counts": gate.get_counts,
+                    "warm_blocks": {path.name: {"header": path.read_bytes()[:32].hex(),
+                        "has_order": b"warm one" in path.read_bytes(),
+                        "has_invoice": b"cold ten" in path.read_bytes()}
+                        for path in blocks.iterdir() if path.is_file()}}), flush=True)
             raise
         writer.execute(f"SELECT note FROM {schema}.warm_orders WHERE id = 1").fetchall()
         head = object_root / "atomic-write-test" / prefix / "commit-head"

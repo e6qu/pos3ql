@@ -68,7 +68,7 @@ use row_versions::{
 };
 use row_walks::{RowScanIds, RowWalkPool};
 use spill_generations::{
-    CapturedSpillRoots, QueryRootLease, QueryRootPool, SpillGenerationRoster,
+    CapturedSpillRoots, QueryRootLease, QueryRootPool, RetainedIndexFile, SpillGenerationRoster,
     SpillGenerationSnapshot, SpillRelation, SpillRootRegistry, SpilledRowRead, SpilledRowState,
 };
 
@@ -3533,6 +3533,22 @@ impl ExtendedStatisticsDef {
 pub(crate) struct Enforcer {
     cache: ValueIndexLease,
     metadata: EnforcerMetadata,
+}
+
+enum ValueIndexSelection<'columns> {
+    Binding(usize),
+    Columns(&'columns [u16]),
+}
+
+struct SelectedValueIndex {
+    binding: usize,
+    files: RetainedIndexFile,
+}
+
+impl SelectedValueIndex {
+    fn handle(&self) -> crate::store::ValueIndexHandle {
+        self.files.handle()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -17769,6 +17785,17 @@ impl Storage {
         SpillRootRegistry::capacity(config)
     }
 
+    pub(crate) fn retained_index_file_capacity(config: &Config) -> usize {
+        SpillRootRegistry::index_capacity(config)
+    }
+
+    pub(crate) fn copy_retained_index_roots(
+        &self,
+        output: &mut Vec<crate::store::BlockId>,
+    ) -> Result<(), SqlError> {
+        self.spill_roots.copy_index_roots(output)
+    }
+
     pub(crate) fn copy_retained_spill_roots(
         &self,
         durable: bool,
@@ -17777,10 +17804,10 @@ impl Storage {
         self.spill_roots.copy_roots(durable, output)
     }
 
-    pub(crate) fn retained_sst_reclamation_pending(&self) -> bool {
+    pub(crate) fn retained_file_reclamation_pending(&self) -> bool {
         self.spill_roots.reclamation_pending()
     }
-    pub(crate) fn take_retained_sst_reclamation(&self) -> bool {
+    pub(crate) fn take_retained_file_reclamation(&self) -> bool {
         self.spill_roots.take_reclamation_pending()
     }
 
@@ -32336,6 +32363,52 @@ impl Storage {
         self.probe_value_binding(table_index, i, hash, visit)
     }
 
+    fn select_value_index(
+        &self,
+        table_index: usize,
+        selection: ValueIndexSelection<'_>,
+    ) -> Result<Option<SelectedValueIndex>, SqlError> {
+        if self.spill.is_none() {
+            return Ok(None);
+        }
+        let publication = self.tables[table_index].publication();
+        let binding = match selection {
+            ValueIndexSelection::Binding(binding) => {
+                if binding >= publication.n_enforcers {
+                    return Ok(None);
+                }
+                binding
+            }
+            ValueIndexSelection::Columns(columns) => {
+                let Some(binding) = publication.enforcers[..publication.n_enforcers]
+                    .iter()
+                    .position(|enforcer| {
+                        enforcer.as_ref().is_some_and(|enforcer| {
+                            enforcer.index_created_at.is_none()
+                                && enforcer.columns() == columns
+                                && enforcer.durable.is_some()
+                        })
+                    })
+                else {
+                    return Ok(None);
+                };
+                binding
+            }
+        };
+        let Some(handle) = publication.enforcers[binding]
+            .as_ref()
+            .and_then(|enforcer| enforcer.durable)
+        else {
+            return Ok(None);
+        };
+        if self.commit_snapshot() < handle.published_lsn {
+            return Ok(None);
+        }
+        // The selected handle becomes owned before publication can replace it.
+        let files = self.spill_roots.retain_index_file(handle)?;
+        Ok(Some(SelectedValueIndex { binding, files }))
+    }
+
     pub(crate) fn probe_value_binding(
         &self,
         table_index: usize,
@@ -32357,13 +32430,13 @@ impl Storage {
                 return Ok(true);
             }
             drop(index);
-            let Some(handle) = e.durable else {
+            drop(e);
+            let Some(input) =
+                self.select_value_index(table_index, ValueIndexSelection::Binding(i))?
+            else {
                 return Ok(false);
             };
-            drop(e);
-            if self.commit_snapshot() < handle.published_lsn {
-                return Ok(false);
-            }
+            let handle = input.handle();
             let Some(spill) = &self.spill else {
                 return Ok(false);
             };
@@ -32386,12 +32459,12 @@ impl Storage {
                 let mut callback_error = None;
                 crate::store::ValueIndexReader::over_retained(roster, data)
                     .probe(
-                        &mut *spill
-                            .blocks
-                            .as_ref()
-                            .expect("value-index generations are durable")
-                            .lock()
-                            .expect("block store lock poisoned"),
+                        &mut crate::store::SharedBlockStore::new(
+                            spill
+                                .blocks
+                                .as_ref()
+                                .expect("value-index generations are durable"),
+                        ),
                         &handle,
                         hash,
                         |rowid, _, key| {
@@ -32759,6 +32832,22 @@ impl Storage {
             .is_some_and(|enforcer| enforcer.cache.read().is_complete_at(self.commit_snapshot()))
     }
 
+    /// An unrelated commit cannot invalidate this table's selected index view.
+    /// A newer key, predicate, payload or saved generation still excludes it.
+    pub(crate) fn value_indexes_match_snapshot(&self, table_index: usize) -> bool {
+        let snapshot = self.commit_snapshot();
+        let publication = self.tables[table_index].publication();
+        publication.enforcers[..publication.n_enforcers]
+            .iter()
+            .flatten()
+            .all(|enforcer| {
+                enforcer.durable_dirty_lsn <= snapshot
+                    && enforcer
+                        .durable
+                        .is_none_or(|handle| handle.published_lsn <= snapshot)
+            })
+    }
+
     pub(crate) fn value_binding_probe_complete(&self, table_index: usize, binding: usize) -> bool {
         self.tables[table_index]
             .enforcer(binding)
@@ -32971,16 +33060,13 @@ impl Storage {
         mut visit: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
-        let Some((binding, handle)) = (0..table.enforcer_count()).find_map(|binding| {
-            let enforcer = table.enforcer(binding).expect("enforcer");
-            (enforcer.index_created_at.is_none() && enforcer.columns() == columns)
-                .then_some((binding, enforcer.durable?))
-        }) else {
+        let Some(input) =
+            self.select_value_index(table_index, ValueIndexSelection::Columns(columns))?
+        else {
             return Ok(false);
         };
-        if self.commit_snapshot() < handle.published_lsn {
-            return Ok(false);
-        }
+        let binding = input.binding;
+        let handle = input.handle();
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
@@ -33002,12 +33088,12 @@ impl Storage {
             let mut callback_error = Ok(());
             crate::store::ValueIndexReader::over_retained(roster, data)
                 .walk(
-                    &mut *spill
-                        .blocks
-                        .as_ref()
-                        .expect("value-index generations are durable")
-                        .lock()
-                        .expect("block store lock poisoned"),
+                    &mut crate::store::SharedBlockStore::new(
+                        spill
+                            .blocks
+                            .as_ref()
+                            .expect("value-index generations are durable"),
+                    ),
                     &handle,
                     |_, rowid, _, key| {
                         if callback_error.is_ok()
@@ -33089,15 +33175,12 @@ impl Storage {
         mut visit: impl FnMut(u64, u64, &[u8], &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
-        let Some(handle) = table
-            .enforcer(binding)
-            .and_then(|enforcer| enforcer.durable)
+        let Some(input) =
+            self.select_value_index(table_index, ValueIndexSelection::Binding(binding))?
         else {
             return Ok(false);
         };
-        if self.commit_snapshot() < handle.published_lsn {
-            return Ok(false);
-        }
+        let handle = input.handle();
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
@@ -33119,12 +33202,12 @@ impl Storage {
             let callback_error = std::cell::RefCell::new(None);
             crate::store::ValueIndexReader::over_retained(roster, data)
                 .range_covering_with_bounds(
-                    &mut *spill
-                        .blocks
-                        .as_ref()
-                        .expect("value-index generations are durable")
-                        .lock()
-                        .expect("block store lock poisoned"),
+                    &mut crate::store::SharedBlockStore::new(
+                        spill
+                            .blocks
+                            .as_ref()
+                            .expect("value-index generations are durable"),
+                    ),
                     &handle,
                     intersects,
                     |key| match classify(key) {
@@ -33190,15 +33273,12 @@ impl Storage {
         ) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
-        let Some(handle) = table
-            .enforcer(binding)
-            .and_then(|enforcer| enforcer.durable)
+        let Some(input) =
+            self.select_value_index(table_index, ValueIndexSelection::Binding(binding))?
         else {
             return Ok(false);
         };
-        if self.commit_snapshot() < handle.published_lsn {
-            return Ok(false);
-        }
+        let handle = input.handle();
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
@@ -33245,12 +33325,12 @@ impl Storage {
             let ValueIndexScratch { roster, data, .. } = &mut *scratch;
             crate::store::ValueIndexReader::over_retained(roster, data)
                 .ranked_covering(
-                    &mut *spill
-                        .blocks
-                        .as_ref()
-                        .expect("value-index generations are durable")
-                        .lock()
-                        .expect("block store lock poisoned"),
+                    &mut crate::store::SharedBlockStore::new(
+                        spill
+                            .blocks
+                            .as_ref()
+                            .expect("value-index generations are durable"),
+                    ),
                     &handle,
                     intersects,
                     priority,
@@ -33274,6 +33354,8 @@ impl Storage {
     /// Supplies the exact key and INCLUDE payload retained by a ranked
     /// candidate. Immutable candidates are found in their remembered leaf;
     /// resident candidates are regenerated from their committed row image.
+    /// The ranking walk retains the immutable generation for this statement,
+    /// including leaves consumed after its selected binding is replaced.
     pub(crate) fn read_ranked_value_binding_entry(
         &self,
         table_index: usize,
@@ -33307,12 +33389,12 @@ impl Storage {
             let ValueIndexScratch { roster, data, .. } = &mut *scratch;
             return crate::store::ValueIndexReader::over_retained(roster, data)
                 .leaf_entry(
-                    &mut *spill
-                        .blocks
-                        .as_ref()
-                        .expect("value-index generations are durable")
-                        .lock()
-                        .expect("block store lock poisoned"),
+                    &mut crate::store::SharedBlockStore::new(
+                        spill
+                            .blocks
+                            .as_ref()
+                            .expect("value-index generations are durable"),
+                    ),
                     id,
                     covering,
                     rowid,
@@ -33361,15 +33443,12 @@ impl Storage {
         else {
             return Ok(false);
         };
-        let Some(handle) = table
-            .enforcer(binding)
-            .and_then(|enforcer| enforcer.durable)
+        let Some(input) =
+            self.select_value_index(table_index, ValueIndexSelection::Binding(binding))?
         else {
             return Ok(false);
         };
-        if self.commit_snapshot() < handle.published_lsn {
-            return Ok(false);
-        }
+        let handle = input.handle();
         let Some(spill) = &self.spill else {
             return Ok(false);
         };
@@ -33414,12 +33493,12 @@ impl Storage {
             let callback_error = std::cell::RefCell::new(None);
             crate::store::ValueIndexReader::over_retained(roster, data)
                 .range_covering_with_bounds(
-                    &mut *spill
-                        .blocks
-                        .as_ref()
-                        .expect("value-index generations are durable")
-                        .lock()
-                        .expect("block store lock poisoned"),
+                    &mut crate::store::SharedBlockStore::new(
+                        spill
+                            .blocks
+                            .as_ref()
+                            .expect("value-index generations are durable"),
+                    ),
                     &handle,
                     |position, summary| {
                         if position != navigation.position {

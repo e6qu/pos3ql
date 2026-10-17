@@ -670,8 +670,10 @@ readers. Garbage collection copies retained root references before object I/O.
 Releasing a root used by a durable garbage pass schedules more maintenance even
 without another write. Active backups also retain their reachable objects.
 
-A paused report retains its selected saved row files after its scans and
-statement arena are released. For example, nested order and invoice reads can
+A paused report retains its selected saved row and index files after its scans
+and statement arena are released. For example, a report looking up an invoice
+through an index keeps that index's files until the report finishes, even if a
+later checkpoint replaces the saved index. Nested order and invoice reads can
 finish their individual walks while the outer report still needs those files.
 Resuming adds any newly selected files to the same statement owner. Completion,
 SQL errors, cancellation, rollback and timeout release it; an executing scope
@@ -682,14 +684,33 @@ Checkpoint publication and merges still wait for pending downloads.
 
 File owners use the same 1,024 slots per query workspace as statement snapshots,
 independent of connection count and the separate 64-slot point-source pool.
-Each shared unique-row-file slot reserves one membership bit per statement slot
-at startup; repeated aliases share that bit. SQLSTATE `54000` reports
+Each shared row or index file slot reserves one membership bit per statement slot
+at startup; repeated aliases share that bit. Index files have an independent
+reservation of `2 * max_value_indexes` distinct roster roots; metadata changes
+that name the same immutable graph share a slot. Its full selected handle keeps
+its own entry count and publication position. Capture pins the graph under table
+publication ownership, then releases that ownership before I/O. Persistent index
+callbacks also release the block-store lock before nested reads. SQLSTATE `54000` reports
 "statement file owners are exhausted (N)", "statement file identity exhausted",
 "statement file references exhausted" or "statement file scope nesting exhausted".
 File-owner exhaustion fails before selecting or registering a snapshot; it does
 not grow memory or partly pin another file.
 A snapshot used with another storage instance returns `XX000`, "statement
 snapshot belongs to another storage instance", before selecting its file context.
+Index capacity errors are "retained index files exceed the startup capacity (N)",
+"retained index file reader count exhausted" and "retained index file snapshot
+exceeds garbage collection scratch (N)". Row-file capacity remains independent.
+Garbage collection walks retained, current and backup index graphs through the
+same storage interface. Its startup-reserved membership map counts each distinct
+block once against `checkpoint_live_blocks`, including shared backup blocks;
+real exhaustion returns `54000` before deletion. Invalid rosters return `58030`.
+The membership map is charged separately from the existing checkpoint workspace.
+An unrelated commit does not invalidate a table's index view when a read resumes.
+For an older snapshot, eligibility checks each binding's last change and
+saved-generation position. Newer key, predicate or included-value changes
+still require the ordinary historical row scan. For example, an order update
+does not make a paused invoice lookup abandon its required index download;
+a missing response still returns `58030`.
 
 ### What publication may change
 

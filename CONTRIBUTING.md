@@ -126,7 +126,7 @@ smallest reproducer. Fix the slow work, deadlock, resource contention, or worklo
 partitioning; do not increase timeout durations. A job waiting without an assigned
 runner is a scheduling delay, not evidence of an execution timeout.
 
-CI also exercises shared heap publication and saved-row-file ownership with
+CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.
 
 PostgreSQL service and client containers use Docker's official image from

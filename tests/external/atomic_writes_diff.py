@@ -82,7 +82,7 @@ def result(connection, statement):
     return {"columns": columns, "rows": rows, "tag": cursor.statusmessage}
 
 
-def setup(connection, schema):
+def setup(connection, schema, read_kind):
     statements = [
         f"DROP SCHEMA IF EXISTS {schema} CASCADE",
         f"CREATE SCHEMA {schema}",
@@ -111,6 +111,10 @@ def setup(connection, schema):
     ]
     for statement in statements:
         connection.execute(statement)
+    if read_kind == "index":
+        connection.execute(f"INSERT INTO {schema}.cold_invoices "
+            "SELECT i, 'other invoice' FROM generate_series(13, 137) AS i")
+        connection.execute(f"CREATE INDEX covered_invoice ON {schema}.cold_invoices(id) INCLUDE (note)")
 
 
 def current_state(connection, schema):
@@ -164,7 +168,7 @@ def exercise(connection, schema, trace=False):
 
 
 class Node:
-    def __init__(self, binary, directory, port, endpoint, prefix):
+    def __init__(self, binary, directory, port, endpoint, prefix, read_kind):
         self.binary = binary
         self.directory, self.port = directory, port
         self.data = directory / "data"
@@ -186,7 +190,8 @@ class Node:
             # the warm order's index and data evict that cached invoice block.
             "block_cache_bytes": "512KiB", "disk_cache_bytes": 0,
             "max_tables": 8, "table_rows": 128, "txn_rows": 256,
-            "max_ddl_per_transaction": 16, "max_value_indexes": 8, "value_index_rows": 256,
+            "max_ddl_per_transaction": 16, "max_value_indexes": 8,
+            "value_index_rows": 1 if read_kind == "index" else 256,
             "max_views": 4, "max_materialized_views": 4, "max_routines": 8,
             "max_domains": 4, "max_enums": 4, "max_composites": 4, "max_triggers": 8,
             "max_prepared_transactions": 2, "max_subscriptions": 1,
@@ -254,21 +259,28 @@ def trace_reads(gate, blocks):
         "required_invoice_object": target}), flush=True)
 
 
-def scenario(reference, node, gate, object_root, prefix, missing, schema):
+def scenario(reference, node, gate, object_root, prefix, missing, schema, read_kind):
+    predicate = " WHERE c.id = 10" if read_kind == "index" else ""
     report = (f"SELECT c.id, c.note, (SELECT note FROM {schema}.warm_orders WHERE id = 1) "
-        f"FROM {schema}.cold_invoices AS c ORDER BY c.id")
-    progress("scenario:setup:" + ("missing" if missing else "success"))
-    setup(reference, schema)
+        f"FROM {schema}.cold_invoices AS c{predicate} ORDER BY c.id")
+    progress(f"scenario:setup:{read_kind}:" + ("missing" if missing else "success"))
+    setup(reference, schema, read_kind)
     expected_report = result(reference, report)
     expected_write = exercise(reference, schema)
     node.start()
     with node.connect() as connection:
-        setup(connection, schema)
+        setup(connection, schema, read_kind)
         connection.execute("CHECKPOINT")
     node.stop()
     blocks = object_root / "atomic-write-test" / prefix / "blocks"
-    candidates = [path for path in blocks.iterdir()
-        if path.is_file() and b"cold ten" in path.read_bytes()]
+    candidates = []
+    for path in blocks.iterdir():
+        if not path.is_file():
+            continue
+        body = path.read_bytes()
+        # ValueIndexData is format tag 11; the row case selects the saved row.
+        if b"cold ten" in body and (len(body) > 4 and body[4] == 11) == (read_kind == "index"):
+            candidates.append(path)
     assert len(candidates) == 1, "fixture needs one object containing its required cold invoice value"
     target = candidates[0]
     target_bytes = target.read_bytes()
@@ -277,6 +289,10 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
     node.wipe_cache()
     node.start()
     with node.connect(bounded=True) as writer, node.connect(bounded=True) as reader:
+        if read_kind == "index":
+            plan = reader.execute("EXPLAIN " + report).fetchall()
+            assert any("Index Only Scan" in row[0] for row in plan), plan
+            print(json.dumps({"read_kind": read_kind, "report_plan": plan}), flush=True)
         progress("scenario:warm")
         try:
             writer.execute(f"SELECT id, note FROM {schema}.warm_orders ORDER BY id").fetchall()
@@ -337,6 +353,7 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
         assert recovered == expected_write["state"], (recovered, expected_write["state"])
     node.stop()
     print(json.dumps({"case": "missing" if missing else "success", "held_key": gate.key,
+        "read_kind": read_kind,
         "postgresql_matches": True, "snapshot_preserved": not missing,
         "durable_ack_before_release": True, "cold_recovery": True,
         "commit_head_sha256": hashlib.sha256(after).hexdigest(),
@@ -393,19 +410,21 @@ def main():
                 assert 180000 <= version < 190000, f"PostgreSQL 18 is required, got {version}"
                 print(json.dumps({"reference_version": version,
                     "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest()}), flush=True)
-                for missing in [False, True]:
-                    case = "missing" if missing else "success"
-                    prefix = f"atomic-{case}/"
-                    schema = f"atomic_io_{owner}_{case}"
-                    node = Node(args.binary, args.work / case, port,
-                        f"127.0.0.1:{server.server_port}", prefix)
+                for read_kind, missing in [(kind, missing)
+                        for kind in ["row", "index"] for missing in [False, True]]:
+                    case = ("missing" if missing else "success")
+                    name = f"{read_kind}-{case}"
+                    prefix = f"atomic-{name}/"
+                    schema = f"atomic_io_{owner}_{read_kind}_{case}"
+                    node = Node(args.binary, args.work / name, port,
+                        f"127.0.0.1:{server.server_port}", prefix, read_kind)
                     with ExitStack() as case_resources:
                         case_resources.callback(reference.execute, f"DROP SCHEMA IF EXISTS {schema} CASCADE")
                         case_resources.callback(node.stop)
                         case_resources.callback(gate.disarm)
                         case_resources.callback(gate.release.set)
-                        scenario(reference, node, gate, object_root, prefix, missing, schema)
-            print("ok: atomic writes match PostgreSQL during held GETs; both cold recoveries passed", flush=True)
+                        scenario(reference, node, gate, object_root, prefix, missing, schema, read_kind)
+            print("ok: atomic writes match PostgreSQL during held row and index GETs; all cold recoveries passed", flush=True)
         except BaseException:
             if node is not None and node.log_path.exists():
                 print("owned server log (last 60 lines):", flush=True)

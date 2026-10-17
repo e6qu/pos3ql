@@ -531,9 +531,92 @@ pub(crate) fn walk_value_roster(
     Ok(true)
 }
 
+/// Startup-owned verified bytes. Mutable scratch access invalidates their identity
+/// before any overwrite, including an operation that later returns NotReady.
+pub(crate) struct RetainedBlockBuffer {
+    bytes: Box<[u8]>,
+    loaded: Option<(BlockId, usize, BlockType)>,
+}
+
+impl RetainedBlockBuffer {
+    pub(crate) fn new() -> Self {
+        Self {
+            bytes: vec![0; MAX_PAYLOAD].into_boxed_slice(),
+            loaded: None,
+        }
+    }
+
+    fn load(
+        &mut self,
+        store: &mut dyn BlockStore,
+        id: &BlockId,
+    ) -> Result<(usize, BlockType), StoreError> {
+        if let Some((loaded, len, kind)) = self.loaded
+            && loaded == *id
+        {
+            return Ok((len, kind));
+        }
+        self.loaded = None;
+        let (len, kind) = store.get(id, &mut self.bytes)?;
+        self.loaded = Some((*id, len, kind));
+        Ok((len, kind))
+    }
+}
+
+impl core::ops::Deref for RetainedBlockBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl core::ops::DerefMut for RetainedBlockBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.loaded = None;
+        &mut self.bytes
+    }
+}
+
+enum ValueReadBuffer<'a> {
+    Borrowed(&'a mut [u8]),
+    Retained(&'a mut RetainedBlockBuffer),
+}
+
+impl ValueReadBuffer<'_> {
+    fn load(
+        &mut self,
+        store: &mut dyn BlockStore,
+        id: &BlockId,
+    ) -> Result<(usize, BlockType), StoreError> {
+        match self {
+            Self::Borrowed(bytes) => store.get(id, bytes),
+            Self::Retained(buffer) => buffer.load(store, id),
+        }
+    }
+}
+
+impl core::ops::Deref for ValueReadBuffer<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Retained(buffer) => buffer,
+        }
+    }
+}
+
+impl core::ops::DerefMut for ValueReadBuffer<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Retained(buffer) => buffer,
+        }
+    }
+}
+
 pub(crate) struct ValueIndexReader<'a> {
-    roster: &'a mut [u8],
-    data: &'a mut [u8],
+    roster: ValueReadBuffer<'a>,
+    data: ValueReadBuffer<'a>,
 }
 
 pub(crate) enum ValueIndexStreamStep {
@@ -782,7 +865,20 @@ impl ValueIndexStream {
 
 impl<'a> ValueIndexReader<'a> {
     pub(crate) fn over(roster: &'a mut [u8], data: &'a mut [u8]) -> Self {
-        Self { roster, data }
+        Self {
+            roster: ValueReadBuffer::Borrowed(roster),
+            data: ValueReadBuffer::Borrowed(data),
+        }
+    }
+
+    pub(crate) fn over_retained(
+        roster: &'a mut RetainedBlockBuffer,
+        data: &'a mut RetainedBlockBuffer,
+    ) -> Self {
+        Self {
+            roster: ValueReadBuffer::Retained(roster),
+            data: ValueReadBuffer::Retained(data),
+        }
     }
 
     /// Visits every entry with `hash`. Runs may contain stale row versions;
@@ -861,7 +957,7 @@ impl<'a> ValueIndexReader<'a> {
         mut classify: impl FnMut(&[u8]) -> ValueIndexPosition,
         mut visit: impl FnMut(u64, u64, u64, &[u8], &[u8]),
     ) -> Result<(), ValueIndexError> {
-        let first_roster = store.get(&handle.roster, self.roster)?;
+        let first_roster = self.roster.load(store, &handle.roster)?;
         let root_kind = first_roster.1;
         if matches!(
             root_kind,
@@ -888,7 +984,7 @@ impl<'a> ValueIndexReader<'a> {
             let (roster_len, kind) = if roster_count == 1 {
                 first_roster
             } else {
-                store.get(&roster, self.roster)?
+                self.roster.load(store, &roster)?
             };
             if kind != BlockType::ValueIndexRoster || roster_len < ROSTER_HEADER {
                 return Err(ValueIndexError::Corrupt);
@@ -905,7 +1001,7 @@ impl<'a> ValueIndexReader<'a> {
                 }) {
                     continue;
                 }
-                let (data_len, kind) = store.get(&id, self.data)?;
+                let (data_len, kind) = self.data.load(store, &id)?;
                 if kind != BlockType::ValueIndexData {
                     return Err(ValueIndexError::Corrupt);
                 }
@@ -938,19 +1034,19 @@ impl<'a> ValueIndexReader<'a> {
         mut priority: impl FnMut(u8, NavigationSummary) -> f64,
         mut visit: impl FnMut(BlockId, bool, u64, u64, u64, &[u8], &[u8]),
     ) -> Result<bool, ValueIndexError> {
-        let (_, root_kind) = store.get(&handle.roster, self.roster)?;
+        let (_, root_kind) = self.roster.load(store, &handle.roster)?;
         if root_kind != BlockType::ValueIndexNavigationV1 {
             return Ok(false);
         }
         let mut cursor = NavigationCursor::new(handle.roster, handle.entries);
         while let Some((id, expected_entries, covering)) = cursor.next_ranked(
             store,
-            self.roster,
+            &mut self.roster,
             &mut intersects,
             &mut |_| true,
             &mut priority,
         )? {
-            let (len, kind) = store.get(&id, self.data)?;
+            let (len, kind) = self.data.load(store, &id)?;
             if kind != BlockType::ValueIndexData {
                 return Err(ValueIndexError::Corrupt);
             }
@@ -983,7 +1079,7 @@ impl<'a> ValueIndexReader<'a> {
         lsn: u64,
         mut visit: impl FnMut(&[u8], &[u8]),
     ) -> Result<bool, ValueIndexError> {
-        let (len, kind) = store.get(&id, self.data)?;
+        let (len, kind) = self.data.load(store, &id)?;
         if kind != BlockType::ValueIndexData {
             return Err(ValueIndexError::Corrupt);
         }
@@ -1016,7 +1112,7 @@ impl<'a> ValueIndexReader<'a> {
         target_hash: Option<u64>,
         mut visit: impl FnMut(u64, u64, u64, &[u8], &[u8]),
     ) -> Result<(), ValueIndexError> {
-        let first_roster = store.get(&handle.roster, self.roster)?;
+        let first_roster = self.roster.load(store, &handle.roster)?;
         let root_kind = first_roster.1;
         if matches!(
             root_kind,
@@ -1044,7 +1140,7 @@ impl<'a> ValueIndexReader<'a> {
             let (roster_len, kind) = if roster_count == 1 {
                 first_roster
             } else {
-                store.get(&roster, self.roster)?
+                self.roster.load(store, &roster)?
             };
             if kind != BlockType::ValueIndexRoster || roster_len < 4 {
                 return Err(ValueIndexError::Corrupt);
@@ -1061,7 +1157,7 @@ impl<'a> ValueIndexReader<'a> {
                 {
                     continue;
                 }
-                let (data_len, kind) = store.get(&id, self.data)?;
+                let (data_len, kind) = self.data.load(store, &id)?;
                 if kind != BlockType::ValueIndexData {
                     return Err(ValueIndexError::Corrupt);
                 }
@@ -1095,9 +1191,9 @@ impl<'a> ValueIndexReader<'a> {
     ) -> Result<(), ValueIndexError> {
         let mut cursor = NavigationCursor::new(handle.roster, handle.entries);
         while let Some((id, expected_entries, covering)) =
-            cursor.next(store, self.roster, &mut intersects, &mut |_| true)?
+            cursor.next(store, &mut self.roster, &mut intersects, &mut |_| true)?
         {
-            let (len, kind) = store.get(&id, self.data)?;
+            let (len, kind) = self.data.load(store, &id)?;
             if kind != BlockType::ValueIndexData {
                 return Err(ValueIndexError::Corrupt);
             }

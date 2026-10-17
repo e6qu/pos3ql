@@ -14214,8 +14214,8 @@ struct SpillScratch {
 }
 
 struct ValueIndexScratch {
-    roster: Box<[u8]>,
-    data: Box<[u8]>,
+    roster: crate::store::RetainedBlockBuffer,
+    data: crate::store::RetainedBlockBuffer,
 }
 
 fn try_mutex_pool<'a, T>(
@@ -14332,8 +14332,8 @@ impl SpillReader {
         };
         let value = || {
             std::sync::Mutex::new(ValueIndexScratch {
-                roster: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
-                data: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+                roster: crate::store::RetainedBlockBuffer::new(),
+                data: crate::store::RetainedBlockBuffer::new(),
             })
         };
         let mut scan_contexts = Vec::with_capacity(SCAN_CONTEXTS);
@@ -32210,7 +32210,7 @@ impl Storage {
             {
                 let ValueIndexScratch { roster, data } = scratch;
                 let mut callback_error = None;
-                crate::store::ValueIndexReader::over(roster, data)
+                crate::store::ValueIndexReader::over_retained(roster, data)
                     .probe(
                         &mut *spill
                             .blocks
@@ -32825,7 +32825,7 @@ impl Storage {
         {
             let ValueIndexScratch { roster, data, .. } = &mut *scratch;
             let mut callback_error = Ok(());
-            crate::store::ValueIndexReader::over(roster, data)
+            crate::store::ValueIndexReader::over_retained(roster, data)
                 .walk(
                     &mut *spill
                         .blocks
@@ -32941,7 +32941,7 @@ impl Storage {
         {
             let ValueIndexScratch { roster, data, .. } = &mut *scratch;
             let callback_error = std::cell::RefCell::new(None);
-            crate::store::ValueIndexReader::over(roster, data)
+            crate::store::ValueIndexReader::over_retained(roster, data)
                 .range_covering_with_bounds(
                     &mut *spill
                         .blocks
@@ -33066,7 +33066,7 @@ impl Storage {
         let callback_error = std::cell::RefCell::new(None);
         let complete = {
             let ValueIndexScratch { roster, data, .. } = &mut *scratch;
-            crate::store::ValueIndexReader::over(roster, data)
+            crate::store::ValueIndexReader::over_retained(roster, data)
                 .ranked_covering(
                     &mut *spill
                         .blocks
@@ -33123,7 +33123,7 @@ impl Storage {
         };
         if let Some((id, covering)) = source {
             let ValueIndexScratch { roster, data, .. } = &mut *scratch;
-            return crate::store::ValueIndexReader::over(roster, data)
+            return crate::store::ValueIndexReader::over_retained(roster, data)
                 .leaf_entry(
                     &mut *spill
                         .blocks
@@ -33229,7 +33229,7 @@ impl Storage {
         {
             let ValueIndexScratch { roster, data, .. } = &mut *scratch;
             let callback_error = std::cell::RefCell::new(None);
-            crate::store::ValueIndexReader::over(roster, data)
+            crate::store::ValueIndexReader::over_retained(roster, data)
                 .range_covering_with_bounds(
                     &mut *spill
                         .blocks

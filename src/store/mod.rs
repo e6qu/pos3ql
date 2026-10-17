@@ -95,9 +95,9 @@ pub(crate) use sst::{
 pub(crate) use tiered::TieredStore;
 pub(crate) use tiered::{StackPlan, build as build_tiers};
 pub(crate) use value::{
-    VALUE_INDEX_KEY_MAX, VALUE_INDEX_TUPLE_MAX, ValueIndexError, ValueIndexHandle,
-    ValueIndexPosition, ValueIndexReader, ValueIndexStream, ValueIndexStreamStep, ValueIndexWriter,
-    walk_value_roster,
+    RetainedBlockBuffer, VALUE_INDEX_KEY_MAX, VALUE_INDEX_TUPLE_MAX, ValueIndexError,
+    ValueIndexHandle, ValueIndexPosition, ValueIndexReader, ValueIndexStream, ValueIndexStreamStep,
+    ValueIndexWriter, walk_value_roster,
 };
 
 use crate::wal::crc32c::crc32c;

@@ -639,7 +639,8 @@ fn delete_pages(
             break;
         }
         for &rowid in &found[..found_count] {
-            let prior = storage.write_pending(table, rowid, txn.txid, txn.command_id(), None)?;
+            let prior =
+                storage.write_pending_image(table, rowid, txn.txid, txn.command_id(), None)?;
             if let Err(error) = txn.touch(table as u32, rowid, prior) {
                 storage.restore_pending(table, rowid, txn.txid, prior);
                 return Err(error);
@@ -709,9 +710,10 @@ fn write_page(
         Some(rowid) => rowid,
         None => storage.next_rowid()?,
     };
-    let loc = storage.heap.append_row(&values)?;
+    let image = storage.heap.append_row_image(&values)?;
     let table = storage.large_object_page_table();
-    let prior = storage.write_pending(table, rowid, txn.txid, txn.command_id(), Some(loc))?;
+    let prior =
+        storage.write_pending_image(table, rowid, txn.txid, txn.command_id(), Some(image))?;
     if let Err(error) = txn.touch(table as u32, rowid, prior) {
         storage.restore_pending(table, rowid, txn.txid, prior);
         return Err(error);

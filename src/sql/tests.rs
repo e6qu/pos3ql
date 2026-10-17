@@ -1302,10 +1302,9 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
 
     workspaces.select(QueryWorkspaceId::from_index(0));
     dml_workspaces
-        .push(exec::PhysicalRow::Local {
+        .push(exec::PhysicalRow::Foreign {
             table_index: 1,
-            rowid: 11,
-            home: crate::storage::RowReadSource::StagedHeap(crate::storage::RowLoc::EMPTY),
+            tuple_id: crate::sql::foreign::RemoteTupleId::parse(b"(0,11)").unwrap(),
         })
         .unwrap();
     assert_eq!(dml_workspaces.len(), 1);
@@ -82096,7 +82095,7 @@ fn alter_rewrite_sources_keep_selected_pending_and_saved_bytes_after_rollback_an
             let exec::PhysicalRow::Local {
                 table_index,
                 rowid,
-                home: crate::storage::RowReadSource::Snapshot(snapshot),
+                home: snapshot,
             } = row
             else {
                 panic!("stored rewrite input");
@@ -83570,4 +83569,108 @@ fn type_reference_moves_sequence_programs_use_engine_execution() {
             "{body}"
         );
     }
+}
+
+fn assert_owned_rewrite_inputs_released(engine: &mut Engine) {
+    crate::mem::guard::forbid_alloc(|| {
+        for _ in 0..2 {
+            let probe = engine.storage.heap.append_image(b"release probe").unwrap();
+            engine
+                .storage
+                .compact_heap(&mut engine.compact_scratch)
+                .unwrap();
+            drop(probe);
+        }
+    });
+}
+
+#[test]
+fn owned_write_inputs_rewrite_constraint_failure_releases_images_and_allows_retry() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE owned_rewrite_keys(id integer PRIMARY KEY); \
+         INSERT INTO owned_rewrite_keys VALUES (1), (11)",
+    );
+    let failed = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "ALTER TABLE owned_rewrite_keys ALTER COLUMN id TYPE smallint USING (id % 10)::smallint",
+        4 << 20,
+    );
+    assert!(
+        failed.windows(5).any(|part| part == b"23505"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_owned_rewrite_inputs_released(&mut engine);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, pg_typeof(id) FROM owned_rewrite_keys ORDER BY id"
+        )),
+        ["1|integer", "11|integer"]
+    );
+    let retry = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "ALTER TABLE owned_rewrite_keys ALTER COLUMN id TYPE bigint; \
+         SELECT id, pg_typeof(id) FROM owned_rewrite_keys ORDER BY id",
+        4 << 20,
+    );
+    assert!(
+        !message_types(&retry).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&retry)
+    );
+    assert_eq!(data_rows(&retry), ["1|bigint", "11|bigint"]);
+    assert_owned_rewrite_inputs_released(&mut engine);
+}
+
+#[test]
+fn owned_write_inputs_rewrite_undo_exhaustion_releases_images_and_restores_definition() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE owned_rewrite_undo(id integer); \
+         INSERT INTO owned_rewrite_undo VALUES (1), (2)",
+    );
+    let failed = run_with_fixed_memory_and_ddl_capacity(
+        &mut engine,
+        &budget,
+        "ALTER TABLE owned_rewrite_undo ALTER COLUMN id TYPE bigint",
+        4 << 20,
+        0,
+    );
+    assert!(
+        failed.windows(5).any(|part| part == b"54000"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_owned_rewrite_inputs_released(&mut engine);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, pg_typeof(id) FROM owned_rewrite_undo ORDER BY id"
+        )),
+        ["1|integer", "2|integer"]
+    );
+    let retry = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "ALTER TABLE owned_rewrite_undo ALTER COLUMN id TYPE bigint; \
+         SELECT id, pg_typeof(id) FROM owned_rewrite_undo ORDER BY id",
+        4 << 20,
+    );
+    assert!(
+        !message_types(&retry).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&retry)
+    );
+    assert_eq!(data_rows(&retry), ["1|bigint", "2|bigint"]);
+    assert_owned_rewrite_inputs_released(&mut engine);
 }

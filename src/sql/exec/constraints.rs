@@ -2753,7 +2753,7 @@ pub(crate) fn apply_fk_parent_actions(
                         seq_session,
                         depth - 1,
                     )?;
-                    let prior = storage.write_pending(
+                    let prior = storage.write_pending_image(
                         child_index,
                         rowid,
                         txn.txid,
@@ -2863,13 +2863,13 @@ pub(crate) fn apply_fk_parent_actions(
                     )
                 })?;
                 rowenc::encode(new_child, out);
-                let new_loc = storage.heap.append_bytes(out)?;
-                let prior = storage.write_pending(
+                let new_image = storage.heap.append_image(out)?;
+                let prior = storage.write_pending_image(
                     child_index,
                     rowid,
                     txn.txid,
                     txn.command_id(),
-                    Some(new_loc),
+                    Some(new_image),
                 )?;
                 if let Err(e) = txn.touch(child_index as u32, rowid, prior) {
                     storage.restore_pending(child_index, rowid, txn.txid, prior);

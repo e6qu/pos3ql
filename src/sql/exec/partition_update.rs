@@ -41,7 +41,7 @@ pub(super) fn prepare_move<'arena>(
     if !dml_row_available(storage, txn, selected, "updated")? {
         return Ok(false);
     }
-    let prior = storage.write_pending(old_table, rowid, txn.txid, txn.command_id(), None)?;
+    let prior = storage.write_pending_image(old_table, rowid, txn.txid, txn.command_id(), None)?;
     if let Err(error) = txn.touch(old_table as u32, rowid, prior) {
         storage.restore_pending(old_table, rowid, txn.txid, prior);
         return Err(error);

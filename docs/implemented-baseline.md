@@ -683,8 +683,10 @@ representation is unchanged. For example, adding a UNIQUE constraint still
 checks existing and transaction-modified rows; it does not needlessly rewrite
 those rows. Operations that change row representation retain the rewrite path.
 
-Appends release their initialization locks before publishing metadata. A pending
-write retains its input bytes through preparation and retries. If compaction
+Appends return owned row images and release initialization locks before metadata
+publication. SQL writes, foreign-key cascades, large-object pages and prepared
+replay retain those images through preparation and retries. Deletes carry no
+row image. Raw-location pending-write adapters are confined to test fixtures. If compaction
 replaces the heap buffer between preparation and publication, publication
 retries and copies the retained input into the current startup-sized buffer;
 insufficient space returns `54000` without publishing the row. For example, an
@@ -696,6 +698,16 @@ reused table identities and stale heap locations. Heap addresses and relocation
 generations describe caches, not durable row identity. Retained byte copies
 use statement memory. Physical reclamation still requires exclusive table
 metadata, but retained byte readers can continue using the old heap buffer.
+
+Table rewrites retain each transformed image until validation, journaling and
+publication finish. The owner array uses the existing statement arena; its
+scoped destructor releases consumed and unconsumed images after success, an
+error or panic. Per-row scratch rewinds cannot reclaim it. Insufficient owner
+storage returns SQLSTATE 54000, "ALTER rewrite retained inputs exceed the
+statement arena"; increasing the startup statement-memory reservation increases
+this allowance. It does not create a growing pool. For example, a rejected
+type conversion leaves the original table readable and allows a later retry
+to reclaim the heap buffers.
 
 Transaction-wide durable publication, concurrent cache/object I/O and
 maintenance, remaining table rewrites, and execution workers are still open.

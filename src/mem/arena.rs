@@ -2,8 +2,8 @@
 //! happens wholesale via `reset`. Backs per-request state (SQL ASTs,
 //! row scratch) that lives exactly as long as one request.
 //!
-//! Values are restricted to `Copy` because the arena never runs
-//! destructors: `reset` just rewinds the offset.
+//! Ordinary allocations require Copy because reset does not run destructors.
+//! Scoped owned slices release their values before the arena can reset.
 
 use core::cell::Cell;
 use core::fmt;
@@ -175,6 +175,29 @@ impl Arena {
         }
     }
 
+    /// Retains values with destructors until this scoped owner is dropped.
+    /// Tail storage survives front rewinds; reset requires the owner to end.
+    pub(crate) fn alloc_owned_slice_with<T>(
+        &self,
+        len: usize,
+        mut fill: impl FnMut(usize) -> T,
+    ) -> Result<OwnedArenaSlice<'_, T>, ArenaFull> {
+        let layout = Layout::array::<T>(len).map_err(|_| self.full(usize::MAX))?;
+        let entries = self.alloc_raw_tail(layout)?.cast::<T>();
+        let mut owned = OwnedArenaSlice {
+            entries,
+            len: 0,
+            arena: core::marker::PhantomData,
+        };
+        for index in 0..len {
+            // SAFETY: this disjoint tail allocation has room and alignment for
+            // every entry. Publish initialization only after fill succeeds.
+            unsafe { entries.add(index).write(fill(index)) };
+            owned.len += 1;
+        }
+        Ok(owned)
+    }
+
     /// Allocates persistent statement state from the opposite end of the
     /// arena. Front rewinds used for per-row scratch cannot reclaim it.
     #[expect(
@@ -308,6 +331,41 @@ impl Drop for Arena {
         let layout =
             Layout::from_size_align(self.capacity, ARENA_ALIGN).expect("validated at construction");
         unsafe { std::alloc::dealloc(self.base, layout) };
+    }
+}
+
+/// Owns only initialized values; backing storage remains in the fixed arena.
+pub(crate) struct OwnedArenaSlice<'arena, T> {
+    entries: *mut T,
+    len: usize,
+    arena: core::marker::PhantomData<&'arena Arena>,
+}
+
+impl<T> core::ops::Deref for OwnedArenaSlice<'_, T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        // SAFETY: initialization advances len, the arena outlives this owner,
+        // and this borrow cannot outlive the values' scoped owner.
+        unsafe { core::slice::from_raw_parts(self.entries, self.len) }
+    }
+}
+
+impl<T> core::ops::DerefMut for OwnedArenaSlice<'_, T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: the owner is unique and its exclusive borrow excludes access
+        // through any earlier slice returned by Deref or DerefMut.
+        unsafe { core::slice::from_raw_parts_mut(self.entries, self.len) }
+    }
+}
+
+impl<T> Drop for OwnedArenaSlice<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: only initialized entries are included, including when fill
+        // panics. No safe borrow can survive destruction of this owner.
+        unsafe {
+            core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(self.entries, self.len));
+        }
     }
 }
 
@@ -477,6 +535,77 @@ pub fn stable_sort_via<T>(
 
 #[cfg(test)]
 mod tests {
+    struct Counted<'a>(&'a core::cell::Cell<usize>);
+
+    impl Drop for Counted<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn owned_write_inputs_scoped_arena_values_survive_front_rewinds_and_drop_once() {
+        let mut budget = Budget::new(256);
+        let mut arena = Arena::new(&mut budget, "scoped owners", 256).unwrap();
+        let dropped = core::cell::Cell::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            let mark = arena.mark();
+            let mut owners = arena
+                .alloc_owned_slice_with(3, |_| Counted(&dropped))
+                .unwrap();
+            arena.alloc_slice_with(32, |_| 7u8).unwrap();
+            // SAFETY: only the unused front scratch is discarded; owners live
+            // in the separately reserved tail.
+            unsafe { arena.rewind_to(mark) };
+            arena.alloc_slice_with(64, |_| 9u8).unwrap();
+            assert_eq!(owners.len(), 3);
+            owners[1] = Counted(&dropped);
+            assert_eq!(dropped.get(), 1);
+            drop(owners);
+            assert_eq!(dropped.get(), 4);
+        });
+        arena.reset();
+        assert_eq!(arena.used(), 0);
+    }
+
+    #[test]
+    fn owned_write_inputs_scoped_arena_drops_initialized_prefix_after_panic() {
+        let mut budget = Budget::new(256);
+        let arena = Arena::new(&mut budget, "panic owners", 256).unwrap();
+        let dropped = core::cell::Cell::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _owners = arena
+                .alloc_owned_slice_with(4, |index| {
+                    assert_ne!(index, 2, "stop initialization");
+                    Counted(&dropped)
+                })
+                .unwrap();
+        }));
+        assert!(result.is_err());
+        assert_eq!(dropped.get(), 2);
+    }
+
+    #[test]
+    fn owned_write_inputs_scoped_arena_capacity_errors_do_not_initialize_values() {
+        let mut budget = Budget::new(64);
+        let arena = Arena::new(&mut budget, "bounded owners", 64).unwrap();
+        let initialized = core::cell::Cell::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            for count in [9, usize::MAX] {
+                let error = arena
+                    .alloc_owned_slice_with(count, |_| {
+                        initialized.set(initialized.get() + 1);
+                        0u64
+                    })
+                    .err()
+                    .unwrap();
+                assert_eq!(error.capacity, 64);
+                assert_eq!(arena.used(), 0);
+                assert_eq!(initialized.get(), 0);
+            }
+        });
+    }
+
     #[test]
     fn stable_sort_via_matches_the_standard_stable_sort() {
         // Duplicate keys in scrambled order: the arena-staged sort must keep

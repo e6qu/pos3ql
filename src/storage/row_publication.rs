@@ -78,9 +78,32 @@ enum PendingPublication {
 }
 
 impl Storage {
-    /// Publishes one immutable pending image. Byte preparation and object I/O
-    /// precede the short version-pool/map transition; retained heap readers
-    /// do not exclude it. Conflicting transactions park through the wait graph.
+    /// Input bytes remain owned from append through preparation and publication.
+    pub(crate) fn write_pending_image(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        cid: u32,
+        image: Option<super::row_heap::HeapRowRead>,
+    ) -> Result<PendingWriteUndo, SqlError> {
+        self.write_pending_image_inner(table_index, rowid, txid, cid, image, true)
+    }
+
+    /// Rewrites and WAL reconstruction do not increment DML counts.
+    pub(crate) fn write_pending_image_untracked(
+        &self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        cid: u32,
+        image: Option<super::row_heap::HeapRowRead>,
+    ) -> Result<PendingWriteUndo, SqlError> {
+        self.write_pending_image_inner(table_index, rowid, txid, cid, image, false)
+    }
+
+    /// Fixture adapter; production callers supply owned images.
+    #[cfg(test)]
     pub fn write_pending(
         &self,
         table_index: usize,
@@ -92,7 +115,8 @@ impl Storage {
         self.write_pending_inner(table_index, rowid, txid, cid, loc, true)
     }
 
-    /// Rewrites and WAL reconstruction share publication without DML counts.
+    /// Fixture adapter for untracked reconstruction.
+    #[cfg(test)]
     pub(crate) fn write_pending_untracked(
         &self,
         table_index: usize,
@@ -104,6 +128,7 @@ impl Storage {
         self.write_pending_inner(table_index, rowid, txid, cid, loc, false)
     }
 
+    #[cfg(test)]
     pub(super) fn write_pending_inner(
         &self,
         table_index: usize,
@@ -114,10 +139,10 @@ impl Storage {
         track_statistics: bool,
     ) -> Result<PendingWriteUndo, SqlError> {
         let image = loc.map(|location| self.heap.get(location)).transpose()?;
-        self.write_pending_image(table_index, rowid, txid, cid, image, track_statistics)
+        self.write_pending_image_inner(table_index, rowid, txid, cid, image, track_statistics)
     }
 
-    fn write_pending_image(
+    fn write_pending_image_inner(
         &self,
         table_index: usize,
         rowid: u64,
@@ -481,6 +506,124 @@ mod tests {
     }
 
     #[test]
+    fn owned_write_inputs_mixed_allocations_publish_and_release_with_fixed_memory() {
+        for tracked in [true, false] {
+            let (mut storage, table) = fixture(&test_config());
+            let mut scratch = relocation_scratch();
+            let mut budget = Budget::new(4096);
+            let arena = crate::mem::arena::Arena::new(&mut budget, "owned writes", 4096).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                let mut images = arena.alloc_owned_slice_with(3, |_| None).unwrap();
+                images[0] = Some(storage.heap.append_row_image(&[Datum::Int4(1)]).unwrap());
+                images[1] = Some(storage.heap.append_row_image(&[Datum::Int4(2)]).unwrap());
+                storage.compact_heap(&mut scratch).unwrap();
+                images[2] = Some(storage.heap.append_row_image(&[Datum::Int4(3)]).unwrap());
+                assert_eq!(
+                    storage.compact_heap(&mut scratch).unwrap_err().sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
+                let mut undos = [None; 3];
+                for index in 0..3 {
+                    let image = images[index].take();
+                    undos[index] = Some(
+                        if tracked {
+                            storage.write_pending_image(table, index as u64 + 1, 7, 1, image)
+                        } else {
+                            storage.write_pending_image_untracked(
+                                table,
+                                index as u64 + 1,
+                                7,
+                                1,
+                                image,
+                            )
+                        }
+                        .unwrap(),
+                    );
+                }
+                drop(images);
+                for (index, undo) in undos.into_iter().enumerate() {
+                    let rowid = index as u64 + 1;
+                    let row = storage.resident_row_state(table, rowid).unwrap().unwrap();
+                    let Some(Some(RowHome::Heap(location))) =
+                        row.visible_at(7, SNAPSHOT_ALL, u64::MAX)
+                    else {
+                        panic!("owned input must be visible")
+                    };
+                    let bytes = storage.heap.get(location).unwrap();
+                    let mut values = [Datum::Null; 1];
+                    rowenc::decode(&bytes, &[ColType::Int4], &mut values).unwrap();
+                    assert_eq!(values[0], Datum::Int4(rowid as i32));
+                    drop(bytes);
+                    drop(row);
+                    storage.restore_pending(table, rowid, 7, undo.unwrap());
+                }
+                assert!(storage.tables[table].rows.is_empty());
+                if !tracked {
+                    assert!(
+                        storage
+                            .cumulative_statistics()
+                            .relation_transactions
+                            .is_empty()
+                    );
+                }
+                let current = storage.heap.retain_allocation();
+                storage.compact_heap(&mut scratch).unwrap();
+                drop(current);
+                assert_eq!(storage.heap.used(), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn owned_write_inputs_failed_publication_drops_unconsumed_rewrite_images() {
+        let mut config = test_config();
+        config.max_row_versions_per_row = 1;
+        let (mut storage, table) = fixture(&config);
+        let mut scratch = relocation_scratch();
+        let mut budget = Budget::new(4096);
+        let arena =
+            crate::mem::arena::Arena::new(&mut budget, "failed owned writes", 4096).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut undo = None;
+            let result = (|| -> Result<(), SqlError> {
+                let mut images = arena.alloc_owned_slice_with(3, |_| None).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "test statement arena full"
+                    )
+                })?;
+                images[0] = Some(storage.heap.append_row_image(&[Datum::Int4(1)])?);
+                images[2] = Some(storage.heap.append_row_image(&[Datum::Int4(3)])?);
+                storage.compact_heap(&mut scratch)?;
+                images[1] = Some(storage.heap.append_row_image(&[Datum::Int4(2)])?);
+                undo = Some(storage.write_pending_image_untracked(
+                    table,
+                    1,
+                    7,
+                    1,
+                    images[0].take(),
+                )?);
+                storage.write_pending_image_untracked(table, 1, 7, 2, images[1].take())?;
+                Ok(())
+            })();
+            assert_eq!(
+                result.unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
+            assert_eq!(row.pending.len(), 1);
+            drop(row);
+            storage.restore_pending(table, 1, 7, undo.unwrap());
+            assert!(storage.tables[table].rows.is_empty());
+            // The third, unconsumed input belonged to the spare buffer.
+            let current = storage.heap.retain_allocation();
+            storage.compact_heap(&mut scratch).unwrap();
+            drop(current);
+            assert_eq!(storage.heap.used(), 0);
+        });
+    }
+
+    #[test]
     fn pending_image_ownership_insert_survives_relocation_before_publication() {
         let (mut storage, table) = fixture(&test_config());
         let mut scratch = relocation_scratch();
@@ -499,7 +642,7 @@ mod tests {
                 PendingPublication::Retry
             ));
             let undo = storage
-                .write_pending_image(table, 1, 7, 1, Some(input.clone()), true)
+                .write_pending_image_inner(table, 1, 7, 1, Some(input.clone()), true)
                 .unwrap();
             let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             let Some(Some(RowHome::Heap(current))) = row.visible_at(7, SNAPSHOT_ALL, u64::MAX)
@@ -541,7 +684,7 @@ mod tests {
                 PendingPublication::Retry
             ));
             let undo = storage
-                .write_pending_image(table, 1, 8, 1, Some(input.clone()), true)
+                .write_pending_image_inner(table, 1, 8, 1, Some(input.clone()), true)
                 .unwrap();
             let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             let Some(Some(RowHome::Heap(updated))) = row.visible_at(8, SNAPSHOT_ALL, 7) else {
@@ -584,7 +727,7 @@ mod tests {
             ));
             storage.heap.append_bytes(&filler).unwrap();
             let error = storage
-                .write_pending_image(table, 1, 7, 1, Some(input), true)
+                .write_pending_image_inner(table, 1, 7, 1, Some(input), true)
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(storage.resident_row_state(table, 1).unwrap().is_none());

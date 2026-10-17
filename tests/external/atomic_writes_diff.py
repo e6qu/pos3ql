@@ -116,14 +116,22 @@ def current_state(connection, schema):
     }
 
 
-def exercise(connection, schema):
+def progress(phase):
+    print(json.dumps({"phase": phase}), flush=True)
+
+
+def exercise(connection, schema, trace=False):
     observed = []
     for statement in [
         f"UPDATE {schema}.warm_orders SET note = 'paid' WHERE id = 1 RETURNING id, note",
         f"INSERT INTO {schema}.warm_orders VALUES (4, 'new') RETURNING id, note",
         f"DELETE FROM {schema}.warm_orders WHERE id = 2 RETURNING id, note",
     ]:
+        if trace:
+            progress("writer:" + statement.split()[0])
         observed.append(result(connection, statement))
+    if trace:
+        progress("writer:COPY")
     with connection.cursor() as cursor:
         with cursor.copy(f"COPY {schema}.warm_orders(id, note) FROM STDIN") as copy:
             copy.write_row((5, "copied"))
@@ -146,6 +154,8 @@ def exercise(connection, schema):
         f"UPDATE {schema}.warm_orders SET note = 'rollback' WHERE id = 1 RETURNING id, note"))
     observed.append(result(connection, "SET CONSTRAINTS ALL IMMEDIATE"))
     observed.append(result(connection, "ROLLBACK"))
+    if trace:
+        progress("writer:state")
     return {"operations": observed, "state": current_state(connection, schema)}
 
 
@@ -181,9 +191,10 @@ class Node:
         with os.fdopen(descriptor, "w") as output:
             output.write("".join(f"{name} = {value}\n" for name, value in values.items()))
 
-    def connect(self):
+    def connect(self, bounded=False):
         return psycopg.connect(host="127.0.0.1", port=self.port, user="postgres",
-            dbname="postgres", autocommit=True, connect_timeout=1, prepare_threshold=None)
+            dbname="postgres", autocommit=True, connect_timeout=1, prepare_threshold=None,
+            options="-c statement_timeout=4000" if bounded else "")
 
     def start(self):
         with self.log_path.open("ab") as log:
@@ -228,6 +239,7 @@ class Node:
 def scenario(reference, node, gate, object_root, prefix, missing, schema):
     report = (f"SELECT c.id, c.note, (SELECT note FROM {schema}.warm_orders WHERE id = 1) "
         f"FROM {schema}.cold_invoices AS c ORDER BY c.id")
+    progress("scenario:setup:" + ("missing" if missing else "success"))
     setup(reference, schema)
     expected_report = result(reference, report)
     expected_write = exercise(reference, schema)
@@ -246,7 +258,8 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
     target_key = target.relative_to(object_root / "atomic-write-test").as_posix()
     node.wipe_cache()
     node.start()
-    with node.connect() as writer, node.connect() as reader:
+    with node.connect(bounded=True) as writer, node.connect(bounded=True) as reader:
+        progress("scenario:warm")
         writer.execute(f"SELECT id, note FROM {schema}.warm_orders ORDER BY id").fetchall()
         writer.execute(f"SELECT note FROM {schema}.warm_orders WHERE id = 1").fetchall()
         head = object_root / "atomic-write-test" / prefix / "commit-head"
@@ -255,36 +268,44 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
         # Hold every request for the object containing a required result value.
         gate.arm(target_key, missing)
         with ThreadPoolExecutor(max_workers=2) as workers:
-            pending = workers.submit(result, reader, report)
             try:
-                if not gate.started.wait(5):
-                    observed = pending.result(timeout=0) if pending.done() else "still pending"
-                    with gate.lock:
-                        keys = sorted(gate.observed_keys)
-                    raise AssertionError({"required_invoice_object": target_key,
-                        "report": observed, "observed_gets": keys})
-                write = workers.submit(exercise, writer, schema)
-                actual_write = write.result(timeout=5)
-                assert actual_write == expected_write, (actual_write, expected_write)
-                assert not pending.done(), "cold report finished before the writer acknowledgement"
-                assert not gate.release.is_set(), "writer progress accidentally released the held GET"
-                after = head.read_bytes()
-                assert after != before, "writer acknowledged without advancing remote commit-head"
-            finally:
-                gate.release.set()
-            if missing:
+                pending = workers.submit(result, reader, report)
                 try:
-                    pending.result(timeout=5)
-                except psycopg.Error as error:
-                    assert error.sqlstate == "58030", error
-                    assert gate.failure_sent.is_set(), "error did not come from the injected GET"
+                    if not gate.started.wait(5):
+                        observed = pending.result(timeout=0) if pending.done() else "still pending"
+                        with gate.lock:
+                            keys = sorted(gate.observed_keys)
+                        raise AssertionError({"required_invoice_object": target_key,
+                            "report": observed, "observed_gets": keys})
+                    progress("scenario:held")
+                    write = workers.submit(exercise, writer, schema, True)
+                    actual_write = write.result(timeout=5)
+                    assert actual_write == expected_write, (actual_write, expected_write)
+                    assert not pending.done(), "cold report finished before the writer acknowledgement"
+                    assert not gate.release.is_set(), "writer progress accidentally released the held GET"
+                    after = head.read_bytes()
+                    assert after != before, "writer acknowledged without advancing remote commit-head"
+                finally:
+                    gate.release.set()
+                progress("scenario:report")
+                if missing:
+                    try:
+                        pending.result(timeout=5)
+                    except psycopg.Error as error:
+                        assert error.sqlstate == "58030", error
+                        assert gate.failure_sent.is_set(), "error did not come from the injected GET"
+                    else:
+                        raise AssertionError("failed block response was hidden")
                 else:
-                    raise AssertionError("failed block response was hidden")
-            else:
-                actual_report = pending.result(timeout=5)
-                assert actual_report == expected_report, (actual_report, expected_report)
-            gate.disarm()
-            assert current_state(writer, schema) == expected_write["state"]
+                    actual_report = pending.result(timeout=5)
+                    assert actual_report == expected_report, (actual_report, expected_report)
+                gate.disarm()
+                assert current_state(writer, schema) == expected_write["state"]
+            except BaseException:
+                progress("scenario:failed; stopping owned server before joining SQL threads")
+                gate.release.set()
+                node.stop(crash=True)
+                raise
     node.stop(crash=True)
     node.wipe_cache()
     node.start()

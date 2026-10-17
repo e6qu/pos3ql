@@ -1,0 +1,49 @@
+name: Atomic read focus
+
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reproduce:
+    if: github.head_ref == 'preserve-downloads-during-writes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build checked-out source
+        run: |
+          cargo clean -p pos3ql
+          cargo build --release --locked
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Reproduce held download directly
+        run: >-
+          target/external-venv/bin/python -u tests/external/atomic_writes_diff.py
+          --pg 5432 --host 127.0.0.1 --user postgres
+          --binary target/release/pos3ql --work "${{ runner.temp }}/atomic-focus"

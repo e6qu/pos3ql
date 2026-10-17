@@ -127,6 +127,8 @@ replacing a suspended reader's socket, bytes or error. A write that needs an
 uncached block still waits synchronously and can download the same block again.
 A paused report keeps the same data view, start time and timeout until it
 finishes; resuming does not start a fresh statement.
+Its selected saved row files stay protected after a scan, nested call or
+statement arena is released; their owners follow the statement through waits.
 Index and selected-column read buffers retain completed data across waits;
 their verified identities do not depend on shared-cache residency.
 Checkpoint publication and object merges still wait for downloads to finish.

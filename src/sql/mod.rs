@@ -430,6 +430,11 @@ impl CheckpointBeat {
     }
 }
 
+struct CommandSnapshot {
+    lease: Option<crate::storage::StatementSnapshotLease>,
+    _files: Option<crate::storage::StatementFileScope>,
+}
+
 /// The query engine: catalog, memtable storage, WAL, object-storage
 /// checkpointing, and statement execution.
 pub struct Engine {
@@ -5062,7 +5067,7 @@ impl Engine {
         advance_command: bool,
         retain_snapshot: bool,
         resume_statement: bool,
-    ) -> Result<Option<crate::storage::StatementSnapshotLease>, SqlError> {
+    ) -> Result<CommandSnapshot, SqlError> {
         self.storage.set_foreign_statement_context(
             txn.txid,
             txn.isolation == TransactionIsolation::Serializable,
@@ -5106,7 +5111,14 @@ impl Engine {
             self.storage.lsn()
         };
         self.storage.set_commit_snapshot(snapshot);
-        Ok(lease)
+        let files = lease
+            .as_ref()
+            .map(|lease| lease.enter_files())
+            .transpose()?;
+        Ok(CommandSnapshot {
+            lease,
+            _files: files,
+        })
     }
 
     pub fn commit_txn(&mut self, txn: &mut TxnState, guc: &GucState) -> Result<(), SqlError> {
@@ -8723,6 +8735,7 @@ impl Engine {
         scratch: &mut exec::DmlScratch,
         inserted: &exec::CopyTransitionRows,
     ) -> Result<(), SqlError> {
+        let _files = setup.restore_snapshot(storage)?;
         exec::copy_statement_end(
             storage,
             txn,
@@ -14225,7 +14238,7 @@ impl Engine {
                 | Stmt::Show(_)
                 | Stmt::ShowAll
         );
-        let mut snapshot_lease = match self.begin_command_snapshot(
+        let mut snapshot = match self.begin_command_snapshot(
             txn,
             takes_snapshot,
             !matches!(statement, Stmt::Commit | Stmt::Rollback),
@@ -14247,13 +14260,13 @@ impl Engine {
             responder,
             reset_workspace,
             capture,
-            &mut snapshot_lease,
+            &mut snapshot.lease,
         );
         if reset_workspace
             && matches!(&result, Ok(Err(error)) if
                 error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
-            && let Some(lease) = snapshot_lease.take()
+            && let Some(lease) = snapshot.lease.take()
         {
             // Transfer ownership before returning to the reactor. The next
             // attempt resumes this command and view; it is not a new statement.

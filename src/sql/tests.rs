@@ -84552,10 +84552,10 @@ fn atomic_block_reads_suspended_snapshot_keeps_its_view_command_and_clocks() {
     let statement_start = datetime::statement_micros();
     let transaction_start = datetime::transaction_micros();
     crate::mem::guard::forbid_alloc(|| {
-        let lease = engine
+        let mut snapshot = engine
             .begin_command_snapshot(&mut reader.transaction, true, true, true, false)
-            .unwrap()
             .unwrap();
+        let lease = snapshot.lease.take().unwrap();
         reader
             .transaction
             .suspend_statement_snapshot(lease, clock, 0);
@@ -84604,10 +84604,10 @@ fn atomic_block_reads_suspended_snapshot_releases_on_cancel_rollback_and_retirem
             engine
                 .ensure_txn(&mut transaction, TxnMode::Explicit, &guc)
                 .unwrap();
-            let lease = engine
+            let mut snapshot = engine
                 .begin_command_snapshot(&mut transaction, true, true, true, false)
-                .unwrap()
                 .unwrap();
+            let lease = snapshot.lease.take().unwrap();
             transaction.suspend_statement_snapshot(lease, datetime::statement_clock(), 0);
         });
         assert!(engine.storage.has_active_snapshots());
@@ -84637,10 +84637,10 @@ fn atomic_block_reads_resuming_keeps_the_original_expired_timeout() {
     let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
     atomic_snapshot_execute(&mut reader, &mut engine, 11, "BEGIN");
     crate::mem::guard::forbid_alloc(|| {
-        let lease = engine
+        let mut snapshot = engine
             .begin_command_snapshot(&mut reader.transaction, true, true, true, false)
-            .unwrap()
             .unwrap();
+        let lease = snapshot.lease.take().unwrap();
         reader
             .transaction
             .suspend_statement_snapshot(lease, datetime::statement_clock(), 1);
@@ -84660,4 +84660,234 @@ fn atomic_block_reads_resuming_keeps_the_original_expired_timeout() {
     assert!(!engine.storage.has_active_snapshots());
     atomic_snapshot_execute(&mut reader, &mut engine, 11, "ROLLBACK");
     assert_eq!(reader.transaction.mode, TxnMode::Idle);
+}
+
+#[test]
+fn statement_files_suspended_sql_releases_on_completion_error_cancel_and_rollback() {
+    for exit in 0..5 {
+        let mut config = test_config(&format!("statement-files-sql-{exit}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = false;
+        config.wal_upload_sync = false;
+        config.object_store_bucket = format!("statement-files-sql-{exit}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+        reader.success(&mut engine,
+            "CREATE TABLE statement_files_orders(id integer); INSERT INTO statement_files_orders VALUES (1)", false);
+        assert!(engine.checkpoint().unwrap());
+        let table = engine
+            .storage
+            .find_table("public", "statement_files_orders")
+            .unwrap();
+        let root = engine
+            .storage
+            .table(table)
+            .spill_generations()
+            .handle(0)
+            .unwrap();
+        assert!(
+            error_sqlstates(&atomic_snapshot_execute(
+                &mut reader,
+                &mut engine,
+                11,
+                "BEGIN"
+            ))
+            .is_empty()
+        );
+        let mut retained = Vec::with_capacity(1);
+        crate::mem::guard::forbid_alloc(|| {
+            reader.transaction.begin_statement_clock();
+            let mut snapshot = engine
+                .begin_command_snapshot(&mut reader.transaction, true, true, true, false)
+                .unwrap();
+            drop(engine.storage.row_scan(table).unwrap());
+            reader.transaction.suspend_statement_snapshot(
+                snapshot.lease.take().unwrap(),
+                datetime::statement_clock(),
+                if exit == 4 { 1 } else { 0 },
+            );
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            engine
+                .storage
+                .copy_retained_spill_roots(true, &mut retained)
+                .unwrap();
+            assert_eq!(retained, [root]);
+        });
+        match exit {
+            0 => {
+                crate::mem::guard::forbid_alloc(|| reader.transaction.release_suspended_statement())
+            }
+            1 => crate::mem::guard::forbid_alloc(|| {
+                engine.rollback_txn(&mut reader.transaction, &reader.guc)
+            }),
+            _ => {
+                let sql = if exit == 3 {
+                    "SELECT missing_column FROM statement_files_orders"
+                } else {
+                    "SELECT id FROM statement_files_orders"
+                };
+                let response = atomic_snapshot_execute(&mut reader, &mut engine, 11, sql);
+                match exit {
+                    2 => {
+                        assert!(error_sqlstates(&response).is_empty());
+                        assert_eq!(data_rows(&response), ["1"]);
+                    }
+                    3 => assert_eq!(error_sqlstates(&response), ["42703"]),
+                    4 => assert_eq!(error_sqlstates(&response), ["57014"]),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            engine
+                .storage
+                .copy_retained_spill_roots(true, &mut retained)
+                .unwrap();
+            assert!(retained.is_empty());
+            assert!(reader.transaction.resume_statement_snapshot().is_none());
+        });
+        drop(reader);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
+    for (case, binary, abort) in [(0, false, false), (1, true, false), (2, false, true)] {
+        let mut config = test_config(&format!("statement-files-copy-{case}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = false;
+        config.wal_upload_sync = false;
+        config.object_store_bucket = format!("statement-files-copy-{case}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut transition = copy_transition_scratch(&mut budget);
+        let mut arena = Arena::new(&mut budget, "copy file inputs", 1 << 18).unwrap();
+        let mut send =
+            crate::mem::FixedBuf::new(&mut budget, "copy file response", 1 << 16).unwrap();
+        reader.success(
+            &mut engine,
+            "CREATE TABLE copy_file_orders(id integer); INSERT INTO copy_file_orders VALUES (1); \
+             CREATE TABLE copy_file_input(id integer PRIMARY KEY); \
+             CREATE FUNCTION copy_file_read() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM id FROM copy_file_orders; RETURN NEW; END $$; \
+             CREATE TRIGGER copy_file_read BEFORE INSERT ON copy_file_input \
+             FOR EACH ROW EXECUTE FUNCTION copy_file_read()",
+            false,
+        );
+        assert!(engine.checkpoint().unwrap());
+        let table = engine
+            .storage
+            .find_table("public", "copy_file_orders")
+            .unwrap();
+        let root = engine
+            .storage
+            .table(table)
+            .spill_generations()
+            .handle(0)
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            engine.storage.evict_committed_table(table);
+            engine.storage.evict_redundant_entries(table);
+            assert!(engine.storage.table(table).rows.is_empty());
+        });
+        reader.success(
+            &mut engine,
+            if binary {
+                "COPY copy_file_input FROM STDIN (FORMAT binary)"
+            } else {
+                "COPY copy_file_input FROM STDIN"
+            },
+            true,
+        );
+        let setup = engine.take_pending_copy().unwrap();
+        let mut retained = Vec::with_capacity(1);
+        crate::mem::guard::forbid_alloc(|| {
+            engine
+                .copy_start(
+                    &setup,
+                    &mut reader.transaction,
+                    reader.guc.seq_session(),
+                    &arena,
+                    &mut Responder::new(&mut send),
+                )
+                .unwrap();
+        });
+        for id in [7u8, 8] {
+            arena.reset();
+            send.clear();
+            crate::mem::guard::forbid_alloc(|| {
+                let mut responder = Responder::new(&mut send);
+                let context = CopyRowContext::new(
+                    &mut reader.transaction,
+                    reader.guc.seq_session(),
+                    &arena,
+                    &mut responder,
+                    &mut transition,
+                );
+                if binary {
+                    engine
+                        .copy_row_binary(&setup, &[0, 1, 0, 0, 0, 4, 0, 0, 0, id], context)
+                        .unwrap();
+                } else {
+                    engine
+                        .copy_row_line(&setup, if id == 7 { b"7" } else { b"8" }, context)
+                        .unwrap();
+                }
+            });
+            assert!(
+                error_sqlstates(&atomic_snapshot_execute(
+                    &mut writer,
+                    &mut engine,
+                    22,
+                    "SELECT 1"
+                ))
+                .is_empty()
+            );
+            crate::mem::guard::forbid_alloc(|| {
+                engine
+                    .storage
+                    .copy_retained_spill_roots(true, &mut retained)
+                    .unwrap();
+                assert_eq!(retained, [root]);
+            });
+        }
+        send.clear();
+        crate::mem::guard::forbid_alloc(|| {
+            if abort {
+                engine.copy_abort(&mut reader.transaction, &reader.guc);
+                setup.release_snapshot();
+            } else {
+                engine
+                    .copy_finish(
+                        &setup,
+                        &mut reader.transaction,
+                        &reader.guc,
+                        &mut Responder::new(&mut send),
+                        &transition,
+                    )
+                    .unwrap();
+            }
+            engine
+                .storage
+                .copy_retained_spill_roots(true, &mut retained)
+                .unwrap();
+            assert!(retained.is_empty());
+            assert!(!engine.storage.has_active_snapshots());
+        });
+        drop(setup);
+        drop((reader, writer, engine));
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
 }

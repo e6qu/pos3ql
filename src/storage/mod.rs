@@ -30970,9 +30970,11 @@ impl Storage {
         }
         let table = &mut self.tables[slot];
         let generations = table.spill_generations.read();
+        let table_generation = table.generation();
         for (_, state) in table.rows.iter_mut() {
             if let Some(RowHome::Heap(loc)) = state.committed {
-                let Some(sst) = generations.eviction_member(state.committed_lsn) else {
+                let Some(sst) = generations.eviction_member(state.committed_lsn, table_generation)
+                else {
                     continue;
                 };
                 state.committed = Some(RowHome::Spilled {
@@ -31011,7 +31013,7 @@ impl Storage {
         slot: usize,
         handle: crate::store::SstHandle,
     ) -> Result<(), SqlError> {
-        self.collapse_spill_through(slot, handle, 0)
+        self.collapse_spill_covered(slot, handle, spill_generations::SpillCoverage::Unknown)
     }
 
     pub(crate) fn collapse_spill_through(
@@ -31020,10 +31022,23 @@ impl Storage {
         handle: crate::store::SstHandle,
         through_lsn: u64,
     ) -> Result<(), SqlError> {
+        self.collapse_spill_covered(
+            slot,
+            handle,
+            spill_generations::SpillCoverage::CommittedThrough(through_lsn),
+        )
+    }
+
+    fn collapse_spill_covered(
+        &mut self,
+        slot: usize,
+        handle: crate::store::SstHandle,
+        coverage: spill_generations::SpillCoverage,
+    ) -> Result<(), SqlError> {
         let versions = &mut self.row_versions.exclusive().committed_row_versions;
         let table = &mut self.tables[slot];
         let mut generations = table.spill_generations.write();
-        generations.collapse(handle, through_lsn)?;
+        generations.collapse_covered(handle, coverage)?;
         for (_, state) in table.rows.iter_mut() {
             remap_committed_homes(versions, state, |home| match home {
                 RowHome::Spilled {
@@ -31094,6 +31109,33 @@ impl Storage {
             .spill_generations
             .write()
             .append(handle, through_lsn)
+    }
+
+    pub(crate) fn install_temporary_spill(
+        &mut self,
+        slot: usize,
+        handle: crate::store::SstHandle,
+        generation: u64,
+        delta: bool,
+    ) -> Result<(), SqlError> {
+        let table = &self.tables[slot];
+        if table.definition().persistence != RelationPersistence::Temporary
+            || table.generation() != generation
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "temporary spill no longer matches its captured table"
+            ));
+        }
+        let coverage = spill_generations::SpillCoverage::ResidentAtGeneration(generation);
+        if delta {
+            table
+                .spill_generations
+                .write()
+                .append_covered(handle, coverage)
+        } else {
+            self.collapse_spill_covered(slot, handle, coverage)
+        }
     }
 
     /// Installs a validated cold-start list without allocating or partial publication.

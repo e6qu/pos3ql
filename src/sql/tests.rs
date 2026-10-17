@@ -63831,7 +63831,11 @@ fn temporary_rows_spill_with_durable_object_storage_disabled() {
              SELECT value, repeat('q', 200) FROM generate_series({first}, {last}) AS g(value)"
         );
         let inserted = run_as(&mut engine, &mut budget, 51, &statement);
-        assert!(!String::from_utf8_lossy(&inserted).contains("ERROR"));
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&inserted)
+        );
         assert!(engine.maybe_checkpoint());
     }
     let crate::storage::ResolvedRelation::Table(table) = engine

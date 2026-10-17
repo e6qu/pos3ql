@@ -748,8 +748,11 @@ turns. Fixed execution workers and independent object I/O remain unfinished.
 Eviction requires an installed object's recorded boundary to cover the row's
 commit position. A later update stays in the heap; history newer than that
 boundary stays resident too. Recovered roots have no eviction boundary and do
-not justify discarding newer heap bytes. A fresh temporary spill records its
-own boundary. For example, if a checkpoint saved an order before its price
+not justify discarding newer heap bytes. A temporary spill records the table
+generation it copied, because temporary commits may share a zero journal
+position. Only that exact table generation can evict to the temporary snapshot;
+a later spill names its own object. These witnesses are distinct states in the
+startup-sized root metadata. For example, if a checkpoint saved an order before its price
 changed, cleanup keeps the new price in memory until another checkpoint saves
 it; it never redirects that row to the older object.
 

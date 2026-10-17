@@ -729,7 +729,6 @@ impl TemporarySpiller {
             return Ok(None);
         };
         let generation = storage.table(slot).generation();
-        let through_lsn = storage.lsn();
         let delta = {
             let generations = storage.table(slot).spill_generations();
             !generations.is_empty() && generations.len() < generations.capacity()
@@ -827,9 +826,13 @@ impl TemporarySpiller {
             .finish(&mut *blocks.lock().expect("block store lock poisoned"))
             .map_err(temporary_sst_to_sql)?;
         match (delta, handle) {
-            (true, Some(handle)) => storage.append_spill_through(slot, handle, through_lsn)?,
+            (true, Some(handle)) => {
+                storage.install_temporary_spill(slot, handle, generation, true)?
+            }
             (true, None) => {}
-            (false, Some(handle)) => storage.collapse_spill_through(slot, handle, through_lsn)?,
+            (false, Some(handle)) => {
+                storage.install_temporary_spill(slot, handle, generation, false)?
+            }
             (false, None) => storage.set_spill_list(slot, &[]),
         }
         storage.clear_tombstones(slot);

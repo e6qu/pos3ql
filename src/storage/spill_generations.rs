@@ -2265,8 +2265,23 @@ mod tests {
                 .unwrap()
                 .durable_dirty_lsn = 9;
             assert!(!storage.value_indexes_match_snapshot(*table));
+            // Publication clears dirtiness; its former rebuild reservation is
+            // no longer a newer committed change to the saved generation.
+            storage.tables[*table].publication().enforcers[0]
+                .as_mut()
+                .unwrap()
+                .durable_dirty = false;
+            assert!(storage.value_indexes_match_snapshot(*table));
+            storage.tables[*table].publication().enforcers[0]
+                .as_mut()
+                .unwrap()
+                .durable_dirty = true;
             storage.set_commit_snapshot(9);
             assert!(storage.value_indexes_match_snapshot(*table));
+            storage.tables[*table].publication().enforcers[0]
+                .as_mut()
+                .unwrap()
+                .durable_dirty = false;
             storage.tables[*table].publication().enforcers[0]
                 .as_mut()
                 .unwrap()

@@ -32841,7 +32841,7 @@ impl Storage {
             .iter()
             .flatten()
             .all(|enforcer| {
-                enforcer.durable_dirty_lsn <= snapshot
+                (!enforcer.durable_dirty || enforcer.durable_dirty_lsn <= snapshot)
                     && enforcer
                         .durable
                         .is_none_or(|handle| handle.published_lsn <= snapshot)

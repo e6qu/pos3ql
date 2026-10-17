@@ -1095,6 +1095,22 @@ impl SstWriter {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SstIndexLeaf {
+    handle: SstHandle,
+    count: usize,
+    lower: Option<SstKey>,
+    upper: Option<SstKey>,
+}
+
+impl SstIndexLeaf {
+    fn covers(self, handle: SstHandle, key: SstKey) -> bool {
+        self.handle == handle
+            && self.lower.is_none_or(|lower| key >= lower)
+            && self.upper.is_none_or(|upper| key < upper)
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SstPointReadProgress {
     request: Option<(SstHandle, SstKey)>,
@@ -1118,6 +1134,7 @@ pub(crate) struct SstReader<'a> {
     decoded_scratch: &'a mut [u8],
     column_scratch: &'a mut [u8],
     point_read: SstPointReadProgress,
+    index_leaf: Option<SstIndexLeaf>,
     loaded_ref: Option<DataBlockRef>,
     loaded_format: Option<RowSstFormat>,
     decoded_len: usize,
@@ -2176,6 +2193,7 @@ impl<'a> SstReader<'a> {
             decoded_scratch,
             column_scratch,
             point_read: SstPointReadProgress::default(),
+            index_leaf: None,
             loaded_ref: None,
             loaded_format: None,
             decoded_len: 0,
@@ -2200,6 +2218,7 @@ impl<'a> SstReader<'a> {
             decoded_scratch: decoded,
             column_scratch: column,
             point_read: SstPointReadProgress::default(),
+            index_leaf: None,
             loaded_ref: None,
             loaded_format: None,
             decoded_len: 0,
@@ -2252,6 +2271,15 @@ impl<'a> SstReader<'a> {
         Ok(decoded_len)
     }
 
+    /// The caller retains the same index bytes and their verified identity.
+    pub(crate) fn restore_cached_index_leaf(&mut self, leaf: Option<SstIndexLeaf>) {
+        self.index_leaf = leaf;
+    }
+
+    pub(crate) fn cached_index_leaf(&self) -> Option<SstIndexLeaf> {
+        self.index_leaf
+    }
+
     pub(crate) fn restore_point_read(&mut self, progress: SstPointReadProgress) {
         self.point_read = progress;
     }
@@ -2268,6 +2296,22 @@ impl<'a> SstReader<'a> {
         snapshot: u64,
     ) -> Result<Option<DataBlockRef>, SstError> {
         let target = SstKey::at(rowid, snapshot);
+        if let Some(leaf) = self.index_leaf
+            && leaf.covers(*handle, target)
+        {
+            let reference = block_containing(
+                self.index_scratch,
+                leaf.count,
+                target,
+                handle.uses_packed_references(),
+            )
+            .map(|entry| block_ref_at(self.index_scratch, entry, handle.uses_packed_references()));
+            self.point_read = SstPointReadProgress {
+                request: Some((*handle, target)),
+                stage: SstPointReadStage::Data(reference),
+            };
+            return Ok(reference);
+        }
         if self.point_read.request != Some((*handle, target)) {
             self.point_read = SstPointReadProgress {
                 request: Some((*handle, target)),
@@ -2275,6 +2319,7 @@ impl<'a> SstReader<'a> {
             };
         }
         if matches!(self.point_read.stage, SstPointReadStage::Filter) {
+            self.index_leaf = None;
             let (len, _) = store.get(&handle.filter, self.index_scratch)?;
             if !bloom::maybe_contains(&self.index_scratch[..len], rowid) {
                 self.point_read.stage = SstPointReadStage::Data(None);
@@ -2662,6 +2707,7 @@ impl<'a> SstReader<'a> {
         handle: &SstHandle,
         ordinal: usize,
     ) -> Result<Option<usize>, SstError> {
+        self.index_leaf = None;
         load_index(store, &handle.index, self.index_scratch)?;
         let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
         if head != INDEX_ROOT_MAGIC {
@@ -2690,6 +2736,7 @@ impl<'a> SstReader<'a> {
         handle: &SstHandle,
         key: SstKey,
     ) -> Result<usize, SstError> {
+        self.index_leaf = None;
         load_index(store, &handle.index, self.index_scratch)?;
         let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
         if head != INDEX_ROOT_MAGIC {
@@ -2708,22 +2755,46 @@ impl<'a> SstReader<'a> {
         handle: &SstHandle,
         key: SstKey,
     ) -> Result<usize, SstError> {
+        self.index_leaf = None;
         load_index(store, &handle.index, self.index_scratch)?;
         let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
         if head != INDEX_ROOT_MAGIC {
-            // The single-block shape: the root is its own covering leaf, and
-            // a point lookup still costs filter + index + one data block.
-            return Ok(head as usize);
+            let count = head as usize;
+            self.index_leaf = Some(SstIndexLeaf {
+                handle: *handle,
+                count,
+                lower: None,
+                upper: None,
+            });
+            return Ok(count);
         }
         let leaves = u32::from_le_bytes(self.index_scratch[4..8].try_into().unwrap()) as usize;
         let leaf = root_leaf_containing(self.index_scratch, leaves, key).unwrap_or(0);
-        let entry_size = VERSIONED_ROOT_ENTRY;
-        let key_bytes = 16;
-        let at = 8 + leaf * entry_size;
+        let first =
+            |ordinal: usize| read_key(&self.index_scratch[8 + ordinal * VERSIONED_ROOT_ENTRY..]);
+        // The root's row-boundary rule admits newer snapshots to the next
+        // leaf when its first row differs, even before that row's first LSN.
+        let boundary = |left: SstKey, right: SstKey| {
+            if left.rowid == right.rowid {
+                right
+            } else {
+                SstKey::newest(right.rowid)
+            }
+        };
+        let lower = (leaf > 0).then(|| boundary(first(leaf - 1), first(leaf)));
+        let upper = (leaf + 1 < leaves).then(|| boundary(first(leaf), first(leaf + 1)));
+        let at = 8 + leaf * VERSIONED_ROOT_ENTRY;
         let mut id = [0u8; 32];
-        id.copy_from_slice(&self.index_scratch[at + key_bytes + 4..at + entry_size]);
+        id.copy_from_slice(&self.index_scratch[at + 16 + 4..at + VERSIONED_ROOT_ENTRY]);
         load_index(store, &BlockId(id), self.index_scratch)?;
-        Ok(u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap()) as usize)
+        let count = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap()) as usize;
+        self.index_leaf = Some(SstIndexLeaf {
+            handle: *handle,
+            count,
+            lower,
+            upper,
+        });
+        Ok(count)
     }
 }
 
@@ -3212,6 +3283,115 @@ mod tests {
     }
 
     #[test]
+    fn atomic_block_reads_owned_index_leaf_survives_reader_rebuild_and_new_snapshots() {
+        let (_budget, mut store) = store();
+        let mut writer = SstWriter::new();
+        writer
+            .append_version(&mut store, SstKey::at(1, 7), b"one")
+            .unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(2, 9), b"two")
+            .unwrap();
+        let original = writer.finish(&mut store).unwrap().unwrap();
+        writer.reset();
+        writer
+            .append_version(&mut store, SstKey::at(1, 7), b"new")
+            .unwrap();
+        let replacement = writer.finish(&mut store).unwrap().unwrap();
+        let mut index = vec![0; MAX_PAYLOAD];
+        let mut data = vec![0; MAX_PAYLOAD];
+        let mut decoded = vec![0; MAX_PAYLOAD];
+        let mut column = vec![0; MAX_PAYLOAD];
+        let mut assembly = vec![0; MAX_ASSEMBLED];
+        let mut leaf = None;
+        let mut cached_data = None;
+        let mut output = [0; 16];
+        crate::mem::guard::forbid_alloc(|| {
+            for (handle, rowid, snapshot, expected, reads) in [
+                (original, 1, 100, Some(b"one".as_slice()), 3),
+                (original, 2, 100, Some(b"two".as_slice()), 0),
+                (original, 1, 0, None, 0),
+                (original, 0, 100, None, 0),
+                (original, 999, 100, None, 0),
+                (replacement, 1, 100, Some(b"new".as_slice()), 3),
+            ] {
+                let before = store.reads();
+                let mut reader = SstReader::over(
+                    &mut index,
+                    &mut data,
+                    &mut decoded,
+                    &mut column,
+                    &mut assembly,
+                );
+                reader.restore_cached_index_leaf(leaf.take());
+                reader.restore_cached_data_block(handle.format, cached_data.take());
+                let probe = reader
+                    .get_at(&mut store, &handle, rowid, snapshot, &mut output)
+                    .unwrap();
+                leaf = reader.cached_index_leaf();
+                cached_data = reader.cached_data_block();
+                if let Some(expected) = expected {
+                    let length = probe.unwrap().len.unwrap() as usize;
+                    assert_eq!(&output[..length], expected);
+                } else {
+                    assert!(probe.is_none());
+                }
+                assert_eq!(store.reads() - before, reads);
+            }
+        });
+    }
+
+    #[test]
+    fn atomic_block_reads_owned_index_leaf_checks_row_and_version_boundaries() {
+        let (_budget, mut store) = store();
+        let mut writer = SstWriter::new();
+        writer
+            .append_version(&mut store, SstKey::at(1, 30), b"thirty")
+            .unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(1, 20), b"twenty")
+            .unwrap();
+        writer.flush_data(&mut store).unwrap();
+        writer.flush_index_leaf(&mut store).unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(1, 10), b"ten")
+            .unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(2, 40), b"forty")
+            .unwrap();
+        writer.flush_data(&mut store).unwrap();
+        writer.flush_index_leaf(&mut store).unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(3, 50), b"fifty")
+            .unwrap();
+        writer.flush_data(&mut store).unwrap();
+        writer.flush_index_leaf(&mut store).unwrap();
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        let arena = arena();
+        let mut reader = SstReader::new(&arena).unwrap();
+        let mut output = [0; 16];
+        crate::mem::guard::forbid_alloc(|| {
+            for (rowid, snapshot, expected, reads) in [
+                (1, 25, b"twenty".as_slice(), 4),
+                (1, 20, b"twenty".as_slice(), 0),
+                (2, u64::MAX, b"forty".as_slice(), 4),
+                (1, 10, b"ten".as_slice(), 0),
+                (1, 25, b"twenty".as_slice(), 4),
+                (3, u64::MAX, b"fifty".as_slice(), 4),
+                (2, u64::MAX, b"forty".as_slice(), 4),
+            ] {
+                let before = store.reads();
+                let probe = reader
+                    .get_at(&mut store, &handle, rowid, snapshot, &mut output)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&output[..probe.len.unwrap() as usize], expected);
+                assert_eq!(store.reads() - before, reads);
+            }
+        });
+    }
+
+    #[test]
     fn atomic_block_reads_point_lookup_resumes_completed_filter_and_index_steps() {
         struct WaitingStore {
             inner: MemoryBlockStore,
@@ -3683,8 +3863,8 @@ mod tests {
         assert_eq!(get(&mut reader, &mut store, &handle, 3), Some(second_bytes));
         assert_eq!(
             store.reads() - before_second_live_row,
-            2,
-            "the filter and index are needed again, but the decoded PAX descriptor is reused"
+            0,
+            "the verified index leaf and decoded PAX data are retained by the reader"
         );
     }
 

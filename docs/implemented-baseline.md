@@ -768,6 +768,10 @@ issue another GET even if a reader is already downloading that block. SQL
 execution remains serial, and this does not enable independent checkpoint
 publication or worker threads.
 
+Row lookups retain the verified sparse-index page already in their own buffer,
+including the row and version bounds where it is valid. A resumed report can
+reuse navigation across rows and snapshots without downloading the same page
+again; another source or an out-of-range key requires a new verified page.
 Index readers keep verified metadata and entries in their existing startup
 buffers when a later row read waits for a download. Selected-column scans keep
 completed columns in the same way. Their identities follow the immutable source,

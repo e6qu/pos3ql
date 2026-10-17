@@ -14213,6 +14213,7 @@ struct SpillScratch {
     bounce_buf: Box<[u8]>,
     decoded_data_ref: Option<(crate::store::SstHandle, crate::store::DataBlockRef, usize)>,
     point_read: crate::store::SstPointReadProgress,
+    index_leaf: Option<crate::store::SstIndexLeaf>,
 }
 
 struct ValueIndexScratch {
@@ -14361,6 +14362,7 @@ impl SpillReader {
                 bounce_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 decoded_data_ref: None,
                 point_read: crate::store::SstPointReadProgress::default(),
+                index_leaf: None,
             })
         };
         let context = || {
@@ -14499,6 +14501,7 @@ impl SpillReader {
             assembly_buf,
             decoded_data_ref,
             point_read,
+            index_leaf,
             ..
         } = &mut *scratch;
         let mut reader = crate::store::SstReader::over(
@@ -14509,6 +14512,7 @@ impl SpillReader {
             assembly_buf,
         );
         reader.restore_point_read(*point_read);
+        reader.restore_cached_index_leaf(index_leaf.take());
         reader.restore_cached_data_block(
             handle.format,
             decoded_data_ref
@@ -14519,6 +14523,7 @@ impl SpillReader {
         );
         let got = reader.get_at(&mut *blocks, &handle, rowid, commit_lsn, out);
         *point_read = reader.point_read_progress();
+        *index_leaf = reader.cached_index_leaf();
         *decoded_data_ref = reader
             .cached_data_block()
             .map(|(reference, cached_len)| (handle, reference, cached_len));
@@ -14563,6 +14568,7 @@ impl SpillReader {
             bounce_buf,
             decoded_data_ref,
             point_read,
+            index_leaf,
             ..
         } = &mut *scratch;
         // The assembly buffer doubles as the row destination: `get`
@@ -14588,6 +14594,7 @@ impl SpillReader {
                 bounce_buf,
             );
             reader.restore_point_read(*point_read);
+            reader.restore_cached_index_leaf(index_leaf.take());
             reader.restore_cached_data_block(
                 handle.format,
                 decoded_data_ref
@@ -14598,6 +14605,7 @@ impl SpillReader {
             );
             let got = reader.get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf);
             *point_read = reader.point_read_progress();
+            *index_leaf = reader.cached_index_leaf();
             *decoded_data_ref = reader
                 .cached_data_block()
                 .map(|(reference, cached_len)| (handle, reference, cached_len));
@@ -29957,15 +29965,15 @@ impl Storage {
         snapshot: u64,
     ) -> Result<Option<SpillVersion>, SqlError> {
         let relation = source.relation();
-        if relation.len() == 0 {
-            return Ok(None);
-        }
         let spill = source.reader.ok_or_else(|| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "retained SST source has no spill reader"
             )
         })?;
+        if relation.len() == 0 {
+            return Ok(None);
+        }
         let Some(mut scratch) = try_source_scratch(
             &spill.scratch,
             "spill row scratch",
@@ -29989,6 +29997,7 @@ impl Storage {
                 assembly_buf,
                 decoded_data_ref,
                 point_read,
+                index_leaf,
                 ..
             } = &mut *scratch;
             let mut reader = crate::store::SstReader::over(
@@ -29999,6 +30008,7 @@ impl Storage {
                 assembly_buf,
             );
             reader.restore_point_read(*point_read);
+            reader.restore_cached_index_leaf(index_leaf.take());
             reader.restore_cached_data_block(
                 handle.format,
                 decoded_data_ref
@@ -30012,6 +30022,7 @@ impl Storage {
                 reader.probe_at(&mut *blocks, &handle, rowid, snapshot)
             };
             *point_read = reader.point_read_progress();
+            *index_leaf = reader.cached_index_leaf();
             *decoded_data_ref = reader
                 .cached_data_block()
                 .map(|(reference, len)| (handle, reference, len));

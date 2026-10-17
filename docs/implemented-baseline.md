@@ -683,8 +683,15 @@ representation is unchanged. For example, adding a UNIQUE constraint still
 checks existing and transaction-modified rows; it does not needlessly rewrite
 those rows. Operations that change row representation retain the rewrite path.
 
-Appends release byte ownership before publishing metadata. Compaction checks
-its complete relocation set before changing bytes or handles. Readers reject
+Appends release their initialization locks before publishing metadata. A pending
+write retains its input bytes through preparation and retries. If compaction
+replaces the heap buffer between preparation and publication, publication
+retries and copies the retained input into the current startup-sized buffer;
+insufficient space returns `54000` without publishing the row. For example, an
+order update waiting to publish cannot accidentally use another row at the old
+address after compaction. A dropped or replaced table still returns `40001`
+before a relocation retry. Compaction checks its complete relocation set before
+changing bytes or handles. Readers reject
 reused table identities and stale heap locations. Heap addresses and relocation
 generations describe caches, not durable row identity. Retained byte copies
 use statement memory. Physical reclamation still requires exclusive table

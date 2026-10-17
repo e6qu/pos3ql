@@ -4,6 +4,7 @@ use super::{
     CatalogDdlState, DatabaseOid, SqlError, SqlName, Storage, TypeCatalog, UserTypeName,
     current_database, sqlstate,
 };
+use crate::sql_err;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NamedTypeSlot {

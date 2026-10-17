@@ -10,12 +10,14 @@ pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
 mod log_positions;
 pub(crate) use log_positions::ReservedLogPosition;
+mod enum_images;
 mod table_creation;
 mod table_definitions;
 mod table_edits;
 mod table_names;
 mod type_contracts;
 mod type_reference_moves;
+use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
 pub(crate) use table_definitions::TableDefinitionRead;
 use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
 pub(crate) mod foreign;
@@ -3726,13 +3728,13 @@ fn enum_member_image_capacity(config: &Config) -> usize {
 }
 
 pub(crate) fn enum_member_budget_bytes(config: &Config) -> usize {
-    enum_member_image_capacity(config)
-        .saturating_mul(config.max_enum_labels_per_type)
-        .saturating_mul(size_of::<EnumMember>())
-        .saturating_add(
-            pending_enum_definition_capacity(config)
-                .saturating_mul(size_of::<PendingEnumMemberSlot>()),
-        )
+    EnumMemberImages::budget_bytes(
+        enum_member_image_capacity(config),
+        config.max_enum_labels_per_type,
+    )
+    .saturating_add(
+        pending_enum_definition_capacity(config).saturating_mul(size_of::<PendingEnumMemberSlot>()),
+    )
 }
 
 pub(crate) fn policy_role_budget_bytes(config: &Config) -> usize {
@@ -7106,7 +7108,6 @@ struct OperatorClassIter<'a> {
 struct TypeCatalog {
     domains: FixedVec<DomainDef>,
     enums: FixedVec<EnumDef>,
-    enum_members: FixedVec<EnumMember>,
     pending_enum_members: FixedVec<PendingEnumMemberSlot>,
     composites: FixedVec<CompositeDef>,
 }
@@ -9282,6 +9283,7 @@ pub struct EnumDef {
     pub name: SqlName,
     pub ownership: Ownership,
     member_count: u32,
+    member_image: Option<u32>,
     pub(crate) pending_definition: Option<PendingEnumDefinition>,
     pub ddl_state: CatalogDdlState,
 }
@@ -9294,29 +9296,29 @@ pub(crate) struct PendingEnumDefinition {
     pub member_count: u32,
     pub safe_member_count: u32,
     pub member_slot: u32,
+    image: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PendingEnumMemberSlot {
-    used: bool,
+    image: Option<u32>,
     previous: Option<u32>,
     depth: u32,
 }
 
 impl PendingEnumMemberSlot {
     const EMPTY: Self = Self {
-        used: false,
+        image: None,
         previous: None,
         depth: 0,
     };
 }
 
 /// One transaction-visible enum definition. Member storage belongs to the
-/// startup-sized catalog slab, so copying this view never copies label data.
-#[derive(Debug, Clone, Copy)]
-pub struct EnumDefinition<'a> {
-    catalog: &'a std::sync::Mutex<TypeCatalog>,
-    member_image: usize,
+/// startup-sized slab; cloning the view retains its selected label image.
+#[derive(Debug, Clone)]
+pub struct EnumDefinition {
+    image: EnumImageRead,
     member_count: usize,
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
@@ -9326,12 +9328,12 @@ pub struct EnumDefinition<'a> {
     pub ddl_state: CatalogDdlState,
 }
 
-impl EnumDefinition<'_> {
-    pub fn members(&self) -> EnumMemberIter<'_> {
+impl EnumDefinition {
+    pub fn members(&self) -> EnumMemberIter {
         EnumMemberIter {
-            catalog: self.catalog,
-            next_slot: self.member_image,
-            end_slot: self.member_image + self.member_count,
+            image: Some(self.image.clone()),
+            next_slot: 0,
+            end_slot: self.member_count,
         }
     }
 
@@ -9346,25 +9348,29 @@ impl EnumDefinition<'_> {
     }
 }
 
-pub struct EnumMemberIter<'a> {
-    catalog: &'a std::sync::Mutex<TypeCatalog>,
+pub struct EnumMemberIter {
+    image: Option<EnumImageRead>,
     next_slot: usize,
     end_slot: usize,
 }
 
-impl Iterator for EnumMemberIter<'_> {
+impl Iterator for EnumMemberIter {
     type Item = EnumMember;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_slot == self.end_slot {
+            self.image = None;
             return None;
         }
         let member = self
-            .catalog
-            .lock()
-            .expect("type catalog lock poisoned")
-            .enum_members[self.next_slot];
+            .image
+            .as_ref()
+            .expect("active enum label iterator")
+            .member(self.next_slot);
         self.next_slot += 1;
+        if self.next_slot == self.end_slot {
+            self.image = None;
+        }
         Some(member)
     }
 
@@ -9374,11 +9380,10 @@ impl Iterator for EnumMemberIter<'_> {
     }
 }
 
-impl ExactSizeIterator for EnumMemberIter<'_> {}
+impl ExactSizeIterator for EnumMemberIter {}
 
 pub(crate) struct EnumReplayMembers<'a> {
-    catalog: std::sync::MutexGuard<'a, TypeCatalog>,
-    start: usize,
+    images: std::sync::MutexGuard<'a, EnumMemberImages>,
     count: usize,
 }
 
@@ -9386,13 +9391,13 @@ impl std::ops::Deref for EnumReplayMembers<'_> {
     type Target = [EnumMember];
 
     fn deref(&self) -> &Self::Target {
-        &self.catalog.enum_members[self.start..self.start + self.count]
+        self.images.replay_members(self.count)
     }
 }
 
 impl std::ops::DerefMut for EnumReplayMembers<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.catalog.enum_members[self.start..self.start + self.count]
+        self.images.replay_members_mut(self.count)
     }
 }
 
@@ -9404,6 +9409,7 @@ impl EnumDef {
         name: SqlName::EMPTY,
         ownership: Ownership::BOOTSTRAP,
         member_count: 0,
+        member_image: None,
         pending_definition: None,
         ddl_state: CatalogDdlState::Absent,
     };
@@ -9419,6 +9425,7 @@ impl EnumDef {
                 schema: pending.schema,
                 name: pending.name,
                 member_count: pending.member_count,
+                member_image: Some(pending.image),
                 pending_definition: None,
                 ..*self
             })
@@ -13704,8 +13711,7 @@ pub struct Storage {
     sequence_catalog: std::sync::Mutex<SequenceCatalog>,
     type_catalog: std::sync::Mutex<TypeCatalog>,
     enum_members_per_image: usize,
-    enum_member_pending_base: usize,
-    enum_member_replay_image: usize,
+    enum_member_images: std::sync::Arc<std::sync::Mutex<EnumMemberImages>>,
     domain_graph_scratch: std::sync::Mutex<FixedVec<u8>>,
     index_catalog: std::sync::Mutex<FixedVec<IndexDef>>,
     index_catalog_capacity: usize,
@@ -18181,16 +18187,11 @@ impl Storage {
             enums.push(EnumDef::EMPTY).expect("sized to max_enums");
         }
         let enum_members_per_image = config.max_enum_labels_per_type;
-        let enum_member_pending_base = config.max_enums;
-        let enum_member_replay_image = enum_member_image_capacity(config) - 1;
-        let enum_member_entries =
-            enum_member_image_capacity(config).saturating_mul(enum_members_per_image);
-        let mut enum_members = FixedVec::new(budget, "enum_members", enum_member_entries)?;
-        for _ in 0..enum_member_entries {
-            enum_members
-                .push(EnumMember::EMPTY)
-                .expect("sized to enum member capacity");
-        }
+        let enum_member_images = EnumMemberImages::new(
+            budget,
+            enum_member_image_capacity(config),
+            enum_members_per_image,
+        )?;
         let mut pending_enum_members = FixedVec::new(
             budget,
             "pending_enum_members",
@@ -18630,13 +18631,11 @@ impl Storage {
             type_catalog: std::sync::Mutex::new(TypeCatalog {
                 domains,
                 enums,
-                enum_members,
                 pending_enum_members,
                 composites,
             }),
             enum_members_per_image,
-            enum_member_pending_base,
-            enum_member_replay_image,
+            enum_member_images,
             domain_graph_scratch: std::sync::Mutex::new(domain_graph_scratch),
             index_catalog: std::sync::Mutex::new(indexes),
             index_catalog_capacity: config.max_indexes,
@@ -20065,13 +20064,13 @@ impl Storage {
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                type_catalog.enums[target_slot] = definition;
                 let count = definition.member_count as usize;
-                let source = source_slot * self.enum_members_per_image;
-                let target = target_slot * self.enum_members_per_image;
-                type_catalog
-                    .enum_members
-                    .copy_within(source..source + count, target);
+                let source = definition.member_image.ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "cloned enum has no member image")
+                })?;
+                let image = EnumImageReservation::copy(&self.enum_member_images, source, count)?;
+                definition.member_image = Some(image.publish());
+                type_catalog.enums[target_slot] = definition;
             }
             for source_slot in 0..type_catalog.composites.len() {
                 let mut definition = type_catalog.composites[source_slot];
@@ -21488,11 +21487,7 @@ impl Storage {
             }
             for slot in 0..catalog.enums.len() {
                 if catalog.enums[slot].database == database {
-                    let pending = catalog.enums[slot]
-                        .pending_definition
-                        .take()
-                        .map(|pending| pending.member_slot);
-                    Self::clear_pending_enum_member_chain(&mut catalog, pending);
+                    self.release_enum_definition_images(&mut catalog, slot);
                     catalog.enums[slot].database = DatabaseOid::POSTGRES;
                     catalog.enums[slot].ddl_state = CatalogDdlState::Absent;
                 }
@@ -39208,7 +39203,7 @@ impl Storage {
 
     /// The definition of an enum named `name` (any schema) visible to `txid` —
     /// for resolving a column whose stored type identity is only the enum name.
-    pub fn enum_by_name(&self, name: &str, txid: u32) -> Option<EnumDefinition<'_>> {
+    pub fn enum_by_name(&self, name: &str, txid: u32) -> Option<EnumDefinition> {
         self.enum_slot_by_name(name, txid)
             .map(|slot| self.enum_for(slot, txid))
     }
@@ -39242,33 +39237,19 @@ impl Storage {
         })
     }
 
-    pub(crate) fn enum_for(&self, slot: usize, txid: u32) -> EnumDefinition<'_> {
-        let (definition, member_image, member_count) = {
+    pub(crate) fn enum_for(&self, slot: usize, txid: u32) -> EnumDefinition {
+        let (definition, image) = {
             let catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
-            let enumeration = catalog.enums[slot];
-            let definition = enumeration.definition_for(txid);
-            let (image, count) = enumeration
-                .pending_definition
-                .filter(|pending| pending.txid == txid)
-                .map_or((slot, enumeration.member_count), |pending| {
-                    (
-                        self.enum_member_pending_base + pending.member_slot as usize,
-                        pending.member_count,
-                    )
-                });
-            (
-                definition,
-                image * self.enum_members_per_image,
-                count as usize,
-            )
+            let definition = catalog.enums[slot].definition_for(txid);
+            let image = EnumImageRead::capture(&self.enum_member_images, definition.member_image);
+            (definition, image)
         };
         EnumDefinition {
-            catalog: &self.type_catalog,
-            member_image,
-            member_count,
+            image,
+            member_count: definition.member_count as usize,
             database: definition.database,
             created_at: definition.created_at,
             schema: definition.schema,
@@ -39314,9 +39295,10 @@ impl Storage {
         else {
             return false;
         };
-        let start = (self.enum_member_pending_base + pending.member_slot as usize)
-            * self.enum_members_per_image;
-        catalog.enum_members[start..start + pending.member_count as usize]
+        self.enum_member_images
+            .lock()
+            .expect("enum member-image lock poisoned")
+            .image_members(pending.image, pending.member_count as usize)
             .iter()
             .position(|member| member.label.as_str() == label)
             .is_some_and(|index| index >= pending.safe_member_count as usize)
@@ -39357,30 +39339,6 @@ impl Storage {
         None
     }
 
-    fn write_enum_member_image(
-        catalog: &mut TypeCatalog,
-        enum_members_per_image: usize,
-        image: usize,
-        members: &[EnumMember],
-    ) -> Result<u32, SqlError> {
-        if members.len() > enum_members_per_image {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "an enum type may have at most {} labels",
-                enum_members_per_image
-            ));
-        }
-        let count = u32::try_from(members.len()).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "enum label count exceeds durable representation"
-            )
-        })?;
-        let start = image * enum_members_per_image;
-        catalog.enum_members[start..start + members.len()].copy_from_slice(members);
-        Ok(count)
-    }
-
     pub(crate) fn enum_label_capacity(&self) -> usize {
         self.enum_members_per_image
     }
@@ -39396,13 +39354,11 @@ impl Storage {
                 self.enum_members_per_image
             ));
         }
-        let start = self.enum_member_replay_image * self.enum_members_per_image;
         Ok(EnumReplayMembers {
-            catalog: self
-                .type_catalog
+            images: self
+                .enum_member_images
                 .lock()
-                .expect("type catalog lock poisoned"),
-            start,
+                .expect("enum member-image lock poisoned"),
             count,
         })
     }
@@ -39425,21 +39381,17 @@ impl Storage {
         } else {
             self.create_enum(schema, name, EnumSpec { members: &[] }, 0)?
         };
-        let source = self.enum_member_replay_image * self.enum_members_per_image;
-        let target = slot * self.enum_members_per_image;
         let mut catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        catalog
-            .enum_members
-            .copy_within(source..source + count, target);
-        catalog.enums[slot].member_count = u32::try_from(count).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "enum label count exceeds durable representation"
-            )
-        })?;
+        let (image, count) = self
+            .enum_member_images
+            .lock()
+            .expect("enum member-image lock poisoned")
+            .replace_from_replay(catalog.enums[slot].member_image, count)?;
+        catalog.enums[slot].member_image = Some(image);
+        catalog.enums[slot].member_count = count;
         Ok(slot)
     }
 
@@ -39540,12 +39492,8 @@ impl Storage {
             class: AccessClass::Enum,
             slot: new as u16,
         });
-        let member_count = Self::write_enum_member_image(
-            &mut catalog,
-            self.enum_members_per_image,
-            new,
-            spec.members,
-        )?;
+        let image = EnumImageReservation::write(&self.enum_member_images, spec.members)?;
+        let member_count = image.count();
         catalog.enums[new] = EnumDef {
             database: current_database(),
             created_at,
@@ -39553,6 +39501,7 @@ impl Storage {
             name,
             ownership,
             member_count,
+            member_image: Some(image.publish()),
             pending_definition: None,
             ddl_state: if txid == 0 {
                 CatalogDdlState::Present
@@ -39659,7 +39608,7 @@ impl Storage {
         let Some(member_slot) = catalog
             .pending_enum_members
             .iter()
-            .position(|entry| !entry.used)
+            .position(|entry| entry.image.is_none())
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -39669,14 +39618,11 @@ impl Storage {
         let depth = previous.map_or(1, |previous| {
             catalog.pending_enum_members[previous as usize].depth + 1
         });
-        let member_count = Self::write_enum_member_image(
-            &mut catalog,
-            self.enum_members_per_image,
-            self.enum_member_pending_base + member_slot,
-            members,
-        )?;
+        let image = EnumImageReservation::write(&self.enum_member_images, members)?;
+        let member_count = image.count();
+        let image = image.publish();
         catalog.pending_enum_members[member_slot] = PendingEnumMemberSlot {
-            used: true,
+            image: Some(image),
             previous,
             depth,
         };
@@ -39690,6 +39636,7 @@ impl Storage {
             member_count,
             safe_member_count,
             member_slot: member_slot as u32,
+            image,
         });
         Ok(prior)
     }
@@ -39711,25 +39658,59 @@ impl Storage {
             .pending_definition
             .filter(|pending| pending.txid == txid)
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "enum alteration is not staged"))?;
-        let start = (self.enum_member_pending_base + pending.member_slot as usize)
-            * self.enum_members_per_image;
-        catalog.enum_members[start..start + pending.member_count as usize]
+        self.enum_member_images
+            .lock()
+            .expect("enum member-image lock poisoned")
+            .image_members(pending.image, pending.member_count as usize)
             .iter()
             .position(|member| member.label == label)
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "new enum label is not staged"))?;
         Ok(())
     }
 
-    fn release_pending_enum_members(catalog: &mut TypeCatalog, slot: u32) -> Option<u32> {
+    fn release_pending_enum_members(
+        &self,
+        catalog: &mut TypeCatalog,
+        slot: u32,
+        keep: Option<u32>,
+    ) -> Option<u32> {
         let pending = catalog.pending_enum_members[slot as usize];
         catalog.pending_enum_members[slot as usize] = PendingEnumMemberSlot::EMPTY;
+        if let Some(image) = pending.image
+            && Some(image) != keep
+        {
+            self.enum_member_images
+                .lock()
+                .expect("enum member-image lock poisoned")
+                .release(image);
+        }
         pending.previous
     }
 
-    fn clear_pending_enum_member_chain(catalog: &mut TypeCatalog, mut tail: Option<u32>) {
+    fn clear_pending_enum_member_chain(
+        &self,
+        catalog: &mut TypeCatalog,
+        mut tail: Option<u32>,
+        keep: Option<u32>,
+    ) {
         while let Some(slot) = tail {
-            tail = Self::release_pending_enum_members(catalog, slot);
+            tail = self.release_pending_enum_members(catalog, slot, keep);
         }
+    }
+
+    fn release_enum_definition_images(&self, catalog: &mut TypeCatalog, slot: usize) {
+        let pending = catalog.enums[slot]
+            .pending_definition
+            .take()
+            .map(|pending| pending.member_slot);
+        self.clear_pending_enum_member_chain(catalog, pending, None);
+        if let Some(image) = catalog.enums[slot].member_image.take() {
+            self.enum_member_images
+                .lock()
+                .expect("enum member-image lock poisoned")
+                .release(image);
+        }
+        catalog.enums[slot].member_count = 0;
     }
 
     pub(crate) fn commit_enum_alter(&mut self, slot: usize, txid: u32) {
@@ -39746,15 +39727,18 @@ impl Storage {
             };
             let definition = catalog.enums[slot].definition_for(txid);
             let previous = catalog.enums[slot];
-            let source = (self.enum_member_pending_base + pending.member_slot as usize)
-                * self.enum_members_per_image;
-            let target = slot * self.enum_members_per_image;
-            let count = pending.member_count as usize;
-            catalog
-                .enum_members
-                .copy_within(source..source + count, target);
             catalog.enums[slot] = definition;
-            Self::clear_pending_enum_member_chain(&mut catalog, Some(pending.member_slot));
+            self.clear_pending_enum_member_chain(
+                &mut catalog,
+                Some(pending.member_slot),
+                Some(pending.image),
+            );
+            if let Some(image) = previous.member_image {
+                self.enum_member_images
+                    .lock()
+                    .expect("enum member-image lock poisoned")
+                    .release(image);
+            }
             (definition.schema != previous.schema || definition.name != previous.name).then_some((
                 previous.schema,
                 previous.name,
@@ -39820,7 +39804,7 @@ impl Storage {
             .lock()
             .expect("type catalog lock poisoned");
         if let Some(current) = catalog.enums[slot].pending_definition {
-            Self::release_pending_enum_members(&mut catalog, current.member_slot);
+            self.release_pending_enum_members(&mut catalog, current.member_slot, None);
         }
         catalog.enums[slot].pending_definition = prior;
     }
@@ -39918,12 +39902,11 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        let pending = catalog.enums[slot]
-            .pending_definition
-            .take()
-            .map(|pending| pending.member_slot);
-        Self::clear_pending_enum_member_chain(&mut catalog, pending);
-        catalog.enums[slot].ddl_state = catalog.enums[slot].ddl_state.commit_drop();
+        let state = catalog.enums[slot].ddl_state.commit_drop();
+        if state == CatalogDdlState::Absent {
+            self.release_enum_definition_images(&mut catalog, slot);
+        }
+        catalog.enums[slot].ddl_state = state;
     }
 
     pub fn rollback_enum_create(&mut self, slot: usize) {
@@ -39931,7 +39914,11 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        catalog.enums[slot].ddl_state = catalog.enums[slot].ddl_state.rollback_create();
+        let state = catalog.enums[slot].ddl_state.rollback_create();
+        if state == CatalogDdlState::Absent {
+            self.release_enum_definition_images(&mut catalog, slot);
+        }
+        catalog.enums[slot].ddl_state = state;
     }
 
     pub fn rollback_enum_drop(&mut self, slot: usize, txid: u32) {
@@ -53163,7 +53150,7 @@ mod tests {
         }
     }
 
-    fn test_database_definition(name: &str) -> DatabaseDefinition {
+    pub(super) fn test_database_definition(name: &str) -> DatabaseDefinition {
         DatabaseDefinition::builtin(name, false, true, "C")
     }
 
@@ -55523,7 +55510,11 @@ mod tests {
             pending_enum_definition_capacity(&config)
         );
         assert_eq!(
-            type_catalog.enum_members.len(),
+            storage
+                .enum_member_images
+                .lock()
+                .expect("enum member-image lock poisoned")
+                .len(),
             enum_member_image_capacity(&config) * 96
         );
         assert_eq!(type_catalog.composites.len(), 29);
@@ -56685,7 +56676,7 @@ mod tests {
         assert_send_sync::<std::sync::Mutex<TypeCatalog>>();
         assert_send_sync::<DomainIter<'_>>();
         assert_send_sync::<EnumIter<'_>>();
-        assert_send_sync::<EnumMemberIter<'_>>();
+        assert_send_sync::<EnumMemberIter>();
         assert_send_sync::<CompositeIter<'_>>();
 
         const WORKERS: usize = 4;
@@ -56721,11 +56712,14 @@ mod tests {
                     enumeration.name = SqlName::parse(enum_name.as_str()).unwrap();
                     enumeration.member_count = 1;
                     enumeration.ddl_state = CatalogDdlState::Present;
-                    catalog.enums[worker] = enumeration;
-                    catalog.enum_members[worker * WORKERS] = EnumMember {
+                    let member = EnumMember {
                         label: SqlName::parse(label.as_str()).unwrap(),
                         sort: worker as f64 + 1.0,
                     };
+                    let image = EnumImageReservation::write(&storage.enum_member_images, &[member])
+                        .unwrap();
+                    enumeration.member_image = Some(image.publish());
+                    catalog.enums[worker] = enumeration;
 
                     let mut composite = CompositeDef::EMPTY;
                     composite.created_at = worker as u64 + 201;
@@ -56744,7 +56738,11 @@ mod tests {
         assert_eq!(catalog.enums.capacity(), WORKERS);
         assert_eq!(catalog.composites.capacity(), WORKERS);
         assert_eq!(
-            catalog.enum_members.capacity(),
+            storage
+                .enum_member_images
+                .lock()
+                .expect("enum member-image lock poisoned")
+                .len(),
             enum_member_image_capacity(&config) * WORKERS
         );
         assert_eq!(

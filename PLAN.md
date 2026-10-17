@@ -74,6 +74,10 @@ through changes and replacement. Reservations and history limits are fixed at
 startup. Table creation, uncommitted table edits, name lookup and changes to type
 references use ownership for each selected table. Waiting for one definition
 keeps shared allocators and catalogs available for unrelated storage work.
+Selected enum definitions retain their label images through alteration,
+rollback, drop, slot reuse, replay and database retirement. Readers and
+iterators keep the fixed label buffers alive independently of storage; type commits
+still require exclusive storage ownership.
 SQL writes and replay retain row bytes from append through publication and
 retries. Table rewrites keep transformed images in the fixed statement arena,
 release owners after errors, and reject replaced heap buffers before publication.

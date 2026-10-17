@@ -44872,7 +44872,7 @@ fn enum_column_in_use(
 }
 
 fn copy_enum_members<'a>(
-    definition: &crate::storage::EnumDefinition<'_>,
+    definition: &crate::storage::EnumDefinition,
     arena: &'a Arena,
 ) -> Result<&'a mut [crate::storage::EnumMember], SqlError> {
     let members = arena

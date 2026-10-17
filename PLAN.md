@@ -125,8 +125,8 @@ An unrelated cached write, including COPY and commit, can complete while a cold
 read waits. Atomic writes use the existing separate block client without
 replacing a suspended reader's socket, bytes or error. A write that needs an
 uncached block still waits synchronously and can download the same block again.
-Suspended statements retain their selected data view, command identity, clocks
-and original timeout; resuming does not start a fresh statement.
+A paused report keeps the same data view, start time and timeout until it
+finishes; resuming does not start a fresh statement.
 Checkpoint publication and object merges still wait for downloads to finish.
 Startup sizing and construction charge every object client, request-slot record,
 block scratch buffer and checkpoint workspace before serving queries.

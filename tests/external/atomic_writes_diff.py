@@ -27,23 +27,25 @@ class DownloadGate:
         self.started = threading.Event()
         self.release = threading.Event()
         self.failure_sent = threading.Event()
-        self.prefix = None
+        self.armed_key = None
         self.missing = False
         self.key = None
 
-    def arm(self, prefix, missing):
+    def arm(self, key, missing):
         with self.lock:
-            self.prefix, self.missing, self.key = prefix + "blocks/", missing, None
+            self.armed_key, self.missing, self.key = key, missing, key
             self.started.clear()
             self.release.clear()
             self.failure_sent.clear()
 
+    def disarm(self):
+        with self.lock:
+            self.armed_key = None
+
     def wait(self, command, key):
         with self.lock:
-            claimed = command == "GET" and self.prefix and key.startswith(self.prefix)
-            if claimed:
-                self.prefix, self.key = None, key
-                missing = self.missing
+            claimed = command == "GET" and key == self.armed_key
+            missing = self.missing
         if not claimed:
             return
         self.started.set()
@@ -228,6 +230,14 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
         setup(connection, schema)
         connection.execute("CHECKPOINT")
     node.stop()
+    blocks = object_root / "atomic-write-test" / prefix / "blocks"
+    candidates = [path for path in blocks.iterdir()
+        if path.is_file() and b"cold ten" in path.read_bytes()]
+    assert len(candidates) == 1, "fixture needs one object containing its required cold invoice value"
+    target = candidates[0]
+    target_bytes = target.read_bytes()
+    assert b"warm one" not in target_bytes, "invoice fault must not target the cached order"
+    target_key = target.relative_to(object_root / "atomic-write-test").as_posix()
     node.wipe_cache()
     node.start()
     with node.connect() as writer, node.connect() as reader:
@@ -235,7 +245,9 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
         writer.execute(f"SELECT note FROM {schema}.warm_orders WHERE id = 1").fetchall()
         head = object_root / "atomic-write-test" / prefix / "commit-head"
         before = head.read_bytes()
-        gate.arm(prefix, missing)
+        # Lookahead can request a block that the final plan never consumes.
+        # Hold every request for the object containing a required result value.
+        gate.arm(target_key, missing)
         with ThreadPoolExecutor(max_workers=2) as workers:
             pending = workers.submit(result, reader, report)
             try:
@@ -260,6 +272,7 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
             else:
                 actual_report = pending.result(timeout=5)
                 assert actual_report == expected_report, (actual_report, expected_report)
+            gate.disarm()
             assert current_state(writer, schema) == expected_write["state"]
     node.stop(crash=True)
     node.wipe_cache()
@@ -272,6 +285,7 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
         "postgresql_matches": True, "snapshot_preserved": not missing,
         "durable_ack_before_release": True, "cold_recovery": True,
         "commit_head_sha256": hashlib.sha256(after).hexdigest(),
+        "held_object_sha256": hashlib.sha256(target_bytes).hexdigest(),
         "state": expected_write["state"]}, sort_keys=True), flush=True)
 
 
@@ -333,6 +347,7 @@ def main():
                     with ExitStack() as case_resources:
                         case_resources.callback(reference.execute, f"DROP SCHEMA IF EXISTS {schema} CASCADE")
                         case_resources.callback(node.stop)
+                        case_resources.callback(gate.disarm)
                         case_resources.callback(gate.release.set)
                         scenario(reference, node, gate, object_root, prefix, missing, schema)
             print("ok: atomic writes match PostgreSQL during held GETs; both cold recoveries passed", flush=True)

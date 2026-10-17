@@ -61807,6 +61807,81 @@ fn joins_are_not_capped_at_eight_edges() {
 }
 
 #[test]
+fn index_file_owners_unrelated_commits_preserve_index_access_for_an_older_snapshot() {
+    let mut config = test_config("index-owner-snapshot-plans");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.value_index_rows = 1;
+    config.object_store_bucket = format!("index-owner-snapshot-plans-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    writer.success(
+        &mut engine,
+        "CREATE TABLE index_invoices(id integer PRIMARY KEY, note text); \
+         CREATE INDEX covered_invoice ON index_invoices(id) INCLUDE(note); \
+         INSERT INTO index_invoices VALUES (1, 'old'), (2, 'second'); \
+         CREATE TABLE unrelated_orders(id integer PRIMARY KEY); \
+         INSERT INTO unrelated_orders VALUES (1)",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    reader.success(&mut engine, "BEGIN ISOLATION LEVEL REPEATABLE READ", true);
+    let query = "SELECT id, note FROM index_invoices WHERE id = 1 ORDER BY id";
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, query, true)),
+        ["1|old"]
+    );
+    writer.success(&mut engine, "INSERT INTO unrelated_orders VALUES (2)", true);
+    let plan = data_rows(&reader.success(
+        &mut engine,
+        "EXPLAIN SELECT id, note FROM index_invoices WHERE id = 1 ORDER BY id",
+        true,
+    ));
+    assert!(
+        plan.iter()
+            .any(|row| row.contains("Index Only Scan using covered_invoice")),
+        "{plan:?}"
+    );
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, query, true)),
+        ["1|old"]
+    );
+    writer.success(
+        &mut engine,
+        "UPDATE index_invoices SET note = 'new' WHERE id = 1",
+        true,
+    );
+    let plan = data_rows(&reader.success(
+        &mut engine,
+        "EXPLAIN SELECT id, note FROM index_invoices WHERE id = 1 ORDER BY id",
+        true,
+    ));
+    assert!(
+        plan.iter().all(|row| !row.contains("Index Only Scan")),
+        "{plan:?}"
+    );
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, query, true)),
+        ["1|old"]
+    );
+    reader.success(&mut engine, "COMMIT", true);
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, query, true)),
+        ["1|new"]
+    );
+    drop(reader);
+    drop(writer);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn uniqueness_cache_capacity_never_limits_table_correctness() {
     let mut config = test_config("value-index-cache-capacity");
     config.table_rows = 32;

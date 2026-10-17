@@ -131,6 +131,8 @@ Its selected saved row and index files stay protected after a scan, nested call
 or statement arena is released; their owners follow the statement through waits.
 An index's saved files are protected before its published reference can change.
 Index callbacks release the block-store lock before calling nested reads.
+Index eligibility uses that table's binding changes and saved generations;
+an unrelated commit does not switch a paused lookup to a different access path.
 Index and selected-column read buffers retain completed data across waits;
 their verified identities do not depend on shared-cache residency.
 Checkpoint publication and object merges still wait for downloads to finish.

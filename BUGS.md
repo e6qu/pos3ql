@@ -4,9 +4,8 @@ This file records defects whose repair is prevented by an external blocker
 or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
-No externally blocked defects are currently recorded. Coordinating checkpoint
-publication and deletion with retained readers, independent storage work and
-execution workers remains in PLAN.md. Completed
+No externally blocked defects are currently recorded. The remaining work on
+checkpoint publication, object deletion and execution workers is tracked in PLAN.md. Completed
 contracts and limits belong in their owning technical guides.
 
 For a new entry, include a reproducer, affected boundary, observed behavior,

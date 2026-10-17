@@ -2249,6 +2249,38 @@ mod tests {
     }
 
     #[test]
+    fn index_file_owners_snapshot_eligibility_uses_binding_changes_and_saved_generation() {
+        let fixture = index_fixture("index-owner-snapshot", false);
+        let IndexFixture {
+            storage,
+            table,
+            handle,
+            ..
+        } = &fixture;
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_commit_snapshot(7);
+            assert!(storage.value_indexes_match_snapshot(*table));
+            storage.tables[*table].publication().enforcers[0]
+                .as_mut()
+                .unwrap()
+                .durable_dirty_lsn = 9;
+            assert!(!storage.value_indexes_match_snapshot(*table));
+            storage.set_commit_snapshot(9);
+            assert!(storage.value_indexes_match_snapshot(*table));
+            storage.tables[*table].publication().enforcers[0]
+                .as_mut()
+                .unwrap()
+                .durable = Some(ValueIndexHandle {
+                published_lsn: 11,
+                ..*handle
+            });
+            assert!(!storage.value_indexes_match_snapshot(*table));
+            storage.set_commit_snapshot(11);
+            assert!(storage.value_indexes_match_snapshot(*table));
+        });
+    }
+
+    #[test]
     fn statement_files_scopes_retain_deduplicate_and_release_selected_roots() {
         let config = test_config();
         let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));

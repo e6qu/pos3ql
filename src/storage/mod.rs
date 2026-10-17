@@ -32832,6 +32832,22 @@ impl Storage {
             .is_some_and(|enforcer| enforcer.cache.read().is_complete_at(self.commit_snapshot()))
     }
 
+    /// An unrelated commit cannot invalidate this table's selected index view.
+    /// A newer key, predicate, payload or saved generation still excludes it.
+    pub(crate) fn value_indexes_match_snapshot(&self, table_index: usize) -> bool {
+        let snapshot = self.commit_snapshot();
+        let publication = self.tables[table_index].publication();
+        publication.enforcers[..publication.n_enforcers]
+            .iter()
+            .flatten()
+            .all(|enforcer| {
+                enforcer.durable_dirty_lsn <= snapshot
+                    && enforcer
+                        .durable
+                        .is_none_or(|handle| handle.published_lsn <= snapshot)
+            })
+    }
+
     pub(crate) fn value_binding_probe_complete(&self, table_index: usize, binding: usize) -> bool {
         self.tables[table_index]
             .enforcer(binding)

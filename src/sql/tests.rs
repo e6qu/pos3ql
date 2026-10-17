@@ -72391,8 +72391,8 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
     assert_eq!(remaining, 0);
     assert!(beats > 1, "maintenance was not paced across dispatch beats");
     assert_eq!(
-        maintenance_lists, 5,
-        "backup retention scans once; commit pruning twice; legacy and block garbage once each"
+        maintenance_lists, 4,
+        "backup retention, commit pruning, legacy and block garbage each scan once"
     );
 
     drop(engine);

@@ -89,11 +89,30 @@ pub(crate) struct StatementSnapshotLease {
     identity: NonZeroU64,
     owner: WaitOwner,
     lsn: u64,
+    files: super::spill_generations::StatementFileLease,
 }
 
 impl StatementSnapshotLease {
     pub(crate) fn snapshot(&self) -> u64 {
         self.lsn
+    }
+
+    pub(crate) fn validate_storage(&self, storage: &Storage) -> Result<(), SqlError> {
+        if !Arc::ptr_eq(&self.snapshots, &storage.snapshots) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "statement snapshot belongs to another storage instance"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn enter_files(
+        &self,
+        storage: &Storage,
+    ) -> Result<super::StatementFileScope, SqlError> {
+        self.validate_storage(storage)?;
+        self.files.enter()
     }
 }
 
@@ -252,6 +271,7 @@ impl Storage {
                 snapshots.statements.capacity()
             ));
         }
+        let files = self.spill_roots.retain_statement()?;
         let lsn = select(self.lsn());
         snapshots
             .statements
@@ -268,6 +288,7 @@ impl Storage {
             identity: next,
             owner,
             lsn,
+            files,
         })
     }
     pub(crate) fn end_transaction_snapshots(&self, transaction: u32) {

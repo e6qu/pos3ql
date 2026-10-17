@@ -670,6 +670,27 @@ readers. Garbage collection copies retained root references before object I/O.
 Releasing a root used by a durable garbage pass schedules more maintenance even
 without another write. Active backups also retain their reachable objects.
 
+A paused report retains its selected saved row files after its scans and
+statement arena are released. For example, nested order and invoice reads can
+finish their individual walks while the outer report still needs those files.
+Resuming adds any newly selected files to the same statement owner. Completion,
+SQL errors, cancellation, rollback and timeout release it; an executing scope
+keeps its files even if its snapshot or Storage instance is retired first.
+Streamed COPY restores that owner for each data message and keeps files selected
+by its triggers until completion or abort, including while it waits for input.
+Checkpoint publication and merges still wait for pending downloads.
+
+File owners use the same 1,024 slots per query workspace as statement snapshots,
+independent of connection count and the separate 64-slot point-source pool.
+Each shared unique-row-file slot reserves one membership bit per statement slot
+at startup; repeated aliases share that bit. SQLSTATE `54000` reports
+"statement file owners are exhausted (N)", "statement file identity exhausted",
+"statement file references exhausted" or "statement file scope nesting exhausted".
+File-owner exhaustion fails before selecting or registering a snapshot; it does
+not grow memory or partly pin another file.
+A snapshot used with another storage instance returns `XX000`, "statement
+snapshot belongs to another storage instance", before selecting its file context.
+
 ### What publication may change
 
 Row publication prepares keys before taking metadata ownership and verifies

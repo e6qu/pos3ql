@@ -51677,17 +51677,22 @@ impl CopySetup {
         *self.snapshot_lease.get_mut().unwrap() = lease;
     }
 
-    fn restore_snapshot(&self, storage: &Storage) {
-        let snapshot = self
-            .snapshot_lease
-            .lock()
-            .unwrap()
+    pub(super) fn restore_snapshot(
+        &self,
+        storage: &Storage,
+    ) -> Result<Option<crate::storage::StatementFileScope>, SqlError> {
+        let lease = self.snapshot_lease.lock().unwrap();
+        let snapshot = lease.as_ref().map(|lease| lease.snapshot());
+        let files = lease
             .as_ref()
-            .map(|lease| lease.snapshot());
+            .map(|lease| lease.enter_files(storage))
+            .transpose()?;
+        drop(lease);
         if let Some(snapshot) = snapshot {
             storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
             storage.set_commit_snapshot(snapshot);
         }
+        Ok(files)
     }
 
     pub(crate) fn release_snapshot(&self) {
@@ -52404,6 +52409,7 @@ pub(crate) fn copy_statement_begin(
     responder: &mut Responder,
     scratch: &mut DmlScratch,
 ) -> Result<(), SqlError> {
+    let _files = setup.restore_snapshot(storage)?;
     let definition = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;
@@ -52452,7 +52458,7 @@ pub(crate) fn copy_statement_end(
     scratch: &mut DmlScratch,
     inserted: &CopyTransitionRows,
 ) -> Result<(), SqlError> {
-    setup.restore_snapshot(storage);
+    let _files = setup.restore_snapshot(storage)?;
     let definition = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;
@@ -52505,7 +52511,7 @@ pub fn copy_match_header(
     line: &[u8],
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    setup.restore_snapshot(storage);
+    let _files = setup.restore_snapshot(storage)?;
     let def = storage.table_def(setup.table_index, setup.txid);
     let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
     let count = if setup.fmt.csv {
@@ -52580,7 +52586,7 @@ pub(crate) fn copy_row(
     scratch: &mut DmlScratch,
     inserted: &mut CopyTransitionRows,
 ) -> Result<CopyRowOutcome, SqlError> {
-    setup.restore_snapshot(storage);
+    let _files = setup.restore_snapshot(storage)?;
     let def = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;
@@ -52711,7 +52717,7 @@ pub(crate) fn copy_row_binary(
     scratch: &mut DmlScratch,
     inserted: &mut CopyTransitionRows,
 ) -> Result<CopyRowOutcome, SqlError> {
-    setup.restore_snapshot(storage);
+    let _files = setup.restore_snapshot(storage)?;
     let def = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;

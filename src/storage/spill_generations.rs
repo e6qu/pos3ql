@@ -1,7 +1,8 @@
 //! Owned immutable SST roots retained until their readers release them.
 
+use core::cell::Cell;
 use core::mem::size_of;
-use core::num::NonZeroUsize;
+use core::num::{NonZeroU64, NonZeroUsize};
 use core::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -272,8 +273,177 @@ struct PinnedRoot {
     garbage_retained: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StatementFileIdentity {
+    slot: usize,
+    serial: NonZeroU64,
+}
+
+#[derive(Clone, Copy)]
+struct StatementFileOwner {
+    serial: NonZeroU64,
+    references: NonZeroUsize,
+    has_roots: bool,
+}
+
+struct RetainedRootState {
+    roots: FixedVec<PinnedRoot>,
+    statements: FixedVec<Option<StatementFileOwner>>,
+    members: FixedVec<u64>,
+    words_per_root: usize,
+    next_statement: u64,
+}
+
+impl Deref for RetainedRootState {
+    type Target = FixedVec<PinnedRoot>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.roots
+    }
+}
+
+impl DerefMut for RetainedRootState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.roots
+    }
+}
+
+impl RetainedRootState {
+    fn contains_statement(&self, root: usize, statement: StatementFileIdentity) -> bool {
+        self.members[root * self.words_per_root + statement.slot / 64]
+            & (1u64 << (statement.slot % 64))
+            != 0
+    }
+
+    fn set_statement(&mut self, root: usize, statement: StatementFileIdentity, present: bool) {
+        let word = &mut self.members[root * self.words_per_root + statement.slot / 64];
+        let mask = 1u64 << (statement.slot % 64);
+        if present {
+            *word |= mask;
+        } else {
+            *word &= !mask;
+        }
+    }
+
+    /// Dense removal moves the membership row with its immutable root.
+    fn remove_root(&mut self, position: usize) -> PinnedRoot {
+        let last = self.roots.len() - 1;
+        let width = self.words_per_root;
+        debug_assert!(
+            self.members[position * width..(position + 1) * width]
+                .iter()
+                .all(|word| *word == 0)
+        );
+        self.members
+            .copy_within(last * width..(last + 1) * width, position * width);
+        self.members[last * width..(last + 1) * width].fill(0);
+        self.roots.swap_remove(position)
+    }
+
+    fn statement_mut(&mut self, identity: StatementFileIdentity) -> &mut StatementFileOwner {
+        self.statements[identity.slot]
+            .as_mut()
+            .filter(|owner| owner.serial == identity.serial)
+            .expect("statement file lease owns a live identity")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SelectedStatementFiles {
+    registry: usize,
+    identity: StatementFileIdentity,
+}
+
+thread_local! {
+    static SELECTED_STATEMENT_FILES: Cell<Option<SelectedStatementFiles>> = const { Cell::new(None) };
+    static STATEMENT_FILE_SCOPE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+#[must_use = "the statement must retain its selected files until execution ends"]
+pub(super) struct StatementFileLease {
+    registry: Arc<SpillRootRegistry>,
+    identity: StatementFileIdentity,
+}
+
+/// A nested execution adds its selected files to the outer statement owner.
+/// The scope owns a reference, so moving or releasing a snapshot cannot retire
+/// its files while execution still uses the selected context.
+#[must_use = "file selection must stay scoped to the executing statement"]
+pub(crate) struct StatementFileScope {
+    _lease: StatementFileLease,
+    previous: Option<SelectedStatementFiles>,
+    depth: usize,
+    thread: core::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl StatementFileLease {
+    pub(super) fn enter(&self) -> Result<StatementFileScope, SqlError> {
+        let previous = SELECTED_STATEMENT_FILES.with(Cell::get);
+        let depth = STATEMENT_FILE_SCOPE_DEPTH
+            .with(Cell::get)
+            .checked_add(1)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement file scope nesting exhausted"
+                )
+            })?;
+        let registry = Arc::as_ptr(&self.registry) as usize;
+        let identity = previous
+            .filter(|selected| selected.registry == registry)
+            .map_or(self.identity, |selected| selected.identity);
+        let mut state = self
+            .registry
+            .roots
+            .lock()
+            .expect("retained SST root lock poisoned");
+        let owner = state.statement_mut(identity);
+        owner.references = owner.references.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "statement file references exhausted"
+            )
+        })?;
+        drop(state);
+        SELECTED_STATEMENT_FILES.with(|selected| {
+            selected.set(Some(SelectedStatementFiles { registry, identity }));
+        });
+        STATEMENT_FILE_SCOPE_DEPTH.with(|current| current.set(depth));
+        Ok(StatementFileScope {
+            _lease: Self {
+                registry: Arc::clone(&self.registry),
+                identity,
+            },
+            previous,
+            depth,
+            thread: core::marker::PhantomData,
+        })
+    }
+}
+
+impl Drop for StatementFileScope {
+    fn drop(&mut self) {
+        // An out-of-order exit must not install a retired owner's context.
+        STATEMENT_FILE_SCOPE_DEPTH.with(|depth| {
+            assert_eq!(
+                depth.get(),
+                self.depth,
+                "statement file scopes must exit in reverse entry order"
+            );
+            depth.set(self.depth - 1);
+        });
+        SELECTED_STATEMENT_FILES.with(|selected| selected.set(self.previous));
+    }
+}
+
+impl Drop for StatementFileLease {
+    fn drop(&mut self) {
+        self.registry.release_statement(self.identity);
+    }
+}
+
 pub(super) struct SpillRootRegistry {
-    roots: Mutex<FixedVec<PinnedRoot>>,
+    roots: Mutex<RetainedRootState>,
     reclamation_pending: AtomicBool,
 }
 
@@ -285,9 +455,17 @@ impl SpillRootRegistry {
     }
 
     pub(super) fn budget_bytes(config: &Config) -> usize {
-        size_of::<Self>()
-            + 2 * size_of::<std::sync::atomic::AtomicUsize>()
-            + Self::capacity(config) * size_of::<PinnedRoot>()
+        (size_of::<Self>() + 2 * size_of::<std::sync::atomic::AtomicUsize>())
+            .saturating_add(Self::capacity(config).saturating_mul(size_of::<PinnedRoot>()))
+            .saturating_add(
+                super::statement_snapshot_capacity(config)
+                    .saturating_mul(size_of::<Option<StatementFileOwner>>()),
+            )
+            .saturating_add(
+                Self::capacity(config)
+                    .saturating_mul(super::statement_snapshot_capacity(config).div_ceil(64))
+                    .saturating_mul(size_of::<u64>()),
+            )
     }
 
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Arc<Self>, BudgetError> {
@@ -296,14 +474,107 @@ impl SpillRootRegistry {
             "retained SST root owner",
         )?;
         let roots = FixedVec::new(budget, "retained SST roots", Self::capacity(config))?;
+        let statement_capacity = super::statement_snapshot_capacity(config);
+        let mut statements = FixedVec::new(budget, "statement file owners", statement_capacity)?;
+        for _ in 0..statement_capacity {
+            statements
+                .push(None)
+                .expect("reserved statement file owners");
+        }
+        let words_per_root = statement_capacity.div_ceil(64);
+        let member_capacity = Self::capacity(config).saturating_mul(words_per_root);
+        let mut members = FixedVec::new(budget, "statement file membership", member_capacity)?;
+        for _ in 0..member_capacity {
+            members.push(0).expect("reserved statement file membership");
+        }
         Ok(Arc::new(Self {
-            roots: Mutex::new(roots),
+            roots: Mutex::new(RetainedRootState {
+                roots,
+                statements,
+                members,
+                words_per_root,
+                next_statement: 0,
+            }),
             reclamation_pending: AtomicBool::new(false),
         }))
     }
 
+    pub(super) fn retain_statement(self: &Arc<Self>) -> Result<StatementFileLease, SqlError> {
+        let mut state = self.roots.lock().expect("retained SST root lock poisoned");
+        let serial = state
+            .next_statement
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement file identity exhausted"
+                )
+            })?;
+        let slot = state
+            .statements
+            .iter()
+            .position(Option::is_none)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement file owners are exhausted ({})",
+                    state.statements.len()
+                )
+            })?;
+        state.statements[slot] = Some(StatementFileOwner {
+            serial,
+            references: NonZeroUsize::new(1).expect("nonzero"),
+            has_roots: false,
+        });
+        state.next_statement = serial.get();
+        Ok(StatementFileLease {
+            registry: Arc::clone(self),
+            identity: StatementFileIdentity { slot, serial },
+        })
+    }
+
+    fn release_statement(&self, identity: StatementFileIdentity) {
+        let mut state = self.roots.lock().expect("retained SST root lock poisoned");
+        let owner = state.statement_mut(identity);
+        if let Some(remaining) = NonZeroUsize::new(owner.references.get() - 1) {
+            owner.references = remaining;
+            return;
+        }
+        // Nested snapshots borrow the outer file owner; retiring their unused
+        // slots must not scan another statement's retained files.
+        if !owner.has_roots {
+            state.statements[identity.slot] = None;
+            return;
+        }
+        let mut position = 0;
+        while position < state.len() {
+            if state.contains_statement(position, identity) {
+                state.set_statement(position, identity, false);
+                if let Some(remaining) = NonZeroUsize::new(state[position].readers.get() - 1) {
+                    state[position].readers = remaining;
+                } else {
+                    let retired = state.remove_root(position);
+                    if retired.durable && retired.garbage_retained {
+                        self.reclamation_pending.store(true, Ordering::Release);
+                    }
+                    continue;
+                }
+            }
+            position += 1;
+        }
+        state.statements[identity.slot] = None;
+    }
+
     fn pin(&self, handles: &[SstHandle], durable: bool) -> Result<(), SqlError> {
         let mut roots = self.roots.lock().expect("retained SST root lock poisoned");
+        let statement = SELECTED_STATEMENT_FILES
+            .with(Cell::get)
+            .filter(|selected| selected.registry == self as *const Self as usize)
+            .map(|selected| selected.identity);
+        if let Some(identity) = statement {
+            roots.statement_mut(identity);
+        }
         let mut needed = 0;
         for (index, handle) in handles.iter().enumerate() {
             if !roots
@@ -314,12 +585,19 @@ impl SpillRootRegistry {
                 needed += 1;
             }
         }
-        for root in roots.iter() {
+        for (position, root) in roots.iter().enumerate() {
             let count = handles
                 .iter()
                 .filter(|handle| **handle == root.handle && root.durable == durable)
                 .count();
-            if root.readers.checked_add(count).is_none() {
+            let statement_pin = count != 0
+                && statement.is_some_and(|identity| !roots.contains_statement(position, identity));
+            if root
+                .readers
+                .checked_add(count)
+                .and_then(|count| count.checked_add(usize::from(statement_pin)))
+                .is_none()
+            {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "retained SST reader count exhausted"
@@ -334,24 +612,40 @@ impl SpillRootRegistry {
             ));
         }
         for handle in handles {
-            if let Some(root) = roots
-                .iter_mut()
-                .find(|root| root.handle == *handle && root.durable == durable)
+            if let Some(position) = roots
+                .iter()
+                .position(|root| root.handle == *handle && root.durable == durable)
             {
+                let statement_pin =
+                    statement.is_some_and(|identity| !roots.contains_statement(position, identity));
+                let root = &mut roots[position];
                 root.readers = root
                     .readers
-                    .checked_add(1)
+                    .checked_add(1 + usize::from(statement_pin))
                     .expect("preflighted reader count");
+                if let Some(identity) = statement {
+                    roots.set_statement(position, identity, true);
+                }
             } else {
+                let position = roots.len();
                 roots
                     .push(PinnedRoot {
                         handle: *handle,
                         durable,
-                        readers: NonZeroUsize::new(1).expect("nonzero"),
+                        readers: NonZeroUsize::new(1 + usize::from(statement.is_some()))
+                            .expect("nonzero"),
                         garbage_retained: false,
                     })
                     .expect("preflighted root capacity");
+                if let Some(identity) = statement {
+                    roots.set_statement(position, identity, true);
+                }
             }
+        }
+        if !handles.is_empty()
+            && let Some(identity) = statement
+        {
+            roots.statement_mut(identity).has_roots = true;
         }
         Ok(())
     }
@@ -366,7 +660,7 @@ impl SpillRootRegistry {
             if let Some(remaining) = NonZeroUsize::new(roots[position].readers.get() - 1) {
                 roots[position].readers = remaining;
             } else {
-                let retired = roots.swap_remove(position);
+                let retired = roots.remove_root(position);
                 if retired.durable && retired.garbage_retained {
                     self.reclamation_pending.store(true, Ordering::Release);
                 }
@@ -1287,6 +1581,318 @@ mod tests {
     }
 
     #[test]
+    fn statement_files_scopes_retain_deduplicate_and_release_selected_roots() {
+        let config = test_config();
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        let mut retained = Vec::with_capacity(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let owner = registry.retain_statement().unwrap();
+            let scope = owner.enter().unwrap();
+            let selected = [handle(1), handle(1), handle(5)];
+            registry.pin(&selected, true).unwrap();
+            registry.release(&selected, true);
+            for _ in 0..128 {
+                registry.pin(&selected, true).unwrap();
+                registry.release(&selected, true);
+            }
+            assert!(
+                registry
+                    .roots
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|root| root.readers.get() == 1)
+            );
+            drop(scope);
+            registry.copy_roots(true, &mut retained).unwrap();
+            assert_eq!(retained, [handle(1), handle(5)]);
+            assert!(!registry.take_reclamation_pending());
+            drop(owner);
+            registry.copy_roots(true, &mut retained).unwrap();
+            assert!(retained.is_empty());
+            assert!(registry.take_reclamation_pending());
+            assert!(!registry.take_reclamation_pending());
+        });
+    }
+
+    #[test]
+    fn statement_files_nested_scopes_keep_child_files_with_the_outer_statement() {
+        let config = test_config();
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let mut retained = Vec::with_capacity(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let outer = registry.retain_statement().unwrap();
+            let outer_scope = outer.enter().unwrap();
+            registry.pin(&[handle(1)], false).unwrap();
+            registry.release(&[handle(1)], false);
+            let inner = registry.retain_statement().unwrap();
+            let inner_scope = inner.enter().unwrap();
+            registry.pin(&[handle(5)], true).unwrap();
+            registry.release(&[handle(5)], true);
+            drop(inner_scope);
+            drop(inner);
+            registry.copy_roots(true, &mut retained).unwrap();
+            assert_eq!(retained, [handle(5)]);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert_eq!(retained, [handle(1)]);
+            drop(outer_scope);
+            drop(outer);
+            assert!(registry.roots.lock().unwrap().is_empty());
+            assert!(registry.take_reclamation_pending());
+        });
+    }
+
+    #[test]
+    fn statement_files_miri_dense_root_moves_preserve_other_statement_memberships() {
+        let config = test_config();
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let mut retained = Vec::with_capacity(3);
+        crate::mem::guard::forbid_alloc(|| {
+            let first = registry.retain_statement().unwrap();
+            let second = registry.retain_statement().unwrap();
+            let temporary = registry.retain_statement().unwrap();
+            for (owner, root, durable) in [
+                (&first, handle(1), true),
+                (&second, handle(5), true),
+                (&temporary, handle(1), false),
+            ] {
+                let scope = owner.enter().unwrap();
+                registry.pin(&[root], durable).unwrap();
+                registry.release(&[root], durable);
+                drop(scope);
+            }
+            registry.copy_roots(true, &mut retained).unwrap();
+            registry.copy_roots(false, &mut retained).unwrap();
+            drop(first);
+            assert!(registry.take_reclamation_pending());
+            registry.copy_roots(true, &mut retained).unwrap();
+            assert_eq!(retained, [handle(5)]);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert_eq!(retained, [handle(1)]);
+            drop(second);
+            assert!(registry.take_reclamation_pending());
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert_eq!(retained, [handle(1)]);
+            drop(temporary);
+            assert!(!registry.take_reclamation_pending());
+            assert!(registry.roots.lock().unwrap().is_empty());
+            let reused = registry.retain_statement().unwrap();
+            let scope = reused.enter().unwrap();
+            registry.pin(&[handle(9)], true).unwrap();
+            registry.release(&[handle(9)], true);
+            drop(scope);
+            drop(reused);
+            assert!(registry.roots.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn statement_files_miri_execution_scope_outlives_its_snapshot_and_registry_owner() {
+        let config = test_config();
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let weak = Arc::downgrade(&registry);
+        let mut retained = Vec::with_capacity(1);
+        crate::mem::guard::forbid_alloc(|| {
+            let owner = registry.retain_statement().unwrap();
+            let scope = owner.enter().unwrap();
+            registry.pin(&[handle(1)], true).unwrap();
+            registry.release(&[handle(1)], true);
+            drop(owner);
+            drop(registry);
+            let remaining = weak.upgrade().unwrap();
+            remaining.copy_roots(true, &mut retained).unwrap();
+            assert_eq!(retained, [handle(1)]);
+            drop(scope);
+            assert!(remaining.roots.lock().unwrap().is_empty());
+            drop(remaining);
+            assert!(weak.upgrade().is_none());
+        });
+    }
+
+    #[test]
+    fn statement_files_owner_capacity_and_identity_reuse_are_exact() {
+        let mut config = test_config();
+        config.max_connections = 1;
+        let capacity = super::super::statement_snapshot_capacity(&config);
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        assert!(capacity > config.max_connections as usize);
+        let mut leases = Vec::with_capacity(capacity);
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..capacity {
+                leases.push(registry.retain_statement().unwrap());
+            }
+            let before = registry.roots.lock().unwrap().next_statement;
+            let error = registry.retain_statement().err().unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("statement file owners"));
+            assert_eq!(registry.roots.lock().unwrap().next_statement, before);
+            let last = leases.pop().unwrap();
+            let prior = last.identity;
+            drop(last);
+            let reused = registry.retain_statement().unwrap();
+            assert_eq!(reused.identity.slot, prior.slot);
+            assert_ne!(reused.identity.serial, prior.serial);
+            drop(reused);
+            leases.clear();
+            registry.roots.lock().unwrap().next_statement = u64::MAX;
+            let error = registry.retain_statement().err().unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(error.message.as_str(), "statement file identity exhausted");
+            assert!(
+                registry
+                    .roots
+                    .lock()
+                    .unwrap()
+                    .statements
+                    .iter()
+                    .all(Option::is_none)
+            );
+        });
+    }
+
+    #[test]
+    fn statement_files_reference_and_root_failures_preserve_existing_owners() {
+        let mut config = test_config();
+        config.max_tables = 1;
+        config.max_spill_generations_per_table = 1;
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let owner = registry.retain_statement().unwrap();
+            STATEMENT_FILE_SCOPE_DEPTH.with(|depth| depth.set(usize::MAX));
+            assert_eq!(
+                owner.enter().err().unwrap().message.as_str(),
+                "statement file scope nesting exhausted"
+            );
+            assert!(SELECTED_STATEMENT_FILES.with(Cell::get).is_none());
+            STATEMENT_FILE_SCOPE_DEPTH.with(|depth| depth.set(0));
+            registry
+                .roots
+                .lock()
+                .unwrap()
+                .statement_mut(owner.identity)
+                .references = NonZeroUsize::new(usize::MAX).unwrap();
+            assert_eq!(
+                owner.enter().err().unwrap().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert!(SELECTED_STATEMENT_FILES.with(Cell::get).is_none());
+            registry
+                .roots
+                .lock()
+                .unwrap()
+                .statement_mut(owner.identity)
+                .references = NonZeroUsize::new(1).unwrap();
+            registry.pin(&[handle(1), handle(5)], true).unwrap();
+            let scope = owner.enter().unwrap();
+            registry.roots.lock().unwrap()[0].readers = NonZeroUsize::new(usize::MAX).unwrap();
+            assert_eq!(
+                registry
+                    .pin(&[handle(1), handle(5)], true)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            {
+                let mut state = registry.roots.lock().unwrap();
+                assert!(state.members.iter().all(|word| *word == 0));
+                assert_eq!(state[1].readers.get(), 1);
+                state[0].readers = NonZeroUsize::new(1).unwrap();
+            }
+            let selected = [handle(1), handle(1), handle(9), handle(13)];
+            registry.pin(&selected, true).unwrap();
+            registry.release(&selected, true);
+            assert_eq!(
+                registry.pin(&[handle(17)], true).unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            registry.release(&[handle(1), handle(5)], true);
+            drop(scope);
+            drop(owner);
+            assert!(registry.roots.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn statement_files_nested_storage_scopes_restore_their_own_registry() {
+        let config = test_config();
+        let mut budget = Budget::new(2 * SpillRootRegistry::budget_bytes(&config));
+        let first = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let second = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let outer = first.retain_statement().unwrap();
+            let inner = second.retain_statement().unwrap();
+            let outer_scope = outer.enter().unwrap();
+            let inner_scope = inner.enter().unwrap();
+            first.pin(&[handle(1)], true).unwrap();
+            first.release(&[handle(1)], true);
+            assert!(first.roots.lock().unwrap().is_empty());
+            second.pin(&[handle(1)], true).unwrap();
+            second.release(&[handle(1)], true);
+            drop(inner_scope);
+            first.pin(&[handle(5)], true).unwrap();
+            first.release(&[handle(5)], true);
+            drop(outer_scope);
+            drop(outer);
+            assert!(first.roots.lock().unwrap().is_empty());
+            assert_eq!(second.roots.lock().unwrap().len(), 1);
+            drop(inner);
+            assert!(second.roots.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn statement_files_execution_scopes_are_local_to_their_worker_thread() {
+        let config = test_config();
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let first = registry.retain_statement().unwrap();
+        let second = registry.retain_statement().unwrap();
+        let mut retained = Vec::with_capacity(2);
+        let first_scope = crate::mem::guard::forbid_alloc(|| {
+            let scope = first.enter().unwrap();
+            registry.pin(&[handle(1)], true).unwrap();
+            registry.release(&[handle(1)], true);
+            scope
+        });
+        let second = std::thread::scope(|threads| {
+            let registry = &registry;
+            threads
+                .spawn(move || {
+                    crate::mem::guard::forbid_alloc(|| {
+                        assert!(SELECTED_STATEMENT_FILES.with(Cell::get).is_none());
+                        let scope = second.enter().unwrap();
+                        registry.pin(&[handle(5)], true).unwrap();
+                        registry.release(&[handle(5)], true);
+                        drop(scope);
+                        assert!(SELECTED_STATEMENT_FILES.with(Cell::get).is_none());
+                        second
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            registry.copy_roots(true, &mut retained).unwrap();
+            assert_eq!(retained, [handle(1), handle(5)]);
+            drop(second);
+            registry.copy_roots(true, &mut retained).unwrap();
+            assert_eq!(retained, [handle(1)]);
+            drop(first_scope);
+            drop(first);
+            assert!(SELECTED_STATEMENT_FILES.with(Cell::get).is_none());
+            assert!(registry.roots.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
     fn sliced_heap_cleanup_zero_commit_and_temporary_snapshot_coverage_are_distinct() {
         let mut budget = Budget::new(SpillGenerationRoster::member_budget_bytes(3));
         let roster = SpillGenerationRoster::new(&mut budget, 3).unwrap();
@@ -1560,6 +2166,151 @@ mod tests {
             arena,
             path,
         }
+    }
+
+    #[test]
+    fn statement_files_keep_real_scan_roots_after_walks_and_arena_are_released() {
+        let PointFixture {
+            mut storage,
+            table,
+            roots,
+            mut arena,
+            path,
+        } = point_fixture("statement-files-waits");
+        let registry = Arc::clone(&storage.spill_roots);
+        let mut retained = Vec::with_capacity(3);
+        let lease = crate::mem::guard::forbid_alloc(|| {
+            let lease = storage.retain_statement_snapshot(71, |_| 7).unwrap();
+            let scope = lease.enter_files(&storage).unwrap();
+            // Repeated source aliases use the statement arena, not the point-source pool.
+            for _ in 0..super::super::MAX_ROW_WALK_NESTING * 2 {
+                drop(storage.row_scan_in(table, &arena).unwrap());
+            }
+            drop(storage.row_scan(table).unwrap());
+            drop(scope);
+            lease
+        });
+        arena.reset();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_spill_list(table, &[roots[2]]);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert_eq!(retained, roots[..2]);
+            let scope = lease.enter_files(&storage).unwrap();
+            drop(storage.row_scan_in(table, &arena).unwrap());
+            drop(scope);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert_eq!(retained, roots);
+            drop(lease);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert!(retained.is_empty());
+            assert!(!registry.take_reclamation_pending());
+        });
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn statement_files_release_after_source_error_replacement_and_storage_retirement() {
+        let PointFixture {
+            mut storage,
+            table,
+            roots,
+            arena,
+            path,
+        } = point_fixture("statement-files-retire");
+        let registry = Arc::clone(&storage.spill_roots);
+        let mut retained = Vec::with_capacity(3);
+        let lease = crate::mem::guard::forbid_alloc(|| {
+            let lease = storage.retain_statement_snapshot(71, |_| 7).unwrap();
+            let scope = lease.enter_files(&storage).unwrap();
+            let scan = storage.row_scan_in(table, &arena).unwrap();
+            let result = scan.roots.with_view::<()>(|_| {
+                Err(sql_err!(
+                    sqlstate::INTERNAL_IO_WAIT,
+                    "suspend selected files"
+                ))
+            });
+            assert_eq!(result.unwrap_err().sqlstate, sqlstate::INTERNAL_IO_WAIT);
+            drop(scan);
+            drop(scope);
+            storage.set_spill_list(table, &[roots[2]]);
+            storage.drop_table(table);
+            lease
+        });
+        drop(storage);
+        crate::mem::guard::forbid_alloc(|| {
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert_eq!(retained, roots[..2]);
+            drop(lease);
+            registry.copy_roots(false, &mut retained).unwrap();
+            assert!(retained.is_empty());
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn statement_files_exhaustion_precedes_snapshot_selection_and_registration() {
+        let config = test_config();
+        let storage = Storage::new(&config, &mut test_budget(&config)).unwrap();
+        let capacity = storage.spill_roots.roots.lock().unwrap().statements.len();
+        let mut owners = Vec::with_capacity(capacity);
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..capacity {
+                owners.push(storage.spill_roots.retain_statement().unwrap());
+            }
+            let before = storage.snapshot_state().next_statement;
+            let error = storage
+                .retain_statement_snapshot(71, |_| {
+                    panic!("full file ownership must fail before selecting a snapshot")
+                })
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("statement file owners"));
+            assert_eq!(storage.snapshot_state().next_statement, before);
+            assert!(!storage.has_active_snapshots());
+            owners.clear();
+            storage.spill_roots.roots.lock().unwrap().next_statement = u64::MAX;
+            let error = storage
+                .retain_statement_snapshot(71, |_| {
+                    panic!("file identity exhaustion must fail before snapshot selection")
+                })
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(error.message.as_str(), "statement file identity exhausted");
+            assert_eq!(storage.snapshot_state().next_statement, before);
+            assert!(!storage.has_active_snapshots());
+        });
+    }
+
+    #[test]
+    fn statement_files_reject_a_foreign_snapshot_before_changing_execution_context() {
+        let config = test_config();
+        let first = Storage::new(&config, &mut test_budget(&config)).unwrap();
+        let second = Storage::new(&config, &mut test_budget(&config)).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let first_lease = first.retain_statement_snapshot(71, |_| 7).unwrap();
+            let second_lease = second.retain_statement_snapshot(71, |_| 9).unwrap();
+            let scope = second_lease.enter_files(&second).unwrap();
+            let selected = SELECTED_STATEMENT_FILES.with(Cell::get).unwrap();
+            let error = first_lease.enter_files(&second).err().unwrap();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
+            assert_eq!(
+                error.message.as_str(),
+                "statement snapshot belongs to another storage instance"
+            );
+            let after = SELECTED_STATEMENT_FILES.with(Cell::get).unwrap();
+            assert_eq!(after.registry, selected.registry);
+            assert_eq!(after.identity.serial, selected.identity.serial);
+            assert_eq!(STATEMENT_FILE_SCOPE_DEPTH.with(Cell::get), 1);
+            assert_eq!(first.oldest_snapshot(), Some(7));
+            assert_eq!(second.oldest_snapshot(), Some(9));
+            drop(scope);
+            drop((first_lease, second_lease));
+            assert!(SELECTED_STATEMENT_FILES.with(Cell::get).is_none());
+            assert!(!first.has_active_snapshots() && !second.has_active_snapshots());
+        });
     }
 
     #[test]

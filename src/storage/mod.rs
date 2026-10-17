@@ -49,6 +49,7 @@ use snapshot_leases::{
     ExportedSnapshot, StatementSnapshot, snapshot_owner_bytes, statement_snapshot_capacity,
 };
 pub(crate) use snapshot_leases::{SnapshotIdentifier, StatementSnapshotLease};
+pub(crate) use spill_generations::StatementFileScope;
 
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;

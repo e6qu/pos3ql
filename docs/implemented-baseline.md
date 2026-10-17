@@ -706,8 +706,8 @@ block once against `checkpoint_live_blocks`, including shared backup blocks;
 real exhaustion returns `54000` before deletion. Invalid rosters return `58030`.
 The membership map is charged separately from the existing checkpoint workspace.
 An unrelated commit does not invalidate a table's index view when a read resumes.
-Eligibility checks each binding's last change and saved-generation position
-against the statement snapshot. Newer key, predicate or included-value changes
+For an older snapshot, eligibility checks each binding's last change and
+saved-generation position. Newer key, predicate or included-value changes
 still require the ordinary historical row scan. For example, an order update
 does not make a paused invoice lookup abandon its required index download;
 a missing response still returns `58030`.

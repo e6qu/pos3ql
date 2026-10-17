@@ -2166,7 +2166,7 @@ fn index_snapshot_is_current(storage: &Storage, slot: usize, txid: u32) -> bool 
     // Resident and object generations carry the published base plus the
     // latest overlay, not every intermediate key image retained for a
     // repeatable-read snapshot. The ordinary MVCC scan owns that case.
-    storage.value_indexes_match_snapshot(slot)
+    (storage.commit_snapshot() == storage.lsn() || storage.value_indexes_match_snapshot(slot))
         // The committed index remains authoritative while another
         // transaction owns a pending image. Only this transaction's visible
         // writes can introduce a key absent from that index.

@@ -82,6 +82,8 @@ privately in bounded turns; unrelated storage reads and writes can progress
 during copying. Automatic checkpoint cleanup resumes copying between server
 turns, allowing SQL reads and writes between those turns. Explicit CHECKPOINT
 and the existing critical memory-pressure path still wait for cleanup.
+Eviction and history release keep later row versions in memory until the
+installed object roots cover them.
 Complete type commits and the remaining maintenance
 paths still require publication coordination. The
 [implementation guide](docs/implemented-baseline.md) owns completed contracts,

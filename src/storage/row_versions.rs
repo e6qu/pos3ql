@@ -403,6 +403,33 @@ pub(super) fn prune_committed_history(
     }
 }
 
+/// Published object roots reproduce the prefix; later versions remain resident.
+pub(super) fn release_committed_history_through(
+    pool: &mut RowVersionPool<CommittedVersionSlot>,
+    history: &mut CommittedHistory,
+    through_lsn: u64,
+) {
+    let mut slot = history.tail;
+    let mut previous = None;
+    let mut retained = 0;
+    while let Some(index) = slot {
+        let entry = pool[index];
+        if entry.version.lsn <= through_lsn {
+            if let Some(previous) = previous {
+                pool[previous].previous = None;
+            } else {
+                history.tail = None;
+            }
+            release_committed_chain(pool, Some(index));
+            history.len = retained;
+            return;
+        }
+        retained += 1;
+        previous = Some(index);
+        slot = entry.previous;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

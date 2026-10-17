@@ -540,6 +540,130 @@ mod tests {
         workspace
     }
 
+    fn saved_handle(tag: u8) -> crate::store::SstHandle {
+        crate::store::SstHandle {
+            index: crate::store::BlockId([tag; 32]),
+            filter: crate::store::BlockId([tag + 1; 32]),
+            roster: crate::store::BlockId([tag + 2; 32]),
+            format: crate::store::RowSstFormat::PackedV4,
+        }
+    }
+
+    #[test]
+    fn sliced_heap_cleanup_eviction_keeps_writes_after_installed_objects() {
+        let (mut storage, table, _) = fixture();
+        crate::mem::guard::forbid_alloc(|| {
+            for (rowid, lsn) in [(2, 11), (3, 13)] {
+                let location = storage
+                    .heap
+                    .append_row(&[Datum::Int4(rowid as i32), Datum::Text("later")])
+                    .unwrap();
+                storage.tables[table]
+                    .rows
+                    .insert(rowid, RowState::committed_only_at(location, lsn))
+                    .unwrap();
+            }
+            storage
+                .append_spill_through(table, saved_handle(1), 7)
+                .unwrap();
+            storage
+                .append_spill_through(table, saved_handle(5), 11)
+                .unwrap();
+            storage.evict_committed_table(table);
+            for (rowid, member, lsn) in [(1, 0, 7), (2, 1, 11)] {
+                let row = storage.resident_row_state(table, rowid).unwrap().unwrap();
+                assert!(matches!(row.committed,
+                    Some(RowHome::Spilled { sst, commit_lsn, .. }) if sst == member && commit_lsn == lsn));
+            }
+            assert_row(&storage, table, 3, 0, u64::MAX, 3, "later");
+            let row = storage.resident_row_state(table, 3).unwrap().unwrap();
+            assert!(matches!(row.committed, Some(RowHome::Heap(_))));
+        });
+    }
+
+    #[test]
+    fn sliced_heap_cleanup_recovered_roots_do_not_invent_eviction_coverage() {
+        let (mut storage, table, original) = fixture();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.set_spill_list(table, &[saved_handle(1)]);
+            storage.evict_committed_table(table);
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
+            assert_eq!(row.committed, Some(RowHome::Heap(original)));
+            drop(row);
+            assert_row(&storage, table, 1, 0, 7, 10, "old");
+            storage
+                .append_spill_through(table, saved_handle(5), 9)
+                .unwrap();
+            storage.evict_committed_table(table);
+            let row = storage.resident_row_state(table, 1).unwrap().unwrap();
+            assert!(matches!(
+                row.committed,
+                Some(RowHome::Spilled {
+                    sst: 1,
+                    commit_lsn: 7,
+                    ..
+                })
+            ));
+        });
+    }
+
+    #[test]
+    fn sliced_heap_cleanup_history_releases_only_published_versions() {
+        let (mut storage, table, _) = fixture();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.register_snapshot(99, 7).unwrap();
+            for (id, txid, lsn) in [(20, 8, 9), (30, 10, 11)] {
+                let image = storage
+                    .heap
+                    .append_row_image(&[Datum::Int4(id), Datum::Text("later")])
+                    .unwrap();
+                storage
+                    .write_pending_image_untracked(table, 1, txid, 1, Some(image))
+                    .unwrap();
+                storage.commit_row(table, 1, txid, lsn).unwrap();
+            }
+            storage.set_spill_list(table, &[saved_handle(1)]);
+            storage.release_durable_histories();
+            assert_eq!(
+                storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .history
+                    .len(),
+                2
+            );
+            storage
+                .append_spill_through(table, saved_handle(5), 7)
+                .unwrap();
+            storage.release_durable_histories();
+            assert_eq!(
+                storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .history
+                    .len(),
+                1
+            );
+            assert_row(&storage, table, 1, 99, 9, 20, "later");
+            assert_row(&storage, table, 1, 0, u64::MAX, 30, "later");
+            storage
+                .append_spill_through(table, saved_handle(9), 11)
+                .unwrap();
+            storage.release_durable_histories();
+            assert!(
+                storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .history
+                    .is_empty()
+            );
+            storage.release_snapshot(99);
+        });
+    }
+
     #[test]
     fn sliced_heap_cleanup_owned_workspace_allows_storage_moves_and_late_writes() {
         let (storage, table, original) = fixture();

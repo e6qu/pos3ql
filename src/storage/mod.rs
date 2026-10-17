@@ -61,7 +61,7 @@ pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
 use row_versions::{
     RowVersionPools, clear_pending_versions, pending_last, pop_pending_version,
     prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
-    release_pending_chain, remap_committed_homes,
+    release_committed_history_through, release_pending_chain, remap_committed_homes,
 };
 use row_walks::{RowScanIds, RowWalkPool};
 use spill_generations::{
@@ -30947,10 +30947,8 @@ impl Storage {
         }
     }
 
-    /// Marks every committed heap row of every live table as spilled to its
-    /// just-checkpointed SST, so the following compaction drops the bytes
-    /// from RAM. Only called after a successful checkpoint whose handles are
-    /// installed on the tables; rows with no SST (empty tables) are left.
+    /// Evicts only row versions covered by an installed checkpoint boundary.
+    /// Later writes keep their heap bytes until another checkpoint saves them.
     pub fn evict_committed(&mut self) {
         for i in 0..self.tables.len() {
             if {
@@ -30972,15 +30970,11 @@ impl Storage {
         }
         let table = &mut self.tables[slot];
         let generations = table.spill_generations.read();
-        let newest = (generations.len() - 1) as u32;
         for (_, state) in table.rows.iter_mut() {
             if let Some(RowHome::Heap(loc)) = state.committed {
-                let sst = generations
-                    .iter()
-                    .position(|member| {
-                        member.through_lsn != 0 && state.committed_lsn <= member.through_lsn
-                    })
-                    .map_or(newest, |generation| generation as u32);
+                let Some(sst) = generations.eviction_member(state.committed_lsn) else {
+                    continue;
+                };
                 state.committed = Some(RowHome::Spilled {
                     len: loc.len,
                     sst,
@@ -31011,6 +31005,7 @@ impl Storage {
 
     /// A full rewrite: the new SST holds every committed row, so the list
     /// collapses to it and every spilled map entry is remapped to slot 0.
+    #[cfg(test)]
     pub(crate) fn collapse_spill(
         &mut self,
         slot: usize,
@@ -31089,14 +31084,6 @@ impl Storage {
     /// A delta flush: the new SST (heap rows + tombstones) joins the list;
     /// existing spilled entries keep their slots. The caller guarantees the
     /// list has room.
-    pub(crate) fn append_spill(
-        &mut self,
-        slot: usize,
-        handle: crate::store::SstHandle,
-    ) -> Result<(), SqlError> {
-        self.append_spill_through(slot, handle, 0)
-    }
-
     pub(crate) fn append_spill_through(
         &mut self,
         slot: usize,
@@ -31654,8 +31641,8 @@ impl Storage {
         })
     }
 
-    /// A successful manifest publish made every resident historical image
-    /// reachable through the table's installed versioned SST list.
+    /// Release saved history while preserving versions newer than each
+    /// table's installed object roots, even when cleanup follows later writes.
     pub fn release_durable_histories(&mut self) {
         let row_versions = self.row_versions.exclusive();
         let (tables, versions) = (&mut self.tables, &mut row_versions.committed_row_versions);
@@ -31665,8 +31652,11 @@ impl Storage {
                 definition.persistence
             } != RelationPersistence::Temporary
         }) {
+            let Some(through_lsn) = table.spill_generations().published_through() else {
+                continue;
+            };
             for (_, state) in table.rows.iter_mut() {
-                prune_committed_history(versions, &mut state.history, None);
+                release_committed_history_through(versions, &mut state.history, through_lsn);
             }
         }
     }

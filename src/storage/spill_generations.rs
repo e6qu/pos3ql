@@ -48,6 +48,21 @@ impl SpillGenerationList {
         self.members.get(index).map(|member| member.handle)
     }
 
+    pub(super) fn eviction_member(&self, commit_lsn: u64) -> Option<u32> {
+        self.members
+            .iter()
+            .position(|member| member.through_lsn != 0 && commit_lsn <= member.through_lsn)
+            .map(|index| index as u32)
+    }
+
+    pub(super) fn published_through(&self) -> Option<u64> {
+        self.members
+            .iter()
+            .map(|member| member.through_lsn)
+            .filter(|&lsn| lsn != 0)
+            .max()
+    }
+
     pub(super) fn clear(&mut self) {
         self.members.clear();
         self.staging.clear();

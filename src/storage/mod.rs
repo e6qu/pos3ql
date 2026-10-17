@@ -21,7 +21,9 @@ use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefiniti
 pub(crate) mod foreign;
 mod partition_rows;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
+mod heap_relocation;
 mod row_heap;
+pub(crate) use heap_relocation::HeapRelocationEntry;
 mod row_identities;
 mod row_images;
 mod row_map;
@@ -2344,13 +2346,6 @@ impl RowLoc {
             generation: 1,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RowHeapImage {
-    Committed,
-    History(usize),
-    Pending(usize),
 }
 
 /// A row's visibility state: the committed image plus a bounded chain of
@@ -29881,22 +29876,6 @@ impl Storage {
         }
     }
 
-    /// The newest object-resident version admitted by `snapshot`. Every SST
-    /// is consulted because a newer run may contain only too-new versions;
-    /// a tombstone remains a first-class verdict.
-    fn spill_probe_at(
-        &self,
-        slot: usize,
-        rowid: u64,
-        snapshot: u64,
-    ) -> Result<Option<SpillVersion>, SqlError> {
-        if self.tables[slot].spill_generations().is_empty() {
-            return Ok(None);
-        }
-        let roots = self.query_roots.retain_point(self, slot, snapshot)?;
-        roots.with_snapshot(|source| Self::probe_spill_snapshot(source, rowid, snapshot))
-    }
-
     fn probe_spill_snapshot(
         source: &SpillGenerationSnapshot,
         rowid: u64,
@@ -29959,6 +29938,8 @@ impl Storage {
         Ok(best)
     }
 
+    /// The newest admitted object version, including deletions, retains the
+    /// captured object roots until its metadata and byte users release them.
     fn spill_row_state_at(
         &self,
         table: usize,
@@ -31574,112 +31555,6 @@ impl Storage {
         }
     }
 
-    /// Rewrites the row heap so it contains only live row images
-    /// (committed and pending alike), in ascending offset order, repointing
-    /// every table's map. Reclaims the garbage left by updates and deletes;
-    /// runs at checkpoint. `scratch` must hold every live image.
-    pub(crate) fn compact_heap(
-        &mut self,
-        scratch: &mut FixedVec<(u32, u64, RowHeapImage, RowLoc)>,
-    ) -> Result<(), SqlError> {
-        let row_versions = self.row_versions.exclusive();
-        let tables = &mut self.tables;
-        self.heap.with_relocation(|heap| {
-            scratch.clear();
-            for (index, table) in tables.iter().enumerate() {
-                // A transaction may have inserted rows into its pending CREATE
-                // before a concurrent checkpoint. Those bytes are private, not
-                // garbage: preserve them even though the committed table image is
-                // not live yet. A genuinely dead slot has neither committed nor
-                // pending existence.
-                if table.existence() == CatalogDdlState::Absent {
-                    continue;
-                }
-                for (rowid, state) in table.rows.iter() {
-                    let overflow = |e| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "heap compaction scratch overflow: {}",
-                            e
-                        )
-                    };
-                    if let Some(RowHome::Heap(loc)) = state.committed {
-                        scratch
-                            .push((index as u32, rowid, RowHeapImage::Committed, loc))
-                            .map_err(overflow)?;
-                    }
-                    let mut history_slot = state.history.tail;
-                    while let Some(slot) = history_slot {
-                        let entry = &row_versions.committed_row_versions[slot];
-                        if let Some(RowHome::Heap(loc)) = entry.version.home {
-                            scratch
-                                .push((index as u32, rowid, RowHeapImage::History(slot), loc))
-                                .map_err(overflow)?;
-                        }
-                        history_slot = entry.previous;
-                    }
-                    let mut pending_slot = state.pending.tail;
-                    while let Some(slot) = pending_slot {
-                        let entry = &row_versions.pending_row_versions[slot];
-                        if let Some(loc) = entry.change.loc {
-                            scratch
-                                .push((index as u32, rowid, RowHeapImage::Pending(slot), loc))
-                                .map_err(overflow)?;
-                        }
-                        pending_slot = entry.previous;
-                    }
-                }
-            }
-            // Moving rows in ascending source order means every copy target is
-            // at or below its source — copy_within stays safe.
-            scratch
-                .as_mut_slice()
-                .sort_unstable_by_key(|(_, _, _, loc)| (loc.offset, loc.len));
-            heap.validate_relocation(scratch.iter().map(|(_, _, _, location)| *location))?;
-            let generation = heap.next_relocation_generation()?;
-            let mut write_at = 0usize;
-            let mut prior_alias: Option<(RowLoc, RowLoc)> = None;
-            for i in 0..scratch.len() {
-                let (table_index, rowid, image, loc) = scratch[i];
-                let len = loc.len as usize;
-                let src = loc.offset as usize;
-                let new_loc = if let Some((prior, relocated)) = prior_alias
-                    && prior == loc
-                {
-                    relocated
-                } else {
-                    debug_assert!(write_at <= src, "targets never overtake sources");
-                    heap.relocate(loc, write_at);
-                    let relocated = RowLoc {
-                        offset: write_at as u32,
-                        len: loc.len,
-                        generation,
-                    };
-                    write_at += len;
-                    prior_alias = Some((loc, relocated));
-                    relocated
-                };
-                match image {
-                    RowHeapImage::Committed => {
-                        tables[table_index as usize]
-                            .rows
-                            .get_mut(&rowid)
-                            .expect("scratch entries come from the maps")
-                            .committed = Some(RowHome::Heap(new_loc));
-                    }
-                    RowHeapImage::History(slot) => {
-                        row_versions.committed_row_versions[slot].version.home =
-                            Some(RowHome::Heap(new_loc));
-                    }
-                    RowHeapImage::Pending(slot) => {
-                        row_versions.pending_row_versions[slot].change.loc = Some(new_loc);
-                    }
-                }
-            }
-            Ok(heap.finish(write_at, generation))
-        })
-    }
-
     /// Compares canonical physical column payloads without allocating or
     /// decoding variable-width values. The comparison happens on the
     /// fallible, pre-commit write path: commit itself must never discover that
@@ -31688,35 +31563,19 @@ impl Storage {
         &self,
         table_index: usize,
         rowid: u64,
-        committed: Option<RowHome>,
-        pending: Option<RowLoc>,
-        txid: u32,
-        track_statistics: bool,
-    ) -> Result<(ColumnSet, bool), SqlError> {
+        committed: VisibleRowHome,
+        pending: &row_heap::HeapRowRead,
+    ) -> Result<ColumnSet, SqlError> {
         let columns = {
             let definition = self.tables[table_index].definition();
             definition.n_columns
         };
-        let all_columns = ColumnSet::all(columns);
-        // Row rewrites and changes under a transaction-private definition can
-        // use a different physical schema. Their enforcers are rebuilt at the
-        // DDL boundary, so conservative invalidation is both sufficient and
-        // avoids comparing unlike encodings.
-        if !track_statistics
-            || self.tables[table_index].pending_definition_transaction() == Some(txid)
-        {
-            return Ok((all_columns, committed.is_some() != pending.is_some()));
-        }
-        let (Some(committed), Some(pending)) = (committed, pending) else {
-            return Ok((all_columns, committed.is_some() != pending.is_some()));
-        };
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         self.tables[table_index].definition().schema(&mut schema);
-        let pending_bytes = self.heap.get(pending)?;
         let mut pending_payloads = [&[][..]; MAX_COLUMNS];
         let mut pending_nulls = [false; MAX_COLUMNS];
         rowenc::encoded_columns(
-            &pending_bytes,
+            pending,
             &schema[..columns],
             &mut pending_payloads,
             &mut pending_nulls,
@@ -31738,12 +31597,9 @@ impl Storage {
                     changed.insert(column);
                 }
             }
-            Ok((changed, false))
+            Ok(changed)
         };
-        match committed {
-            RowHome::Heap(location) => compare(pending_bytes.other(location)?),
-            RowHome::Spilled { .. } => self.with_row_bytes(table_index, rowid, committed, compare),
-        }
+        self.with_row_bytes(table_index, rowid, committed, compare)
     }
 
     /// Drops map entries the spill lists reproduce exactly — committed,

@@ -1,10 +1,10 @@
-//! Published row bytes are immutable until exclusive relocation; appends use disjoint tails.
+//! Retained row bytes stay immutable; appends initialize disjoint tails.
 
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::RowLoc;
 use crate::mem::budget::{Budget, BudgetError};
@@ -12,8 +12,13 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
 pub(crate) struct RowHeap {
-    state: Arc<RwLock<RowHeapState>>,
-    spare: Arc<RwLock<RowHeapState>>,
+    buffers: [Arc<RwLock<RowHeapState>>; 2],
+    publication: RwLock<HeapPublication>,
+}
+
+struct HeapPublication {
+    second_active: bool,
+    relocation_frontier: Option<usize>,
 }
 
 pub(super) struct RowHeapState {
@@ -26,8 +31,9 @@ pub(super) struct RowHeapState {
 
 // SAFETY: readers access only ranges below the acquired publication frontier.
 // One append owner initializes the disjoint tail before releasing that frontier.
-// Retained Arc owners prohibit relocation and byte reuse. Appends hold a read
-// guard until initialization ends; relocation requires unique allocation ownership.
+// Retained Arc owners prohibit mutation and reuse of their ranges. Appends
+// hold a read guard through initialization; relocation destinations require
+// unique allocation ownership.
 unsafe impl Sync for RowHeapState {}
 
 #[derive(Clone)]
@@ -83,13 +89,15 @@ impl HeapRowRead {
 
 impl RowHeap {
     pub(super) fn retain_allocation(&self) -> HeapRowRead {
-        let generation = self
-            .state
+        let publication = self
+            .publication
             .read()
-            .expect("row heap lock poisoned")
-            .generation;
+            .expect("heap publication lock poisoned");
+        let allocation = &self.buffers[usize::from(publication.second_active)];
+        let state = allocation.read().expect("row heap lock poisoned");
+        let generation = state.generation;
         HeapRowRead {
-            state: Arc::clone(&self.state),
+            state: Arc::clone(allocation),
             location: RowLoc {
                 offset: 0,
                 len: 0,
@@ -97,6 +105,7 @@ impl RowHeap {
             },
         }
     }
+
     pub(super) const fn control_bytes() -> usize {
         size_of::<Self>() + 2 * (size_of::<RwLock<RowHeapState>>() + 2 * size_of::<usize>())
     }
@@ -137,8 +146,56 @@ impl RowHeap {
             }))
         };
         Ok(Self {
-            state: allocation(),
-            spare: allocation(),
+            buffers: [allocation(), allocation()],
+            publication: RwLock::new(HeapPublication {
+                second_active: false,
+                relocation_frontier: None,
+            }),
+        })
+    }
+
+    /// The caller owns row versions while selecting the capture frontier.
+    pub(super) fn begin_copy(&self) -> Result<HeapCopy<'_>, SqlError> {
+        let mut publication = self
+            .publication
+            .write()
+            .expect("heap publication lock poisoned");
+        if publication.relocation_frontier.is_some() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "row heap relocation is already active"
+            ));
+        }
+        let source = &self.buffers[usize::from(publication.second_active)];
+        let source_state = source.read().expect("row heap lock poisoned");
+        let generation = source_state.next_relocation_generation()?;
+        let frontier = source_state.used.load(Ordering::Acquire);
+        let target_second = !publication.second_active;
+        let target = &self.buffers[usize::from(target_second)];
+        if Arc::strong_count(target) != 1 || Arc::weak_count(target) != 0 {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "row heap relocation buffers are retained by readers"
+            ));
+        }
+        let target = target.write().expect("row heap lock poisoned");
+        let source = HeapRowRead {
+            state: Arc::clone(source),
+            location: RowLoc {
+                offset: 0,
+                len: 0,
+                generation: source_state.generation,
+            },
+        };
+        publication.relocation_frontier = Some(frontier);
+        Ok(HeapCopy {
+            heap: self,
+            source,
+            target: Some(target),
+            frontier,
+            generation,
+            target_second,
+            completed: false,
         })
     }
 
@@ -148,12 +205,28 @@ impl RowHeap {
         &mut self,
         move_rows: impl FnOnce(&mut HeapRelocation<'_>) -> Result<RelocationCompleted, SqlError>,
     ) -> Result<(), SqlError> {
-        if let Some(state) = Arc::get_mut(&mut self.state) {
+        let publication = self
+            .publication
+            .get_mut()
+            .expect("heap publication lock poisoned");
+        if publication.relocation_frontier.is_some() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "row heap relocation is already active"
+            ));
+        }
+        let [first, second] = &mut self.buffers;
+        let (source, target) = if publication.second_active {
+            (second, first)
+        } else {
+            (first, second)
+        };
+        if let Some(state) = Arc::get_mut(source) {
             let mut relocation =
                 HeapRelocation::InPlace(state.get_mut().expect("row heap lock poisoned"));
             move_rows(&mut relocation)?;
         } else {
-            let target = Arc::get_mut(&mut self.spare)
+            let target = Arc::get_mut(target)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -162,11 +235,11 @@ impl RowHeap {
                 })?
                 .get_mut()
                 .expect("row heap lock poisoned");
-            let source = self.state.read().expect("row heap lock poisoned");
+            let source = source.read().expect("row heap lock poisoned");
             let mut relocation = HeapRelocation::Copy { source, target };
             move_rows(&mut relocation)?;
             drop(relocation);
-            core::mem::swap(&mut self.state, &mut self.spare);
+            publication.second_active = !publication.second_active;
         }
         Ok(())
     }
@@ -222,7 +295,12 @@ impl RowHeap {
         len: usize,
         initialize: impl FnOnce(&mut [u8]) -> Result<(), SqlError>,
     ) -> Result<HeapRowRead, SqlError> {
-        let state = self.state.read().expect("row heap lock poisoned");
+        let publication = self
+            .publication
+            .read()
+            .expect("heap publication lock poisoned");
+        let allocation = &self.buffers[usize::from(publication.second_active)];
+        let state = allocation.read().expect("row heap lock poisoned");
         let _append = state.append.lock().expect("row heap append lock poisoned");
         let start = state.used.load(Ordering::Acquire);
         state.check_capacity(start, len)?;
@@ -242,36 +320,75 @@ impl RowHeap {
         state.used.store(start + len, Ordering::Release);
         // Retain the initialized allocation before releasing append ownership.
         Ok(HeapRowRead {
-            state: Arc::clone(&self.state),
+            state: Arc::clone(allocation),
             location,
         })
     }
 
     pub(crate) fn get(&self, location: RowLoc) -> Result<HeapRowRead, SqlError> {
-        let state = self.state.read().expect("row heap lock poisoned");
+        let publication = self
+            .publication
+            .read()
+            .expect("heap publication lock poisoned");
+        let allocation = &self.buffers[usize::from(publication.second_active)];
+        let state = allocation.read().expect("row heap lock poisoned");
         state.validate(location)?;
         Ok(HeapRowRead {
-            state: Arc::clone(&self.state),
+            state: Arc::clone(allocation),
             location,
         })
     }
 
+    pub(super) fn current_is_retained(&self) -> bool {
+        let publication = self
+            .publication
+            .read()
+            .expect("heap publication lock poisoned");
+        let allocation = &self.buffers[usize::from(publication.second_active)];
+        Arc::strong_count(allocation) != 1 || Arc::weak_count(allocation) != 0
+    }
+
+    #[cfg(test)]
     pub(super) fn is_current_allocation(&self, image: &HeapRowRead) -> bool {
-        Arc::ptr_eq(&self.state, &image.state)
+        let publication = self
+            .publication
+            .read()
+            .expect("heap publication lock poisoned");
+        Arc::ptr_eq(
+            &self.buffers[usize::from(publication.second_active)],
+            &image.state,
+        )
+    }
+
+    pub(super) fn accepts_publication(&self, image: &HeapRowRead) -> bool {
+        let publication = self
+            .publication
+            .read()
+            .expect("heap publication lock poisoned");
+        Arc::ptr_eq(
+            &self.buffers[usize::from(publication.second_active)],
+            &image.state,
+        ) && publication
+            .relocation_frontier
+            .is_none_or(|frontier| image.location.offset as usize >= frontier)
     }
 
     pub(super) fn retain_for_publication(
         &self,
         image: &HeapRowRead,
     ) -> Result<HeapRowRead, SqlError> {
-        if self.is_current_allocation(image) {
+        if self.accepts_publication(image) {
             return Ok(image.clone());
         }
         self.append_image(image)
     }
 
     pub(crate) fn used(&self) -> usize {
-        self.state
+        let publication = self
+            .publication
+            .read()
+            .expect("heap publication lock poisoned");
+        self.buffers[usize::from(publication.second_active)]
             .read()
             .expect("row heap lock poisoned")
             .used
@@ -279,12 +396,25 @@ impl RowHeap {
     }
 
     pub(crate) fn capacity(&self) -> usize {
-        self.state.read().expect("row heap lock poisoned").capacity
+        let publication = self
+            .publication
+            .read()
+            .expect("heap publication lock poisoned");
+        self.buffers[usize::from(publication.second_active)]
+            .read()
+            .expect("row heap lock poisoned")
+            .capacity
     }
 
     #[cfg(test)]
     pub(super) fn exclusive(&mut self) -> Result<&mut RowHeapState, SqlError> {
-        Arc::get_mut(&mut self.state)
+        let active = usize::from(
+            self.publication
+                .get_mut()
+                .expect("heap publication lock poisoned")
+                .second_active,
+        );
+        Arc::get_mut(&mut self.buffers[active])
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -298,13 +428,197 @@ impl RowHeap {
     pub(super) fn test_write(
         &self,
     ) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, RowHeapState>> {
-        // Capture clones its owner under a read guard, so the count cannot
-        // increase while this test-only mutable guard is held.
-        let state = self.state.try_write()?;
-        if Arc::strong_count(&self.state) != 1 {
+        let publication = match self.publication.try_read() {
+            Ok(publication) => publication,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(std::sync::TryLockError::WouldBlock);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("heap publication lock poisoned");
+            }
+        };
+        let allocation = &self.buffers[usize::from(publication.second_active)];
+        // Capturing an owner must acquire this allocation's read guard first.
+        // The permanent buffer slots keep the returned guard's address stable.
+        let state = allocation.try_write()?;
+        if Arc::strong_count(allocation) != 1 {
             return Err(std::sync::TryLockError::WouldBlock);
         }
         Ok(state)
+    }
+
+    #[cfg(test)]
+    fn current_state(&self) -> &Arc<RwLock<RowHeapState>> {
+        let publication = self
+            .publication
+            .read()
+            .expect("heap publication lock poisoned");
+        &self.buffers[usize::from(publication.second_active)]
+    }
+
+    #[cfg(test)]
+    fn spare_state(&self) -> &Arc<RwLock<RowHeapState>> {
+        let publication = self
+            .publication
+            .read()
+            .expect("heap publication lock poisoned");
+        &self.buffers[usize::from(!publication.second_active)]
+    }
+}
+
+/// Only the inactive, unretained buffer is mutable during a private copy.
+pub(super) struct HeapCopy<'heap> {
+    heap: &'heap RowHeap,
+    source: HeapRowRead,
+    target: Option<RwLockWriteGuard<'heap, RowHeapState>>,
+    frontier: usize,
+    generation: u64,
+    target_second: bool,
+    completed: bool,
+}
+
+impl HeapCopy<'_> {
+    pub(super) fn frontier(&self) -> usize {
+        self.frontier
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(super) fn source_used(&self) -> usize {
+        self.source
+            .state
+            .read()
+            .expect("row heap lock poisoned")
+            .used
+            .load(Ordering::Acquire)
+    }
+
+    pub(super) fn validate_locations(
+        &self,
+        locations: impl Iterator<Item = RowLoc>,
+    ) -> Result<(), SqlError> {
+        self.source
+            .state
+            .read()
+            .expect("row heap lock poisoned")
+            .validate_relocation(locations)
+    }
+
+    pub(super) fn copy_bytes(
+        &mut self,
+        location: RowLoc,
+        source_at: usize,
+        destination: usize,
+        len: usize,
+    ) -> Result<(), SqlError> {
+        let bytes = self.source.other(location)?;
+        let source = bytes
+            .get(
+                source_at..source_at.checked_add(len).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "heap relocation source range overflow"
+                    )
+                })?,
+            )
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "heap relocation source range exceeds its row"
+                )
+            })?;
+        let target = self
+            .target
+            .as_mut()
+            .expect("private heap copy has a target");
+        let end = destination.checked_add(len).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "heap relocation destination range overflow"
+            )
+        })?;
+        let output = target
+            .buffer
+            .get_mut()
+            .get_mut(destination..end)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "heap relocation exceeds its startup buffer"
+                )
+            })?;
+        output.copy_from_slice(source);
+        Ok(())
+    }
+
+    /// The caller owns row versions. Appends stop only for the final metadata
+    /// check and remap; a newer tail asks the caller for another private turn.
+    pub(super) fn try_publish(
+        &mut self,
+        packed_bytes: usize,
+        copied_tail: usize,
+        remap: impl FnOnce(u64) -> Result<(), SqlError>,
+    ) -> Result<bool, SqlError> {
+        let mut publication = self
+            .heap
+            .publication
+            .write()
+            .expect("heap publication lock poisoned");
+        if self.completed
+            || publication.second_active == self.target_second
+            || publication.relocation_frontier != Some(self.frontier)
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "heap relocation no longer owns publication"
+            ));
+        }
+        let used = self.source_used();
+        if used.checked_sub(self.frontier) != Some(copied_tail) {
+            return Ok(false);
+        }
+        let used = packed_bytes.checked_add(copied_tail).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "heap relocation exceeds its startup buffer"
+            )
+        })?;
+        let target = self
+            .target
+            .as_mut()
+            .expect("private heap copy has a target");
+        if used > target.capacity {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "heap relocation exceeds its startup buffer"
+            ));
+        }
+        remap(self.generation)?;
+        *target.used.get_mut() = used;
+        target.generation = self.generation;
+        publication.second_active = self.target_second;
+        publication.relocation_frontier = None;
+        self.completed = true;
+        // New captures must not wait on a target guard retained by a finished job.
+        drop(self.target.take());
+        Ok(true)
+    }
+}
+
+impl Drop for HeapCopy<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut publication = self
+                .heap
+                .publication
+                .write()
+                .expect("heap publication lock poisoned");
+            assert_eq!(publication.relocation_frontier, Some(self.frontier));
+            assert_ne!(publication.second_active, self.target_second);
+            publication.relocation_frontier = None;
+        }
     }
 }
 
@@ -486,6 +800,86 @@ mod tests {
         let heap = RowHeap::new(&mut budget, bytes).unwrap();
         assert_eq!(budget.remaining(), 0);
         heap
+    }
+
+    #[test]
+    fn shared_heap_relocation_heap_copy_retains_inputs_and_publishes_late_bytes() {
+        let heap = heap(32);
+        crate::mem::guard::forbid_alloc(|| {
+            heap.append_bytes(b"dead").unwrap();
+            let old = heap.append_image(b"keep").unwrap();
+            let mut copy = heap.begin_copy().unwrap();
+            copy.validate_locations(core::iter::once(old.location()))
+                .unwrap();
+            copy.copy_bytes(old.location(), 0, 0, 4).unwrap();
+            let late = heap.append_image(b"next").unwrap();
+            let remapped = core::cell::Cell::new(false);
+            assert!(
+                !copy
+                    .try_publish(4, 0, |_| {
+                        remapped.set(true);
+                        Ok(())
+                    })
+                    .unwrap()
+            );
+            assert!(!remapped.get());
+            assert_eq!(&*heap.get(old.location()).unwrap(), b"keep");
+            assert!(!heap.accepts_publication(&old));
+            assert!(heap.accepts_publication(&late));
+            let rehomed = heap.retain_for_publication(&old).unwrap();
+            assert!(rehomed.location().offset as usize >= copy.frontier());
+            let tail = copy.source_used() - copy.frontier();
+            let location = RowLoc {
+                offset: copy.frontier() as u32,
+                len: tail as u32,
+                generation: old.location().generation,
+            };
+            copy.copy_bytes(location, 0, 4, tail).unwrap();
+            let generation = copy.generation();
+            assert!(copy.try_publish(4, tail, |_| Ok(())).unwrap());
+            assert_eq!(heap.used(), 12);
+            assert_eq!(
+                &*heap
+                    .get(RowLoc {
+                        offset: 4,
+                        len: 4,
+                        generation
+                    })
+                    .unwrap(),
+                b"next"
+            );
+            assert_eq!(&*old, b"keep");
+            assert_eq!(&*late, b"next");
+            assert_eq!(&*rehomed, b"keep");
+        });
+    }
+
+    #[test]
+    fn shared_heap_relocation_heap_cancel_and_generation_exhaustion_release_controls() {
+        let mut heap = heap(32);
+        crate::mem::guard::forbid_alloc(|| {
+            let image = heap.append_image(b"keep").unwrap();
+            let mut copy = heap.begin_copy().unwrap();
+            copy.copy_bytes(image.location(), 0, 0, 1).unwrap();
+            drop(copy);
+            let used = heap.used();
+            let retained = heap.retain_for_publication(&image).unwrap();
+            assert_eq!(retained.location(), image.location());
+            assert_eq!(heap.used(), used);
+            drop(retained);
+            drop(image);
+            heap.exclusive().unwrap().generation = u64::MAX;
+            let error = heap.begin_copy().err().unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(
+                heap.publication
+                    .read()
+                    .unwrap()
+                    .relocation_frontier
+                    .is_none()
+            );
+            assert!(heap.test_write().is_ok());
+        });
     }
 
     #[test]
@@ -1002,7 +1396,7 @@ mod tests {
                 generation: 2,
             };
             let current = heap.get(second).unwrap();
-            let source = Arc::as_ptr(&heap.state);
+            let source = Arc::as_ptr(heap.current_state());
             let error = heap
                 .with_relocation(|_| panic!("busy buffers entered relocation"))
                 .unwrap_err();
@@ -1011,7 +1405,7 @@ mod tests {
                 error.message.as_str(),
                 "row heap relocation buffers are retained by readers"
             );
-            assert_eq!(Arc::as_ptr(&heap.state), source);
+            assert_eq!(Arc::as_ptr(heap.current_state()), source);
             let appended = heap.append_bytes(b"next").unwrap();
             assert_eq!(current.other(appended).unwrap(), b"next");
             assert_eq!(
@@ -1086,7 +1480,7 @@ mod tests {
         let location = heap.append_bytes(b"original").unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let retained = heap.get(location).unwrap();
-            let owner = Arc::as_ptr(&heap.state);
+            let owner = Arc::as_ptr(heap.current_state());
             let overlap = [RowLoc::test(0, 6), RowLoc::test(4, 4)];
             let error = heap
                 .with_relocation(|move_rows| {
@@ -1095,8 +1489,15 @@ mod tests {
                 })
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
-            assert_eq!(Arc::as_ptr(&heap.state), owner);
-            assert_eq!(heap.spare.read().unwrap().used.load(Ordering::Acquire), 0);
+            assert_eq!(Arc::as_ptr(heap.current_state()), owner);
+            assert_eq!(
+                heap.spare_state()
+                    .read()
+                    .unwrap()
+                    .used
+                    .load(Ordering::Acquire),
+                0
+            );
             assert_eq!(heap.used(), 8);
             assert_eq!(&*retained, b"original");
             drop(retained);
@@ -1108,7 +1509,7 @@ mod tests {
         };
         crate::mem::guard::forbid_alloc(|| {
             let retained = heap.get(exhausted).unwrap();
-            let owner = Arc::as_ptr(&heap.state);
+            let owner = Arc::as_ptr(heap.current_state());
             let error = heap
                 .with_relocation(|move_rows| {
                     move_rows.validate_relocation(core::iter::once(exhausted))?;
@@ -1117,8 +1518,15 @@ mod tests {
                 })
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert_eq!(Arc::as_ptr(&heap.state), owner);
-            assert_eq!(heap.spare.read().unwrap().used.load(Ordering::Acquire), 0);
+            assert_eq!(Arc::as_ptr(heap.current_state()), owner);
+            assert_eq!(
+                heap.spare_state()
+                    .read()
+                    .unwrap()
+                    .used
+                    .load(Ordering::Acquire),
+                0
+            );
             assert_eq!(&*retained, b"original");
         });
     }

@@ -69,7 +69,7 @@ use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
-use crate::storage::{ColumnMeta, ColumnSet, RowHome, RowLoc, SqlName, Storage};
+use crate::storage::{ColumnMeta, ColumnSet, RowHome, SqlName, Storage};
 use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
 std::thread_local! {
@@ -421,7 +421,7 @@ pub struct Engine {
     dml_scratch: DmlWorkspaces,
     statistics_receipts: std::sync::Arc<crate::storage::StatisticsReceiptPool>,
     /// Scratch for heap compaction: every live row image across tables.
-    compact_scratch: FixedVec<(u32, u64, crate::storage::RowHeapImage, RowLoc)>,
+    compact_scratch: FixedVec<crate::storage::HeapRelocationEntry>,
     /// Startup-bounded slot-private execution arenas. The reactor still
     /// serializes execution, but statements no longer depend on one global
     /// workspace identity; worker parallelism can use these slots without
@@ -3346,12 +3346,8 @@ impl Engine {
                         .saturating_mul(size_of::<exec::PhysicalRow>()),
                 ),
             )
-            + crate::storage::row_heap_image_capacity(config).saturating_mul(size_of::<(
-                u32,
-                u64,
-                crate::storage::RowHeapImage,
-                RowLoc,
-            )>())
+            + crate::storage::row_heap_image_capacity(config)
+                .saturating_mul(size_of::<crate::storage::HeapRelocationEntry>())
             + config.query_workspace_slots.saturating_mul(
                 config
                     .work_arena_bytes

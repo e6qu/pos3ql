@@ -692,12 +692,37 @@ retries and copies the retained input into the current startup-sized buffer;
 insufficient space returns `54000` without publishing the row. For example, an
 order update waiting to publish cannot accidentally use another row at the old
 address after compaction. A dropped or replaced table still returns `40001`
-before a relocation retry. Compaction checks its complete relocation set before
-changing bytes or handles. Readers reject
+before a relocation retry. Update comparisons retain the committed row and
+the new input independently, so they may read from different heap buffers.
+Compaction checks its complete relocation set before changing bytes or handles.
+Readers reject
 reused table identities and stale heap locations. Heap addresses and relocation
 generations describe caches, not durable row identity. Retained byte copies
-use statement memory. Physical reclamation still requires exclusive table
-metadata, but retained byte readers can continue using the old heap buffer.
+use statement memory.
+
+Heap relocation reserves the existing spare buffer, captures resident locations,
+then sorts and copies privately in bounded turns. Only capture and the final
+remap own the shared row-version metadata. A write prepared before capture
+moves its unpublished input into the append tail; writes after capture already
+use that tail. Relocation copies later appends before publishing. If the tail
+advances again, publication requests another copy turn without changing row
+locations. Current rows, history, pending versions and aliases are remapped by
+their old location rather than reusable allocator slots.
+
+For example, one connection can retain an old order while another updates a
+different order during copying. Both still read their own selected bytes after
+the buffer switch. Table retirement clears its rows through version ownership;
+a replaced slot's new rows survive publication. A held table definition does
+not keep copying or unrelated publication waiting.
+
+The two heap buffers and coordination controls are charged at startup. The
+existing relocation scratch now stores typed source/destination entries.
+Exhaustion returns 54000: "heap compaction scratch overflow", "row heap relocation
+buffers are retained by readers", or "row heap relocation is already active".
+Cancellation releases the private buffer and capture boundary. Exclusive
+callers can still compact an unretained active buffer in place when an older
+reader retains the other buffer. Shared callers always use the private copy
+path. Engine-wide scheduling and SQL execution workers remain unfinished.
 
 Table rewrites retain each transformed image until validation, journaling and
 publication finish. The owner array uses the existing statement arena; its

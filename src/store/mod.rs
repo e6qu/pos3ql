@@ -471,7 +471,8 @@ pub(crate) struct BlockIoStats {
     /// Completed durable-block response bodies. This differs from issued GETs:
     /// a hedge or failed request may never deliver a body.
     pub(crate) object_read_completions: u64,
-    /// Payload bytes carried by completed durable-block GET responses.
+    /// Completed successful object-response body bytes, including block
+    /// headers. Later frame verification can still reject those bytes.
     pub(crate) object_read_bytes: u64,
     /// Elapsed wall time awaiting completed durable-block GET responses.
     /// Telemetry calibrates future plans only; it is not durable state.

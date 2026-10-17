@@ -2946,6 +2946,7 @@ impl Engine {
         arena: &Arena,
         trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let role = self.subscription_apply_role(stream, binding.table_slot(), txn.txid)?;
         let prior = eval::funcs::system::current_user_owned();
         eval::funcs::system::set_current_user(role.as_str());
@@ -2973,6 +2974,7 @@ impl Engine {
         arena: &Arena,
         trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let role = self.subscription_apply_role(stream, binding.table_slot(), txn.txid)?;
         let prior = eval::funcs::system::current_user_owned();
         eval::funcs::system::set_current_user(role.as_str());
@@ -3000,6 +3002,7 @@ impl Engine {
         arena: &Arena,
         trigger_context: &mut exec::ReplicationTriggerContext<'_, '_>,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let role = self.subscription_apply_role(stream, binding.table_slot(), txn.txid)?;
         let prior = eval::funcs::system::current_user_owned();
         eval::funcs::system::set_current_user(role.as_str());
@@ -3062,6 +3065,7 @@ impl Engine {
         restart_identity: bool,
         arena: &Arena,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         if tables.is_empty() {
             return Err(sql_err!(
                 sqlstate::PROTOCOL_VIOLATION,
@@ -5096,6 +5100,7 @@ impl Engine {
     }
 
     pub fn commit_txn(&mut self, txn: &mut TxnState, guc: &GucState) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         self.finish_txn(txn, guc, None)
     }
 
@@ -6745,6 +6750,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         self.fire_constraint_trigger_boundary(
             txn,
             guc,
@@ -6782,6 +6788,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let fail =
             |engine: &mut Self, txn: &mut TxnState, cursors: &mut cursor::CursorPool, error| {
                 if txn.is_explicit() {
@@ -6951,6 +6958,7 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let Some(slot) = self.prepared_transactions.find(gid) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -7037,6 +7045,7 @@ impl Engine {
         responder: &mut Responder,
         boundary: exec::TriggerQueueBoundary,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         exec::fire_constraint_triggers(
             &mut self.storage,
             txn,
@@ -7286,17 +7295,17 @@ impl Engine {
         self.ckpt.is_some()
     }
 
+    fn atomic_block_read_scope(&self) -> Option<crate::checkpoint::AtomicBlockReadScope> {
+        self.ckpt
+            .as_ref()
+            .map(Checkpointer::atomic_block_read_scope)
+    }
+
     /// Enables reactor-driven reads only for the durable block stack. Manifest
     /// and WAL clients retain their synchronous, statement-atomic contracts.
     pub(crate) fn enable_async_block_reads(&mut self) {
         if let Some(checkpointer) = self.ckpt.as_mut() {
             checkpointer.enable_async_block_reads();
-        }
-    }
-
-    pub(crate) fn disable_async_block_reads(&mut self) {
-        if let Some(checkpointer) = self.ckpt.as_mut() {
-            checkpointer.disable_async_block_reads();
         }
     }
 
@@ -7895,6 +7904,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let _atomic_reads = self.atomic_block_read_scope();
         if !txn.is_explicit() {
             responder.warning(
                 sqlstate::NO_ACTIVE_SQL_TRANSACTION,
@@ -8235,9 +8245,10 @@ impl Engine {
         }
         // A checkpoint owns the block stack synchronously: its publication
         // state machine cannot be rewound as a client statement can.
-        ckpt.disable_async_block_reads();
-        let checkpoint = ckpt.checkpoint(&mut self.storage, &mut self.scratch);
-        ckpt.enable_async_block_reads();
+        let checkpoint = {
+            let _atomic_reads = ckpt.atomic_block_read_scope();
+            ckpt.checkpoint(&mut self.storage, &mut self.scratch)
+        };
         match checkpoint? {
             Some(lsn) => {
                 self.begin_post_publish_cleanup(lsn);
@@ -8246,9 +8257,10 @@ impl Engine {
                     .ckpt
                     .as_mut()
                     .expect("checkpoint target remains attached");
-                ckpt.disable_async_block_reads();
-                let maintenance = ckpt.finish_maintenance(&self.storage);
-                ckpt.enable_async_block_reads();
+                let maintenance = {
+                    let _atomic_reads = ckpt.atomic_block_read_scope();
+                    ckpt.finish_maintenance(&self.storage)
+                };
                 maintenance?;
                 Ok(true)
             }
@@ -8507,6 +8519,7 @@ impl Engine {
         line: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let scratch = match context.dml_scratch {
             CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
             CopyDmlScratch::SubscriptionWorker(scratch) => scratch,
@@ -8542,6 +8555,7 @@ impl Engine {
         row: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let scratch = match context.dml_scratch {
             CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
             CopyDmlScratch::SubscriptionWorker(scratch) => scratch,
@@ -8567,6 +8581,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         Self::copy_start_with_scratch(
             &mut self.storage,
             setup,
@@ -8587,6 +8602,7 @@ impl Engine {
         responder: &mut Responder,
         scratch: &mut exec::DmlScratch,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         Self::copy_start_with_scratch(
             &mut self.storage,
             setup,
@@ -8631,6 +8647,7 @@ impl Engine {
         responder: &mut Responder,
         inserted: &exec::CopyTransitionRows,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         self.work.reset();
         let result = Self::copy_finish_with_scratch(
             &mut self.storage,
@@ -8658,6 +8675,7 @@ impl Engine {
         responder: &mut Responder,
         workspace: SubscriptionCopyWorkspace<'_>,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         workspace.arena.reset();
         Self::copy_finish_with_scratch(
             &mut self.storage,
@@ -8870,7 +8888,7 @@ impl Engine {
         // A checkpoint beat advances publication state that cannot be replayed
         // after yielding. Its block reads therefore own the store
         // synchronously, just as an explicit CHECKPOINT does.
-        ckpt.disable_async_block_reads();
+        let atomic_reads = ckpt.atomic_block_read_scope();
         // A wide sweep can lose headroom faster than one beat reclaims it.
         // Complete publication under critical pressure before dispatch resumes.
         let critical = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85;
@@ -8885,7 +8903,7 @@ impl Engine {
         } else {
             ckpt.checkpoint_step(&mut self.storage, &mut self.scratch)
         };
-        ckpt.enable_async_block_reads();
+        drop(atomic_reads);
         let remote_maintenance_finished =
             remote_maintenance_was_pending && !ckpt.published_maintenance_pending();
         match checkpoint {
@@ -9450,6 +9468,7 @@ impl Engine {
         responder: &mut Responder,
         conn_id: i32,
     ) -> Result<bool, WireFull> {
+        let _atomic_reads = self.atomic_block_read_scope();
         self.work.bind_connection(conn_id);
         datetime::begin_statement();
         if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
@@ -13654,6 +13673,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         self.ensure_txn(txn, TxnMode::Implicit, guc)?;
         let result = (|| {
             let _guc_scope = guc::enter_eval_scope(guc, txn);
@@ -14039,15 +14059,13 @@ impl Engine {
         reset_workspace: bool,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if statement_writes(statement) && self.block_reads_pending() {
-            return Ok(Err(sql_err!(
-                sqlstate::INTERNAL_IO_WAIT,
-                "durable block reads in progress"
-            )));
-        }
-        if statement_writes(statement) {
-            self.disable_async_block_reads();
-        }
+        let _atomic_reads = if statement_writes(statement) {
+            self.ckpt
+                .as_ref()
+                .map(Checkpointer::atomic_block_read_scope)
+        } else {
+            None
+        };
         let _configuration_reload_scope = ConfigurationReloadScope::new(self, guc);
         let _guc_eval_scope = guc::enter_eval_scope(guc, txn);
         // Reclaim the shared execution arena from the previous top-level

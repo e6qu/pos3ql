@@ -83989,7 +83989,12 @@ fn owned_write_inputs_rewrite_undo_exhaustion_releases_images_and_restores_defin
     assert_owned_rewrite_inputs_released(&mut engine);
 }
 
-fn check_cleanup_during_download(name: &str, fail_read: bool, retain_both: bool) {
+fn check_cleanup_during_download(
+    name: &str,
+    fail_read: bool,
+    retain_both: bool,
+    during: impl FnOnce(&mut Engine, &Budget),
+) {
     use crate::io::reactor::Reactor;
     use crate::store::{BlockStore, StoreError};
     use std::io::{Read, Write};
@@ -84118,6 +84123,9 @@ fn check_cleanup_during_download(name: &str, fail_read: bool, retain_both: bool)
         )),
         ["80|655360"]
     );
+    during(&mut engine, &budget);
+    assert_eq!(engine.pending_block_read_fd(0), Some(fd));
+    assert!(blocks.lock().unwrap().async_gets_enabled());
     let mut values = [Datum::Null; 2];
     crate::storage::rowenc::decode(&current, &[ColType::Int4, ColType::Text], &mut values).unwrap();
     assert!(matches!(values[1], Datum::Text(value) if value.len() == 8192));
@@ -84161,17 +84169,17 @@ fn check_cleanup_during_download(name: &str, fail_read: bool, retain_both: bool)
 
 #[test]
 fn cleanup_download_overlap_finishes_cleanup_and_preserves_the_pending_response() {
-    check_cleanup_during_download("cleanup-download-success", false, false);
+    check_cleanup_during_download("cleanup-download-success", false, false, |_, _| {});
 }
 
 #[test]
 fn cleanup_download_overlap_finishes_cleanup_without_hiding_a_download_error() {
-    check_cleanup_during_download("cleanup-download-error", true, false);
+    check_cleanup_during_download("cleanup-download-error", true, false, |_, _| {});
 }
 
 #[test]
 fn cleanup_download_overlap_retained_buffer_failure_retries_without_cancelling_the_get() {
-    check_cleanup_during_download("cleanup-download-retained", false, true);
+    check_cleanup_during_download("cleanup-download-retained", false, true, |_, _| {});
 }
 
 #[test]
@@ -84431,4 +84439,67 @@ fn cleanup_download_overlap_commit_pruning_ignores_newer_unpublished_orphans() {
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn atomic_block_reads_cached_simple_writes_and_sql_errors_preserve_pending_get() {
+    check_cleanup_during_download("atomic-simple-write", false, false, |engine, budget| {
+        let failed = run_with_fixed_memory(
+            engine,
+            budget,
+            "UPDATE cleanup_orders SET missing_column = 1 WHERE id = 1",
+            4 << 20,
+        );
+        assert_eq!(error_sqlstates(&failed), ["42703"]);
+        let output = run_with_fixed_memory(
+            engine,
+            budget,
+            "UPDATE cleanup_orders SET note = 'paid' WHERE id = 1; \
+             INSERT INTO cleanup_orders VALUES (81, 'new'); \
+             DELETE FROM cleanup_orders WHERE id = 2; \
+             SELECT count(*), sum(id) FROM cleanup_orders; \
+             SELECT note FROM cleanup_orders WHERE id = 1",
+            4 << 20,
+        );
+        assert!(!message_types(&output).contains(&b'E'));
+        assert_eq!(data_rows(&output), ["80|3319", "paid"]);
+    });
+}
+
+#[test]
+fn atomic_block_reads_cached_extended_write_preserves_pending_get() {
+    check_cleanup_during_download("atomic-extended-write", false, false, |engine, budget| {
+        let mut request_budget = Budget::new(budget.remaining());
+        let arena = Arena::new(&mut request_budget, "atomic extended query", 4 << 20).unwrap();
+        let mut send =
+            crate::mem::FixedBuf::new(&mut request_budget, "atomic extended send", 1 << 16)
+                .unwrap();
+        let mut txn = TxnState::new(&mut request_budget, 128).unwrap();
+        let mut pool = test_pool(&mut request_budget);
+        let mut cursors = test_cursors(&mut request_budget);
+        let mut guc = GucState::new();
+        {
+            let mut responder =
+                Responder::for_execute(&mut send, crate::pg::respond::ResultFmt::ALL_TEXT);
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| engine.execute_extended(
+                    "UPDATE cleanup_orders SET note = 'extended' WHERE id = 1 RETURNING id, note",
+                    &arena,
+                    &[],
+                    &[],
+                    &mut txn,
+                    &mut pool,
+                    &mut cursors,
+                    &mut guc,
+                    &mut responder,
+                    1,
+                    false,
+                ))
+                .unwrap(),
+                ExtendedExecutionStatus::Complete(true)
+            ));
+        }
+        crate::mem::guard::forbid_alloc(|| engine.commit_txn(&mut txn, &guc)).unwrap();
+        assert_eq!(data_rows(send.readable()), ["1|extended"]);
+    });
 }

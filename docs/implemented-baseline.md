@@ -751,8 +751,25 @@ turns. Checkpoint publication, merges, and temporary spilling still wait for
 pending durable-block downloads. Fixed execution workers and independent storage
 publication remain unfinished.
 
+For example, while one connection downloads an uncached invoice, another can
+update a cached order and receive its durable commit acknowledgement. INSERT,
+UPDATE, DELETE, COPY, trigger execution and commit use the existing separate
+block client for any reads that must finish without restarting the operation.
+They preserve the suspended reader's socket, response bytes and error, including
+across nested calls and SQL errors. The reader keeps its original statement
+snapshot. A write that needs an uncached block still waits synchronously; it can
+issue another GET even if a reader is already downloading that block. SQL
+execution remains serial, and this does not enable independent checkpoint
+publication or worker threads.
+
+Object-read byte counters include each successfully completed HTTP response
+body, including its block header, even if block verification rejects it.
+Reusing a completed response does not count it twice. The HTTP client discards
+a connection when the server advertises that it will close it, while retaining
+the completed response for its owner.
+
 The object-request reservation includes every configured read client, the
-separate block write and metadata clients, read-slot controls, and the 256 KiB
+separate atomic block and metadata clients, read-slot controls, and the 256 KiB
 block scratch buffer. Checkpoint writer buffers and workspace arrays are charged
 when constructed too. For example, increasing `object_store_get_slots` reserves
 another complete request/response buffer before accepting connections; it cannot

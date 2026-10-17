@@ -751,7 +751,7 @@ boundary stays resident too. Recovered roots have no eviction boundary and do
 not justify discarding newer heap bytes. A temporary spill records the table
 generation it copied, because temporary commits may share a zero journal
 position. Only that exact table generation can evict to the temporary snapshot;
-a later spill names its own object. These witnesses are distinct states in the
+a later spill names its own object. These kinds of boundary are distinct states in the
 startup-sized root metadata. For example, if a checkpoint saved an order before its price
 changed, cleanup keeps the new price in memory until another checkpoint saves
 it; it never redirects that row to the older object.
@@ -766,9 +766,26 @@ this allowance. It does not create a growing pool. For example, a rejected
 type conversion leaves the original table readable and allows a later retry
 to reclaim the heap buffers.
 
-Transaction-wide durable publication, concurrent cache/object I/O and
-maintenance, remaining table rewrites, and execution workers are still open.
-A retained reader must remain safe across all of those changes.
+Selected enum definitions and label iterators retain the label image they read.
+A label image is one complete saved list of labels.
+Changing or dropping the type, rolling back a later change, reusing its catalog
+slot, replaying a definition, or retiring a database cannot replace those
+selected labels. Iterators release their image at the end or on drop; cloned
+definitions release it when dropped. The label buffers remain alive after Storage is
+removed while a selected reader still owns it. For example, a reader that
+selected the status labels `new` and `paid` keeps those labels while an ALTER
+adds `shipped`; another lookup sees the new definition.
+
+Committed definitions, pending changes and retained readers share the existing
+startup label buffers. A separate image remains reserved for replay.
+Image counters and controls are charged at startup. Exhaustion returns 54000,
+"enum member-image pool is exhausted", without changing the published
+definition. Release old readers or increase the startup catalog reservations
+before retrying. Replay can reuse an unretained image in place; it reserves a
+different image when readers retain the old one. Type commits remain exclusive.
+
+Transaction-wide catalog and durable publication, concurrent cache/object I/O
+and maintenance, remaining table rewrites, and execution workers are still open.
 
 ## What the tests establish
 

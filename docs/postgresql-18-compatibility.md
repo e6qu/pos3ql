@@ -128,6 +128,15 @@ slots. The active transaction identity registry reserves
 returns `54000` if none is free; existing transactions remain usable, and ending
 one releases its entry. SQL and maintenance share one checked identity counter.
 `max_catalog_versions_per_object` bounds retained definition/undo versions.
+Enum label images reserve `max_enums + P` shared slots and one replay scratch
+image, where `P = min(max_enums * max_catalog_versions_per_object,
+(max_connections + max_prepared_transactions + max_subscriptions) *
+max_ddl_per_transaction)`. Committed definitions, pending changes and retained
+readers share those slots. Reader retention can exhaust this pool before a
+pending-definition limit is reached; `54000` names the enum member-image pool
+and preserves the published definition. Each image holds
+`max_enum_labels_per_type` labels. The image counters and controls are included
+in the startup memory plan.
 `max_row_versions_per_row` bounds pending writes and committed snapshot versions;
 each write retains an immutable image, including writes in the same command.
 Pending version identity exhaustion is a named program-limit error.

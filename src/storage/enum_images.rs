@@ -1,0 +1,710 @@
+//! Selected enum labels remain immutable until their last reader releases them.
+
+use std::sync::{Arc, Mutex};
+
+use super::EnumMember;
+use crate::mem::budget::{Budget, BudgetError};
+use crate::mem::fixed_vec::FixedVec;
+use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql_err;
+
+#[derive(Clone, Copy, Debug)]
+struct ImageSlot {
+    owned: bool,
+    readers: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct EnumMemberImages {
+    members: FixedVec<EnumMember>,
+    slots: FixedVec<ImageSlot>,
+    width: usize,
+}
+
+impl EnumMemberImages {
+    pub(super) fn budget_bytes(images: usize, width: usize) -> usize {
+        images
+            .saturating_mul(width)
+            .saturating_mul(size_of::<EnumMember>())
+            .saturating_add(images.saturating_mul(size_of::<ImageSlot>()))
+            .saturating_add(
+                size_of::<Arc<Mutex<Self>>>() + size_of::<Mutex<Self>>() + 2 * size_of::<usize>(),
+            )
+    }
+
+    pub(super) fn new(
+        budget: &mut Budget,
+        images: usize,
+        width: usize,
+    ) -> Result<Arc<Mutex<Self>>, BudgetError> {
+        if images == 0 || images > u32::MAX as usize {
+            return Err(BudgetError {
+                what: "enum member-image address range",
+                requested: images,
+                remaining: budget.remaining(),
+                total: budget.total(),
+            });
+        }
+        let entries = images.checked_mul(width).ok_or(BudgetError {
+            what: "enum member-image slab",
+            requested: usize::MAX,
+            remaining: budget.remaining(),
+            total: budget.total(),
+        })?;
+        budget.draw(
+            size_of::<Arc<Mutex<Self>>>() + size_of::<Mutex<Self>>() + 2 * size_of::<usize>(),
+            "enum member-image controls",
+        )?;
+        let mut members = FixedVec::new(budget, "enum_members", entries)?;
+        for _ in 0..entries {
+            members
+                .push(EnumMember::EMPTY)
+                .expect("reserved label slab");
+        }
+        let mut slots = FixedVec::new(budget, "enum member-image slots", images)?;
+        for index in 0..images {
+            slots
+                .push(ImageSlot {
+                    // The final image is the isolated replay scratch.
+                    owned: index == images - 1,
+                    readers: 0,
+                })
+                .expect("reserved image controls");
+        }
+        Ok(Arc::new(Mutex::new(Self {
+            members,
+            slots,
+            width,
+        })))
+    }
+
+    fn validate_count(&self, count: usize) -> Result<u32, SqlError> {
+        if count > self.width {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "an enum type may have at most {} labels",
+                self.width
+            ));
+        }
+        u32::try_from(count).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "enum label count exceeds durable representation"
+            )
+        })
+    }
+
+    fn reserve(&mut self) -> Result<u32, SqlError> {
+        let image = self
+            .slots
+            .iter()
+            .position(|slot| !slot.owned && slot.readers == 0)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "enum member-image pool is exhausted"
+                )
+            })?;
+        self.slots[image].owned = true;
+        Ok(image as u32)
+    }
+
+    pub(super) fn release(&mut self, image: u32) {
+        assert_ne!(image as usize, self.slots.len() - 1);
+        let slot = &mut self.slots[image as usize];
+        assert!(slot.owned, "enum member image has a logical owner");
+        slot.owned = false;
+    }
+
+    pub(super) fn replay_image(&self) -> u32 {
+        (self.slots.len() - 1) as u32
+    }
+
+    pub(super) fn replay_members(&self, count: usize) -> &[EnumMember] {
+        let start = self.replay_image() as usize * self.width;
+        &self.members[start..start + count]
+    }
+
+    pub(super) fn replay_members_mut(&mut self, count: usize) -> &mut [EnumMember] {
+        let start = self.replay_image() as usize * self.width;
+        &mut self.members[start..start + count]
+    }
+
+    pub(super) fn image_members(&self, image: u32, count: usize) -> &[EnumMember] {
+        let start = image as usize * self.width;
+        &self.members[start..start + count]
+    }
+
+    pub(super) fn replace_from_replay(
+        &mut self,
+        current: Option<u32>,
+        count: usize,
+    ) -> Result<(u32, u32), SqlError> {
+        let count = self.validate_count(count)?;
+        let reusable = if let Some(image) = current {
+            if image == self.replay_image()
+                || self
+                    .slots
+                    .get(image as usize)
+                    .is_none_or(|slot| !slot.owned)
+            {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "enum replay target has no catalog owner"
+                ));
+            }
+            self.slots[image as usize].readers == 0
+        } else {
+            false
+        };
+        let target = if reusable {
+            current.expect("reusable catalog image")
+        } else {
+            self.reserve()?
+        };
+        let start = self.replay_image() as usize * self.width;
+        let destination = target as usize * self.width;
+        self.members
+            .as_mut_slice()
+            .copy_within(start..start + count as usize, destination);
+        if !reusable && let Some(previous) = current {
+            self.release(previous);
+        }
+        Ok((target, count))
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.members.len()
+    }
+}
+
+/// An unpublished image releases its reservation on every error path.
+pub(super) struct EnumImageReservation {
+    images: Arc<Mutex<EnumMemberImages>>,
+    image: Option<u32>,
+    count: u32,
+}
+
+impl EnumImageReservation {
+    pub(super) fn write(
+        images: &Arc<Mutex<EnumMemberImages>>,
+        members: &[EnumMember],
+    ) -> Result<Self, SqlError> {
+        let mut state = images.lock().expect("enum member-image lock poisoned");
+        let count = state.validate_count(members.len())?;
+        let image = state.reserve()?;
+        let start = image as usize * state.width;
+        state.members[start..start + members.len()].copy_from_slice(members);
+        Ok(Self {
+            images: Arc::clone(images),
+            image: Some(image),
+            count,
+        })
+    }
+
+    pub(super) fn copy(
+        images: &Arc<Mutex<EnumMemberImages>>,
+        source: u32,
+        count: usize,
+    ) -> Result<Self, SqlError> {
+        let mut state = images.lock().expect("enum member-image lock poisoned");
+        let count = state.validate_count(count)?;
+        if state
+            .slots
+            .get(source as usize)
+            .is_none_or(|slot| !slot.owned && slot.readers == 0)
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "enum member copy has no retained source image"
+            ));
+        }
+        let image = state.reserve()?;
+        let start = source as usize * state.width;
+        let target = image as usize * state.width;
+        state
+            .members
+            .as_mut_slice()
+            .copy_within(start..start + count as usize, target);
+        Ok(Self {
+            images: Arc::clone(images),
+            image: Some(image),
+            count,
+        })
+    }
+
+    pub(super) fn count(&self) -> u32 {
+        self.count
+    }
+
+    pub(super) fn publish(mut self) -> u32 {
+        self.image.take().expect("reserved enum member image")
+    }
+}
+
+impl Drop for EnumImageReservation {
+    fn drop(&mut self) {
+        if let Some(image) = self.image {
+            self.images
+                .lock()
+                .expect("enum member-image lock poisoned")
+                .release(image);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct EnumImageRead {
+    images: Arc<Mutex<EnumMemberImages>>,
+    image: Option<u32>,
+}
+
+impl EnumImageRead {
+    pub(super) fn capture(images: &Arc<Mutex<EnumMemberImages>>, image: Option<u32>) -> Self {
+        if let Some(image) = image {
+            let mut state = images.lock().expect("enum member-image lock poisoned");
+            let slot = &mut state.slots[image as usize];
+            assert!(
+                slot.owned || slot.readers != 0,
+                "selected enum member image is retained"
+            );
+            slot.readers = slot
+                .readers
+                .checked_add(1)
+                .expect("enum image owner count overflow");
+        }
+        Self {
+            images: Arc::clone(images),
+            image,
+        }
+    }
+
+    pub(super) fn member(&self, index: usize) -> EnumMember {
+        let state = self.images.lock().expect("enum member-image lock poisoned");
+        let image = self.image.expect("nonempty enum image");
+        state.members[image as usize * state.width + index]
+    }
+}
+
+impl Clone for EnumImageRead {
+    fn clone(&self) -> Self {
+        Self::capture(&self.images, self.image)
+    }
+}
+
+impl Drop for EnumImageRead {
+    fn drop(&mut self) {
+        if let Some(image) = self.image {
+            let mut state = self.images.lock().expect("enum member-image lock poisoned");
+            let slot = &mut state.slots[image as usize];
+            slot.readers = slot
+                .readers
+                .checked_sub(1)
+                .expect("retained enum image owner");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::SqlName;
+    use crate::storage::tests::{test_budget, test_config, test_database_definition};
+    use crate::storage::{DatabaseOid, EnumSpec, Storage};
+
+    fn storage(enum_capacity: usize) -> Storage {
+        let mut config = test_config();
+        config.max_enums = enum_capacity;
+        config.max_enum_labels_per_type = 4;
+        config.max_catalog_versions_per_object = 1;
+        config.max_databases = 4;
+        config.max_schemas = 8;
+        let mut budget = test_budget(&config);
+        Storage::new(&config, &mut budget).unwrap()
+    }
+
+    fn create(storage: &mut Storage, name: &str) -> usize {
+        storage
+            .create_enum(
+                SqlName::parse("public").unwrap(),
+                SqlName::parse(name).unwrap(),
+                EnumSpec {
+                    members: &[member("new", 1.0)],
+                },
+                0,
+            )
+            .unwrap()
+    }
+
+    fn alter(
+        storage: &mut Storage,
+        slot: usize,
+        members: &[EnumMember],
+    ) -> Result<Option<super::super::PendingEnumDefinition>, SqlError> {
+        storage.stage_enum_alter(
+            slot,
+            SqlName::parse("public").unwrap(),
+            SqlName::parse("state").unwrap(),
+            members,
+            77,
+        )
+    }
+
+    fn member(label: &str, sort: f64) -> EnumMember {
+        EnumMember {
+            label: SqlName::parse(label).unwrap(),
+            sort,
+        }
+    }
+
+    fn images(count: usize, width: usize) -> Arc<Mutex<EnumMemberImages>> {
+        let mut budget = Budget::new(EnumMemberImages::budget_bytes(count, width));
+        let images = EnumMemberImages::new(&mut budget, count, width).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        images
+    }
+
+    #[test]
+    fn enum_image_ownership_pool_readers_keep_labels_after_release_and_pool_removal() {
+        let images = images(3, 2);
+        let old = member("new", 1.0);
+        let replacement = member("paid", 2.0);
+        crate::mem::guard::forbid_alloc(|| {
+            let image = EnumImageReservation::write(&images, &[old])
+                .unwrap()
+                .publish();
+            let selected = EnumImageRead::capture(&images, Some(image));
+            images.lock().unwrap().release(image);
+            let new_image = EnumImageReservation::write(&images, &[replacement])
+                .unwrap()
+                .publish();
+            assert_ne!(new_image, image);
+            let retained = selected.clone();
+            drop(selected);
+            images.lock().unwrap().release(new_image);
+            drop(images);
+            assert_eq!(retained.member(0).label, old.label);
+            assert_eq!(retained.member(0).sort, old.sort);
+        });
+    }
+
+    #[test]
+    fn enum_image_ownership_pool_capacity_resumes_after_the_last_reader_and_reservation_drop() {
+        let images = images(3, 2);
+        let label = member("old", 1.0);
+        crate::mem::guard::forbid_alloc(|| {
+            let first = EnumImageReservation::write(&images, &[label])
+                .unwrap()
+                .publish();
+            let selected = EnumImageRead::capture(&images, Some(first));
+            let retained = selected.clone();
+            images.lock().unwrap().release(first);
+            let second = EnumImageReservation::write(&images, &[label])
+                .unwrap()
+                .publish();
+            let error = EnumImageReservation::write(&images, &[label])
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                error.message.as_str(),
+                "enum member-image pool is exhausted"
+            );
+            drop(selected);
+            assert!(EnumImageReservation::write(&images, &[label]).is_err());
+            assert_eq!(retained.member(0).label, label.label);
+            drop(retained);
+            let reservation = EnumImageReservation::write(&images, &[label]).unwrap();
+            drop(reservation);
+            let third = EnumImageReservation::write(&images, &[label])
+                .unwrap()
+                .publish();
+            assert_eq!(third, first);
+            images.lock().unwrap().release(second);
+            images.lock().unwrap().release(third);
+        });
+    }
+
+    #[test]
+    fn enum_image_ownership_pool_validation_and_copy_preserve_source_and_capacity() {
+        let images = images(3, 2);
+        let label = member("source", 1.0);
+        crate::mem::guard::forbid_alloc(|| {
+            let source = EnumImageReservation::write(&images, &[label])
+                .unwrap()
+                .publish();
+            let invalid = EnumImageReservation::write(&images, &[label, label, label])
+                .err()
+                .unwrap();
+            assert_eq!(invalid.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            let invalid = EnumImageReservation::copy(&images, u32::MAX, 1)
+                .err()
+                .unwrap();
+            assert_eq!(invalid.sqlstate, sqlstate::INTERNAL_ERROR);
+            let copy = EnumImageReservation::copy(&images, source, 1)
+                .unwrap()
+                .publish();
+            let selected = EnumImageRead::capture(&images, Some(copy));
+            images.lock().unwrap().release(source);
+            images.lock().unwrap().release(copy);
+            let reused = EnumImageReservation::write(&images, &[member("changed", 2.0)])
+                .unwrap()
+                .publish();
+            assert_eq!(reused, source);
+            assert_eq!(selected.member(0).label, label.label);
+            images.lock().unwrap().release(reused);
+        });
+    }
+
+    #[test]
+    fn enum_image_ownership_pool_replay_reuses_only_unretained_images() {
+        let images = images(2, 1);
+        let original = member("old", 1.0);
+        let changed = member("new", 2.0);
+        crate::mem::guard::forbid_alloc(|| {
+            let source = EnumImageReservation::write(&images, &[original])
+                .unwrap()
+                .publish();
+            images.lock().unwrap().replay_members_mut(1)[0] = changed;
+            let retained = EnumImageRead::capture(&images, Some(source));
+            let error = images
+                .lock()
+                .unwrap()
+                .replace_from_replay(Some(source), 1)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(retained.member(0).label, original.label);
+            drop(retained);
+            let (image, count) = images
+                .lock()
+                .unwrap()
+                .replace_from_replay(Some(source), 1)
+                .unwrap();
+            assert_eq!(image, source);
+            assert_eq!(count, 1);
+            let retained = EnumImageRead::capture(&images, Some(image));
+            assert_eq!(retained.member(0).label, changed.label);
+            images.lock().unwrap().release(image);
+        });
+    }
+
+    #[test]
+    fn enum_image_ownership_selected_views_and_iterators_survive_commit_and_slot_reuse() {
+        let mut storage = storage(1);
+        crate::mem::guard::forbid_alloc(|| {
+            let slot = create(&mut storage, "state");
+            let before = storage.enum_for(slot, 0);
+            let selected = before.clone();
+            let mut labels = before.members();
+            drop(before);
+            alter(
+                &mut storage,
+                slot,
+                &[member("new", 1.0), member("paid", 2.0)],
+            )
+            .unwrap();
+            storage.commit_enum_alter(slot, 77);
+            assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
+            assert_eq!(selected.members().len(), 1);
+            assert_eq!(
+                storage.drop_enum("public", "state", 77).unwrap(),
+                Some(slot)
+            );
+            storage.commit_enum_drop(slot);
+            let replacement = storage
+                .create_enum(
+                    SqlName::parse("public").unwrap(),
+                    SqlName::parse("replacement").unwrap(),
+                    EnumSpec {
+                        members: &[member("other", 3.0)],
+                    },
+                    0,
+                )
+                .unwrap();
+            assert_eq!(replacement, slot);
+            assert_ne!(
+                selected.created_at,
+                storage.enum_for(replacement, 0).created_at
+            );
+            assert_eq!(selected.sort_of("new"), Some(1.0));
+            assert_eq!(labels.next().unwrap().label.as_str(), "new");
+            assert!(labels.next().is_none());
+            assert_eq!(storage.enum_for(replacement, 0).sort_of("other"), Some(3.0));
+        });
+    }
+
+    #[test]
+    fn enum_image_ownership_capacity_and_rollback_release_selected_images() {
+        let mut storage = storage(1);
+        crate::mem::guard::forbid_alloc(|| {
+            let slot = create(&mut storage, "state");
+            let before = storage.enum_for(slot, 0);
+            alter(
+                &mut storage,
+                slot,
+                &[member("new", 1.0), member("paid", 2.0)],
+            )
+            .unwrap();
+            storage.commit_enum_alter(slot, 77);
+            let members = [
+                member("new", 1.0),
+                member("paid", 2.0),
+                member("shipped", 3.0),
+            ];
+            let error = alter(&mut storage, slot, &members).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                error.message.as_str(),
+                "enum member-image pool is exhausted"
+            );
+            assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
+            drop(before);
+            let prior = alter(&mut storage, slot, &members).unwrap();
+            let pending = storage.enum_for(slot, 77);
+            storage.rollback_enum_alter(slot, prior);
+            assert_eq!(pending.sort_of("shipped"), Some(3.0));
+            assert!(alter(&mut storage, slot, &members).is_err());
+            drop(pending);
+            let prior = alter(&mut storage, slot, &members).unwrap();
+            storage.rollback_enum_alter(slot, prior);
+            assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
+        });
+    }
+
+    #[test]
+    fn enum_image_ownership_iterator_releases_at_end_and_outlives_storage() {
+        let mut storage = storage(1);
+        let slot = crate::mem::guard::forbid_alloc(|| create(&mut storage, "state"));
+        let mut labels = crate::mem::guard::forbid_alloc(|| storage.enum_for(slot, 0).members());
+        drop(storage);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(labels.next().unwrap().label.as_str(), "new");
+            assert!(labels.next().is_none());
+        });
+    }
+
+    #[test]
+    fn enum_image_ownership_worker_view_keeps_catalog_writers_available() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let mut storage = storage(1);
+        let slot = create(&mut storage, "state");
+        let selected = storage.enum_for(slot, 0);
+        let published = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let flag = &published;
+            let reader = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !flag.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                assert!(
+                    flag.load(Ordering::Acquire),
+                    "enum writer waited for a selected reader"
+                );
+                crate::mem::guard::forbid_alloc(|| {
+                    assert_eq!(selected.members().len(), 1);
+                    assert_eq!(selected.sort_of("new"), Some(1.0));
+                    assert_eq!(selected.sort_of("paid"), None);
+                });
+            });
+            let result = crate::mem::guard::forbid_alloc(|| {
+                alter(
+                    &mut storage,
+                    slot,
+                    &[member("new", 1.0), member("paid", 2.0)],
+                )?;
+                storage.commit_enum_alter(slot, 77);
+                Ok::<(), SqlError>(())
+            });
+            published.store(true, Ordering::Release);
+            result.unwrap();
+            reader.join().unwrap();
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            let prior = alter(
+                &mut storage,
+                slot,
+                &[
+                    member("new", 1.0),
+                    member("paid", 2.0),
+                    member("shipped", 3.0),
+                ],
+            )
+            .unwrap();
+            storage.rollback_enum_alter(slot, prior);
+        });
+    }
+
+    #[test]
+    fn enum_image_ownership_replay_preserves_readers_and_failed_replacement() {
+        let mut storage = storage(1);
+        crate::mem::guard::forbid_alloc(|| {
+            let slot = create(&mut storage, "state");
+            let before = storage.enum_for(slot, 0);
+            storage
+                .enum_replay_members(2)
+                .unwrap()
+                .copy_from_slice(&[member("new", 1.0), member("paid", 2.0)]);
+            storage
+                .finish_enum_replay(
+                    SqlName::parse("public").unwrap(),
+                    SqlName::parse("state").unwrap(),
+                    2,
+                )
+                .unwrap();
+            assert_eq!(before.members().len(), 1);
+            let current = storage.enum_for(slot, 0);
+            storage.enum_replay_members(1).unwrap()[0] = member("later", 4.0);
+            let error = storage
+                .finish_enum_replay(
+                    SqlName::parse("public").unwrap(),
+                    SqlName::parse("state").unwrap(),
+                    1,
+                )
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.enum_for(slot, 0).sort_of("paid"), Some(2.0));
+            drop(before);
+            storage
+                .finish_enum_replay(
+                    SqlName::parse("public").unwrap(),
+                    SqlName::parse("state").unwrap(),
+                    1,
+                )
+                .unwrap();
+            assert_eq!(current.sort_of("paid"), Some(2.0));
+            assert_eq!(storage.enum_for(slot, 0).sort_of("later"), Some(4.0));
+        });
+    }
+
+    #[test]
+    fn enum_image_ownership_database_clone_and_retirement_keep_selected_labels() {
+        let mut storage = storage(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let source = create(&mut storage, "state");
+            let source_view = storage.enum_for(source, 0);
+            let database = storage
+                .create_database(
+                    None,
+                    DatabaseOid::POSTGRES,
+                    test_database_definition("enum_clone"),
+                    0,
+                    77,
+                )
+                .unwrap();
+            let oid = storage.database(database).oid;
+            storage.select_database(oid).unwrap();
+            let cloned = storage.enum_slot("public", "state", 77).unwrap();
+            let selected = storage.enum_for(cloned, 77);
+            assert_ne!(cloned, source);
+            assert_eq!(selected.database, oid);
+            storage.retire_database(oid, true);
+            storage.select_database(DatabaseOid::POSTGRES).unwrap();
+            assert_eq!(source_view.sort_of("new"), Some(1.0));
+            assert_eq!(selected.sort_of("new"), Some(1.0));
+            assert_eq!(storage.enum_for(source, 0).sort_of("new"), Some(1.0));
+        });
+    }
+}

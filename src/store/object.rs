@@ -151,6 +151,19 @@ struct ObjectReadSlot {
 }
 
 impl OwnedObjectStore {
+    pub(crate) fn budget_bytes(config: &crate::config::Config) -> usize {
+        config
+            .object_store_get_slots
+            .saturating_add(1)
+            .saturating_mul(ObjectStore::budget_bytes(config))
+            .saturating_add(
+                config
+                    .object_store_get_slots
+                    .saturating_mul(core::mem::size_of::<ObjectReadSlot>()),
+            )
+            .saturating_add(super::BLOCK_SIZE)
+    }
+
     /// Startup-only: the scratch Vec is reserved once, before the allocator
     /// freezes, and never grows.
     pub(crate) fn new(
@@ -183,6 +196,9 @@ impl OwnedObjectStore {
                 })
                 .expect("object read slots sized from configuration");
         }
+        budget
+            .draw(super::BLOCK_SIZE, "object_store_block_scratch")
+            .map_err(crate::object_store::SetupError::Budget)?;
         Ok(Self {
             write_client,
             slots,
@@ -708,6 +724,39 @@ mod tests {
                 }
                 Err(error) => panic!("read request: {error}"),
             }
+        }
+    }
+
+    #[test]
+    fn cleanup_download_overlap_request_pool_charges_clients_controls_and_scratch() {
+        let mut config = network_config(9, "request-budget");
+        config.object_store_head_bytes = 4096;
+        config.object_store_response_bytes = super::super::BLOCK_SIZE;
+        for slots in [1, 2, 7] {
+            config.object_store_get_slots = slots;
+            let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
+            let store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+            assert_eq!(budget.remaining(), 0);
+            assert_eq!(store.slots.capacity(), slots);
+            assert_eq!(store.scratch.len(), super::super::BLOCK_SIZE);
+        }
+    }
+
+    #[test]
+    fn cleanup_download_overlap_short_request_budget_fails_before_runtime() {
+        let mut config = network_config(9, "request-budget-short");
+        config.object_store_head_bytes = 4096;
+        config.object_store_response_bytes = super::super::BLOCK_SIZE;
+        for slots in [1, 2, 7] {
+            config.object_store_get_slots = slots;
+            let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config) - 1);
+            let error = OwnedObjectStore::new(&config, &mut budget, "blocks/")
+                .err()
+                .expect("one missing scratch byte must reject startup");
+            let crate::object_store::SetupError::Budget(error) = error else {
+                panic!("short request budget must return its named budget error");
+            };
+            assert_eq!(error.what, "object_store_block_scratch");
         }
     }
 

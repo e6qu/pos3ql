@@ -43,7 +43,7 @@ More client connections do not currently mean more statements executing together
 |---|---:|---|
 | `/livez` or `/healthz` | 200 | The event loop accepted and answered the request. |
 | `/readyz` | 200 | Startup completed, durable progress is healthy, and the process still owns the writer fence. |
-| `/readyz` | 503 | WAL or checkpoint progress failed, the object store is unavailable, or another process owns the writer fence. |
+| `/readyz` | 503 | WAL publication or remote checkpoint work failed, the object store is unavailable, or another process owns the writer fence. |
 | `/metrics` | 200 | Prometheus text metrics for current readiness, connections, query workspace capacity, active leases and waiters, WAL, row memory, checkpoint pressure, cache traffic, and immutable-block object requests. |
 | `/capacity` | 200 | JSON containing current use, waiting work and startup limits for memory, connections, query workspaces, WAL, the row heap, caches, catalogs, prepared transactions, replication, and whether credential rotation is configured. |
 
@@ -55,8 +55,20 @@ This detects a displaced idle process before it can continue serving routed
 reads. The request uses the existing fixed object client and allocates no
 runtime memory, but it can wait on object-store latency. `/livez` remains a
 local event-loop probe for separating process failure from durable-tier
-failure. Readiness also turns false when commit publication or checkpoint work
-fails and returns true after the pending durable work succeeds.
+failure. Readiness also turns false when commit publication or remote checkpoint work
+fails and returns true after a successful durable publication or completion of
+its pending remote cleanup. A skipped
+maintenance turn, local heap cleanup, or temporary-file spill cannot clear a
+storage failure status. For example, a cached report can succeed while
+`/readyz` still reports that the last durable publication failed.
+Local capacity errors keep their named SQL errors and do not by themselves
+change durable readiness.
+
+Failed maintenance retries no sooner than one second later. Client traffic
+does not shorten that delay. An idle server also retries a failure that happened
+before a checkpoint started. An empty retry releases its wakeup without changing
+publication readiness. This pacing applies to background maintenance; the commit
+barrier still decides when client responses are durable.
 
 ## Metrics and alerts
 

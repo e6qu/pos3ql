@@ -72391,8 +72391,8 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
     assert_eq!(remaining, 0);
     assert!(beats > 1, "maintenance was not paced across dispatch beats");
     assert_eq!(
-        maintenance_lists, 5,
-        "backup retention scans once; commit pruning twice; legacy and block garbage once each"
+        maintenance_lists, 4,
+        "backup retention, commit pruning, legacy and block garbage each scan once"
     );
 
     drop(engine);
@@ -83589,25 +83589,33 @@ fn assert_owned_rewrite_inputs_released(engine: &mut Engine) {
 }
 
 fn sliced_cleanup_fixture(name: &str, durable: bool) -> (Engine, Budget, Config) {
+    sliced_cleanup_fixture_with_wal(name, durable, false)
+}
+
+fn sliced_cleanup_fixture_with_wal(
+    name: &str,
+    durable: bool,
+    upload: bool,
+) -> (Engine, Budget, Config) {
     let mut config = test_config(name);
     config.object_store_on = durable;
     config.object_store_sim = durable;
-    config.wal_upload = false;
-    config.wal_upload_sync = false;
+    config.wal_upload = upload;
+    config.wal_upload_sync = upload;
     config.object_store_bucket = format!("{name}-{}", std::process::id());
     if durable {
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let output = run_with_fixed_memory(
-        &mut engine,
-        &budget,
-        "CREATE TABLE cleanup_orders(id integer PRIMARY KEY, note text); \
-         INSERT INTO cleanup_orders SELECT i, repeat('x', 8192) \
-         FROM generate_series(1, 80) AS g(i)",
-        32 << 20,
-    );
+    let sql = "CREATE TABLE cleanup_orders(id integer PRIMARY KEY, note text); \
+               INSERT INTO cleanup_orders SELECT i, repeat('x', 8192) \
+               FROM generate_series(1, 80) AS g(i)";
+    let output = if upload {
+        run_with(&mut engine, &mut budget, sql)
+    } else {
+        run_with_fixed_memory(&mut engine, &budget, sql, 32 << 20)
+    };
     assert!(!message_types(&output).contains(&b'E'));
     (engine, budget, config)
 }
@@ -83979,4 +83987,448 @@ fn owned_write_inputs_rewrite_undo_exhaustion_releases_images_and_restores_defin
     );
     assert_eq!(data_rows(&retry), ["1|bigint", "2|bigint"]);
     assert_owned_rewrite_inputs_released(&mut engine);
+}
+
+fn check_cleanup_during_download(name: &str, fail_read: bool, retain_both: bool) {
+    use crate::io::reactor::Reactor;
+    use crate::store::{BlockStore, StoreError};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let (mut engine, budget, mut config) = sliced_cleanup_fixture(name, false);
+    let retain_row = |engine: &Engine| {
+        let table = engine
+            .storage
+            .find_table("public", "cleanup_orders")
+            .unwrap();
+        let home = engine
+            .storage
+            .resident_rows(table)
+            .iter()
+            .next()
+            .unwrap()
+            .1
+            .committed;
+        let Some(crate::storage::RowHome::Heap(location)) = home else {
+            panic!("fixture row is resident")
+        };
+        engine.storage.heap.get(location).unwrap()
+    };
+    let older = retain_row(&engine);
+    let lsn = engine.storage.lsn();
+    if retain_both {
+        start_sliced_cleanup(&mut engine, lsn);
+        finish_sliced_cleanup(&mut engine);
+    }
+    let current = retain_row(&engine);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    config.object_store_on = true;
+    config.object_store_sim = false;
+    config.object_store_endpoint = listener.local_addr().unwrap().to_string();
+    config.object_store_access_key = "test-access".to_string();
+    config.object_store_secret_key = "test-secret".to_string();
+    config.object_store_get_slots = 1;
+    config.block_cache_bytes = 2 * crate::store::MAX_PAYLOAD;
+    config.disk_cache_bytes = 0;
+    let mut io_budget = Budget::new(256 << 20);
+    engine.ckpt = Some(crate::checkpoint::Checkpointer::new(&config, &mut io_budget).unwrap());
+    let blocks = engine.ckpt.as_ref().unwrap().block_stack();
+    engine.enable_async_block_reads();
+    assert!(blocks.lock().unwrap().async_gets_enabled());
+    let payload = b"the download still belongs to its waiting reader";
+    let mut framed = [0u8; crate::store::BLOCK_SIZE];
+    let (id, framed_len) =
+        crate::store::encode(payload, crate::store::BlockType::SstData, 0, &mut framed).unwrap();
+    let mut output = [0u8; 128];
+    assert_eq!(
+        crate::mem::guard::forbid_alloc(|| blocks.lock().unwrap().get(&id, &mut output)),
+        Err(StoreError::NotReady)
+    );
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "GET did not open its socket");
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("accept GET: {error}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut request = [0u8; 4096];
+    let mut received = 0;
+    while !request[..received]
+        .windows(4)
+        .any(|bytes| bytes == b"\r\n\r\n")
+    {
+        let n = stream.read(&mut request[received..]).unwrap();
+        assert!(n > 0 && received + n < request.len());
+        received += n;
+    }
+    assert!(request[..received].starts_with(b"GET "));
+    let fd = engine.pending_block_read_fd(0).expect("GET is suspended");
+    let mut reactor = Reactor::new(&mut io_budget, 4).unwrap();
+    reactor.register_read(fd, 7).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        engine.begin_post_publish_cleanup(lsn);
+        assert!(engine.checkpoint_can_progress());
+        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
+        assert_eq!(reactor.poll(Some(Duration::ZERO)).unwrap(), 0);
+        if retain_both {
+            assert_eq!(engine.checkpoint_beat(), CheckpointBeat::LocalFailure);
+            assert!(!engine.compact_scratch.active());
+            assert_eq!(engine.pending_block_read_fd(0), Some(fd));
+        }
+    });
+    drop(older);
+    let mut turns = 0;
+    crate::mem::guard::forbid_alloc(|| {
+        while engine.post_publish_cleanup.is_some() {
+            assert!(turns < 64, "cleanup must finish without the GET response");
+            assert!(engine.checkpoint_can_progress());
+            assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
+            assert_eq!(engine.pending_block_read_fd(0), Some(fd));
+            assert!(engine.object_store_reads_busy());
+            turns += 1;
+        }
+        assert!(turns > 2, "the fixture must exercise sliced copying");
+        assert!(!engine.compact_scratch.active());
+        assert!(!engine.checkpoint_can_progress());
+        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::WaitingForReads);
+        assert_eq!(reactor.poll(Some(Duration::ZERO)).unwrap(), 0);
+        let stats = blocks.lock().unwrap().io_stats();
+        assert_eq!(stats.object_gets, 1);
+        assert_eq!(stats.object_puts, 0);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    });
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*), sum(length(note)) FROM cleanup_orders",
+            4 << 20,
+        )),
+        ["80|655360"]
+    );
+    let mut values = [Datum::Null; 2];
+    crate::storage::rowenc::decode(&current, &[ColType::Int4, ColType::Text], &mut values).unwrap();
+    assert!(matches!(values[1], Datum::Text(value) if value.len() == 8192));
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    if fail_read {
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    } else {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nETag: \"cleanup-read\"\r\nContent-Length: {framed_len}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.write_all(&framed[..framed_len]).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    crate::mem::guard::forbid_alloc(|| {
+        loop {
+            assert!(Instant::now() < deadline, "released GET did not complete");
+            let count = reactor.poll(Some(Duration::from_millis(10))).unwrap();
+            if count != 0 && engine.advance_pending_block_read(0).unwrap() {
+                break;
+            }
+        }
+        let result = blocks.lock().unwrap().get(&id, &mut output);
+        if fail_read {
+            assert_eq!(result, Err(StoreError::NotFound));
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                (payload.len(), crate::store::BlockType::SstData)
+            );
+            assert_eq!(&output[..payload.len()], payload);
+        }
+        assert!(!engine.object_store_reads_busy());
+    });
+}
+
+#[test]
+fn cleanup_download_overlap_finishes_cleanup_and_preserves_the_pending_response() {
+    check_cleanup_during_download("cleanup-download-success", false, false);
+}
+
+#[test]
+fn cleanup_download_overlap_finishes_cleanup_without_hiding_a_download_error() {
+    check_cleanup_during_download("cleanup-download-error", true, false);
+}
+
+#[test]
+fn cleanup_download_overlap_retained_buffer_failure_retries_without_cancelling_the_get() {
+    check_cleanup_during_download("cleanup-download-retained", false, true);
+}
+
+#[test]
+fn cleanup_download_overlap_distinguishes_publication_local_cleanup_and_remote_recovery() {
+    let (mut engine, _budget, config) = sliced_cleanup_fixture("cleanup-outcomes", true);
+    engine.wal.commit();
+    let mut published = false;
+    for _ in 0..64 {
+        match engine.checkpoint_beat() {
+            CheckpointBeat::Advanced => {}
+            CheckpointBeat::Durable => {
+                published = true;
+                break;
+            }
+            other => panic!("unexpected publication outcome: {other:?}"),
+        }
+    }
+    assert!(published);
+    assert!(engine.post_publish_cleanup.is_some());
+    crate::mem::guard::forbid_alloc(|| {
+        while engine.post_publish_cleanup.is_some() {
+            assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
+        }
+    });
+    assert!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_maintenance_pending()
+    );
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+    {
+        let mut namespace = namespace.borrow_mut();
+        namespace.faults.fail_from_op = Some(namespace.op_count);
+    }
+    let mut failed = false;
+    for _ in 0..16 {
+        let beat = engine.checkpoint_beat();
+        if beat == CheckpointBeat::StorageFailure {
+            failed = true;
+            break;
+        }
+        assert_eq!(beat, CheckpointBeat::Advanced);
+    }
+    assert!(
+        failed,
+        "the pending remote cleanup must encounter the outage"
+    );
+    assert!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_maintenance_pending()
+    );
+    namespace.borrow_mut().faults.fail_from_op = None;
+    let mut recovered = false;
+    for _ in 0..64 {
+        let beat = engine.checkpoint_beat();
+        if !engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_maintenance_pending()
+        {
+            assert_eq!(beat, CheckpointBeat::Durable);
+            recovered = true;
+            break;
+        }
+        assert_eq!(beat, CheckpointBeat::Advanced);
+    }
+    assert!(
+        recovered,
+        "remote cleanup recovery must not require a new write"
+    );
+    assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Idle);
+}
+
+#[test]
+fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhaustion() {
+    let (mut engine, budget, _config) = sliced_cleanup_fixture("cleanup-published-full", true);
+    let retain_row = |engine: &Engine| {
+        let table = engine
+            .storage
+            .find_table("public", "cleanup_orders")
+            .unwrap();
+        let home = engine
+            .storage
+            .resident_rows(table)
+            .iter()
+            .next()
+            .unwrap()
+            .1
+            .committed;
+        let Some(crate::storage::RowHome::Heap(location)) = home else {
+            panic!("fixture row is resident")
+        };
+        engine.storage.heap.get(location).unwrap()
+    };
+    let older = retain_row(&engine);
+    let lsn = engine.storage.lsn();
+    start_sliced_cleanup(&mut engine, lsn);
+    crate::mem::guard::forbid_alloc(|| engine.finish_post_publish_cleanup())
+        .expect("initial setup can reclaim the unretained active buffer in place");
+    let current = retain_row(&engine);
+    crate::mem::guard::forbid_alloc(|| {
+        for _ in 0..4 {
+            drop(engine.storage.heap.append_image(&[0u8; 64 << 10]).unwrap());
+        }
+    });
+    assert!(engine.storage.heap.used() * 100 >= engine.storage.heap.capacity() * 85);
+    assert_eq!(
+        engine.checkpoint_beat(),
+        CheckpointBeat::DurableWithLocalFailure
+    );
+    assert!(engine.post_publish_cleanup.is_some());
+    assert!(!engine.compact_scratch.active());
+    drop(older);
+    finish_sliced_cleanup(&mut engine);
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*), sum(length(note)) FROM cleanup_orders",
+            4 << 20,
+        )),
+        ["80|655360"]
+    );
+    let mut values = [Datum::Null; 2];
+    crate::storage::rowenc::decode(&current, &[ColType::Int4, ColType::Text], &mut values).unwrap();
+    assert!(matches!(values[1], Datum::Text(value) if value.len() == 8192));
+}
+
+fn publish_cleanup_fixture(engine: &mut Engine) -> u64 {
+    for _ in 0..64 {
+        match engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap()
+        {
+            crate::checkpoint::CheckpointStep::Published { lsn } => return lsn,
+            crate::checkpoint::CheckpointStep::Working => {}
+            crate::checkpoint::CheckpointStep::Idle => panic!("fixture has unpublished rows"),
+        }
+    }
+    panic!("bounded fixture checkpoint did not publish")
+}
+
+#[test]
+fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_prefix() {
+    for covers_pending in [false, true] {
+        let name = if covers_pending {
+            "cleanup-wal-covered"
+        } else {
+            "cleanup-wal-suffix"
+        };
+        let (mut engine, mut budget, config) = sliced_cleanup_fixture_with_wal(name, true, true);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+        let head_key = format!("{}commit-head", config.object_store_prefix);
+        let before = namespace.borrow().object_bytes(&head_key).unwrap().to_vec();
+        let before_write = if covers_pending {
+            None
+        } else {
+            Some(publish_cleanup_fixture(&mut engine))
+        };
+        namespace.borrow_mut().faults.fail_from_op = Some(0);
+        let failed = run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO cleanup_orders VALUES (81, 'retry')",
+        );
+        assert_eq!(error_sqlstates(&failed), ["58030"]);
+        assert!(engine.durable_retry_pending());
+        let published = if let Some(published) = before_write {
+            published
+        } else {
+            namespace.borrow_mut().faults.fail_from_op = None;
+            let published = publish_cleanup_fixture(&mut engine);
+            namespace.borrow_mut().faults.fail_from_op = Some(0);
+            published
+        };
+        engine.begin_post_publish_cleanup(published);
+        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::StorageFailure);
+        assert!(matches!(
+            engine.post_publish_cleanup.unwrap().phase,
+            PostPublishPhase::Prepare
+        ));
+        assert!(!engine.compact_scratch.active());
+        let pending_bytes = engine.wal.pending_batch_bytes();
+        crate::mem::guard::forbid_alloc(|| {
+            // Exercise the CPU-only turn used while an object GET owns I/O.
+            assert!(!engine.post_publish_cleanup_step(false).unwrap());
+            assert_eq!(engine.wal.pending_batch_bytes(), pending_bytes);
+        });
+        namespace.borrow_mut().faults.fail_from_op = None;
+        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Durable);
+        assert!(!engine.durable_retry_pending());
+        assert!(engine.compact_scratch.active());
+        assert_ne!(
+            namespace.borrow().object_bytes(&head_key).unwrap(),
+            before.as_slice()
+        );
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovery_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(
+                &mut recovered,
+                &mut recovery_budget,
+                "SELECT count(*), sum(id) FROM cleanup_orders"
+            )),
+            ["81|3321"]
+        );
+        drop(recovered);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+fn cleanup_download_overlap_commit_pruning_ignores_newer_unpublished_orphans() {
+    use crate::object_store::Precondition;
+    let (mut engine, _budget, config) =
+        sliced_cleanup_fixture_with_wal("cleanup-orphan-commit", true, true);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+    let orphan_first = engine.storage.lsn();
+    let orphan_batch = format!("commits/{orphan_first:020}-ffffffff.batch");
+    let orphan_head = format!("commits/{orphan_first:020}-ffffffff.head");
+    for key in [&orphan_batch, &orphan_head] {
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .client
+            .put(key, b"unpublished orphan", Precondition::IfNoneMatchAny)
+            .unwrap();
+    }
+    assert!(engine.checkpoint().unwrap());
+    for key in [&orphan_batch, &orphan_head] {
+        let key = format!("{}{key}", config.object_store_prefix);
+        assert!(namespace.borrow().object_bytes(&key).is_none());
+    }
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT count(*), sum(id) FROM cleanup_orders"
+        )),
+        ["80|3240"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }

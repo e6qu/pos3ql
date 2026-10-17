@@ -900,6 +900,24 @@ impl TemporarySpiller {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CommitPruneProgress {
+    Unloaded,
+    FindBoundary {
+        floor: u64,
+        cursor: Option<CommitBatchId>,
+    },
+    List {
+        floor: u64,
+        boundary: Option<CommitBatchId>,
+    },
+    Delete {
+        floor: u64,
+        boundary: Option<CommitBatchId>,
+        overflow: bool,
+    },
+}
+
 pub(crate) struct Checkpointer {
     pub(crate) client: ObjectStore,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
@@ -949,8 +967,7 @@ pub(crate) struct Checkpointer {
     backup_roster_loaded: bool,
     garbage_scratch: Vec<StackStr<64>>,
     delete_objects_per_beat: usize,
-    commit_prune_loaded: bool,
-    commit_prune_overflow: bool,
+    commit_prune: CommitPruneProgress,
     legacy_garbage_loaded: bool,
     legacy_garbage_overflow: bool,
     block_garbage_loaded: bool,
@@ -1097,9 +1114,8 @@ impl Checkpointer {
         );
     }
 
-    pub(crate) fn budget_bytes(config: &Config) -> usize {
+    pub(crate) fn workspace_budget_bytes(config: &Config) -> usize {
         let table_capacity = crate::storage::table_slot_capacity(config);
-        let manifest_capacity = config.checkpoint_manifest_bytes;
         let table_bookkeeping = table_capacity
             * (2 * core::mem::size_of::<SlotList>()
                 + 2 * core::mem::size_of::<u64>()
@@ -1110,11 +1126,27 @@ impl Checkpointer {
             + table_capacity
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(core::mem::size_of::<(usize, SlotInstall)>());
-        // One synchronous manifest/WAL client plus the fixed durable-block
-        // read pool. The cache tiers draw their own budget in the constructor.
-        (1 + config.object_store_get_slots) * ObjectStore::budget_bytes(config)
+        core::mem::size_of::<CommitPruneProgress>()
             + 2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
+            + table_bookkeeping
+            + table_capacity.saturating_mul(crate::storage::MAX_VALUE_ENFORCERS)
+                * core::mem::size_of::<ValueInstall>()
+            + config.checkpoint_live_blocks * core::mem::size_of::<(BlockId, Option<BlockType>)>()
+            + config.checkpoint_garbage_batch_objects
+                * (core::mem::size_of::<StackStr<80>>() + core::mem::size_of::<StackStr<64>>())
+            + config.checkpoint_commit_batches * core::mem::size_of::<StackStr<64>>()
+            + config.max_backups * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
+            + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
+    }
+
+    pub(crate) fn budget_bytes(config: &Config) -> usize {
+        let table_capacity = crate::storage::table_slot_capacity(config);
+        // The metadata client is separate from the block write client, fixed
+        // read pool and scratch. Cache tiers draw their own startup budget.
+        ObjectStore::budget_bytes(config)
+            + OwnedObjectStore::budget_bytes(config)
+            + Self::workspace_budget_bytes(config)
             + ExternalRunReader::budget_bytes()
             + ValueIndexStream::budget_bytes(config.checkpoint_live_blocks)
             + crate::store::MAX_PAYLOAD
@@ -1128,23 +1160,13 @@ impl Checkpointer {
             + config.table_rows * core::mem::size_of::<u64>()
             + config.max_prepared_transactions
                 * core::mem::size_of::<crate::storage::PreparedTransactionCatalogEntry>()
-            + table_bookkeeping
             + (2usize.saturating_mul(table_capacity) + 1)
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(core::mem::size_of::<Option<PrevSst>>())
-            + table_capacity.saturating_mul(crate::storage::MAX_VALUE_ENFORCERS)
-                * core::mem::size_of::<ValueInstall>()
-            + config.checkpoint_live_blocks * core::mem::size_of::<(BlockId, Option<BlockType>)>()
-            + config.checkpoint_garbage_batch_objects
-                * (core::mem::size_of::<StackStr<80>>() + core::mem::size_of::<StackStr<64>>())
-            + config.checkpoint_commit_batches * core::mem::size_of::<StackStr<64>>()
-            + config.max_backups * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
-            + manifest_capacity
+            + config.checkpoint_manifest_bytes
             + 128
-            + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
             + MERGE_SOURCE_SCRATCH_BYTES
-            + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
     }
 
     /// One bounded step of the paced merge — the compaction work a beat may
@@ -1328,6 +1350,10 @@ impl Checkpointer {
     pub(crate) fn maintenance_pending(&self, storage: &Storage) -> bool {
         self.published_lsn_pending_maintenance.is_some()
             || storage.retained_sst_reclamation_pending()
+    }
+
+    pub(crate) fn published_maintenance_pending(&self) -> bool {
+        self.published_lsn_pending_maintenance.is_some()
     }
 
     /// A schedule beat: scan a bounded stretch of one member, collecting
@@ -1647,6 +1673,12 @@ impl Checkpointer {
         }
         let table_capacity = crate::storage::table_slot_capacity(config);
         let manifest_capacity = config.checkpoint_manifest_bytes;
+        budget
+            .draw(
+                Self::workspace_budget_bytes(config),
+                "checkpoint workspaces",
+            )
+            .map_err(CheckpointSetupError::Budget)?;
         let base = OwnedObjectStore::new(config, budget, "blocks/")
             .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?;
         let plan = StackPlan::resolve(config.block_cache_bytes, config.disk_cache_bytes);
@@ -1758,8 +1790,7 @@ impl Checkpointer {
             backup_roster_loaded: false,
             garbage_scratch: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             delete_objects_per_beat: config.checkpoint_delete_objects_per_beat,
-            commit_prune_loaded: false,
-            commit_prune_overflow: false,
+            commit_prune: CommitPruneProgress::Unloaded,
             legacy_garbage_loaded: false,
             legacy_garbage_overflow: false,
             block_garbage_loaded: false,
@@ -2397,10 +2428,17 @@ impl Checkpointer {
     /// Schedules deletion of commit objects covered by a durable manifest.
     /// Repeated scheduling keeps the more conservative boundary.
     pub(crate) fn schedule_commit_prune(&mut self, up_to_lsn: u64) {
-        self.commit_prune_through = Some(
-            self.commit_prune_through
-                .map_or(up_to_lsn, |pending| pending.min(up_to_lsn)),
-        );
+        let floor = self
+            .commit_prune_through
+            .map_or(up_to_lsn, |pending| pending.min(up_to_lsn));
+        if self
+            .commit_prune_through
+            .is_some_and(|pending| floor < pending)
+        {
+            self.commit_prune = CommitPruneProgress::Unloaded;
+            self.garbage_scratch.clear();
+        }
+        self.commit_prune_through = Some(floor);
     }
 
     fn load_backup_names(&mut self) -> Result<(), SqlError> {
@@ -2465,10 +2503,8 @@ impl Checkpointer {
         Ok(oldest)
     }
 
-    /// Deletes at most one configured batch of commit objects. The newest
-    /// covered batch and its descriptor remain because that batch may
-    /// straddle the recovery boundary. Returns true once no older objects
-    /// remain.
+    /// Keep the published chain's covered boundary. Newer filenames may be
+    /// unpublished orphans. Follow one descriptor or delete one batch per turn.
     fn prune_commit_batch(&mut self, up_to_lsn: u64) -> Result<bool, SqlError> {
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
@@ -2478,86 +2514,8 @@ impl Checkpointer {
             .lock()
             .expect("block store lock poisoned")
             .io_stats();
-        #[cfg(feature = "checkpoint-profile")]
         let mut deleted = 0;
-        // Scan into the larger fixed staging batch once, then retain it while
-        // dispatch beats remove small groups. This bounds foreground DELETEs
-        // without rebuilding the namespace view for every group.
-        if !self.commit_prune_loaded {
-            let up_to_lsn = self
-                .oldest_backup_lsn()?
-                .map_or(up_to_lsn, |backup_floor| up_to_lsn.min(backup_floor));
-            self.garbage_scratch.clear();
-            let mut boundary = StackStr::<64>::new();
-            self.client
-                .list("commits/", |key| {
-                    let is_covered_batch = key
-                        .strip_prefix("commits/")
-                        .and_then(|name| name.strip_suffix(".batch"))
-                        .and_then(|stem| stem.split_once('-'))
-                        .and_then(|(first, _)| first.parse::<u64>().ok())
-                        .is_some_and(|first| first <= up_to_lsn);
-                    if is_covered_batch && key > boundary.as_str() {
-                        boundary = crate::stack_format!(64, "{}", key);
-                    }
-                })
-                .map_err(object_store_to_sql)?;
-            let mut overflow = false;
-            if !boundary.is_empty() {
-                let boundary_name = boundary
-                    .as_str()
-                    .strip_prefix("commits/")
-                    .and_then(|name| name.strip_suffix(".batch"))
-                    .expect("boundary was selected from commit batches");
-                let doomed = &mut self.garbage_scratch;
-                if let Err(error) = self.client.list("commits/", |key| {
-                    let stem = key.strip_prefix("commits/").and_then(|name| {
-                        name.strip_suffix(".batch")
-                            .or_else(|| name.strip_suffix(".head"))
-                    });
-                    let is_doomed = stem
-                        .and_then(|stem| stem.split_once('-').map(|(first, _)| (stem, first)))
-                        .and_then(|(stem, first)| {
-                            first.parse::<u64>().ok().map(|first| (stem, first))
-                        })
-                        .is_some_and(|(stem, first)| first <= up_to_lsn && stem != boundary_name);
-                    if is_doomed {
-                        if doomed.len() < doomed.capacity() {
-                            doomed.push(crate::stack_format!(64, "{}", key));
-                        } else {
-                            overflow = true;
-                        }
-                    }
-                }) {
-                    self.garbage_scratch.clear();
-                    return Err(object_store_to_sql(error));
-                }
-            }
-            self.commit_prune_overflow = overflow;
-            self.commit_prune_loaded = true;
-        }
-        for _ in 0..self.delete_objects_per_beat.min(self.garbage_scratch.len()) {
-            let key = *self
-                .garbage_scratch
-                .last()
-                .expect("nonempty staged commit deletion batch");
-            self.client
-                .delete(key.as_str())
-                .map_err(object_store_to_sql)?;
-            self.garbage_scratch.pop();
-            #[cfg(feature = "checkpoint-profile")]
-            {
-                deleted += 1;
-            }
-        }
-        let done = if self.garbage_scratch.is_empty() {
-            self.commit_prune_loaded = false;
-            let done = !self.commit_prune_overflow;
-            self.commit_prune_overflow = false;
-            done
-        } else {
-            false
-        };
+        let result = self.advance_commit_prune(up_to_lsn, &mut deleted);
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
             "commit_prune",
@@ -2571,7 +2529,135 @@ impl Checkpointer {
                 .io_stats(),
             deleted,
         );
-        Ok(done)
+        result
+    }
+
+    fn advance_commit_prune(
+        &mut self,
+        up_to_lsn: u64,
+        deleted: &mut usize,
+    ) -> Result<bool, SqlError> {
+        match self.commit_prune {
+            CommitPruneProgress::Unloaded => {
+                let floor = self
+                    .oldest_backup_lsn()?
+                    .map_or(up_to_lsn, |backup| up_to_lsn.min(backup));
+                self.garbage_scratch.clear();
+                self.commit_prune = CommitPruneProgress::FindBoundary {
+                    floor,
+                    cursor: self.commit_head,
+                };
+                Ok(false)
+            }
+            CommitPruneProgress::FindBoundary { floor, cursor } => {
+                if let Some(batch) = cursor {
+                    let key = stack_format!(
+                        72,
+                        "commits/{:020}-{:08x}.head",
+                        batch.first_lsn,
+                        batch.digest
+                    );
+                    self.client
+                        .get(key.as_str(), None)
+                        .map_err(object_store_to_sql)?;
+                    let (described, previous) = parse_commit_descriptor(self.client.body_bytes())
+                        .map_err(|message| {
+                        sql_err!(sqlstate::IO_ERROR, "commit prune: {message}")
+                    })?;
+                    if described != batch
+                        || previous.is_some_and(|previous| previous.first_lsn >= batch.first_lsn)
+                    {
+                        return Err(sql_err!(
+                            sqlstate::IO_ERROR,
+                            "commit prune descriptor does not match its ordered chain"
+                        ));
+                    }
+                    self.commit_prune = if batch.first_lsn <= floor {
+                        CommitPruneProgress::List {
+                            floor,
+                            boundary: Some(batch),
+                        }
+                    } else {
+                        CommitPruneProgress::FindBoundary {
+                            floor,
+                            cursor: previous,
+                        }
+                    };
+                } else {
+                    self.commit_prune = CommitPruneProgress::List {
+                        floor,
+                        boundary: cursor,
+                    };
+                }
+                Ok(false)
+            }
+            CommitPruneProgress::List { floor, boundary } => {
+                self.garbage_scratch.clear();
+                let boundary_name = boundary
+                    .map(|batch| stack_format!(64, "{:020}-{:08x}", batch.first_lsn, batch.digest));
+                let mut overflow = false;
+                let doomed = &mut self.garbage_scratch;
+                if let Err(error) = self.client.list("commits/", |key| {
+                    let stem = key.strip_prefix("commits/").and_then(|name| {
+                        name.strip_suffix(".batch")
+                            .or_else(|| name.strip_suffix(".head"))
+                    });
+                    let is_doomed = stem
+                        .and_then(|stem| stem.split_once('-').map(|(first, _)| (stem, first)))
+                        .and_then(|(stem, first)| {
+                            first.parse::<u64>().ok().map(|first| (stem, first))
+                        })
+                        .is_some_and(|(stem, first)| {
+                            first <= floor
+                                && boundary_name
+                                    .as_ref()
+                                    .is_none_or(|boundary| stem != boundary.as_str())
+                        });
+                    if is_doomed {
+                        if doomed.len() < doomed.capacity() {
+                            doomed.push(stack_format!(64, "{}", key));
+                        } else {
+                            overflow = true;
+                        }
+                    }
+                }) {
+                    self.garbage_scratch.clear();
+                    return Err(object_store_to_sql(error));
+                }
+                self.commit_prune = CommitPruneProgress::Delete {
+                    floor,
+                    boundary,
+                    overflow,
+                };
+                Ok(false)
+            }
+            CommitPruneProgress::Delete {
+                floor,
+                boundary,
+                overflow,
+            } => {
+                for _ in 0..self.delete_objects_per_beat.min(self.garbage_scratch.len()) {
+                    let key = *self
+                        .garbage_scratch
+                        .last()
+                        .expect("nonempty staged commit deletion batch");
+                    self.client
+                        .delete(key.as_str())
+                        .map_err(object_store_to_sql)?;
+                    self.garbage_scratch.pop();
+                    *deleted += 1;
+                }
+                if !self.garbage_scratch.is_empty() {
+                    return Ok(false);
+                }
+                self.commit_prune = if overflow {
+                    CommitPruneProgress::List { floor, boundary }
+                } else {
+                    CommitPruneProgress::Unloaded
+                };
+                Ok(!overflow)
+            }
+        }
     }
 
     /// Cold start: loads the manifest (if any) and rehydrates every SST
@@ -17287,6 +17373,157 @@ mod stored_dependency_tests {
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;
     use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependencies};
+
+    #[test]
+    fn cleanup_download_overlap_pruning_walk_yields_retries_and_preserves_late_appends() {
+        let mut config = Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_get_slots = 1;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        config.checkpoint_garbage_batch_objects = 3;
+        config.checkpoint_delete_objects_per_beat = 2;
+        config.object_store_bucket = format!("paced-prune-{}", std::process::id());
+        config.data_dir = std::env::temp_dir()
+            .join(&config.object_store_bucket)
+            .to_str()
+            .unwrap()
+            .to_owned();
+        config.remove_test_data_dir_on_drop();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+        let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
+        let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+        let mut batches = Vec::new();
+        for first in 1..=9 {
+            let body = stack_format!(32, "opaque batch {first}");
+            checkpointer
+                .publish_commit_batch(first, body.as_str().as_bytes())
+                .unwrap();
+            batches.push(checkpointer.commit_head.unwrap());
+        }
+        let retained = batches[3];
+        let orphan_digest = !retained.digest;
+        let orphan_batch = format!(
+            "commits/{:020}-{orphan_digest:08x}.batch",
+            retained.first_lsn
+        );
+        let orphan_head = format!(
+            "commits/{:020}-{orphan_digest:08x}.head",
+            retained.first_lsn
+        );
+        for key in [&orphan_batch, &orphan_head] {
+            checkpointer
+                .client
+                .put(key, b"unpublished orphan", Precondition::IfNoneMatchAny)
+                .unwrap();
+        }
+        assert!(!checkpointer.prune_commit_batch(4).unwrap());
+        for _ in 0..2 {
+            let before = namespace.borrow().op_count;
+            crate::mem::guard::forbid_alloc(|| {
+                assert!(!checkpointer.prune_commit_batch(4).unwrap())
+            });
+            assert_eq!(namespace.borrow().op_count, before + 1);
+        }
+        let cursor = match checkpointer.commit_prune {
+            CommitPruneProgress::FindBoundary { cursor, .. } => cursor,
+            _ => panic!("long chain must remain in its bounded walk"),
+        };
+        namespace.borrow_mut().faults.fail_from_op = Some(0);
+        let failure =
+            crate::mem::guard::forbid_alloc(|| checkpointer.prune_commit_batch(4)).unwrap_err();
+        assert_eq!(failure.sqlstate, sqlstate::IO_ERROR);
+        assert!(matches!(checkpointer.commit_prune,
+            CommitPruneProgress::FindBoundary { cursor: current, .. } if current == cursor));
+        namespace.borrow_mut().faults.fail_from_op = None;
+        let mut turns = 0;
+        while matches!(
+            checkpointer.commit_prune,
+            CommitPruneProgress::FindBoundary { .. }
+        ) {
+            assert!(turns < 16);
+            let before = namespace.borrow().op_count;
+            crate::mem::guard::forbid_alloc(|| {
+                assert!(!checkpointer.prune_commit_batch(4).unwrap())
+            });
+            assert_eq!(namespace.borrow().op_count, before + 1);
+            turns += 1;
+        }
+        assert!(matches!(checkpointer.commit_prune,
+            CommitPruneProgress::List { boundary: Some(boundary), .. } if boundary == retained));
+        assert!(!checkpointer.prune_commit_batch(4).unwrap());
+        // A later publication extends the captured chain instead of replacing it.
+        checkpointer
+            .publish_commit_batch(10, b"later committed batch")
+            .unwrap();
+        batches.push(checkpointer.commit_head.unwrap());
+        let mut complete = false;
+        for _ in 0..32 {
+            let deleting = matches!(
+                checkpointer.commit_prune,
+                CommitPruneProgress::Delete { .. }
+            );
+            let before = namespace.borrow().op_count;
+            complete = checkpointer.prune_commit_batch(4).unwrap();
+            assert!(namespace.borrow().op_count - before <= if deleting { 2 } else { 1 });
+            if complete {
+                break;
+            }
+        }
+        assert!(complete);
+        let namespace = namespace.borrow();
+        for batch in batches {
+            for suffix in ["batch", "head"] {
+                let key = format!(
+                    "{}commits/{:020}-{:08x}.{suffix}",
+                    config.object_store_prefix, batch.first_lsn, batch.digest
+                );
+                assert_eq!(namespace.object_bytes(&key).is_some(), batch.first_lsn >= 4);
+            }
+        }
+        for key in [&orphan_batch, &orphan_head] {
+            assert!(
+                namespace
+                    .object_bytes(&format!("{}{key}", config.object_store_prefix))
+                    .is_none()
+            );
+        }
+        drop(namespace);
+        drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn cleanup_download_overlap_checkpoint_reserves_metadata_and_block_clients() {
+        let mut config = Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_endpoint = "127.0.0.1:9".to_owned();
+        config.object_store_bucket = "checkpoint-request-budget".to_owned();
+        config.object_store_access_key = "test-access".to_owned();
+        config.object_store_secret_key = "test-secret".to_owned();
+        config.object_store_head_bytes = 4096;
+        config.object_store_response_bytes = crate::store::BLOCK_SIZE;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        config.data_dir = std::env::temp_dir()
+            .join(format!(
+                "pos3ql-checkpoint-request-budget-{}",
+                std::process::id()
+            ))
+            .to_str()
+            .unwrap()
+            .to_owned();
+        config.remove_test_data_dir_on_drop();
+        for slots in [1, 4, 7] {
+            config.object_store_get_slots = slots;
+            let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
+            let checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+            assert_eq!(budget.remaining(), 0);
+            drop(checkpointer);
+        }
+    }
 
     #[test]
     fn retained_sst_temporary_spill_constructor_charges_its_startup_budget() {

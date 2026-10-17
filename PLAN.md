@@ -84,7 +84,8 @@ release owners after errors, and reject replaced heap buffers before publication
 Heap relocation captures and publishes under row-version ownership while copying
 privately in bounded turns; unrelated storage reads and writes can progress
 during copying. Automatic checkpoint cleanup resumes copying between server
-turns, allowing SQL reads and writes between those turns. Explicit CHECKPOINT
+turns, including while an unrelated object download waits. SQL reads and writes
+can execute between cleanup turns when their existing admission rules allow it. Explicit CHECKPOINT
 and the existing critical memory-pressure path still wait for cleanup.
 Eviction and history release keep later row versions in memory until the
 installed object roots cover them.
@@ -114,6 +115,18 @@ reuse, rollback, and recovery are tested without runtime allocation.
 **User example:** one customer reads an uncached invoice while another reads a
 cached invoice. The second request should not wait for the first download.
 A checkpoint or storage merge should allow ordinary queries to keep progressing.
+
+Local heap cleanup progresses during pending downloads without using an object
+client. Failed maintenance has a one-second retry deadline even under continuous
+client traffic or when idle; local progress does not clear a storage failure
+status. Completing a published checkpoint's remote cleanup can
+restore readiness without requiring another write.
+Checkpoint publication and object merges still wait for downloads to finish.
+Startup sizing and construction charge every object client, request-slot record,
+block scratch buffer and checkpoint workspace before serving queries.
+Commit-history cleanup follows the published chain one descriptor per turn;
+unpublished uploads cannot replace the boundary needed for recovery. Unacknowledged
+journal batches remain available until their publication retry completes.
 
 - Reserve independent request slots and scratch buffers at startup. Keep cache
   checks and updates brief; do not hold broad locks during slow object I/O.

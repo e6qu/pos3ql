@@ -725,7 +725,11 @@ reader retains the other buffer. Shared callers always use the private copy
 path.
 
 Ordinary automatic checkpoint cleanup copies at most 64 KiB of heap bytes per
-cleanup step. The server advances one step between messages or while idle. Each SQL
+cleanup step. The server advances one step between messages or while idle,
+including while an unrelated object download is waiting. For example, a slow
+invoice download does not prevent the server from reclaiming unused row memory.
+After local cleanup finishes, the reactor waits for download readiness rather
+than repeatedly polling maintenance that needs that download to finish. Each SQL
 statement also advances at most one step before executing; it does not drain
 the complete copy. For
 example, a large cleanup can remain pending while a client reads an order,
@@ -743,7 +747,28 @@ instance returns XX000, "heap relocation belongs to another storage instance",
 without publishing either instance. Journal cleanup runs once for the published
 prefix; writes after it keep their journal suffix for recovery. Heap capture,
 sorting, final remapping, eviction, and other maintenance still run within server
-turns. Fixed execution workers and independent object I/O remain unfinished.
+turns. Checkpoint publication, merges, and temporary spilling still wait for
+pending durable-block downloads. Fixed execution workers and independent storage
+publication remain unfinished.
+
+The object-request reservation includes every configured read client, the
+separate block write and metadata clients, read-slot controls, and the 256 KiB
+block scratch buffer. Checkpoint writer buffers and workspace arrays are charged
+when constructed too. For example, increasing `object_store_get_slots` reserves
+another complete request/response buffer before accepting connections; it cannot
+borrow memory later from the row heap. Insufficient startup memory names the
+component that could not be reserved.
+
+Commit-history cleanup keeps the entry selected by the published chain, even
+when a newer filename belongs to an upload that failed before publication. For
+example, a failed order upload cannot cause cleanup to delete the history used
+by a confirmed order. Boundary discovery reads at most one commit descriptor per
+turn. Deletion count and staging memory keep their configured limits; listing
+the namespace can still span many pages. Retries
+retain their cursor after errors, and later commits can extend the chain.
+Pending journal uploads retain their bytes through local cleanup, including
+when the snapshot already covers them. With no pending block download, the
+publication retry runs before local cleanup continues.
 
 Eviction requires an installed object's recorded boundary to cover the row's
 commit position. A later update stays in the heap; history newer than that

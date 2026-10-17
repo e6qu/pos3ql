@@ -58406,7 +58406,8 @@ mod tests {
                         let mut context = spill.scan_contexts[0]
                             .lock()
                             .expect("spill scan context lock poisoned");
-                        context.index_buf[worker] = context.index_buf[worker].wrapping_add(1);
+                        let count = u64::from_le_bytes(context.index_buf[..8].try_into().unwrap());
+                        context.index_buf[..8].copy_from_slice(&(count + 1).to_le_bytes());
                         drop(context);
                         spill.cursor_contexts[worker]
                             .lock()
@@ -58425,10 +58426,14 @@ mod tests {
             4_001
         );
         assert_eq!(
-            spill.scan_contexts[0]
-                .lock()
-                .expect("spill scan context lock poisoned")
-                .owner,
+            u64::from_le_bytes(
+                spill.scan_contexts[0]
+                    .lock()
+                    .expect("spill scan context lock poisoned")
+                    .index_buf[..8]
+                    .try_into()
+                    .unwrap()
+            ),
             4_000
         );
         for worker in 0..4 {
@@ -58632,17 +58637,35 @@ mod tests {
     }
 
     #[test]
-    fn spill_walk_identity_exhaustion_preserves_active_buffer_owners() {
+    fn spill_walk_identity_exhaustion_preserves_pending_scan_images() {
         let mut budget = Budget::new(SpillReader::budget_bytes(false, 1));
         let spill = SpillReader::new(&mut budget, 1, None, None).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             *spill.next_walk_id.lock().unwrap() = u64::MAX - 1;
             assert_eq!(spill.next_walk_id().unwrap(), u64::MAX - 1);
-            spill.scan_contexts[0].lock().unwrap().owner = 1;
+            let handle = crate::store::SstHandle {
+                index: crate::store::BlockId([1; 32]),
+                filter: crate::store::BlockId([2; 32]),
+                roster: crate::store::BlockId([3; 32]),
+                format: crate::store::RowSstFormat::CURRENT,
+            };
+            let mut context = spill.scan_contexts[0].lock().unwrap();
+            let slot = context.reserve_image(ScanBlockImage {
+                handle,
+                ordinal: 0,
+                reference: crate::store::DataBlockRef::Direct(handle.index),
+                successor: ScanSuccessor::End,
+                bytes: None,
+            });
+            context.member_blocks[slot][0] = 1;
+            drop(context);
             let error = spill.next_walk_id().unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(*spill.next_walk_id.lock().unwrap(), u64::MAX);
-            assert_eq!(spill.scan_contexts[0].lock().unwrap().owner, 1);
+            let context = spill.scan_contexts[0].lock().unwrap();
+            assert_eq!(context.find_image(handle, 0), Some(slot));
+            assert!(context.member_images[slot].unwrap().bytes.is_none());
+            assert_eq!(context.member_blocks[slot][0], 1);
         });
     }
 

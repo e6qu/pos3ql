@@ -84167,8 +84167,8 @@ fn cleanup_download_overlap_retained_buffer_failure_retries_without_cancelling_t
 }
 
 #[test]
-fn cleanup_download_overlap_distinguishes_durable_publication_from_local_cleanup() {
-    let (mut engine, _budget, _config) = sliced_cleanup_fixture("cleanup-outcomes", true);
+fn cleanup_download_overlap_distinguishes_publication_local_cleanup_and_remote_recovery() {
+    let (mut engine, _budget, config) = sliced_cleanup_fixture("cleanup-outcomes", true);
     engine.wal.commit();
     let mut published = false;
     for _ in 0..64 {
@@ -84188,6 +84188,59 @@ fn cleanup_download_overlap_distinguishes_durable_publication_from_local_cleanup
             assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
         }
     });
+    assert!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_maintenance_pending()
+    );
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+    {
+        let mut namespace = namespace.borrow_mut();
+        namespace.faults.fail_from_op = Some(namespace.op_count);
+    }
+    let mut failed = false;
+    for _ in 0..16 {
+        let beat = engine.checkpoint_beat();
+        if beat == CheckpointBeat::StorageFailure {
+            failed = true;
+            break;
+        }
+        assert_eq!(beat, CheckpointBeat::Advanced);
+    }
+    assert!(
+        failed,
+        "the pending remote cleanup must encounter the outage"
+    );
+    assert!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_maintenance_pending()
+    );
+    namespace.borrow_mut().faults.fail_from_op = None;
+    let mut recovered = false;
+    for _ in 0..64 {
+        let beat = engine.checkpoint_beat();
+        if !engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_maintenance_pending()
+        {
+            assert_eq!(beat, CheckpointBeat::Durable);
+            recovered = true;
+            break;
+        }
+        assert_eq!(beat, CheckpointBeat::Advanced);
+    }
+    assert!(
+        recovered,
+        "remote cleanup recovery must not require a new write"
+    );
+    assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Idle);
 }
 
 #[test]

@@ -8862,6 +8862,7 @@ impl Engine {
         // A wide sweep can lose headroom faster than one beat reclaims it.
         // Complete publication under critical pressure before dispatch resumes.
         let critical = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85;
+        let remote_maintenance_was_pending = ckpt.published_maintenance_pending();
         let checkpoint = if critical {
             ckpt.checkpoint(&mut self.storage, &mut self.scratch)
                 .map(|published| {
@@ -8873,6 +8874,8 @@ impl Engine {
             ckpt.checkpoint_step(&mut self.storage, &mut self.scratch)
         };
         ckpt.enable_async_block_reads();
+        let remote_maintenance_finished =
+            remote_maintenance_was_pending && !ckpt.published_maintenance_pending();
         match checkpoint {
             Ok(CheckpointStep::Published { lsn }) => {
                 self.begin_post_publish_cleanup(lsn);
@@ -8894,13 +8897,19 @@ impl Engine {
                 CheckpointBeat::Durable
             }
             Ok(CheckpointStep::Working) => {
-                if retried_upload {
+                if retried_upload || remote_maintenance_finished {
                     CheckpointBeat::Durable
                 } else {
                     CheckpointBeat::Advanced
                 }
             }
-            Ok(CheckpointStep::Idle) => progress,
+            Ok(CheckpointStep::Idle) => {
+                if remote_maintenance_finished {
+                    CheckpointBeat::Durable
+                } else {
+                    progress
+                }
+            }
             Err(e) => {
                 let message = stack_format!(
                     512,

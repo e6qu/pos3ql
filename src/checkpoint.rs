@@ -1334,6 +1334,10 @@ impl Checkpointer {
             || storage.retained_sst_reclamation_pending()
     }
 
+    pub(crate) fn published_maintenance_pending(&self) -> bool {
+        self.published_lsn_pending_maintenance.is_some()
+    }
+
     /// A schedule beat: scan a bounded stretch of one member, collecting
     /// `(rowid, commit_lsn, source-rank | tombstone-bit)`. When both members
     /// are done, exact duplicate keys choose the newer member, then the

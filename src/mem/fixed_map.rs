@@ -62,15 +62,16 @@ impl Hasher for Fnv1aHasher {
 impl<K: Hash + Eq, V> FixedMap<K, V> {
     /// Bytes `new` will draw from the budget for a given capacity.
     pub fn budget_bytes(capacity: usize) -> usize {
-        Self::slot_count(capacity) * size_of::<Option<(K, V)>>()
+        Self::slot_count(capacity)
+            .and_then(|count| count.checked_mul(size_of::<Option<(K, V)>>()))
+            .unwrap_or(usize::MAX)
     }
 
-    fn slot_count(capacity: usize) -> usize {
+    fn slot_count(capacity: usize) -> Option<usize> {
         capacity
             .checked_mul(2)
             .and_then(|n| n.checked_next_power_of_two())
-            .unwrap_or_else(|| panic!("map capacity {capacity} is unrepresentable"))
-            .max(8)
+            .map(|count| count.max(8))
     }
 
     pub fn new(
@@ -78,7 +79,12 @@ impl<K: Hash + Eq, V> FixedMap<K, V> {
         what: &'static str,
         capacity: usize,
     ) -> Result<Self, BudgetError> {
-        let slot_count = Self::slot_count(capacity);
+        let slot_count = Self::slot_count(capacity).ok_or(BudgetError {
+            what,
+            requested: usize::MAX,
+            remaining: budget.remaining(),
+            total: budget.total(),
+        })?;
         budget.draw_array(slot_count, size_of::<Option<(K, V)>>(), what)?;
         let mut slots = Vec::new();
         slots.resize_with(slot_count, || None);
@@ -217,6 +223,24 @@ impl<K: Hash + Eq, V> FixedMap<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_file_owners_map_overflow_returns_a_named_startup_error() {
+        for capacity in [usize::MAX, usize::MAX / 4] {
+            let mut budget = Budget::new(128);
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(FixedMap::<u64, u64>::budget_bytes(capacity), usize::MAX);
+                let error =
+                    FixedMap::<u64, u64>::new(&mut budget, "retained graph membership", capacity)
+                        .err()
+                        .unwrap();
+                assert_eq!(error.what, "retained graph membership");
+                assert_eq!(error.requested, usize::MAX);
+                assert_eq!(error.remaining, 128);
+                assert_eq!(budget.used(), 0);
+            });
+        }
+    }
 
     #[test]
     fn insert_get_replace_remove() {

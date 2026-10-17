@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
+use crate::mem::fixed_map::FixedMap;
 use crate::mem::fixed_vec::FixedVec;
 use crate::object_store::{
     ByteRange, Client as ObjectStore, EntityTag, Error as ObjectError, Precondition,
@@ -658,6 +659,11 @@ fn garbage_sst_root_capacity(config: &Config) -> usize {
             .saturating_mul(config.max_spill_generations_per_table)
 }
 
+fn garbage_index_root_capacity(config: &Config) -> usize {
+    crate::storage::Storage::retained_index_file_capacity(config)
+        .saturating_add(config.max_value_indexes)
+}
+
 pub(crate) struct TemporarySpiller {
     blocks: std::sync::Arc<std::sync::Mutex<crate::store::EphemeralBlockStore>>,
     handles: Vec<SstHandle>,
@@ -957,7 +963,9 @@ pub(crate) struct Checkpointer {
     /// Published index identities during a rebuild; untyped block identities
     /// during garbage collection. Both uses fit checkpoint_live_blocks.
     roster_scratch: Vec<(BlockId, Option<BlockType>)>,
+    garbage_seen: FixedMap<BlockId, ()>,
     garbage_sst_roots: Vec<SstHandle>,
+    garbage_index_roots: Vec<BlockId>,
     doomed_blocks: Vec<StackStr<80>>,
     manifest_buf: FixedBuf,
     prepared_transaction_snapshot: FixedVec<crate::storage::PreparedTransactionCatalogEntry>,
@@ -1165,12 +1173,14 @@ impl Checkpointer {
         ObjectStore::budget_bytes(config)
             + OwnedObjectStore::budget_bytes(config)
             + Self::workspace_budget_bytes(config)
+            + FixedMap::<BlockId, ()>::budget_bytes(config.checkpoint_live_blocks)
             + ExternalRunReader::budget_bytes()
             + ValueIndexStream::budget_bytes(config.checkpoint_live_blocks)
             + crate::store::MAX_PAYLOAD
             + 2 * crate::store::MAX_PAYLOAD
             + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
             + garbage_sst_root_capacity(config) * core::mem::size_of::<SstHandle>()
+            + garbage_index_root_capacity(config) * core::mem::size_of::<BlockId>()
             + CheckpointValueCursor::budget_bytes(
                 config.max_spill_generations_per_table,
                 config.table_rows,
@@ -1367,7 +1377,7 @@ impl Checkpointer {
 
     pub(crate) fn maintenance_pending(&self, storage: &Storage) -> bool {
         self.published_lsn_pending_maintenance.is_some()
-            || storage.retained_sst_reclamation_pending()
+            || storage.retained_file_reclamation_pending()
     }
 
     pub(crate) fn published_maintenance_pending(&self) -> bool {
@@ -1769,6 +1779,12 @@ impl Checkpointer {
                 "garbage collection retained SST roots",
             )
             .map_err(CheckpointSetupError::Budget)?;
+        budget
+            .draw(
+                garbage_index_root_capacity(config) * core::mem::size_of::<BlockId>(),
+                "garbage collection retained index roots",
+            )
+            .map_err(CheckpointSetupError::Budget)?;
         Ok(Self {
             client: ObjectStore::new(config, budget)
                 .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
@@ -1783,7 +1799,14 @@ impl Checkpointer {
             ),
             merge_scratch: Vec::with_capacity(config.checkpoint_merge_entries),
             roster_scratch: Vec::with_capacity(config.checkpoint_live_blocks),
+            garbage_seen: FixedMap::new(
+                budget,
+                "garbage collection block membership",
+                config.checkpoint_live_blocks,
+            )
+            .map_err(CheckpointSetupError::Budget)?,
             garbage_sst_roots: Vec::with_capacity(garbage_sst_root_capacity(config)),
+            garbage_index_roots: Vec::with_capacity(garbage_index_root_capacity(config)),
             doomed_blocks: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             manifest_buf: FixedBuf::new(budget, "manifest_buf", manifest_capacity)
                 .map_err(CheckpointSetupError::Budget)?,
@@ -7868,7 +7891,7 @@ impl Checkpointer {
     }
 
     fn observe_retained_root_release(&mut self, storage: &Storage) {
-        if !self.block_garbage_pending && storage.take_retained_sst_reclamation() {
+        if !self.block_garbage_pending && storage.take_retained_file_reclamation() {
             self.block_garbage_pending = true;
             self.published_lsn_pending_maintenance
                 .get_or_insert(storage.lsn());
@@ -13106,8 +13129,8 @@ impl Checkpointer {
                 .lock()
                 .expect("block store lock poisoned")
                 .io_stats();
-            self.roster_scratch.clear();
             self.ensure_backup_names_loaded()?;
+            let mut keep = BlockKeepSet::new(&mut self.roster_scratch, &mut self.garbage_seen);
             self.sst_arena.reset();
             let scratch = self
                 .sst_arena
@@ -13117,14 +13140,7 @@ impl Checkpointer {
             // yet; sweeping them would destroy the job's progress.
             if self.merge_job.is_some() {
                 for id in self.merge_writer.roster_so_far() {
-                    if self.roster_scratch.len() == self.roster_scratch.capacity() {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
-                            self.roster_scratch.capacity()
-                        ));
-                    }
-                    self.roster_scratch.push((*id, None));
+                    keep.insert(*id)?;
                 }
             }
             storage.copy_retained_spill_roots(true, &mut self.garbage_sst_roots)?;
@@ -13141,14 +13157,7 @@ impl Checkpointer {
                 .sort_unstable_by_key(|handle| handle.roster);
             self.garbage_sst_roots.dedup_by_key(|handle| handle.roster);
             for h in self.garbage_sst_roots.iter().copied() {
-                if self.roster_scratch.len() == self.roster_scratch.capacity() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
-                        self.roster_scratch.capacity()
-                    ));
-                }
-                self.roster_scratch.push((h.roster, None));
+                keep.insert(h.roster)?;
                 let n = self
                     .blocks
                     .lock()
@@ -13163,49 +13172,52 @@ impl Checkpointer {
                             "gc roster is not a multiple of 32 bytes"
                         ));
                     }
-                    if self.roster_scratch.len() == self.roster_scratch.capacity() {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
-                            self.roster_scratch.capacity()
-                        ));
-                    }
+
                     let mut id = [0u8; 32];
                     id.copy_from_slice(id_bytes);
-                    self.roster_scratch.push((BlockId(id), None));
+                    keep.insert(BlockId(id))?;
                 }
             }
+            storage.copy_retained_index_roots(&mut self.garbage_index_roots)?;
             for slot in 0..storage.physical_table_count() {
                 for binding in 0..storage.value_binding_count(slot) {
                     let Some(handle) = storage.value_binding_handle(slot, binding) else {
                         continue;
                     };
-                    let complete = crate::store::walk_value_roster(
-                        &mut *self.blocks.lock().expect("block store lock poisoned"),
-                        handle.roster,
-                        scratch,
-                        |id, _| {
-                            if self.roster_scratch.len() == self.roster_scratch.capacity() {
-                                return false;
-                            }
-                            self.roster_scratch.push((id, None));
-                            true
-                        },
-                    )
-                    .map_err(|error| {
-                        sql_err!(
-                            SQLSTATE_IO,
-                            "corrupt persistent value-index roster: {:?}",
-                            error
-                        )
-                    })?;
-                    if !complete {
+                    if self.garbage_index_roots.contains(&handle.roster) {
+                        continue;
+                    }
+                    if self.garbage_index_roots.len() == self.garbage_index_roots.capacity() {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
-                            self.roster_scratch.capacity()
+                            "garbage collection index roots exceed fixed scratch capacity"
                         ));
                     }
+                    self.garbage_index_roots.push(handle.roster);
+                }
+            }
+            self.garbage_index_roots.sort_unstable();
+            self.garbage_index_roots.dedup();
+            for roster in self.garbage_index_roots.iter().copied() {
+                let complete = crate::store::walk_value_roster(
+                    &mut *self.blocks.lock().expect("block store lock poisoned"),
+                    roster,
+                    scratch,
+                    |id, _| keep.insert(id).is_ok(),
+                )
+                .map_err(|error| {
+                    sql_err!(
+                        SQLSTATE_IO,
+                        "corrupt persistent value-index roster: {:?}",
+                        error
+                    )
+                })?;
+                if !complete {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
+                        keep.capacity()
+                    ));
                 }
             }
             for index in 0..self.backup_scratch.len() {
@@ -13220,16 +13232,16 @@ impl Checkpointer {
                 }
                 retain_manifest_blocks(
                     &self.blocks,
-                    &mut self.roster_scratch,
+                    &mut keep,
                     scratch,
                     self.manifest_buf.readable(),
                 )?;
             }
+            drop(keep);
             // Listing may visit many obsolete objects. Sort the fixed keep-set
             // once so each membership probe is logarithmic rather than scanning
             // every live block for every listed key.
             self.roster_scratch.sort_unstable_by_key(|(id, _)| *id);
-            self.roster_scratch.dedup_by_key(|(id, _)| *id);
             #[cfg(feature = "checkpoint-profile")]
             profile_checkpoint_phase(
                 "gc_keep",
@@ -13332,7 +13344,7 @@ impl Checkpointer {
                 .io_stats(),
             deleted,
         );
-        if done && storage.take_retained_sst_reclamation() {
+        if done && storage.take_retained_file_reclamation() {
             return Ok(false);
         }
         Ok(done)
@@ -13565,21 +13577,53 @@ fn manifest_commit_retention_floor(bytes: &[u8]) -> Result<u64, &'static str> {
     Ok(floor)
 }
 
-fn retain_block(keep: &mut Vec<(BlockId, Option<BlockType>)>, id: BlockId) -> Result<(), SqlError> {
-    if keep.len() == keep.capacity() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
-            keep.capacity()
-        ));
+struct BlockKeepSet<'scratch> {
+    blocks: &'scratch mut Vec<(BlockId, Option<BlockType>)>,
+    seen: &'scratch mut FixedMap<BlockId, ()>,
+}
+
+impl<'scratch> BlockKeepSet<'scratch> {
+    fn new(
+        blocks: &'scratch mut Vec<(BlockId, Option<BlockType>)>,
+        seen: &'scratch mut FixedMap<BlockId, ()>,
+    ) -> Self {
+        assert_eq!(
+            blocks.capacity(),
+            seen.capacity(),
+            "keep-set reservations agree"
+        );
+        blocks.clear();
+        seen.clear();
+        Self { blocks, seen }
     }
-    keep.push((id, None));
-    Ok(())
+
+    fn capacity(&self) -> usize {
+        self.blocks.capacity()
+    }
+
+    fn insert(&mut self, id: BlockId) -> Result<(), SqlError> {
+        match self.seen.insert(id, ()) {
+            Ok(None) => {
+                self.blocks.push((id, None));
+                Ok(())
+            }
+            Ok(Some(())) => Ok(()),
+            Err(_) => Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
+                self.capacity()
+            )),
+        }
+    }
+}
+
+fn retain_block(keep: &mut BlockKeepSet<'_>, id: BlockId) -> Result<(), SqlError> {
+    keep.insert(id)
 }
 
 fn retain_manifest_blocks(
     blocks: &std::sync::Arc<std::sync::Mutex<TieredStore<OwnedObjectStore>>>,
-    keep: &mut Vec<(BlockId, Option<BlockType>)>,
+    keep: &mut BlockKeepSet<'_>,
     scratch: &mut [u8],
     bytes: &[u8],
 ) -> Result<(), SqlError> {
@@ -17406,6 +17450,245 @@ mod stored_dependency_tests {
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;
     use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependencies};
+
+    #[test]
+    fn index_file_owners_keep_set_counts_shared_blocks_once_at_exact_capacity() {
+        let mut budget = Budget::new(FixedMap::<BlockId, ()>::budget_bytes(2));
+        let mut seen = FixedMap::new(&mut budget, "test block membership", 2).unwrap();
+        let mut blocks = Vec::with_capacity(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut keep = BlockKeepSet::new(&mut blocks, &mut seen);
+            for _ in 0..128 {
+                for tag in [1, 2, 1, 2] {
+                    retain_block(&mut keep, BlockId([tag; 32])).unwrap();
+                }
+            }
+            let error = keep.insert(BlockId([3; 32])).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(keep.blocks.len(), 2);
+            assert_eq!(keep.seen.len(), 2);
+            assert_eq!(keep.blocks[0].0, BlockId([1; 32]));
+            assert_eq!(keep.blocks[1].0, BlockId([2; 32]));
+            keep.insert(BlockId([1; 32])).unwrap();
+            drop(keep);
+            let mut retry = BlockKeepSet::new(&mut blocks, &mut seen);
+            retry.insert(BlockId([3; 32])).unwrap();
+            assert_eq!(retry.blocks.len(), 1);
+            assert_eq!(retry.seen.len(), 1);
+        });
+    }
+
+    fn index_gc_fixture(label: &str, capacity: usize) -> (Checkpointer, Storage, usize, Config) {
+        let mut config = Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        config.memtable_bytes = 1 << 16;
+        config.max_tables = 2;
+        config.max_connections = 2;
+        config.table_rows = 16;
+        config.txn_rows = 16;
+        config.max_value_indexes = 2;
+        config.value_index_rows = 4;
+        config.checkpoint_live_blocks = capacity;
+        config.object_store_bucket = format!("{label}-{}", std::process::id());
+        config.data_dir = std::env::temp_dir()
+            .join(&config.object_store_bucket)
+            .to_str()
+            .unwrap()
+            .to_owned();
+        config.remove_test_data_dir_on_drop();
+        let mut budget = Budget::new(
+            config.memtable_bytes
+                + Storage::extra_budget_bytes(&config)
+                + Checkpointer::budget_bytes(&config)
+                + crate::storage::SpillReader::budget_bytes(true, 3),
+        );
+        let checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let reader = crate::storage::SpillReader::new(
+            &mut budget,
+            3,
+            Some(checkpointer.block_stack()),
+            None,
+        )
+        .unwrap();
+        storage.attach_spill(reader);
+        let mut definition = TableDef {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("saved_index").unwrap(),
+            n_columns: 1,
+            ..TableDef::empty()
+        };
+        definition.columns[0] = ColumnMeta {
+            name: SqlName::parse("id").unwrap(),
+            ctype: ColType::Int4,
+            unique: true,
+            ..ColumnMeta::EMPTY
+        };
+        let table = storage.create_table(definition).unwrap();
+        (checkpointer, storage, table, config)
+    }
+
+    fn write_gc_index(checkpointer: &Checkpointer, payload: &[u8]) -> ValueIndexHandle {
+        let mut writer = ValueIndexWriter::new();
+        let mut blocks = checkpointer.blocks.lock().unwrap();
+        writer
+            .append_covering(
+                &mut *blocks,
+                (11, 1, 7),
+                b"key",
+                payload,
+                &mut |left, right| left.cmp(right),
+            )
+            .unwrap();
+        writer.finish(&mut *blocks, 7).unwrap().unwrap()
+    }
+
+    fn index_gc_hex(id: BlockId) -> String {
+        let mut key = [0; 64];
+        id.write_key(&mut key);
+        core::str::from_utf8(&key).unwrap().to_owned()
+    }
+
+    #[test]
+    fn index_file_owners_garbage_collection_retains_old_graph_until_last_owner_and_backup() {
+        let (mut checkpoint, mut storage, table, config) =
+            index_gc_fixture("index-gc-retention", 4);
+        let old = write_gc_index(&checkpoint, b"old");
+        let new = write_gc_index(&checkpoint, b"new");
+        storage
+            .install_value_binding(
+                table,
+                &[0],
+                None,
+                crate::storage::ColumnSet::EMPTY,
+                Some(old),
+            )
+            .unwrap();
+        let first = storage.retain_statement_snapshot(71, |_| 7).unwrap();
+        let second = storage.retain_statement_snapshot(72, |_| 7).unwrap();
+        for owner in [&first, &second] {
+            let scope = owner.enter_files(&storage).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                assert!(
+                    storage
+                        .walk_value_index(table, &[0], |_, _| Ok(()))
+                        .unwrap()
+                );
+            });
+            drop(scope);
+        }
+        storage
+            .install_value_binding(
+                table,
+                &[0],
+                None,
+                crate::storage::ColumnSet::EMPTY,
+                Some(new),
+            )
+            .unwrap();
+        let manifest = format!(
+            "pos3ql-manifest-v14\nvix 0 1 0 0 - {} 1 7\nend\n",
+            index_gc_hex(old.roster)
+        );
+        // Two backups and two readers share the same graph at the four-block limit.
+        for name in ["first", "second"] {
+            checkpoint
+                .put_immutable(&format!("backups/{name}/manifest"), manifest.as_bytes())
+                .unwrap();
+        }
+        assert!(
+            crate::mem::guard::forbid_alloc(|| checkpoint.collect_block_garbage_batch(&storage))
+                .unwrap()
+        );
+        assert_eq!(checkpoint.roster_scratch.len(), 4);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+        let old_key = format!(
+            "{}blocks/{}",
+            config.object_store_prefix,
+            index_gc_hex(old.roster)
+        );
+        let new_key = format!(
+            "{}blocks/{}",
+            config.object_store_prefix,
+            index_gc_hex(new.roster)
+        );
+        drop(first);
+        assert!(!storage.take_retained_file_reclamation());
+        drop(second);
+        assert!(storage.take_retained_file_reclamation());
+        assert!(checkpoint.collect_block_garbage_batch(&storage).unwrap());
+        assert!(namespace.borrow().object_bytes(&old_key).is_some());
+        assert!(checkpoint.delete_backup("first").unwrap());
+        assert!(checkpoint.collect_block_garbage_batch(&storage).unwrap());
+        assert!(namespace.borrow().object_bytes(&old_key).is_some());
+        assert!(checkpoint.delete_backup("second").unwrap());
+        assert!(checkpoint.collect_block_garbage_batch(&storage).unwrap());
+        assert!(namespace.borrow().object_bytes(&old_key).is_none());
+        assert!(namespace.borrow().object_bytes(&new_key).is_some());
+        drop(storage);
+        drop(checkpoint);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn index_file_owners_garbage_collection_errors_precede_any_deletion() {
+        let (mut checkpoint, mut storage, table, config) = index_gc_fixture("index-gc-errors", 1);
+        let live = write_gc_index(&checkpoint, b"live");
+        let orphan = write_gc_index(&checkpoint, b"orphan");
+        storage
+            .install_value_binding(
+                table,
+                &[0],
+                None,
+                crate::storage::ColumnSet::EMPTY,
+                Some(live),
+            )
+            .unwrap();
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+        let orphan_key = format!(
+            "{}blocks/{}",
+            config.object_store_prefix,
+            index_gc_hex(orphan.roster)
+        );
+        let error = checkpoint
+            .collect_block_garbage_batch(&storage)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(!checkpoint.block_garbage_loaded);
+        assert!(checkpoint.doomed_blocks.is_empty());
+        assert!(namespace.borrow().object_bytes(&orphan_key).is_some());
+        let corrupt = checkpoint
+            .blocks
+            .lock()
+            .unwrap()
+            .put(b"bad roster", BlockType::ValueIndexRoster, 0)
+            .unwrap();
+        storage
+            .install_value_binding(
+                table,
+                &[0],
+                None,
+                crate::storage::ColumnSet::EMPTY,
+                Some(ValueIndexHandle {
+                    roster: corrupt,
+                    ..live
+                }),
+            )
+            .unwrap();
+        let error = checkpoint
+            .collect_block_garbage_batch(&storage)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::IO_ERROR);
+        assert!(!checkpoint.block_garbage_loaded);
+        assert!(checkpoint.doomed_blocks.is_empty());
+        assert!(namespace.borrow().object_bytes(&orphan_key).is_some());
+        drop(storage);
+        drop(checkpoint);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
 
     fn atomic_scope_fixture(name: &str) -> (Checkpointer, Config) {
         let mut config = Config::default_dev();

@@ -1,4 +1,4 @@
-//! Owned immutable SST roots retained until their readers release them.
+//! Owned immutable row and index files retained until their readers release them.
 
 use core::cell::Cell;
 use core::mem::size_of;
@@ -13,7 +13,7 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
-use crate::store::SstHandle;
+use crate::store::{BlockId, SstHandle, ValueIndexHandle};
 
 /// Handles and their eviction boundaries are published as one complete list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,9 +266,48 @@ impl SpillGenerationRoster {
     }
 }
 
-struct PinnedRoot {
+trait RetainedFileRoot: Copy + Eq {
+    const ROOT_BUDGET: &'static str;
+    const MEMBERSHIP_BUDGET: &'static str;
+    const CAPACITY_ERROR: &'static str;
+    const REFERENCE_ERROR: &'static str;
+
+    fn durable(self) -> bool;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RowFileRoot {
     handle: SstHandle,
     durable: bool,
+}
+
+impl RetainedFileRoot for RowFileRoot {
+    const ROOT_BUDGET: &'static str = "retained SST roots";
+    const MEMBERSHIP_BUDGET: &'static str = "statement file membership";
+    const CAPACITY_ERROR: &'static str = "retained SST roots exceed the startup capacity";
+    const REFERENCE_ERROR: &'static str = "retained SST reader count exhausted";
+
+    fn durable(self) -> bool {
+        self.durable
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct IndexFileRoot(BlockId);
+
+impl RetainedFileRoot for IndexFileRoot {
+    const ROOT_BUDGET: &'static str = "retained index files";
+    const MEMBERSHIP_BUDGET: &'static str = "statement index file membership";
+    const CAPACITY_ERROR: &'static str = "retained index files exceed the startup capacity";
+    const REFERENCE_ERROR: &'static str = "retained index file reader count exhausted";
+
+    fn durable(self) -> bool {
+        true
+    }
+}
+
+struct PinnedRoot<Root> {
+    handle: Root,
     readers: NonZeroUsize,
     garbage_retained: bool,
 }
@@ -286,29 +325,56 @@ struct StatementFileOwner {
     has_roots: bool,
 }
 
-struct RetainedRootState {
-    roots: FixedVec<PinnedRoot>,
-    statements: FixedVec<Option<StatementFileOwner>>,
+struct RetainedRootPool<Root> {
+    roots: FixedVec<PinnedRoot<Root>>,
     members: FixedVec<u64>,
     words_per_root: usize,
-    next_statement: u64,
 }
 
-impl Deref for RetainedRootState {
-    type Target = FixedVec<PinnedRoot>;
+impl<Root> Deref for RetainedRootPool<Root> {
+    type Target = FixedVec<PinnedRoot<Root>>;
 
     fn deref(&self) -> &Self::Target {
         &self.roots
     }
 }
 
-impl DerefMut for RetainedRootState {
+impl<Root> DerefMut for RetainedRootPool<Root> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.roots
     }
 }
 
-impl RetainedRootState {
+impl<Root: RetainedFileRoot> RetainedRootPool<Root> {
+    fn budget_bytes(capacity: usize, statement_capacity: usize) -> usize {
+        capacity
+            .saturating_mul(size_of::<PinnedRoot<Root>>())
+            .saturating_add(
+                capacity
+                    .saturating_mul(statement_capacity.div_ceil(64))
+                    .saturating_mul(size_of::<u64>()),
+            )
+    }
+
+    fn new(
+        budget: &mut Budget,
+        capacity: usize,
+        statement_capacity: usize,
+    ) -> Result<Self, BudgetError> {
+        let roots = FixedVec::new(budget, Root::ROOT_BUDGET, capacity)?;
+        let words_per_root = statement_capacity.div_ceil(64);
+        let member_capacity = capacity.saturating_mul(words_per_root);
+        let mut members = FixedVec::new(budget, Root::MEMBERSHIP_BUDGET, member_capacity)?;
+        for _ in 0..member_capacity {
+            members.push(0).expect("reserved statement file membership");
+        }
+        Ok(Self {
+            roots,
+            members,
+            words_per_root,
+        })
+    }
+
     fn contains_statement(&self, root: usize, statement: StatementFileIdentity) -> bool {
         self.members[root * self.words_per_root + statement.slot / 64]
             & (1u64 << (statement.slot % 64))
@@ -326,7 +392,7 @@ impl RetainedRootState {
     }
 
     /// Dense removal moves the membership row with its immutable root.
-    fn remove_root(&mut self, position: usize) -> PinnedRoot {
+    fn remove_root(&mut self, position: usize) -> PinnedRoot<Root> {
         let last = self.roots.len() - 1;
         let width = self.words_per_root;
         debug_assert!(
@@ -340,6 +406,136 @@ impl RetainedRootState {
         self.roots.swap_remove(position)
     }
 
+    fn pin(
+        &mut self,
+        keys: impl Iterator<Item = Root> + Clone,
+        statement: Option<StatementFileIdentity>,
+    ) -> Result<(), SqlError> {
+        let mut needed = 0;
+        for (index, key) in keys.clone().enumerate() {
+            if !self.roots.iter().any(|root| root.handle == key)
+                && !keys.clone().take(index).any(|prior| prior == key)
+            {
+                needed += 1;
+            }
+        }
+        for (position, root) in self.roots.iter().enumerate() {
+            let count = keys.clone().filter(|key| *key == root.handle).count();
+            let statement_pin = count != 0
+                && statement.is_some_and(|identity| !self.contains_statement(position, identity));
+            if root
+                .readers
+                .checked_add(count)
+                .and_then(|count| count.checked_add(usize::from(statement_pin)))
+                .is_none()
+            {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "{}",
+                    Root::REFERENCE_ERROR
+                ));
+            }
+        }
+        if needed > self.roots.capacity() - self.roots.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "{} ({})",
+                Root::CAPACITY_ERROR,
+                self.roots.capacity()
+            ));
+        }
+        for key in keys {
+            if let Some(position) = self.roots.iter().position(|root| root.handle == key) {
+                let statement_pin =
+                    statement.is_some_and(|identity| !self.contains_statement(position, identity));
+                self.roots[position].readers = self.roots[position]
+                    .readers
+                    .checked_add(1 + usize::from(statement_pin))
+                    .expect("preflighted reader count");
+                if let Some(identity) = statement {
+                    self.set_statement(position, identity, true);
+                }
+            } else {
+                let position = self.roots.len();
+                self.roots
+                    .push(PinnedRoot {
+                        handle: key,
+                        readers: NonZeroUsize::new(1 + usize::from(statement.is_some()))
+                            .expect("nonzero"),
+                        garbage_retained: false,
+                    })
+                    .expect("preflighted root capacity");
+                if let Some(identity) = statement {
+                    self.set_statement(position, identity, true);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn release_one(&mut self, position: usize) -> bool {
+        if let Some(remaining) = NonZeroUsize::new(self.roots[position].readers.get() - 1) {
+            self.roots[position].readers = remaining;
+            false
+        } else {
+            let retired = self.remove_root(position);
+            retired.handle.durable() && retired.garbage_retained
+        }
+    }
+
+    fn release(&mut self, keys: impl Iterator<Item = Root>) -> bool {
+        let mut reclamation = false;
+        for key in keys {
+            let position = self
+                .roots
+                .iter()
+                .position(|root| root.handle == key)
+                .expect("reader retains its root");
+            reclamation |= self.release_one(position);
+        }
+        reclamation
+    }
+
+    fn release_statement(&mut self, identity: StatementFileIdentity) -> bool {
+        let mut reclamation = false;
+        let mut position = 0;
+        while position < self.roots.len() {
+            if self.contains_statement(position, identity) {
+                self.set_statement(position, identity, false);
+                let removed = self.roots[position].readers.get() == 1;
+                reclamation |= self.release_one(position);
+                if removed {
+                    continue;
+                }
+            }
+            position += 1;
+        }
+        reclamation
+    }
+}
+
+struct RetainedRootState {
+    roots: RetainedRootPool<RowFileRoot>,
+    index_roots: RetainedRootPool<IndexFileRoot>,
+    statements: FixedVec<Option<StatementFileOwner>>,
+    next_statement: u64,
+}
+
+impl Deref for RetainedRootState {
+    type Target = RetainedRootPool<RowFileRoot>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.roots
+    }
+}
+
+impl DerefMut for RetainedRootState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.roots
+    }
+}
+
+impl RetainedRootState {
     fn statement_mut(&mut self, identity: StatementFileIdentity) -> &mut StatementFileOwner {
         self.statements[identity.slot]
             .as_mut()
@@ -442,6 +638,24 @@ impl Drop for StatementFileLease {
     }
 }
 
+#[must_use = "the selected index generation must keep its files alive"]
+pub(super) struct RetainedIndexFile {
+    registry: Arc<SpillRootRegistry>,
+    handle: ValueIndexHandle,
+}
+
+impl RetainedIndexFile {
+    pub(super) fn handle(&self) -> ValueIndexHandle {
+        self.handle
+    }
+}
+
+impl Drop for RetainedIndexFile {
+    fn drop(&mut self) {
+        self.registry.release_index_file(self.handle);
+    }
+}
+
 pub(super) struct SpillRootRegistry {
     roots: Mutex<RetainedRootState>,
     reclamation_pending: AtomicBool,
@@ -454,45 +668,44 @@ impl SpillRootRegistry {
             .saturating_mul(2)
     }
 
+    pub(super) fn index_capacity(config: &Config) -> usize {
+        config.max_value_indexes.saturating_mul(2)
+    }
+
     pub(super) fn budget_bytes(config: &Config) -> usize {
+        let statements = super::statement_snapshot_capacity(config);
         (size_of::<Self>() + 2 * size_of::<std::sync::atomic::AtomicUsize>())
-            .saturating_add(Self::capacity(config).saturating_mul(size_of::<PinnedRoot>()))
-            .saturating_add(
-                super::statement_snapshot_capacity(config)
-                    .saturating_mul(size_of::<Option<StatementFileOwner>>()),
-            )
-            .saturating_add(
-                Self::capacity(config)
-                    .saturating_mul(super::statement_snapshot_capacity(config).div_ceil(64))
-                    .saturating_mul(size_of::<u64>()),
-            )
+            .saturating_add(statements.saturating_mul(size_of::<Option<StatementFileOwner>>()))
+            .saturating_add(RetainedRootPool::<RowFileRoot>::budget_bytes(
+                Self::capacity(config),
+                statements,
+            ))
+            .saturating_add(RetainedRootPool::<IndexFileRoot>::budget_bytes(
+                Self::index_capacity(config),
+                statements,
+            ))
     }
 
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Arc<Self>, BudgetError> {
         budget.draw(
             size_of::<Self>() + 2 * size_of::<std::sync::atomic::AtomicUsize>(),
-            "retained SST root owner",
+            "retained file root owner",
         )?;
-        let roots = FixedVec::new(budget, "retained SST roots", Self::capacity(config))?;
         let statement_capacity = super::statement_snapshot_capacity(config);
+        let roots = RetainedRootPool::new(budget, Self::capacity(config), statement_capacity)?;
+        let index_roots =
+            RetainedRootPool::new(budget, Self::index_capacity(config), statement_capacity)?;
         let mut statements = FixedVec::new(budget, "statement file owners", statement_capacity)?;
         for _ in 0..statement_capacity {
             statements
                 .push(None)
                 .expect("reserved statement file owners");
         }
-        let words_per_root = statement_capacity.div_ceil(64);
-        let member_capacity = Self::capacity(config).saturating_mul(words_per_root);
-        let mut members = FixedVec::new(budget, "statement file membership", member_capacity)?;
-        for _ in 0..member_capacity {
-            members.push(0).expect("reserved statement file membership");
-        }
         Ok(Arc::new(Self {
             roots: Mutex::new(RetainedRootState {
                 roots,
+                index_roots,
                 statements,
-                members,
-                words_per_root,
                 next_statement: 0,
             }),
             reclamation_pending: AtomicBool::new(false),
@@ -535,136 +748,88 @@ impl SpillRootRegistry {
     }
 
     fn release_statement(&self, identity: StatementFileIdentity) {
-        let mut state = self.roots.lock().expect("retained SST root lock poisoned");
+        let mut state = self.roots.lock().expect("retained file root lock poisoned");
         let owner = state.statement_mut(identity);
         if let Some(remaining) = NonZeroUsize::new(owner.references.get() - 1) {
             owner.references = remaining;
             return;
         }
-        // Nested snapshots borrow the outer file owner; retiring their unused
-        // slots must not scan another statement's retained files.
-        if !owner.has_roots {
-            state.statements[identity.slot] = None;
-            return;
-        }
-        let mut position = 0;
-        while position < state.len() {
-            if state.contains_statement(position, identity) {
-                state.set_statement(position, identity, false);
-                if let Some(remaining) = NonZeroUsize::new(state[position].readers.get() - 1) {
-                    state[position].readers = remaining;
-                } else {
-                    let retired = state.remove_root(position);
-                    if retired.durable && retired.garbage_retained {
-                        self.reclamation_pending.store(true, Ordering::Release);
-                    }
-                    continue;
-                }
+        if owner.has_roots {
+            let rows = state.roots.release_statement(identity);
+            let indexes = state.index_roots.release_statement(identity);
+            if rows || indexes {
+                self.reclamation_pending.store(true, Ordering::Release);
             }
-            position += 1;
         }
         state.statements[identity.slot] = None;
     }
 
-    fn pin(&self, handles: &[SstHandle], durable: bool) -> Result<(), SqlError> {
-        let mut roots = self.roots.lock().expect("retained SST root lock poisoned");
+    fn selected_statement(&self, state: &mut RetainedRootState) -> Option<StatementFileIdentity> {
         let statement = SELECTED_STATEMENT_FILES
             .with(Cell::get)
             .filter(|selected| selected.registry == self as *const Self as usize)
             .map(|selected| selected.identity);
         if let Some(identity) = statement {
-            roots.statement_mut(identity);
+            state.statement_mut(identity);
         }
-        let mut needed = 0;
-        for (index, handle) in handles.iter().enumerate() {
-            if !roots
+        statement
+    }
+
+    fn pin(&self, handles: &[SstHandle], durable: bool) -> Result<(), SqlError> {
+        let mut state = self.roots.lock().expect("retained file root lock poisoned");
+        let statement = self.selected_statement(&mut state);
+        state.roots.pin(
+            handles
                 .iter()
-                .any(|root| root.handle == *handle && root.durable == durable)
-                && !handles[..index].contains(handle)
-            {
-                needed += 1;
-            }
-        }
-        for (position, root) in roots.iter().enumerate() {
-            let count = handles
-                .iter()
-                .filter(|handle| **handle == root.handle && root.durable == durable)
-                .count();
-            let statement_pin = count != 0
-                && statement.is_some_and(|identity| !roots.contains_statement(position, identity));
-            if root
-                .readers
-                .checked_add(count)
-                .and_then(|count| count.checked_add(usize::from(statement_pin)))
-                .is_none()
-            {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "retained SST reader count exhausted"
-                ));
-            }
-        }
-        if needed > roots.capacity() - roots.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "retained SST roots exceed the startup capacity ({})",
-                roots.capacity()
-            ));
-        }
-        for handle in handles {
-            if let Some(position) = roots
-                .iter()
-                .position(|root| root.handle == *handle && root.durable == durable)
-            {
-                let statement_pin =
-                    statement.is_some_and(|identity| !roots.contains_statement(position, identity));
-                let root = &mut roots[position];
-                root.readers = root
-                    .readers
-                    .checked_add(1 + usize::from(statement_pin))
-                    .expect("preflighted reader count");
-                if let Some(identity) = statement {
-                    roots.set_statement(position, identity, true);
-                }
-            } else {
-                let position = roots.len();
-                roots
-                    .push(PinnedRoot {
-                        handle: *handle,
-                        durable,
-                        readers: NonZeroUsize::new(1 + usize::from(statement.is_some()))
-                            .expect("nonzero"),
-                        garbage_retained: false,
-                    })
-                    .expect("preflighted root capacity");
-                if let Some(identity) = statement {
-                    roots.set_statement(position, identity, true);
-                }
-            }
-        }
+                .copied()
+                .map(|handle| RowFileRoot { handle, durable }),
+            statement,
+        )?;
         if !handles.is_empty()
             && let Some(identity) = statement
         {
-            roots.statement_mut(identity).has_roots = true;
+            state.statement_mut(identity).has_roots = true;
         }
         Ok(())
     }
 
     fn release(&self, handles: &[SstHandle], durable: bool) {
-        let mut roots = self.roots.lock().expect("retained SST root lock poisoned");
-        for handle in handles {
-            let position = roots
+        let mut state = self.roots.lock().expect("retained file root lock poisoned");
+        if state.roots.release(
+            handles
                 .iter()
-                .position(|root| root.handle == *handle && root.durable == durable)
-                .expect("reader retains its root");
-            if let Some(remaining) = NonZeroUsize::new(roots[position].readers.get() - 1) {
-                roots[position].readers = remaining;
-            } else {
-                let retired = roots.remove_root(position);
-                if retired.durable && retired.garbage_retained {
-                    self.reclamation_pending.store(true, Ordering::Release);
-                }
-            }
+                .copied()
+                .map(|handle| RowFileRoot { handle, durable }),
+        ) {
+            self.reclamation_pending.store(true, Ordering::Release);
+        }
+    }
+
+    pub(super) fn retain_index_file(
+        self: &Arc<Self>,
+        handle: ValueIndexHandle,
+    ) -> Result<RetainedIndexFile, SqlError> {
+        let mut state = self.roots.lock().expect("retained file root lock poisoned");
+        let statement = self.selected_statement(&mut state);
+        state
+            .index_roots
+            .pin(core::iter::once(IndexFileRoot(handle.roster)), statement)?;
+        if let Some(identity) = statement {
+            state.statement_mut(identity).has_roots = true;
+        }
+        Ok(RetainedIndexFile {
+            registry: Arc::clone(self),
+            handle,
+        })
+    }
+
+    fn release_index_file(&self, handle: ValueIndexHandle) {
+        let mut state = self.roots.lock().expect("retained file root lock poisoned");
+        if state
+            .index_roots
+            .release(core::iter::once(IndexFileRoot(handle.roster)))
+        {
+            self.reclamation_pending.store(true, Ordering::Release);
         }
     }
 
@@ -675,7 +840,10 @@ impl SpillRootRegistry {
     ) -> Result<(), SqlError> {
         let mut roots = self.roots.lock().expect("retained SST root lock poisoned");
         output.clear();
-        let count = roots.iter().filter(|root| root.durable == durable).count();
+        let count = roots
+            .iter()
+            .filter(|root| root.handle.durable == durable)
+            .count();
         if count > output.capacity() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -683,12 +851,32 @@ impl SpillRootRegistry {
                 output.capacity()
             ));
         }
-        for root in roots.iter_mut().filter(|root| root.durable == durable) {
+        for root in roots
+            .iter_mut()
+            .filter(|root| root.handle.durable == durable)
+        {
             root.garbage_retained = true;
-            output.push(root.handle);
+            output.push(root.handle.handle);
         }
         Ok(())
     }
+    pub(super) fn copy_index_roots(&self, output: &mut Vec<BlockId>) -> Result<(), SqlError> {
+        let mut state = self.roots.lock().expect("retained file root lock poisoned");
+        output.clear();
+        if state.index_roots.len() > output.capacity() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "retained index file snapshot exceeds garbage collection scratch ({})",
+                output.capacity()
+            ));
+        }
+        for root in state.index_roots.iter_mut() {
+            root.garbage_retained = true;
+            output.push(root.handle.0);
+        }
+        Ok(())
+    }
+
     pub(super) fn reclamation_pending(&self) -> bool {
         self.reclamation_pending.load(Ordering::Acquire)
     }
@@ -1569,7 +1757,7 @@ impl Drop for SpillGenerationSnapshot {
 mod tests {
     use super::*;
     use crate::storage::tests::{make_def, test_budget, test_config};
-    use crate::store::{BlockId, RowSstFormat};
+    use crate::store::{BlockId, OwnedObjectStore, RowSstFormat, TieredStore};
 
     fn handle(tag: u8) -> SstHandle {
         SstHandle {
@@ -1578,6 +1766,486 @@ mod tests {
             roster: BlockId([tag.wrapping_add(2); 32]),
             format: RowSstFormat::PackedV4,
         }
+    }
+
+    fn index_handle(tag: u8) -> ValueIndexHandle {
+        ValueIndexHandle {
+            roster: BlockId([tag; 32]),
+            entries: 3,
+            published_lsn: 7,
+        }
+    }
+
+    #[test]
+    fn index_file_owners_reserve_independent_capacity_and_preserve_handle_metadata() {
+        let mut config = test_config();
+        config.max_value_indexes = 1;
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        let mut roots = Vec::with_capacity(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let first_handle = index_handle(1);
+            let newer_handle = ValueIndexHandle {
+                entries: 9,
+                published_lsn: 11,
+                ..first_handle
+            };
+            let first = registry.retain_index_file(first_handle).unwrap();
+            let newer = registry.retain_index_file(newer_handle).unwrap();
+            assert_eq!(first.handle(), first_handle);
+            assert_eq!(newer.handle(), newer_handle);
+            let second = registry.retain_index_file(index_handle(2)).unwrap();
+            let error = registry.retain_index_file(index_handle(3)).err().unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(
+                error
+                    .message
+                    .as_str()
+                    .starts_with(IndexFileRoot::CAPACITY_ERROR)
+            );
+            // A full index pool must not consume the independently reserved row pool.
+            registry.pin(&[handle(1)], true).unwrap();
+            registry.release(&[handle(1)], true);
+            registry.copy_index_roots(&mut roots).unwrap();
+            assert_eq!(roots, [first_handle.roster, index_handle(2).roster]);
+            drop(first);
+            assert!(!registry.take_reclamation_pending());
+            drop(newer);
+            assert!(registry.take_reclamation_pending());
+            let replacement = registry.retain_index_file(index_handle(3)).unwrap();
+            drop(second);
+            assert!(registry.take_reclamation_pending());
+            drop(replacement);
+            assert!(!registry.take_reclamation_pending());
+            assert!(registry.roots.lock().unwrap().index_roots.is_empty());
+        });
+    }
+
+    #[test]
+    fn index_file_owners_miri_final_release_clears_both_file_pools() {
+        let config = test_config();
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let mut rows = Vec::with_capacity(2);
+        let mut indexes = Vec::with_capacity(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let first = registry.retain_statement().unwrap();
+            let second = registry.retain_statement().unwrap();
+            for (owner, tag) in [(&first, 1), (&second, 5)] {
+                let scope = owner.enter().unwrap();
+                registry.pin(&[handle(tag)], true).unwrap();
+                registry.release(&[handle(tag)], true);
+                drop(registry.retain_index_file(index_handle(tag)).unwrap());
+                drop(scope);
+            }
+            registry.copy_roots(true, &mut rows).unwrap();
+            registry.copy_index_roots(&mut indexes).unwrap();
+            drop(first);
+            assert!(registry.take_reclamation_pending());
+            registry.copy_roots(true, &mut rows).unwrap();
+            registry.copy_index_roots(&mut indexes).unwrap();
+            assert_eq!(rows, [handle(5)]);
+            assert_eq!(indexes, [index_handle(5).roster]);
+            drop(second);
+            assert!(registry.take_reclamation_pending());
+            let state = registry.roots.lock().unwrap();
+            assert!(state.roots.is_empty());
+            assert!(state.index_roots.is_empty());
+            assert!(state.index_roots.members.iter().all(|word| *word == 0));
+        });
+    }
+
+    #[test]
+    fn index_file_owners_miri_scope_outlives_storage_and_reused_owner_slots() {
+        let config = test_config();
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let weak = Arc::downgrade(&registry);
+        let mut roots = Vec::with_capacity(1);
+        crate::mem::guard::forbid_alloc(|| {
+            let old = registry.retain_statement().unwrap();
+            let old_identity = old.identity;
+            drop(old);
+            let owner = registry.retain_statement().unwrap();
+            assert_eq!(owner.identity.slot, old_identity.slot);
+            assert_ne!(owner.identity.serial, old_identity.serial);
+            let scope = owner.enter().unwrap();
+            drop(registry.retain_index_file(index_handle(1)).unwrap());
+            drop(owner);
+            drop(registry);
+            let registry = weak.upgrade().unwrap();
+            registry.copy_index_roots(&mut roots).unwrap();
+            assert_eq!(roots, [index_handle(1).roster]);
+            drop(scope);
+            assert!(registry.take_reclamation_pending());
+            assert!(registry.roots.lock().unwrap().index_roots.is_empty());
+            drop(registry);
+            assert!(weak.upgrade().is_none());
+        });
+    }
+
+    #[test]
+    fn index_file_owners_membership_crosses_word_boundaries_and_deduplicates() {
+        let mut config = test_config();
+        config.max_value_indexes = 1;
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let mut owners = Vec::with_capacity(66);
+        let mut roots = Vec::with_capacity(2);
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..66 {
+                let owner = registry.retain_statement().unwrap();
+                let scope = owner.enter().unwrap();
+                for _ in 0..3 {
+                    drop(registry.retain_index_file(index_handle(1)).unwrap());
+                }
+                drop(scope);
+                owners.push(owner);
+            }
+            assert_eq!(
+                registry.roots.lock().unwrap().index_roots[0].readers.get(),
+                66
+            );
+            registry.copy_index_roots(&mut roots).unwrap();
+            while owners.len() > 1 {
+                drop(owners.pop());
+                assert!(!registry.take_reclamation_pending());
+            }
+            drop(owners.pop());
+            assert!(registry.take_reclamation_pending());
+            assert!(registry.roots.lock().unwrap().index_roots.is_empty());
+        });
+    }
+
+    #[test]
+    fn index_file_owners_exhaustion_and_snapshot_errors_leave_memberships_intact() {
+        let mut config = test_config();
+        config.max_value_indexes = 1;
+        let mut budget = Budget::new(SpillRootRegistry::budget_bytes(&config));
+        let registry = SpillRootRegistry::new(&config, &mut budget).unwrap();
+        let mut short = Vec::with_capacity(0);
+        let mut roots = Vec::with_capacity(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let file = registry.retain_index_file(index_handle(1)).unwrap();
+            let owner = registry.retain_statement().unwrap();
+            let scope = owner.enter().unwrap();
+            registry.roots.lock().unwrap().index_roots[0].readers =
+                NonZeroUsize::new(usize::MAX).unwrap();
+            let error = registry.retain_index_file(index_handle(1)).err().unwrap();
+            assert_eq!(error.message.as_str(), IndexFileRoot::REFERENCE_ERROR);
+            {
+                let mut state = registry.roots.lock().unwrap();
+                assert!(state.index_roots.members.iter().all(|word| *word == 0));
+                assert!(!state.statement_mut(owner.identity).has_roots);
+                state.index_roots[0].readers = NonZeroUsize::new(1).unwrap();
+            }
+            assert_eq!(
+                registry.copy_index_roots(&mut short).unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            drop(file);
+            assert!(!registry.take_reclamation_pending());
+            drop(registry.retain_index_file(index_handle(2)).unwrap());
+            drop(registry.retain_index_file(index_handle(3)).unwrap());
+            assert!(registry.retain_index_file(index_handle(4)).is_err());
+            registry.copy_index_roots(&mut roots).unwrap();
+            assert_eq!(roots, [index_handle(2).roster, index_handle(3).roster]);
+            drop(scope);
+            drop(owner);
+            assert!(registry.take_reclamation_pending());
+            assert!(registry.roots.lock().unwrap().index_roots.is_empty());
+        });
+    }
+
+    struct IndexFixture {
+        storage: Storage,
+        table: usize,
+        handle: ValueIndexHandle,
+        blocks: Arc<Mutex<TieredStore<OwnedObjectStore>>>,
+        config: Config,
+    }
+
+    fn index_fixture(label: &str, navigation: bool) -> IndexFixture {
+        let mut config = test_config();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket = format!("{label}-{}", std::process::id());
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        let mut budget = Budget::new(
+            config.memtable_bytes
+                + Storage::extra_budget_bytes(&config)
+                + OwnedObjectStore::budget_bytes(&config)
+                + SpillReader::budget_bytes(true, 3)
+                + (1 << 20),
+        );
+        let base = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        let mut store = crate::store::build_tiers(
+            &mut budget,
+            base,
+            crate::store::StackPlan::resolve(0, 0),
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let mut writer = crate::store::ValueIndexWriter::new();
+        if navigation {
+            writer.reset_navigation(0, crate::store::NavigationKind::Spatial, true);
+        }
+        for rowid in 1..=3 {
+            if navigation {
+                writer
+                    .append_navigation(
+                        &mut store,
+                        (11, rowid, 7),
+                        b"key",
+                        Some(b"old value"),
+                        crate::store::SpatialBounds::new(0.0, 0.0, 1.0, 1.0),
+                        &mut |left, right| left.cmp(right),
+                    )
+                    .unwrap();
+            } else {
+                writer
+                    .append_covering(
+                        &mut store,
+                        (11, rowid, 7),
+                        b"key",
+                        b"old value",
+                        &mut |left, right| left.cmp(right),
+                    )
+                    .unwrap();
+            }
+        }
+        let handle = writer.finish(&mut store, 7).unwrap().unwrap();
+        let blocks = Arc::new(Mutex::new(store));
+        let reader = SpillReader::new(&mut budget, 3, Some(Arc::clone(&blocks)), None).unwrap();
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage.attach_spill(reader);
+        let mut definition = make_def(label, &[("id", ColType::Int4, false)]);
+        definition.columns[0].unique = true;
+        let table = storage.create_table(definition).unwrap();
+        {
+            let mut publication = storage.tables[table].publication();
+            let enforcer = publication.enforcers[0].as_mut().unwrap();
+            enforcer.durable = Some(handle);
+            enforcer.cache.write().mark_incomplete();
+        }
+        IndexFixture {
+            storage,
+            table,
+            handle,
+            blocks,
+            config,
+        }
+    }
+
+    impl Drop for IndexFixture {
+        fn drop(&mut self) {
+            crate::object_store::sim::drop_namespace(&self.config.object_store_bucket);
+        }
+    }
+
+    #[test]
+    fn index_file_owners_reader_callbacks_release_store_and_allow_nested_probes() {
+        let fixture = index_fixture("index-owner-nested", false);
+        let IndexFixture {
+            storage,
+            table,
+            blocks,
+            handle,
+            ..
+        } = &fixture;
+        crate::mem::guard::forbid_alloc(|| {
+            let check_nested = || -> Result<(), SqlError> {
+                assert!(
+                    blocks.try_lock().is_ok(),
+                    "callbacks must not hold the block store"
+                );
+                assert!(storage.tables[*table].publication.try_lock().is_ok());
+                let mut nested = 0;
+                assert!(storage.probe_value_binding(*table, 0, 11, |_, key| {
+                    assert_eq!(key, Some(b"key".as_slice()));
+                    nested += 1;
+                    Ok(())
+                })?);
+                assert_eq!(nested, 3);
+                Ok(())
+            };
+            let mut visited = 0;
+            assert!(
+                storage
+                    .probe_value_binding(*table, 0, 11, |_, _| {
+                        check_nested()?;
+                        visited += 1;
+                        Ok(())
+                    })
+                    .unwrap()
+            );
+            assert_eq!(visited, 3);
+            assert!(
+                storage
+                    .walk_value_index(*table, &[0], |_, _| check_nested())
+                    .unwrap()
+            );
+            assert!(
+                storage
+                    .range_value_index_binding(
+                        *table,
+                        0,
+                        |_| {
+                            check_nested()?;
+                            Ok(crate::store::ValueIndexPosition::Match)
+                        },
+                        |_, _, _, payload| {
+                            assert_eq!(payload, b"old value");
+                            check_nested()
+                        }
+                    )
+                    .unwrap()
+            );
+            let input = storage
+                .select_value_index(*table, super::super::ValueIndexSelection::Binding(0))
+                .unwrap()
+                .unwrap();
+            assert_eq!(input.handle(), *handle);
+            drop(input);
+            assert!(
+                storage
+                    .spill_roots
+                    .roots
+                    .lock()
+                    .unwrap()
+                    .index_roots
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn index_file_owners_ranked_leaves_survive_binding_replacement_and_wait() {
+        let fixture = index_fixture("index-owner-ranked", true);
+        let IndexFixture {
+            storage,
+            table,
+            blocks,
+            handle,
+            ..
+        } = &fixture;
+        let mut roots = Vec::with_capacity(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let owner = storage.retain_statement_snapshot(71, |_| 7).unwrap();
+            let scope = owner.enter_files(storage).unwrap();
+            let mut candidate = None;
+            assert!(
+                storage
+                    .rank_value_index_binding(
+                        *table,
+                        0,
+                        |_, _| {
+                            assert!(blocks.try_lock().is_ok());
+                            true
+                        },
+                        |_, _| {
+                            assert!(blocks.try_lock().is_ok());
+                            0.0
+                        },
+                        |source, rowid, lsn, _, _| {
+                            assert!(blocks.try_lock().is_ok());
+                            candidate = Some((source, rowid, lsn));
+                            Ok(())
+                        }
+                    )
+                    .unwrap()
+            );
+            drop(scope);
+            storage.tables[*table].publication().enforcers[0]
+                .as_mut()
+                .unwrap()
+                .durable = None;
+            storage.spill_roots.copy_index_roots(&mut roots).unwrap();
+            assert_eq!(roots, [handle.roster]);
+            let scope = owner.enter_files(storage).unwrap();
+            let (source, rowid, lsn) = candidate.unwrap();
+            let mut visited = false;
+            assert!(
+                storage
+                    .read_ranked_value_binding_entry(
+                        *table,
+                        0,
+                        source,
+                        rowid,
+                        lsn,
+                        |key, payload| {
+                            assert!(blocks.try_lock().is_ok());
+                            assert_eq!(key, b"key");
+                            assert_eq!(payload, b"old value");
+                            visited = true;
+                        }
+                    )
+                    .unwrap()
+            );
+            assert!(visited);
+            drop(scope);
+            drop(owner);
+            assert!(storage.spill_roots.take_reclamation_pending());
+            assert!(
+                storage
+                    .spill_roots
+                    .roots
+                    .lock()
+                    .unwrap()
+                    .index_roots
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn index_file_owners_reject_future_generation_and_release_callback_errors() {
+        let fixture = index_fixture("index-owner-errors", false);
+        let IndexFixture {
+            storage,
+            table,
+            handle,
+            ..
+        } = &fixture;
+        let mut roots = Vec::with_capacity(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let owner = storage.retain_statement_snapshot(71, |_| 6).unwrap();
+            storage.set_commit_snapshot(6);
+            let scope = owner.enter_files(storage).unwrap();
+            assert!(
+                storage
+                    .select_value_index(*table, super::super::ValueIndexSelection::Binding(0))
+                    .unwrap()
+                    .is_none()
+            );
+            drop(scope);
+            drop(owner);
+            let owner = storage.retain_statement_snapshot(71, |_| 7).unwrap();
+            storage.set_commit_snapshot(7);
+            let scope = owner.enter_files(storage).unwrap();
+            let error = storage
+                .walk_value_index(*table, &[0], |_, _| {
+                    Err(sql_err!(sqlstate::INTERNAL_IO_WAIT, "test suspended index"))
+                })
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_IO_WAIT);
+            drop(scope);
+            storage.spill_roots.copy_index_roots(&mut roots).unwrap();
+            assert_eq!(roots, [handle.roster]);
+            drop(owner);
+            assert!(storage.spill_roots.take_reclamation_pending());
+            assert!(
+                storage
+                    .spill_roots
+                    .roots
+                    .lock()
+                    .unwrap()
+                    .index_roots
+                    .is_empty()
+            );
+        });
     }
 
     #[test]

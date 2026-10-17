@@ -127,8 +127,10 @@ replacing a suspended reader's socket, bytes or error. A write that needs an
 uncached block still waits synchronously and can download the same block again.
 A paused report keeps the same data view, start time and timeout until it
 finishes; resuming does not start a fresh statement.
-Its selected saved row files stay protected after a scan, nested call or
-statement arena is released; their owners follow the statement through waits.
+Its selected saved row and index files stay protected after a scan, nested call
+or statement arena is released; their owners follow the statement through waits.
+An index's saved files are protected before its published reference can change.
+Index callbacks release the block-store lock before calling nested reads.
 Index and selected-column read buffers retain completed data across waits;
 their verified identities do not depend on shared-cache residency.
 Checkpoint publication and object merges still wait for downloads to finish.
@@ -143,7 +145,8 @@ journal batches remain available until their publication retry completes.
 - Coordinate requests for the same missing block, allow bounded parallel reads
   and prefetch, and release requests correctly on cancellation.
 - Build checkpoint and merge output separately, then publish the new object
-  references in a short, consistent update.
+  references in a short, consistent update. Keep the existing pending-download
+  gate until publication and deletion use the retained row and index owners.
 - Share limited resources fairly among reads, durable commits, and maintenance.
   Delete old objects only after readers and backups release them.
 

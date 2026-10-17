@@ -31,6 +31,8 @@ jobs:
         run: cargo miri test --lib --locked sliced_heap_cleanup_heap_ -- --test-threads=1
       - name: Statement file ownership
         run: cargo miri test --lib --locked statement_files_miri_ -- --test-threads=1
+      - name: Index file ownership
+        run: cargo miri test --lib --locked index_file_owners_miri_ -- --test-threads=1
       - name: Enum member image ownership
         run: cargo miri test --lib --locked enum_image_ownership_pool_ -- --test-threads=1
       - name: Ordered row source pointer provenance

@@ -4,7 +4,7 @@ use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use super::RowLoc;
 use crate::mem::budget::{Budget, BudgetError};
@@ -13,7 +13,7 @@ use crate::sql_err;
 
 pub(crate) struct RowHeap {
     buffers: [Arc<RwLock<RowHeapState>>; 2],
-    publication: RwLock<HeapPublication>,
+    publication: Arc<RwLock<HeapPublication>>,
 }
 
 struct HeapPublication {
@@ -107,7 +107,10 @@ impl RowHeap {
     }
 
     pub(super) const fn control_bytes() -> usize {
-        size_of::<Self>() + 2 * (size_of::<RwLock<RowHeapState>>() + 2 * size_of::<usize>())
+        size_of::<Self>()
+            + 2 * (size_of::<RwLock<RowHeapState>>() + 2 * size_of::<usize>())
+            + size_of::<RwLock<HeapPublication>>()
+            + 2 * size_of::<usize>()
     }
 
     #[cfg(test)]
@@ -147,15 +150,15 @@ impl RowHeap {
         };
         Ok(Self {
             buffers: [allocation(), allocation()],
-            publication: RwLock::new(HeapPublication {
+            publication: Arc::new(RwLock::new(HeapPublication {
                 second_active: false,
                 relocation_frontier: None,
-            }),
+            })),
         })
     }
 
     /// The caller owns row versions while selecting the capture frontier.
-    pub(super) fn begin_copy(&self) -> Result<HeapCopy<'_>, SqlError> {
+    pub(super) fn begin_copy(&self) -> Result<HeapCopy, SqlError> {
         let mut publication = self
             .publication
             .write()
@@ -178,7 +181,6 @@ impl RowHeap {
                 "row heap relocation buffers are retained by readers"
             ));
         }
-        let target = target.write().expect("row heap lock poisoned");
         let source = HeapRowRead {
             state: Arc::clone(source),
             location: RowLoc {
@@ -189,9 +191,9 @@ impl RowHeap {
         };
         publication.relocation_frontier = Some(frontier);
         Ok(HeapCopy {
-            heap: self,
+            publication: Arc::clone(&self.publication),
             source,
-            target: Some(target),
+            target: Some(Arc::clone(target)),
             frontier,
             generation,
             target_second,
@@ -205,9 +207,9 @@ impl RowHeap {
         &mut self,
         move_rows: impl FnOnce(&mut HeapRelocation<'_>) -> Result<RelocationCompleted, SqlError>,
     ) -> Result<(), SqlError> {
-        let publication = self
+        let mut publication = self
             .publication
-            .get_mut()
+            .write()
             .expect("heap publication lock poisoned");
         if publication.relocation_frontier.is_some() {
             return Err(sql_err!(
@@ -410,7 +412,7 @@ impl RowHeap {
     pub(super) fn exclusive(&mut self) -> Result<&mut RowHeapState, SqlError> {
         let active = usize::from(
             self.publication
-                .get_mut()
+                .read()
                 .expect("heap publication lock poisoned")
                 .second_active,
         );
@@ -467,17 +469,21 @@ impl RowHeap {
 }
 
 /// Only the inactive, unretained buffer is mutable during a private copy.
-pub(super) struct HeapCopy<'heap> {
-    heap: &'heap RowHeap,
+pub(super) struct HeapCopy {
+    publication: Arc<RwLock<HeapPublication>>,
     source: HeapRowRead,
-    target: Option<RwLockWriteGuard<'heap, RowHeapState>>,
+    target: Option<Arc<RwLock<RowHeapState>>>,
     frontier: usize,
     generation: u64,
     target_second: bool,
     completed: bool,
 }
 
-impl HeapCopy<'_> {
+impl HeapCopy {
+    pub(super) fn belongs_to(&self, heap: &RowHeap) -> bool {
+        Arc::ptr_eq(&self.publication, &heap.publication)
+    }
+
     pub(super) fn frontier(&self) -> usize {
         self.frontier
     }
@@ -529,10 +535,12 @@ impl HeapCopy<'_> {
                     "heap relocation source range exceeds its row"
                 )
             })?;
-        let target = self
+        let mut target = self
             .target
-            .as_mut()
-            .expect("private heap copy has a target");
+            .as_ref()
+            .expect("private heap copy has a target")
+            .write()
+            .expect("row heap lock poisoned");
         let end = destination.checked_add(len).ok_or_else(|| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -562,7 +570,6 @@ impl HeapCopy<'_> {
         remap: impl FnOnce(u64) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let mut publication = self
-            .heap
             .publication
             .write()
             .expect("heap publication lock poisoned");
@@ -585,10 +592,12 @@ impl HeapCopy<'_> {
                 "heap relocation exceeds its startup buffer"
             )
         })?;
-        let target = self
+        let mut target = self
             .target
-            .as_mut()
-            .expect("private heap copy has a target");
+            .as_ref()
+            .expect("private heap copy has a target")
+            .write()
+            .expect("row heap lock poisoned");
         if used > target.capacity {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -601,17 +610,17 @@ impl HeapCopy<'_> {
         publication.second_active = self.target_second;
         publication.relocation_frontier = None;
         self.completed = true;
-        // New captures must not wait on a target guard retained by a finished job.
+        // Release the target owner before allowing another capture.
+        drop(target);
         drop(self.target.take());
         Ok(true)
     }
 }
 
-impl Drop for HeapCopy<'_> {
+impl Drop for HeapCopy {
     fn drop(&mut self) {
         if !self.completed {
             let mut publication = self
-                .heap
                 .publication
                 .write()
                 .expect("heap publication lock poisoned");
@@ -800,6 +809,57 @@ mod tests {
         let heap = RowHeap::new(&mut budget, bytes).unwrap();
         assert_eq!(budget.remaining(), 0);
         heap
+    }
+
+    #[test]
+    fn sliced_heap_cleanup_heap_copy_owns_controls_after_heap_destruction() {
+        let heap = heap(32);
+        let retained = heap.append_image(b"keep").unwrap();
+        let mut copy = crate::mem::guard::forbid_alloc(|| heap.begin_copy()).unwrap();
+        drop(heap);
+        crate::mem::guard::forbid_alloc(|| {
+            copy.copy_bytes(retained.location(), 0, 0, 2).unwrap();
+            copy.copy_bytes(retained.location(), 2, 2, 2).unwrap();
+            assert!(copy.try_publish(4, 0, |_| Ok(())).unwrap());
+            drop(copy);
+            assert_eq!(&*retained, b"keep");
+        });
+    }
+
+    #[test]
+    fn sliced_heap_cleanup_heap_cancel_allows_exclusive_reuse_and_retry() {
+        let mut heap = heap(32);
+        crate::mem::guard::forbid_alloc(|| {
+            let location = heap.append_bytes(b"keep").unwrap();
+            let mut copy = heap.begin_copy().unwrap();
+            copy.copy_bytes(location, 0, 0, 1).unwrap();
+            let error = heap.with_relocation(|_| unreachable!()).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            drop(copy);
+            heap.with_relocation(|relocation| {
+                let generation = relocation.next_relocation_generation()?;
+                relocation.relocate(location, 0);
+                Ok(relocation.finish(4, generation))
+            })
+            .unwrap();
+            let current = RowLoc {
+                generation: location.generation + 1,
+                ..location
+            };
+            assert_eq!(&*heap.get(current).unwrap(), b"keep");
+            let mut copy = heap.begin_copy().unwrap();
+            copy.copy_bytes(current, 0, 0, 4).unwrap();
+            assert!(copy.try_publish(4, 0, |_| Ok(())).unwrap());
+            assert_eq!(
+                &*heap
+                    .get(RowLoc {
+                        generation: current.generation + 1,
+                        ..current
+                    })
+                    .unwrap(),
+                b"keep"
+            );
+        });
     }
 
     #[test]

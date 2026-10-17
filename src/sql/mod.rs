@@ -394,6 +394,21 @@ pub(crate) enum ProtocolReset {
     All,
 }
 
+#[derive(Clone, Copy)]
+struct PostPublishCleanup {
+    lsn: u64,
+    phase: PostPublishPhase,
+}
+
+#[derive(Clone, Copy)]
+enum PostPublishPhase {
+    Prepare,
+    Compact,
+    Evict,
+    CompactAfterEviction,
+    Finish,
+}
+
 /// The query engine: catalog, memtable storage, WAL, object-storage
 /// checkpointing, and statement execution.
 pub struct Engine {
@@ -404,7 +419,7 @@ pub struct Engine {
     /// A published manifest whose local bookkeeping still needs to finish.
     /// Keeping this state makes publication and its cleanup one retriable
     /// completion protocol instead of reporting success after the manifest.
-    post_publish_cleanup: Option<u64>,
+    post_publish_cleanup: Option<PostPublishCleanup>,
     /// A COPY FROM STDIN the last statement started: the connection takes
     /// it, switches into copy-in mode, and feeds data lines back through
     /// [`Engine::copy_row_line`] until CopyDone.
@@ -421,7 +436,7 @@ pub struct Engine {
     dml_scratch: DmlWorkspaces,
     statistics_receipts: std::sync::Arc<crate::storage::StatisticsReceiptPool>,
     /// Scratch for heap compaction: every live row image across tables.
-    compact_scratch: FixedVec<crate::storage::HeapRelocationEntry>,
+    compact_scratch: crate::storage::HeapRelocationWorkspace,
     /// Startup-bounded slot-private execution arenas. The reactor still
     /// serializes execution, but statements no longer depend on one global
     /// workspace identity; worker parallelism can use these slots without
@@ -3346,8 +3361,10 @@ impl Engine {
                         .saturating_mul(size_of::<exec::PhysicalRow>()),
                 ),
             )
-            + crate::storage::row_heap_image_capacity(config)
-                .saturating_mul(size_of::<crate::storage::HeapRelocationEntry>())
+            + crate::storage::HeapRelocationWorkspace::budget_bytes(
+                crate::storage::row_heap_image_capacity(config),
+            )
+            + size_of::<Option<PostPublishCleanup>>()
             + config.query_workspace_slots.saturating_mul(
                 config
                     .work_arena_bytes
@@ -3623,6 +3640,10 @@ impl Engine {
                 .expect("sized to max_ddl_per_transaction");
         }
         let work = QueryWorkspaces::new(config, budget)?;
+        budget.draw(
+            size_of::<Option<PostPublishCleanup>>(),
+            "post-publication cleanup controls",
+        )?;
         Ok(Self {
             storage,
             wal,
@@ -3635,9 +3656,8 @@ impl Engine {
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
             dml_scratch: DmlWorkspaces::new(config, budget)?,
             statistics_receipts: crate::storage::StatisticsReceiptPool::new(config, budget)?,
-            compact_scratch: FixedVec::new(
+            compact_scratch: crate::storage::HeapRelocationWorkspace::new(
                 budget,
-                "compact_scratch",
                 crate::storage::row_heap_image_capacity(config),
             )?,
             work,
@@ -8240,10 +8260,8 @@ impl Engine {
         checkpointer.delete_backup(name)
     }
 
-    /// The journal and heap bookkeeping owed once a manifest has published:
-    /// everything at or below `lsn` is bucket-durable, so the local journal
-    /// restarts and the heap compacts (spilling under memory pressure).
-    fn after_publish(&mut self, lsn: u64) -> Result<(), SqlError> {
+    /// The published prefix is durable; preserve any later journal suffix.
+    fn prepare_post_publish_cleanup(&mut self, lsn: u64) {
         if !self.storage.has_active_snapshots() {
             if self.wal_upload
                 && let Some(ckpt) = self.ckpt.as_mut()
@@ -8273,61 +8291,102 @@ impl Engine {
                 self.wal.reset_after_checkpoint();
             }
         }
-        #[cfg(feature = "checkpoint-profile")]
-        let local_profile = self.ckpt.as_ref().map(Checkpointer::profile_start);
         // The checkpoint installed each table's spill-SST list as it
         // wrote (full rewrites collapse a list, deltas append).
         self.storage.release_durable_histories();
-        self.storage.compact_heap(&mut self.compact_scratch)?;
-        // Under memory pressure, committed bytes leave the heap: the map
-        // entries flip to spilled and a second compaction drops the
-        // bytes. Reads fetch them back through the cache tiers. Below the
-        // threshold nothing spills and reads stay heap-fast.
-        if self.storage.spill_attached()
-            && (self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 50
-                || self.storage.map_pressure())
-        {
-            self.storage.evict_committed();
-            self.storage.compact_heap(&mut self.compact_scratch)?;
-        }
-        // Map-occupancy pressure sheds redundant entries the same way heap
-        // pressure sheds bytes: the overlay keeps the working set, the
-        // bucket keeps the rows.
-        self.storage.evict_entries();
-        #[cfg(feature = "checkpoint-profile")]
-        if let (Some(ckpt), Some((started, before))) = (self.ckpt.as_ref(), local_profile) {
-            ckpt.profile_phase("local_cleanup", lsn, started, before);
-        }
-        Ok(())
     }
 
     fn begin_post_publish_cleanup(&mut self, lsn: u64) {
         // Cleanup may retry, but publication already marked only the table
         // generations the manifest captured as clean.
-        self.post_publish_cleanup = Some(lsn);
+        assert!(self.post_publish_cleanup.is_none());
+        assert!(!self.compact_scratch.active());
+        self.post_publish_cleanup = Some(PostPublishCleanup {
+            lsn,
+            phase: PostPublishPhase::Prepare,
+        });
     }
 
     fn finish_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
-        let lsn = self
-            .post_publish_cleanup
-            .expect("post-publication cleanup has its published LSN");
-        self.after_publish(lsn)?;
-        self.post_publish_cleanup = None;
-        Ok(())
-    }
-
-    fn retry_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
-        if self.post_publish_cleanup.is_some() {
-            self.finish_post_publish_cleanup()?;
+        while self.post_publish_cleanup.is_some() {
+            self.post_publish_cleanup_step(true)?;
         }
         Ok(())
     }
 
-    /// Whether checkpoint or compaction work is pending — an active sweep,
-    /// a paced merge (mid-flight, finished-awaiting-publish, or a list at
-    /// the trigger). The event loop keeps beating pending work between
-    /// events, so an idle server still finishes what a trigger started and
-    /// compacts what its lists owe.
+    fn post_publish_cleanup_step(&mut self, exclusive: bool) -> Result<bool, SqlError> {
+        let cleanup = self
+            .post_publish_cleanup
+            .expect("post-publication cleanup has its published LSN");
+        #[cfg(feature = "checkpoint-profile")]
+        let local_profile = self.ckpt.as_ref().map(Checkpointer::profile_start);
+        let result = self.advance_post_publish_cleanup(cleanup, exclusive);
+        #[cfg(feature = "checkpoint-profile")]
+        if let (Some(ckpt), Some((started, before))) = (self.ckpt.as_ref(), local_profile) {
+            ckpt.profile_phase("local_cleanup", cleanup.lsn, started, before);
+        }
+        result
+    }
+
+    fn advance_post_publish_cleanup(
+        &mut self,
+        cleanup: PostPublishCleanup,
+        exclusive: bool,
+    ) -> Result<bool, SqlError> {
+        let next = match cleanup.phase {
+            PostPublishPhase::Prepare => {
+                self.prepare_post_publish_cleanup(cleanup.lsn);
+                PostPublishPhase::Compact
+            }
+            PostPublishPhase::Compact | PostPublishPhase::CompactAfterEviction => {
+                let finished = self.compact_scratch.compact_step(
+                    &mut self.storage,
+                    core::num::NonZeroUsize::new(64 << 10).unwrap(),
+                    exclusive,
+                )?;
+                if !finished {
+                    return Ok(false);
+                }
+                match cleanup.phase {
+                    PostPublishPhase::Compact => PostPublishPhase::Evict,
+                    _ => PostPublishPhase::Finish,
+                }
+            }
+            PostPublishPhase::Evict => {
+                if self.storage.spill_attached()
+                    && (self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 50
+                        || self.storage.map_pressure())
+                {
+                    self.storage.evict_committed();
+                    PostPublishPhase::CompactAfterEviction
+                } else {
+                    PostPublishPhase::Finish
+                }
+            }
+            PostPublishPhase::Finish => {
+                self.storage.evict_entries();
+                self.post_publish_cleanup = None;
+                return Ok(true);
+            }
+        };
+        self.post_publish_cleanup = Some(PostPublishCleanup {
+            lsn: cleanup.lsn,
+            phase: next,
+        });
+        Ok(false)
+    }
+
+    fn retry_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
+        if self.post_publish_cleanup.is_some() {
+            if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
+                self.finish_post_publish_cleanup()?;
+            } else {
+                self.post_publish_cleanup_step(false)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The COPY FROM the last statement started, if any; the connection
     /// takes it and enters copy-in mode.
     pub fn take_pending_copy(&mut self) -> Option<exec::CopySetup> {
@@ -8643,6 +8702,8 @@ impl Engine {
         }
     }
 
+    /// The event loop keeps advancing cleanup, checkpoints, and merges between
+    /// messages and while idle until their pending work completes.
     pub fn checkpoint_work_pending(&self) -> bool {
         self.post_publish_cleanup.is_some()
             || self.ckpt.as_ref().is_some_and(|c| {
@@ -8677,8 +8738,13 @@ impl Engine {
             return false;
         }
         if self.post_publish_cleanup.is_some() {
-            return match self.finish_post_publish_cleanup() {
-                Ok(()) => true,
+            let cleanup = if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
+                self.finish_post_publish_cleanup()
+            } else {
+                self.post_publish_cleanup_step(false).map(|_| ())
+            };
+            return match cleanup {
+                Ok(_) => true,
                 Err(e) => {
                     let message = stack_format!(
                         512,
@@ -8714,7 +8780,7 @@ impl Engine {
                 self.storage.release_table_histories(slot);
             }
             self.storage.evict_committed_table(slot);
-            if let Err(error) = self.storage.compact_heap(&mut self.compact_scratch) {
+            if let Err(error) = self.compact_scratch.compact_exclusive(&mut self.storage) {
                 let message = stack_format!(
                     512,
                     "temporary spill cleanup failed ({}): {}\n",
@@ -8750,7 +8816,8 @@ impl Engine {
         ckpt.disable_async_block_reads();
         // A wide sweep can lose headroom faster than one beat reclaims it.
         // Complete publication under critical pressure before dispatch resumes.
-        let checkpoint = if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
+        let critical = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85;
+        let checkpoint = if critical {
             ckpt.checkpoint(&mut self.storage, &mut self.scratch)
                 .map(|published| {
                     published.map_or(CheckpointStep::Idle, |lsn| CheckpointStep::Published {
@@ -8764,7 +8831,12 @@ impl Engine {
         match checkpoint {
             Ok(CheckpointStep::Published { lsn }) => {
                 self.begin_post_publish_cleanup(lsn);
-                if let Err(e) = self.finish_post_publish_cleanup() {
+                let cleanup = if critical {
+                    self.finish_post_publish_cleanup()
+                } else {
+                    self.post_publish_cleanup_step(false).map(|_| ())
+                };
+                if let Err(e) = cleanup {
                     let message = stack_format!(
                         512,
                         "post-checkpoint bookkeeping failed ({}): {}\n",

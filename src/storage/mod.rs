@@ -23,7 +23,9 @@ mod partition_rows;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
 mod heap_relocation;
 mod row_heap;
+#[cfg(test)]
 pub(crate) use heap_relocation::HeapRelocationEntry;
+pub(crate) use heap_relocation::HeapRelocationWorkspace;
 mod row_identities;
 mod row_images;
 mod row_map;

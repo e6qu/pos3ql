@@ -79,8 +79,11 @@ retries. Table rewrites keep transformed images in the fixed statement arena,
 release owners after errors, and reject replaced heap buffers before publication.
 Heap relocation captures and publishes under row-version ownership while copying
 privately in bounded turns; unrelated storage reads and writes can progress
-during copying. Complete type commits and engine-wide maintenance scheduling
-still require the remaining publication coordination. The
+during copying. Automatic checkpoint cleanup resumes copying between server
+turns, allowing SQL reads and writes between those turns. Explicit CHECKPOINT
+and the existing critical memory-pressure path still wait for cleanup.
+Complete type commits and the remaining maintenance
+paths still require publication coordination. The
 [implementation guide](docs/implemented-baseline.md) owns completed contracts,
 user examples and exact capacity errors.
 
@@ -88,9 +91,10 @@ Still to do:
 
 - Finish shared-state protection for engine-wide publication and remaining
   table rewrites and maintenance paths.
-- Schedule private heap relocation alongside engine work, including fair
-  retries when both heap buffers are retained. Complete rewrites must preserve
-  historical object versions needed by active readers.
+- Move the remaining maintenance work off the statement path, including heap
+  capture, sorting, remapping, critical memory pressure, and fair retries when
+  both buffers are retained.
+  Complete rewrites must preserve historical object versions needed by readers.
 - Verify release after errors, rollback, and transaction end, and prevent
   reused identities or names in another database from being mistaken for older data.
 

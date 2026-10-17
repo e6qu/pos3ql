@@ -768,6 +768,12 @@ issue another GET even if a reader is already downloading that block. SQL
 execution remains serial, and this does not enable independent checkpoint
 publication or worker threads.
 
+Index readers keep verified metadata and entries in their existing startup
+buffers when a later row read waits for a download. Selected-column scans keep
+completed columns in the same way. Their identities follow the immutable source,
+so another attempt can reuse the bytes even after shared-cache eviction.
+Overwriting scratch or failing a replacement clears its previous identity.
+
 Deferred constraint triggers run before an implicit commit at the end of a
 simple query, extended-protocol Sync or COPY. For example, if a deferred order
 check rejects a copied row, COPY fails and its transaction rolls back; the

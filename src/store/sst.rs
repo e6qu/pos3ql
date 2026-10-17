@@ -2199,6 +2199,10 @@ impl<'a> SstReader<'a> {
         if self.loaded_ref == Some(reference) && self.loaded_format == Some(format) {
             return Ok(self.decoded_len);
         }
+        // A failed replacement may already have overwritten decoded bytes.
+        self.loaded_ref = None;
+        self.loaded_format = None;
+        self.decoded_len = 0;
         let (raw_len, block_type) =
             read_data_block_raw_ref(store, reference, self.data_scratch, self.assembly)?;
         let decoded_len = match (format, block_type) {
@@ -3136,6 +3140,43 @@ mod tests {
     fn arena() -> Arena {
         let mut budget = Budget::new(64 << 20);
         Arena::new(&mut budget, "sst test arena", 32 << 20).expect("arena fits")
+    }
+
+    #[test]
+    fn atomic_block_reads_failed_decode_releases_the_previous_buffer_identity() {
+        let (_budget, mut store) = store();
+        let arena = arena();
+        let mut reader = SstReader::new(&arena).unwrap();
+        let valid = store
+            .put(b"previous rows", BlockType::SstDataV2, 0)
+            .unwrap();
+        let invalid = store
+            .put(&[0x10, b'x', 0, 0], BlockType::SstDataV2Lz4, 0)
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let reference = DataBlockRef::Direct(valid);
+            reader
+                .load_data_block(&mut store, RowSstFormat::DirectV2, reference)
+                .unwrap();
+            assert_eq!(reader.cached_data_block(), Some((reference, 13)));
+            assert!(
+                reader
+                    .load_data_block(
+                        &mut store,
+                        RowSstFormat::DirectV2,
+                        DataBlockRef::Direct(invalid)
+                    )
+                    .is_err()
+            );
+            assert_eq!(reader.decoded_scratch[0], b'x');
+            assert!(reader.cached_data_block().is_none());
+            let reads = store.reads();
+            reader
+                .load_data_block(&mut store, RowSstFormat::DirectV2, reference)
+                .unwrap();
+            assert_eq!(store.reads(), reads + 1);
+            assert_eq!(&reader.decoded_scratch[..13], b"previous rows");
+        });
     }
 
     /// Builds an SST from `(rowid, row)` pairs, returns its root.

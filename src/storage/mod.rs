@@ -14454,17 +14454,17 @@ impl SpillReader {
         );
         reader.restore_cached_data_block(
             handle.format,
-            (*decoded_data_ref).and_then(|(cached_handle, reference, cached_len)| {
-                (cached_handle == handle).then_some((reference, cached_len))
-            }),
+            decoded_data_ref
+                .take()
+                .and_then(|(cached_handle, reference, cached_len)| {
+                    (cached_handle == handle).then_some((reference, cached_len))
+                }),
         );
-        let got = reader
-            .get_at(&mut *blocks, &handle, rowid, commit_lsn, out)
-            .map_err(spill_read_error)?;
+        let got = reader.get_at(&mut *blocks, &handle, rowid, commit_lsn, out);
         *decoded_data_ref = reader
             .cached_data_block()
             .map(|(reference, cached_len)| (handle, reference, cached_len));
-        match got {
+        match got.map_err(spill_read_error)? {
             Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {
                 Ok(&out[..len as usize])
             }
@@ -14527,17 +14527,17 @@ impl SpillReader {
             );
             reader.restore_cached_data_block(
                 handle.format,
-                (*decoded_data_ref).and_then(|(cached_handle, reference, cached_len)| {
-                    (cached_handle == handle).then_some((reference, cached_len))
-                }),
+                decoded_data_ref
+                    .take()
+                    .and_then(|(cached_handle, reference, cached_len)| {
+                        (cached_handle == handle).then_some((reference, cached_len))
+                    }),
             );
-            let got = reader
-                .get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf)
-                .map_err(spill_read_error)?;
+            let got = reader.get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf);
             *decoded_data_ref = reader
                 .cached_data_block()
                 .map(|(reference, cached_len)| (handle, reference, cached_len));
-            got
+            got.map_err(spill_read_error)?
         };
         match got {
             Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {

@@ -1274,6 +1274,111 @@ mod tests {
     use crate::store::memory::MemoryBlockStore;
 
     #[test]
+    fn atomic_block_reads_index_buffers_survive_repeated_download_waits() {
+        struct WaitingStore {
+            inner: MemoryBlockStore,
+            pending: Option<BlockId>,
+            requests: usize,
+        }
+        impl BlockStore for WaitingStore {
+            fn put(
+                &mut self,
+                bytes: &[u8],
+                kind: BlockType,
+                lsn: u64,
+            ) -> Result<BlockId, StoreError> {
+                self.inner.put(bytes, kind, lsn)
+            }
+            fn get(
+                &mut self,
+                id: &BlockId,
+                into: &mut [u8],
+            ) -> Result<(usize, BlockType), StoreError> {
+                self.requests += 1;
+                if self.pending == Some(*id) {
+                    self.pending = None;
+                    self.inner.get(id, into)
+                } else {
+                    self.pending = Some(*id);
+                    into[0] = 0xee;
+                    Err(StoreError::NotReady)
+                }
+            }
+        }
+        let mut budget = Budget::new(8 << 20);
+        let mut inner = MemoryBlockStore::new(&mut budget, "waiting index", 4 << 20, 32).unwrap();
+        let mut writer = ValueIndexWriter::new();
+        writer
+            .append(&mut inner, 7, 11, 3, b"order", &mut |a, b| a.cmp(b))
+            .unwrap();
+        let handle = writer.finish(&mut inner, 10).unwrap().unwrap();
+        let mut store = WaitingStore {
+            inner,
+            pending: None,
+            requests: 0,
+        };
+        let mut roster = RetainedBlockBuffer::new();
+        let mut data = RetainedBlockBuffer::new();
+        crate::mem::guard::forbid_alloc(|| {
+            for attempt in 0..3 {
+                let mut found = 0;
+                let result = ValueIndexReader::over_retained(&mut roster, &mut data).walk(
+                    &mut store,
+                    &handle,
+                    |hash, rowid, lsn, key| {
+                        assert_eq!((hash, rowid, lsn, key), (7, 11, 3, b"order".as_slice()));
+                        found += 1;
+                    },
+                );
+                if attempt < 2 {
+                    assert!(matches!(
+                        result,
+                        Err(ValueIndexError::Store(StoreError::NotReady))
+                    ));
+                    assert_eq!(found, 0);
+                } else {
+                    result.unwrap();
+                    assert_eq!(found, 1);
+                }
+            }
+            assert_eq!(store.requests, 4);
+            // Another SQL attempt needs no cache residency or new request.
+            ValueIndexReader::over_retained(&mut roster, &mut data)
+                .walk(&mut store, &handle, |_, _, _, _| {})
+                .unwrap();
+            assert_eq!(store.requests, 4);
+        });
+    }
+
+    #[test]
+    fn atomic_block_reads_retained_buffer_invalidates_before_overwrites_and_errors() {
+        let mut budget = Budget::new(8 << 20);
+        let mut store = MemoryBlockStore::new(&mut budget, "retained buffer", 4 << 20, 32).unwrap();
+        let id = store
+            .put(b"verified", BlockType::ValueIndexData, 0)
+            .unwrap();
+        let mut buffer = RetainedBlockBuffer::new();
+        crate::mem::guard::forbid_alloc(|| {
+            buffer.load(&mut store, &id).unwrap();
+            let first_reads = store.reads();
+            buffer.load(&mut store, &id).unwrap();
+            assert_eq!(store.reads(), first_reads);
+            buffer[0] = b'x';
+            buffer.load(&mut store, &id).unwrap();
+            assert_eq!(&buffer[..8], b"verified");
+            assert_eq!(store.reads(), first_reads + 1);
+            assert!(matches!(
+                buffer.load(&mut store, &BlockId([0xff; 32])),
+                Err(StoreError::NotFound)
+            ));
+            assert!(buffer.loaded.is_none());
+            buffer.load(&mut store, &id).unwrap();
+            assert_eq!(&buffer[..8], b"verified");
+            assert_eq!(store.reads(), first_reads + 2);
+        });
+    }
+
+    #[test]
     fn spatial_covering_generations_prune_data_preserve_payloads_and_walk_every_gc_node() {
         let mut budget = Budget::new(16 << 20);
         let mut store =

@@ -700,7 +700,7 @@ mod tests {
             let selected = storage.enum_for(cloned, 77);
             assert_ne!(cloned, source);
             assert_eq!(selected.database, oid);
-            storage.retire_database(oid, true);
+            storage.retire_database(database, true);
             storage.select_database(DatabaseOid::POSTGRES).unwrap();
             assert_eq!(source_view.sort_of("new"), Some(1.0));
             assert_eq!(selected.sort_of("new"), Some(1.0));

@@ -2171,7 +2171,7 @@ mod tests {
     #[test]
     fn statement_files_keep_real_scan_roots_after_walks_and_arena_are_released() {
         let PointFixture {
-            storage,
+            mut storage,
             table,
             roots,
             mut arena,
@@ -2251,7 +2251,7 @@ mod tests {
     #[test]
     fn statement_files_exhaustion_precedes_snapshot_selection_and_registration() {
         let config = test_config();
-        let storage = Storage::new(&config, &mut test_budget()).unwrap();
+        let storage = Storage::new(&config, &mut test_budget(&config)).unwrap();
         let capacity = storage.spill_roots.roots.lock().unwrap().statements.len();
         let mut owners = Vec::with_capacity(capacity);
         crate::mem::guard::forbid_alloc(|| {

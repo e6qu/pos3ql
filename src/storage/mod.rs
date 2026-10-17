@@ -29876,22 +29876,6 @@ impl Storage {
         }
     }
 
-    /// The newest object-resident version admitted by `snapshot`. Every SST
-    /// is consulted because a newer run may contain only too-new versions;
-    /// a tombstone remains a first-class verdict.
-    fn spill_probe_at(
-        &self,
-        slot: usize,
-        rowid: u64,
-        snapshot: u64,
-    ) -> Result<Option<SpillVersion>, SqlError> {
-        if self.tables[slot].spill_generations().is_empty() {
-            return Ok(None);
-        }
-        let roots = self.query_roots.retain_point(self, slot, snapshot)?;
-        roots.with_snapshot(|source| Self::probe_spill_snapshot(source, rowid, snapshot))
-    }
-
     fn probe_spill_snapshot(
         source: &SpillGenerationSnapshot,
         rowid: u64,
@@ -29954,6 +29938,8 @@ impl Storage {
         Ok(best)
     }
 
+    /// The newest admitted object version, including deletions, retains the
+    /// captured object roots until its metadata and byte users release them.
     fn spill_row_state_at(
         &self,
         table: usize,

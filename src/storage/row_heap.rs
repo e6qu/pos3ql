@@ -177,29 +177,51 @@ impl RowHeap {
     }
 
     pub(crate) fn append_bytes(&self, bytes: &[u8]) -> Result<RowLoc, SqlError> {
-        self.append_with(bytes.len(), |out| {
+        self.append_image(bytes).map(|image| image.location())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_row(
+        &self,
+        values: &[crate::sql::types::Datum<'_>],
+    ) -> Result<RowLoc, SqlError> {
+        self.append_row_image(values).map(|image| image.location())
+    }
+
+    pub(crate) fn append_image(&self, bytes: &[u8]) -> Result<HeapRowRead, SqlError> {
+        self.append_image_with(bytes.len(), |out| {
             out.copy_from_slice(bytes);
             Ok(())
         })
     }
 
-    pub(crate) fn append_row(
+    pub(crate) fn append_row_image(
         &self,
         values: &[crate::sql::types::Datum<'_>],
-    ) -> Result<RowLoc, SqlError> {
-        self.append_with(super::rowenc::encoded_len(values), |out| {
+    ) -> Result<HeapRowRead, SqlError> {
+        self.append_image_with(super::rowenc::encoded_len(values), |out| {
             super::rowenc::encode(values, out);
             Ok(())
         })
     }
 
-    /// Initialization cannot retain the writable range or publish its location.
-    /// Release byte ownership before taking row-version or catalog write owners.
+    #[cfg(test)]
     fn append_with(
         &self,
         len: usize,
         initialize: impl FnOnce(&mut [u8]) -> Result<(), SqlError>,
     ) -> Result<RowLoc, SqlError> {
+        self.append_image_with(len, initialize)
+            .map(|image| image.location())
+    }
+
+    /// Initialization cannot retain the writable range or publish its location.
+    /// Release initialization locks before row-version or catalog write ownership.
+    fn append_image_with(
+        &self,
+        len: usize,
+        initialize: impl FnOnce(&mut [u8]) -> Result<(), SqlError>,
+    ) -> Result<HeapRowRead, SqlError> {
         let state = self.state.read().expect("row heap lock poisoned");
         let _append = state.append.lock().expect("row heap append lock poisoned");
         let start = state.used.load(Ordering::Acquire);
@@ -218,7 +240,11 @@ impl RowHeap {
         };
         initialize(out)?;
         state.used.store(start + len, Ordering::Release);
-        Ok(location)
+        // Retain the initialized allocation before releasing append ownership.
+        Ok(HeapRowRead {
+            state: Arc::clone(&self.state),
+            location,
+        })
     }
 
     pub(crate) fn get(&self, location: RowLoc) -> Result<HeapRowRead, SqlError> {
@@ -241,8 +267,7 @@ impl RowHeap {
         if self.is_current_allocation(image) {
             return Ok(image.clone());
         }
-        let location = self.append_bytes(image)?;
-        self.get(location)
+        self.append_image(image)
     }
 
     pub(crate) fn used(&self) -> usize {
@@ -461,6 +486,36 @@ mod tests {
         let heap = RowHeap::new(&mut budget, bytes).unwrap();
         assert_eq!(budget.remaining(), 0);
         heap
+    }
+
+    #[test]
+    fn owned_write_inputs_failed_append_preserves_frontier_and_releases_owners() {
+        let mut heap = heap(16);
+        crate::mem::guard::forbid_alloc(|| {
+            let image = heap.append_image(b"keep").unwrap();
+            let error = heap
+                .append_image_with(4, |out| {
+                    out.copy_from_slice(b"lost");
+                    Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "encoding failed"
+                    ))
+                })
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(heap.used(), 4);
+            let error = heap
+                .append_image(b"too many bytes for this heap")
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(heap.used(), 4);
+            assert_eq!(&*image, b"keep");
+            drop(image);
+            // No owner from either failure may prevent exclusive reclamation.
+            assert!(heap.exclusive().is_ok());
+        });
     }
 
     #[test]

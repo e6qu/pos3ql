@@ -496,13 +496,6 @@ impl OrderedRowSnapshot<'_, '_> {
     }
 }
 
-/// Deferred executor reads distinguish an MVCC snapshot from staged write bytes.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum RowReadSource {
-    Snapshot(RowSnapshot),
-    StagedHeap(RowLoc),
-}
-
 pub(crate) struct VisibleRowHome {
     snapshot: RowSnapshot,
     table_slot: usize,
@@ -613,17 +606,6 @@ impl From<VisibleRowHome> for RowByteRead {
 impl From<RowSnapshot> for RowByteRead {
     fn from(snapshot: RowSnapshot) -> Self {
         Self(RowByteSource::Snapshot(snapshot))
-    }
-}
-
-impl From<RowReadSource> for RowByteRead {
-    fn from(source: RowReadSource) -> Self {
-        match source {
-            RowReadSource::Snapshot(snapshot) => Self(RowByteSource::Snapshot(snapshot)),
-            RowReadSource::StagedHeap(location) => {
-                Self(RowByteSource::Physical(RowHome::Heap(location)))
-            }
-        }
     }
 }
 

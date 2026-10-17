@@ -19239,14 +19239,14 @@ fn replay_transaction_batches(
                             else {
                                 continue;
                             };
-                            let location = storage.heap.append_bytes(row)?;
+                            let image = storage.heap.append_image(row)?;
                             storage.observe_rowid(rowid);
-                            let prior = storage.write_pending_untracked(
+                            let prior = storage.write_pending_image_untracked(
                                 table_slot,
                                 rowid,
                                 transaction_id,
                                 command_id,
-                                Some(location),
+                                Some(image),
                             )?;
                             prepared.slot_mut(slot).transaction.touch(
                                 table_slot as u32,
@@ -19266,7 +19266,7 @@ fn replay_transaction_batches(
                             else {
                                 continue;
                             };
-                            let prior = storage.write_pending_untracked(
+                            let prior = storage.write_pending_image_untracked(
                                 table_slot,
                                 rowid,
                                 transaction_id,

@@ -47,7 +47,7 @@ pub(crate) use snapshot_leases::{SnapshotIdentifier, StatementSnapshotLease};
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::RowHeap;
 pub(crate) use row_images::{
-    OrderedRowSnapshot, RowByteRead, RowReadSource, RowSnapshot, TableRowSnapshot, VisibleRowHome,
+    OrderedRowSnapshot, RowByteRead, RowSnapshot, TableRowSnapshot, VisibleRowHome,
 };
 use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::RowMap;

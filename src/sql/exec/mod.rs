@@ -47,7 +47,7 @@ pub(crate) enum PhysicalRow {
     Local {
         table_index: usize,
         rowid: u64,
-        home: crate::storage::RowReadSource,
+        home: crate::storage::RowSnapshot,
     },
     Foreign {
         table_index: usize,
@@ -60,19 +60,11 @@ impl PhysicalRow {
         Self::Local {
             table_index,
             rowid,
-            home: crate::storage::RowReadSource::Snapshot(snapshot),
+            home: snapshot,
         }
     }
 
-    fn staged(table_index: usize, rowid: u64, location: crate::storage::RowLoc) -> Self {
-        Self::Local {
-            table_index,
-            rowid,
-            home: crate::storage::RowReadSource::StagedHeap(location),
-        }
-    }
-
-    fn local_parts(self) -> (usize, u64, crate::storage::RowReadSource) {
+    fn local_parts(self) -> (usize, u64, crate::storage::RowSnapshot) {
         match self {
             Self::Local {
                 table_index,
@@ -318,12 +310,7 @@ fn dml_row_available(
     else {
         return Ok(true);
     };
-    let crate::storage::RowReadSource::Snapshot(original) = home else {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "selected DML row is a staging record"
-        ));
-    };
+    let original = home;
     Ok(
         match storage.row_self_change(table_index, rowid, original, txn.txid, txn.command_id())? {
             crate::storage::RowSelfChange::Original => true,
@@ -5478,13 +5465,13 @@ where
         )
     })?;
     rowenc::encode(&new_values[..def.n_columns], new_bytes);
-    let new_loc = storage.heap.append_bytes(new_bytes)?;
-    let prior = storage.write_pending(
+    let new_image = storage.heap.append_image(new_bytes)?;
+    let prior = storage.write_pending_image(
         table_index,
         rowid,
         txn.txid,
         txn.command_id(),
-        Some(new_loc),
+        Some(new_image),
     )?;
     if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
         storage.restore_pending(table_index, rowid, txn.txid, prior);
@@ -39450,7 +39437,8 @@ pub fn refresh_materialized_view(
             break;
         }
         for &rowid in &rowids[..count] {
-            match storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), None) {
+            match storage.write_pending_image(table_index, rowid, txn.txid, txn.command_id(), None)
+            {
                 Ok(prior) => {
                     if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
                         storage.restore_pending(table_index, rowid, txn.txid, prior);
@@ -53519,7 +53507,8 @@ fn apply_replication_delete_row(
             MAX_FK_CASCADE_DEPTH,
         )?;
     }
-    let prior = storage.write_pending(row_table, row.rowid(), txn.txid, txn.command_id(), None)?;
+    let prior =
+        storage.write_pending_image(row_table, row.rowid(), txn.txid, txn.command_id(), None)?;
     if let Err(error) = txn.touch(row_table as u32, row.rowid(), prior) {
         storage.restore_pending(row_table, row.rowid(), txn.txid, prior);
         return Err(error);
@@ -53830,7 +53819,7 @@ pub fn apply_replication_truncate(
                 break;
             }
             for &rowid in &rowids[..count] {
-                let prior = storage.write_pending_untracked(
+                let prior = storage.write_pending_image_untracked(
                     table,
                     rowid,
                     txn.txid,
@@ -57305,7 +57294,7 @@ pub(crate) fn merge<'a>(
                             ) {
                                 return sql_fail(error);
                             }
-                            match storage.write_pending(
+                            match storage.write_pending_image(
                                 target_tables[j],
                                 target_ids[j],
                                 txn.txid,
@@ -57702,17 +57691,17 @@ pub(crate) fn merge<'a>(
                                 Err(_) => return sql_fail(arena_full()),
                             };
                             rowenc::encode(&persisted[..new_definition.n_columns], out);
-                            let loc = match storage.heap.append_bytes(out) {
+                            let image = match storage.heap.append_image(out) {
                                 Ok(x) => x,
                                 Err(e) => return sql_fail(e),
                             };
                             if updated_table == target_tables[j] {
-                                match storage.write_pending(
+                                match storage.write_pending_image(
                                     updated_table,
                                     target_ids[j],
                                     txn.txid,
                                     txn.command_id(),
-                                    Some(loc),
+                                    Some(image),
                                 ) {
                                     Ok(prior) => {
                                         if let Err(e) =
@@ -57731,12 +57720,12 @@ pub(crate) fn merge<'a>(
                                 }
                             } else {
                                 let inserted_rowid = stored_rowid;
-                                let prior = match storage.write_pending(
+                                let prior = match storage.write_pending_image(
                                     updated_table,
                                     inserted_rowid,
                                     txn.txid,
                                     txn.command_id(),
-                                    Some(loc),
+                                    Some(image),
                                 ) {
                                     Ok(prior) => prior,
                                     Err(error) => return sql_fail(error),
@@ -61694,13 +61683,18 @@ pub(crate) fn update<'a>(
                 Err(error) => return sql_fail(error),
             }
         }
-        let new_loc = match storage.heap.append_bytes(new_bytes) {
+        let new_image = match storage.heap.append_image(new_bytes) {
             Ok(x) => x,
             Err(e) => return sql_fail(e),
         };
         if target_table == row_table {
-            match storage.write_pending(row_table, rowid, txn.txid, txn.command_id(), Some(new_loc))
-            {
+            match storage.write_pending_image(
+                row_table,
+                rowid,
+                txn.txid,
+                txn.command_id(),
+                Some(new_image),
+            ) {
                 Ok(prior) => {
                     if let Err(e) = txn.touch(row_table as u32, rowid, prior) {
                         storage.restore_pending(row_table, rowid, txn.txid, prior);
@@ -61711,12 +61705,12 @@ pub(crate) fn update<'a>(
             }
         } else {
             let inserted_rowid = stored_rowid;
-            let insert_prior = match storage.write_pending(
+            let insert_prior = match storage.write_pending_image(
                 target_table,
                 inserted_rowid,
                 txn.txid,
                 txn.command_id(),
-                Some(new_loc),
+                Some(new_image),
             ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
@@ -62363,7 +62357,7 @@ pub(crate) fn delete<'a>(
             Ok(false) => continue,
             Err(error) => return sql_fail(error),
         }
-        match storage.write_pending(row_table, rowid, txn.txid, txn.command_id(), None) {
+        match storage.write_pending_image(row_table, rowid, txn.txid, txn.command_id(), None) {
             Ok(prior) => {
                 if let Err(error) = txn.touch(row_table as u32, rowid, prior) {
                     storage.restore_pending(row_table, rowid, txn.txid, prior);
@@ -62686,7 +62680,7 @@ pub(crate) fn truncate(
                 break;
             }
             for &rowid in &rowids[..count] {
-                match storage.write_pending_untracked(
+                match storage.write_pending_image_untracked(
                     table_index,
                     rowid,
                     txn.txid,
@@ -67359,6 +67353,15 @@ fn alter_table_relation(
         None
     };
     let rewritten_rows = scratch.len();
+    let mut rewritten_images = match arena.alloc_owned_slice_with(rewritten_rows, |_| None) {
+        Ok(images) => images,
+        Err(_) => {
+            return sql_fail(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "ALTER rewrite retained inputs exceed the statement arena"
+            ));
+        }
+    };
 
     let mut old_schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut old_schema);
@@ -67411,14 +67414,11 @@ fn alter_table_relation(
         Err(e) => return sql_fail(e),
     };
     for i in 0..rewritten_rows {
-        let (_, rowid, old_home) = scratch[i].local_parts();
-        let new_loc = {
+        let (_, rowid, snapshot) = scratch[i].local_parts();
+        let image = {
             // Build the new image in the statement arena so the heap borrow
             // (decoded text refs) ends before the heap append.
             let new_bytes: &[u8] = {
-                let crate::storage::RowReadSource::Snapshot(snapshot) = old_home else {
-                    unreachable!("rewrite input is an original stored row")
-                };
                 let home = match original_rows
                     .as_ref()
                     .expect("rewrite retains its source")
@@ -67538,40 +67538,25 @@ fn alter_table_relation(
                 rowenc::encode(values, buffer);
                 &*buffer
             };
-            match storage.heap.append_bytes(new_bytes) {
+            match storage.heap.append_image(new_bytes) {
                 Ok(x) => x,
                 Err(e) => return sql_fail(e),
             }
         };
-        scratch[i] = PhysicalRow::staged(table_index, rowid, new_loc);
+        rewritten_images[i] = Some(image);
     }
 
     // Cross-row constraints must see the transformed image set rather than the
     // old rows still installed in storage.
     if has_rewrite {
-        for a in 0..scratch.len() {
-            let (_, _, crate::storage::RowReadSource::StagedHeap(la)) = scratch[a].local_parts()
-            else {
-                unreachable!()
-            };
-            let abytes = match storage.heap.get(la) {
-                Ok(row) => row,
-                Err(error) => return sql_fail(error),
-            };
+        for (a, image) in rewritten_images.iter().enumerate() {
+            let abytes = image.as_ref().expect("rewritten input retained");
             let mut avals = [Datum::Null; MAX_COLUMNS];
-            if let Err(e) = rowenc::decode(&abytes, new_schema, &mut avals) {
+            if let Err(e) = rowenc::decode(abytes, new_schema, &mut avals) {
                 return sql_fail(e);
             }
-            for b in (a + 1)..scratch.len() {
-                let (_, _, crate::storage::RowReadSource::StagedHeap(lb)) =
-                    scratch[b].local_parts()
-                else {
-                    unreachable!()
-                };
-                let bbytes = match abytes.other(lb) {
-                    Ok(row) => row,
-                    Err(error) => return sql_fail(error),
-                };
+            for image in rewritten_images.iter().skip(a + 1) {
+                let bbytes = image.as_ref().expect("rewritten input retained");
                 let mut bvals = [Datum::Null; MAX_COLUMNS];
                 if let Err(e) = rowenc::decode(bbytes, new_schema, &mut bvals) {
                     return sql_fail(e);
@@ -67662,15 +67647,11 @@ fn alter_table_relation(
             return sql_fail(e);
         }
         for i in 0..rewritten_rows {
-            let (_, rowid, new_home) = scratch[i].local_parts();
-            let crate::storage::RowReadSource::StagedHeap(new_loc) = new_home else {
-                unreachable!("the rewrite pass re-homes every row to the heap");
-            };
+            let (_, rowid, _) = scratch[i].local_parts();
             let lsn = storage.bump_lsn();
-            let row = match storage.heap.get(new_loc) {
-                Ok(row) => row,
-                Err(error) => return sql_fail(error),
-            };
+            let row = rewritten_images[i]
+                .as_ref()
+                .expect("rewritten input retained");
             if let Err(e) = wal.stage_reserved(
                 txn.txid,
                 lsn,
@@ -67678,7 +67659,7 @@ fn alter_table_relation(
                     schema: new_def.schema.as_str(),
                     table: new_def.name.as_str(),
                     rowid,
-                    row: &row,
+                    row,
                     is_update: false,
                     old_row: None,
                     command_id: txn.command_id(),
@@ -68271,16 +68252,16 @@ fn alter_table_relation(
         }
     }
     for i in 0..rewritten_rows {
-        let (_, rowid, new_home) = scratch[i].local_parts();
-        let crate::storage::RowReadSource::StagedHeap(new_loc) = new_home else {
-            unreachable!("the rewrite pass re-homes every row to the heap");
-        };
-        match storage.write_pending_untracked(
+        let (_, rowid, _) = scratch[i].local_parts();
+        let image = rewritten_images[i]
+            .take()
+            .expect("rewritten input retained");
+        match storage.write_pending_image_untracked(
             table_index,
             rowid,
             txn.txid,
             txn.command_id(),
-            Some(new_loc),
+            Some(image),
         ) {
             Ok(prior) => {
                 if let Err(error) = txn.touch(table_index as u32, rowid, prior) {
@@ -69389,8 +69370,9 @@ fn store_row(
         Some(rowid) => rowid,
         None => storage.next_rowid()?,
     };
-    let loc = storage.heap.append_row(values)?;
-    let prior = storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), Some(loc))?;
+    let image = storage.heap.append_row_image(values)?;
+    let prior =
+        storage.write_pending_image(table_index, rowid, txn.txid, txn.command_id(), Some(image))?;
     if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
         storage.restore_pending(table_index, rowid, txn.txid, prior);
         return Err(e);

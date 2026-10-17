@@ -31,6 +31,7 @@ class DownloadGate:
         self.missing = False
         self.key = None
         self.observed_keys = set()
+        self.get_counts = {}
 
     def arm(self, key, missing):
         with self.lock:
@@ -46,6 +47,8 @@ class DownloadGate:
 
     def wait(self, command, key):
         with self.lock:
+            if command == "GET":
+                self.get_counts[key] = self.get_counts.get(key, 0) + 1
             if command == "GET" and self.armed_key is not None:
                 self.observed_keys.add(key)
             claimed = command == "GET" and key == self.armed_key
@@ -260,7 +263,12 @@ def scenario(reference, node, gate, object_root, prefix, missing, schema):
     node.start()
     with node.connect(bounded=True) as writer, node.connect(bounded=True) as reader:
         progress("scenario:warm")
-        writer.execute(f"SELECT id, note FROM {schema}.warm_orders ORDER BY id").fetchall()
+        try:
+            writer.execute(f"SELECT id, note FROM {schema}.warm_orders ORDER BY id").fetchall()
+        except BaseException:
+            with gate.lock:
+                print(json.dumps({"warm_get_counts": gate.get_counts}), flush=True)
+            raise
         writer.execute(f"SELECT note FROM {schema}.warm_orders WHERE id = 1").fetchall()
         head = object_root / "atomic-write-test" / prefix / "commit-head"
         before = head.read_bytes()

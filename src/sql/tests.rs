@@ -61865,8 +61865,13 @@ fn index_file_owners_unrelated_commits_preserve_index_access_for_an_older_snapsh
         plan.iter().all(|row| !row.contains("Index Only Scan")),
         "{plan:?}"
     );
+    // Stream the single historical match; sorting would upload simulator runs.
     assert_eq!(
-        data_rows(&reader.success(&mut engine, query, true)),
+        data_rows(&reader.success(
+            &mut engine,
+            "SELECT id, note FROM index_invoices WHERE id = 1",
+            true,
+        )),
         ["1|old"]
     );
     reader.success(&mut engine, "COMMIT", true);

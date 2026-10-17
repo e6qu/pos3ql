@@ -1097,9 +1097,8 @@ impl Checkpointer {
         );
     }
 
-    pub(crate) fn budget_bytes(config: &Config) -> usize {
+    fn workspace_budget_bytes(config: &Config) -> usize {
         let table_capacity = crate::storage::table_slot_capacity(config);
-        let manifest_capacity = config.checkpoint_manifest_bytes;
         let table_bookkeeping = table_capacity
             * (2 * core::mem::size_of::<SlotList>()
                 + 2 * core::mem::size_of::<u64>()
@@ -1110,11 +1109,26 @@ impl Checkpointer {
             + table_capacity
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(core::mem::size_of::<(usize, SlotInstall)>());
-        // One synchronous manifest/WAL client plus the fixed durable-block
-        // read pool. The cache tiers draw their own budget in the constructor.
-        (1 + config.object_store_get_slots) * ObjectStore::budget_bytes(config)
-            + 2 * SstWriter::budget_bytes()
+        2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
+            + table_bookkeeping
+            + table_capacity.saturating_mul(crate::storage::MAX_VALUE_ENFORCERS)
+                * core::mem::size_of::<ValueInstall>()
+            + config.checkpoint_live_blocks * core::mem::size_of::<(BlockId, Option<BlockType>)>()
+            + config.checkpoint_garbage_batch_objects
+                * (core::mem::size_of::<StackStr<80>>() + core::mem::size_of::<StackStr<64>>())
+            + config.checkpoint_commit_batches * core::mem::size_of::<StackStr<64>>()
+            + config.max_backups * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
+            + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
+    }
+
+    pub(crate) fn budget_bytes(config: &Config) -> usize {
+        let table_capacity = crate::storage::table_slot_capacity(config);
+        // The metadata client is separate from the block write client, fixed
+        // read pool and scratch. Cache tiers draw their own startup budget.
+        ObjectStore::budget_bytes(config)
+            + OwnedObjectStore::budget_bytes(config)
+            + Self::workspace_budget_bytes(config)
             + ExternalRunReader::budget_bytes()
             + ValueIndexStream::budget_bytes(config.checkpoint_live_blocks)
             + crate::store::MAX_PAYLOAD
@@ -1128,23 +1142,13 @@ impl Checkpointer {
             + config.table_rows * core::mem::size_of::<u64>()
             + config.max_prepared_transactions
                 * core::mem::size_of::<crate::storage::PreparedTransactionCatalogEntry>()
-            + table_bookkeeping
             + (2usize.saturating_mul(table_capacity) + 1)
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(core::mem::size_of::<Option<PrevSst>>())
-            + table_capacity.saturating_mul(crate::storage::MAX_VALUE_ENFORCERS)
-                * core::mem::size_of::<ValueInstall>()
-            + config.checkpoint_live_blocks * core::mem::size_of::<(BlockId, Option<BlockType>)>()
-            + config.checkpoint_garbage_batch_objects
-                * (core::mem::size_of::<StackStr<80>>() + core::mem::size_of::<StackStr<64>>())
-            + config.checkpoint_commit_batches * core::mem::size_of::<StackStr<64>>()
-            + config.max_backups * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
-            + manifest_capacity
+            + config.checkpoint_manifest_bytes
             + 128
-            + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
             + MERGE_SOURCE_SCRATCH_BYTES
-            + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
     }
 
     /// One bounded step of the paced merge — the compaction work a beat may
@@ -1647,6 +1651,12 @@ impl Checkpointer {
         }
         let table_capacity = crate::storage::table_slot_capacity(config);
         let manifest_capacity = config.checkpoint_manifest_bytes;
+        budget
+            .draw(
+                Self::workspace_budget_bytes(config),
+                "checkpoint workspaces",
+            )
+            .map_err(CheckpointSetupError::Budget)?;
         let base = OwnedObjectStore::new(config, budget, "blocks/")
             .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?;
         let plan = StackPlan::resolve(config.block_cache_bytes, config.disk_cache_bytes);
@@ -17287,6 +17297,36 @@ mod stored_dependency_tests {
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;
     use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependencies};
+
+    #[test]
+    fn cleanup_download_overlap_checkpoint_reserves_metadata_and_block_clients() {
+        let mut config = Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_endpoint = "127.0.0.1:9".to_owned();
+        config.object_store_bucket = "checkpoint-request-budget".to_owned();
+        config.object_store_access_key = "test-access".to_owned();
+        config.object_store_secret_key = "test-secret".to_owned();
+        config.object_store_head_bytes = 4096;
+        config.object_store_response_bytes = crate::store::BLOCK_SIZE;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        config.data_dir = std::env::temp_dir()
+            .join(format!(
+                "pos3ql-checkpoint-request-budget-{}",
+                std::process::id()
+            ))
+            .to_str()
+            .unwrap()
+            .to_owned();
+        config.remove_test_data_dir_on_drop();
+        for slots in [1, 4, 7] {
+            config.object_store_get_slots = slots;
+            let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
+            let checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+            assert_eq!(budget.remaining(), 0);
+            drop(checkpointer);
+        }
+    }
 
     #[test]
     fn retained_sst_temporary_spill_constructor_charges_its_startup_budget() {

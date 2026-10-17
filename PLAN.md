@@ -121,6 +121,8 @@ client. Failed maintenance has a one-second retry deadline even under continuous
 client traffic or when idle; local progress does not clear a failed
 durable-publication status.
 Checkpoint publication and object merges still wait for downloads to finish.
+Startup sizing and construction charge every object client, request-slot record,
+block scratch buffer and checkpoint workspace before serving queries.
 
 - Reserve independent request slots and scratch buffers at startup. Keep cache
   checks and updates brief; do not hold broad locks during slow object I/O.

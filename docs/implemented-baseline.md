@@ -751,6 +751,14 @@ turns. Checkpoint publication, merges, and temporary spilling still wait for
 pending durable-block downloads. Fixed execution workers and independent storage
 publication remain unfinished.
 
+The object-request reservation includes every configured read client, the
+separate block write and metadata clients, read-slot controls, and the 256 KiB
+block scratch buffer. Checkpoint writer buffers and workspace arrays are charged
+when constructed too. For example, increasing `object_store_get_slots` reserves
+another complete request/response buffer before accepting connections; it cannot
+borrow memory later from the row heap. Insufficient startup memory names the
+component that could not be reserved.
+
 Eviction requires an installed object's recorded boundary to cover the row's
 commit position. A later update stays in the heap; history newer than that
 boundary stays resident too. Recovered roots have no eviction boundary and do

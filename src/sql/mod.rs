@@ -8224,8 +8224,8 @@ impl Engine {
             // command, so it is a no-op rather than a client-visible error.
             return Ok(false);
         };
-        // Everything the snapshot will contain must be journal-durable
-        // first, so an interrupted checkpoint never strands acked writes.
+        // Flush committed records before capture. A covered upload stays
+        // pending until its publication retry reconciles the durable root.
         self.wal.commit();
         if ckpt.block_reads_busy() {
             return Err(sql_err!(
@@ -8307,8 +8307,9 @@ impl Engine {
             // A sliced checkpoint can publish a snapshot while later
             // statements have already appended WAL. Retaining the journal in
             // that case lets recovery replay the suffix above this manifest;
-            // only a checkpoint at the current tail may restart it.
-            if self.wal.last_lsn() <= lsn {
+            // only a checkpoint at the current tail may restart it. Retain an
+            // unacknowledged batch until its root publication is reconciled.
+            if self.wal.last_lsn() <= lsn && !self.durable_retry_pending() {
                 self.wal.reset_after_checkpoint();
             }
         }
@@ -8749,33 +8750,14 @@ impl Engine {
     /// pressure retains the existing synchronous cleanup contract. Publication
     /// and merge beats still use synchronous object I/O after reads finish.
     pub(crate) fn checkpoint_beat(&mut self) -> CheckpointBeat {
-        if self.post_publish_cleanup.is_some() {
-            let cleanup = if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
-                self.finish_post_publish_cleanup()
-            } else {
-                self.post_publish_cleanup_step(false).map(|_| ())
-            };
-            return match cleanup {
-                Ok(_) => CheckpointBeat::Advanced,
-                Err(e) => {
-                    let message = stack_format!(
-                        512,
-                        "post-checkpoint bookkeeping failed ({}): {}\n",
-                        e.sqlstate,
-                        e.message.as_str()
-                    );
-                    crate::util::stderr_line(message.as_str());
-                    CheckpointBeat::LocalFailure
-                }
-            };
-        }
-        // The read pool has independent requests, but checkpoint reads must
-        // switch it to synchronous mode without interrupting an owned GET.
-        if self.block_reads_pending() {
+        let reads_pending = self.block_reads_pending();
+        if reads_pending && self.post_publish_cleanup.is_none() {
             return CheckpointBeat::WaitingForReads;
         }
-        let retried_upload = self.durable_retry_pending();
-        if let Err(error) = self.retry_pending_wal_upload() {
+        // Preserve the durable retry barrier whenever storage work can run.
+        // With an owned GET, only already-published local cleanup may advance.
+        let retried_upload = !reads_pending && self.durable_retry_pending();
+        if !reads_pending && let Err(error) = self.retry_pending_wal_upload() {
             let message = stack_format!(
                 512,
                 "auto-checkpoint failed ({}): {}\n",
@@ -8784,6 +8766,36 @@ impl Engine {
             );
             crate::util::stderr_line(message.as_str());
             return CheckpointBeat::StorageFailure;
+        }
+        if self.post_publish_cleanup.is_some() {
+            let cleanup = if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
+                self.finish_post_publish_cleanup()
+            } else {
+                self.post_publish_cleanup_step(false).map(|_| ())
+            };
+            return match cleanup {
+                Ok(_) => {
+                    if retried_upload {
+                        CheckpointBeat::Durable
+                    } else {
+                        CheckpointBeat::Advanced
+                    }
+                }
+                Err(e) => {
+                    let message = stack_format!(
+                        512,
+                        "post-checkpoint bookkeeping failed ({}): {}\n",
+                        e.sqlstate,
+                        e.message.as_str()
+                    );
+                    crate::util::stderr_line(message.as_str());
+                    if retried_upload {
+                        CheckpointBeat::DurableWithLocalFailure
+                    } else {
+                        CheckpointBeat::LocalFailure
+                    }
+                }
+            };
         }
         let progress = if retried_upload {
             CheckpointBeat::Durable

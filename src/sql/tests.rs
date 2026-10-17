@@ -83589,25 +83589,33 @@ fn assert_owned_rewrite_inputs_released(engine: &mut Engine) {
 }
 
 fn sliced_cleanup_fixture(name: &str, durable: bool) -> (Engine, Budget, Config) {
+    sliced_cleanup_fixture_with_wal(name, durable, false)
+}
+
+fn sliced_cleanup_fixture_with_wal(
+    name: &str,
+    durable: bool,
+    upload: bool,
+) -> (Engine, Budget, Config) {
     let mut config = test_config(name);
     config.object_store_on = durable;
     config.object_store_sim = durable;
-    config.wal_upload = false;
-    config.wal_upload_sync = false;
+    config.wal_upload = upload;
+    config.wal_upload_sync = upload;
     config.object_store_bucket = format!("{name}-{}", std::process::id());
     if durable {
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let output = run_with_fixed_memory(
-        &mut engine,
-        &budget,
-        "CREATE TABLE cleanup_orders(id integer PRIMARY KEY, note text); \
-         INSERT INTO cleanup_orders SELECT i, repeat('x', 8192) \
-         FROM generate_series(1, 80) AS g(i)",
-        32 << 20,
-    );
+    let sql = "CREATE TABLE cleanup_orders(id integer PRIMARY KEY, note text); \
+               INSERT INTO cleanup_orders SELECT i, repeat('x', 8192) \
+               FROM generate_series(1, 80) AS g(i)";
+    let output = if upload {
+        run_with(&mut engine, &mut budget, sql)
+    } else {
+        run_with_fixed_memory(&mut engine, &budget, sql, 32 << 20)
+    };
     assert!(!message_types(&output).contains(&b'E'));
     (engine, budget, config)
 }
@@ -84296,4 +84304,131 @@ fn cleanup_download_overlap_confirmed_publication_survives_local_buffer_exhausti
     let mut values = [Datum::Null; 2];
     crate::storage::rowenc::decode(&current, &[ColType::Int4, ColType::Text], &mut values).unwrap();
     assert!(matches!(values[1], Datum::Text(value) if value.len() == 8192));
+}
+
+fn publish_cleanup_fixture(engine: &mut Engine) -> u64 {
+    for _ in 0..64 {
+        match engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap()
+        {
+            crate::checkpoint::CheckpointStep::Published { lsn } => return lsn,
+            crate::checkpoint::CheckpointStep::Working => {}
+            crate::checkpoint::CheckpointStep::Idle => panic!("fixture has unpublished rows"),
+        }
+    }
+    panic!("bounded fixture checkpoint did not publish")
+}
+
+#[test]
+fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_prefix() {
+    for covers_pending in [false, true] {
+        let name = if covers_pending {
+            "cleanup-wal-covered"
+        } else {
+            "cleanup-wal-suffix"
+        };
+        let (mut engine, mut budget, config) = sliced_cleanup_fixture_with_wal(name, true, true);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+        let head_key = format!("{}commit-head", config.object_store_prefix);
+        let before = namespace.borrow().object_bytes(&head_key).unwrap().to_vec();
+        let before_write = if covers_pending {
+            None
+        } else {
+            Some(publish_cleanup_fixture(&mut engine))
+        };
+        namespace.borrow_mut().faults.fail_from_op = Some(0);
+        let failed = run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO cleanup_orders VALUES (81, 'retry')",
+        );
+        assert_eq!(error_sqlstates(&failed), ["58030"]);
+        assert!(engine.durable_retry_pending());
+        let published = if let Some(published) = before_write {
+            published
+        } else {
+            namespace.borrow_mut().faults.fail_from_op = None;
+            let published = publish_cleanup_fixture(&mut engine);
+            namespace.borrow_mut().faults.fail_from_op = Some(0);
+            published
+        };
+        engine.begin_post_publish_cleanup(published);
+        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::StorageFailure);
+        assert!(matches!(
+            engine.post_publish_cleanup.unwrap().phase,
+            PostPublishPhase::Prepare
+        ));
+        assert!(!engine.compact_scratch.active());
+        let pending_bytes = engine.wal.pending_batch_bytes();
+        crate::mem::guard::forbid_alloc(|| {
+            // Exercise the CPU-only turn used while an object GET owns I/O.
+            assert!(!engine.post_publish_cleanup_step(false).unwrap());
+            assert_eq!(engine.wal.pending_batch_bytes(), pending_bytes);
+        });
+        namespace.borrow_mut().faults.fail_from_op = None;
+        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Durable);
+        assert!(!engine.durable_retry_pending());
+        assert!(engine.compact_scratch.active());
+        assert_ne!(
+            namespace.borrow().object_bytes(&head_key).unwrap(),
+            before.as_slice()
+        );
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovery_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(
+                &mut recovered,
+                &mut recovery_budget,
+                "SELECT count(*), sum(id) FROM cleanup_orders"
+            )),
+            ["81|3321"]
+        );
+        drop(recovered);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+fn cleanup_download_overlap_commit_pruning_ignores_newer_unpublished_orphans() {
+    use crate::object_store::Precondition;
+    let (mut engine, _budget, config) =
+        sliced_cleanup_fixture_with_wal("cleanup-orphan-commit", true, true);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+    let orphan_first = engine.storage.lsn();
+    let orphan_batch = format!("commits/{orphan_first:020}-ffffffff.batch");
+    let orphan_head = format!("commits/{orphan_first:020}-ffffffff.head");
+    for key in [&orphan_batch, &orphan_head] {
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .client
+            .put(key, b"unpublished orphan", Precondition::IfNoneMatchAny)
+            .unwrap();
+    }
+    assert!(engine.checkpoint().unwrap());
+    for key in [&orphan_batch, &orphan_head] {
+        let key = format!("{}{key}", config.object_store_prefix);
+        assert!(namespace.borrow().object_bytes(&key).is_none());
+    }
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT count(*), sum(id) FROM cleanup_orders"
+        )),
+        ["80|3240"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }

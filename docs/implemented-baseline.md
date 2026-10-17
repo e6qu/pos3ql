@@ -759,6 +759,17 @@ another complete request/response buffer before accepting connections; it cannot
 borrow memory later from the row heap. Insufficient startup memory names the
 component that could not be reserved.
 
+Commit-history cleanup keeps the entry selected by the published chain, even
+when a newer filename belongs to an upload that failed before publication. For
+example, a failed order upload cannot cause cleanup to delete the history used
+by a confirmed order. Boundary discovery reads at most one commit descriptor per
+turn. Deletion count and staging memory keep their configured limits; listing
+the namespace can still span many pages. Retries
+retain their cursor after errors, and later commits can extend the chain.
+Pending journal uploads retain their bytes through local cleanup, including
+when the snapshot already covers them. With no pending block download, the
+publication retry runs before local cleanup continues.
+
 Eviction requires an installed object's recorded boundary to cover the row's
 commit position. A later update stays in the heap; history newer than that
 boundary stays resident too. Recovered roots have no eviction boundary and do

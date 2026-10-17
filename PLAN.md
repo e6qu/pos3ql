@@ -124,6 +124,9 @@ restore readiness without requiring another write.
 Checkpoint publication and object merges still wait for downloads to finish.
 Startup sizing and construction charge every object client, request-slot record,
 block scratch buffer and checkpoint workspace before serving queries.
+Commit-history cleanup follows the published chain one descriptor per turn;
+unpublished uploads cannot replace the boundary needed for recovery. Unacknowledged
+journal batches remain available until their publication retry completes.
 
 - Reserve independent request slots and scratch buffers at startup. Keep cache
   checks and updates brief; do not hold broad locks during slow object I/O.

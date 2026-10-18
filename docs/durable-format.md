@@ -189,9 +189,9 @@ those generations and schedules replacements; scalar key hashes use stable membe
 identities rather than labels or sort positions; existing row objects remain
 readable. Enum-dependent most-common-value hash summaries from older manifests
 or journal kind 77 are retired while their counts and dependency estimates remain
-valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. Upgrade
-every recovery and replacement candidate before allowing kind 149 or manifest
-v15 to be written.
+valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. Upgrade every recovery and replacement candidate before this binary writes
+journal kinds 149–153 or manifest v15. Kind 153 applies to ordinary row writes
+too, so the upgrade is required before resuming writes, even without enum DDL.
 
 ### Composite type name changes
 

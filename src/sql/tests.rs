@@ -85734,4 +85734,16 @@ fn enum_value_identity_domain_comparisons_require_base_enum_casts() {
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT state::enum_operator_state = 'old' FROM enum_operator_rows WHERE state IS NOT NULL",
         true)), ["t"]);
+    session.success(&mut engine, "TRUNCATE enum_operator_rows", true);
+    for sql in [
+        "SELECT state = 'old' FROM enum_operator_rows",
+        "SELECT 1 FROM enum_operator_rows WHERE state = 'old'::enum_operator_state",
+        "SELECT NULL::enum_operator_domain = 'old' WHERE false",
+    ] {
+        let output = session.execute(&mut engine, sql, true);
+        assert!(
+            String::from_utf8_lossy(&output).contains("42883"),
+            "{sql}: {output:?}"
+        );
+    }
 }

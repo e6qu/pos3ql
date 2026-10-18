@@ -615,6 +615,11 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         })
     }
 
+    fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        self.catalog
+            .and_then(|catalog| catalog.domain_base_type(type_oid))
+    }
+
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {
         self.catalog
             .and_then(|catalog| catalog.user_type_oid(type_name))

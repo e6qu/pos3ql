@@ -42520,6 +42520,15 @@ impl Storage {
         )
     }
 
+    pub(crate) fn domain_base_type_for_oid(&self, type_oid: i32, txid: u32) -> Option<ColType> {
+        let slot =
+            usize::try_from(type_oid.checked_sub(crate::sql::types::oid::FIRST_DOMAIN)?).ok()?;
+        if slot >= self.domain_count() || !self.domain_slot_visible_to(slot, txid) {
+            return None;
+        }
+        Some(self.domain_for(slot, txid).base)
+    }
+
     pub(crate) fn user_type_identity_oid(
         &self,
         identity: UserTypeName,

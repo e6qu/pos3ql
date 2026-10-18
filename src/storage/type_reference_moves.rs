@@ -761,3 +761,44 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enum_value_identity_type_moves_preserve_outer_domains() {
+        let identity = |name| UserTypeName {
+            schema: super::super::SqlName::parse("public").unwrap(),
+            name: super::super::SqlName::parse(name).unwrap(),
+        };
+        let prior = identity("prior");
+        let current = identity("current");
+        let outer = identity("outer");
+        for (kind, ctype) in [
+            (TypeReferenceKind::Enum, ColType::Enum(0)),
+            (TypeReferenceKind::Enum, ColType::Array(ArrElem::Enum(0))),
+            (
+                TypeReferenceKind::Domain,
+                ColType::Array(ArrElem::domain(0, ColType::Enum(0)).unwrap()),
+            ),
+        ] {
+            let movement = TypeReferenceMove::new(DatabaseOid::POSTGRES, kind, 0, prior, current);
+            let mut declared = Some(outer);
+            assert!(!movement.rewrite(ctype, &mut declared));
+            assert_eq!(declared, Some(outer));
+            declared = Some(prior);
+            assert!(movement.rewrite(ctype, &mut declared));
+            assert_eq!(declared, Some(current));
+            let mut parent = None;
+            let mut base = Some(prior);
+            movement.rewrite_domain(ctype, &mut parent, &mut base);
+            assert_eq!(base, Some(current));
+            parent = Some(outer);
+            base = None;
+            movement.rewrite_domain(ctype, &mut parent, &mut base);
+            assert_eq!(parent, Some(outer));
+            assert_eq!(base, None);
+        }
+    }
+}

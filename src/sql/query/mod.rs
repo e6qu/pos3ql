@@ -3960,13 +3960,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
-        let slot = usize::try_from(type_oid.checked_sub(super::types::oid::FIRST_DOMAIN)?).ok()?;
-        if slot >= self.storage.domain_count()
-            || !self.storage.domain_slot_visible_to(slot, self.txid)
-        {
-            return None;
-        }
-        Some(self.storage.domain_for(slot, self.txid).base)
+        self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }
 
     fn user_type_identity_oid(
@@ -9062,6 +9056,10 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
             type_mod,
             collation: scope.output_collation(entry),
         })
+    }
+
+    fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }
 
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {

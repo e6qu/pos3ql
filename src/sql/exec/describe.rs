@@ -539,6 +539,10 @@ impl ColTypeResolver for CatalogCols<'_> {
         Ok(())
     }
 
+    fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        self.storage.domain_base_type_for_oid(type_oid, self.txid)
+    }
+
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {
         crate::sql::catalog::user_type_oid(self.storage, self.txid, type_name)
             .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
@@ -1387,6 +1391,10 @@ pub trait ColTypeResolver {
 
     fn validate_explicit_cast(&self, _source_oid: i32, _target: ColType) -> Result<(), SqlError> {
         Ok(())
+    }
+
+    fn domain_base_type(&self, _type_oid: i32) -> Option<ColType> {
+        None
     }
 
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {
@@ -3237,6 +3245,25 @@ pub fn infer_type_res(
                 .and_then(|name| columns.operator_result(name, lo, ro))
             {
                 return Ok((result.type_oid, result.ctype.typlen()));
+            }
+            if matches!(operator, Eq | NotEq | Lt | LtEq | Gt | GtEq) {
+                let left_declared = infer_routine_argument_oid(left, columns)?;
+                let right_declared = infer_routine_argument_oid(right, columns)?;
+                if [left_declared, right_declared]
+                    .iter()
+                    .any(|oid| matches!(columns.domain_base_type(*oid), Some(ColType::Enum(_))))
+                {
+                    if let Some(result) = operator.operator_name().and_then(|name| {
+                        columns.operator_result(name, left_declared, right_declared)
+                    }) {
+                        return Ok((result.type_oid, result.ctype.typlen()));
+                    }
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "operator does not exist for enum domain arguments: {}",
+                        operator.operator_name().unwrap_or("?")
+                    ));
+                }
             }
             let is_bit = |o: i32| matches!(o, oid::BIT | oid::VARBIT);
             match operator {

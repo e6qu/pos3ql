@@ -898,6 +898,14 @@ transaction reads `waiting` from its unchanged order row. A view created with
 The label edit changes catalog metadata and does not rewrite the orders table.
 Rollback selects the earlier definition again.
 
+Domain rules also apply when an enum value is stored inside a record or an array.
+Changing a label or moving its type keeps those rules and their captured values
+attached to the same enum members. PostgreSQL requires a base-type cast when
+comparing a domain over an enum. For example, with a domain `order_state` over
+`state`, write `status::state = 'ready'::state`; `status = 'ready'` returns
+SQLSTATE `42883`. The explicit cast does not remove checks when assigning a
+value to the domain.
+
 Selected enum definitions and label iterators retain the label image they read.
 A label image is one complete saved list of labels.
 Changing or dropping the type, rolling back a later change, reusing its catalog

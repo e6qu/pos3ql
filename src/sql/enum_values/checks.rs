@@ -92,19 +92,6 @@ fn bind_expression<const N: usize>(
         .iter()
         .filter(|token| matches!(token.token, Tok::Str(_)))
         .count();
-    let mut parameters = StackStr::<N>::new();
-    let mut parameter = 0;
-    for token in tokens {
-        if matches!(token.token, Tok::Str(_)) {
-            parameter += 1;
-            let _ = write!(parameters, "${parameter} ");
-        } else {
-            let _ = write!(parameters, "{} ", &source[token.start..token.end]);
-        }
-    }
-    if parameters.is_truncated() {
-        return Err(full::<N>());
-    }
     let mut name = StackStr::<260>::new();
     write_name(&mut name, definition.schema.as_str());
     let _ = name.write_char('.');
@@ -125,21 +112,21 @@ fn bind_expression<const N: usize>(
                     "enum expression has no base type name"
                 )
             })?;
+    let prefix = if default_target {
+        "SELECT (\n"
+    } else {
+        "SELECT \n"
+    };
     let query = if default_target {
-        arena.alloc_str_display(format_args!(
-            "SELECT ({})::{}",
-            parameters.as_str(),
-            context_type
-        ))
+        arena.alloc_str_display(format_args!("{prefix}{source}\n)::{context_type}"))
     } else {
         arena.alloc_str_display(format_args!(
-            "SELECT {} FROM (VALUES (NULL::{})) AS __pos3ql_domain(value)",
-            parameters.as_str(),
-            context_type
+            "{prefix}{source}\n FROM (VALUES (NULL::{context_type})) AS __pos3ql_domain(value)"
         ))
     }
     .map_err(|_| crate::sql::query::arena_full_pub())?;
-    let select = crate::sql::parser::parse_query(query, arena)?;
+    let positions = super::string_parameter_positions(tokens, prefix.len(), arena)?;
+    let select = crate::sql::parser::parse_query_with_string_parameters(query, arena, positions)?;
     let oids = arena
         .alloc_slice_with(count, |_| oid::TEXT)
         .map_err(|_| crate::sql::query::arena_full_pub())?;
@@ -148,7 +135,7 @@ fn bind_expression<const N: usize>(
     let mut output = StackStr::<N>::new();
     let _ = output.write_str(HEADER);
     let mut bound = false;
-    parameter = 0;
+    let mut parameter = 0;
     let mut index = 0;
     while index < tokens.len() {
         let token = tokens[index];

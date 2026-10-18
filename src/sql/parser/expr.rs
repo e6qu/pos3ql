@@ -568,8 +568,9 @@ impl<'a> Parser<'a> {
                 self.arena_expr(Expr::NumericLit(text))
             }
             Tok::Str(s) => {
+                let source_at = self.peek_at;
                 self.advance()?;
-                self.arena_expr(Expr::Str(s))
+                self.string_expression(s, source_at)
             }
             Tok::Bit(s) => {
                 self.advance()?;

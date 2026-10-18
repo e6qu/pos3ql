@@ -146,6 +146,33 @@ fn query_tokens<'a>(source: &'a str, arena: &'a Arena) -> Result<&'a [QueryToken
     Ok(tokens)
 }
 
+fn string_parameter_positions<'a>(
+    tokens: &[QueryToken<'_>],
+    offset: usize,
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    let count = tokens
+        .iter()
+        .filter(|token| matches!(token.token, super::lexer::Tok::Str(_)))
+        .count();
+    let positions = arena
+        .alloc_slice_with(count, |_| 0)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut index = 0;
+    for token in tokens {
+        if matches!(token.token, super::lexer::Tok::Str(_)) {
+            positions[index] = token.start.checked_add(offset).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "stored literal position is too large"
+                )
+            })?;
+            index += 1;
+        }
+    }
+    Ok(positions)
+}
+
 fn write_name<const N: usize>(output: &mut crate::util::StackStr<N>, name: &str) {
     use core::fmt::Write;
     let _ = output.write_char('"');
@@ -178,27 +205,11 @@ pub(crate) fn bind_query<const N: usize>(
     if count == 0 || !storage.has_visible_enums(txid) {
         return Ok(crate::util::StackStr::from_str(source));
     }
-    let mut parameterized = crate::util::StackStr::<N>::new();
-    let mut parameter = 0;
-    for token in tokens {
-        if matches!(token.token, Tok::Str(_)) {
-            parameter += 1;
-            let _ = write!(parameterized, "${parameter} ");
-        } else {
-            let _ = write!(parameterized, "{} ", &source[token.start..token.end]);
-        }
-    }
-    if parameterized.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "stored enum binding exceeds {} bytes",
-            N
-        ));
-    }
-    let parameterized = arena
-        .alloc_str(parameterized.as_str())
+    let positions = string_parameter_positions(tokens, 0, arena)?;
+    let query_source = arena
+        .alloc_str(source)
         .map_err(|_| super::query::arena_full_pub())?;
-    let select = super::parser::parse_query(parameterized, arena)?;
+    let select = super::parser::parse_query_with_string_parameters(query_source, arena, positions)?;
     let select =
         super::query::expand_stored_query(select, storage, txid, path, dependencies.view(), arena)?;
     let oids = arena
@@ -213,7 +224,7 @@ pub(crate) fn bind_query<const N: usize>(
     );
     let mut output = crate::util::StackStr::<N>::new();
     let _ = output.write_str(QUERY_HEADER);
-    parameter = 0;
+    let mut parameter = 0;
     let mut any_binding = false;
     for token in tokens {
         let mut binding = None;

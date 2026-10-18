@@ -86082,3 +86082,52 @@ fn enum_value_identity_quoted_default_names_keep_catalog_spelling() {
         [r#"'*/%é'::"QuotedState""#]
     );
 }
+
+#[test]
+fn enum_value_identity_views_preserve_grammar_literals_and_typed_constants() {
+    let config = test_config("enum-view-grammar-literals");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        r#"
+        CREATE TYPE grammar_state AS ENUM ('old', 'ready');
+        CREATE VIEW grammar_values AS
+            WITH items AS (
+                SELECT item_id FROM JSON_TABLE(
+                    '[{"id":1}]', '$[*]' COLUMNS (item_id integer PATH '$.id')
+                ) AS extracted
+            )
+            SELECT DATE '2024-01-02' AS day,
+                   'old'::grammar_state AS kept, item_id,
+                   TIMESTAMP(2) '2024-01-02 03:04:05.12345' AS stamp,
+                   INTERVAL '1' DAY AS age, 'old'::text AS plain
+              FROM items;
+        ALTER TYPE grammar_state RENAME VALUE 'old' TO 'new'
+    "#,
+        true,
+    );
+    session.success(
+        &mut engine,
+        "ALTER TYPE grammar_state ADD VALUE 'old'",
+        true,
+    );
+    let query = "SELECT kept::text, item_id, day::text, stamp::text, age::text, plain
+                 FROM grammar_values";
+    let expected = ["new|1|2024-01-02|2024-01-02 03:04:05.12|1 day|old"];
+    assert_eq!(
+        data_rows(&session.success(&mut engine, query, true)),
+        expected
+    );
+    engine.commit_wal().unwrap();
+    drop(session);
+    drop(engine);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, query, true)),
+        expected
+    );
+}

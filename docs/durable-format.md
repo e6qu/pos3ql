@@ -171,8 +171,10 @@ instead of installing opaque bytes it cannot decode.
 Bound view SQL uses the non-SQL prefix `pos3ql-bound-query-v1`, followed by
 tokenized SQL. Before each typed enum literal, `/*p3e:D:M*/` records dependency
 position D and member position M. The writer strips client comments before adding
-bindings. Readers resolve these positions through the captured dependencies and
-remove the internal grammar before parsing or displaying SQL. Unknown grammar
+bindings. The parser analyzes ordinary value strings as parameters while
+preserving grammar literals, including JSON_TABLE paths and typed date constants.
+Readers resolve the bound positions through the captured dependencies and remove
+the internal grammar before parsing or displaying SQL. Unknown grammar
 versions and invalid bindings are errors.
 
 Domain CHECK and stored DEFAULT SQL against an enum or enum-array base use `pos3ql-enum-check-v1`. Its

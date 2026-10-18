@@ -580,7 +580,9 @@ impl ParameterInference<'_> {
         }
         query::walk_children(expression, &mut |child| {
             self.infer_explicit_cast_params(child, txid, oids);
-        });
+            Ok(())
+        })
+        .expect("explicit cast parameter walk cannot fail");
         if let Expr::Subquery(select)
         | Expr::Exists(select)
         | Expr::ArraySubquery(select)

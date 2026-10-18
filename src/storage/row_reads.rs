@@ -47,7 +47,13 @@ impl super::Storage {
                 "selected DML table was removed"
             )
         })?;
-        let definition = table.definition.read();
+        let (definition, versions, rows) = super::row_ownership::acquire(|| {
+            Ok((
+                table.definition.try_read_for_batch()?,
+                self.row_versions.try_read_for_batch()?,
+                table.rows.try_read_for_batch()?,
+            ))
+        });
         let identity = definition.identity;
         if identity.created_at != original.created_at || !identity.existence.visible_to(txid) {
             return Err(sql_err!(
@@ -55,8 +61,6 @@ impl super::Storage {
                 "selected DML table was replaced"
             ));
         }
-        let versions = self.row_versions.read();
-        let rows = table.rows.read();
         let Some(&state) = rows.get(&rowid) else {
             return Ok(RowSelfChange::Original);
         };
@@ -641,8 +645,9 @@ pub(crate) struct RowReadView<'a> {
 
 impl<'a> RowReadView<'a> {
     pub(super) fn new(versions: &'a RowVersionPools, rows: &'a RowMap) -> Self {
-        let versions = versions.read();
-        let rows = rows.read();
+        let (versions, rows) = super::row_ownership::acquire(|| {
+            Ok((versions.try_read_for_batch()?, rows.try_read_for_batch()?))
+        });
         Self { rows, versions }
     }
 
@@ -652,26 +657,29 @@ impl<'a> RowReadView<'a> {
         rows: &RowMap,
         rowid: u64,
     ) -> Result<Option<RowRead<'static>>, SqlError> {
-        Self::point_with(versions, rows, rowid, |_, _| Ok(None))
+        let (owner, rows) = super::row_ownership::acquire(|| {
+            Ok((versions.try_read_for_batch()?, rows.try_read_for_batch()?))
+        });
+        let state = rows.get(&rowid).copied();
+        drop(rows);
+        Self::capture_with(versions, &owner, state, |_, _| Ok(None))
     }
 
-    pub(super) fn point_with(
+    pub(super) fn capture_with(
         versions: &RowVersionPools,
-        rows: &RowMap,
-        rowid: u64,
+        owner: &RowVersionState,
+        state: Option<RowState>,
         sources: impl FnOnce(
             RowState,
             &CapturedRowMetadata,
         ) -> Result<Option<CapturedRowSources>, SqlError>,
     ) -> Result<Option<RowRead<'static>>, SqlError> {
-        let owner = versions.read();
-        let Some(state) = rows.read().get(&rowid).copied() else {
+        let Some(state) = state else {
             return Ok(None);
         };
         let image = versions
             .metadata
-            .capture(&owner, state, |image| sources(state, image))?;
-        drop(owner);
+            .capture(owner, state, |image| sources(state, image))?;
         Ok(Some(RowRead {
             state,
             versions: VersionOwner::Retained(image),

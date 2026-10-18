@@ -5,7 +5,7 @@ or genuine intractability. Fixable defects must be fixed in the change that
 finds them. Planned work and architecture limits belong in [PLAN.md](PLAN.md).
 
 No externally blocked defects are currently recorded. Remaining work, including
-complete type publication, heap capture and remapping, whole eviction walks,
+complete type publication, bounded heap capture/remapping and cleanup walks,
 checkpoint coordination, object deletion and execution workers, belongs in PLAN.md.
 Completed contracts and explicit type limits belong in their owning technical guides.
 

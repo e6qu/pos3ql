@@ -66,10 +66,11 @@ old undo records cannot erase later edits or replacement types.
 Row writes, replay and table rewrites retain the bytes they need. Automatic
 local cleanup sorts, validates, assigns destinations and copies rows in bounded
 turns, including while an unrelated object download waits. Ordinary queries can
-progress between turns. Redundant saved-row eviction visits each map entry once;
-its complete walk still occupies one turn. Capture and final remapping still
-hold shared version ownership for their complete operation; explicit CHECKPOINT and critical memory
-pressure still wait for cleanup.
+progress between turns. Row reads, writes and cleanup release shared owners
+before waiting for one table. Post-checkpoint eviction and history release use
+shared storage access. Heap capture, final remapping, and whole cleanup walks
+still complete within one turn; explicit CHECKPOINT and critical memory pressure
+still wait for cleanup.
 
 Complete type-name changes and remaining maintenance still need publication
 coordination. The [implementation guide](docs/implemented-baseline.md) owns

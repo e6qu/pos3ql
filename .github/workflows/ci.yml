@@ -27,6 +27,8 @@ jobs:
         run: cargo miri test --lib --locked owned_write_inputs_scoped_arena -- --test-threads=1
       - name: Private heap copy ownership and publication
         run: cargo miri test --lib --locked shared_heap_relocation_heap_ -- --test-threads=1
+      - name: Heap row-map ownership and lock release
+        run: cargo miri test --lib --locked row_lock_owners_heap_ -- --test-threads=1
       - name: Resumable heap copy ownership
         run: cargo miri test --lib --locked sliced_heap_cleanup_heap_ -- --test-threads=1
       - name: Statement file ownership

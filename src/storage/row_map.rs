@@ -21,6 +21,20 @@ impl RowMap {
         })
     }
 
+    pub(super) fn try_read_for_batch(
+        &self,
+    ) -> Result<RwLockReadGuard<'_, FixedMap<u64, RowState>>, super::row_ownership::LockWait<'_>>
+    {
+        super::row_ownership::try_read(&self.state, "table row state lock poisoned")
+    }
+
+    pub(super) fn try_write_for_batch(
+        &self,
+    ) -> Result<RwLockWriteGuard<'_, FixedMap<u64, RowState>>, super::row_ownership::LockWait<'_>>
+    {
+        super::row_ownership::try_write(&self.state, "table row state lock poisoned")
+    }
+
     pub(super) fn read(&self) -> RwLockReadGuard<'_, FixedMap<u64, RowState>> {
         self.state.read().expect("table row state lock poisoned")
     }

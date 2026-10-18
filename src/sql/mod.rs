@@ -8892,9 +8892,7 @@ impl Engine {
                 }
             }
         {
-            if !self.storage.has_active_snapshots() {
-                self.storage.release_table_histories(slot);
-            }
+            self.storage.release_table_histories(slot);
             self.storage.evict_committed_table(slot);
             if let Err(error) = self.compact_scratch.compact_exclusive(&mut self.storage) {
                 let message = stack_format!(

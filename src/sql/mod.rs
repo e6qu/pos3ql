@@ -416,6 +416,7 @@ enum PostPublishPhase {
 pub(crate) enum CheckpointBeat {
     Idle,
     WaitingForReads,
+    WaitingForOwner,
     Advanced,
     Durable,
     DurableWithLocalFailure,
@@ -6075,7 +6076,8 @@ impl Engine {
         // commit boundary are complete, so the statement retry can resume the
         // same transaction instead of observing cleared undo buffers.
         if prepared_slot.is_none() {
-            self.storage.end_transaction_snapshots(txn.txid);
+            self.storage
+                .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
             self.storage.release_serializable(txn.txid);
             self.storage.release_table_locks(txn.txid);
             self.storage.release_row_locks(txn.txid);
@@ -7063,7 +7065,8 @@ impl Engine {
                     apply_wal_op(&mut self.storage, resolution_lsn, operation)
                 })
         } else if commit {
-            self.storage.end_transaction_snapshots(txn.txid);
+            self.storage
+                .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
             self.storage.release_serializable(txn.txid);
             self.storage.release_table_locks(txn.txid);
             self.storage.release_row_locks(txn.txid);
@@ -8794,7 +8797,8 @@ impl Engine {
     /// The event loop keeps advancing cleanup, checkpoints, and merges between
     /// messages and while idle until their pending work completes.
     pub fn checkpoint_work_pending(&self) -> bool {
-        self.post_publish_cleanup.is_some()
+        self.storage.history_cleanup_pending()
+            || self.post_publish_cleanup.is_some()
             || self.ckpt.as_ref().is_some_and(|c| {
                 c.sweep_active()
                     || c.maintenance_pending(&self.storage)
@@ -8802,10 +8806,12 @@ impl Engine {
             })
     }
 
-    /// Local cleanup can progress without borrowing any object-store client.
-    /// Other maintenance waits for all statement-owned block reads to finish.
+    /// Heap and history cleanup use no object client. Publication and merge
+    /// work still wait for statement-owned block reads to finish.
     pub(crate) fn checkpoint_can_progress(&self) -> bool {
-        self.post_publish_cleanup.is_some() || !self.block_reads_pending()
+        self.post_publish_cleanup.is_some()
+            || self.storage.history_cleanup_pending()
+            || !self.block_reads_pending()
     }
 
     /// Advances one maintenance turn; false requests retry backoff.
@@ -8813,12 +8819,13 @@ impl Engine {
         !self.checkpoint_beat().failed()
     }
 
-    /// Copy at most 64 KiB during ordinary local cleanup. Critical heap
-    /// pressure retains the existing synchronous cleanup contract. Publication
-    /// and merge beats still use synchronous object I/O after reads finish.
+    /// Snapshot cleanup visits at most 64 stable slots alongside a heap step.
+    /// Critical pressure, heap capture/remapping and other maintenance still
+    /// have whole turns. Publication and merge wait for owned reads to finish.
     pub(crate) fn checkpoint_beat(&mut self) -> CheckpointBeat {
         let reads_pending = self.block_reads_pending();
-        if reads_pending && self.post_publish_cleanup.is_none() {
+        let history_pending = self.storage.history_cleanup_pending();
+        if reads_pending && self.post_publish_cleanup.is_none() && !history_pending {
             return CheckpointBeat::WaitingForReads;
         }
         // Preserve the durable retry barrier whenever storage work can run.
@@ -8834,6 +8841,12 @@ impl Engine {
             crate::util::stderr_line(message.as_str());
             return CheckpointBeat::StorageFailure;
         }
+        let history = if history_pending {
+            self.storage
+                .advance_history_cleanup(core::num::NonZeroUsize::new(64).unwrap())
+        } else {
+            crate::storage::HistoryReclamation::Idle
+        };
         if self.post_publish_cleanup.is_some() {
             let cleanup = if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
                 self.finish_post_publish_cleanup()
@@ -8867,8 +8880,23 @@ impl Engine {
         let progress = if retried_upload {
             CheckpointBeat::Durable
         } else {
-            CheckpointBeat::Idle
+            match history {
+                crate::storage::HistoryReclamation::Idle => CheckpointBeat::Idle,
+                crate::storage::HistoryReclamation::Advanced => CheckpointBeat::Advanced,
+                crate::storage::HistoryReclamation::WaitingForOwner => {
+                    CheckpointBeat::WaitingForOwner
+                }
+            }
         };
+        if reads_pending {
+            return match history {
+                crate::storage::HistoryReclamation::Idle => CheckpointBeat::WaitingForReads,
+                crate::storage::HistoryReclamation::Advanced => CheckpointBeat::Advanced,
+                crate::storage::HistoryReclamation::WaitingForOwner => {
+                    CheckpointBeat::WaitingForOwner
+                }
+            };
+        }
         let heap_full = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 65;
         let history_full = self.storage.history_pressure();
         let temporary_map_full = self.storage.temporary_map_pressure();
@@ -18644,7 +18672,7 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
 }
 
 fn rollback_transaction_overlays(storage: &mut Storage, txn: &TxnState) {
-    storage.end_transaction_snapshots(txn.txid);
+    storage.end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
     storage.release_serializable(txn.txid);
     storage.release_table_locks(txn.txid);
     storage.release_row_locks(txn.txid);

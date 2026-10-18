@@ -201,7 +201,7 @@ impl Storage {
         capture: impl FnOnce(
             super::spill_generations::SpillGenerationImage,
             &super::spill_generations::SpillGenerationList,
-            &crate::mem::fixed_map::FixedMap<u64, super::RowState>,
+            &super::RowEntries,
         ) -> Result<T, SqlError>,
     ) -> Result<T, SqlError> {
         let table = &self.tables[table_slot];
@@ -535,7 +535,7 @@ impl RowWalkPool {
 
     fn retain_from(
         self: &Arc<Self>,
-        rows: &crate::mem::fixed_map::FixedMap<u64, super::RowState>,
+        rows: &super::RowEntries,
         skip_redundant: bool,
     ) -> Result<(RetainedRowIds, bool), SqlError> {
         let retained = self.capture(|rowids| {

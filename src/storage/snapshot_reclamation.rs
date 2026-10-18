@@ -1,21 +1,28 @@
-//! Reclaim history in bounded transitions while preserving newly admitted readers.
+//! Bound history maintenance by stable row slots; active readers keep their versions.
 
+use core::num::NonZeroUsize;
 use std::sync::{Mutex, TryLockError};
 
 use super::{Storage, prune_committed_history};
-use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
-use crate::mem::fixed_vec::FixedVec;
 
-const ROWS_PER_BATCH: usize = 64;
+const SLOTS_PER_BATCH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
 pub(super) struct SnapshotReclamation {
     workspace: Mutex<ReclamationWorkspace>,
 }
 
 struct ReclamationWorkspace {
-    rowids: FixedVec<u64>,
+    cursor: Option<ReclamationCursor>,
     retry: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ReclamationCursor {
+    table: usize,
+    slot: usize,
+    pressure_started: bool,
+    pressure_found: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -24,24 +31,42 @@ enum ReclamationMode {
     SkipBusy,
 }
 
+#[derive(Clone, Copy)]
+enum PressureScan {
+    Start,
+    Continue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotCleanup {
+    Schedule,
+    Finish,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryReclamation {
+    Idle,
+    Advanced,
+    WaitingForOwner,
+}
+
+struct PrunedSlots {
+    next: usize,
+    visited: usize,
+    complete: bool,
+    pressure: bool,
+}
+
 impl SnapshotReclamation {
-    fn capacity(config: &Config) -> usize {
-        config.table_rows.max(config.large_object_pages)
+    pub(super) fn budget_bytes() -> usize {
+        size_of::<Self>()
     }
 
-    pub(super) fn budget_bytes(config: &Config) -> usize {
-        size_of::<Self>() + Self::capacity(config) * size_of::<u64>()
-    }
-
-    pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+    pub(super) fn new(budget: &mut Budget) -> Result<Self, BudgetError> {
         budget.draw(size_of::<Self>(), "snapshot reclamation control")?;
         Ok(Self {
             workspace: Mutex::new(ReclamationWorkspace {
-                rowids: FixedVec::new(
-                    budget,
-                    "snapshot reclamation row identities",
-                    Self::capacity(config),
-                )?,
+                cursor: None,
                 retry: false,
             }),
         })
@@ -53,83 +78,162 @@ struct SnapshotRowOwners<'storage> {
     generations:
         std::sync::RwLockReadGuard<'storage, super::spill_generations::SpillGenerationList>,
     versions: std::sync::RwLockWriteGuard<'storage, super::row_versions::RowVersionState>,
-    rows: std::sync::RwLockWriteGuard<
-        'storage,
-        crate::mem::fixed_map::FixedMap<u64, super::RowState>,
-    >,
+    rows: std::sync::RwLockWriteGuard<'storage, super::RowEntries>,
 }
 
 impl Storage {
     pub(super) fn prune_snapshot_versions(&self) {
-        // Explicit release completes reclamation; statement admission only tries it.
+        // Explicit completion drains cleanup. Admission never owns this workspace.
         let mut workspace = self
             .snapshot_reclamation
             .workspace
             .lock()
             .expect("snapshot reclamation workspace poisoned");
         self.snapshot_state().statement_reclamation_pending = false;
-        workspace.retry =
-            !self.prune_snapshot_versions_in(&mut workspace.rowids, ReclamationMode::Wait);
-    }
-
-    pub(crate) fn prune_released_statement_snapshots(&self) {
-        let mut workspace = match self.snapshot_reclamation.workspace.try_lock() {
-            Ok(workspace) => workspace,
-            Err(TryLockError::WouldBlock) => return,
-            Err(TryLockError::Poisoned(_)) => panic!("snapshot reclamation workspace poisoned"),
-        };
-        let Ok(mut snapshots) =
-            super::row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")
-        else {
-            return;
-        };
-        if !snapshots.statement_reclamation_pending && !workspace.retry {
-            return;
-        }
-        // Consume only this request. A release during the pass sets a new one;
-        // skipped owners have a separate retry bit in this startup workspace.
-        snapshots.statement_reclamation_pending = false;
-        drop(snapshots);
-        workspace.retry =
-            !self.prune_snapshot_versions_in(&mut workspace.rowids, ReclamationMode::SkipBusy);
-    }
-
-    fn prune_snapshot_versions_in(
-        &self,
-        rowids: &mut FixedVec<u64>,
-        mode: ReclamationMode,
-    ) -> bool {
-        let mut complete = true;
+        workspace.cursor = None;
+        workspace.retry = false;
+        let mut pressure_started = false;
+        let mut pressure_found = false;
         for table in 0..self.tables.len() {
-            rowids.clear();
-            {
-                let rows = match mode {
-                    ReclamationMode::Wait => self.tables[table].rows.read(),
-                    ReclamationMode::SkipBusy => {
-                        let Ok(rows) = self.tables[table].rows.try_read_for_batch() else {
-                            complete = false;
-                            continue;
-                        };
-                        rows
-                    }
-                };
-                for (&rowid, _) in rows.iter() {
-                    rowids
-                        .push(rowid)
-                        .expect("reclamation identities sized to every table");
-                }
-            }
-            // Map deletion shifts backing slots. Retained identities ensure
-            // neither deletion nor an intervening update skips captured rows.
-            for batch in rowids.as_slice().chunks(ROWS_PER_BATCH) {
-                if !self.prune_snapshot_row_batch(table, batch, mode) {
-                    complete = false;
+            let mut slot = 0;
+            loop {
+                let batch = self
+                    .prune_snapshot_row_slots(
+                        table,
+                        slot,
+                        SLOTS_PER_BATCH,
+                        ReclamationMode::Wait,
+                        if pressure_started {
+                            PressureScan::Continue
+                        } else {
+                            PressureScan::Start
+                        },
+                    )
+                    .expect("waiting cleanup acquires its owners");
+                pressure_started = true;
+                pressure_found |= batch.pressure;
+                if batch.complete {
                     break;
                 }
+                slot = batch.next;
             }
         }
-        rowids.clear();
-        complete
+        assert!(self.finish_history_pressure(pressure_found, ReclamationMode::Wait));
+    }
+
+    pub(crate) fn history_cleanup_pending(&self) -> bool {
+        let workspace = match self.snapshot_reclamation.workspace.try_lock() {
+            Ok(workspace) => workspace,
+            Err(TryLockError::WouldBlock) => return true,
+            Err(TryLockError::Poisoned(_)) => panic!("snapshot reclamation workspace poisoned"),
+        };
+        if workspace.cursor.is_some() || workspace.retry {
+            return true;
+        }
+        let Ok(snapshots) =
+            super::row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")
+        else {
+            return true;
+        };
+        snapshots.statement_reclamation_pending
+    }
+
+    pub(crate) fn advance_history_cleanup(&self, work: NonZeroUsize) -> HistoryReclamation {
+        let mut workspace = match self.snapshot_reclamation.workspace.try_lock() {
+            Ok(workspace) => workspace,
+            Err(TryLockError::WouldBlock) => return HistoryReclamation::WaitingForOwner,
+            Err(TryLockError::Poisoned(_)) => panic!("snapshot reclamation workspace poisoned"),
+        };
+        if workspace.cursor.is_none() {
+            let Ok(mut snapshots) =
+                super::row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")
+            else {
+                return HistoryReclamation::WaitingForOwner;
+            };
+            if !snapshots.statement_reclamation_pending && !workspace.retry {
+                return HistoryReclamation::Idle;
+            }
+            // Releases arriving during the pass remain queued for another pass.
+            snapshots.statement_reclamation_pending = false;
+            workspace.retry = false;
+            workspace.cursor = Some(ReclamationCursor {
+                table: 0,
+                slot: 0,
+                pressure_started: false,
+                pressure_found: false,
+            });
+        }
+        let mut cursor = workspace.cursor.expect("cleanup pass started");
+        let mut remaining = work.get();
+        while remaining != 0 && cursor.table < self.tables.len() {
+            let limit = NonZeroUsize::new(remaining).expect("remaining work is nonzero");
+            match self.prune_snapshot_row_slots(
+                cursor.table,
+                cursor.slot,
+                limit,
+                ReclamationMode::SkipBusy,
+                if cursor.pressure_started {
+                    PressureScan::Continue
+                } else {
+                    PressureScan::Start
+                },
+            ) {
+                Some(batch) => {
+                    cursor.pressure_started = true;
+                    cursor.pressure_found |= batch.pressure;
+                    remaining -= batch.visited.max(1);
+                    if batch.complete {
+                        cursor.table += 1;
+                        cursor.slot = 0;
+                    } else {
+                        cursor.slot = batch.next;
+                    }
+                }
+                None => {
+                    workspace.retry = true;
+                    cursor.table += 1;
+                    cursor.slot = 0;
+                    remaining -= 1;
+                }
+            }
+        }
+        if cursor.table == self.tables.len() {
+            if workspace.retry {
+                workspace.cursor = None;
+                return HistoryReclamation::WaitingForOwner;
+            }
+            if !self.finish_history_pressure(cursor.pressure_found, ReclamationMode::SkipBusy) {
+                workspace.cursor = Some(cursor);
+                return HistoryReclamation::WaitingForOwner;
+            }
+            workspace.cursor = None;
+            HistoryReclamation::Advanced
+        } else {
+            workspace.cursor = Some(cursor);
+            HistoryReclamation::Advanced
+        }
+    }
+
+    fn finish_history_pressure(&self, found: bool, mode: ReclamationMode) -> bool {
+        let versions = match mode {
+            ReclamationMode::Wait => {
+                super::row_ownership::acquire(|| self.row_versions.try_write_for_batch())
+            }
+            ReclamationMode::SkipBusy => {
+                let Ok(versions) = self.row_versions.try_write_for_batch() else {
+                    return false;
+                };
+                versions
+            }
+        };
+        // A publisher after the pass began may have changed an earlier row.
+        // The version owner prevents clearing its signal during finalization.
+        if found || !versions.history_pressure_changed {
+            self.row_versions
+                .history_pressure
+                .store(found, std::sync::atomic::Ordering::Release);
+        }
+        true
     }
 
     fn try_snapshot_row_owners(
@@ -147,13 +251,14 @@ impl Storage {
         })
     }
 
-    fn prune_snapshot_row_batch(
+    fn prune_snapshot_row_slots(
         &self,
         table: usize,
-        rowids: &[u64],
+        start: usize,
+        work: NonZeroUsize,
         mode: ReclamationMode,
-    ) -> bool {
-        // Recheck retention after every wait and between bounded row batches.
+        pressure_scan: PressureScan,
+    ) -> Option<PrunedSlots> {
         let SnapshotRowOwners {
             snapshots,
             generations,
@@ -163,33 +268,54 @@ impl Storage {
             ReclamationMode::Wait => {
                 super::row_ownership::acquire(|| self.try_snapshot_row_owners(table))
             }
-            ReclamationMode::SkipBusy => {
-                let Ok(owners) = self.try_snapshot_row_owners(table) else {
-                    return false;
-                };
-                owners
-            }
+            ReclamationMode::SkipBusy => self.try_snapshot_row_owners(table).ok()?,
         };
+        if matches!(pressure_scan, PressureScan::Start) {
+            versions.history_pressure_changed = false;
+        }
+        assert!(
+            start <= rows.scan_end(),
+            "cleanup cursor exceeds used row slots"
+        );
+        if rows.is_empty() {
+            return Some(PrunedSlots {
+                next: rows.scan_end(),
+                visited: 0,
+                complete: true,
+                pressure: false,
+            });
+        }
+        let end = start.saturating_add(work.get()).min(rows.scan_end());
         let oldest = snapshots.oldest();
-        for rowid in rowids {
-            let Some(state) = rows.get_mut(rowid) else {
-                continue;
+        let mut pressure = false;
+        for slot in start..end {
+            let remove = if let Some((rowid, state)) = rows.entry_at_slot_mut(slot) {
+                prune_committed_history(
+                    &mut versions.committed_row_versions,
+                    &mut state.history,
+                    oldest,
+                );
+                pressure |= !state.history.is_empty()
+                    && state.history.len().saturating_add(2) >= self.max_row_versions_per_row;
+                (oldest.is_none()
+                    && generations.is_empty()
+                    && state.committed.is_none()
+                    && state.history.is_empty()
+                    && state.pending.is_none())
+                .then_some(*rowid)
+            } else {
+                None
             };
-            prune_committed_history(
-                &mut versions.committed_row_versions,
-                &mut state.history,
-                oldest,
-            );
-            if oldest.is_none()
-                && generations.is_empty()
-                && state.committed.is_none()
-                && state.history.is_empty()
-                && state.pending.is_none()
-            {
-                rows.remove(rowid);
+            if let Some(rowid) = remove {
+                rows.remove(&rowid).expect("selected row exists");
             }
         }
-        true
+        Some(PrunedSlots {
+            next: end,
+            visited: end - start,
+            complete: end == rows.scan_end(),
+            pressure,
+        })
     }
 }
 
@@ -219,6 +345,37 @@ mod tests {
             .unwrap();
         storage.set_lsn(7);
         (storage, first, second)
+    }
+
+    fn finish_history_work(storage: &Storage) {
+        let reserved: usize = storage
+            .tables
+            .iter()
+            .map(|table| table.rows.capacity() + 1)
+            .sum();
+        for _ in 0..=reserved * 2 + 1 {
+            if !storage.history_cleanup_pending() {
+                return;
+            }
+            assert_ne!(
+                storage.advance_history_cleanup(SLOTS_PER_BATCH),
+                HistoryReclamation::WaitingForOwner
+            );
+        }
+        panic!("history cleanup did not finish within its reserved slot bound");
+    }
+
+    fn finish_blocked_pass(storage: &Storage) {
+        // These fixtures have one occupied slot per table. A busy table is
+        // skipped, so at most one turn per physical table completes the pass.
+        for _ in 0..=storage.tables.len() {
+            if storage.advance_history_cleanup(SLOTS_PER_BATCH)
+                == HistoryReclamation::WaitingForOwner
+            {
+                return;
+            }
+        }
+        panic!("busy-owner cleanup did not retain its retry request");
     }
 
     #[test]
@@ -255,7 +412,17 @@ mod tests {
             drop(wait);
             drop(held);
 
-            assert!(storage.prune_snapshot_row_batch(first, &[1], ReclamationMode::Wait));
+            assert!(
+                storage
+                    .prune_snapshot_row_slots(
+                        first,
+                        0,
+                        SLOTS_PER_BATCH,
+                        ReclamationMode::Wait,
+                        PressureScan::Continue
+                    )
+                    .is_some()
+            );
             assert_eq!(storage.tables[first].rows.get(&1).unwrap().history.len(), 1);
             storage.release_snapshot(99);
             assert!(
@@ -278,24 +445,19 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reclamation_budget_matches_largest_table_and_rejects_short_startup() {
-        let mut config = test_config();
-        for (rows, pages) in [(16, 8), (8, 16)] {
-            config.table_rows = rows;
-            config.large_object_pages = pages;
-            let bytes = SnapshotReclamation::budget_bytes(&config);
-            let mut budget = Budget::new(bytes);
-            let workspace = SnapshotReclamation::new(&config, &mut budget).unwrap();
-            assert_eq!(budget.used(), bytes);
-            let state = workspace.workspace.lock().unwrap();
-            assert_eq!(state.rowids.capacity(), 16);
-            assert!(!state.retry);
-            drop(state);
-            let mut short = Budget::new(bytes - 1);
-            let error = SnapshotReclamation::new(&config, &mut short).err().unwrap();
-            assert_eq!(error.what, "snapshot reclamation row identities");
-            assert_eq!(error.requested, 16 * size_of::<u64>());
-        }
+    fn bounded_snapshot_control_budget_is_fixed_and_rejects_short_startup() {
+        let bytes = SnapshotReclamation::budget_bytes();
+        let mut budget = Budget::new(bytes);
+        let control = SnapshotReclamation::new(&mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        let state = control.workspace.lock().unwrap();
+        assert!(state.cursor.is_none());
+        assert!(!state.retry);
+        drop(state);
+        let mut short = Budget::new(bytes - 1);
+        let error = SnapshotReclamation::new(&mut short).err().unwrap();
+        assert_eq!(error.what, "snapshot reclamation control");
+        assert_eq!(error.requested, bytes);
     }
 
     #[test]
@@ -331,10 +493,11 @@ mod tests {
                 let cleanup = scope.spawn(move || {
                     crate::mem::guard::forbid_alloc(|| match mode {
                         0 => cleanup_storage.release_snapshot(99),
-                        1 => cleanup_storage.end_transaction_snapshots(99),
+                        1 => cleanup_storage
+                            .end_transaction_snapshots(99, crate::storage::SnapshotCleanup::Finish),
                         _ => {
                             drop(reader);
-                            cleanup_storage.prune_released_statement_snapshots();
+                            cleanup_storage.prune_snapshot_versions();
                         }
                     })
                 });
@@ -413,8 +576,8 @@ mod tests {
                         .workspace
                         .lock()
                         .unwrap()
-                        .rowids
-                        .is_empty()
+                        .cursor
+                        .is_none()
                 );
             });
         }
@@ -431,7 +594,17 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             let state = storage.resident_row_state(table, 1).unwrap().unwrap();
-            assert!(storage.prune_snapshot_row_batch(table, &[1], ReclamationMode::Wait));
+            assert!(
+                storage
+                    .prune_snapshot_row_slots(
+                        table,
+                        0,
+                        SLOTS_PER_BATCH,
+                        ReclamationMode::Wait,
+                        PressureScan::Continue
+                    )
+                    .is_some()
+            );
             assert_eq!(
                 storage
                     .resident_row_state(table, 1)
@@ -466,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reclamation_removes_every_deleted_row_across_shifted_map_slots() {
+    fn snapshot_reclamation_removes_every_deleted_row_across_stable_slots() {
         let mut config = test_config();
         config.table_rows = 1024;
         config.large_object_pages = 2048;
@@ -500,8 +673,8 @@ mod tests {
                     .workspace
                     .lock()
                     .unwrap()
-                    .rowids
-                    .is_empty()
+                    .cursor
+                    .is_none()
             );
         });
     }
@@ -584,7 +757,6 @@ mod tests {
                 finished.load(Ordering::Acquire)
             });
             assert_eq!(held.get(&1).unwrap().history.len(), 1);
-            // Unblock even a regression before joining the worker.
             drop(held);
             (progressed, worker.join().unwrap())
         });
@@ -594,6 +766,24 @@ mod tests {
         );
         assert_eq!(reader.snapshot(), 11);
         crate::mem::guard::forbid_alloc(|| {
+            // Admission does no maintenance, including on an available table.
+            assert_eq!(
+                storage.tables[second].rows.get(&1).unwrap().history.len(),
+                1
+            );
+            assert!(storage.snapshot_state().statement_reclamation_pending);
+            assert!(
+                storage
+                    .snapshot_reclamation
+                    .workspace
+                    .lock()
+                    .unwrap()
+                    .cursor
+                    .is_none()
+            );
+            drop(reader);
+            let held = storage.tables[first].rows.write();
+            finish_blocked_pass(&storage);
             assert!(
                 storage.tables[second]
                     .rows
@@ -602,17 +792,11 @@ mod tests {
                     .history
                     .is_empty()
             );
+            assert_eq!(held.get(&1).unwrap().history.len(), 1);
             assert!(storage.snapshot_reclamation.workspace.lock().unwrap().retry);
             assert!(!storage.snapshot_state().statement_reclamation_pending);
-            storage.prune_released_statement_snapshots();
-            assert_eq!(storage.tables[first].rows.get(&1).unwrap().history.len(), 1);
-            let workspace = storage.snapshot_reclamation.workspace.lock().unwrap();
-            assert!(!workspace.retry);
-            assert!(workspace.rowids.is_empty());
-            drop(workspace);
-            drop(reader);
-            assert!(storage.snapshot_state().statement_reclamation_pending);
-            storage.prune_released_statement_snapshots();
+            drop(held);
+            finish_history_work(&storage);
             assert!(
                 storage.tables[first]
                     .rows
@@ -621,7 +805,7 @@ mod tests {
                     .history
                     .is_empty()
             );
-            assert!(!storage.snapshot_state().statement_reclamation_pending);
+            assert!(!storage.history_cleanup_pending());
             storage
                 .with_row_bytes(first, 1, image, |bytes| {
                     let mut values = [Datum::Null];
@@ -650,7 +834,7 @@ mod tests {
         let finished = AtomicBool::new(false);
         let progressed = std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
-                crate::mem::guard::forbid_alloc(|| storage.prune_released_statement_snapshots());
+                crate::mem::guard::forbid_alloc(|| finish_blocked_pass(&storage));
                 finished.store(true, Ordering::Release);
             });
             let progressed = crate::mem::guard::forbid_alloc(|| {
@@ -680,7 +864,7 @@ mod tests {
             assert!(storage.snapshot_reclamation.workspace.lock().unwrap().retry);
             assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
             storage.register_snapshot(100, 7).unwrap();
-            storage.prune_released_statement_snapshots();
+            finish_history_work(&storage);
             assert!(!storage.snapshot_reclamation.workspace.lock().unwrap().retry);
             assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
             storage.release_snapshot(100);
@@ -708,7 +892,10 @@ mod tests {
             let progressed = std::thread::scope(|scope| {
                 let worker = scope.spawn(|| {
                     crate::mem::guard::forbid_alloc(|| {
-                        storage.prune_released_statement_snapshots()
+                        assert_eq!(
+                            storage.advance_history_cleanup(SLOTS_PER_BATCH),
+                            HistoryReclamation::WaitingForOwner
+                        );
                     });
                     finished.store(true, Ordering::Release);
                 });
@@ -730,7 +917,7 @@ mod tests {
             );
             crate::mem::guard::forbid_alloc(|| {
                 assert!(storage.snapshot_state().statement_reclamation_pending);
-                storage.prune_released_statement_snapshots();
+                finish_history_work(&storage);
                 assert!(!storage.snapshot_state().statement_reclamation_pending);
             });
         }
@@ -741,7 +928,17 @@ mod tests {
         let (storage, table, _) = fixture();
         crate::mem::guard::forbid_alloc(|| {
             let rows = storage.tables[table].rows.write();
-            assert!(!storage.prune_snapshot_row_batch(table, &[1], ReclamationMode::SkipBusy));
+            assert!(
+                storage
+                    .prune_snapshot_row_slots(
+                        table,
+                        0,
+                        SLOTS_PER_BATCH,
+                        ReclamationMode::SkipBusy,
+                        PressureScan::Continue
+                    )
+                    .is_none()
+            );
             assert!(storage.snapshots.try_lock().is_ok());
             assert!(storage.row_versions.test_write().is_ok());
             assert!(
@@ -782,7 +979,9 @@ mod tests {
                     crate::mem::guard::forbid_alloc(|| drop(reader));
                 });
                 start.wait();
-                crate::mem::guard::forbid_alloc(|| storage.prune_released_statement_snapshots());
+                crate::mem::guard::forbid_alloc(|| {
+                    storage.advance_history_cleanup(SLOTS_PER_BATCH)
+                });
             });
             crate::mem::guard::forbid_alloc(|| {
                 if !storage.tables[table]
@@ -792,12 +991,9 @@ mod tests {
                     .history
                     .is_empty()
                 {
-                    assert!(
-                        storage.snapshot_state().statement_reclamation_pending
-                            || storage.snapshot_reclamation.workspace.lock().unwrap().retry
-                    );
+                    assert!(storage.history_cleanup_pending());
                 }
-                storage.prune_released_statement_snapshots();
+                finish_history_work(&storage);
                 assert!(
                     storage.tables[table]
                         .rows
@@ -810,5 +1006,316 @@ mod tests {
                 assert!(!storage.snapshot_reclamation.workspace.lock().unwrap().retry);
             });
         }
+    }
+
+    #[test]
+    fn bounded_snapshot_work_counts_slots_through_lookup_shifts_and_reuse() {
+        let mut config = test_config();
+        config.max_tables = 1;
+        config.table_rows = 128;
+        config.large_object_pages = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("bounded_deleted", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        storage.set_lsn(7);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut deleted = RowState::committed_only_at(super::super::RowLoc::test(0, 0), 7);
+            deleted.committed = None;
+            for rowid in 0..128 {
+                storage.tables[table].rows.insert(rowid, deleted).unwrap();
+            }
+            let released = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+            drop(released);
+            let one = NonZeroUsize::new(1).unwrap();
+            assert_eq!(
+                storage.advance_history_cleanup(one),
+                HistoryReclamation::Advanced
+            );
+            assert_eq!(storage.tables[table].rows.len(), 127);
+            assert!(storage.tables[table].rows.get(&0).is_none());
+            assert_eq!(
+                storage
+                    .snapshot_reclamation
+                    .workspace
+                    .lock()
+                    .unwrap()
+                    .cursor
+                    .unwrap()
+                    .slot,
+                1
+            );
+            storage.tables[table].rows.remove(&1).unwrap();
+            storage.tables[table].rows.insert(1000, deleted).unwrap();
+            storage.tables[table].rows.insert(1001, deleted).unwrap();
+            let released = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
+            drop(released);
+            assert_eq!(
+                storage.advance_history_cleanup(one),
+                HistoryReclamation::Advanced
+            );
+            assert_eq!(storage.tables[table].rows.len(), 127);
+            assert!(storage.tables[table].rows.get(&1000).is_none());
+            assert!(storage.tables[table].rows.get(&1001).is_some());
+            finish_history_work(&storage);
+            assert!(storage.tables[table].rows.is_empty());
+            assert!(!storage.history_cleanup_pending());
+        });
+    }
+
+    #[test]
+    fn bounded_snapshot_release_during_a_partial_pass_remains_queued() {
+        let (storage, table, _) = fixture();
+        let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+        let state = storage.resident_row_state(table, 1).unwrap().unwrap();
+        let selected = storage
+            .visible_row_home_at(table, 1, state, 99, SNAPSHOT_ALL, 7)
+            .unwrap()
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
+            storage
+                .write_pending_image_untracked(table, 1, 8, 1, Some(image))
+                .unwrap();
+            storage.commit_row(table, 1, 8, 9).unwrap();
+            storage.observe_lsn(9);
+            let released = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
+            drop(released);
+            let one = NonZeroUsize::new(1).unwrap();
+            assert_eq!(
+                storage.advance_history_cleanup(one),
+                HistoryReclamation::Advanced
+            );
+            assert!(
+                storage
+                    .snapshot_reclamation
+                    .workspace
+                    .lock()
+                    .unwrap()
+                    .cursor
+                    .is_some()
+            );
+            assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
+            drop(reader);
+            for _ in 0..=storage.tables.len() {
+                let active = storage
+                    .snapshot_reclamation
+                    .workspace
+                    .lock()
+                    .unwrap()
+                    .cursor
+                    .is_some();
+                if !active {
+                    break;
+                }
+                assert_eq!(
+                    storage.advance_history_cleanup(one),
+                    HistoryReclamation::Advanced
+                );
+            }
+            assert!(
+                storage
+                    .snapshot_reclamation
+                    .workspace
+                    .lock()
+                    .unwrap()
+                    .cursor
+                    .is_none()
+            );
+            assert!(storage.snapshot_state().statement_reclamation_pending);
+            assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
+            finish_history_work(&storage);
+            assert!(
+                storage.tables[table]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .history
+                    .is_empty()
+            );
+            storage
+                .with_row_bytes(table, 1, selected, |bytes| {
+                    let mut values = [Datum::Null];
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                    assert_eq!(values[0], Datum::Int4(1));
+                    Ok(())
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn bounded_snapshot_transaction_end_drains_work_without_reusing_live_lease() {
+        let (storage, table, _) = fixture();
+        let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.register_snapshot(99, 7).unwrap();
+            let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
+            storage
+                .write_pending_image_untracked(table, 1, 8, 1, Some(image))
+                .unwrap();
+            storage.commit_row(table, 1, 8, 9).unwrap();
+            storage.observe_lsn(9);
+            let released = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
+            drop(released);
+            assert_eq!(
+                storage.advance_history_cleanup(NonZeroUsize::new(1).unwrap()),
+                HistoryReclamation::Advanced
+            );
+            assert!(
+                storage
+                    .snapshot_reclamation
+                    .workspace
+                    .lock()
+                    .unwrap()
+                    .cursor
+                    .is_some()
+            );
+            storage.end_transaction_snapshots(99, crate::storage::SnapshotCleanup::Finish);
+            assert!(!storage.has_active_snapshots());
+            assert!(
+                storage.tables[table]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .history
+                    .is_empty()
+            );
+            assert!(
+                storage
+                    .snapshot_reclamation
+                    .workspace
+                    .lock()
+                    .unwrap()
+                    .cursor
+                    .is_none()
+            );
+            assert!(!storage.snapshot_reclamation.workspace.lock().unwrap().retry);
+            assert_eq!(storage.snapshot_state().statements.len(), 1);
+            drop(reader);
+            assert!(storage.snapshot_state().statements.is_empty());
+            finish_history_work(&storage);
+            assert!(!storage.history_cleanup_pending());
+        });
+    }
+
+    #[test]
+    fn bounded_snapshot_pressure_signal_keeps_publication_after_an_earlier_slot() {
+        let mut config = test_config();
+        config.max_tables = 1;
+        config.table_rows = 4;
+        config.large_object_pages = 1;
+        config.max_row_versions_per_row = 3;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "pressure_during_scan",
+                &[("id", ColType::Int4, true)],
+            ))
+            .unwrap();
+        let location = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+        storage.tables[table]
+            .rows
+            .insert(1, RowState::committed_only_at(location, 7))
+            .unwrap();
+        storage.set_lsn(7);
+        let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let released = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
+            drop(released);
+            assert_eq!(
+                storage.advance_history_cleanup(NonZeroUsize::new(1).unwrap()),
+                HistoryReclamation::Advanced
+            );
+            assert!(!storage.history_pressure());
+            let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
+            storage
+                .write_pending_image_untracked(table, 1, 8, 1, Some(image))
+                .unwrap();
+            storage.commit_row(table, 1, 8, 9).unwrap();
+            storage.observe_lsn(9);
+            assert!(storage.history_pressure());
+            finish_history_work(&storage);
+            assert!(
+                storage.history_pressure(),
+                "a completed pass erased later publication"
+            );
+            assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
+            drop(reader);
+            finish_history_work(&storage);
+            assert!(!storage.history_pressure());
+            assert!(
+                storage.tables[table]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .history
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn bounded_snapshot_obsolete_boundary_does_not_fill_one_version_row() {
+        let mut config = test_config();
+        config.max_tables = 1;
+        config.table_rows = 4;
+        config.large_object_pages = 1;
+        config.max_row_versions_per_row = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        let table = storage
+            .create_table(make_def("one_history_slot", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        let location = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+        storage.tables[table]
+            .rows
+            .insert(1, RowState::committed_only_at(location, 7))
+            .unwrap();
+        storage.set_lsn(7);
+        let old = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
+            storage
+                .write_pending_image_untracked(table, 1, 8, 1, Some(image))
+                .unwrap();
+            storage.commit_row(table, 1, 8, 9).unwrap();
+            storage.observe_lsn(9);
+            drop(old);
+            let current = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
+            assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
+            let image = storage.heap.append_row_image(&[Datum::Int4(30)]).unwrap();
+            storage
+                .write_pending_image_untracked(table, 1, 10, 1, Some(image))
+                .unwrap();
+            storage.commit_row(table, 1, 10, 11).unwrap();
+            storage.observe_lsn(11);
+            let state = storage.resident_row_state(table, 1).unwrap().unwrap();
+            let selected = storage
+                .visible_row_home_at(table, 1, state, 100, SNAPSHOT_ALL, current.snapshot())
+                .unwrap()
+                .unwrap();
+            storage
+                .with_row_bytes(table, 1, selected, |bytes| {
+                    let mut values = [Datum::Null];
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                    assert_eq!(values[0], Datum::Int4(20));
+                    Ok(())
+                })
+                .unwrap();
+            drop(current);
+            finish_history_work(&storage);
+            assert!(!storage.history_pressure());
+            assert!(
+                storage.tables[table]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .history
+                    .is_empty()
+            );
+        });
     }
 }

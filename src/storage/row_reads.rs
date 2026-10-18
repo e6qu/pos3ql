@@ -1,5 +1,6 @@
 //! Row images whose chain handles retain the version owner that issued them.
 
+use super::RowEntries;
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
@@ -20,7 +21,6 @@ use super::spill_generations::{
     CapturedSpillRoots, QueryRootLease, SpilledRowRead, SpilledRowState,
 };
 use super::{CommittedVersion, PendingChange, RowHome, RowLoc, RowState};
-use crate::mem::fixed_map::FixedMap;
 
 const METADATA_READS_PER_WORKSPACE: usize = 64;
 
@@ -639,7 +639,7 @@ impl<'owner> RowRead<'owner> {
 /// Acquire version ownership before map ownership. A complete walk borrows
 /// this owner rather than recursively acquiring the pool lock for each row.
 pub(crate) struct RowReadView<'a> {
-    rows: RwLockReadGuard<'a, FixedMap<u64, RowState>>,
+    rows: RwLockReadGuard<'a, RowEntries>,
     versions: RwLockReadGuard<'a, RowVersionState>,
 }
 
@@ -721,7 +721,7 @@ mod tests {
         )
     }
 
-    fn install(versions: &mut RowVersionState, rows: &mut FixedMap<u64, RowState>, epoch: u32) {
+    fn install(versions: &mut RowVersionState, rows: &mut RowEntries, epoch: u32) {
         for (_, state) in rows.iter() {
             let mut pending = state.pending;
             clear_pending_versions(&mut versions.pending_row_versions, &mut pending);

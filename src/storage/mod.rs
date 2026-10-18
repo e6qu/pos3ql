@@ -46,6 +46,7 @@ pub(crate) mod rowenc;
 mod snapshot_leases;
 mod snapshot_reclamation;
 use snapshot_reclamation::SnapshotReclamation;
+pub(crate) use snapshot_reclamation::{HistoryReclamation, SnapshotCleanup};
 mod statistics;
 mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
@@ -63,7 +64,7 @@ pub(crate) use row_images::{
     OrderedRowSnapshot, RowByteRead, RowSnapshot, TableRowSnapshot, VisibleRowHome,
 };
 use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
-pub(crate) use row_map::RowMap;
+pub(crate) use row_map::{RowEntries, RowMap};
 pub(crate) use row_reads::{RowRead, RowSelfChange};
 use row_reads::{RowReadView, RowReadVisitor};
 pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
@@ -15096,7 +15097,7 @@ impl Storage {
             ))
         });
         for _ in 0..WORK_PER_TURN {
-            if *cursor == rows.backing_slot_count() {
+            if *cursor == rows.scan_end() {
                 debug_assert!(rows.is_empty());
                 return true;
             }
@@ -15107,7 +15108,8 @@ impl Storage {
             let state = rows.remove(&rowid).expect("selected row exists");
             release_pending_chain(&mut versions.pending_row_versions, state.pending.tail);
             release_committed_chain(&mut versions.committed_row_versions, state.history.tail);
-            // Backshift deletion may move the next row into this slot.
+            // Lookup backshifts never move a different row's stable slot.
+            *cursor += 1;
         }
         false
     }
@@ -17860,8 +17862,9 @@ impl Storage {
             + statement_snapshot_capacity(config) * size_of::<StatementSnapshot>()
             + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
             + 2 * config.collation_scratch_bytes
-            + table_slot_capacity(config)
-                * (size_of::<Table>() + FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
+            + table_slot_capacity(config) * size_of::<Table>()
+            + config.max_tables * RowMap::budget_bytes(config.table_rows)
+            + RowMap::budget_bytes(config.large_object_pages)
             + table_slot_capacity(config).saturating_mul(
                 SpillGenerationRoster::member_budget_bytes(config.max_spill_generations_per_table),
             )
@@ -17870,7 +17873,7 @@ impl Storage {
             + RowVersionPools::control_bytes()
             + RowVersionPools::metadata_budget_bytes(config)
             + Self::retained_row_walk_budget_bytes(config)
-            + SnapshotReclamation::budget_bytes(config)
+            + SnapshotReclamation::budget_bytes()
             + row_ownership::HeapRowOwnership::budget_bytes(config)
             + SpillRootRegistry::budget_bytes(config)
             + QueryRootPool::budget_bytes(config)
@@ -17897,8 +17900,6 @@ impl Storage {
                 .max_indexes
                 .saturating_mul(config.max_brin_unsummarized_ranges_per_index)
                 .saturating_mul(size_of::<u64>())
-            + FixedMap::<u64, RowState>::budget_bytes(config.large_object_pages)
-                .saturating_sub(FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
             + config.max_rules * size_of::<RuleDef>()
             + config.max_collations * size_of::<CollationDef>()
             + config.max_conversions * size_of::<ConversionDef>()
@@ -18002,7 +18003,7 @@ impl Storage {
             definition_images::TableDefinitionImagePool::new(config, budget)?;
         let row_versions = RowVersionPools::new(config, budget)?;
         let row_walks = RowWalkPool::new(config, budget)?;
-        let snapshot_reclamation = SnapshotReclamation::new(config, budget)?;
+        let snapshot_reclamation = SnapshotReclamation::new(budget)?;
         let heap_row_ownership = row_ownership::HeapRowOwnership::new(config, budget)?;
         let spill_roots = SpillRootRegistry::new(config, budget)?;
         let query_roots = QueryRootPool::new(config, budget)?;
@@ -31828,14 +31829,9 @@ impl Storage {
     /// Published versions are then read through the immutable SST forest and
     /// the resident side chain is released.
     pub fn history_pressure(&self) -> bool {
-        let maximum = self.max_row_versions_per_row;
-        self.tables.iter().any(|table| {
-            table.live()
-                && table
-                    .rows
-                    .iter()
-                    .any(|(_, state)| state.history.len().saturating_add(2) >= maximum)
-        })
+        self.row_versions
+            .history_pressure
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Removes a committed row outright (journal replay of a DELETE), retaining
@@ -32015,6 +32011,12 @@ impl Storage {
                 self.max_row_versions_per_row,
                 old,
             )?;
+            if state.history.len().saturating_add(2) >= self.max_row_versions_per_row {
+                versions.history_pressure_changed = true;
+                self.row_versions
+                    .history_pressure
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
         } else {
             prune_committed_history(
                 &mut versions.committed_row_versions,
@@ -52984,24 +52986,28 @@ mod tests {
 
     #[test]
     fn table_state_row_map_controls_are_charged_at_startup() {
-        let mut config = test_config();
-        config.query_workspace_slots = 2;
-        let bytes = config.memtable_bytes + Storage::extra_budget_bytes(&config);
-        let mut budget = Budget::new(bytes);
-        let mut storage = Storage::new(&config, &mut budget).unwrap();
-        storage.configure_collation(&config, &mut budget).unwrap();
-        assert_eq!(budget.remaining(), 0);
-        assert!(size_of::<RowMap>() > size_of::<FixedMap<u64, RowState>>());
-        assert_eq!(storage.tables.len(), table_slot_capacity(&config));
-        for (slot, table) in storage.tables.iter().enumerate() {
-            assert_eq!(
-                table.rows.capacity(),
-                if slot == config.max_tables {
-                    config.large_object_pages
-                } else {
-                    config.table_rows
-                }
-            );
+        for (rows, pages) in [(8, 16), (16, 8)] {
+            let mut config = test_config();
+            config.query_workspace_slots = 2;
+            config.table_rows = rows;
+            config.large_object_pages = pages;
+            let bytes = config.memtable_bytes + Storage::extra_budget_bytes(&config);
+            let mut budget = Budget::new(bytes);
+            let mut storage = Storage::new(&config, &mut budget).unwrap();
+            storage.configure_collation(&config, &mut budget).unwrap();
+            assert_eq!(budget.remaining(), 0);
+            assert!(size_of::<RowMap>() > size_of::<RowEntries>());
+            assert_eq!(storage.tables.len(), table_slot_capacity(&config));
+            for (slot, table) in storage.tables.iter().enumerate() {
+                assert_eq!(
+                    table.rows.capacity(),
+                    if slot == config.max_tables {
+                        pages
+                    } else {
+                        rows
+                    }
+                );
+            }
         }
     }
 

@@ -75,12 +75,16 @@ local cleanup sorts, validates, assigns destinations and copies rows in bounded
 turns, including while an unrelated object download waits. Ordinary queries can
 progress between turns. Row reads, writes and cleanup release shared owners
 before waiting for one table. Post-checkpoint eviction and history release use
-shared storage access. Statement admission tries history cleanup without waiting
-for busy registry, table, saved-file or version owners; skipped work remains
-pending for a later admission. Explicit transaction release still completes
-its cleanup. Heap capture, final remapping, and whole cleanup walks still
-complete within one turn; explicit CHECKPOINT and critical memory pressure still
-wait for cleanup.
+shared storage access. Reader-history cleanup visits at most 64 stable row slots
+per ordinary maintenance turn, including while idle or an unrelated download
+waits. Starting a statement and normal transaction completion schedule work;
+they do not drain a table or copy all row identities. Busy owners retry without
+changing storage readiness. A startup cursor preserves partial work, skipped
+tables and new releases. Row publication maintains a pressure signal so testing
+history pressure also needs no whole-table scan. Synchronous history completion
+is an explicit internal choice. Heap capture, final remapping, post-checkpoint
+eviction and other cleanup walks still have whole turns; explicit CHECKPOINT
+and critical heap pressure still wait for cleanup.
 
 Complete type-name changes and remaining maintenance still need publication
 coordination. The [implementation guide](docs/implemented-baseline.md) owns

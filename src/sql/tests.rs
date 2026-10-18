@@ -86288,3 +86288,183 @@ fn enum_value_identity_views_preserve_grammar_literals_and_typed_constants() {
         expected
     );
 }
+
+#[test]
+fn bounded_snapshot_history_advances_between_queries_without_object_store() {
+    let mut config = test_config("bounded-history-memory");
+    config.object_store_on = false;
+    config.object_store_sim = false;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.max_tables = 2;
+    config.table_rows = 512;
+    config.large_object_pages = 1;
+    config.memtable_bytes = 4 << 20;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE TABLE history_orders(id integer PRIMARY KEY, value integer); \
+         INSERT INTO history_orders SELECT i, i FROM generate_series(1, 256) AS g(i)",
+        4 << 20,
+    );
+    assert!(!message_types(&output).contains(&b'E'));
+    assert!(!engine.checkpoint_enabled());
+    let reader = engine
+        .storage
+        .retain_statement_snapshot(99, |lsn| lsn)
+        .unwrap();
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "UPDATE history_orders SET value = value + 1",
+        4 << 20,
+    );
+    assert!(!message_types(&output).contains(&b'E'));
+    let table = engine
+        .storage
+        .find_table("public", "history_orders")
+        .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        for _ in 0..16 {
+            if !engine.storage.history_cleanup_pending() {
+                break;
+            }
+            assert!(engine.maybe_checkpoint());
+        }
+        assert!(!engine.storage.history_cleanup_pending());
+        assert_eq!(
+            engine
+                .storage
+                .resident_rows(table)
+                .iter()
+                .filter(|(_, state)| !state.history.is_empty())
+                .count(),
+            256
+        );
+        drop(reader);
+        assert!(engine.checkpoint_work_pending());
+        assert!(engine.checkpoint_can_progress());
+        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
+        assert_eq!(
+            engine
+                .storage
+                .resident_rows(table)
+                .iter()
+                .filter(|(_, state)| !state.history.is_empty())
+                .count(),
+            192
+        );
+        assert!(engine.storage.history_cleanup_pending());
+    });
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*), min(id), max(id) FROM history_orders",
+            4 << 20
+        )),
+        ["256|1|256"]
+    );
+    crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(
+            engine
+                .storage
+                .resident_rows(table)
+                .iter()
+                .filter(|(_, state)| !state.history.is_empty())
+                .count(),
+            192,
+            "an ordinary query drained history outside maintenance turns"
+        );
+        for _ in 0..16 {
+            if !engine.storage.history_cleanup_pending() {
+                break;
+            }
+            assert!(engine.maybe_checkpoint());
+        }
+        assert!(!engine.checkpoint_work_pending());
+        assert_eq!(
+            engine
+                .storage
+                .resident_rows(table)
+                .iter()
+                .filter(|(_, state)| !state.history.is_empty())
+                .count(),
+            0
+        );
+        assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Idle);
+    });
+}
+
+#[test]
+fn bounded_snapshot_history_progresses_while_unrelated_download_waits() {
+    check_cleanup_during_download(
+        "bounded-history-download",
+        false,
+        false,
+        |engine, budget| {
+            let reader = engine
+                .storage
+                .retain_statement_snapshot(99, |lsn| lsn)
+                .unwrap();
+            let output = run_with_fixed_memory(
+                engine,
+                budget,
+                "UPDATE cleanup_orders SET note = 'updated'",
+                4 << 20,
+            );
+            assert!(!message_types(&output).contains(&b'E'));
+            let table = engine
+                .storage
+                .find_table("public", "cleanup_orders")
+                .unwrap();
+            let fd = engine.pending_block_read_fd(0).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(
+                    engine
+                        .storage
+                        .resident_rows(table)
+                        .iter()
+                        .filter(|(_, state)| !state.history.is_empty())
+                        .count(),
+                    80
+                );
+                drop(reader);
+                assert!(engine.checkpoint_can_progress());
+                assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
+                assert_eq!(
+                    engine
+                        .storage
+                        .resident_rows(table)
+                        .iter()
+                        .filter(|(_, state)| !state.history.is_empty())
+                        .count(),
+                    16
+                );
+                assert_eq!(engine.pending_block_read_fd(0), Some(fd));
+                for _ in 0..16 {
+                    if !engine.storage.history_cleanup_pending() {
+                        break;
+                    }
+                    assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
+                    assert_eq!(engine.pending_block_read_fd(0), Some(fd));
+                    assert!(engine.object_store_reads_busy());
+                }
+                assert!(!engine.storage.history_cleanup_pending());
+                assert_eq!(
+                    engine
+                        .storage
+                        .resident_rows(table)
+                        .iter()
+                        .filter(|(_, state)| !state.history.is_empty())
+                        .count(),
+                    0
+                );
+                assert!(!engine.checkpoint_can_progress());
+                assert_eq!(engine.checkpoint_beat(), CheckpointBeat::WaitingForReads);
+            });
+        },
+    );
+}

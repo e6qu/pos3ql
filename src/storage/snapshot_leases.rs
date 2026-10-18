@@ -1,5 +1,6 @@
 //! Owned, startup-bounded retention for executing statement snapshots.
 
+use super::SnapshotCleanup;
 use core::mem::size_of;
 use core::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
@@ -251,7 +252,6 @@ impl Storage {
         transaction: u32,
         select: impl FnOnce(u64) -> u64,
     ) -> Result<StatementSnapshotLease, SqlError> {
-        self.prune_released_statement_snapshots();
         let owner = self.transaction_wait_owner(transaction);
         let mut snapshots = self.snapshot_state();
         let next = snapshots
@@ -291,7 +291,7 @@ impl Storage {
             files,
         })
     }
-    pub(crate) fn end_transaction_snapshots(&self, transaction: u32) {
+    pub(crate) fn end_transaction_snapshots(&self, transaction: u32, cleanup: SnapshotCleanup) {
         let mut snapshots = self.snapshot_state();
         if let Some(position) = snapshots
             .active
@@ -307,8 +307,11 @@ impl Storage {
         {
             statement.lsn = None;
         }
+        snapshots.statement_reclamation_pending = true;
         drop(snapshots);
-        self.prune_snapshot_versions();
+        if cleanup == SnapshotCleanup::Finish {
+            self.prune_snapshot_versions();
+        }
         let owner = self.transaction_wait_owner(transaction);
         self.lock_state().row.resource_released(owner);
     }
@@ -382,13 +385,13 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             storage.export_replication_snapshot(77, 7).unwrap();
-            storage.prune_released_statement_snapshots();
+            storage.prune_snapshot_versions();
             assert_original_row(&storage, table, 99);
             import_snapshot(&storage, 77, 7, 99, || Ok(())).unwrap();
             storage.invalidate_replication_snapshot(77);
             assert_eq!(storage.oldest_snapshot(), Some(7));
             assert_original_row(&storage, table, 99);
-            storage.end_transaction_snapshots(99);
+            storage.end_transaction_snapshots(99, crate::storage::SnapshotCleanup::Finish);
             assert_eq!(storage.oldest_snapshot(), None);
             assert!(
                 storage
@@ -512,7 +515,10 @@ mod tests {
             storage.export_replication_snapshot(77, 7).unwrap();
             let formerly_synthetic = 0x8000_0000 | 77;
             storage.register_snapshot(formerly_synthetic, 9).unwrap();
-            storage.end_transaction_snapshots(formerly_synthetic);
+            storage.end_transaction_snapshots(
+                formerly_synthetic,
+                crate::storage::SnapshotCleanup::Finish,
+            );
             assert_eq!(storage.oldest_snapshot(), Some(7));
             let blocker = storage.schema_lock_blocker(99).unwrap();
             assert_eq!(blocker, super::super::SchemaLockBlocker::Connection(77));
@@ -562,7 +568,7 @@ mod tests {
         });
         crate::mem::guard::forbid_alloc(|| {
             assert!(storage.snapshot_state().statement_reclamation_pending);
-            storage.prune_released_statement_snapshots();
+            storage.prune_snapshot_versions();
             assert!(!storage.snapshot_state().statement_reclamation_pending);
         });
     }
@@ -603,7 +609,7 @@ mod tests {
                 });
             });
             crate::mem::guard::forbid_alloc(|| {
-                storage.prune_released_statement_snapshots();
+                storage.prune_snapshot_versions();
                 if imported.load(Ordering::Acquire) {
                     assert_eq!(storage.oldest_snapshot(), Some(7));
                     assert_original_row(&storage, table, 99);
@@ -662,7 +668,7 @@ mod tests {
             drop(reader);
             assert!(!storage.has_active_snapshots());
             assert_eq!(storage.schema_lock_blocker(8), None);
-            storage.prune_released_statement_snapshots();
+            storage.prune_snapshot_versions();
             assert!(
                 storage
                     .resident_row_state(table, 1)
@@ -734,7 +740,7 @@ mod tests {
             progressed,
             "writer must finish before the statement lease and selected bytes release"
         );
-        crate::mem::guard::forbid_alloc(|| storage.prune_released_statement_snapshots());
+        crate::mem::guard::forbid_alloc(|| storage.prune_snapshot_versions());
         assert!(
             storage
                 .resident_row_state(table, 1)
@@ -781,7 +787,7 @@ mod tests {
                     .is_empty(),
                 "a writer's own statement must not retain replaced images"
             );
-            storage.end_transaction_snapshots(8);
+            storage.end_transaction_snapshots(8, crate::storage::SnapshotCleanup::Finish);
             assert_eq!(storage.oldest_snapshot(), None);
             let newer = storage.retain_statement_snapshot(9, |_| 9).unwrap();
             assert_ne!(outer.identity, newer.identity);

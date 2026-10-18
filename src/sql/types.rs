@@ -4068,7 +4068,9 @@ impl ArrElem {
 
     /// Rebuilds a domain-array element identity from the domain catalog.
     pub fn domain(slot: u16, base: ColType) -> Option<Self> {
-        if matches!(base, ColType::Record) {
+        // One domain-array element carries one scalar base code and slot.
+        // Nested array bases need a distinct durable element representation.
+        if matches!(base, ColType::Record | ColType::Array(_)) {
             return None;
         }
         let base_user_slot = match base {

@@ -38736,6 +38736,55 @@ impl Storage {
                         ));
                     }
                 },
+                ColType::Array(element) if element.user_type_slot().is_some() => {
+                    if defer_manifest_binding {
+                        spec.base
+                    } else {
+                        let slot =
+                            usize::from(element.user_type_slot().expect("user element checked"));
+                        let current = match element {
+                            ArrElem::Enum(_)
+                                if slot < self.enum_count()
+                                    && self.enum_for(slot, txid).database == current_database()
+                                    && self.enum_for(slot, txid).visible_to(txid) =>
+                            {
+                                let definition = self.enum_for(slot, txid);
+                                Some(UserTypeName {
+                                    schema: definition.schema,
+                                    name: definition.name,
+                                })
+                            }
+                            ArrElem::Composite(_)
+                                if slot < self.composite_count()
+                                    && self.composite_for(slot, txid).database
+                                        == current_database()
+                                    && self.composite_for(slot, txid).visible_to(txid) =>
+                            {
+                                let definition = self.composite_for(slot, txid);
+                                Some(UserTypeName {
+                                    schema: definition.schema,
+                                    name: definition.name,
+                                })
+                            }
+                            ArrElem::Domain { .. }
+                                if slot < self.domain_count()
+                                    && self.domain_for(slot, txid).database
+                                        == current_database()
+                                    && self.domain_for(slot, txid).visible_to(txid) =>
+                            {
+                                let definition = self.domain_for(slot, txid);
+                                Some(UserTypeName {
+                                    schema: definition.schema,
+                                    name: definition.name,
+                                })
+                            }
+                            _ => None,
+                        };
+                        let identity = current.unwrap_or(identity);
+                        spec.base_user_type = Some(identity);
+                        self.rebind_declared_user_type(spec.base, identity, txid)?
+                    }
+                }
                 _ => {
                     return Err(sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,

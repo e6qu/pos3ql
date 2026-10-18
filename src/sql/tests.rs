@@ -52447,6 +52447,10 @@ fn enum_value_identity_compact_ids_preserve_value_size() {
         u32::MAX - 1
     );
     assert!(EnumMemberId::from_ordinal(u32::MAX).is_none());
+    assert!(
+        crate::sql::types::ArrElem::domain(0, ColType::Array(crate::sql::types::ArrElem::Enum(0)))
+            .is_none()
+    );
 }
 
 #[test]

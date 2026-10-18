@@ -265,6 +265,9 @@ fn domain_base_slot(def: &crate::storage::DomainDef) -> u16 {
     match (def.base_user_type, def.base) {
         (Some(_), crate::sql::types::ColType::Enum(slot))
         | (Some(_), crate::sql::types::ColType::Composite(slot)) => slot,
+        (Some(_), crate::sql::types::ColType::Array(element)) => {
+            element.user_type_slot().unwrap_or(NO_DOMAIN_BASE_SLOT)
+        }
         (None, _) => NO_DOMAIN_BASE_SLOT,
         (Some(_), _) => NO_DOMAIN_BASE_SLOT,
     }
@@ -9387,6 +9390,26 @@ fn decode_op_inner<'a>(
                     if slot != NO_DOMAIN_BASE_SLOT =>
                 {
                     crate::sql::types::ColType::Composite(slot)
+                }
+                (Some(_), ColType::Array(element), slot) if slot != NO_DOMAIN_BASE_SLOT => {
+                    ColType::Array(match element {
+                        crate::sql::types::ArrElem::Enum(_) => {
+                            crate::sql::types::ArrElem::Enum(slot)
+                        }
+                        crate::sql::types::ArrElem::Composite(_) => {
+                            crate::sql::types::ArrElem::Composite(slot)
+                        }
+                        crate::sql::types::ArrElem::Domain {
+                            base_code,
+                            base_user_slot,
+                            ..
+                        } => crate::sql::types::ArrElem::Domain {
+                            slot,
+                            base_code,
+                            base_user_slot,
+                        },
+                        _ => return None,
+                    })
                 }
                 (None, base, NO_DOMAIN_BASE_SLOT) => base,
                 _ => return None,

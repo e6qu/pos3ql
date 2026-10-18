@@ -22059,9 +22059,9 @@ fn pg_attrdef<'a>(
             0
         };
         for column in 0..columns.len() {
-            let default = columns
-                .default_at_ref(column)
-                .expect("view default column is bounded");
+            let Some(default) = columns.default_at_ref(column) else {
+                continue;
+            };
             let Some(default) = super::enum_values::default_expression(
                 default,
                 if column < described {

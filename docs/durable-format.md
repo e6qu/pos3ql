@@ -181,10 +181,11 @@ text array of base member ordinals, and `/*p3t:N*/` binds N tokens of an explici
 cast type name to the domain's selected base enum. Ordinary text is unbound.
 Rendering removes the grammar and resolves current labels and type names.
 Defaults also retain their original display text as UTF-8 in
-`/*p3o:TEXT*/` immediately after the header. Percent and slash bytes use percent escapes
+`/*p3o:TEXT*/` immediately after the header. Percent and slash bytes use `%25` and `%2f`
 so text cannot terminate the comment. The comment stays unchanged through
-schema rewrites. `pg_type.typdefault` and `information_schema.domains.domain_default` expose this
-original text. Execution and column/view default descriptions resolve the captured members.
+schema rewrites. `pg_type.typdefault` and
+`information_schema.domains.domain_default` expose this original text. Execution
+and column/view default descriptions resolve the captured members.
 Domain definitions with bound checks, defaults or named array bases use journal kind 151;
 bound views use kind 152;
 the previous domain and view kinds remain readable. Tables carrying bound default

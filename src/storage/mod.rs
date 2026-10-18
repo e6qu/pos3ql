@@ -35200,25 +35200,39 @@ impl Storage {
     pub(crate) fn snapshot_view_query(
         &self,
         slot: usize,
+        txid: u32,
         arena: &crate::mem::arena::Arena,
     ) -> Result<StoredQueryDefinition, SqlError> {
-        let catalog = self.view_rule_catalog();
-        let rule_slot = catalog.views[slot].return_rule;
-        let definition = &catalog.rules[usize::from(rule_slot)].definition;
-        let dependencies = self.snapshot_dependency_image(
-            self.committed_dependency_image(StoredQueryDependencyOwner::Rule(rule_slot)),
+        let mut query = {
+            let catalog = self.view_rule_catalog();
+            let rule_slot = catalog.views[slot].return_rule;
+            let definition = &catalog.rules[usize::from(rule_slot)].definition;
+            let dependencies = self.snapshot_dependency_image(
+                self.committed_dependency_image(StoredQueryDependencyOwner::Rule(rule_slot)),
+                arena,
+            )?;
+            StoredQueryDefinition {
+                sql: StackStr::from_str(
+                    definition
+                        .action_sql()
+                        .next()
+                        .expect("every view has one _RETURN action"),
+                ),
+                creation_path: definition.creation_path,
+                dependencies,
+            }
+        };
+        let user = crate::sql::eval::funcs::system::session_user_owned();
+        let path = self.compute_path(query.creation_path.as_str(), user.as_str(), txid);
+        query.sql = crate::sql::enum_values::resolve_query(
+            query.sql.as_str(),
+            self,
+            txid,
+            path,
+            &mut query.dependencies,
             arena,
         )?;
-        Ok(StoredQueryDefinition {
-            sql: StackStr::from_str(
-                definition
-                    .action_sql()
-                    .next()
-                    .expect("every view has one _RETURN action"),
-            ),
-            creation_path: definition.creation_path,
-            dependencies,
-        })
+        Ok(query)
     }
 
     pub(crate) fn view_sql(&self, slot: usize) -> StackStr<VIEW_SQL_MAX> {
@@ -54425,7 +54439,7 @@ mod tests {
                     }
                     drop(catalog);
                     for (slot, view) in storage.checkpoint_views() {
-                        let query = storage.snapshot_view_query(slot, &arena).unwrap();
+                        let query = storage.snapshot_view_query(slot, 0, &arena).unwrap();
                         assert_eq!(query.sql.as_str(), "SELECT 1");
                         assert_eq!(query.creation_path.as_str(), "public");
                         assert_eq!(
@@ -54445,7 +54459,7 @@ mod tests {
             for (slot, view) in storage.views_visible_to(0) {
                 let rule = storage.rule(usize::from(view.return_rule));
                 assert_eq!(rule.definition.target, RuleTarget::View(slot as u16));
-                let query = storage.snapshot_view_query(slot, &arena).unwrap();
+                let query = storage.snapshot_view_query(slot, 0, &arena).unwrap();
                 assert_eq!(query.sql.as_str(), "SELECT 1");
                 assert_eq!(query.creation_path.as_str(), "public");
                 assert!(query.dependencies.entries().is_empty());

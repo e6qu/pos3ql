@@ -4764,7 +4764,9 @@ fn subst_tableref<'a>(
             }
             crate::storage::ViewSecurity::Invoker => context.authorization_role,
         };
-        let query = context.storage.snapshot_view_query(slot, arena)?;
+        let query = context
+            .storage
+            .snapshot_view_query(slot, context.txid, arena)?;
         let view_sql = arena
             .alloc_str(query.sql.as_str())
             .map_err(|_| arena_full())?;

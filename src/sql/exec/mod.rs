@@ -36004,7 +36004,7 @@ pub fn create_view(
             Err(error) => return sql_fail(error),
         }
     };
-    let dependencies = match super::query::stored_query_dependencies(
+    let mut dependencies = match super::query::stored_query_dependencies(
         buffer.as_str(),
         storage,
         txn.txid,
@@ -36143,6 +36143,19 @@ pub fn create_view(
             "search_path is too long to store with a view"
         ));
     }
+    buffer = match super::enum_values::bind_query(
+        buffer.as_str(),
+        storage,
+        txn.txid,
+        path,
+        &mut dependencies,
+        false,
+        arena,
+    ) {
+        Ok(bound) => bound,
+        Err(error) => return sql_fail(error),
+    };
+    let durable_sql = buffer;
     match storage.create_view(
         schema,
         sqlname,
@@ -36215,7 +36228,7 @@ pub fn create_view(
                         schema: schema.as_str(),
                         name: name.name,
                         columns: crate::wal::WalViewColumns::Captured(&columns),
-                        sql,
+                        sql: durable_sql.as_str(),
                         path: raw_path,
                         security_invoker: matches!(security, super::ast::ViewSecurity::Invoker),
                         security_barrier: match security_barrier {
@@ -36852,7 +36865,7 @@ fn rewrite_view_column_dependents(
         }
 
         let view = storage.view(view_slot);
-        let query = storage.snapshot_view_query(view_slot, arena)?;
+        let query = storage.snapshot_view_query(view_slot, txn.txid, arena)?;
         let view_sql = query.sql;
         let rewritten = rewrite_relation_column_identifiers(view_sql.as_str(), rename, arena)?;
         if rewritten == view_sql {
@@ -37856,7 +37869,7 @@ pub fn comment(
                         relation.name
                     ));
                 };
-                let query = match storage.snapshot_view_query(slot, arena) {
+                let query = match storage.snapshot_view_query(slot, txn.txid, arena) {
                     Ok(query) => query,
                     Err(error) => return sql_fail(error),
                 };
@@ -46300,7 +46313,7 @@ fn rewrite_composite_dependent_views(
             continue;
         }
         let view = storage.view(view_slot);
-        let query = storage.snapshot_view_query(view_slot, arena)?;
+        let query = storage.snapshot_view_query(view_slot, txn.txid, arena)?;
         let view_sql = query.sql;
         let creation_path = query.creation_path;
         let user = super::eval::funcs::system::session_user_owned();
@@ -58522,7 +58535,7 @@ pub(crate) fn view_trigger_definition(
     let view = storage.view(view_slot);
     let mut columns = [ColDesc::new("", 0, 0); MAX_COLUMNS];
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let query = storage.snapshot_view_query(view_slot, arena)?;
+    let query = storage.snapshot_view_query(view_slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
     let dependencies = query.dependencies;
     let source = arena
@@ -59184,7 +59197,7 @@ fn materialize_view_rows<'a>(
     capacity: usize,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let query = storage.snapshot_view_query(view_slot, arena)?;
+    let query = storage.snapshot_view_query(view_slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
     let source = arena
         .alloc_str(query.sql.as_str())

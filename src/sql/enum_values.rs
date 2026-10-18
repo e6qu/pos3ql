@@ -95,3 +95,288 @@ pub(crate) fn sort(value: Datum<'_>, storage: &Storage, txid: u32) -> Result<f64
     };
     member.map(|member| member.sort).ok_or_else(corrupt)
 }
+
+// The prefix is not SQL. Only catalog writers create this durable grammar;
+// client comments cannot forge a binding.
+const QUERY_HEADER: &str = "pos3ql-bound-query-v1\n";
+
+#[derive(Clone, Copy)]
+struct QueryToken<'a> {
+    token: super::lexer::Tok<'a>,
+    start: usize,
+    end: usize,
+}
+
+fn query_tokens<'a>(source: &'a str, arena: &'a Arena) -> Result<&'a [QueryToken<'a>], SqlError> {
+    use super::lexer::{Lexer, Tok};
+    let lexical = |error: super::lexer::LexError| {
+        sql_err!(
+            error.kind.sqlstate(),
+            "invalid stored SQL at byte {}: {}",
+            error.at,
+            error.message
+        )
+    };
+    let mut lexer = Lexer::new(source, arena);
+    let mut count = 0;
+    while lexer.next_token().map_err(lexical)? != Tok::Eof {
+        count += 1;
+    }
+    let tokens = arena
+        .alloc_slice_with(count, |_| QueryToken {
+            token: Tok::Eof,
+            start: 0,
+            end: 0,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut lexer = Lexer::new(source, arena);
+    for token in tokens.iter_mut() {
+        token.token = lexer.next_token().map_err(lexical)?;
+        token.start = lexer.token_start();
+        token.end = lexer.token_end();
+    }
+    Ok(tokens)
+}
+
+fn write_name<const N: usize>(output: &mut crate::util::StackStr<N>, name: &str) {
+    use core::fmt::Write;
+    let _ = output.write_char('"');
+    for character in name.chars() {
+        if character == '"' {
+            let _ = output.write_char('"');
+        }
+        let _ = output.write_char(character);
+    }
+    let _ = output.write_char('"');
+}
+
+pub(crate) fn bind_query<const N: usize>(
+    source: &str,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    dependencies: &mut crate::storage::StoredQueryDependencies,
+    legacy: bool,
+    arena: &Arena,
+) -> Result<crate::util::StackStr<N>, SqlError> {
+    use super::lexer::Tok;
+    use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependency};
+    use core::fmt::Write;
+    let tokens = query_tokens(source, arena)?;
+    let count = tokens
+        .iter()
+        .filter(|token| matches!(token.token, Tok::Str(_)))
+        .count();
+    if count == 0 || storage.enum_count() == 0 {
+        return Ok(crate::util::StackStr::from_str(source));
+    }
+    let mut parameterized = crate::util::StackStr::<N>::new();
+    let mut parameter = 0;
+    for token in tokens {
+        if matches!(token.token, Tok::Str(_)) {
+            parameter += 1;
+            let _ = write!(parameterized, "${parameter} ");
+        } else {
+            let _ = write!(parameterized, "{} ", &source[token.start..token.end]);
+        }
+    }
+    if parameterized.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "stored enum binding exceeds {} bytes",
+            N
+        ));
+    }
+    let parameterized = arena
+        .alloc_str(parameterized.as_str())
+        .map_err(|_| super::query::arena_full_pub())?;
+    let select = super::parser::parse_query(parameterized, arena)?;
+    let select =
+        super::query::expand_stored_query(select, storage, txid, path, dependencies.view(), arena)?;
+    let oids = arena
+        .alloc_slice_with(count, |_| super::types::oid::TEXT)
+        .map_err(|_| super::query::arena_full_pub())?;
+    super::param_types::infer(
+        storage,
+        &super::ast::Stmt::Select(*select),
+        txid,
+        arena,
+        oids,
+    );
+    let mut output = crate::util::StackStr::<N>::new();
+    let _ = output.write_str(QUERY_HEADER);
+    parameter = 0;
+    let mut any_binding = false;
+    for token in tokens {
+        let mut binding = None;
+        if let Tok::Str(label) = token.token {
+            let oid = oids[parameter];
+            parameter += 1;
+            if (super::types::oid::FIRST_ENUM
+                ..super::types::oid::FIRST_ENUM + storage.enum_count() as i32)
+                .contains(&oid)
+            {
+                let slot = (oid - super::types::oid::FIRST_ENUM) as usize;
+                let definition = storage.enum_for(slot, txid);
+                let member = definition
+                    .members()
+                    .position(|member| {
+                        if legacy {
+                            member.legacy_label.is_some_and(|old| old.as_str() == label)
+                        } else {
+                            member.label.as_str() == label
+                        }
+                    })
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INVALID_TEXT_REPRESENTATION,
+                            "invalid input value for enum {}: \"{}\"",
+                            definition.name.as_str(),
+                            label
+                        )
+                    })?;
+                if !legacy {
+                    super::exec::ensure_enum_value_is_safe(storage, slot as u16, label, txid)?;
+                }
+                let dependency = dependencies.view().entries().iter().position(|dependency| {
+                    dependency.class == DependencyClass::Enum
+                        && usize::from(dependency.slot) == slot
+                });
+                let dependency = match dependency {
+                    Some(index) => index,
+                    None => {
+                        let index = dependencies.view().entries().len();
+                        dependencies.push(StoredQueryDependency {
+                            class: DependencyClass::Enum,
+                            slot: slot as u16,
+                            identity: StoredDependencyIdentity::Name,
+                            referenced_columns: crate::storage::ColumnSet::EMPTY,
+                            schema: definition.schema,
+                            name: definition.name,
+                            referenced_schema: definition.schema,
+                            referenced_name: definition.name,
+                        })?;
+                        index
+                    }
+                };
+                any_binding = true;
+                binding = Some((dependency, member, definition.schema, definition.name));
+            }
+        }
+        if let Some((dependency, member, _, _)) = binding {
+            let _ = write!(output, "/*p3e:{dependency}:{member}*/");
+        }
+        let _ = output.write_str(&source[token.start..token.end]);
+        if let Some((_, _, schema, name)) = binding {
+            let _ = output.write_str("::");
+            write_name(&mut output, schema.as_str());
+            let _ = output.write_char('.');
+            write_name(&mut output, name.as_str());
+        }
+        let _ = output.write_char(' ');
+    }
+    if !any_binding {
+        return Ok(crate::util::StackStr::from_str(source));
+    }
+    if output.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "stored enum binding exceeds {} bytes",
+            N
+        ));
+    }
+    Ok(output)
+}
+
+pub(crate) fn resolve_query<const N: usize>(
+    source: &str,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    dependencies: &mut crate::storage::StoredQueryDependencies,
+    arena: &Arena,
+) -> Result<crate::util::StackStr<N>, SqlError> {
+    use super::lexer::Tok;
+    use core::fmt::Write;
+    let legacy;
+    let source = if let Some(source) = source.strip_prefix(QUERY_HEADER) {
+        source
+    } else {
+        if source.starts_with("pos3ql-bound-query-") {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "unsupported stored query encoding"
+            ));
+        }
+        legacy = bind_query::<N>(source, storage, txid, path, dependencies, true, arena)?;
+        let Some(source) = legacy.as_str().strip_prefix(QUERY_HEADER) else {
+            return Ok(legacy);
+        };
+        source
+    };
+    let tokens = query_tokens(source, arena)?;
+    let mut output = crate::util::StackStr::<N>::new();
+    let mut previous = 0;
+    for token in tokens {
+        let gap = source[previous..token.start].trim();
+        let binding = gap
+            .strip_prefix("/*p3e:")
+            .and_then(|gap| gap.strip_suffix("*/"));
+        if let Some(binding) = binding {
+            if !matches!(token.token, Tok::Str(_)) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "stored enum binding does not precede a literal"
+                ));
+            }
+            let (dependency, member) = binding
+                .split_once(':')
+                .and_then(|(dependency, member)| {
+                    Some((
+                        dependency.parse::<usize>().ok()?,
+                        member.parse::<usize>().ok()?,
+                    ))
+                })
+                .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "invalid stored enum binding"))?;
+            let dependency = dependencies
+                .view()
+                .entries()
+                .get(dependency)
+                .copied()
+                .filter(|dependency| dependency.class == crate::storage::DependencyClass::Enum)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "stored enum binding has no type dependency"
+                    )
+                })?;
+            let definition = storage.enum_for(usize::from(dependency.slot), txid);
+            let member = definition.members().nth(member).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "stored enum binding has no member"
+                )
+            })?;
+            let _ = output.write_str("E'");
+            for character in member.label.as_str().chars() {
+                if matches!(character, '\'' | '\\') {
+                    let _ = output.write_char(character);
+                }
+                let _ = output.write_char(character);
+            }
+            let _ = output.write_char('\'');
+        } else {
+            let _ = output.write_str(&source[token.start..token.end]);
+        }
+        let _ = output.write_char(' ');
+        previous = token.end;
+    }
+    if output.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "resolved stored enum binding exceeds {} bytes",
+            N
+        ));
+    }
+    Ok(output)
+}

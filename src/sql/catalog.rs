@@ -13607,7 +13607,10 @@ pub fn view_def_text<'a>(
     for (slot, _) in storage.views_visible_to(txid) {
         if view_oid(slot) == oid {
             return arena
-                .alloc_str_display(format_args!("{};", storage.view_sql(slot).as_str()))
+                .alloc_str_display(format_args!(
+                    "{};",
+                    storage.snapshot_view_query(slot, txid, arena)?.sql.as_str()
+                ))
                 .map(Some)
                 .map_err(|_| arena_full());
         }
@@ -15863,7 +15866,7 @@ pub(crate) fn describe_view<'a>(
             (candidate.schema == view.schema && candidate.name == view.name).then_some(slot)
         })
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "view does not exist"))?;
-    let query = storage.snapshot_view_query(slot, arena)?;
+    let query = storage.snapshot_view_query(slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
     let dependencies = query.dependencies;
     let source = arena
@@ -15913,7 +15916,7 @@ fn describe_stored_view<'a>(
     out: &mut [super::types::ColDesc<'a>],
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let query = storage.snapshot_view_query(slot, arena)?;
+    let query = storage.snapshot_view_query(slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
     let dependencies = query.dependencies;
     let source = arena
@@ -30219,7 +30222,10 @@ fn pg_views<'a>(
                     txid,
                     arena,
                 )?,
-                text(storage.view_sql(slot).as_str(), arena)?,
+                text(
+                    storage.snapshot_view_query(slot, txid, arena)?.sql.as_str(),
+                    arena,
+                )?,
             ],
             arena,
         )?;
@@ -31139,7 +31145,7 @@ fn info_views<'a>(
     let out = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (index, (_, view)) in storage.views_visible_to(txid).enumerate() {
+    for (index, (slot, view)) in storage.views_visible_to(txid).enumerate() {
         let is_updatable = super::query::view_is_auto_updatable(
             storage,
             view.schema_for(txid).as_str(),
@@ -31153,7 +31159,10 @@ fn info_views<'a>(
                 text("postgres", arena)?,
                 text(view.schema_for(txid).as_str(), arena)?,
                 text(view.name_for(txid).as_str(), arena)?,
-                text(storage.view_sql_for(&view).as_str(), arena)?,
+                text(
+                    storage.snapshot_view_query(slot, txid, arena)?.sql.as_str(),
+                    arena,
+                )?,
                 text(
                     match view.check_option_for(txid) {
                         None => "NONE",

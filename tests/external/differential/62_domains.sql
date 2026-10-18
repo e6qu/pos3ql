@@ -90,8 +90,10 @@ SELECT udt_schema, udt_name, domain_name
 BEGIN;
 ALTER DOMAIN dom_def SET DEFAULT 77;
 SELECT typdefault FROM pg_type WHERE typname = 'dom_def';
+SELECT pg_get_expr(typdefaultbin, 0) FROM pg_type WHERE typname = 'dom_def';
 ROLLBACK;
 SELECT typdefault FROM pg_type WHERE typname = 'dom_def';
+SELECT pg_get_expr(typdefaultbin, 0) FROM pg_type WHERE typname = 'dom_def';
 ALTER DOMAIN dom_def SET DEFAULT 99;
 -- Persistent schemas reject record and its array pseudo-type at the DDL
 -- boundary; domains use PostgreSQL's distinct base-type diagnostic.
@@ -103,6 +105,7 @@ CREATE TABLE dom_t2 (x dom_def);
 INSERT INTO dom_t2 DEFAULT VALUES;
 SELECT x FROM dom_t2;
 ALTER DOMAIN dom_def DROP DEFAULT;
+SELECT typdefault, pg_get_expr(typdefaultbin, 0) FROM pg_type WHERE typname = 'dom_def';
 -- ADD a CHECK every existing row already satisfies (so no re-validation
 -- failure), then enforce it on a new insert.
 ALTER DOMAIN dom_pos ADD CONSTRAINT lt50 CHECK (VALUE < 50);

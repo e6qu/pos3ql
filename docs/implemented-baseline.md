@@ -913,6 +913,9 @@ field still shows `'old'::state`.
 [PostgreSQL's information-schema view](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/catalog/information_schema.sql#L943)
 exposes that same saved domain text. Column and view default descriptions and
 execution use the retained member, so they do not interpret that old text again.
+For a domain, query `pg_get_expr(typdefaultbin, 0)` for the current default
+expression. This separate field follows renamed labels and type names without
+running functions in the default.
 
 Selected enum definitions and label iterators retain the label image they read.
 A label image is one complete saved list of labels.

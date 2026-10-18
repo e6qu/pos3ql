@@ -85930,6 +85930,19 @@ fn enum_value_identity_domain_defaults_follow_members_after_type_moves_and_wal()
                 "'old'::default_state",
             ]
         );
+        assert_eq!(
+            data_rows(&session.success(
+                engine,
+                "SELECT pg_get_expr(typdefaultbin, 0) FROM pg_type
+                 WHERE typname IN ('default_value','default_batch','default_dynamic') ORDER BY typname",
+                true,
+            )),
+            [
+                "'{new}'::defaults_moved.default_state[]",
+                "default_echo('new'::defaults_moved.default_state)",
+                "'new'::defaults_moved.default_state",
+            ]
+        );
         assert_eq!(data_rows(&session.success(engine,
             "SELECT domain_default FROM information_schema.domains
                  WHERE domain_name IN ('default_value','default_batch','default_dynamic') ORDER BY domain_name", true)),

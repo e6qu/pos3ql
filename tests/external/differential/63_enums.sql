@@ -348,6 +348,8 @@ SELECT state::text, states[1]::text, echo_state::text, dynamic::text FROM defaul
 SELECT state::text, states[1]::text, echo_state::text, dynamic::text FROM default_after;
 SELECT last_value FROM default_calls;
 SELECT typname, typdefault FROM pg_type WHERE typname IN ('default_value','default_batch','default_dynamic') ORDER BY typname;
+SELECT typname, pg_get_expr(typdefaultbin, 0) FROM pg_type
+ WHERE typname IN ('default_value','default_batch','default_dynamic') ORDER BY typname;
 SELECT domain_name, domain_default FROM information_schema.domains
  WHERE domain_name IN ('default_value','default_batch','default_dynamic') ORDER BY domain_name;
 DROP VIEW default_view;

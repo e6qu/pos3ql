@@ -28747,7 +28747,19 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text(type_storage(d.base), arena)?,
-                Datum::Null,
+                match &d.default_expr {
+                    Some(expression) => text(
+                        super::enum_values::checks::describe_default(
+                            expression.as_str(),
+                            d.base,
+                            storage,
+                            txid,
+                            arena,
+                        )?,
+                        arena,
+                    )?,
+                    None => Datum::Null,
+                },
             ],
             arena,
         )?;

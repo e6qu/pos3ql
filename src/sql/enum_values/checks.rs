@@ -271,14 +271,38 @@ pub(crate) fn resolve_default<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
+    resolve_default_expression(source, base, storage, txid, arena, false)
+}
+
+pub(crate) fn describe_default<'a>(
+    source: &str,
+    base: ColType,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    canonical_display(
+        resolve_default_expression(source, base, storage, txid, arena, true)?,
+        arena,
+    )
+}
+
+fn resolve_default_expression<'a>(
+    source: &str,
+    base: ColType,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    display_names: bool,
+) -> Result<&'a str, SqlError> {
     if source.starts_with("pos3ql-enum-check-") {
-        return resolve(source, base, storage, txid, arena);
+        return resolve_expression(source, base, storage, txid, arena, display_names);
     }
     let legacy = bind_default::<{ crate::storage::DEFAULT_EXPR_MAX }>(
         source, base, storage, txid, true, arena,
     )?;
     if is_bound(legacy.as_str()) {
-        resolve(legacy.as_str(), base, storage, txid, arena)
+        resolve_expression(legacy.as_str(), base, storage, txid, arena, display_names)
     } else {
         arena
             .alloc_str(source)

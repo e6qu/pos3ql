@@ -236,7 +236,7 @@ that really rewrites those orders still obeys its fixed row and statement limits
 Captured sources remain readable after table replacement and Storage teardown.
 The last shared lease releases the roots and makes its slot reusable.
 
-Sorted scans and enum rewrites retain one source for their selected heap
+Sorted scans retain one source for their selected heap
 allocation and saved files. Their copyable row records borrow that source,
 keeping physical order, version, and byte location together. Fetching a record
 uses its original owner directly, so removal, version-chain reuse, and heap relocation cannot redirect
@@ -251,10 +251,6 @@ earlier orders even if later versions delete them. Replacing the table cannot
 redirect the report's next unread row to the new table's schema or files.
 For a sorted read, collected rows keep their original bytes even if reclamation
 moves the current table's rows before those collected rows are fetched.
-For example, `ALTER TYPE order_state RENAME VALUE 'pending' TO 'waiting'`
-retains the rows it collected while rewriting scalar and array values. A
-savepoint rollback restores their earlier labels and indexed lookups; an
-exhausted statement arena returns `54000` and rolls back the alteration.
 MERGE copies each target row's selected bytes into the existing statement arena
 before policy evaluation or writes. Later decoding uses those copies, including
 for inherited columns and partition moves. It no longer looks up a saved
@@ -891,6 +887,16 @@ statement arena"; increasing the startup statement-memory reservation increases
 this allowance. It does not create a growing pool. For example, a rejected
 type conversion leaves the original table readable and allows a later retry
 to reclaim the heap buffers.
+
+Enum row values retain a stable member identity rather than depending on a
+label's spelling or sort position. This also applies inside named records and
+arrays, column defaults, and typed constants captured in views. For example,
+after `ALTER TYPE order_state RENAME VALUE 'pending' TO 'waiting'`, an older
+transaction reads `waiting` from its unchanged order row. A view created with
+`'pending'::order_state` follows that same member; adding a new member named
+`pending` does not redirect the view. Plain text containing `pending` is unchanged.
+The label edit changes catalog metadata and does not rewrite the orders table.
+Rollback selects the earlier definition again.
 
 Selected enum definitions and label iterators retain the label image they read.
 A label image is one complete saved list of labels.

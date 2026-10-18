@@ -9304,8 +9304,8 @@ impl EnumMember {
 
 /// A `CREATE TYPE ... AS ENUM (...)` type: an ordered set of string labels. Its
 /// *existence* and label set are transactional catalog state, mirroring
-/// [`DomainDef`]; an enum value stored in a column carries its own label and
-/// sort key inline, so decoding a row needs no catalog lookup.
+/// [`DomainDef`]. Stored values keep stable member ordinals; materialization
+/// binds cached labels and sort positions to a selected definition.
 #[derive(Debug, Clone, Copy)]
 pub struct EnumDef {
     pub(crate) database: DatabaseOid,

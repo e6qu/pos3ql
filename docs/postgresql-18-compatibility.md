@@ -109,7 +109,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | DML output schema | Shared startup schema-image pool: table slots × (`max_catalog_versions_per_object` + 1) × `query_workspace_slots`; released after output analysis | SQLSTATE 54000 before partial description on exhaustion; descriptions avoid full schema copies in the statement arena |
 | Reader-history cleanup | One separate startup workspace with `max(table_rows, large_object_pages)` 64-bit row identities; at most 64 identities per shared-lock transition | Included in startup memory; does not consume query walk slots; current reader retention is rechecked for every batch |
 | Retained row identities | 64 internal walk slots per query workspace; each reserves the largest configured table, large-object page, or value-index row capacity | Owned startup slots survive map/table/Storage removal; SQLSTATE 54000 on slot or identity-buffer exhaustion |
-| Deferred row retention for sorted scans and enum rewrites | 32 bytes per optional row record on the release target, within the fixed statement arena; one shared source per table | Records borrow their original heap/file owner; statement or source exhaustion returns SQLSTATE 54000 |
+| Deferred row retention for sorted scans | 32 bytes per optional row record on the release target, within the fixed statement arena; one shared source per table | Records borrow their original heap/file owner; statement or source exhaustion returns SQLSTATE 54000 |
 | Sequential SQL resident scans | 32 bytes per resident overlay row, including deletions, in the fixed statement arena; saved rows continue streaming | Captured visible versions and original heap/files survive cleanup and table/Storage removal; SQLSTATE 54000 releases failed capture ownership |
 | Table COPY TO retention | 32 bytes per ordered output record on the release target, plus captured resident records and saved-file lists in the fixed statement arena | The named relation's original source releases on completion or error; SQLSTATE 54000 on exhaustion, without raising query limits |
 | Index validation retention | 32 bytes per resident overlay row plus saved-file lists in the fixed statement arena, reused between target tables; per-row expression scratch is recycled; saved rows stream | Ordinary, copied, and partition indexes include own changes and current committed rows; SQLSTATE 54000 releases failed creation and its pending catalog entries |
@@ -136,7 +136,8 @@ max_ddl_per_transaction)`. Committed definitions, pending changes and retained
 readers share those slots. Reader retention can exhaust this pool before a
 pending-definition limit is reached; `54000` names the enum member-image pool
 and preserves the published definition. Each image holds
-`max_enum_labels_per_type` labels. The image counters and controls are included
+`max_enum_labels_per_type` members, each with a current label, sort position and
+optional legacy label binding. Their actual structure sizes, counters and controls are included
 in the startup memory plan.
 `max_row_versions_per_row` bounds pending writes and committed snapshot versions;
 each write retains an immutable image, including writes in the same command.

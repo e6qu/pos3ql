@@ -52010,6 +52010,205 @@ fn enum_value_identity_domain_check_follows_member_rename() {
 }
 
 #[test]
+fn enum_value_identity_view_implicit_literals_and_reused_labels() {
+    let config = test_config("enum-identity-view-bindings");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TYPE enum_binding_state AS ENUM ('old', 'ready');          CREATE TABLE enum_binding_rows(id integer, state enum_binding_state);          INSERT INTO enum_binding_rows VALUES (1, 'old');          CREATE VIEW enum_binding_view AS SELECT id, 'old'::enum_binding_state AS pinned,            'old' AS note FROM enum_binding_rows WHERE state = 'old';          ALTER TYPE enum_binding_state RENAME VALUE 'old' TO 'new';          ALTER TYPE enum_binding_state ADD VALUE 'old';          INSERT INTO enum_binding_rows VALUES (2, 'old')", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, pinned::text, note FROM enum_binding_view ORDER BY id",
+            true
+        )),
+        ["1|new|old"]
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; ALTER TYPE enum_binding_state RENAME VALUE 'new' TO 'pending'",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, pinned::text, note FROM enum_binding_view ORDER BY id",
+            true
+        )),
+        ["1|pending|old"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, pinned::text, note FROM enum_binding_view ORDER BY id",
+            true
+        )),
+        ["1|new|old"]
+    );
+    session.success(&mut engine,
+        "CREATE SCHEMA enum_binding_moved; ALTER TYPE enum_binding_state RENAME TO renamed_state;          ALTER TYPE renamed_state SET SCHEMA enum_binding_moved", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, pinned::text, note FROM enum_binding_view ORDER BY id",
+            true
+        )),
+        ["1|new|old"]
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT position('pos3ql-bound-query' IN pg_get_viewdef('enum_binding_view'::regclass)) = 0,                 position('p3e:' IN pg_get_viewdef('enum_binding_view'::regclass)) = 0", true)), ["t|t"]);
+}
+
+#[test]
+fn enum_value_identity_domain_check_rejects_other_members_after_rename() {
+    let config = test_config("enum-identity-domain-rejection");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TYPE enum_domain_state AS ENUM ('old', 'ready');          CREATE DOMAIN enum_checked_state AS enum_domain_state CHECK (VALUE = 'old');          CREATE TABLE enum_checked_rows (state enum_checked_state)", true);
+    let rejected = session.execute(
+        &mut engine,
+        "INSERT INTO enum_checked_rows VALUES ('ready')",
+        true,
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("23514"),
+        "{rejected:?}"
+    );
+    session.success(
+        &mut engine,
+        "ALTER TYPE enum_domain_state RENAME VALUE 'old' TO 'new'",
+        true,
+    );
+    let rejected = session.execute(
+        &mut engine,
+        "INSERT INTO enum_checked_rows VALUES ('ready')",
+        true,
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("23514"),
+        "{rejected:?}"
+    );
+    session.success(
+        &mut engine,
+        "INSERT INTO enum_checked_rows VALUES ('new')",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT state::text FROM enum_checked_rows",
+            true
+        )),
+        ["new"]
+    );
+}
+
+#[test]
+fn enum_value_identity_nested_arrays_keep_nulls_bounds_and_plain_text() {
+    let config = test_config("enum-identity-nested-arrays");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TYPE enum_array_state AS ENUM ('old', 'ready');          CREATE TYPE enum_array_detail AS (states enum_array_state[], note text);          CREATE TYPE enum_array_outer AS (detail enum_array_detail, batch enum_array_detail[]);          CREATE TABLE enum_array_rows (detail enum_array_outer);          INSERT INTO enum_array_rows VALUES (ROW(ROW('[0:2]={old,NULL,ready}'::enum_array_state[],             'old, \"quoted\"')::enum_array_detail,             ARRAY[ROW(ARRAY['old'::enum_array_state], 'old')::enum_array_detail, NULL])::enum_array_outer);          ALTER TYPE enum_array_state RENAME VALUE 'old' TO 'new'", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT ((detail).detail).states[0]::text, ((detail).detail).states[1] IS NULL,            ((detail).detail).states[2]::text, ((detail).detail).note,            (((detail).batch)[1]).states[1]::text, ((detail).batch)[2] IS NULL          FROM enum_array_rows", true)), ["new|t|ready|old, \"quoted\"|new|t"]);
+}
+
+#[test]
+fn enum_value_identity_saved_indexes_and_views_survive_empty_cache_recovery() {
+    let mut config = test_config("enum-identity-empty-cache");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("enum-identity-empty-cache-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TYPE enum_saved_state AS ENUM ('old', 'ready', 'high');          CREATE TYPE enum_saved_detail AS (state enum_saved_state, note text);          CREATE TABLE enum_saved_rows(id integer PRIMARY KEY, state enum_saved_state UNIQUE, detail enum_saved_detail);          INSERT INTO enum_saved_rows VALUES (1, 'old', ROW('old', 'old')::enum_saved_detail),             (2, 'high', ROW('high', 'high')::enum_saved_detail);          CREATE VIEW enum_saved_view AS SELECT id, 'old'::enum_saved_state AS pinned             FROM enum_saved_rows WHERE state = 'old'", true);
+    let original_xmins = data_rows(&session.success(
+        &mut engine,
+        "SELECT xmin::text FROM enum_saved_rows ORDER BY id",
+        true,
+    ));
+    assert!(engine.checkpoint().unwrap());
+    session.success(
+        &mut engine,
+        "ALTER TYPE enum_saved_state RENAME VALUE 'old' TO 'new'",
+        true,
+    );
+    for index in 0..30 {
+        session.success(
+            &mut engine,
+            &format!("ALTER TYPE enum_saved_state ADD VALUE 'middle_{index}' BEFORE 'high'"),
+            true,
+        );
+    }
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT xmin::text FROM enum_saved_rows ORDER BY id",
+            true
+        )),
+        original_xmins
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT id, state::text, (detail).state::text, (detail).note FROM enum_saved_rows            WHERE state = 'new'::enum_saved_state;          SELECT id FROM enum_saved_rows WHERE state > 'middle_29'::enum_saved_state;          SELECT id, pinned::text FROM enum_saved_view", true)),
+        ["1|new|new|old", "2", "1|new"]);
+    let duplicate = session.execute(
+        &mut engine,
+        "INSERT INTO enum_saved_rows VALUES (3, 'new', NULL)",
+        true,
+    );
+    assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    assert_eq!(data_rows(&session.success(&mut cold,
+        "SELECT id, state::text, (detail).state::text, (detail).note FROM enum_saved_rows ORDER BY id;          SELECT id, pinned::text FROM enum_saved_view", true)),
+        ["1|new|new|old", "2|high|high|high", "1|new"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut cold,
+            "SELECT xmin::text FROM enum_saved_rows ORDER BY id",
+            true
+        )),
+        original_xmins
+    );
+    let duplicate = session.execute(
+        &mut cold,
+        "INSERT INTO enum_saved_rows VALUES (3, 'new', NULL)",
+        true,
+    );
+    assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
+    session.success(&mut cold,
+        "ALTER TYPE enum_saved_state ADD VALUE 'old';          INSERT INTO enum_saved_rows VALUES (3, 'old', ROW('old', 'old')::enum_saved_detail)", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut cold,
+            "SELECT id, pinned::text FROM enum_saved_view",
+            true
+        )),
+        ["1|new"]
+    );
+    drop(session);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_recovery() {
     let mut config = test_config("owned-enum-rewrite");
     config.object_store_on = true;

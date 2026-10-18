@@ -4749,12 +4749,9 @@ pub enum Datum<'a> {
         physical_fields: u16,
         text: &'a str,
     },
-    /// A user-defined enum value. `slot` identifies the enum type (for OID /
-    /// `pg_typeof`); `sort` is the member's sort key, by which enum values
-    /// order (PostgreSQL orders by `enumsortorder`, not label text); `label`
-    /// is the member's text, used for output and equality. All three are
-    /// carried inline so a value is self-describing — decode needs no catalog
-    /// and [`compare_datums`](super::eval::operators::compare_datums) stays pure.
+    /// A user-defined enum member. Durable identity is independent of its
+    /// cached label and sort position; catalog-aware materialization refreshes
+    /// both before SQL evaluation. None identifies a legacy label-bound value.
     Enum {
         slot: u16,
         member: Option<u32>,

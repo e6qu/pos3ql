@@ -6,8 +6,8 @@ binaries may not recognize newly written formats. The table below states the
 actual supported readers and writers.
 
 **User example:** a current server can open a checkpoint written in manifest
-v13 and write v14 at its next checkpoint. Do not assume you can then downgrade
-to a binary that cannot read v14. No incompatible offline migration is currently
+v13 or v14 and write v15 at its next checkpoint. Do not assume you can then downgrade
+to a binary that cannot read v15. No incompatible offline migration is currently
 available, and unknown formats stop startup explicitly.
 
 Object storage is the durable tier. Immutable objects may outlive the binary
@@ -19,8 +19,9 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v13` | yes | no | The next successful checkpoint publishes v14. |
-| Checkpoint manifest | `pos3ql-manifest-v14` | yes | yes | Current format. |
+| Checkpoint manifest | `pos3ql-manifest-v13` | yes | no | The next successful checkpoint publishes v15. |
+| Checkpoint manifest | `pos3ql-manifest-v14` | yes | no | The next successful checkpoint publishes v15. |
+| Checkpoint manifest | `pos3ql-manifest-v15` | yes | yes | Current enum member identities and legacy label bindings. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
 | Empty commit root | `pos3ql-empty-commit-head-v1` | yes | yes | Fences an as-yet unpublished commit root. |
@@ -141,6 +142,41 @@ before catalog mutation. Raising this boundary would renumber durable catalog
 identities, so it requires an explicit format and OID migration rather than a
 constant change.
 
+### Enum member identities
+
+An enum member's position in its catalog member list is its stable identity.
+Adding a member appends to that list, even when its displayed sort position is
+BEFORE another member. Renaming or renumbering never changes an existing member's
+identity. Row values keep this identity separately from their cached label and
+sort position. Catalog-aware reads select the current label and sort position.
+
+Manifest v15 adds an optional legacy label after each enum member's sort bits.
+Older manifests and enum journal kinds 23/147 initialize this binding from their
+labels. Journal kind 149 writes the current label, sort bits, and an optional
+legacy label for each member; it retains the u32 member count. Existing legacy
+bindings survive later label changes. No missing identity is guessed.
+
+A row enum's u32 label-length high bit marks an additional u32 member identity
+before its cached label. A clear high bit retains the legacy decoder. Composite
+physical-field counts use bit 15 to mark records whose enum leaves contain member
+ordinals. The remaining bits retain the physical attribute count. The marker
+covers nested records and arrays; ordinary text fields retain their original text.
+Frozen enum defaults use journal/default tag 42 for a member identity; tag 12
+remains readable.
+
+Bound view SQL uses the non-SQL prefix `pos3ql-bound-query-v1`, followed by
+tokenized SQL. Before each typed enum literal, `/*p3e:D:M*/` records dependency
+position D and member position M. The writer strips client comments before adding
+bindings. Readers resolve these positions through the captured dependencies and
+remove the internal grammar before parsing or displaying SQL. Unknown grammar
+versions and invalid bindings are errors.
+
+Legacy enum indexes hashed labels. Loading an older manifest explicitly retires
+those generations and schedules replacements; existing row objects remain
+readable. Label edits and sort renumbering do not rewrite table rows. Upgrade
+every recovery and replacement candidate before allowing kind 149 or manifest
+v15 to be written.
+
 ### Composite type name changes
 
 Renaming a composite type or moving it to another schema writes journal kind
@@ -193,8 +229,8 @@ writer can publish that identity. During the compatibility window:
    rewrite; and
 5. retries retain the exact source and destination identities.
 
-Manifest v13 follows the same rule: it is accepted at startup, while every new
-manifest is v14. Published v2 and v3 row generations can coexist with v4
+Manifests v13 and v14 follow the same rule: both are accepted at startup, while
+every new manifest is v15. Published v2 and v3 row generations can coexist with v4
 generations. New row slices and pair merges write v4 PAX; new deltas write v4
 packed rows. A clean older generation may remain reachable indefinitely, so
 online replacement does not by itself justify removing its reader.
@@ -203,7 +239,7 @@ The reader and writer identities above are executable declarations. A test
 compares those declarations with this matrix, so adding or removing an identity
 requires updating both in the same change. The v13 compatibility path publishes
 an actual legacy manifest, destroys both local cache tiers, recovers its v4 row
-generation, publishes v14 after a later commit, destroys the caches again, and
+generation, publishes v15 after a later commit, destroys the caches again, and
 recovers both generations. This qualifies the stated online upgrade instead of
 only testing the header parser.
 

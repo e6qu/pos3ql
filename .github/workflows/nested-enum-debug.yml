@@ -23,7 +23,12 @@ jobs:
           key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - run: cargo clean -p pos3ql
-      - run: python3 tools/test_command.py cargo test --locked --lib enum_value_identity_ -- --test-threads=1
+      - name: Enum ownership, SQL and recovery regressions
+        run: python3 tools/test_command.py cargo test --locked --lib enum_ -- --test-threads=1
+      - name: Durable reader and writer declarations
+        run: python3 tools/test_command.py cargo test --locked --lib durable_format_documentation_matches_the_executable_matrix -- --test-threads=1
+      - name: Clippy
+        run: cargo clippy --locked --lib --tests -- -D warnings
 
   postgresql:
     runs-on: ubuntu-latest

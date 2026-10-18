@@ -519,7 +519,7 @@ pub(crate) enum DdlUndo {
     /// ALTER TYPE staged a definition visible only to its transaction.
     EnumAltered {
         slot: u32,
-        prior: Option<crate::storage::PendingEnumDefinition>,
+        prior: crate::storage::EnumAlterUndo,
     },
     /// CREATE INDEX at this slot — undo by dropping it.
     IndexCreated(u32),

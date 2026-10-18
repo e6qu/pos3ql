@@ -82,9 +82,10 @@ including nested records, arrays, defaults, domain checks and captured view lite
 Changing a label no longer rewrites table rows or waits for an older read transaction.
 Type binding retains a domain's own identity separately from its base value;
 table, record and routine recovery share the same declaration resolver.
-Selected enum definitions retain their fixed label images through alteration,
-rollback, drop, slot reuse, replay and database retirement. Publishing complete
-type changes and all their references still requires exclusive storage ownership.
+Selected enum definitions retain their fixed label buffers through changes and recovery.
+Enum label edits use shared storage access for staging, publication and rollback;
+undo cannot erase a later edit or a replacement type. Complete type-name changes
+and their references still require coordinated publication before workers can run.
 SQL writes and replay retain row bytes from append through publication and
 retries. Table rewrites keep transformed images in the fixed statement arena,
 release owners after errors, and reject replaced heap buffers before publication.

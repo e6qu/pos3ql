@@ -11,6 +11,8 @@ mod definition_images;
 mod log_positions;
 pub(crate) use log_positions::ReservedLogPosition;
 mod enum_images;
+mod enum_publication;
+pub(crate) use enum_publication::{EnumAlterUndo, EnumMemberPublication};
 mod table_creation;
 mod table_definitions;
 mod table_edits;
@@ -9322,6 +9324,7 @@ pub struct EnumDef {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingEnumDefinition {
     pub txid: u32,
+    version: u64,
     pub schema: SqlName,
     pub name: SqlName,
     pub member_count: u32,
@@ -39661,13 +39664,13 @@ impl Storage {
     }
 
     pub(crate) fn stage_enum_alter(
-        &mut self,
+        &self,
         slot: usize,
         schema: SqlName,
         name: SqlName,
         members: &[EnumMember],
         txid: u32,
-    ) -> Result<Option<PendingEnumDefinition>, SqlError> {
+    ) -> Result<EnumAlterUndo, SqlError> {
         let mut catalog = self
             .type_catalog
             .lock()
@@ -39713,6 +39716,7 @@ impl Storage {
         let depth = previous.map_or(1, |previous| {
             catalog.pending_enum_members[previous as usize].depth + 1
         });
+        let version = self.catalog_sequence.next()?;
         let image = EnumImageReservation::write(&self.enum_member_images, members)?;
         let member_count = image.count();
         let image = image.publish();
@@ -39726,6 +39730,7 @@ impl Storage {
         });
         catalog.enums[slot].pending_definition = Some(PendingEnumDefinition {
             txid,
+            version,
             schema,
             name,
             member_count,
@@ -39733,11 +39738,16 @@ impl Storage {
             member_slot: member_slot as u32,
             image,
         });
-        Ok(prior)
+        Ok(EnumAlterUndo {
+            created_at: catalog.enums[slot].created_at,
+            transaction: txid,
+            version,
+            prior,
+        })
     }
 
     pub(crate) fn mark_enum_label_uncommitted(
-        &mut self,
+        &self,
         slot: usize,
         label: SqlName,
         txid: u32,
@@ -39809,41 +39819,51 @@ impl Storage {
     }
 
     pub(crate) fn commit_enum_alter(&mut self, slot: usize, txid: u32) {
+        match self.commit_enum_members(slot, txid) {
+            EnumMemberPublication::Complete => return,
+            EnumMemberPublication::IdentityMoveRequired => {}
+        }
         let rename = {
             let mut catalog = self
                 .type_catalog
                 .lock()
                 .expect("type catalog lock poisoned");
-            let Some(pending) = catalog.enums[slot]
-                .pending_definition
-                .filter(|pending| pending.txid == txid)
-            else {
-                return;
-            };
-            let definition = catalog.enums[slot].definition_for(txid);
-            let previous = catalog.enums[slot];
-            catalog.enums[slot] = definition;
-            self.clear_pending_enum_member_chain(
-                &mut catalog,
-                Some(pending.member_slot),
-                Some(pending.image),
-            );
-            if let Some(image) = previous.member_image {
-                self.enum_member_images
-                    .lock()
-                    .expect("enum member-image lock poisoned")
-                    .release(image);
-            }
-            (definition.schema != previous.schema || definition.name != previous.name).then_some((
-                previous.schema,
-                previous.name,
-                definition.schema,
-                definition.name,
-            ))
+            self.install_enum_alter_locked(&mut catalog, slot, txid)
         };
         if let Some((old_schema, old_name, schema, name)) = rename {
             self.move_enum_references(slot, old_schema, old_name, schema, name);
         }
+    }
+
+    fn install_enum_alter_locked(
+        &self,
+        catalog: &mut TypeCatalog,
+        slot: usize,
+        txid: u32,
+    ) -> Option<(SqlName, SqlName, SqlName, SqlName)> {
+        let pending = catalog.enums[slot]
+            .pending_definition
+            .filter(|pending| pending.txid == txid)?;
+        let definition = catalog.enums[slot].definition_for(txid);
+        let previous = catalog.enums[slot];
+        catalog.enums[slot] = definition;
+        self.clear_pending_enum_member_chain(
+            catalog,
+            Some(pending.member_slot),
+            Some(pending.image),
+        );
+        if let Some(image) = previous.member_image {
+            self.enum_member_images
+                .lock()
+                .expect("enum member-image lock poisoned")
+                .release(image);
+        }
+        (definition.schema != previous.schema || definition.name != previous.name).then_some((
+            previous.schema,
+            previous.name,
+            definition.schema,
+            definition.name,
+        ))
     }
 
     pub(crate) fn replay_enum_identity(
@@ -39867,19 +39887,22 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn rollback_enum_alter(
-        &mut self,
-        slot: usize,
-        prior: Option<PendingEnumDefinition>,
-    ) {
+    pub(crate) fn rollback_enum_alter(&self, slot: usize, undo: EnumAlterUndo) {
         let mut catalog = self
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        if let Some(current) = catalog.enums[slot].pending_definition {
-            self.release_pending_enum_members(&mut catalog, current.member_slot, None);
-        }
-        catalog.enums[slot].pending_definition = prior;
+        let definition = &catalog.enums[slot];
+        let Some(current) = definition.pending_definition.filter(|pending| {
+            definition.created_at == undo.created_at
+                && pending.txid == undo.transaction
+                && pending.version == undo.version
+        }) else {
+            // An already applied or superseded undo cannot release a later image.
+            return;
+        };
+        self.release_pending_enum_members(&mut catalog, current.member_slot, None);
+        catalog.enums[slot].pending_definition = undo.prior;
     }
 
     /// Moves an enum and every persisted reference to its type identity. Runtime

@@ -10,7 +10,18 @@ use crate::mem::fixed_vec::FixedVec;
 const ROWS_PER_BATCH: usize = 64;
 
 pub(super) struct SnapshotReclamation {
-    rowids: Mutex<FixedVec<u64>>,
+    workspace: Mutex<ReclamationWorkspace>,
+}
+
+struct ReclamationWorkspace {
+    rowids: FixedVec<u64>,
+    retry: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ReclamationMode {
+    Wait,
+    SkipBusy,
 }
 
 impl SnapshotReclamation {
@@ -25,11 +36,14 @@ impl SnapshotReclamation {
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         budget.draw(size_of::<Self>(), "snapshot reclamation control")?;
         Ok(Self {
-            rowids: Mutex::new(FixedVec::new(
-                budget,
-                "snapshot reclamation row identities",
-                Self::capacity(config),
-            )?),
+            workspace: Mutex::new(ReclamationWorkspace {
+                rowids: FixedVec::new(
+                    budget,
+                    "snapshot reclamation row identities",
+                    Self::capacity(config),
+                )?,
+                retry: false,
+            }),
         })
     }
 }
@@ -47,36 +61,58 @@ struct SnapshotRowOwners<'storage> {
 
 impl Storage {
     pub(super) fn prune_snapshot_versions(&self) {
-        // Serialize only cleanup scratch. Callers release the registry before
-        // waiting here; ordinary row reads and writes do not use this workspace.
-        let mut rowids = self
+        // Explicit release completes reclamation; statement admission only tries it.
+        let mut workspace = self
             .snapshot_reclamation
-            .rowids
+            .workspace
             .lock()
             .expect("snapshot reclamation workspace poisoned");
-        self.prune_snapshot_versions_in(&mut rowids);
+        self.snapshot_state().statement_reclamation_pending = false;
+        workspace.retry =
+            !self.prune_snapshot_versions_in(&mut workspace.rowids, ReclamationMode::Wait);
     }
 
     pub(crate) fn prune_released_statement_snapshots(&self) {
-        // Statement admission must not queue behind another cleanup. Its
-        // pending flag remains set, so a later admission retries the work.
-        let mut rowids = match self.snapshot_reclamation.rowids.try_lock() {
-            Ok(rowids) => rowids,
+        let mut workspace = match self.snapshot_reclamation.workspace.try_lock() {
+            Ok(workspace) => workspace,
             Err(TryLockError::WouldBlock) => return,
             Err(TryLockError::Poisoned(_)) => panic!("snapshot reclamation workspace poisoned"),
         };
-        let pending = self.snapshot_state().statement_reclamation_pending;
-        if pending {
-            self.prune_snapshot_versions_in(&mut rowids);
+        let Ok(mut snapshots) =
+            super::row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")
+        else {
+            return;
+        };
+        if !snapshots.statement_reclamation_pending && !workspace.retry {
+            return;
         }
+        // Consume only this request. A release during the pass sets a new one;
+        // skipped owners have a separate retry bit in this startup workspace.
+        snapshots.statement_reclamation_pending = false;
+        drop(snapshots);
+        workspace.retry =
+            !self.prune_snapshot_versions_in(&mut workspace.rowids, ReclamationMode::SkipBusy);
     }
 
-    fn prune_snapshot_versions_in(&self, rowids: &mut FixedVec<u64>) {
-        self.snapshot_state().statement_reclamation_pending = false;
+    fn prune_snapshot_versions_in(
+        &self,
+        rowids: &mut FixedVec<u64>,
+        mode: ReclamationMode,
+    ) -> bool {
+        let mut complete = true;
         for table in 0..self.tables.len() {
             rowids.clear();
             {
-                let rows = self.tables[table].rows.read();
+                let rows = match mode {
+                    ReclamationMode::Wait => self.tables[table].rows.read(),
+                    ReclamationMode::SkipBusy => {
+                        let Ok(rows) = self.tables[table].rows.try_read_for_batch() else {
+                            complete = false;
+                            continue;
+                        };
+                        rows
+                    }
+                };
                 for (&rowid, _) in rows.iter() {
                     rowids
                         .push(rowid)
@@ -86,10 +122,14 @@ impl Storage {
             // Map deletion shifts backing slots. Retained identities ensure
             // neither deletion nor an intervening update skips captured rows.
             for batch in rowids.as_slice().chunks(ROWS_PER_BATCH) {
-                self.prune_snapshot_row_batch(table, batch);
+                if !self.prune_snapshot_row_batch(table, batch, mode) {
+                    complete = false;
+                    break;
+                }
             }
         }
         rowids.clear();
+        complete
     }
 
     fn try_snapshot_row_owners(
@@ -107,14 +147,29 @@ impl Storage {
         })
     }
 
-    fn prune_snapshot_row_batch(&self, table: usize, rowids: &[u64]) {
+    fn prune_snapshot_row_batch(
+        &self,
+        table: usize,
+        rowids: &[u64],
+        mode: ReclamationMode,
+    ) -> bool {
         // Recheck retention after every wait and between bounded row batches.
         let SnapshotRowOwners {
             snapshots,
             generations,
             mut versions,
             mut rows,
-        } = super::row_ownership::acquire(|| self.try_snapshot_row_owners(table));
+        } = match mode {
+            ReclamationMode::Wait => {
+                super::row_ownership::acquire(|| self.try_snapshot_row_owners(table))
+            }
+            ReclamationMode::SkipBusy => {
+                let Ok(owners) = self.try_snapshot_row_owners(table) else {
+                    return false;
+                };
+                owners
+            }
+        };
         let oldest = snapshots.oldest();
         for rowid in rowids {
             let Some(state) = rows.get_mut(rowid) else {
@@ -134,6 +189,7 @@ impl Storage {
                 rows.remove(rowid);
             }
         }
+        true
     }
 }
 
@@ -199,7 +255,7 @@ mod tests {
             drop(wait);
             drop(held);
 
-            storage.prune_snapshot_row_batch(first, &[1]);
+            assert!(storage.prune_snapshot_row_batch(first, &[1], ReclamationMode::Wait));
             assert_eq!(storage.tables[first].rows.get(&1).unwrap().history.len(), 1);
             storage.release_snapshot(99);
             assert!(
@@ -231,7 +287,10 @@ mod tests {
             let mut budget = Budget::new(bytes);
             let workspace = SnapshotReclamation::new(&config, &mut budget).unwrap();
             assert_eq!(budget.used(), bytes);
-            assert_eq!(workspace.rowids.lock().unwrap().capacity(), 16);
+            let state = workspace.workspace.lock().unwrap();
+            assert_eq!(state.rowids.capacity(), 16);
+            assert!(!state.retry);
+            drop(state);
             let mut short = Budget::new(bytes - 1);
             let error = SnapshotReclamation::new(&config, &mut short).err().unwrap();
             assert_eq!(error.what, "snapshot reclamation row identities");
@@ -351,9 +410,10 @@ mod tests {
                 assert!(
                     storage
                         .snapshot_reclamation
-                        .rowids
+                        .workspace
                         .lock()
                         .unwrap()
+                        .rowids
                         .is_empty()
                 );
             });
@@ -371,7 +431,7 @@ mod tests {
                 .unwrap();
             storage.commit_row(table, 1, 8, 9).unwrap();
             let state = storage.resident_row_state(table, 1).unwrap().unwrap();
-            storage.prune_snapshot_row_batch(table, &[1]);
+            assert!(storage.prune_snapshot_row_batch(table, &[1], ReclamationMode::Wait));
             assert_eq!(
                 storage
                     .resident_row_state(table, 1)
@@ -437,9 +497,10 @@ mod tests {
             assert!(
                 storage
                     .snapshot_reclamation
-                    .rowids
+                    .workspace
                     .lock()
                     .unwrap()
+                    .rowids
                     .is_empty()
             );
         });
@@ -475,5 +536,272 @@ mod tests {
             );
             walks.clear();
         });
+    }
+
+    #[test]
+    fn nonblocking_snapshot_admission_skips_busy_rows_and_retries_without_losing_images() {
+        let (mut storage, first, second) = fixture();
+        let location = storage.heap.append_row(&[Datum::Int4(2)]).unwrap();
+        storage.tables[second]
+            .rows
+            .insert(1, RowState::committed_only_at(location, 7))
+            .unwrap();
+        let old_reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+        let selected = storage.resident_row_state(first, 1).unwrap().unwrap();
+        let image = storage
+            .visible_row_home_at(first, 1, selected, 99, SNAPSHOT_ALL, 7)
+            .unwrap()
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (table, txid, lsn, value) in [(first, 8, 9, 20), (second, 10, 11, 30)] {
+                let image = storage
+                    .heap
+                    .append_row_image(&[Datum::Int4(value)])
+                    .unwrap();
+                storage
+                    .write_pending_image_untracked(table, 1, txid, 1, Some(image))
+                    .unwrap();
+                storage.commit_row(table, 1, txid, lsn).unwrap();
+                storage.observe_lsn(lsn);
+            }
+            drop(old_reader);
+        });
+        let held = storage.tables[first].rows.write();
+        let finished = AtomicBool::new(false);
+        let (progressed, reader) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let reader = crate::mem::guard::forbid_alloc(|| {
+                    storage.retain_statement_snapshot(101, |lsn| lsn).unwrap()
+                });
+                finished.store(true, Ordering::Release);
+                reader
+            });
+            let progressed = crate::mem::guard::forbid_alloc(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                finished.load(Ordering::Acquire)
+            });
+            assert_eq!(held.get(&1).unwrap().history.len(), 1);
+            // Unblock even a regression before joining the worker.
+            drop(held);
+            (progressed, worker.join().unwrap())
+        });
+        assert!(
+            progressed,
+            "statement admission waited for another table's cleanup"
+        );
+        assert_eq!(reader.snapshot(), 11);
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(
+                storage.tables[second]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .history
+                    .is_empty()
+            );
+            assert!(storage.snapshot_reclamation.workspace.lock().unwrap().retry);
+            assert!(!storage.snapshot_state().statement_reclamation_pending);
+            storage.prune_released_statement_snapshots();
+            assert!(
+                storage.tables[first]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .history
+                    .is_empty()
+            );
+            let workspace = storage.snapshot_reclamation.workspace.lock().unwrap();
+            assert!(!workspace.retry);
+            assert!(workspace.rowids.is_empty());
+            drop(workspace);
+            storage
+                .with_row_bytes(first, 1, image, |bytes| {
+                    let mut values = [Datum::Null];
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                    assert_eq!(values[0], Datum::Int4(1));
+                    Ok(())
+                })
+                .unwrap();
+            drop(reader);
+        });
+    }
+
+    #[test]
+    fn nonblocking_snapshot_cleanup_releases_owners_and_rechecks_readers_on_retry() {
+        let (storage, table, _) = fixture();
+        let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
+            storage
+                .write_pending_image_untracked(table, 1, 8, 1, Some(image))
+                .unwrap();
+            storage.commit_row(table, 1, 8, 9).unwrap();
+            storage.observe_lsn(9);
+            drop(reader);
+        });
+        let versions = storage.row_versions.test_write().unwrap();
+        let finished = AtomicBool::new(false);
+        let progressed = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| storage.prune_released_statement_snapshots());
+                finished.store(true, Ordering::Release);
+            });
+            let progressed = crate::mem::guard::forbid_alloc(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                finished.load(Ordering::Acquire)
+            });
+            // Check guards only after the worker returned, without waiting on them.
+            let registry_released = storage.snapshots.try_lock().is_ok();
+            let generations_released = storage.tables[table]
+                .spill_generations
+                .try_read_for_batch()
+                .is_ok();
+            let rows_released = storage.tables[table].rows.test_write().is_ok();
+            drop(versions);
+            worker.join().unwrap();
+            assert!(registry_released && generations_released && rows_released);
+            progressed
+        });
+        assert!(
+            progressed,
+            "opportunistic cleanup waited for row-version ownership"
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(storage.snapshot_reclamation.workspace.lock().unwrap().retry);
+            assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
+            storage.register_snapshot(100, 7).unwrap();
+            storage.prune_released_statement_snapshots();
+            assert!(!storage.snapshot_reclamation.workspace.lock().unwrap().retry);
+            assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
+            storage.release_snapshot(100);
+            assert!(
+                storage.tables[table]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .history
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn nonblocking_snapshot_cleanup_skips_busy_control_owners_without_consuming_work() {
+        let (storage, _, _) = fixture();
+        for busy_registry in [true, false] {
+            let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+            crate::mem::guard::forbid_alloc(|| drop(reader));
+            let registry = busy_registry.then(|| storage.snapshot_state());
+            let workspace =
+                (!busy_registry).then(|| storage.snapshot_reclamation.workspace.lock().unwrap());
+            let finished = AtomicBool::new(false);
+            let progressed = std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    crate::mem::guard::forbid_alloc(|| {
+                        storage.prune_released_statement_snapshots()
+                    });
+                    finished.store(true, Ordering::Release);
+                });
+                let progressed = crate::mem::guard::forbid_alloc(|| {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    finished.load(Ordering::Acquire)
+                });
+                drop(registry);
+                drop(workspace);
+                worker.join().unwrap();
+                progressed
+            });
+            assert!(
+                progressed,
+                "opportunistic cleanup waited for a control owner"
+            );
+            crate::mem::guard::forbid_alloc(|| {
+                assert!(storage.snapshot_state().statement_reclamation_pending);
+                storage.prune_released_statement_snapshots();
+                assert!(!storage.snapshot_state().statement_reclamation_pending);
+            });
+        }
+    }
+
+    #[test]
+    fn nonblocking_snapshot_batch_releases_prefix_owners_when_rows_are_busy() {
+        let (storage, table, _) = fixture();
+        crate::mem::guard::forbid_alloc(|| {
+            let rows = storage.tables[table].rows.write();
+            assert!(!storage.prune_snapshot_row_batch(table, &[1], ReclamationMode::SkipBusy));
+            assert!(storage.snapshots.try_lock().is_ok());
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(
+                storage.tables[table]
+                    .spill_generations
+                    .try_read_for_batch()
+                    .is_ok()
+            );
+            assert!(rows.get(&1).is_some());
+        });
+    }
+
+    #[test]
+    fn nonblocking_snapshot_release_racing_cleanup_keeps_its_reclamation_request() {
+        let (storage, table, _) = fixture();
+        for iteration in 0..8 {
+            let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                let image = storage
+                    .heap
+                    .append_row_image(&[Datum::Int4(20 + iteration)])
+                    .unwrap();
+                let lsn = 9 + iteration as u64 * 2;
+                storage
+                    .write_pending_image_untracked(table, 1, 8, 1, Some(image))
+                    .unwrap();
+                storage.commit_row(table, 1, 8, lsn).unwrap();
+                storage.observe_lsn(lsn);
+            });
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    crate::mem::guard::forbid_alloc(|| drop(reader));
+                });
+                start.wait();
+                crate::mem::guard::forbid_alloc(|| storage.prune_released_statement_snapshots());
+            });
+            crate::mem::guard::forbid_alloc(|| {
+                if !storage.tables[table]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .history
+                    .is_empty()
+                {
+                    assert!(
+                        storage.snapshot_state().statement_reclamation_pending
+                            || storage.snapshot_reclamation.workspace.lock().unwrap().retry
+                    );
+                }
+                storage.prune_released_statement_snapshots();
+                assert!(
+                    storage.tables[table]
+                        .rows
+                        .get(&1)
+                        .unwrap()
+                        .history
+                        .is_empty()
+                );
+                assert!(!storage.snapshot_state().statement_reclamation_pending);
+                assert!(!storage.snapshot_reclamation.workspace.lock().unwrap().retry);
+            });
+        }
     }
 }

@@ -74,9 +74,12 @@ local cleanup sorts, validates, assigns destinations and copies rows in bounded
 turns, including while an unrelated object download waits. Ordinary queries can
 progress between turns. Row reads, writes and cleanup release shared owners
 before waiting for one table. Post-checkpoint eviction and history release use
-shared storage access. Heap capture, final remapping, and whole cleanup walks
-still complete within one turn; explicit CHECKPOINT and critical memory pressure
-still wait for cleanup.
+shared storage access. Statement admission tries history cleanup without waiting
+for busy registry, table, saved-file or version owners; skipped work remains
+pending for a later admission. Explicit transaction release still completes
+its cleanup. Heap capture, final remapping, and whole cleanup walks still
+complete within one turn; explicit CHECKPOINT and critical memory pressure still
+wait for cleanup.
 
 Complete type-name changes and remaining maintenance still need publication
 coordination. The [implementation guide](docs/implemented-baseline.md) owns

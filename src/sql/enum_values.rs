@@ -439,6 +439,7 @@ impl core::fmt::Display for SqlString<'_> {
 /// Re-render only changed enum constants; preserve other expression sources.
 pub(crate) fn default_expression<'a>(
     default: &crate::storage::ColumnDefault,
+    base: Option<crate::sql::types::ColType>,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
@@ -446,6 +447,18 @@ pub(crate) fn default_expression<'a>(
     let Some(expression) = default.expression() else {
         return Ok(None);
     };
+    if default.constant().is_none() {
+        if let Some(base) = base {
+            return checks::resolve_default(expression.as_str(), base, storage, txid, arena)
+                .map(Some);
+        }
+        if checks::is_bound(expression.as_str()) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "bound enum default has no declared base type"
+            ));
+        }
+    }
     let copy_original = || {
         arena
             .alloc_str(expression.as_str())

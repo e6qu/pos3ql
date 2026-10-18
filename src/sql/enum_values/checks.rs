@@ -1,4 +1,4 @@
-//! Domain CHECK constants bind to the domain's base enum, not its labels.
+//! Stored enum expressions bind constants to members, not their labels.
 
 use super::{SqlString, query_tokens, write_name};
 use crate::mem::arena::Arena;
@@ -24,6 +24,29 @@ pub(crate) fn bind<const N: usize>(
     txid: u32,
     legacy: bool,
     arena: &Arena,
+) -> Result<StackStr<N>, SqlError> {
+    bind_expression(source, base, storage, txid, legacy, arena, false)
+}
+
+pub(crate) fn bind_default<const N: usize>(
+    source: &str,
+    base: ColType,
+    storage: &Storage,
+    txid: u32,
+    legacy: bool,
+    arena: &Arena,
+) -> Result<StackStr<N>, SqlError> {
+    bind_expression(source, base, storage, txid, legacy, arena, true)
+}
+
+fn bind_expression<const N: usize>(
+    source: &str,
+    base: ColType,
+    storage: &Storage,
+    txid: u32,
+    legacy: bool,
+    arena: &Arena,
+    default_target: bool,
 ) -> Result<StackStr<N>, SqlError> {
     let Some(slot) = enum_slot(base) else {
         return Ok(StackStr::from_str(source));
@@ -51,15 +74,36 @@ pub(crate) fn bind<const N: usize>(
     write_name(&mut name, definition.schema.as_str());
     let _ = name.write_char('.');
     write_name(&mut name, definition.name.as_str());
-    let context_type = crate::sql::catalog::user_type_name_text(storage, txid, base.oid(), arena)?
-        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "enum CHECK has no base type name"))?;
-    let query = arena
-        .alloc_str_display(format_args!(
+    let context_base = if default_target {
+        match base {
+            ColType::Array(_) => ColType::Array(crate::sql::types::ArrElem::Enum(slot)),
+            _ => ColType::Enum(slot),
+        }
+    } else {
+        base
+    };
+    let context_type =
+        crate::sql::catalog::user_type_name_text(storage, txid, context_base.oid(), arena)?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "enum expression has no base type name"
+                )
+            })?;
+    let query = if default_target {
+        arena.alloc_str_display(format_args!(
+            "SELECT ({})::{}",
+            parameters.as_str(),
+            context_type
+        ))
+    } else {
+        arena.alloc_str_display(format_args!(
             "SELECT {} FROM (VALUES (NULL::{})) AS __pos3ql_domain(value)",
             parameters.as_str(),
             context_type
         ))
-        .map_err(|_| crate::sql::query::arena_full_pub())?;
+    }
+    .map_err(|_| crate::sql::query::arena_full_pub())?;
     let select = crate::sql::parser::parse_query(query, arena)?;
     let oids = arena
         .alloc_slice_with(count, |_| oid::TEXT)
@@ -182,9 +226,31 @@ pub(crate) fn bind<const N: usize>(
 fn full<const N: usize>() -> SqlError {
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        "bound enum CHECK exceeds {} bytes",
+        "bound enum expression exceeds {} bytes",
         N
     )
+}
+
+pub(crate) fn resolve_default<'a>(
+    source: &str,
+    base: ColType,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    if source.starts_with("pos3ql-enum-check-") {
+        return resolve(source, base, storage, txid, arena);
+    }
+    let legacy = bind_default::<{ crate::storage::DEFAULT_EXPR_MAX }>(
+        source, base, storage, txid, true, arena,
+    )?;
+    if is_bound(legacy.as_str()) {
+        resolve(legacy.as_str(), base, storage, txid, arena)
+    } else {
+        arena
+            .alloc_str(source)
+            .map_err(|_| crate::sql::query::arena_full_pub())
+    }
 }
 
 pub(crate) fn resolve<'a>(
@@ -194,7 +260,20 @@ pub(crate) fn resolve<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
+    if source.starts_with("pos3ql-enum-check-") && !is_bound(source) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "unsupported enum expression encoding"
+        ));
+    }
     let Some(slot) = enum_slot(base) else {
+        if is_bound(source) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "bound enum expression has no enum base type"
+            ));
+        }
+
         return arena
             .alloc_str(source)
             .map_err(|_| crate::sql::query::arena_full_pub());

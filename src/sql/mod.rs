@@ -10231,7 +10231,7 @@ impl Engine {
         let (columns, transition_types) = match target {
             crate::storage::RuleTarget::Table(slot) => {
                 let definition = storage.table_def(usize::from(slot), txn.txid);
-                rule_defaults = match exec::parse_defaults(&definition, arena) {
+                rule_defaults = match exec::parse_defaults(&definition, arena, storage, txn.txid) {
                     Ok(defaults) => defaults,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -18854,13 +18854,15 @@ fn replay_transaction_batches(
                             "prepared transaction WAL is corrupt"
                         )
                     })? {
-                        WalOp::RestoreTable(payload) => apply_prepared_table_wal_payload(
-                            storage,
-                            prepared,
-                            slot,
-                            transaction_id,
-                            payload,
-                        )?,
+                        WalOp::RestoreTable(payload) | WalOp::RestoreTypedTable(payload) => {
+                            apply_prepared_table_wal_payload(
+                                storage,
+                                prepared,
+                                slot,
+                                transaction_id,
+                                payload,
+                            )?
+                        }
                         WalOp::CreateSequence {
                             schema,
                             name,
@@ -19713,7 +19715,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 ));
             }
         }
-        WalOp::RestoreTable(payload) => apply_table_wal_payload(storage, payload)?,
+        WalOp::RestoreTable(payload) | WalOp::RestoreTypedTable(payload) => {
+            apply_table_wal_payload(storage, payload)?
+        }
         WalOp::CreateTable(_) => {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,

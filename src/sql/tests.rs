@@ -52209,8 +52209,16 @@ fn enum_value_identity_saved_indexes_and_views_survive_empty_cache_recovery() {
         true,
     );
     assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
-    session.success(&mut cold,
-        "ALTER TYPE enum_saved_state ADD VALUE 'old';          INSERT INTO enum_saved_rows VALUES (3, 'old', ROW('old', 'old')::enum_saved_detail)", true);
+    session.success(
+        &mut cold,
+        "ALTER TYPE enum_saved_state ADD VALUE 'old'",
+        true,
+    );
+    session.success(
+        &mut cold,
+        "INSERT INTO enum_saved_rows VALUES (3, 'old', ROW('old', 'old')::enum_saved_detail)",
+        true,
+    );
     assert_eq!(
         data_rows(&session.success(
             &mut cold,
@@ -52524,6 +52532,31 @@ fn enum_value_identity_private_markers_and_invalid_bindings_are_checked() {
         )),
         ["new"]
     );
+    for (source, base, expected) in [
+        ("pos3ql-enum-check-v99\n'old'", ColType::Text, "0A000"),
+        (
+            "pos3ql-enum-check-v99\n'old'",
+            ColType::Enum(slot as u16),
+            "0A000",
+        ),
+        (
+            "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
+            ColType::Text,
+            "XX000",
+        ),
+    ] {
+        let error = crate::mem::guard::forbid_alloc(|| {
+            crate::sql::enum_values::checks::resolve_default(
+                source,
+                base,
+                &engine.storage,
+                0,
+                &arena,
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, expected);
+    }
 }
 
 #[test]
@@ -85816,4 +85849,105 @@ fn enum_value_identity_domains_containing_domain_arrays_keep_their_declarations(
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     assert_declarations(&mut session, &mut engine);
+}
+
+#[test]
+fn enum_value_identity_domain_defaults_follow_members_after_type_moves_and_wal() {
+    let config = test_config("enum-domain-default-identities");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TYPE default_state AS ENUM ('old', 'ready');
+         CREATE DOMAIN default_value AS default_state DEFAULT 'old'::default_state;
+         CREATE DOMAIN default_batch AS default_state[] DEFAULT '{old}'::default_state[];
+         CREATE FUNCTION default_echo(default_state) RETURNS default_state LANGUAGE SQL VOLATILE AS 'SELECT $1';
+         CREATE TABLE default_before (state default_value, states default_batch,
+             echo_state default_state DEFAULT default_echo('old'));
+         CREATE VIEW default_view AS SELECT * FROM default_before;
+         ALTER VIEW default_view ALTER COLUMN echo_state SET DEFAULT default_echo('old');
+         ALTER TYPE default_state RENAME VALUE 'old' TO 'new';
+         ", true);
+    session.success(
+        &mut engine,
+        "ALTER TYPE default_state ADD VALUE 'old'",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "CREATE SCHEMA defaults_moved;
+         ALTER TYPE default_state SET SCHEMA defaults_moved;
+         CREATE TABLE default_after (state default_value, states default_batch,
+             echo_state defaults_moved.default_state DEFAULT default_echo('old'));
+         INSERT INTO default_before DEFAULT VALUES;
+         INSERT INTO default_after DEFAULT VALUES;
+         INSERT INTO default_view DEFAULT VALUES",
+        true,
+    );
+    let assert_defaults = |session: &mut ConfiguredTransactionSession, engine: &mut Engine| {
+        assert_eq!(
+            data_rows(&session.success(
+                engine,
+                "SELECT state::text, states[1]::text, echo_state::text FROM default_before;
+             SELECT state::text, states[1]::text, echo_state::text FROM default_after",
+                true
+            )),
+            ["new|new|new", "new|new|new", "new|new|old"]
+        );
+        let defaults = data_rows(&session.success(
+            engine,
+            "SELECT typdefault FROM pg_type
+                 WHERE typname IN ('default_value','default_batch') ORDER BY typname",
+            true,
+        ));
+        assert_eq!(defaults.len(), 2);
+        assert!(
+            defaults
+                .iter()
+                .all(|value| value.contains("new") && !value.contains("pos3ql-")),
+            "{defaults:?}"
+        );
+        let view_default = data_rows(&session.success(
+            engine,
+            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef
+                 WHERE adrelid = 'default_view'::regclass",
+            true,
+        ));
+        assert_eq!(view_default.len(), 1);
+        assert!(
+            view_default[0].contains("new") && !view_default[0].contains("pos3ql-"),
+            "{view_default:?}"
+        );
+    };
+    assert_defaults(&mut session, &mut engine);
+    engine.commit_wal().unwrap();
+    drop(session);
+    drop(engine);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_defaults(&mut session, &mut engine);
+    session.success(&mut engine, "INSERT INTO default_view DEFAULT VALUES", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM default_before WHERE echo_state::text = 'new'",
+            true
+        )),
+        ["3"]
+    );
+    session.success(
+        &mut engine,
+        "CREATE TABLE default_recovered (state default_value, states default_batch);
+         INSERT INTO default_recovered DEFAULT VALUES",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT state::text, states[1]::text FROM default_recovered",
+            true
+        )),
+        ["new|new"]
+    );
 }

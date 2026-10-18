@@ -2547,24 +2547,16 @@ pub(crate) fn dispatch<'a>(
                         return Ok(regtype(referenced_oid, type_name));
                     }
                 }
-                // A bare user-typed column retains its declared identity; an
-                // expression over it uses the representation type below.
+                // A domain declaration can contain an array without being
+                // an array of the declared domain.
                 if let crate::sql::ast::Expr::Column { qualifier, name } = args[0]
                     && let Some(identity) = row.column_user_type(*qualifier, name)
+                    && let Some(ctype) = row.col_type(*qualifier, name)
+                    && let Some(cat) = hooks.catalog
+                    && let Some(referenced_oid) = cat.declared_user_type_oid(ctype, identity)
+                    && let Some(type_name) = cat.type_name(referenced_oid, arena)?
                 {
-                    if let Some(ColType::Array(element)) = row.col_type(*qualifier, name)
-                        && element.user_type_slot().is_some()
-                        && let Some(cat) = hooks.catalog
-                        && let Some(name) = cat.user_array_name(element, arena)?
-                    {
-                        return Ok(regtype(element.array_oid(), name));
-                    }
-                    if let Some(cat) = hooks.catalog
-                        && let Some(referenced_oid) = cat.user_type_identity_oid(identity, false)
-                        && let Some(type_name) = cat.type_name(referenced_oid, arena)?
-                    {
-                        return Ok(regtype(referenced_oid, type_name));
-                    }
+                    return Ok(regtype(referenced_oid, type_name));
                 }
                 if let crate::sql::ast::Expr::Subscript { base, .. } = args[0]
                     && let crate::sql::ast::Expr::Column { qualifier, name } = &**base

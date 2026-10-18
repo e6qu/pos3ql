@@ -1245,6 +1245,11 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             operand, type_name, ..
         } => match operand {
             Expr::Column { .. }
+            | Expr::SchemaColumn { .. }
+            | Expr::Subscript { .. }
+            | Expr::Slice { .. }
+            | Expr::Field { .. }
+            | Expr::WholeRow(_)
             | Expr::Call { .. }
             | Expr::Array(_)
             | Expr::ArraySubquery(_)
@@ -1277,9 +1282,15 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
 
 fn cast_source_name<'a>(expression: &Expr<'a>) -> Option<&'a str> {
     match expression {
-        Expr::Column { .. } | Expr::Call { .. } | Expr::Array(_) | Expr::ArraySubquery(_) => {
-            name_of(expression)
-        }
+        Expr::Column { .. }
+        | Expr::SchemaColumn { .. }
+        | Expr::Subscript { .. }
+        | Expr::Slice { .. }
+        | Expr::Field { .. }
+        | Expr::WholeRow(_)
+        | Expr::Call { .. }
+        | Expr::Array(_)
+        | Expr::ArraySubquery(_) => name_of(expression),
         Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => cast_source_name(operand),
         _ => None,
     }

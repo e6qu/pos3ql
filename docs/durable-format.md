@@ -175,15 +175,17 @@ bindings. Readers resolve these positions through the captured dependencies and
 remove the internal grammar before parsing or displaying SQL. Unknown grammar
 versions and invalid bindings are errors.
 
-Domain CHECK SQL against an enum or enum-array base uses `pos3ql-enum-check-v1`. Its
+Domain CHECK and stored DEFAULT SQL against an enum or enum-array base use `pos3ql-enum-check-v1`. Its
 `/*p3c:M*/` literal bindings refer to base member M; `/*p3a*/` introduces a
 text array of base member ordinals, and `/*p3t:N*/` binds N tokens of an explicit
 cast type name to the domain's selected base enum. Ordinary text is unbound.
 Rendering removes the grammar and resolves current labels and type names.
-Domain definitions with bound checks or named array bases use journal kind 151;
+Domain definitions with bound checks, defaults or named array bases use journal kind 151;
 bound views use kind 152;
-the previous domain and view kinds remain readable. This distinction also
-survives prepared-transaction re-encoding.
+the previous domain and view kinds remain readable. Tables carrying bound default
+source use kind 154; their preceding table kind remains readable. These distinctions
+survive prepared-transaction re-encoding. Bound view defaults use column-default
+tag 3; the preceding expression tag 2 remains readable.
 
 Legacy enum indexes hashed labels. Loading an older manifest explicitly retires
 those generations and schedules replacements; scalar key hashes use stable member
@@ -191,7 +193,7 @@ identities rather than labels or sort positions; existing row objects remain
 readable. Enum-dependent most-common-value hash summaries from older manifests
 or journal kind 77 are retired while their counts and dependency estimates remain
 valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. Upgrade every recovery and replacement candidate before this binary writes
-journal kinds 149–153 or manifest v15. Kind 153 applies to ordinary row writes
+journal kinds 149–154 or manifest v15. Kind 153 applies to ordinary row writes
 too, so the upgrade is required before resuming writes, even without enum DDL.
 
 ### Composite type name changes

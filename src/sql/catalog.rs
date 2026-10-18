@@ -22018,8 +22018,13 @@ fn pg_attrdef<'a>(
         let table = storage.table_def(slot, txid);
         let relid = table_oid(storage, slot);
         for (ci, c) in table.columns().iter().enumerate() {
-            let Some(text_expr) =
-                super::enum_values::default_expression(&c.default, storage, txid, arena)?
+            let Some(text_expr) = super::enum_values::default_expression(
+                &c.default,
+                Some(c.ctype),
+                storage,
+                txid,
+                arena,
+            )?
             else {
                 continue;
             };
@@ -22041,12 +22046,32 @@ fn pg_attrdef<'a>(
     }
     for (slot, view) in storage.views_visible_to(txid) {
         let columns = view.columns_for(txid);
+        let has_expression_default = (0..columns.len()).any(|index| {
+            columns.default_at_ref(index).is_some_and(|default| {
+                default.constant().is_none() && default.expression().is_some()
+            })
+        });
+        let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+        let described = if has_expression_default {
+            describe_view(storage, txid, &view, arena, &mut descriptions)?
+        } else {
+            0
+        };
         for column in 0..columns.len() {
             let default = columns
                 .default_at_ref(column)
                 .expect("view default column is bounded");
-            let Some(default) =
-                super::enum_values::default_expression(default, storage, txid, arena)?
+            let Some(default) = super::enum_values::default_expression(
+                default,
+                if column < described {
+                    Some(view_column_catalog_type(storage, txid, descriptions[column].type_oid)?.0)
+                } else {
+                    None
+                },
+                storage,
+                txid,
+                arena,
+            )?
             else {
                 continue;
             };
@@ -28696,7 +28721,13 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bool(d.not_null),
                 match &d.default_expr {
                     Some(e) => text(
-                        arena.alloc_str(e.as_str()).map_err(|_| arena_full())?,
+                        super::enum_values::checks::resolve_default(
+                            e.as_str(),
+                            d.base,
+                            storage,
+                            txid,
+                            arena,
+                        )?,
                         arena,
                     )?,
                     None => Datum::Null,
@@ -31613,7 +31644,13 @@ fn info_column_row<'a>(
     let default = if column.default.is_generated() {
         None
     } else {
-        super::enum_values::default_expression(&column.default, storage, txid, arena)?
+        super::enum_values::default_expression(
+            &column.default,
+            Some(column.ctype),
+            storage,
+            txid,
+            arena,
+        )?
     };
     let generated = column.default.is_generated();
     let generated_expression = generated.then(|| column.default.expression()).flatten();
@@ -33007,7 +33044,16 @@ fn info_domains<'a>(
             ),
         };
         let default = match domain.default_expr {
-            Some(value) => text(value.as_str(), arena)?,
+            Some(value) => text(
+                super::enum_values::checks::resolve_default(
+                    value.as_str(),
+                    domain.base,
+                    storage,
+                    txid,
+                    arena,
+                )?,
+                arena,
+            )?,
             None => Datum::Null,
         };
         output[count] = row(

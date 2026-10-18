@@ -5286,7 +5286,12 @@ where
             .iter()
             .any(|(_, expression)| matches!(expression, Expr::DefaultMarker))
         {
-            Some(parse_defaults(logical_definition, arena)?)
+            Some(parse_defaults(
+                logical_definition,
+                arena,
+                storage,
+                txn.txid,
+            )?)
         } else {
             None
         };
@@ -40676,7 +40681,16 @@ fn build_domain_spec(
     let default_expr = match default_text {
         Some(t) => {
             validate_domain_expr(t, false, arena)?;
-            Some(domain_text::<{ crate::storage::DEFAULT_EXPR_MAX }>(t)?)
+            Some(super::enum_values::checks::bind_default::<
+                { crate::storage::DEFAULT_EXPR_MAX },
+            >(
+                domain_text::<{ crate::storage::DEFAULT_EXPR_MAX }>(t)?.as_str(),
+                base,
+                storage,
+                txid,
+                false,
+                arena,
+            )?)
         }
         // PostgreSQL copies a parent domain's default at CREATE time: a later
         // ALTER of the parent default does not change the child.
@@ -41668,7 +41682,16 @@ pub fn alter_domain(
             if let Err(e) = validate_domain_expr(text, false, arena) {
                 return sql_fail(e);
             }
-            match domain_text::<{ crate::storage::DEFAULT_EXPR_MAX }>(text) {
+            match domain_text::<{ crate::storage::DEFAULT_EXPR_MAX }>(text).and_then(|text| {
+                super::enum_values::checks::bind_default::<{ crate::storage::DEFAULT_EXPR_MAX }>(
+                    text.as_str(),
+                    spec.base,
+                    storage,
+                    txn.txid,
+                    false,
+                    arena,
+                )
+            }) {
                 Ok(t) => spec.default_expr = Some(t),
                 Err(e) => return sql_fail(e),
             }
@@ -52452,7 +52475,7 @@ pub(crate) fn copy_row(
         ));
     }
     let checks = parse_checks(def, arena)?;
-    let default_exprs = parse_defaults(def, arena)?;
+    let default_exprs = parse_defaults(def, arena, storage, txn.txid)?;
     let generated_exprs = parse_generated(def, arena)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
     let mut explicit = [false; MAX_COLUMNS];
@@ -52564,7 +52587,7 @@ pub(crate) fn copy_row_binary(
         ));
     }
     let checks = parse_checks(def, arena)?;
-    let default_exprs = parse_defaults(def, arena)?;
+    let default_exprs = parse_defaults(def, arena, storage, txn.txid)?;
     let generated_exprs = parse_generated(def, arena)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
     let mut explicit = [false; MAX_COLUMNS];
@@ -52862,7 +52885,7 @@ pub(crate) fn apply_replication_insert(
     for &local in binding.remote_to_local() {
         explicit[local] = true;
     }
-    let defaults = parse_defaults(&definition, arena)?;
+    let defaults = parse_defaults(&definition, arena, storage, txn.txid)?;
     fill_omitted_defaults(
         storage,
         txn.txid,
@@ -55431,6 +55454,8 @@ fn parse_view_defaults<'a>(
     view: Option<ViewCheck<'_>>,
     definition: &TableDef,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<constraints::ParsedDefaults<'a>, SqlError> {
     let mut parsed = [None; MAX_COLUMNS];
     let Some(view) = view else {
@@ -55461,12 +55486,13 @@ fn parse_view_defaults<'a>(
                 "view default target is absent from its base relation"
             ));
         };
-        let source = arena.alloc_str(source.as_str()).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "view default expression exceeds the statement arena"
-            )
-        })?;
+        let source = super::enum_values::checks::resolve_default(
+            source.as_str(),
+            definition.columns[base_index].ctype,
+            storage,
+            txid,
+            arena,
+        )?;
         parsed[base_index] = Some(crate::sql::parser::parse_expr(source, arena)?);
     }
     Ok(parsed)
@@ -56909,7 +56935,7 @@ pub(crate) fn merge<'a>(
         Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
-    let defaults = match parse_defaults(def, arena) {
+    let defaults = match parse_defaults(def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -59700,14 +59726,15 @@ where
                 (&*rows, count)
             };
 
-        let default_exprs = match parse_defaults(def, arena) {
+        let default_exprs = match parse_defaults(def, arena, storage, txn.txid) {
             Ok(d) => d,
             Err(e) => return sql_fail(e),
         };
-        let view_default_exprs = match parse_view_defaults(view_check, def, arena) {
-            Ok(d) => d,
-            Err(e) => return sql_fail(e),
-        };
+        let view_default_exprs =
+            match parse_view_defaults(view_check, def, arena, storage, txn.txid) {
+                Ok(d) => d,
+                Err(e) => return sql_fail(e),
+            };
         let generated_exprs = match parse_generated(def, arena) {
             Ok(g) => g,
             Err(e) => return sql_fail(e),
@@ -59907,11 +59934,11 @@ where
 
     // Non-constant DEFAULT expressions (now(), nextval(...), …) and GENERATED
     // expressions, re-parsed once and evaluated per row below.
-    let default_exprs = match parse_defaults(def, arena) {
+    let default_exprs = match parse_defaults(def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
-    let view_default_exprs = match parse_view_defaults(view_check, def, arena) {
+    let view_default_exprs = match parse_view_defaults(view_check, def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -60727,7 +60754,7 @@ pub(crate) fn update<'a>(
             ));
         }
     }
-    let defaults = match parse_defaults(def, arena) {
+    let defaults = match parse_defaults(def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -67250,7 +67277,7 @@ fn alter_table_relation(
     // Non-constant DEFAULTs of columns added by this ALTER: each existing row is
     // backfilled by evaluating the default, so a `nextval` default consumes a
     // value per existing row, exactly as PostgreSQL rewrites the table.
-    let new_defaults = match parse_defaults(&new_def, arena) {
+    let new_defaults = match parse_defaults(&new_def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };

@@ -313,3 +313,34 @@ DROP DOMAIN kept_outer;
 DROP DOMAIN kept_inner_new;
 DROP TYPE kept_moved.kept_state;
 DROP SCHEMA kept_moved;
+
+
+-- Domain defaults keep typed members for existing and newly created columns.
+CREATE TYPE default_state AS ENUM ('old', 'ready');
+CREATE DOMAIN default_value AS default_state DEFAULT 'old'::default_state;
+CREATE DOMAIN default_batch AS default_state[] DEFAULT '{old}'::default_state[];
+CREATE FUNCTION default_echo(default_state) RETURNS default_state LANGUAGE SQL VOLATILE AS 'SELECT $1';
+CREATE TABLE default_before (state default_value, states default_batch,
+    echo_state default_state DEFAULT default_echo('old'));
+CREATE VIEW default_view AS SELECT * FROM default_before;
+ALTER VIEW default_view ALTER COLUMN echo_state SET DEFAULT default_echo('old');
+ALTER TYPE default_state RENAME VALUE 'old' TO 'new';
+ALTER TYPE default_state ADD VALUE 'old';
+CREATE SCHEMA defaults_moved;
+ALTER TYPE default_state SET SCHEMA defaults_moved;
+CREATE TABLE default_after (state default_value, states default_batch,
+    echo_state defaults_moved.default_state DEFAULT default_echo('old'));
+INSERT INTO default_before DEFAULT VALUES;
+INSERT INTO default_after DEFAULT VALUES;
+INSERT INTO default_view DEFAULT VALUES;
+SELECT state::text, states[1]::text, echo_state::text FROM default_before;
+SELECT state::text, states[1]::text, echo_state::text FROM default_after;
+SELECT typname, typdefault FROM pg_type WHERE typname IN ('default_value','default_batch') ORDER BY typname;
+DROP VIEW default_view;
+DROP TABLE default_before;
+DROP TABLE default_after;
+DROP DOMAIN default_value;
+DROP DOMAIN default_batch;
+DROP FUNCTION default_echo(defaults_moved.default_state);
+DROP TYPE defaults_moved.default_state;
+DROP SCHEMA defaults_moved;

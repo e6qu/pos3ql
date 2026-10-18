@@ -1450,6 +1450,8 @@ pub(crate) type ParsedDefaults<'a> = [Option<&'a Expr<'a>>; MAX_COLUMNS];
 pub(crate) fn parse_defaults<'a>(
     def: &TableDef,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<ParsedDefaults<'a>, SqlError> {
     let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
     for (i, c) in def.columns().iter().enumerate() {
@@ -1457,9 +1459,19 @@ pub(crate) fn parse_defaults<'a>(
             continue;
         }
         if let Some(text) = c.default.expression() {
-            let text = arena
-                .alloc_str(text.as_str())
-                .map_err(|_| crate::sql::query::arena_full_pub())?;
+            let text = if c.default.constant().is_none() {
+                super::super::enum_values::checks::resolve_default(
+                    text.as_str(),
+                    c.ctype,
+                    storage,
+                    txid,
+                    arena,
+                )?
+            } else {
+                arena
+                    .alloc_str(text.as_str())
+                    .map_err(|_| crate::sql::query::arena_full_pub())?
+            };
             out[i] = Some(crate::sql::parser::parse_expr(text, arena)?);
         }
     }
@@ -2747,7 +2759,7 @@ pub(crate) fn apply_fk_parent_actions(
 
             let child_schema = cdef.schema.as_str();
             let child_name = cdef.name.as_str();
-            let defaults = parse_defaults(&cdef, arena)?;
+            let defaults = parse_defaults(&cdef, arena, storage, txn.txid)?;
             for &(rowid, old_bytes) in matches.as_slice() {
                 let mut crow = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(old_bytes, cschema, &mut crow)?;

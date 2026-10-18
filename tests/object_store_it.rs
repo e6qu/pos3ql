@@ -340,8 +340,12 @@ fn checkpoint_and_cold_start_from_bucket() {
         run_sql(
             &mut e,
             &mut budget,
-            "ALTER TYPE saved_state ADD VALUE 'old';
-             INSERT INTO saved_enum_rows VALUES
+            "ALTER TYPE saved_state ADD VALUE 'old'",
+        );
+        run_sql(
+            &mut e,
+            &mut budget,
+            "INSERT INTO saved_enum_rows VALUES
                  (3, 'old', ROW('old', 'old')::saved_detail, '{old}')",
         );
         let view = run_sql(

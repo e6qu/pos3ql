@@ -890,7 +890,9 @@ to reclaim the heap buffers.
 
 Enum row values retain a stable member identity rather than depending on a
 label's spelling or sort position. This also applies inside named records and
-arrays, column defaults, and typed constants captured in views. For example,
+arrays, column and domain defaults, and typed constants captured in views.
+A typed enum argument inside a default also retains its member when a function
+runs for every new row. For example,
 after `ALTER TYPE order_state RENAME VALUE 'pending' TO 'waiting'`, an older
 transaction reads `waiting` from its unchanged order row. A view created with
 `'pending'::order_state` follows that same member; adding a new member named

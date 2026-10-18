@@ -20714,9 +20714,16 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     else {
         panic!("named-composite array element lost its stored layout")
     };
+    let member_tag = crate::storage::rowenc::COMPOSITE_MEMBER_IDENTITIES;
     assert_eq!(
-        physical_fields, 2,
+        physical_fields & !member_tag,
+        2,
         "binary input retains the composite layout"
+    );
+    assert_ne!(
+        physical_fields & member_tag,
+        0,
+        "binary input uses the canonical stored member representation"
     );
     run_with(
         &mut engine,
@@ -79606,20 +79613,34 @@ fn copy_formats_and_unsupported() {
 
 #[test]
 fn arrays_of_array_domains_preserve_the_domain_element_identity() {
-    let (mut engine, mut budget) = test_engine();
+    let config = test_config("builtin-array-domain-elements");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
         &mut budget,
         "CREATE DOMAIN integer_vector AS integer[]; \
-         CREATE TABLE array_domain_values (values integer_vector[]); \
+         CREATE TABLE array_domain_values (items integer_vector[]); \
          INSERT INTO array_domain_values VALUES (ARRAY[ARRAY[3, 4]::integer_vector]); \
-         SELECT values::text FROM array_domain_values",
+         SELECT items::text FROM array_domain_values",
     );
     assert_eq!(
         data_rows(&output),
         ["{\"{3,4}\"}"],
         "{}",
         String::from_utf8_lossy(&output)
+    );
+
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION vector_echo(integer_vector[]) RETURNS integer_vector[]
+                 LANGUAGE SQL IMMUTABLE AS 'SELECT $1';
+             SELECT pg_typeof(items)::text, pg_typeof(items[1])::text,
+                    vector_echo(items)::text FROM array_domain_values"
+        )),
+        [r#"integer_vector[]|integer_vector|{"{3,4}"}"#]
     );
 
     let slot = engine
@@ -79657,6 +79678,25 @@ fn arrays_of_array_domains_preserve_the_domain_element_identity() {
             .unwrap()
             .to_string(),
         "{\"{3,4}\"}"
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DOMAIN integer_vector RENAME TO kept_vector",
+    );
+    engine.commit_wal().unwrap();
+    drop(arena);
+    drop(engine);
+    let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT pg_typeof(items)::text, pg_typeof(items[1])::text,
+                    vector_echo(items)::text FROM array_domain_values"
+        )),
+        [r#"kept_vector[]|kept_vector|{"{3,4}"}"#]
     );
 }
 

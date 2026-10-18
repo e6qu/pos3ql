@@ -234,3 +234,19 @@ DROP DOMAIN dom_not_valid;
 DROP DOMAIN dom_moved_schema.dom_moved;
 DROP SCHEMA dom_moved_schema;
 DROP ROLE dom_move_owner;
+
+
+-- A domain may be an array element even when its base is a built-in array.
+CREATE DOMAIN integer_vector AS integer[];
+CREATE TABLE array_domain_values (items integer_vector[]);
+CREATE FUNCTION vector_echo(integer_vector[]) RETURNS integer_vector[]
+ LANGUAGE SQL IMMUTABLE AS 'SELECT $1';
+INSERT INTO array_domain_values VALUES (ARRAY[ARRAY[3, 4]::integer_vector]);
+SELECT pg_typeof(items)::text, pg_typeof(items[1])::text,
+       vector_echo(items)::text FROM array_domain_values;
+ALTER DOMAIN integer_vector RENAME TO kept_vector;
+SELECT pg_typeof(items)::text, pg_typeof(items[1])::text,
+       vector_echo(items)::text FROM array_domain_values;
+DROP FUNCTION vector_echo(kept_vector[]);
+DROP TABLE array_domain_values;
+DROP DOMAIN kept_vector;

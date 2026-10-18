@@ -33,9 +33,11 @@ commands and explicit architecture rejections. Curated differential queries,
 raw-wire/driver probes, and the vendored regression schedule are continuing
 ratchets. Unsupported clauses and type combinations must reject explicitly.
 
-Arrays of domains whose base type is another array are rejected. The current
-durable array element stores one scalar base type; it cannot retain that nested
-declaration. A domain containing an array of scalar domains is supported.
+Arrays of domains over built-in arrays are supported. For example, a domain
+`integer_vector` over `integer[]` can be used as `integer_vector[]`.
+Arrays of domains whose base is an array of user-defined values are rejected:
+the stored base code cannot retain that nested declaration. A scalar domain
+containing an array of scalar domains is supported.
 For example, `CREATE DOMAIN positive_ids AS positive_integer[]` is distinct
 from an unsupported `positive_ids[]` column.
 

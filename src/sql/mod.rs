@@ -21886,11 +21886,12 @@ fn validate_recovered_enabled_subscription(
 }
 
 // Keep fixture SQL/workspace headroom separate from the retained-storage,
-// checkpoint workspace and block scratch reservations charged at startup.
+// enum image, checkpoint workspace and block scratch startup reservations.
 #[cfg(test)]
 pub(crate) fn test_engine_budget(config: &Config, base: usize) -> Budget {
     Budget::new(
         base + Storage::table_definition_image_budget_bytes(config)
+            + crate::storage::enum_member_budget_bytes(config)
             + Storage::retained_row_walk_budget_bytes(config)
             + Storage::retained_row_metadata_budget_bytes(config)
             + Storage::row_heap_relocation_budget_bytes(config)

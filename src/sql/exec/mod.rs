@@ -28454,17 +28454,11 @@ pub(crate) fn resolve_routine_type(
     let user_type = |schema, name| crate::storage::UserTypeName { schema, name };
     let (result, usage_identity) = if let Some(slot) = storage.resolve_domain_slot(base, txid) {
         let domain = storage.domain(slot);
-        if array && matches!(domain.base, ColType::Array(_)) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "arrays of domains with array base types are not supported"
-            ));
-        }
         let ctype = if array {
             ColType::Array(ArrElem::domain(slot as u16, domain.base).ok_or_else(|| {
                 sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "type \"{}\" cannot be an array element",
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "type \"{}\" cannot be a stored array element",
                     written
                 )
             })?)
@@ -42242,7 +42236,7 @@ fn build_composite_spec(
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
-                            "arrays of domains require a scalar base type"
+                            "arrays of domains require a supported element base type"
                         )
                     })?,
                 )
@@ -53812,7 +53806,7 @@ pub(crate) fn resolve_parameter_input_type(
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "arrays of domains require a scalar base type"
+                    "arrays of domains require a supported element base type"
                 )
             })?;
         return Ok(ParameterInputType::DomainArray(element));

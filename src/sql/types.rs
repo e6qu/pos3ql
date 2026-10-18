@@ -3818,8 +3818,7 @@ impl ArrElem {
                 base_user_slot,
                 ..
             } => {
-                match ColType::from_code(base_code)
-                    .expect("domain array carries a valid scalar base code")
+                match ColType::from_code(base_code).expect("domain array carries a valid base code")
                 {
                     ColType::Enum(_) => ColType::Enum(base_user_slot),
                     ColType::Composite(_) => ColType::Composite(base_user_slot),
@@ -4068,9 +4067,11 @@ impl ArrElem {
 
     /// Rebuilds a domain-array element identity from the domain catalog.
     pub fn domain(slot: u16, base: ColType) -> Option<Self> {
-        // One domain-array element carries one scalar base code and slot.
-        // Nested array bases need a distinct durable element representation.
-        if matches!(base, ColType::Record | ColType::Array(_)) {
+        // Built-in array bases retain their complete element in the base code.
+        // Nested user-type slots are not represented by that code.
+        if matches!(base, ColType::Record)
+            || matches!(base, ColType::Array(element) if element.user_type_slot().is_some())
+        {
             return None;
         }
         let base_user_slot = match base {

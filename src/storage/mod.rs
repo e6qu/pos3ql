@@ -38348,7 +38348,10 @@ impl Storage {
         // element's slot is not the identity of the column declaration.
         if let Some(UserTypeName { schema, name }) = column.user_type
             && let Some(slot) = self.domain_identity_slot(schema.as_str(), name.as_str(), txid)
-            && matches!(self.domain_for(slot, txid).base, ColType::Array(_))
+            && matches!(
+                self.domain_for(slot, txid).base,
+                ColType::Array(ArrElem::Domain { .. })
+            )
         {
             return Ok(DeclaredColumnType::UserDefined {
                 oid: oid::domain_oid(slot as u16),
@@ -38949,14 +38952,14 @@ impl Storage {
             let domain = self.domain_for(slot, txid);
             return match ctype {
                 ColType::Array(ArrElem::Domain { .. })
-                    if !matches!(domain.base, ColType::Array(_)) =>
+                    if !matches!(domain.base, ColType::Array(ArrElem::Domain { .. })) =>
                 {
                     ArrElem::domain(slot as u16, domain.base)
                         .map(ColType::Array)
                         .ok_or_else(|| {
                             sql_err!(
                                 sqlstate::FEATURE_NOT_SUPPORTED,
-                                "arrays of domain {} require a scalar base type",
+                                "arrays of domain {} require a supported element base type",
                                 identity.name.as_str()
                             )
                         })
@@ -42322,7 +42325,10 @@ impl Storage {
         {
             return Some(
                 if matches!(ctype, ColType::Array(ArrElem::Domain { .. }))
-                    && !matches!(self.domain_for(slot, txid).base, ColType::Array(_))
+                    && !matches!(
+                        self.domain_for(slot, txid).base,
+                        ColType::Array(ArrElem::Domain { .. })
+                    )
                 {
                     oid::domain_array_oid(slot as u16)
                 } else {

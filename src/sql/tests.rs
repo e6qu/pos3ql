@@ -52534,11 +52534,7 @@ fn enum_value_identity_private_markers_and_invalid_bindings_are_checked() {
     );
     for (source, base, expected) in [
         ("pos3ql-enum-check-v99\n'old'", ColType::Text, "0A000"),
-        (
-            "pos3ql-enum-check-v99\n'old'",
-            ColType::Enum(slot as u16),
-            "0A000",
-        ),
+        ("pos3ql-enum-check-v99\n'old'", ColType::Enum(slot), "0A000"),
         (
             "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
             ColType::Text,
@@ -52546,12 +52542,12 @@ fn enum_value_identity_private_markers_and_invalid_bindings_are_checked() {
         ),
         (
             "pos3ql-enum-check-v1\n/*p3o:%ff*/\n/*p3c:0*/'old'",
-            ColType::Enum(slot as u16),
+            ColType::Enum(slot),
             "XX000",
         ),
         (
             "pos3ql-enum-check-v1\n/*p3o:%0*/\n/*p3c:0*/'old'",
-            ColType::Enum(slot as u16),
+            ColType::Enum(slot),
             "XX000",
         ),
     ] {

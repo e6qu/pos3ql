@@ -22058,14 +22058,14 @@ fn pg_attrdef<'a>(
         } else {
             0
         };
-        for column in 0..columns.len() {
+        for (column, description) in descriptions.iter().enumerate().take(columns.len()) {
             let Some(default) = columns.default_at_ref(column) else {
                 continue;
             };
             let Some(default) = super::enum_values::default_expression(
                 default,
                 if column < described {
-                    Some(view_column_catalog_type(storage, txid, descriptions[column].type_oid)?.0)
+                    Some(view_column_catalog_type(storage, txid, description.type_oid)?.0)
                 } else {
                     None
                 },

@@ -156,30 +156,28 @@ fn bind_expression<const N: usize>(
         // Their spelling must follow the selected type through name moves.
         let after_cast =
             index > 0 && matches!(tokens[index - 1].token, Tok::Op("::") | Tok::Ident("as"));
-        if after_cast {
-            if let Tok::Ident(first) | Tok::QuotedIdent(first) = token.token {
-                let (schema, bare, width) =
-                    if index + 2 < tokens.len() && tokens[index + 1].token == Tok::Op(".") {
-                        match tokens[index + 2].token {
-                            Tok::Ident(bare) | Tok::QuotedIdent(bare) => (Some(first), bare, 3),
-                            _ => (None, first, 1),
-                        }
-                    } else {
-                        (None, first, 1)
-                    };
-                let selected = match schema {
-                    Some(schema) => storage.enum_slot(schema, bare, txid),
-                    None => storage.resolve_enum_slot(bare, txid),
-                };
-                if selected == Some(usize::from(slot)) {
-                    let _ = write!(output, "/*p3t:{width}*/");
-                    for selected in &tokens[index..index + width] {
-                        let _ = write!(output, "{} ", &source[selected.start..selected.end]);
+        if after_cast && let Tok::Ident(first) | Tok::QuotedIdent(first) = token.token {
+            let (schema, bare, width) =
+                if index + 2 < tokens.len() && tokens[index + 1].token == Tok::Op(".") {
+                    match tokens[index + 2].token {
+                        Tok::Ident(bare) | Tok::QuotedIdent(bare) => (Some(first), bare, 3),
+                        _ => (None, first, 1),
                     }
-                    bound = true;
-                    index += width;
-                    continue;
+                } else {
+                    (None, first, 1)
+                };
+            let selected = match schema {
+                Some(schema) => storage.enum_slot(schema, bare, txid),
+                None => storage.resolve_enum_slot(bare, txid),
+            };
+            if selected == Some(usize::from(slot)) {
+                let _ = write!(output, "/*p3t:{width}*/");
+                for selected in &tokens[index..index + width] {
+                    let _ = write!(output, "{} ", &source[selected.start..selected.end]);
                 }
+                bound = true;
+                index += width;
+                continue;
             }
         }
         if let Tok::Str(label) = token.token {

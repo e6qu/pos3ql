@@ -3,6 +3,7 @@
 use core::mem::{align_of, size_of};
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
+use super::row_map::RowMap;
 use super::row_versions::{RowVersionPools, RowVersionState};
 use super::{RowState, Table};
 use crate::config::Config;
@@ -121,9 +122,12 @@ struct RowMapAttempt<'slots, 'storage> {
 }
 
 impl<'storage> RowMapAttempt<'_, 'storage> {
-    fn acquire_maps(&mut self, tables: &'storage [Table]) -> Result<(), LockWait<'storage>> {
-        for (slot, table) in tables.iter().enumerate() {
-            self.slots[slot] = Some(table.rows.try_write_for_batch()?);
+    fn acquire_maps(
+        &mut self,
+        maps: impl IntoIterator<Item = &'storage RowMap>,
+    ) -> Result<(), LockWait<'storage>> {
+        for (slot, rows) in maps.into_iter().enumerate() {
+            self.slots[slot] = Some(rows.try_write_for_batch()?);
         }
         Ok(())
     }
@@ -166,12 +170,12 @@ struct HeapRows<'slots, 'storage> {
 
 fn try_heap_rows<'slots, 'storage>(
     versions: &'storage RowVersionPools,
-    tables: &'storage [Table],
+    maps: impl IntoIterator<Item = &'storage RowMap>,
     slots: &'slots mut [Option<RowMapWrite<'storage>>],
 ) -> Result<HeapRows<'slots, 'storage>, LockWait<'storage>> {
     let mut owners = RowMapAttempt { slots };
     let versions = versions.try_write_for_batch()?;
-    owners.acquire_maps(tables)?;
+    owners.acquire_maps(maps)?;
     Ok(HeapRows {
         versions,
         rows: LockedRowMaps { owners },
@@ -212,6 +216,15 @@ impl HeapRowOwnership {
         tables: &[Table],
         operation: impl FnOnce(&mut RowVersionState, &mut LockedRowMaps<'_, '_>) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
+        self.with_maps(versions, tables.iter().map(|table| &table.rows), operation)
+    }
+
+    fn with_maps<'storage, R>(
+        &self,
+        versions: &'storage RowVersionPools,
+        maps: impl ExactSizeIterator<Item = &'storage RowMap> + Clone,
+        operation: impl FnOnce(&mut RowVersionState, &mut LockedRowMaps<'_, '_>) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
         // Only maintenance uses this scratch. Wait for it before taking any
         // version or table owner, and retain no guards between server turns.
         let mut scratch = self
@@ -220,7 +233,7 @@ impl HeapRowOwnership {
             .expect("heap row ownership scratch poisoned");
         scratch.reset();
         let mut slots = scratch
-            .alloc_owned_slice_with(tables.len(), |_| None)
+            .alloc_owned_slice_with(maps.len(), |_| None)
             .map_err(|error| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -229,7 +242,7 @@ impl HeapRowOwnership {
                 )
             })?;
         loop {
-            match try_heap_rows(versions, tables, &mut slots) {
+            match try_heap_rows(versions, maps.clone(), &mut slots) {
                 Ok(mut owners) => return operation(&mut owners.versions, &mut owners.rows),
                 Err(wait) => wait.wait(),
             }
@@ -365,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn row_lock_owners_heap_partial_acquisition_error_and_exhaustion_release_all() {
+    fn row_lock_owners_storage_partial_acquisition_allows_unrelated_write_and_undo() {
         let mut config = test_config();
         config.max_tables = 3;
         config.table_rows = 1;
@@ -386,10 +399,6 @@ mod tests {
             .create_table(make_def("owner_other", &[("id", ColType::Int4, false)]))
             .unwrap();
         assert!(first < blocked);
-        let mut tiny_config = test_config();
-        tiny_config.max_tables = 0;
-        let mut tiny_budget = Budget::new(HeapRowOwnership::budget_bytes(&tiny_config));
-        let tiny = HeapRowOwnership::new(&tiny_config, &mut tiny_budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let held = storage.tables[blocked].rows.write();
             {
@@ -398,9 +407,13 @@ mod tests {
                 let mut slots = scratch
                     .alloc_owned_slice_with(storage.tables.len(), |_| None)
                     .unwrap();
-                let wait = try_heap_rows(&storage.row_versions, &storage.tables, &mut slots)
-                    .err()
-                    .unwrap();
+                let wait = try_heap_rows(
+                    &storage.row_versions,
+                    storage.tables.iter().map(|table| &table.rows),
+                    &mut slots,
+                )
+                .err()
+                .unwrap();
                 assert!(slots.iter().all(Option::is_none));
                 assert!(storage.row_versions.test_write().is_ok());
                 assert!(storage.tables[first].rows.test_write().is_ok());
@@ -415,18 +428,13 @@ mod tests {
             }
             drop(held);
 
-            let error: Result<(), SqlError> = storage.heap_row_ownership.with_all(
-                &storage.row_versions,
-                &storage.tables,
-                |_, rows| {
+            storage
+                .heap_row_ownership
+                .with_all(&storage.row_versions, &storage.tables, |_, rows| {
                     assert_eq!(rows.iter().count(), storage.tables.len());
-                    Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "forced ownership operation failure"
-                    ))
-                },
-            );
-            assert_eq!(error.unwrap_err().sqlstate, sqlstate::INTERNAL_ERROR);
+                    Ok(())
+                })
+                .unwrap();
             assert!(storage.row_versions.test_write().is_ok());
             assert!(
                 storage
@@ -434,22 +442,89 @@ mod tests {
                     .iter()
                     .all(|table| table.rows.test_write().is_ok())
             );
+        });
+    }
 
+    #[test]
+    fn row_lock_owners_heap_partial_acquisition_error_and_exhaustion_release_all() {
+        let mut config = test_config();
+        config.max_tables = 2;
+        config.table_rows = 1;
+        config.txn_rows = 1;
+        config.large_object_pages = 1;
+        config.max_connections = 1;
+        config.max_prepared_transactions = 0;
+        config.max_row_versions_per_row = 1;
+        let mut budget = test_budget(&config);
+        let versions = RowVersionPools::new(&config, &mut budget).unwrap();
+        let maps: [_; 3] = core::array::from_fn(|_| {
+            RowMap::new(&mut budget, "heap ownership test rows", 1).unwrap()
+        });
+        let workspace = HeapRowOwnership::new(&config, &mut budget).unwrap();
+        config.max_tables = 0;
+        let mut tiny_budget = Budget::new(HeapRowOwnership::budget_bytes(&config));
+        let tiny = HeapRowOwnership::new(&config, &mut tiny_budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let held = maps[1].write();
+            {
+                let mut scratch = workspace.scratch.lock().unwrap();
+                scratch.reset();
+                let mut slots = scratch
+                    .alloc_owned_slice_with(maps.len(), |_| None)
+                    .unwrap();
+                let wait = try_heap_rows(&versions, maps.iter(), &mut slots)
+                    .err()
+                    .unwrap();
+                assert!(slots.iter().all(Option::is_none));
+                assert!(versions.test_write().is_ok());
+                assert!(maps[0].test_write().is_ok());
+                let (_versions, mut other) = acquire(|| {
+                    Ok((
+                        versions.try_write_for_batch()?,
+                        maps[2].try_write_for_batch()?,
+                    ))
+                });
+                other
+                    .insert(
+                        1,
+                        RowState {
+                            committed: None,
+                            committed_lsn: 7,
+                            checkpoint_change_lsn: 7,
+                            history: super::super::CommittedHistory::empty(),
+                            pending: super::super::PendingVersions::empty(),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(other.remove(&1).unwrap().committed_lsn, 7);
+                drop(wait);
+            }
+            drop(held);
+
+            let error: Result<(), SqlError> =
+                workspace.with_maps(&versions, maps.iter(), |_, rows| {
+                    assert_eq!(rows.iter().count(), maps.len());
+                    Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "forced ownership operation failure"
+                    ))
+                });
+            assert_eq!(error.unwrap_err().sqlstate, sqlstate::INTERNAL_ERROR);
+            assert!(versions.test_write().is_ok());
+            assert!(maps.iter().all(|rows| rows.test_write().is_ok()));
             let mut calls = 0;
-            storage
-                .heap_row_ownership
-                .with_all(&storage.row_versions, &storage.tables, |_, rows| {
+            workspace
+                .with_maps(&versions, maps.iter(), |_, rows| {
                     calls += 1;
-                    assert_eq!(rows.iter().count(), storage.tables.len());
+                    assert_eq!(rows.iter().count(), maps.len());
                     Ok(())
                 })
                 .unwrap();
             assert_eq!(calls, 1);
 
-            let error: Result<(), SqlError> =
-                tiny.with_all(&storage.row_versions, &storage.tables, |_, _| {
-                    panic!("exhausted scratch ran the operation")
-                });
+            let error: Result<(), SqlError> = tiny.with_maps(&versions, maps.iter(), |_, _| {
+                panic!("exhausted scratch ran the operation")
+            });
             let error = error.unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(
@@ -458,13 +533,8 @@ mod tests {
                     .as_str()
                     .starts_with("heap row-map ownership workspace exhausted:")
             );
-            assert!(storage.row_versions.test_write().is_ok());
-            assert!(
-                storage
-                    .tables
-                    .iter()
-                    .all(|table| table.rows.test_write().is_ok())
-            );
+            assert!(versions.test_write().is_ok());
+            assert!(maps.iter().all(|rows| rows.test_write().is_ok()));
         });
     }
 }

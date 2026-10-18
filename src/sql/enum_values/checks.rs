@@ -36,7 +36,38 @@ pub(crate) fn bind_default<const N: usize>(
     legacy: bool,
     arena: &Arena,
 ) -> Result<StackStr<N>, SqlError> {
-    bind_expression(source, base, storage, txid, legacy, arena, true)
+    let bound = bind_expression::<N>(source, base, storage, txid, legacy, arena, true)?;
+    if enum_slot(base).is_none() {
+        return Ok(bound);
+    }
+    let mut executable = StackStr::<N>::new();
+    executable.write_str(HEADER).map_err(|_| full::<N>())?;
+    executable
+        .write_str(
+            bound
+                .as_str()
+                .strip_prefix(HEADER)
+                .unwrap_or(bound.as_str()),
+        )
+        .map_err(|_| full::<N>())?;
+    let rendered = resolve_expression(executable.as_str(), base, storage, txid, arena, true)?;
+    let display = canonical_display(rendered, arena)?;
+    let mut stored = StackStr::<N>::new();
+    stored.write_str(HEADER).map_err(|_| full::<N>())?;
+    stored.write_str("/*p3o:").map_err(|_| full::<N>())?;
+    for byte in display.bytes() {
+        write!(stored, "{byte:02x}").map_err(|_| full::<N>())?;
+    }
+    stored.write_str("*/\n").map_err(|_| full::<N>())?;
+    stored
+        .write_str(
+            executable
+                .as_str()
+                .strip_prefix(HEADER)
+                .expect("writer prefix"),
+        )
+        .map_err(|_| full::<N>())?;
+    Ok(stored)
 }
 
 fn bind_expression<const N: usize>(
@@ -70,7 +101,7 @@ fn bind_expression<const N: usize>(
     if parameters.is_truncated() {
         return Err(full::<N>());
     }
-    let mut name = StackStr::<256>::new();
+    let mut name = StackStr::<260>::new();
     write_name(&mut name, definition.schema.as_str());
     let _ = name.write_char('.');
     write_name(&mut name, definition.name.as_str());
@@ -260,6 +291,17 @@ pub(crate) fn resolve<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
+    resolve_expression(source, base, storage, txid, arena, false)
+}
+
+fn resolve_expression<'a>(
+    source: &str,
+    base: ColType,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    display_names: bool,
+) -> Result<&'a str, SqlError> {
     if source.starts_with("pos3ql-enum-check-") && !is_bound(source) {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -298,10 +340,18 @@ pub(crate) fn resolve<'a>(
         body
     };
     let definition = storage.enum_for(usize::from(slot), txid);
-    let mut name = StackStr::<256>::new();
-    write_name(&mut name, definition.schema.as_str());
-    let _ = name.write_char('.');
-    write_name(&mut name, definition.name.as_str());
+    let mut name = StackStr::<260>::new();
+    if display_names {
+        let display_name =
+            crate::sql::catalog::user_type_name_text(storage, txid, oid::enum_oid(slot), arena)?
+                .ok_or_else(corrupt)?;
+        name.write_str(display_name).map_err(|_| corrupt())?;
+    } else {
+        write_name(&mut name, definition.schema.as_str());
+        let _ = name.write_char('.');
+        write_name(&mut name, definition.name.as_str());
+    }
+    let (_, body) = split_display(body)?;
     let tokens = query_tokens(body, arena)?;
     let mut output = crate::mem::arena::ArenaString::new(arena);
     let mut previous = 0;
@@ -379,6 +429,88 @@ pub(crate) fn resolve<'a>(
         index += 1;
     }
     Ok(output.as_str())
+}
+
+fn canonical_display<'a>(source: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    let tokens = query_tokens(source, arena)?;
+    let mut output = crate::mem::arena::ArenaString::new(arena);
+    let mut previous = None;
+    for token in tokens {
+        let no_space_before = matches!(
+            token.token,
+            Tok::Op("::" | "." | "(" | ")" | "[" | "]" | ",")
+        );
+        let no_space_after_previous =
+            matches!(previous, None | Some(Tok::Op("::" | "." | "(" | "[")));
+        if !no_space_before && !no_space_after_previous {
+            output
+                .write_char(' ')
+                .map_err(|_| crate::sql::query::arena_full_pub())?;
+        }
+        if let Tok::Str(value) = token.token {
+            output
+                .write_str(crate::sql::eval::quote_literal_str(value, arena)?)
+                .map_err(|_| crate::sql::query::arena_full_pub())?;
+        } else {
+            output
+                .write_str(&source[token.start..token.end])
+                .map_err(|_| crate::sql::query::arena_full_pub())?;
+        }
+        previous = Some(token.token);
+    }
+    Ok(output.as_str())
+}
+
+fn decode_display<'a>(
+    encoded: &str,
+    bytes: &'a mut [u8; crate::storage::DEFAULT_EXPR_MAX],
+) -> Result<&'a str, SqlError> {
+    let length = encoded.len() / 2;
+    if encoded.is_empty() || encoded.len() % 2 != 0 || length > bytes.len() {
+        return Err(corrupt());
+    }
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16).ok_or_else(corrupt)?;
+        let low = (pair[1] as char).to_digit(16).ok_or_else(corrupt)?;
+        bytes[index] = (high * 16 + low) as u8;
+    }
+    let text = core::str::from_utf8(&bytes[..length]).map_err(|_| corrupt())?;
+    if text.contains('\0') {
+        return Err(corrupt());
+    }
+    Ok(text)
+}
+
+fn split_display(body: &str) -> Result<(Option<&str>, &str), SqlError> {
+    let Some(display) = body.strip_prefix("/*p3o:") else {
+        return Ok((None, body));
+    };
+    let (encoded, body) = display.split_once("*/\n").ok_or_else(corrupt)?;
+    let mut bytes = [0; crate::storage::DEFAULT_EXPR_MAX];
+    decode_display(encoded, &mut bytes)?;
+    Ok((Some(encoded), body))
+}
+
+/// PostgreSQL keeps typdefault's original display text independently from
+/// the executable expression, which resolves current enum labels and names.
+pub(crate) fn default_display<'a>(source: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    if let Some(body) = source.strip_prefix(HEADER) {
+        let (display, _) = split_display(body)?;
+        let mut bytes = [0; crate::storage::DEFAULT_EXPR_MAX];
+        let display = decode_display(display.ok_or_else(corrupt)?, &mut bytes)?;
+        arena
+            .alloc_str(display)
+            .map_err(|_| crate::sql::query::arena_full_pub())
+    } else if source.starts_with("pos3ql-enum-check-") {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "unsupported enum expression encoding"
+        ))
+    } else {
+        arena
+            .alloc_str(source)
+            .map_err(|_| crate::sql::query::arena_full_pub())
+    }
 }
 
 fn corrupt() -> SqlError {

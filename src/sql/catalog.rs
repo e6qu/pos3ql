@@ -14340,12 +14340,13 @@ pub fn user_type_name_text<'a>(
                 (oid - type_oid::FIRST_DOMAIN) as usize
             })
     };
-    let mut rendered = StackStr::<140>::new();
+    let mut rendered = StackStr::<260>::new();
     use core::fmt::Write as _;
     if !unqualified_visible {
-        let _ = write!(rendered, "{}.", schema.as_str());
+        write_identifier(&mut rendered, schema.as_str());
+        let _ = rendered.write_char('.');
     }
-    let _ = rendered.write_str(name.as_str());
+    write_identifier(&mut rendered, name.as_str());
     if array {
         let _ = rendered.write_str("[]");
     }
@@ -28721,13 +28722,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bool(d.not_null),
                 match &d.default_expr {
                     Some(e) => text(
-                        super::enum_values::checks::resolve_default(
-                            e.as_str(),
-                            d.base,
-                            storage,
-                            txid,
-                            arena,
-                        )?,
+                        super::enum_values::checks::default_display(e.as_str(), arena)?,
                         arena,
                     )?,
                     None => Datum::Null,
@@ -33045,13 +33040,7 @@ fn info_domains<'a>(
         };
         let default = match domain.default_expr {
             Some(value) => text(
-                super::enum_values::checks::resolve_default(
-                    value.as_str(),
-                    domain.base,
-                    storage,
-                    txid,
-                    arena,
-                )?,
+                super::enum_values::checks::default_display(value.as_str(), arena)?,
                 arena,
             )?,
             None => Datum::Null,

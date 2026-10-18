@@ -319,31 +319,57 @@ DROP SCHEMA kept_moved;
 CREATE TYPE default_state AS ENUM ('old', 'ready');
 CREATE DOMAIN default_value AS default_state DEFAULT 'old'::default_state;
 CREATE DOMAIN default_batch AS default_state[] DEFAULT '{old}'::default_state[];
-CREATE FUNCTION default_echo(default_state) RETURNS default_state LANGUAGE SQL VOLATILE AS 'SELECT $1';
+CREATE SEQUENCE default_calls;
+CREATE FUNCTION default_echo(default_state) RETURNS default_state LANGUAGE SQL VOLATILE
+ AS 'SELECT $1 WHERE nextval(''default_calls'') > 0';
+CREATE DOMAIN default_dynamic AS default_state DEFAULT default_echo('ready');
+ALTER DOMAIN default_dynamic SET DEFAULT default_echo('old');
 CREATE TABLE default_before (state default_value, states default_batch,
-    echo_state default_state DEFAULT default_echo('old'));
+    echo_state default_state DEFAULT default_echo('old'), dynamic default_dynamic);
 CREATE VIEW default_view AS SELECT * FROM default_before;
 ALTER VIEW default_view ALTER COLUMN echo_state SET DEFAULT default_echo('old');
 ALTER TYPE default_state RENAME VALUE 'old' TO 'new';
 ALTER TYPE default_state ADD VALUE 'old';
+BEGIN;
 CREATE SCHEMA defaults_moved;
 ALTER TYPE default_state SET SCHEMA defaults_moved;
+SAVEPOINT retired_type_name;
+SELECT NULL::default_state;
+ROLLBACK TO retired_type_name;
 CREATE TABLE default_after (state default_value, states default_batch,
-    echo_state defaults_moved.default_state DEFAULT default_echo('old'));
+    echo_state defaults_moved.default_state DEFAULT default_echo('old'), dynamic default_dynamic);
 CREATE FUNCTION default_echo(text) RETURNS defaults_moved.default_state
     LANGUAGE SQL VOLATILE AS 'SELECT ''old''::defaults_moved.default_state';
 INSERT INTO default_before DEFAULT VALUES;
 INSERT INTO default_after DEFAULT VALUES;
 INSERT INTO default_view DEFAULT VALUES;
-SELECT state::text, states[1]::text, echo_state::text FROM default_before;
-SELECT state::text, states[1]::text, echo_state::text FROM default_after;
-SELECT typname, typdefault FROM pg_type WHERE typname IN ('default_value','default_batch') ORDER BY typname;
+COMMIT;
+SELECT state::text, states[1]::text, echo_state::text, dynamic::text FROM default_before;
+SELECT state::text, states[1]::text, echo_state::text, dynamic::text FROM default_after;
+SELECT last_value FROM default_calls;
+SELECT typname, typdefault FROM pg_type WHERE typname IN ('default_value','default_batch','default_dynamic') ORDER BY typname;
+SELECT domain_name, domain_default FROM information_schema.domains
+ WHERE domain_name IN ('default_value','default_batch','default_dynamic') ORDER BY domain_name;
 DROP VIEW default_view;
 DROP TABLE default_before;
 DROP TABLE default_after;
+DROP DOMAIN default_dynamic;
 DROP DOMAIN default_value;
 DROP DOMAIN default_batch;
 DROP FUNCTION default_echo(defaults_moved.default_state);
 DROP FUNCTION default_echo(text);
+DROP SEQUENCE default_calls;
 DROP TYPE defaults_moved.default_state;
 DROP SCHEMA defaults_moved;
+
+
+CREATE TYPE "QuotedState" AS ENUM ('old', 'ready');
+CREATE DOMAIN "QuotedValue" AS "QuotedState" DEFAULT 'old'::"QuotedState";
+CREATE TABLE quoted_rows(value "QuotedValue");
+ALTER TYPE "QuotedState" RENAME VALUE 'old' TO 'new';
+INSERT INTO quoted_rows DEFAULT VALUES;
+SELECT value::text, pg_typeof(value)::text FROM quoted_rows;
+SELECT typdefault FROM pg_type WHERE typname = 'QuotedValue';
+DROP TABLE quoted_rows;
+DROP DOMAIN "QuotedValue";
+DROP TYPE "QuotedState";

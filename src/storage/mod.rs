@@ -38398,7 +38398,9 @@ impl Storage {
                         "enum column type lacks its durable identity"
                     )
                 })?;
-                if self.enum_slot(schema.as_str(), name.as_str(), txid) != Some(slot as usize) {
+                if self.enum_identity_slot(schema.as_str(), name.as_str(), txid)
+                    != Some(slot as usize)
+                {
                     return Err(sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
                         "enum column type does not match its durable identity"
@@ -38417,7 +38419,9 @@ impl Storage {
                         "enum-array column type lacks its durable identity"
                     )
                 })?;
-                if self.enum_slot(schema.as_str(), name.as_str(), txid) != Some(slot as usize) {
+                if self.enum_identity_slot(schema.as_str(), name.as_str(), txid)
+                    != Some(slot as usize)
+                {
                     return Err(sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
                         "enum-array column type does not match its durable identity"
@@ -38434,7 +38438,8 @@ impl Storage {
                         "composite column type lacks its durable identity"
                     )
                 })?;
-                if self.composite_slot(schema.as_str(), name.as_str(), txid) != Some(slot as usize)
+                if self.composite_identity_slot(schema.as_str(), name.as_str(), txid)
+                    != Some(slot as usize)
                 {
                     return Err(sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
@@ -38454,7 +38459,8 @@ impl Storage {
                         "composite-array column type lacks its durable identity"
                     )
                 })?;
-                if self.composite_slot(schema.as_str(), name.as_str(), txid) != Some(slot as usize)
+                if self.composite_identity_slot(schema.as_str(), name.as_str(), txid)
+                    != Some(slot as usize)
                 {
                     return Err(sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
@@ -38480,14 +38486,14 @@ impl Storage {
                 name,
             });
         }
-        if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), txid) {
+        if let Some(slot) = self.enum_identity_slot(schema.as_str(), name.as_str(), txid) {
             return Ok(DeclaredColumnType::UserDefined {
                 oid: oid::enum_oid(slot as u16),
                 schema,
                 name,
             });
         }
-        if let Some(slot) = self.composite_slot(schema.as_str(), name.as_str(), txid) {
+        if let Some(slot) = self.composite_identity_slot(schema.as_str(), name.as_str(), txid) {
             return Ok(DeclaredColumnType::UserDefined {
                 oid: oid::composite_oid(slot as u16),
                 schema,
@@ -38937,7 +38943,8 @@ impl Storage {
         identity: UserTypeName,
         txid: u32,
     ) -> Result<ColType, SqlError> {
-        if let Some(slot) = self.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+        if let Some(slot) =
+            self.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
         {
             let domain = self.domain_for(slot, txid);
             return match ctype {
@@ -38957,7 +38964,9 @@ impl Storage {
                 _ => Ok(domain.base),
             };
         }
-        if let Some(slot) = self.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid) {
+        if let Some(slot) =
+            self.enum_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+        {
             return Ok(if matches!(ctype, ColType::Array(_)) {
                 ColType::Array(ArrElem::Enum(slot as u16))
             } else {
@@ -38965,7 +38974,7 @@ impl Storage {
             });
         }
         if let Some(slot) =
-            self.composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+            self.composite_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
         {
             return Ok(if matches!(ctype, ColType::Array(_)) {
                 ColType::Array(ArrElem::Composite(slot as u16))
@@ -39401,6 +39410,28 @@ impl Storage {
                 && e.definition_for(txid).schema.as_str() == schema
                 && e.definition_for(txid).name.as_str() == name)
                 .then_some(slot)
+        })
+    }
+    /// Resolves a durable declaration while its owner transaction moves the
+    /// public name. SQL lookup continues to use enum_slot.
+    pub(crate) fn enum_identity_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.enum_slot(schema, name, txid).or_else(|| {
+            EnumIter {
+                catalog: &self.type_catalog,
+                next_slot: 0,
+            }
+            .find_map(|(slot, definition)| {
+                (definition.database == current_database()
+                    && definition.visible_to(txid)
+                    && definition.schema.as_str() == schema
+                    && definition.name.as_str() == name
+                    && definition.pending_definition.is_some_and(|pending| {
+                        pending.txid == txid
+                            && (pending.schema != definition.schema
+                                || pending.name != definition.name)
+                    }))
+                .then_some(slot)
+            })
         })
     }
 
@@ -40005,6 +40036,33 @@ impl Storage {
                 && definition.definition_for(txid).schema.as_str() == schema
                 && definition.definition_for(txid).name.as_str() == name)
                 .then_some(slot)
+        })
+    }
+    /// Resolves a durable declaration while its owner transaction moves the
+    /// public name. SQL lookup continues to use composite_slot.
+    pub(crate) fn composite_identity_slot(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        self.composite_slot(schema, name, txid).or_else(|| {
+            CompositeIter {
+                catalog: &self.type_catalog,
+                next_slot: 0,
+            }
+            .find_map(|(slot, definition)| {
+                (definition.database == current_database()
+                    && definition.visible_to(txid)
+                    && definition.schema.as_str() == schema
+                    && definition.name.as_str() == name
+                    && definition.pending_definition.is_some_and(|pending| {
+                        pending.txid == txid
+                            && (pending.schema != definition.schema
+                                || pending.name != definition.name)
+                    }))
+                .then_some(slot)
+            })
         })
     }
 
@@ -42258,25 +42316,19 @@ impl Storage {
             return Some(polymorphic.oid());
         }
 
-        if let Some(identity) = user_type {
-            let scalar = self.user_type_identity_oid(identity, false, txid)?;
-            if self
-                .domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                .is_some()
-            {
-                return Some(
-                    if matches!(ctype, ColType::Array(ArrElem::Domain { .. }))
-                        && !matches!(
-                            self.domain_base_type_for_oid(scalar, txid),
-                            Some(ColType::Array(_))
-                        )
-                    {
-                        self.user_type_identity_oid(identity, true, txid)?
-                    } else {
-                        scalar
-                    },
-                );
-            }
+        if let Some(identity) = user_type
+            && let Some(slot) =
+                self.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+        {
+            return Some(
+                if matches!(ctype, ColType::Array(ArrElem::Domain { .. }))
+                    && !matches!(self.domain_for(slot, txid).base, ColType::Array(_))
+                {
+                    oid::domain_array_oid(slot as u16)
+                } else {
+                    oid::domain_oid(slot as u16)
+                },
+            );
         }
         match ctype {
             ColType::Enum(slot) => return Some(oid::enum_oid(slot)),
@@ -42493,14 +42545,16 @@ impl Storage {
                 oid::domain_oid(slot as u16)
             });
         }
-        if let Some(slot) = self.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid) {
+        if let Some(slot) =
+            self.enum_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+        {
             return Some(if array {
                 oid::enum_array_oid(slot as u16)
             } else {
                 oid::enum_oid(slot as u16)
             });
         }
-        self.composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+        self.composite_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
             .map(|slot| {
                 if array {
                     oid::composite_array_oid(slot as u16)

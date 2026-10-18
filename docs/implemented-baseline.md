@@ -907,6 +907,12 @@ comparing a domain over an enum. For example, with a domain `order_state` over
 `state`, write `status::state = 'ready'::state`; `status = 'ready'` returns
 SQLSTATE `42883`. The explicit cast does not remove checks when assigning a
 value to the domain.
+PostgreSQL keeps the original text in `pg_type.typdefault`. For example, after
+renaming `old` to `new`, a domain default inserts `new` while that cached catalog
+field still shows `'old'::state`.
+[PostgreSQL's information-schema view](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/catalog/information_schema.sql#L943)
+exposes that same saved domain text. Column and view default descriptions and
+execution use the retained member, so they do not interpret that old text again.
 
 Selected enum definitions and label iterators retain the label image they read.
 A label image is one complete saved list of labels.

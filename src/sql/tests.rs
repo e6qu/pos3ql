@@ -52544,6 +52544,16 @@ fn enum_value_identity_private_markers_and_invalid_bindings_are_checked() {
             ColType::Text,
             "XX000",
         ),
+        (
+            "pos3ql-enum-check-v1\n/*p3o:ff*/\n/*p3c:0*/'old'",
+            ColType::Enum(slot as u16),
+            "XX000",
+        ),
+        (
+            "pos3ql-enum-check-v1\n/*p3o:0*/\n/*p3c:0*/'old'",
+            ColType::Enum(slot as u16),
+            "XX000",
+        ),
     ] {
         let error = crate::mem::guard::forbid_alloc(|| {
             crate::sql::enum_values::checks::resolve_default(
@@ -85857,17 +85867,24 @@ fn enum_value_identity_domain_defaults_follow_members_after_type_moves_and_wal()
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine,
+    session.success(
+        &mut engine,
         "CREATE TYPE default_state AS ENUM ('old', 'ready');
          CREATE DOMAIN default_value AS default_state DEFAULT 'old'::default_state;
          CREATE DOMAIN default_batch AS default_state[] DEFAULT '{old}'::default_state[];
-         CREATE FUNCTION default_echo(default_state) RETURNS default_state LANGUAGE SQL VOLATILE AS 'SELECT $1';
+         CREATE SEQUENCE default_calls;
+         CREATE FUNCTION default_echo(default_state) RETURNS default_state LANGUAGE SQL VOLATILE
+             AS 'SELECT $1 WHERE nextval(''default_calls'') > 0';
+         CREATE DOMAIN default_dynamic AS default_state DEFAULT default_echo('ready');
+         ALTER DOMAIN default_dynamic SET DEFAULT default_echo('old');
          CREATE TABLE default_before (state default_value, states default_batch,
-             echo_state default_state DEFAULT default_echo('old'));
+             echo_state default_state DEFAULT default_echo('old'), dynamic default_dynamic);
          CREATE VIEW default_view AS SELECT * FROM default_before;
          ALTER VIEW default_view ALTER COLUMN echo_state SET DEFAULT default_echo('old');
          ALTER TYPE default_state RENAME VALUE 'old' TO 'new';
-         ", true);
+         ",
+        true,
+    );
     session.success(
         &mut engine,
         "ALTER TYPE default_state ADD VALUE 'old'",
@@ -85875,40 +85892,52 @@ fn enum_value_identity_domain_defaults_follow_members_after_type_moves_and_wal()
     );
     session.success(
         &mut engine,
-        "CREATE SCHEMA defaults_moved;
+        "BEGIN; CREATE SCHEMA defaults_moved;
          ALTER TYPE default_state SET SCHEMA defaults_moved;
+         SAVEPOINT retired_type_name",
+        true,
+    );
+    let retired = session.execute(&mut engine, "SELECT NULL::default_state", true);
+    assert_eq!(error_sqlstates(&retired), ["42704"]);
+    session.success(&mut engine,
+        "ROLLBACK TO retired_type_name;
          CREATE TABLE default_after (state default_value, states default_batch,
-             echo_state defaults_moved.default_state DEFAULT default_echo('old'));
+             echo_state defaults_moved.default_state DEFAULT default_echo('old'), dynamic default_dynamic);
          CREATE FUNCTION default_echo(text) RETURNS defaults_moved.default_state
              LANGUAGE SQL VOLATILE AS 'SELECT ''old''::defaults_moved.default_state';
          INSERT INTO default_before DEFAULT VALUES;
          INSERT INTO default_after DEFAULT VALUES;
-         INSERT INTO default_view DEFAULT VALUES",
+         INSERT INTO default_view DEFAULT VALUES; COMMIT",
         true,
     );
     let assert_defaults = |session: &mut ConfiguredTransactionSession, engine: &mut Engine| {
         assert_eq!(
             data_rows(&session.success(
                 engine,
-                "SELECT state::text, states[1]::text, echo_state::text FROM default_before;
-             SELECT state::text, states[1]::text, echo_state::text FROM default_after",
+                "SELECT state::text, states[1]::text, echo_state::text, dynamic::text FROM default_before;
+             SELECT state::text, states[1]::text, echo_state::text, dynamic::text FROM default_after",
                 true
             )),
-            ["new|new|new", "new|new|new", "new|new|old"]
+            ["new|new|new|new", "new|new|new|new", "new|new|old|new"]
         );
         let defaults = data_rows(&session.success(
             engine,
             "SELECT typdefault FROM pg_type
-                 WHERE typname IN ('default_value','default_batch') ORDER BY typname",
+                 WHERE typname IN ('default_value','default_batch','default_dynamic') ORDER BY typname",
             true,
         ));
-        assert_eq!(defaults.len(), 2);
-        assert!(
-            defaults
-                .iter()
-                .all(|value| value.contains("new") && !value.contains("pos3ql-")),
-            "{defaults:?}"
+        assert_eq!(
+            defaults,
+            [
+                "'{old}'::default_state[]",
+                "default_echo('old'::default_state)",
+                "'old'::default_state",
+            ]
         );
+        assert_eq!(data_rows(&session.success(engine,
+            "SELECT domain_default FROM information_schema.domains
+                 WHERE domain_name IN ('default_value','default_batch','default_dynamic') ORDER BY domain_name", true)),
+            defaults);
         let view_default = data_rows(&session.success(
             engine,
             "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef
@@ -85922,6 +85951,10 @@ fn enum_value_identity_domain_defaults_follow_members_after_type_moves_and_wal()
         );
     };
     assert_defaults(&mut session, &mut engine);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT last_value FROM default_calls", true)),
+        ["6"]
+    );
     engine.commit_wal().unwrap();
     drop(session);
     drop(engine);
@@ -85930,6 +85963,10 @@ fn enum_value_identity_domain_defaults_follow_members_after_type_moves_and_wal()
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     assert_defaults(&mut session, &mut engine);
     session.success(&mut engine, "INSERT INTO default_view DEFAULT VALUES", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT last_value FROM default_calls", true)),
+        ["8"]
+    );
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
@@ -85951,5 +85988,39 @@ fn enum_value_identity_domain_defaults_follow_members_after_type_moves_and_wal()
             true
         )),
         ["new|new"]
+    );
+}
+
+#[test]
+fn enum_value_identity_quoted_default_names_keep_catalog_spelling() {
+    let config = test_config("enum-quoted-default-types");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        r#"
+        CREATE TYPE "QuotedState" AS ENUM ('old', 'ready');
+        CREATE DOMAIN "QuotedValue" AS "QuotedState" DEFAULT 'old'::"QuotedState";
+        CREATE TABLE quoted_rows(value "QuotedValue");
+        ALTER TYPE "QuotedState" RENAME VALUE 'old' TO 'new';
+        INSERT INTO quoted_rows DEFAULT VALUES"#,
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT value::text, pg_typeof(value)::text FROM quoted_rows",
+            true
+        )),
+        [r#"new|"QuotedValue""#]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT typdefault FROM pg_type WHERE typname = 'QuotedValue'",
+            true
+        )),
+        [r#"'old'::"QuotedState""#]
     );
 }

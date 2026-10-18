@@ -2,6 +2,8 @@
 
 use super::*;
 
+type CapturedTypeResolver<'a> = &'a dyn Fn(&str) -> Option<i32>;
+
 pub(crate) fn infer<'a>(
     storage: &'a Storage,
     statement: &'a Stmt<'a>,
@@ -18,7 +20,7 @@ pub(crate) fn infer_declared(
     statement: &Stmt<'_>,
     txid: u32,
     oids: &mut [i32],
-    captured_types: Option<&dyn Fn(&str) -> Option<i32>>,
+    captured_types: Option<CapturedTypeResolver<'_>>,
 ) {
     ParameterInference {
         storage,
@@ -43,7 +45,7 @@ pub(crate) fn infer_resolved<'a>(
 
 struct ParameterInference<'a> {
     storage: &'a Storage,
-    captured_types: Option<&'a dyn Fn(&str) -> Option<i32>>,
+    captured_types: Option<CapturedTypeResolver<'a>>,
 }
 
 impl ParameterInference<'_> {

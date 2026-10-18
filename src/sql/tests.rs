@@ -52209,6 +52209,139 @@ fn enum_value_identity_saved_indexes_and_views_survive_empty_cache_recovery() {
 }
 
 #[test]
+fn enum_value_identity_hashes_are_selective_and_bind_legacy_labels() {
+    let config = test_config("enum-identity-key-hashes");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let members = [
+        crate::storage::EnumMember {
+            label: crate::storage::SqlName::parse("new").unwrap(),
+            legacy_label: Some(crate::storage::SqlName::parse("old").unwrap()),
+            sort: 1.0,
+        },
+        crate::storage::EnumMember {
+            label: crate::storage::SqlName::parse("ready").unwrap(),
+            legacy_label: Some(crate::storage::SqlName::parse("ready").unwrap()),
+            sort: 2.0,
+        },
+    ];
+    let slot = engine
+        .storage
+        .create_enum(
+            crate::storage::SqlName::parse("public").unwrap(),
+            crate::storage::SqlName::parse("enum_hash_state").unwrap(),
+            crate::storage::EnumSpec { members: &members },
+            0,
+        )
+        .unwrap() as u16;
+    let hash = |member, sort, label| {
+        crate::mem::guard::forbid_alloc(|| {
+            crate::sql::eval::hash_key_catalog(
+                &engine.storage,
+                &[Datum::Enum {
+                    slot,
+                    member,
+                    sort,
+                    label,
+                }],
+                &[0],
+            )
+        })
+        .unwrap()
+    };
+    assert_eq!(hash(None, 1.0, "old"), hash(Some(0), 99.0, "new"));
+    assert_eq!(hash(Some(0), 1.0, "old"), hash(Some(0), 99.0, "new"));
+    assert_ne!(hash(Some(0), 1.0, "new"), hash(Some(1), 2.0, "ready"));
+}
+
+#[test]
+fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
+    let config = test_config("enum-identity-legacy-values");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let members = [
+        crate::storage::EnumMember {
+            label: crate::storage::SqlName::parse("old").unwrap(),
+            legacy_label: Some(crate::storage::SqlName::parse("old").unwrap()),
+            sort: 1.0,
+        },
+        crate::storage::EnumMember {
+            label: crate::storage::SqlName::parse("ready").unwrap(),
+            legacy_label: Some(crate::storage::SqlName::parse("ready").unwrap()),
+            sort: 2.0,
+        },
+    ];
+    let slot = engine
+        .storage
+        .create_enum(
+            crate::storage::SqlName::parse("public").unwrap(),
+            crate::storage::SqlName::parse("enum_legacy_state").unwrap(),
+            crate::storage::EnumSpec { members: &members },
+            0,
+        )
+        .unwrap() as u16;
+    let read_arena = Arena::new(&mut budget, "legacy enum reads", 1 << 20).unwrap();
+    let legacy = Datum::Enum {
+        slot,
+        member: None,
+        sort: 1.0,
+        label: "old",
+    };
+    let element = crate::sql::types::ArrElem::Enum(slot);
+    let array = crate::sql::array::build_shaped(
+        &[legacy, Datum::Null],
+        crate::sql::array::Shape::one(2).unwrap(),
+        &read_arena,
+    )
+    .unwrap();
+    let values = [
+        legacy,
+        Datum::Array {
+            element,
+            raw: array,
+        },
+    ];
+    let length = crate::storage::rowenc::encoded_len(&values);
+    let mut bytes = [0; 512];
+    crate::storage::rowenc::encode(&values, &mut bytes[..length]);
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TYPE enum_legacy_detail AS (state enum_legacy_state, note text);          ALTER TYPE enum_legacy_state RENAME VALUE 'old' TO 'new';          ALTER TYPE enum_legacy_state ADD VALUE 'old';          ALTER TYPE enum_legacy_state RENAME VALUE 'new' TO 'again'", true);
+    let mut decoded = [Datum::Null; 2];
+    crate::mem::guard::forbid_alloc(|| {
+        crate::storage::rowenc::decode(
+            &bytes[..length],
+            &[ColType::Enum(slot), ColType::Array(element)],
+            &mut decoded,
+        )
+        .unwrap();
+        let catalog = crate::sql::query::storage_catalog(&engine.storage, &read_arena, 0);
+        for value in &mut decoded {
+            *value = crate::sql::eval::materialize_enum_values(*value, Some(&catalog), &read_arena)
+                .unwrap();
+        }
+    });
+    assert_eq!(decoded[0].to_string(), "again");
+    assert_eq!(decoded[1].to_string(), "{again,NULL}");
+    let composite_slot = engine
+        .storage
+        .composite_slot("public", "enum_legacy_detail", 0)
+        .unwrap() as u16;
+    let record = crate::mem::guard::forbid_alloc(|| {
+        crate::sql::exec::decode_stored_composite_text(
+            "(old,old)",
+            composite_slot,
+            2,
+            &engine.storage,
+            0,
+            &read_arena,
+        )
+    })
+    .unwrap();
+    assert_eq!(record.to_string(), "(again,old)");
+}
+
+#[test]
 fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_recovery() {
     let mut config = test_config("owned-enum-rewrite");
     config.object_store_on = true;

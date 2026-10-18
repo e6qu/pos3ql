@@ -172,7 +172,8 @@ remove the internal grammar before parsing or displaying SQL. Unknown grammar
 versions and invalid bindings are errors.
 
 Legacy enum indexes hashed labels. Loading an older manifest explicitly retires
-those generations and schedules replacements; existing row objects remain
+those generations and schedules replacements; scalar key hashes use stable member
+identities rather than labels or sort positions; existing row objects remain
 readable. Label edits and sort renumbering do not rewrite table rows. Upgrade
 every recovery and replacement candidate before allowing kind 149 or manifest
 v15 to be written.

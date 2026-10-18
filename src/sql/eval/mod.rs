@@ -36,6 +36,7 @@ pub use operators::{
     hash_key_collated,
 };
 use operators::{compare_text_collated, logic, range_mismatch, unary};
+pub(crate) use operators::{hash_key_catalog, hash_key_collated_catalog, hash_key_identified};
 
 /// DETAIL/HINT lines for the next emitted error or notice. `SqlError` is
 /// constructed at ~60 sites and stays two fields; the rare errors that carry

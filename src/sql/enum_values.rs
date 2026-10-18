@@ -380,3 +380,25 @@ pub(crate) fn resolve_query<const N: usize>(
     }
     Ok(output)
 }
+
+pub(crate) fn legacy_identity(slot: u16, label: &str, storage: &Storage) -> Result<u32, SqlError> {
+    let corrupt = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored enum member has no catalog identity"
+        )
+    };
+    if usize::from(slot) >= storage.enum_count() {
+        return Err(corrupt());
+    }
+    storage
+        .enum_for(usize::from(slot), 0)
+        .members()
+        .position(|member| {
+            member
+                .legacy_label
+                .is_some_and(|legacy| legacy.as_str() == label)
+        })
+        .map(|index| index as u32)
+        .ok_or_else(corrupt)
+}

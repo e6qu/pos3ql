@@ -12714,6 +12714,7 @@ mod tests {
             decode_op(KIND_CREATE_ENUM_V3, payload),
             Some(WalOp::RestoreEnum {
                 wide_count: true,
+                stable_members: true,
                 ..
             })
         ));
@@ -12738,6 +12739,19 @@ mod tests {
             legacy[at..at + 8].copy_from_slice(&member.sort.to_le_bytes());
             at += 8;
         }
+        let prefix = 1 + "mood".len() + 1 + "public".len();
+        let mut wide = [0u8; 256];
+        wide[..prefix].copy_from_slice(&legacy[..prefix]);
+        wide[prefix..prefix + 4].copy_from_slice(&(members.len() as u32).to_le_bytes());
+        wide[prefix + 4..at + 3].copy_from_slice(&legacy[prefix + 1..at]);
+        assert!(matches!(
+            decode_op(KIND_CREATE_ENUM_V2, &wide[..at + 3]),
+            Some(WalOp::RestoreEnum {
+                wide_count: true,
+                stable_members: false,
+                ..
+            })
+        ));
         crate::mem::guard::forbid_alloc(|| {
             assert!(matches!(
                 decode_op(KIND_CREATE_ENUM, &legacy[..at]),

@@ -10,8 +10,8 @@
 use crate::mem::arena::Arena;
 use crate::sql::ast::Expr;
 use crate::sql::eval::{
-    ColumnLookup, EvalHooks, SqlError, compare_datums_collated, eval_full, hash_key_collated,
-    resolved_expression_collation, sqlstate,
+    ColumnLookup, EvalHooks, SqlError, compare_datums_collated, eval_full,
+    hash_key_collated_catalog, resolved_expression_collation, sqlstate,
 };
 use crate::sql::txn::TxnState;
 use crate::sql::types::{ColType, Datum};
@@ -730,7 +730,8 @@ fn enforce_key_uniqueness(
         for (index, column) in columns.iter().enumerate() {
             collations[index] = def.columns()[*column as usize].collation;
         }
-        let hash = hash_key_collated(values, columns, &collations[..columns.len()]);
+        let hash =
+            hash_key_collated_catalog(storage, values, columns, &collations[..columns.len()])?;
         let physical_columns =
             super::remap_columns(&storage.table_def(table_index, txid), def, columns)?;
         storage.probe_value(

@@ -645,6 +645,81 @@ pub fn hash_key_collated(values: &[Datum], columns: &[u16], collations: &[Collat
     hasher.finish()
 }
 
+pub(crate) fn hash_key_catalog(
+    storage: &crate::storage::Storage,
+    values: &[Datum],
+    columns: &[u16],
+) -> Result<u64, SqlError> {
+    hash_catalog(storage, values, columns, None)
+}
+
+pub(crate) fn hash_key_collated_catalog(
+    storage: &crate::storage::Storage,
+    values: &[Datum],
+    columns: &[u16],
+    collations: &[Collation],
+) -> Result<u64, SqlError> {
+    hash_catalog(storage, values, columns, Some(collations))
+}
+
+/// Stable identities retain selective hashes across label and ordering edits.
+/// Only legacy scalar keys need a catalog lookup; current keys need no copying.
+fn hash_catalog(
+    storage: &crate::storage::Storage,
+    values: &[Datum],
+    columns: &[u16],
+    collations: Option<&[Collation]>,
+) -> Result<u64, SqlError> {
+    use core::hash::Hasher;
+    let mut hasher = crate::mem::fixed_map::Fnv1aHasher::default();
+    for (position, &column) in columns.iter().enumerate() {
+        let datum = &values[usize::from(column)];
+        if let Datum::Enum {
+            slot,
+            member,
+            label,
+            ..
+        } = datum
+        {
+            let member = match member {
+                Some(member) => *member,
+                None => super::super::enum_values::legacy_identity(*slot, label, storage)?,
+            };
+            hasher.write(&[31]);
+            hasher.write(&member.to_le_bytes());
+        } else if collations.is_some_and(|collations| {
+            matches!(
+                collations[position],
+                Collation::Default | Collation::Catalog(_)
+            )
+        }) && matches!(datum, Datum::Text(_) | Datum::Bpchar(_))
+        {
+            hasher.write(&[0x54]);
+        } else {
+            hash_datum(datum, &mut hasher);
+        }
+    }
+    Ok(hasher.finish())
+}
+
+/// Planner estimates can use a selective hash only when every enum constant
+/// already has a typed member identity. Legacy row bytes require hash_key_catalog.
+pub(crate) fn hash_key_identified(values: &[Datum], columns: &[u16]) -> Option<u64> {
+    use core::hash::Hasher;
+    let mut hasher = crate::mem::fixed_map::Fnv1aHasher::default();
+    for &column in columns {
+        match &values[usize::from(column)] {
+            Datum::Enum { member, .. } => {
+                let member = member.as_ref()?;
+                hasher.write(&[31]);
+                hasher.write(&member.to_le_bytes());
+            }
+            datum => hash_datum(datum, &mut hasher),
+        }
+    }
+    Some(hasher.finish())
+}
+
 fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
     use core::hash::Hasher as _;
     // Canonical float bits: -0.0 and 0.0 are equal, and PostgreSQL's btree

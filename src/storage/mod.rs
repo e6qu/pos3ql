@@ -86,7 +86,7 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::mem::value_index::{ValueIndexLease, ValueIndexPool};
 use crate::pg::replication_client::{ConnectionInfo, ConnectionInfoError};
 use crate::sql::ast::{Collation, TablespaceCost};
-use crate::sql::eval::{SqlError, SqlState, hash_key, hash_key_collated, sqlstate};
+use crate::sql::eval::{SqlError, SqlState, hash_key_catalog, hash_key_collated_catalog, sqlstate};
 use crate::sql::types::{ArrElem, ColType, Datum};
 use crate::store::BlockStore;
 use crate::util::StackStr;
@@ -30952,7 +30952,10 @@ impl Storage {
                 let width = rowenc::encoded_len(core::slice::from_ref(&value)).saturating_sub(3);
                 widths[column] = widths[column].saturating_add(width as u64);
                 let index = [column as u16];
-                add_distinct(&mut registers[column], hash_key(values, &index));
+                add_distinct(
+                    &mut registers[column],
+                    hash_key_catalog(self, values, &index)?,
+                );
             }
         };
         // Overlay rows carry every pending or newer committed image. Spilled
@@ -32231,11 +32234,12 @@ impl Storage {
                         core::array::from_fn::<u16, MAX_INDEX_COLS, _>(|index| index as u16);
                     out[n_out] = (
                         binding,
-                        hash_key_collated(
+                        hash_key_collated_catalog(
+                            self,
                             key,
                             &compact[..enforcer.n_cols],
                             &enforcer.collations[..enforcer.n_cols],
-                        ),
+                        )?,
                     );
                     n_out += 1;
                     Ok(())
@@ -33657,10 +33661,9 @@ impl Storage {
         for table in self.tables.iter() {
             let mut publication = table.publication();
             for enforcer in publication.enforcers.iter_mut().flatten() {
-                if enforcer.key_types[..enforcer.n_cols]
-                    .iter()
-                    .any(|ctype| matches!(ctype, ColType::Enum(_)))
-                {
+                if enforcer.key_types[..enforcer.n_cols].iter().any(|ctype| {
+                    matches!(ctype, ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)))
+                }) {
                     enforcer.durable = None;
                     enforcer.durable_dirty = true;
                     enforcer.durable_rebuild = true;
@@ -33786,7 +33789,7 @@ impl Storage {
             binding,
             rowid,
             home,
-            |key, values, enforcer| Self::encode_value_binding_parts(key, values, enforcer, output),
+            |key, values, enforcer| self.encode_value_binding_parts(key, values, enforcer, output),
         )
     }
 
@@ -33807,7 +33810,7 @@ impl Storage {
             table_index,
             binding,
             values,
-            |key, values, enforcer| Self::encode_value_binding_parts(key, values, enforcer, output),
+            |key, values, enforcer| self.encode_value_binding_parts(key, values, enforcer, output),
         );
         // SAFETY: the encoded key and payload own their bytes in `output`.
         unsafe { arena.rewind_to(mark) };
@@ -33815,6 +33818,7 @@ impl Storage {
     }
 
     fn encode_value_binding_parts(
+        &self,
         key: Option<&[Datum]>,
         values: &[Datum],
         enforcer: &Enforcer,
@@ -33856,11 +33860,12 @@ impl Storage {
         Ok(Some((
             key_len,
             payload_len,
-            hash_key_collated(
+            hash_key_collated_catalog(
+                self,
                 key,
                 &compact[..enforcer.n_cols],
                 &enforcer.collations[..enforcer.n_cols],
-            ),
+            )?,
         )))
     }
 

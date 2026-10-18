@@ -5956,7 +5956,32 @@ pub(crate) fn materialize_composite_text_output<'a>(
             slot,
             physical_fields,
             text,
-        } => catalog.materialize_composite(slot, physical_fields, text, arena),
+        } => materialize_composite_text_output(
+            catalog.materialize_composite(slot, physical_fields, text, arena)?,
+            catalog,
+            arena,
+        ),
+        Datum::Composite { slot, fields } => {
+            let output = arena.alloc_slice_copy(fields).map_err(|_| arena_full())?;
+            for field in output.iter_mut() {
+                field.value = materialize_composite_text_output(field.value, catalog, arena)?;
+            }
+            Ok(Datum::Composite {
+                slot,
+                fields: output,
+            })
+        }
+        Datum::Record(fields) => {
+            let output = arena.alloc_slice_copy(fields).map_err(|_| arena_full())?;
+            for field in output.iter_mut() {
+                field.value = materialize_composite_text_output(field.value, catalog, arena)?;
+            }
+            Ok(Datum::Record(output))
+        }
+        Datum::Enum { .. } => catalog.materialize_enum(value, arena),
+        Datum::Array { element, .. } if matches!(element.to_coltype(), ColType::Enum(_)) => {
+            materialize_enum_values(value, Some(catalog), arena)
+        }
         Datum::Array { element, raw } if matches!(element.to_coltype(), ColType::Composite(_)) => {
             let shape = super::array::shape(raw).expect("array datum invariant");
             let items = super::array::alloc_items(arena, shape.element_count())?;
@@ -5966,8 +5991,12 @@ pub(crate) fn materialize_composite_text_output<'a>(
                         slot,
                         physical_fields,
                         text,
-                    } => catalog.materialize_composite(slot, physical_fields, text, arena)?,
-                    value => value,
+                    } => materialize_composite_text_output(
+                        catalog.materialize_composite(slot, physical_fields, text, arena)?,
+                        catalog,
+                        arena,
+                    )?,
+                    value => materialize_composite_text_output(value, catalog, arena)?,
                 };
             }
             Ok(Datum::Text(super::array::format_shaped(

@@ -7724,9 +7724,6 @@ impl Checkpointer {
                     ))
                 })?;
         }
-        if manifest_format != ManifestFormat::V15 {
-            storage.retire_legacy_enum_indexes();
-        }
         for (manifest_index, statistics) in table_statistics {
             let slot = slot_of.get(manifest_index).copied().flatten().ok_or(
                 CheckpointSetupError::Corrupt("statistics reference unknown table"),
@@ -7789,6 +7786,9 @@ impl Checkpointer {
                 })?;
             if statistics.data.valid {
                 storage.install_extended_statistics_data(slot, statistics.data);
+                if manifest_format != ManifestFormat::V15 {
+                    storage.retire_legacy_extended_statistics_hash(slot);
+                }
             }
         }
         // Engine startup performs one catalog rebind after it has merged the
@@ -7799,6 +7799,9 @@ impl Checkpointer {
             .select_database(crate::storage::DatabaseOid::POSTGRES)
             .map_err(|_| CheckpointSetupError::Corrupt("postgres database is unavailable"))?;
         storage.set_lsn(lsn);
+        if manifest_format != ManifestFormat::V15 {
+            storage.retire_legacy_enum_indexes();
+        }
         if next_rowid > 0 {
             storage.observe_rowid(next_rowid - 1);
         }

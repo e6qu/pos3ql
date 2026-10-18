@@ -171,7 +171,8 @@ PostgreSQL's on-disk page layout.
   prepare for the [remaining concurrency work](../PLAN.md#remaining-sequence).
 - PostgreSQL's cost model and exact EXPLAIN text are not compatibility complete.
   PostgreSQL parallel-query/JIT and planner/executor hooks do not exist.
-- Heap layout, heap-version `ctid`, HOT, physical vacuum internals, physical
+- Heap layout, heap-version `ctid`, transaction-header columns (`xmin`, `xmax`,
+  `cmin`, `cmax`), HOT, physical vacuum internals, physical
   XLOG/streaming replication, hot standby, and binary-WAL tools are non-goals.
   Object-native row identities are not exposed as invented heap addresses.
 - Logical copies are asynchronous independently durable databases; transparent

@@ -16,7 +16,7 @@ use crate::sql::eval::{
 use crate::sql::txn::TxnState;
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{MAX_COLUMNS, Storage, TableDef, ValidationRead, rowenc};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, Storage, TableDef, ValidationRead, rowenc};
 
 use super::{RowCtx, check_not_null};
 
@@ -141,6 +141,11 @@ pub(crate) fn coerce_domain_value<'a>(
                 }
                 value => super::coerce_composite_value(value, slot, storage, txid, arena)?,
             },
+            crate::sql::types::ColType::Array(
+                element @ (crate::sql::types::ArrElem::Enum(_)
+                | crate::sql::types::ArrElem::Composite(_)
+                | crate::sql::types::ArrElem::Domain { .. }),
+            ) => super::coerce_user_type_array(value, element, storage, txid, arena)?,
             base => crate::sql::eval::cast_to(value, base, arena)?,
         }
     };
@@ -205,7 +210,14 @@ pub(crate) fn validate_domain_check<'a>(
         catalog: Some(&catalog),
         ..crate::sql::eval::NO_HOOKS
     };
-    let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
+    let source = crate::sql::enum_values::checks::resolve(
+        check.expression.as_str(),
+        domain.base,
+        storage,
+        txid,
+        arena,
+    )?;
+    let expression = crate::sql::parser::parse_expr(source, arena)?;
     if matches!(
         eval_full(expression, arena, params, &context, &hooks)?,
         Datum::Bool(false)
@@ -220,6 +232,22 @@ pub(crate) fn validate_domain_check<'a>(
     Ok(())
 }
 
+pub(crate) fn column_domain_slot(
+    storage: &Storage,
+    column: &ColumnMeta,
+    txid: u32,
+) -> Option<usize> {
+    let identity = column.user_type?;
+    let slot =
+        storage.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)?;
+    if matches!(column.ctype, ColType::Array(crate::sql::types::ArrElem::Domain { slot: element_slot, .. }) if usize::from(element_slot) == slot)
+    {
+        None
+    } else {
+        Some(slot)
+    }
+}
+
 /// Enforces every domain-typed column's NOT NULL and CHECK constraints against a
 /// candidate row: base coercion has already happened, so this only runs the
 /// domain's own rules, binding `VALUE` to each column's value.
@@ -232,23 +260,7 @@ pub(crate) fn check_domain_constraints(
     params: &[Datum],
 ) -> Result<(), SqlError> {
     for (i, col) in def.columns().iter().enumerate() {
-        let Some(user_type) = col.user_type else {
-            continue;
-        };
-        // Enum identity also lives in `user_type`, as do enum/domain array element
-        // identities. Only a scalar domain applies its constraint to the whole
-        // column value; a domain array validates each element while coercing.
-        if matches!(
-            col.ctype,
-            ColType::Enum(_)
-                | ColType::Array(crate::sql::types::ArrElem::Enum(_))
-                | ColType::Array(crate::sql::types::ArrElem::Domain { .. })
-        ) {
-            continue;
-        }
-        let Some(slot) =
-            storage.domain_identity_slot(user_type.schema.as_str(), user_type.name.as_str(), txid)
-        else {
+        let Some(slot) = column_domain_slot(storage, col, txid) else {
             continue;
         };
         let value = values.get(i).copied().unwrap_or(Datum::Null);

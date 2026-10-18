@@ -52117,6 +52117,9 @@ fn enum_value_identity_nested_arrays_keep_nulls_bounds_and_plain_text() {
         "CREATE TYPE enum_array_state AS ENUM ('old', 'ready');          CREATE TYPE enum_array_detail AS (states enum_array_state[], note text);          CREATE TYPE enum_array_outer AS (detail enum_array_detail, batch enum_array_detail[]);          CREATE TABLE enum_array_rows (detail enum_array_outer);          INSERT INTO enum_array_rows VALUES (ROW(ROW('[0:2]={old,NULL,ready}'::enum_array_state[],             'old, \"quoted\"')::enum_array_detail,             ARRAY[ROW(ARRAY['old'::enum_array_state], 'old')::enum_array_detail, NULL])::enum_array_outer);          ALTER TYPE enum_array_state RENAME VALUE 'old' TO 'new'", true);
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT ((detail).detail).states[0]::text, ((detail).detail).states[1] IS NULL,            ((detail).detail).states[2]::text, ((detail).detail).note,            (((detail).batch)[1]).states[1]::text, ((detail).batch)[2] IS NULL          FROM enum_array_rows", true)), ["new|t|ready|old, \"quoted\"|new|t"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT position('new' IN detail::text) > 0, position('old' IN detail::text) > 0 FROM enum_array_rows", true)),
+        ["t|t"]);
 }
 
 #[test]
@@ -52133,11 +52136,20 @@ fn enum_value_identity_saved_indexes_and_views_survive_empty_cache_recovery() {
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     session.success(&mut engine,
         "CREATE TYPE enum_saved_state AS ENUM ('old', 'ready', 'high');          CREATE TYPE enum_saved_detail AS (state enum_saved_state, note text);          CREATE TABLE enum_saved_rows(id integer PRIMARY KEY, state enum_saved_state UNIQUE, detail enum_saved_detail);          INSERT INTO enum_saved_rows VALUES (1, 'old', ROW('old', 'old')::enum_saved_detail),             (2, 'high', ROW('high', 'high')::enum_saved_detail);          CREATE VIEW enum_saved_view AS SELECT id, 'old'::enum_saved_state AS pinned             FROM enum_saved_rows WHERE state = 'old'", true);
-    let original_xmins = data_rows(&session.success(
-        &mut engine,
-        "SELECT xmin::text FROM enum_saved_rows ORDER BY id",
-        true,
-    ));
+    let versions = |storage: &crate::storage::Storage| {
+        let slot = storage.find_table("public", "enum_saved_rows").unwrap();
+        let mut versions = Vec::new();
+        storage
+            .for_each_row_state(slot, &mut |rowid, state| {
+                versions.push((rowid, state.committed_lsn));
+                Ok(core::ops::ControlFlow::Continue(()))
+            })
+            .unwrap();
+        versions.sort_unstable();
+        versions
+    };
+    let original_versions = versions(&engine.storage);
+    assert_eq!(original_versions.len(), 2);
     assert!(engine.checkpoint().unwrap());
     session.success(
         &mut engine,
@@ -52151,14 +52163,7 @@ fn enum_value_identity_saved_indexes_and_views_survive_empty_cache_recovery() {
             true,
         );
     }
-    assert_eq!(
-        data_rows(&session.success(
-            &mut engine,
-            "SELECT xmin::text FROM enum_saved_rows ORDER BY id",
-            true
-        )),
-        original_xmins
-    );
+    assert_eq!(versions(&engine.storage), original_versions);
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT id, state::text, (detail).state::text, (detail).note FROM enum_saved_rows            WHERE state = 'new'::enum_saved_state;          SELECT id FROM enum_saved_rows WHERE state > 'middle_29'::enum_saved_state;          SELECT id, pinned::text FROM enum_saved_view", true)),
         ["1|new|new|old", "2", "1|new"]);
@@ -52178,14 +52183,7 @@ fn enum_value_identity_saved_indexes_and_views_survive_empty_cache_recovery() {
     assert_eq!(data_rows(&session.success(&mut cold,
         "SELECT id, state::text, (detail).state::text, (detail).note FROM enum_saved_rows ORDER BY id;          SELECT id, pinned::text FROM enum_saved_view", true)),
         ["1|new|new|old", "2|high|high|high", "1|new"]);
-    assert_eq!(
-        data_rows(&session.success(
-            &mut cold,
-            "SELECT xmin::text FROM enum_saved_rows ORDER BY id",
-            true
-        )),
-        original_xmins
-    );
+    assert_eq!(versions(&cold.storage), original_versions);
     let duplicate = session.execute(
         &mut cold,
         "INSERT INTO enum_saved_rows VALUES (3, 'new', NULL)",
@@ -52342,6 +52340,36 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
 }
 
 #[test]
+fn enum_value_identity_default_catalog_sql_follows_the_frozen_value() {
+    let config = test_config("enum-identity-default-catalog");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TYPE enum_default_state AS ENUM ('old', 'ready');          CREATE TABLE enum_default_rows (state enum_default_state DEFAULT 'old');          ALTER TYPE enum_default_state RENAME VALUE 'old' TO 'new'", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT position('new' IN pg_get_expr(adbin, adrelid)) > 0 FROM pg_attrdef            WHERE adrelid = 'enum_default_rows'::regclass;          SELECT position('new' IN column_default) > 0 FROM information_schema.columns            WHERE table_name = 'enum_default_rows' AND column_name = 'state'", true)), ["t", "t"]);
+}
+
+#[test]
+fn enum_value_identity_default_and_rows_cast_to_current_text_after_rename() {
+    let config = test_config("enum-identity-default-conversion");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TYPE enum_cast_state AS ENUM ('old', 'ready');          CREATE TABLE enum_cast_rows (id integer, state enum_cast_state DEFAULT 'old');          INSERT INTO enum_cast_rows(id) VALUES (1);          ALTER TYPE enum_cast_state RENAME VALUE 'old' TO 'new';          ALTER TABLE enum_cast_rows ALTER COLUMN state TYPE text USING state::text;          INSERT INTO enum_cast_rows(id) VALUES (2)", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, state FROM enum_cast_rows ORDER BY id",
+            true
+        )),
+        ["1|new", "2|new"]
+    );
+}
+
+#[test]
 fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_recovery() {
     let mut config = test_config("owned-enum-rewrite");
     config.object_store_on = true;
@@ -52467,7 +52495,7 @@ fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_re
 }
 
 #[test]
-fn owned_enum_rewrite_sources_release_after_arena_exhaustion_and_retry() {
+fn enum_metadata_edits_do_not_collect_rows_in_the_statement_arena() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
         &mut engine,
@@ -52489,7 +52517,7 @@ fn owned_enum_rewrite_sources_release_after_arena_exhaustion_and_retry() {
         32 << 10,
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("54000"),
+        !message_types(&output).contains(&b'E'),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -52497,16 +52525,16 @@ fn owned_enum_rewrite_sources_release_after_arena_exhaustion_and_retry() {
         data_rows(&run_with_fixed_memory(
             &mut engine,
             &budget,
-            "SELECT count(*) FROM rewrite_limited_rows WHERE state = 'old'; \
+            "SELECT count(*) FROM rewrite_limited_rows WHERE state = 'new'; \
              SELECT enumlabel FROM pg_enum WHERE enumtypid = 'rewrite_limited'::regtype ORDER BY enumsortorder",
             1 << 20,
         )),
-        ["512", "old", "ready"]
+        ["512", "new", "ready"]
     );
     let output = run_with_fixed_memory(
         &mut engine,
         &budget,
-        "ALTER TYPE rewrite_limited RENAME VALUE 'old' TO 'new'; \
+        "BEGIN; ALTER TYPE rewrite_limited RENAME VALUE 'new' TO 'temporary'; ROLLBACK; \
          SELECT count(*) FROM rewrite_limited_rows WHERE state = 'new'",
         1 << 20,
     );

@@ -19846,6 +19846,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 ));
             };
             storage.install_extended_statistics_data(slot, statistics.materialize()?);
+            if statistics.has_legacy_enum_hashes() {
+                storage.retire_legacy_extended_statistics_hash(slot);
+            }
         }
         WalOp::DropTable { schema, name } => {
             let Some(index) = storage.find_table(schema, name) else {
@@ -20687,7 +20690,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.apply_sequence_advance(schema, name, last, is_called);
         }
         WalOp::ResetUnloggedRelations => storage.reset_unlogged_relations()?,
-        WalOp::RestoreDomain(payload) => {
+        WalOp::RestoreDomain(payload) | WalOp::RestoreBoundDomain(payload) => {
             let def = crate::wal::decode_domain_payload(payload).ok_or_else(|| {
                 sql_err!(
                     sqlstate::DATA_EXCEPTION,

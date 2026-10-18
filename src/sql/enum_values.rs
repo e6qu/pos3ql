@@ -1,5 +1,7 @@
 //! Bind durable enum member identities to the selected catalog image.
 
+pub(crate) mod checks;
+
 use crate::mem::arena::Arena;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::Datum;
@@ -99,6 +101,10 @@ pub(crate) fn sort(value: Datum<'_>, storage: &Storage, txid: u32) -> Result<f64
 // client comments cannot forge a binding.
 const QUERY_HEADER: &str = "pos3ql-bound-query-v1\n";
 
+pub(crate) fn is_bound_query(source: &str) -> bool {
+    source.starts_with(QUERY_HEADER)
+}
+
 #[derive(Clone, Copy)]
 struct QueryToken<'a> {
     token: super::lexer::Tok<'a>,
@@ -166,7 +172,7 @@ pub(crate) fn bind_query<const N: usize>(
         .iter()
         .filter(|token| matches!(token.token, Tok::Str(_)))
         .count();
-    if count == 0 || storage.enum_count() == 0 {
+    if count == 0 || !storage.has_visible_enums(txid) {
         return Ok(crate::util::StackStr::from_str(source));
     }
     let mut parameterized = crate::util::StackStr::<N>::new();
@@ -259,7 +265,13 @@ pub(crate) fn bind_query<const N: usize>(
                     }
                 };
                 any_binding = true;
-                binding = Some((dependency, member, definition.schema, definition.name));
+                let referenced = dependencies.view().entries()[dependency];
+                binding = Some((
+                    dependency,
+                    member,
+                    referenced.referenced_schema,
+                    referenced.referenced_name,
+                ));
             }
         }
         if let Some((dependency, member, _, _)) = binding {
@@ -268,8 +280,10 @@ pub(crate) fn bind_query<const N: usize>(
         let _ = output.write_str(&source[token.start..token.end]);
         if let Some((_, _, schema, name)) = binding {
             let _ = output.write_str("::");
-            write_name(&mut output, schema.as_str());
-            let _ = output.write_char('.');
+            if !schema.as_str().is_empty() {
+                write_name(&mut output, schema.as_str());
+                let _ = output.write_char('.');
+            }
             write_name(&mut output, name.as_str());
         }
         let _ = output.write_char(' ');
@@ -400,4 +414,77 @@ pub(crate) fn legacy_identity(slot: u16, label: &str, storage: &Storage) -> Resu
         })
         .map(|index| index as u32)
         .ok_or_else(corrupt)
+}
+
+struct SqlString<'a>(&'a str);
+
+impl core::fmt::Display for SqlString<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::fmt::Write;
+        output.write_str("E'")?;
+        for character in self.0.chars() {
+            if matches!(character, '\'' | '\\') {
+                output.write_char(character)?;
+            }
+            output.write_char(character)?;
+        }
+        output.write_char('\'')
+    }
+}
+
+/// Catalog SQL must follow a frozen value's identity, just like execution.
+/// Re-render only changed enum constants; preserve other expression sources.
+pub(crate) fn default_expression<'a>(
+    default: &crate::storage::ColumnDefault,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let Some(expression) = default.expression() else {
+        return Ok(None);
+    };
+    let copy_original = || {
+        arena
+            .alloc_str(expression.as_str())
+            .map(Some)
+            .map_err(|_| super::query::arena_full_pub())
+    };
+    let Some(constant) = default.constant() else {
+        return copy_original();
+    };
+    let cached = constant.as_datum();
+    if !matches!(cached, Datum::Enum { .. })
+        && !matches!(cached, Datum::Array { element, .. } if matches!(element.to_coltype(), super::types::ColType::Enum(_)))
+    {
+        return copy_original();
+    }
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let current = super::eval::materialize_enum_values(cached, Some(&catalog), arena)?;
+    if current == cached {
+        return copy_original();
+    }
+    let type_name = super::catalog::user_type_name_text(storage, txid, current.type_oid(), arena)?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "enum default has no declared type"
+            )
+        })?;
+    let value = arena
+        .alloc_str_display(current)
+        .map_err(|_| super::query::arena_full_pub())?;
+    arena
+        .alloc_str_display(format_args!("{}::{}", SqlString(value), type_name))
+        .map(Some)
+        .map_err(|_| super::query::arena_full_pub())
+}
+
+pub(crate) fn materialize<'a>(
+    value: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    super::eval::materialize_enum_values(value, Some(&catalog), arena)
 }

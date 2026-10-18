@@ -33663,7 +33663,7 @@ impl Storage {
             let mut publication = table.publication();
             for enforcer in publication.enforcers.iter_mut().flatten() {
                 if enforcer.key_types[..enforcer.n_cols].iter().any(|ctype| {
-                    matches!(ctype, ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)))
+                    matches!(ctype, ColType::Enum(_)) || matches!(ctype, ColType::Array(element) if matches!(element.to_coltype(), ColType::Enum(_)))
                 }) {
                     enforcer.durable = None;
                     enforcer.durable_dirty = true;
@@ -39446,6 +39446,17 @@ impl Storage {
         }
     }
 
+    pub(crate) fn has_visible_enums(&self, txid: u32) -> bool {
+        self.type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .enums
+            .iter()
+            .any(|enumeration| {
+                enumeration.database == current_database() && enumeration.visible_to(txid)
+            })
+    }
+
     pub(crate) fn enum_count(&self) -> usize {
         self.type_catalog
             .lock()
@@ -45097,6 +45108,53 @@ impl Storage {
             });
         catalog.definitions[slot].data = data;
         Self::clear_pending_extended_statistics_data(&mut catalog, slot);
+    }
+
+    /// Hash summaries are caches. Keep counts and dependencies, but retire old
+    /// enum MCV hashes before they can be compared with stable member hashes.
+    pub(crate) fn retire_legacy_extended_statistics_hash(&mut self, slot: usize) {
+        let (database, table, keys, n_keys) = {
+            let catalog = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            let definition = &catalog.definitions[slot];
+            (
+                definition.database,
+                definition.table,
+                definition.keys,
+                definition.n_keys,
+            )
+        };
+        let has_enums = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .enums
+            .iter()
+            .any(|enumeration| enumeration.database == database && enumeration.visible_to(0));
+        if !has_enums {
+            return;
+        }
+        let affects_enum = {
+            let definition = self.tables[usize::from(table)].definition();
+            keys[..usize::from(n_keys)].iter().any(|key| match key {
+                ExtendedStatisticsKey::Column(name) => definition
+                    .column_index(name.as_str())
+                    .is_some_and(|column| {
+                        matches!(definition.columns[column].ctype, ColType::Enum(_))
+                    }),
+                ExtendedStatisticsKey::Expression(_) => true,
+            })
+        };
+        if affects_enum {
+            self.extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned")
+                .definitions[slot]
+                .data
+                .n_mcv = 0;
+        }
     }
 
     pub(crate) fn install_extended_statistics_data(

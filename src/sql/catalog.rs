@@ -15046,7 +15046,14 @@ pub fn constraint_def_text<'a>(
             }
             let mut rendered = StackStr::<1024>::new();
             use core::fmt::Write as _;
-            let _ = write!(rendered, "CHECK (({}))", check.expression.as_str());
+            let expression = super::enum_values::checks::resolve(
+                check.expression.as_str(),
+                domain.base,
+                storage,
+                txid,
+                arena,
+            )?;
+            let _ = write!(rendered, "CHECK (({}))", expression);
             append_constraint_attributes(
                 &mut rendered,
                 crate::storage::ConstraintTiming::NotDeferrable,
@@ -22011,7 +22018,9 @@ fn pg_attrdef<'a>(
         let table = storage.table_def(slot, txid);
         let relid = table_oid(storage, slot);
         for (ci, c) in table.columns().iter().enumerate() {
-            let Some(text_expr) = c.default.expression() else {
+            let Some(text_expr) =
+                super::enum_values::default_expression(&c.default, storage, txid, arena)?
+            else {
                 continue;
             };
             if n == out.len() {
@@ -22022,7 +22031,7 @@ fn pg_attrdef<'a>(
                     Datum::Oid((relid * 100 + ci as i32 + 1) as u32), // synthetic adbin oid
                     Datum::Oid(relid as u32),
                     Datum::Int2(ci as i16 + 1),
-                    text(text_expr.as_str(), arena)?,
+                    Datum::Text(text_expr),
                     Datum::Oid(2604),
                 ],
                 arena,
@@ -22032,11 +22041,15 @@ fn pg_attrdef<'a>(
     }
     for (slot, view) in storage.views_visible_to(txid) {
         let columns = view.columns_for(txid);
-        for (column, default) in (0..columns.len()).filter_map(|index| {
-            columns
-                .default_at_ref(index)
-                .and_then(|default| default.expression().map(|expression| (index, expression)))
-        }) {
+        for column in 0..columns.len() {
+            let default = columns
+                .default_at_ref(column)
+                .expect("view default column is bounded");
+            let Some(default) =
+                super::enum_values::default_expression(default, storage, txid, arena)?
+            else {
+                continue;
+            };
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attrdef"));
             }
@@ -22046,7 +22059,7 @@ fn pg_attrdef<'a>(
                     Datum::Oid((relid * 100 + column as i32 + 1) as u32),
                     Datum::Oid(relid as u32),
                     Datum::Int2(column as i16 + 1),
-                    text(default.as_str(), arena)?,
+                    Datum::Text(default),
                     Datum::Oid(2604),
                 ],
                 arena,
@@ -31597,9 +31610,11 @@ fn info_column_row<'a>(
             StackStr::from_str(column.ctype.catalog_name()),
         )
     };
-    let default = (!column.default.is_generated())
-        .then(|| column.default.expression())
-        .flatten();
+    let default = if column.default.is_generated() {
+        None
+    } else {
+        super::enum_values::default_expression(&column.default, storage, txid, arena)?
+    };
     let generated = column.default.is_generated();
     let generated_expression = generated.then(|| column.default.expression()).flatten();
     let nullable =
@@ -31641,7 +31656,7 @@ fn info_column_row<'a>(
         .map(|sequence| stack_format!(32, "{}", sequence.min_value));
     let identity_cycle = identity_sequence.as_ref().map(|sequence| sequence.cycle);
     let default_datum = match default {
-        Some(value) => text(value.as_str(), arena)?,
+        Some(value) => Datum::Text(value),
         None => Datum::Null,
     };
     let domain_catalog = match domain {
@@ -33170,7 +33185,14 @@ fn info_check_constraints<'a>(
             continue;
         }
         for check in domain.checks() {
-            let clause = stack_format!(1024, "({})", check.expression.as_str());
+            let expression = super::enum_values::checks::resolve(
+                check.expression.as_str(),
+                domain.base,
+                storage,
+                txid,
+                arena,
+            )?;
+            let clause = stack_format!(1024, "({})", expression);
             append(domain.schema.as_str(), check.name.as_str(), clause.as_str())?;
         }
         if domain.not_null {

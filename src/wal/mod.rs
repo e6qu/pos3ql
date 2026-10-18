@@ -145,6 +145,9 @@ wal_record_kinds! {
 /// Kind 23 remains decodable so existing journals retain their durable meaning.
     KIND_CREATE_ENUM_V2 = 147;
     KIND_CREATE_ENUM_V3 = 149;
+    KIND_ANALYZE_EXTENDED_STATISTICS_V2 = 150;
+    KIND_CREATE_DOMAIN_BOUND = 151;
+    KIND_CREATE_VIEW_BOUND = 152;
     KIND_SET_PUBLICATION_OWNER = 43;
     KIND_RENAME_PUBLICATION = 44;
     KIND_CREATE_ROUTINE = 45;
@@ -570,9 +573,14 @@ impl WalExtendedStatisticsKey<'_> {
 pub(crate) enum WalExtendedStatisticsData<'a> {
     Captured(&'a ExtendedStatisticsData),
     Encoded(&'a [u8]),
+    LegacyEnumHashes(&'a [u8]),
 }
 
 impl WalExtendedStatisticsData<'_> {
+    pub(crate) fn has_legacy_enum_hashes(self) -> bool {
+        matches!(self, Self::LegacyEnumHashes(_))
+    }
+
     fn encoded_len(self) -> usize {
         match self {
             Self::Captured(data) => {
@@ -587,7 +595,7 @@ impl WalExtendedStatisticsData<'_> {
                     + 4
                     + usize::from(data.n_mcv) * 8
             }
-            Self::Encoded(bytes) => bytes.len(),
+            Self::Encoded(bytes) | Self::LegacyEnumHashes(bytes) => bytes.len(),
         }
     }
 
@@ -622,19 +630,21 @@ impl WalExtendedStatisticsData<'_> {
                 }
                 ok
             }
-            Self::Encoded(bytes) => buffer.append(bytes),
+            Self::Encoded(bytes) | Self::LegacyEnumHashes(bytes) => buffer.append(bytes),
         }
     }
 
     pub(crate) fn materialize(self) -> Result<ExtendedStatisticsData, SqlError> {
         match self {
             Self::Captured(data) => Ok(*data),
-            Self::Encoded(bytes) => decode_extended_statistics_data(bytes).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "corrupt extended statistics in journal"
-                )
-            }),
+            Self::Encoded(bytes) | Self::LegacyEnumHashes(bytes) => {
+                decode_extended_statistics_data(bytes).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "corrupt extended statistics in journal"
+                    )
+                })
+            }
         }
     }
 }
@@ -1401,6 +1411,7 @@ pub(crate) enum WalOp<'a> {
     CreateDomain(&'a crate::storage::DomainDef),
     /// The validated durable domain image, materialized only while applying it.
     RestoreDomain(&'a [u8]),
+    RestoreBoundDomain(&'a [u8]),
     DropDomain {
         schema: &'a str,
         name: &'a str,
@@ -2469,7 +2480,13 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::Delete { .. } => KIND_DELETE,
         WalOp::Truncate { .. } => KIND_TRUNCATE_WIDE,
         WalOp::LogicalMessage { .. } => KIND_LOGICAL_MESSAGE,
-        WalOp::CreateView { .. } => KIND_CREATE_VIEW_V2,
+        WalOp::CreateView { sql, .. } => {
+            if crate::sql::enum_values::is_bound_query(sql) {
+                KIND_CREATE_VIEW_BOUND
+            } else {
+                KIND_CREATE_VIEW_V2
+            }
+        }
         WalOp::DropView { .. } => KIND_DROP_VIEW,
         WalOp::SetViewOptions { .. } => KIND_SET_VIEW_OPTIONS,
         WalOp::SetViewColumns { .. } => KIND_SET_VIEW_COLUMNS_V2,
@@ -2541,7 +2558,19 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SequenceAdvance { .. } => KIND_SEQUENCE_ADVANCE,
         WalOp::ResetUnloggedRelations => KIND_RESET_UNLOGGED_RELATIONS,
         WalOp::Comment { .. } => KIND_COMMENT,
-        WalOp::CreateDomain(_) | WalOp::RestoreDomain(_) => KIND_CREATE_DOMAIN,
+        WalOp::CreateDomain(definition) => {
+            if definition
+                .checks()
+                .iter()
+                .any(|check| crate::sql::enum_values::checks::is_bound(check.expression.as_str()))
+            {
+                KIND_CREATE_DOMAIN_BOUND
+            } else {
+                KIND_CREATE_DOMAIN
+            }
+        }
+        WalOp::RestoreDomain(_) => KIND_CREATE_DOMAIN,
+        WalOp::RestoreBoundDomain(_) => KIND_CREATE_DOMAIN_BOUND,
         WalOp::DropDomain { .. } => KIND_DROP_DOMAIN,
         WalOp::CreateEnum { .. }
         | WalOp::RestoreEnum {
@@ -2602,7 +2631,13 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::Analyze { .. } => KIND_ANALYZE,
         WalOp::SetExtendedStatistics { .. } => KIND_SET_EXTENDED_STATISTICS,
         WalOp::DropExtendedStatistics { .. } => KIND_DROP_EXTENDED_STATISTICS,
-        WalOp::AnalyzeExtendedStatistics { .. } => KIND_ANALYZE_EXTENDED_STATISTICS,
+        WalOp::AnalyzeExtendedStatistics { statistics, .. } => {
+            if statistics.has_legacy_enum_hashes() {
+                KIND_ANALYZE_EXTENDED_STATISTICS
+            } else {
+                KIND_ANALYZE_EXTENDED_STATISTICS_V2
+            }
+        }
         WalOp::UpsertRole { .. } => KIND_UPSERT_ROLE,
         WalOp::DropRole { .. } => KIND_DROP_ROLE,
         WalOp::RenameRole { .. } => KIND_RENAME_ROLE,
@@ -3329,6 +3364,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n
         }
         WalOp::RestoreDomain(payload)
+        | WalOp::RestoreBoundDomain(payload)
         | WalOp::RestoreRoutine { payload, .. }
         | WalOp::RestoreForeignTable(payload)
         | WalOp::RestoreOperatorFamily(payload)
@@ -5383,6 +5419,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::RestoreDomain(payload)
+        | WalOp::RestoreBoundDomain(payload)
         | WalOp::RestoreRoutine { payload, .. }
         | WalOp::RestoreForeignTable(payload)
         | WalOp::RestoreOperatorFamily(payload)
@@ -7732,8 +7769,8 @@ fn decode_op_inner<'a>(
                 content,
             })
         }),
-        KIND_CREATE_VIEW | KIND_CREATE_VIEW_V2 => decode_large_op(|| {
-            let wide_columns = kind == KIND_CREATE_VIEW_V2;
+        KIND_CREATE_VIEW | KIND_CREATE_VIEW_V2 | KIND_CREATE_VIEW_BOUND => decode_large_op(|| {
+            let wide_columns = kind != KIND_CREATE_VIEW;
             let name = take_name(&mut at)?;
             let columns_start = at;
             let column_count = if wide_columns {
@@ -7767,6 +7804,9 @@ fn decode_op_inner<'a>(
             let raw = payload.get(at..at + sql_len)?;
             at += sql_len;
             let sql = core::str::from_utf8(raw).ok()?;
+            if (kind == KIND_CREATE_VIEW_BOUND) != crate::sql::enum_values::is_bound_query(sql) {
+                return None;
+            }
             let schema = take_name(&mut at)?;
             let path_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
             at += 2;
@@ -9294,7 +9334,7 @@ fn decode_op_inner<'a>(
                 text,
             })
         }),
-        KIND_CREATE_DOMAIN => decode_large_op(|| {
+        KIND_CREATE_DOMAIN | KIND_CREATE_DOMAIN_BOUND => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let payload_version = *payload.get(at)?;
@@ -9414,7 +9454,11 @@ fn decode_op_inner<'a>(
             if let Some(output) = decoded_domain {
                 *output = definition;
             }
-            Some(WalOp::RestoreDomain(payload))
+            Some(if kind == KIND_CREATE_DOMAIN_BOUND {
+                WalOp::RestoreBoundDomain(payload)
+            } else {
+                WalOp::RestoreDomain(payload)
+            })
         }),
         KIND_DROP_DOMAIN => decode_large_op(|| {
             let name = take_name(&mut at)?;
@@ -10713,17 +10757,23 @@ fn decode_op_inner<'a>(
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropExtendedStatistics { schema, name })
         }),
-        KIND_ANALYZE_EXTENDED_STATISTICS => decode_large_op(|| {
-            let schema = take_name(&mut at)?;
-            let name = take_name(&mut at)?;
-            let encoded = payload.get(at..)?;
-            decode_extended_statistics_data(encoded)?;
-            Some(WalOp::AnalyzeExtendedStatistics {
-                schema,
-                name,
-                statistics: WalExtendedStatisticsData::Encoded(encoded),
+        KIND_ANALYZE_EXTENDED_STATISTICS | KIND_ANALYZE_EXTENDED_STATISTICS_V2 => {
+            decode_large_op(|| {
+                let schema = take_name(&mut at)?;
+                let name = take_name(&mut at)?;
+                let encoded = payload.get(at..)?;
+                decode_extended_statistics_data(encoded)?;
+                Some(WalOp::AnalyzeExtendedStatistics {
+                    schema,
+                    name,
+                    statistics: if kind == KIND_ANALYZE_EXTENDED_STATISTICS {
+                        WalExtendedStatisticsData::LegacyEnumHashes(encoded)
+                    } else {
+                        WalExtendedStatisticsData::Encoded(encoded)
+                    },
+                })
             })
-        }),
+        }
         KIND_UPSERT_ROLE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let flags = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);

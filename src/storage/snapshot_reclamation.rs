@@ -756,6 +756,9 @@ mod tests {
         for iteration in 0..8 {
             let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
             crate::mem::guard::forbid_alloc(|| {
+                let released = storage.retain_statement_snapshot(100, |lsn| lsn).unwrap();
+                drop(released);
+                assert!(storage.snapshot_state().statement_reclamation_pending);
                 let image = storage
                     .heap
                     .append_row_image(&[Datum::Int4(20 + iteration)])

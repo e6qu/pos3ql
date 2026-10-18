@@ -795,6 +795,12 @@ existing 85% critical heap threshold, automatic checkpointing also finishes
 publication and cleanup before dispatch resumes, preserving headroom for the
 next write. This pressure path can still delay connections.
 
+Evicting redundant saved-row metadata evaluates each map entry once, without
+rescanning earlier entries after every 512 removals. Pending changes, retained
+history, heap rows, deletion markers and unpublished saved rows stay resident.
+The walk handles collision chains that wrap around the fixed map without
+allocating or weakening lookup correctness. It still completes in one server turn.
+
 The startup relocation workspace owns its scratch, preparation state and copy
 controls across turns; their exact sizes are charged at startup. Moving the
 engine does not invalidate them. Cancellation or a preparation/copy error

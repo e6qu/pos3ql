@@ -483,25 +483,7 @@ impl Storage {
     }
 
     pub(super) fn evict_redundant_rows(rows: &mut FixedMap<u64, RowState>) {
-        loop {
-            let mut batch = [0u64; 512];
-            let mut n = 0usize;
-            for (&rowid, state) in rows.iter() {
-                if Self::redundant_spilled_row_state(state) {
-                    batch[n] = rowid;
-                    n += 1;
-                    if n == batch.len() {
-                        break;
-                    }
-                }
-            }
-            if n == 0 {
-                return;
-            }
-            for rowid in &batch[..n] {
-                rows.remove(rowid);
-            }
-        }
+        rows.retain(|_, state| !Self::redundant_spilled_row_state(state));
     }
 }
 
@@ -523,6 +505,94 @@ mod tests {
 
     fn relocation_scratch() -> FixedVec<HeapRelocationEntry> {
         FixedVec::new(&mut Budget::new(4096), "publication relocation test", 16).unwrap()
+    }
+
+    #[test]
+    fn heap_eviction_preserves_unpublished_heap_deleted_historical_and_pending_rows() {
+        const REDUNDANT: usize = 1536;
+        let mut config = test_config();
+        config.table_rows = 2048;
+        let (mut storage, table) = fixture(&config);
+        crate::mem::guard::forbid_alloc(|| {
+            let location = storage.heap.append_bytes(b"kept").unwrap();
+            let spilled = RowState {
+                committed: Some(RowHome::Spilled {
+                    len: 4,
+                    sst: 0,
+                    commit_lsn: 7,
+                }),
+                committed_lsn: 7,
+                checkpoint_change_lsn: 0,
+                history: CommittedHistory::empty(),
+                pending: PendingVersions::empty(),
+            };
+            let mut retained = [spilled; 5];
+            retained[0].checkpoint_change_lsn = 7;
+            retained[1].committed = Some(RowHome::Heap(location));
+            retained[2].committed = None;
+            {
+                let versions = storage.row_versions.exclusive();
+                push_committed_version(
+                    &mut versions.committed_row_versions,
+                    &mut retained[3].history,
+                    config.max_row_versions_per_row,
+                    CommittedVersion {
+                        home: Some(RowHome::Heap(location)),
+                        lsn: 6,
+                    },
+                )
+                .unwrap();
+                push_pending_version(
+                    &mut versions.pending_row_versions,
+                    &mut retained[4].pending,
+                    config.max_row_versions_per_row,
+                    PendingChange {
+                        txid: 9,
+                        cid: 1,
+                        loc: Some(location),
+                        changed_columns: ColumnSet::EMPTY,
+                        changes_existence: false,
+                    },
+                )
+                .unwrap();
+            }
+            {
+                let mut rows = storage.tables[table].rows.write();
+                for rowid in 0..REDUNDANT {
+                    rows.insert(rowid as u64, spilled).unwrap();
+                }
+                for (index, state) in retained.iter().enumerate() {
+                    rows.insert((REDUNDANT + index) as u64, *state).unwrap();
+                }
+                Storage::evict_redundant_rows(&mut rows);
+                assert_eq!(rows.len(), retained.len());
+                for rowid in 0..REDUNDANT {
+                    assert!(rows.get(&(rowid as u64)).is_none());
+                }
+                for (index, state) in retained.iter().enumerate() {
+                    assert_eq!(rows.get(&((REDUNDANT + index) as u64)), Some(state));
+                }
+                Storage::evict_redundant_rows(&mut rows);
+                assert_eq!(rows.len(), retained.len());
+            }
+            let historical = storage
+                .resident_row_state(table, (REDUNDANT + 3) as u64)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                historical.visible_at(0, SNAPSHOT_ALL, 6),
+                Some(Some(RowHome::Heap(location)))
+            );
+            drop(historical);
+            let pending = storage
+                .resident_row_state(table, (REDUNDANT + 4) as u64)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                pending.visible_at(9, SNAPSHOT_ALL, u64::MAX),
+                Some(Some(RowHome::Heap(location)))
+            );
+        });
     }
 
     #[test]

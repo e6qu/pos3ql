@@ -3,13 +3,12 @@
 use core::mem::{align_of, size_of};
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
-use super::RowState;
+use super::RowEntries;
 use super::row_map::RowMap;
 use super::row_versions::{RowVersionPools, RowVersionState};
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
-use crate::mem::fixed_map::FixedMap;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
@@ -115,7 +114,7 @@ pub(super) fn acquire<'lock, Owners>(
     }
 }
 
-type RowMapWrite<'storage> = RwLockWriteGuard<'storage, FixedMap<u64, RowState>>;
+type RowMapWrite<'storage> = RwLockWriteGuard<'storage, RowEntries>;
 
 struct RowMapAttempt<'slots, 'storage> {
     slots: &'slots mut [Option<RowMapWrite<'storage>>],
@@ -148,14 +147,14 @@ pub(super) struct LockedRowMaps<'slots, 'storage> {
 }
 
 impl LockedRowMaps<'_, '_> {
-    pub(super) fn iter(&self) -> impl Iterator<Item = &FixedMap<u64, RowState>> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = &RowEntries> {
         self.owners
             .slots
             .iter()
             .map(|owner| &**owner.as_ref().expect("all row maps acquired"))
     }
 
-    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut FixedMap<u64, RowState>> {
+    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut RowEntries> {
         self.owners
             .slots
             .iter_mut()
@@ -245,6 +244,7 @@ impl HeapRowOwnership {
 mod tests {
     use super::*;
     use crate::sql::types::{ColType, Datum};
+    use crate::storage::RowState;
     use crate::storage::tests::{make_def, test_budget, test_config};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};

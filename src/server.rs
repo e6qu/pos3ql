@@ -53,7 +53,8 @@ impl CheckpointSchedule {
 
     fn observe(&mut self, beat: CheckpointBeat, now: Instant, durability_ready: &mut bool) {
         match beat {
-            CheckpointBeat::LocalFailure
+            CheckpointBeat::WaitingForOwner
+            | CheckpointBeat::LocalFailure
             | CheckpointBeat::StorageFailure
             | CheckpointBeat::DurableWithLocalFailure => {
                 self.retry_at = Some(now + Duration::from_secs(1));
@@ -3968,5 +3969,32 @@ mod tests {
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = crate::store::BLOCK_SIZE;
         assert_eq!(Server::block_read_slots(&config), 7);
+    }
+
+    #[test]
+    fn bounded_snapshot_owner_contention_retries_without_changing_readiness() {
+        use crate::sql::CheckpointBeat;
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        for initially_ready in [true, false] {
+            let mut schedule = super::CheckpointSchedule { retry_at: None };
+            let mut ready = initially_ready;
+            crate::mem::guard::forbid_alloc(|| {
+                assert!(!CheckpointBeat::WaitingForOwner.failed());
+                schedule.observe(CheckpointBeat::WaitingForOwner, now, &mut ready);
+                assert_eq!(ready, initially_ready);
+                assert!(!schedule.should_run(true, now));
+                assert_eq!(
+                    schedule.timeout(true, true, now),
+                    Some(Duration::from_secs(1))
+                );
+                assert!(schedule.should_run(true, now + Duration::from_secs(1)));
+                schedule.observe(CheckpointBeat::Advanced, now, &mut ready);
+                assert_eq!(ready, initially_ready);
+                assert!(schedule.due(now));
+                schedule.observe(CheckpointBeat::Durable, now, &mut ready);
+                assert!(ready);
+            });
+        }
     }
 }

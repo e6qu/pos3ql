@@ -154,26 +154,36 @@ changes select bytes through the retained metadata owner, including after
 heap relocation. Saved-row rereads and commit key encoding also use the
 captured byte owner. Commit publication validates the pending version and uses
 its current location if reclamation moved it. Current row versions within the
-same table remain visible to authoritative walks. History deletion holds the
-registry and shared version guards for at most 64 captured row identities at a
-time. One brief row-map read copies each table's identities before its batches
-begin. It rechecks current readers after every wait and before each batch.
-Acquisition releases earlier snapshot, version and table guards before waiting
-for a contended lock. Reads, pending writes, undo, commit and cleanup use the
-same rule. A retry acquires a fresh coherent set; data changes and callbacks
-run only after acquisition succeeds. Statement admission explicitly uses
-nonblocking cleanup: a busy workspace, registry, row map, saved-file list or
-version pool leaves the work for retry. Busy tables do not prevent cleanup of
-available tables. One retry flag in the startup workspace preserves skipped
-work separately from releases arriving during the pass; a later admission tries
-again and rechecks current readers. Explicit transaction release still waits
-for its complete cleanup. These passes still visit whole tables; this change
-does not bound total cleanup CPU time. A new report admitted between batches
-keeps the versions it needs.
+same table remain visible to authoritative walks. Lookup buckets contain row
+slot positions; a separate fixed array stores each row's state once. Deleting a
+lookup key never moves another row slot. The lookup index and row array are
+charged at startup, including the independently sized large-object page table.
 
-**User example:** starting a report does not wait for cleanup to acquire an
-unrelated table's row metadata. Once that owner releases it, a later statement
-retries cleanup; a report already reading old order values keeps those bytes.
+History cleanup retains a fixed cursor instead of copying every table's row
+identities. An ordinary server turn visits at most 64 stable slots; an empty or
+busy table consumes one work unit. Work continues between messages, while idle,
+and during an unrelated download, including without object storage enabled.
+Each batch rechecks current readers under registry, saved-file, version and row
+owners. A busy owner is skipped without retaining earlier guards. The server
+uses its existing one-second retry cadence for unfinished contention and keeps
+storage readiness unchanged. Lookup shifts, removal and table clearing cannot
+move unvisited row cells; new releases remain queued independently of the pass.
+The slot quota counts metadata visits, not elapsed time: a row's bounded version
+chain and lookup-index deletion are part of that slot's work.
+
+Starting a statement does no history sweep. Normal commit and rollback release
+retention immediately and schedule maintenance. Callers that require
+complete reclamation select synchronous completion explicitly. Row publication
+sets a conservative pressure signal; a completed pass clears it only if no
+publisher changed an earlier row during the pass. Checking pressure needs no
+row scan. Before a row write, readers at or after its current committed version
+do not keep an obsolete earlier boundary, avoiding a false one-version capacity
+error while cleanup is pending. Older reports still retain the versions they need.
+
+**User example:** ending a report queues cleanup instead of walking a large
+orders table before the next query can start. Later turns release small batches
+while another customer reads or updates an order. A report already using an old
+total keeps those bytes even after its metadata is reclaimed.
 
 Pending table definitions retain their table and one reserved version slot.
 A reader releases the pool's allocation control before returning the definition;

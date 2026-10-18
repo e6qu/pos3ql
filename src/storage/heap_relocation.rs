@@ -26,7 +26,7 @@ fn visit_heap_locations<Rows>(
     mut visit: impl FnMut(RowLoc) -> Result<(), SqlError>,
 ) -> Result<(), SqlError>
 where
-    Rows: Deref<Target = FixedMap<u64, RowState>>,
+    Rows: Deref<Target = RowEntries>,
 {
     for rows in maps {
         for (_, state) in rows.iter() {
@@ -78,7 +78,7 @@ impl<'scratch> RelocationPlan<'scratch> {
         entries: &'scratch mut FixedVec<HeapRelocationEntry>,
     ) -> Result<Self, SqlError>
     where
-        Rows: Deref<Target = FixedMap<u64, RowState>>,
+        Rows: Deref<Target = RowEntries>,
     {
         entries.clear();
         visit_heap_locations(maps, versions, |source| {
@@ -197,7 +197,7 @@ impl<'scratch> RelocationPlan<'scratch> {
         tail: Option<(usize, usize)>,
     ) -> Result<(), SqlError>
     where
-        Rows: Deref<Target = FixedMap<u64, RowState>>,
+        Rows: Deref<Target = RowEntries>,
     {
         visit_heap_locations(maps, versions, |source| {
             self.relocated(source, generation, tail).map(|_| ())
@@ -226,7 +226,7 @@ impl<'scratch> RelocationPlan<'scratch> {
         generation: u64,
         tail: Option<(usize, usize)>,
     ) where
-        Rows: DerefMut<Target = FixedMap<u64, RowState>>,
+        Rows: DerefMut<Target = RowEntries>,
     {
         let relocate = |location| {
             self.relocated(location, generation, tail)

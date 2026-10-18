@@ -413,10 +413,13 @@ impl Storage {
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
         });
+        // Readers at or after the current image need no earlier boundary.
+        let retained =
+            oldest.filter(|snapshot| state.committed_lsn == 0 || *snapshot < state.committed_lsn);
         prune_committed_history(
             &mut versions.committed_row_versions,
             &mut state.history,
-            oldest,
+            retained,
         );
         // Pruning releases slots, so publish its chain handles even if a later
         // capacity check fails. Readers can never traverse a released chain.
@@ -466,7 +469,7 @@ impl Storage {
 
     fn restore_pending_locked(
         versions: &mut RowVersionState,
-        rows: &mut FixedMap<u64, RowState>,
+        rows: &mut RowEntries,
         rowid: u64,
         txid: u32,
         undo: PendingWriteUndo,
@@ -493,7 +496,7 @@ impl Storage {
         }
     }
 
-    pub(super) fn evict_redundant_rows(rows: &mut FixedMap<u64, RowState>) {
+    pub(super) fn evict_redundant_rows(rows: &mut RowEntries) {
         rows.retain(|_, state| !Self::redundant_spilled_row_state(state));
     }
 }

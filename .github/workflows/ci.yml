@@ -29,6 +29,8 @@ jobs:
         run: cargo miri test --lib --locked shared_heap_relocation_heap_ -- --test-threads=1
       - name: Heap row-map ownership and lock release
         run: cargo miri test --lib --locked row_lock_owners_heap_ -- --test-threads=1
+      - name: Stable row slots and bounded iteration
+        run: cargo miri test --lib --locked stable_row_slots_ -- --test-threads=1
       - name: Resumable heap copy ownership
         run: cargo miri test --lib --locked sliced_heap_cleanup_heap_ -- --test-threads=1
       - name: Statement file ownership

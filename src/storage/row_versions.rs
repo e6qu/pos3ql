@@ -63,10 +63,12 @@ impl<T> IndexMut<usize> for RowVersionPool<T> {
 pub(super) struct RowVersionState {
     pub(super) pending_row_versions: RowVersionPool<PendingVersionSlot>,
     pub(super) committed_row_versions: RowVersionPool<CommittedVersionSlot>,
+    pub(super) history_pressure_changed: bool,
 }
 
 pub(super) struct RowVersionPools {
     state: RwLock<RowVersionState>,
+    pub(super) history_pressure: std::sync::atomic::AtomicBool,
     pub(super) metadata: std::sync::Arc<super::row_reads::RowMetadataPool>,
 }
 
@@ -82,6 +84,7 @@ impl RowVersionPools {
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         budget.draw(Self::control_bytes(), "row-version pool controls")?;
         Ok(Self {
+            history_pressure: std::sync::atomic::AtomicBool::new(false),
             metadata: super::row_reads::RowMetadataPool::new(config, budget)?,
             state: RwLock::new(RowVersionState {
                 pending_row_versions: RowVersionPool::new(
@@ -94,6 +97,7 @@ impl RowVersionPools {
                     "committed_row_versions",
                     committed_row_version_capacity(config),
                 )?,
+                history_pressure_changed: false,
             }),
         })
     }
@@ -452,12 +456,14 @@ mod tests {
                 + RowVersionPools::metadata_budget_bytes(&config),
         );
         RowVersionPools {
+            history_pressure: std::sync::atomic::AtomicBool::new(false),
             metadata: super::super::row_reads::RowMetadataPool::new(&config, &mut budget).unwrap(),
             state: RwLock::new(RowVersionState {
                 pending_row_versions: RowVersionPool::new(&mut budget, "test pending", capacity)
                     .unwrap(),
                 committed_row_versions: RowVersionPool::new(&mut budget, "test history", capacity)
                     .unwrap(),
+                history_pressure_changed: false,
             }),
         }
     }

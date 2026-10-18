@@ -363,13 +363,15 @@ DROP TYPE defaults_moved.default_state;
 DROP SCHEMA defaults_moved;
 
 
-CREATE TYPE "QuotedState" AS ENUM ('old', 'ready');
+CREATE TYPE "QuotedState" AS ENUM ('old', 'ready', '*/%é');
 CREATE DOMAIN "QuotedValue" AS "QuotedState" DEFAULT 'old'::"QuotedState";
-CREATE TABLE quoted_rows(value "QuotedValue");
+CREATE DOMAIN "QuotedOdd" AS "QuotedState" DEFAULT '*/%é'::"QuotedState";
+CREATE TABLE quoted_rows(value "QuotedValue", odd "QuotedOdd");
 ALTER TYPE "QuotedState" RENAME VALUE 'old' TO 'new';
 INSERT INTO quoted_rows DEFAULT VALUES;
-SELECT value::text, pg_typeof(value)::text FROM quoted_rows;
-SELECT typdefault FROM pg_type WHERE typname = 'QuotedValue';
+SELECT value::text, pg_typeof(value)::text, odd::text FROM quoted_rows;
+SELECT typdefault FROM pg_type WHERE typname IN ('QuotedValue','QuotedOdd') ORDER BY typname;
 DROP TABLE quoted_rows;
 DROP DOMAIN "QuotedValue";
+DROP DOMAIN "QuotedOdd";
 DROP TYPE "QuotedState";

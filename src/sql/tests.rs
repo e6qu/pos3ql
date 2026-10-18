@@ -52545,12 +52545,12 @@ fn enum_value_identity_private_markers_and_invalid_bindings_are_checked() {
             "XX000",
         ),
         (
-            "pos3ql-enum-check-v1\n/*p3o:ff*/\n/*p3c:0*/'old'",
+            "pos3ql-enum-check-v1\n/*p3o:%ff*/\n/*p3c:0*/'old'",
             ColType::Enum(slot as u16),
             "XX000",
         ),
         (
-            "pos3ql-enum-check-v1\n/*p3o:0*/\n/*p3c:0*/'old'",
+            "pos3ql-enum-check-v1\n/*p3o:%0*/\n/*p3c:0*/'old'",
             ColType::Enum(slot as u16),
             "XX000",
         ),
@@ -86000,9 +86000,10 @@ fn enum_value_identity_quoted_default_names_keep_catalog_spelling() {
     session.success(
         &mut engine,
         r#"
-        CREATE TYPE "QuotedState" AS ENUM ('old', 'ready');
+        CREATE TYPE "QuotedState" AS ENUM ('old', 'ready', '*/%é');
         CREATE DOMAIN "QuotedValue" AS "QuotedState" DEFAULT 'old'::"QuotedState";
-        CREATE TABLE quoted_rows(value "QuotedValue");
+        CREATE DOMAIN "QuotedOdd" AS "QuotedState" DEFAULT '*/%é'::"QuotedState";
+        CREATE TABLE quoted_rows(value "QuotedValue", odd "QuotedOdd");
         ALTER TYPE "QuotedState" RENAME VALUE 'old' TO 'new';
         INSERT INTO quoted_rows DEFAULT VALUES"#,
         true,
@@ -86010,10 +86011,10 @@ fn enum_value_identity_quoted_default_names_keep_catalog_spelling() {
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
-            "SELECT value::text, pg_typeof(value)::text FROM quoted_rows",
+            "SELECT value::text, pg_typeof(value)::text, odd::text FROM quoted_rows",
             true
         )),
-        [r#"new|"QuotedValue""#]
+        [r#"new|"QuotedValue"|*/%é"#]
     );
     assert_eq!(
         data_rows(&session.success(
@@ -86022,5 +86023,13 @@ fn enum_value_identity_quoted_default_names_keep_catalog_spelling() {
             true
         )),
         [r#"'old'::"QuotedState""#]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT typdefault FROM pg_type WHERE typname = 'QuotedOdd'",
+            true
+        )),
+        [r#"'*/%é'::"QuotedState""#]
     );
 }

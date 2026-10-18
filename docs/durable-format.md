@@ -180,8 +180,9 @@ Domain CHECK and stored DEFAULT SQL against an enum or enum-array base use `pos3
 text array of base member ordinals, and `/*p3t:N*/` binds N tokens of an explicit
 cast type name to the domain's selected base enum. Ordinary text is unbound.
 Rendering removes the grammar and resolves current labels and type names.
-Defaults also retain their definition-time display text as UTF-8 hex in
-`/*p3o:HEX*/` immediately after the header. The comment stays unchanged through
+Defaults also retain their original display text as UTF-8 in
+`/*p3o:TEXT*/` immediately after the header. Percent and slash bytes use percent escapes
+so text cannot terminate the comment. The comment stays unchanged through
 schema rewrites. `pg_type.typdefault` and `information_schema.domains.domain_default` expose this
 original text. Execution and column/view default descriptions resolve the captured members.
 Domain definitions with bound checks, defaults or named array bases use journal kind 151;

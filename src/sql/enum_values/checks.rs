@@ -55,8 +55,12 @@ pub(crate) fn bind_default<const N: usize>(
     let mut stored = StackStr::<N>::new();
     stored.write_str(HEADER).map_err(|_| full::<N>())?;
     stored.write_str("/*p3o:").map_err(|_| full::<N>())?;
-    for byte in display.bytes() {
-        write!(stored, "{byte:02x}").map_err(|_| full::<N>())?;
+    for character in display.chars() {
+        if matches!(character, '/' | '%') {
+            write!(stored, "%{:02x}", character as u8).map_err(|_| full::<N>())?;
+        } else {
+            stored.write_char(character).map_err(|_| full::<N>())?;
+        }
     }
     stored.write_str("*/\n").map_err(|_| full::<N>())?;
     stored
@@ -465,14 +469,26 @@ fn decode_display<'a>(
     encoded: &str,
     bytes: &'a mut [u8; crate::storage::DEFAULT_EXPR_MAX],
 ) -> Result<&'a str, SqlError> {
-    let length = encoded.len() / 2;
-    if encoded.is_empty() || encoded.len() % 2 != 0 || length > bytes.len() {
+    if encoded.is_empty() {
         return Err(corrupt());
     }
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
-        let high = (pair[0] as char).to_digit(16).ok_or_else(corrupt)?;
-        let low = (pair[1] as char).to_digit(16).ok_or_else(corrupt)?;
-        bytes[index] = (high * 16 + low) as u8;
+    let encoded = encoded.as_bytes();
+    let mut input = 0;
+    let mut length = 0;
+    while input < encoded.len() {
+        let byte = if encoded[input] == b'%' {
+            let pair = encoded.get(input + 1..input + 3).ok_or_else(corrupt)?;
+            let high = (pair[0] as char).to_digit(16).ok_or_else(corrupt)?;
+            let low = (pair[1] as char).to_digit(16).ok_or_else(corrupt)?;
+            input += 3;
+            (high * 16 + low) as u8
+        } else {
+            let byte = encoded[input];
+            input += 1;
+            byte
+        };
+        *bytes.get_mut(length).ok_or_else(corrupt)? = byte;
+        length += 1;
     }
     let text = core::str::from_utf8(&bytes[..length]).map_err(|_| corrupt())?;
     if text.contains('\0') {

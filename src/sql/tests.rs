@@ -12358,6 +12358,7 @@ fn run_with_fixed_memory_and_ddl_capacity(
 }
 
 struct ConfiguredTransactionSession {
+    connection_id: i32,
     send: crate::mem::FixedBuf,
     arena: Arena,
     transaction: TxnState,
@@ -12373,6 +12374,7 @@ impl ConfiguredTransactionSession {
 
     fn with_arena_bytes(config: &Config, budget: &mut Budget, arena_bytes: usize) -> Self {
         Self {
+            connection_id: 1,
             send: crate::mem::FixedBuf::new(budget, "configured transaction send", 4 << 20)
                 .unwrap(),
             arena: Arena::new(budget, "configured transaction arena", arena_bytes).unwrap(),
@@ -12388,6 +12390,11 @@ impl ConfiguredTransactionSession {
         }
     }
 
+    fn with_connection_id(mut self, connection_id: i32) -> Self {
+        self.connection_id = connection_id;
+        self
+    }
+
     fn execute(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
         self.send.clear();
         self.arena.reset();
@@ -12401,7 +12408,7 @@ impl ConfiguredTransactionSession {
                 &mut self.cursors,
                 &mut self.guc,
                 &mut responder,
-                1,
+                self.connection_id,
             )
         };
         if fixed_memory {
@@ -51833,8 +51840,8 @@ fn enum_value_identity_old_snapshot_uses_renamed_catalog_label() {
     let config = test_config("enum-old-snapshot-label");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
-    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(41);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(73);
     writer.success(
         &mut engine,
         "CREATE TYPE enum_snapshot_state AS ENUM ('old', 'ready'); \
@@ -51847,11 +51854,12 @@ fn enum_value_identity_old_snapshot_uses_renamed_catalog_label() {
         "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM enum_snapshot_orders",
         true,
     );
-    writer.success(
+    let renamed = writer.success(
         &mut engine,
         "ALTER TYPE enum_snapshot_state RENAME VALUE 'old' TO 'new'",
         true,
     );
+    assert!(message_types(&renamed).contains(&b'C'));
     assert_eq!(
         data_rows(&reader.success(
             &mut engine,
@@ -51894,8 +51902,8 @@ fn enum_value_identity_old_snapshot_uses_current_order_after_renumbering() {
     let config = test_config("enum-old-snapshot-order");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
-    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(41);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(73);
     writer.success(
         &mut engine,
         "CREATE TYPE enum_identity_order AS ENUM ('low', 'high'); \
@@ -51909,11 +51917,12 @@ fn enum_value_identity_old_snapshot_uses_current_order_after_renumbering() {
         true,
     );
     for index in 0..30 {
-        writer.success(
+        let altered = writer.success(
             &mut engine,
             &format!("ALTER TYPE enum_identity_order ADD VALUE 'middle_{index}' BEFORE 'high'"),
             true,
         );
+        assert!(message_types(&altered).contains(&b'C'));
     }
     assert_eq!(
         data_rows(&reader.success(

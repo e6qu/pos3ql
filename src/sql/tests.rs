@@ -70908,9 +70908,15 @@ fn repeatable_read_retains_committed_row_history() {
         .storage
         .find_table("public", "snapshot_rows")
         .unwrap();
+    assert!(engine.storage.history_cleanup_pending());
+    assert!(
+        !engine.storage.table(table).rows.is_empty(),
+        "ordinary queries must leave released delete markers to maintenance"
+    );
+    assert_eq!(engine.checkpoint_beat(), super::CheckpointBeat::Advanced);
     assert!(
         engine.storage.table(table).rows.is_empty(),
-        "the final snapshot release must reclaim a non-spilled delete marker"
+        "maintenance after the final snapshot release must reclaim non-spilled delete markers"
     );
 }
 

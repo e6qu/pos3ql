@@ -3472,7 +3472,7 @@ mod tests {
                 retained.is_empty(),
                 "failed capture must release files already registered"
             );
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             let scan = storage.captured_row_scan_in(table, 0, &arena).unwrap();
             let nested = storage.captured_row_scan_in(table, 0, &arena).unwrap();
             let mut count = 0;

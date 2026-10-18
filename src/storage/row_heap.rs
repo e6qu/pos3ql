@@ -426,8 +426,19 @@ impl RowHeap {
             .map(|state| state.get_mut().expect("row heap lock poisoned"))
     }
 
+    /// Appending may acquire the locks while initialized bytes remain retained.
     #[cfg(test)]
-    pub(super) fn test_write(
+    pub(super) fn test_append_locks_available(&self) -> bool {
+        self.publication.try_read().is_ok_and(|publication| {
+            self.buffers[usize::from(publication.second_active)]
+                .try_write()
+                .is_ok()
+        })
+    }
+
+    /// Exclusive buffer access requires every retained byte owner to be released.
+    #[cfg(test)]
+    pub(super) fn test_exclusive_write(
         &self,
     ) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, RowHeapState>> {
         let publication = match self.publication.try_read() {
@@ -468,6 +479,33 @@ impl RowHeap {
     }
 }
 
+#[derive(Default)]
+pub(super) struct RelocationValidation {
+    prior: Option<RowLoc>,
+}
+
+impl RelocationValidation {
+    fn validate(&mut self, state: &RowHeapState, location: RowLoc) -> Result<(), SqlError> {
+        state.validate(location)?;
+        if location.len == 0 {
+            return Ok(());
+        }
+        if let Some(previous) = self.prior {
+            if previous == location {
+                return Ok(());
+            }
+            if (location.offset as usize) < previous.offset as usize + previous.len as usize {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "heap compaction contains overlapping row locations"
+                ));
+            }
+        }
+        self.prior = Some(location);
+        Ok(())
+    }
+}
+
 /// Only the inactive, unretained buffer is mutable during a private copy.
 pub(super) struct HeapCopy {
     publication: Arc<RwLock<HeapPublication>>,
@@ -501,15 +539,13 @@ impl HeapCopy {
             .load(Ordering::Acquire)
     }
 
-    pub(super) fn validate_locations(
+    pub(super) fn validate_location(
         &self,
-        locations: impl Iterator<Item = RowLoc>,
+        validation: &mut RelocationValidation,
+        location: RowLoc,
     ) -> Result<(), SqlError> {
-        self.source
-            .state
-            .read()
-            .expect("row heap lock poisoned")
-            .validate_relocation(locations)
+        let state = self.source.state.read().expect("row heap lock poisoned");
+        validation.validate(&state, location)
     }
 
     pub(super) fn copy_bytes(
@@ -751,24 +787,9 @@ impl RowHeapState {
         &self,
         locations: impl Iterator<Item = RowLoc>,
     ) -> Result<(), SqlError> {
-        let mut prior: Option<RowLoc> = None;
+        let mut validation = RelocationValidation::default();
         for location in locations {
-            self.validate(location)?;
-            if location.len == 0 {
-                continue;
-            }
-            if let Some(previous) = prior {
-                if previous == location {
-                    continue;
-                }
-                if (location.offset as usize) < previous.offset as usize + previous.len as usize {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "heap compaction contains overlapping row locations"
-                    ));
-                }
-            }
-            prior = Some(location);
+            validation.validate(self, location)?;
         }
         Ok(())
     }
@@ -869,7 +890,7 @@ mod tests {
             heap.append_bytes(b"dead").unwrap();
             let old = heap.append_image(b"keep").unwrap();
             let mut copy = heap.begin_copy().unwrap();
-            copy.validate_locations(core::iter::once(old.location()))
+            copy.validate_location(&mut RelocationValidation::default(), old.location())
                 .unwrap();
             copy.copy_bytes(old.location(), 0, 0, 4).unwrap();
             let late = heap.append_image(b"next").unwrap();
@@ -938,7 +959,7 @@ mod tests {
                     .relocation_frontier
                     .is_none()
             );
-            assert!(heap.test_write().is_ok());
+            assert!(heap.test_exclusive_write().is_ok());
         });
     }
 
@@ -1128,15 +1149,15 @@ mod tests {
         bytes.copy_from_slice(b"abcd");
         crate::mem::guard::forbid_alloc(|| {
             let read = heap.get(location).unwrap();
-            assert!(heap.test_write().is_err());
+            assert!(heap.test_exclusive_write().is_err());
             assert_eq!(&*read, b"abcd");
             assert_eq!(read.other(location).unwrap(), b"abcd");
             assert!(read.other(RowLoc::test(3, 2)).is_err());
             drop(read);
-            assert!(heap.test_write().is_ok());
+            assert!(heap.test_exclusive_write().is_ok());
             assert!(heap.get(RowLoc::test(u32::MAX, u32::MAX)).is_err());
             assert!(heap.get(RowLoc::test(4, 1)).is_err());
-            assert!(heap.test_write().is_ok());
+            assert!(heap.test_exclusive_write().is_ok());
             assert_eq!(heap.used(), 4);
             assert_eq!(heap.capacity(), 8);
         });
@@ -1248,7 +1269,7 @@ mod tests {
                 sqlstate::SERIALIZATION_FAILURE
             );
             drop(read);
-            assert!(heap.test_write().is_ok());
+            assert!(heap.test_exclusive_write().is_ok());
         });
     }
 
@@ -1303,7 +1324,7 @@ mod tests {
             start.wait();
             crate::mem::guard::forbid_alloc(|| {
                 let mut state = loop {
-                    if let Ok(state) = heap.test_write() {
+                    if let Ok(state) = heap.test_exclusive_write() {
                         break state;
                     }
                     std::thread::yield_now();
@@ -1317,7 +1338,7 @@ mod tests {
             });
         });
         assert!(heap.get(old).is_err());
-        assert!(heap.test_write().is_ok());
+        assert!(heap.test_exclusive_write().is_ok());
     }
 
     #[test]
@@ -1346,7 +1367,7 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 for epoch in 1u64..=500 {
                     loop {
-                        if let Ok(mut writer) = heap.test_write() {
+                        if let Ok(mut writer) = heap.test_exclusive_write() {
                             writer.buffer.get_mut()[..8].copy_from_slice(&epoch.to_le_bytes());
                             break;
                         }

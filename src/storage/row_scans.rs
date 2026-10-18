@@ -516,7 +516,7 @@ mod tests {
             assert_eq!(storage.read_snapshot(), 1);
             assert_eq!(storage.commit_snapshot(), 7);
             assert_eq!(storage.table_statistics(table, 0).valid, before.valid);
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             let outer = storage.analyze_snapshot();
             assert_eq!(storage.read_snapshot(), super::super::SNAPSHOT_ALL);
             assert_eq!(storage.commit_snapshot(), 11);
@@ -577,7 +577,7 @@ mod tests {
             crate::sql::query::disarm_timeout();
             assert_eq!(error.sqlstate, sqlstate::QUERY_CANCELED);
             assert_eq!(arena.used(), 0);
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             let scan = storage.captured_row_scan_in(table, 0, &arena).unwrap();
             let mut count = 0;
             let error = scan
@@ -594,7 +594,7 @@ mod tests {
             assert!(storage.row_versions.test_write().is_ok());
             assert!(storage.tables[table].rows.test_write().is_ok());
             drop(scan);
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             let retry = storage.captured_row_scan_in(table, 0, &arena).unwrap();
             let mut count = 0;
             assert!(
@@ -608,7 +608,7 @@ mod tests {
             );
             assert_eq!(count, 2);
             drop(retry);
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             storage.set_commit_snapshot(old_commit);
         });
     }
@@ -648,7 +648,7 @@ mod tests {
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             let scan = storage.captured_row_scan_in(table, 0, &arena).unwrap();
             let nested = storage.captured_row_scan_in(table, 0, &arena).unwrap();
             let mut count = 0;
@@ -679,11 +679,11 @@ mod tests {
             );
             drop(scan);
             assert!(
-                storage.heap.test_write().is_err(),
+                storage.heap.test_exclusive_write().is_err(),
                 "nested scan still retains its heap"
             );
             drop(nested);
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             storage.set_commit_snapshot(old_commit);
         });
     }

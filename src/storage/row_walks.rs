@@ -1106,7 +1106,7 @@ mod tests {
             let mut each = |entry: super::super::CheckpointValueEntry<'_>| {
                 assert!(storage.tables[table].rows.test_write().is_ok());
                 assert!(storage.row_versions.test_write().is_ok());
-                assert!(storage.heap.test_write().is_ok());
+                assert!(storage.heap.test_exclusive_write().is_ok());
                 assert_eq!(entry.commit_lsn, 7);
                 let mut values = [Datum::Null];
                 super::super::rowenc::decode(entry.key, &[ColType::Int4], &mut values)?;
@@ -1255,7 +1255,7 @@ mod tests {
             assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
             assert!(storage.tables[table].rows.test_write().is_ok());
             assert!(storage.row_versions.test_write().is_ok());
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             cursor.reset();
             changed.clear();
             let mut count = 0;
@@ -1401,14 +1401,14 @@ mod tests {
                     storage.restore_pending(table, rowid, 7, undo);
                     assert_eq!(change.loc, Some(location));
                     assert!(storage.resident_row_state(table, rowid).unwrap().is_none());
-                    assert!(storage.heap.test_write().is_err());
+                    assert!(storage.heap.test_exclusive_write().is_err());
                     storage.with_row_bytes(table, rowid, image.unwrap(), |bytes| {
                         let mut values = [Datum::Null];
                         super::super::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
                         assert_eq!(values[0], Datum::Int4(2));
                         Ok(())
                     })?;
-                    assert!(storage.heap.test_write().is_ok());
+                    assert!(storage.heap.test_exclusive_write().is_ok());
                     count += 1;
                     Ok(core::ops::ControlFlow::Continue(()))
                 })
@@ -1432,7 +1432,7 @@ mod tests {
                 .unwrap();
             assert!(storage.row_versions.test_write().is_ok());
             assert!(storage.tables[table].rows.test_write().is_ok());
-            assert!(storage.heap.test_write().is_err());
+            assert!(storage.heap.test_exclusive_write().is_err());
             storage.restore_pending(table, 1, 7, undo);
             storage
                 .with_row_bytes(table, 1, image, |bytes| {
@@ -1442,7 +1442,7 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
         });
     }
 
@@ -1850,7 +1850,7 @@ mod tests {
                 .for_each_pending_row_change(table, &mut |rowid, change, image| {
                     assert_eq!(rowid, 1);
                     assert!(change.loc.is_none() && image.is_none());
-                    assert!(storage.heap.test_write().is_ok());
+                    assert!(storage.heap.test_exclusive_write().is_ok());
                     assert_eq!(storage.read_snapshot(), 0);
                     assert_eq!(storage.commit_snapshot(), 0);
                     deleted += 1;

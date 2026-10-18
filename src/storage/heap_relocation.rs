@@ -1,8 +1,11 @@
-//! Bounded heap copy plans; row versions coordinate capture and publication.
+//! Bounded heap preparation and copying; row versions coordinate publication.
 
 use core::num::NonZeroUsize;
 
-use super::row_heap::HeapCopy;
+mod sort;
+use sort::RelocationSort;
+
+use super::row_heap::{HeapCopy, RelocationValidation};
 use super::row_versions::RowVersionState;
 use super::*;
 use crate::mem::fixed_vec::FixedVec;
@@ -209,8 +212,18 @@ pub(crate) struct HeapRelocationJob<'storage, 'scratch> {
     progress: HeapRelocationProgress,
 }
 
+enum HeapRelocationPreparation {
+    Sorting(RelocationSort),
+    Packing {
+        entry: usize,
+        validation: RelocationValidation,
+    },
+    Ready,
+}
+
 struct HeapRelocationProgress {
     copy: HeapCopy,
+    preparation: HeapRelocationPreparation,
     packed_bytes: usize,
     entry: usize,
     entry_at: usize,
@@ -223,6 +236,65 @@ pub(crate) enum HeapRelocationPublication<'storage, 'scratch> {
 }
 
 impl HeapRelocationProgress {
+    fn prepare_step(
+        &mut self,
+        entries: &mut FixedVec<HeapRelocationEntry>,
+        remaining: &mut usize,
+    ) -> Result<bool, SqlError> {
+        loop {
+            match &mut self.preparation {
+                HeapRelocationPreparation::Sorting(sort) => {
+                    if !sort.step(entries.as_mut_slice(), remaining) {
+                        return Ok(false);
+                    }
+                    self.preparation = HeapRelocationPreparation::Packing {
+                        entry: 0,
+                        validation: RelocationValidation::default(),
+                    };
+                }
+                HeapRelocationPreparation::Packing { entry, validation } => {
+                    while *entry < entries.len() && *remaining != 0 {
+                        let source = entries[*entry].source;
+                        self.copy.validate_location(validation, source)?;
+                        if (source.offset as usize)
+                            .checked_add(source.len as usize)
+                            .is_none_or(|end| end > self.copy.frontier())
+                        {
+                            return Err(sql_err!(
+                                sqlstate::SERIALIZATION_FAILURE,
+                                "heap relocation row exceeds its captured prefix"
+                            ));
+                        }
+                        let destination = if *entry == 0 || entries[*entry - 1].source != source {
+                            let destination = self.packed_bytes;
+                            self.packed_bytes = self
+                                .packed_bytes
+                                .checked_add(source.len as usize)
+                                .filter(|&bytes| bytes <= u32::MAX as usize)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "heap relocation address range exhausted"
+                                    )
+                                })?;
+                            destination as u32
+                        } else {
+                            entries[*entry - 1].destination
+                        };
+                        entries[*entry].destination = destination;
+                        *entry += 1;
+                        *remaining -= 1;
+                    }
+                    if *entry != entries.len() {
+                        return Ok(false);
+                    }
+                    self.preparation = HeapRelocationPreparation::Ready;
+                }
+                HeapRelocationPreparation::Ready => return Ok(true),
+            }
+        }
+    }
+
     /// Work is bounded by bytes and by zero-length or aliased entry visits.
     fn copy_step(
         &mut self,
@@ -283,7 +355,9 @@ impl HeapRelocationProgress {
                 "heap relocation belongs to another storage instance"
             ));
         }
-        if self.entry != entries.len() {
+        if !matches!(self.preparation, HeapRelocationPreparation::Ready)
+            || self.entry != entries.len()
+        {
             return Ok(false);
         }
         let plan = RelocationPlan {
@@ -321,7 +395,7 @@ impl<'storage, 'scratch> HeapRelocationJob<'storage, 'scratch> {
     }
 }
 
-/// Owns the startup scratch and copy controls across independent server turns.
+/// Owns startup scratch and preparation/copy controls across server turns.
 pub(crate) struct HeapRelocationWorkspace {
     entries: FixedVec<HeapRelocationEntry>,
     progress: Option<HeapRelocationProgress>,
@@ -370,7 +444,14 @@ impl HeapRelocationWorkspace {
                     "heap relocation belongs to another storage instance"
                 ));
             }
-            if !progress.copy_step(&self.entries, budget)? {
+            let mut remaining = budget.get();
+            if !progress.prepare_step(&mut self.entries, &mut remaining)? {
+                return Ok(false);
+            }
+            let Some(copy_budget) = NonZeroUsize::new(remaining) else {
+                return Ok(false);
+            };
+            if !progress.copy_step(&self.entries, copy_budget)? {
                 return Ok(false);
             }
             progress.try_publish(storage, &mut self.entries)
@@ -414,7 +495,13 @@ impl Storage {
         &'storage self,
         entries: &'scratch mut FixedVec<HeapRelocationEntry>,
     ) -> Result<HeapRelocationJob<'storage, 'scratch>, SqlError> {
-        let progress = self.capture_heap_relocation(entries)?;
+        let mut progress = self.capture_heap_relocation(entries)?;
+        loop {
+            let mut remaining = usize::MAX;
+            if progress.prepare_step(entries, &mut remaining)? {
+                break;
+            }
+        }
         Ok(HeapRelocationJob {
             storage: self,
             entries,
@@ -426,28 +513,16 @@ impl Storage {
         &self,
         entries: &mut FixedVec<HeapRelocationEntry>,
     ) -> Result<HeapRelocationProgress, SqlError> {
-        let (copy, mut plan) = {
+        let copy = {
             let versions = self.row_versions.write();
             let copy = self.heap.begin_copy()?;
-            let plan = RelocationPlan::capture(&self.tables, &versions, entries)?;
-            (copy, plan)
+            RelocationPlan::capture(&self.tables, &versions, entries)?;
+            copy
         };
-        plan.sort();
-        copy.validate_locations(plan.entries.iter().map(|entry| entry.source))?;
-        if plan
-            .entries
-            .iter()
-            .any(|entry| entry.source.offset as usize + entry.source.len as usize > copy.frontier())
-        {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "heap relocation row exceeds its captured prefix"
-            ));
-        }
-        plan.pack()?;
         Ok(HeapRelocationProgress {
             copy,
-            packed_bytes: plan.packed_bytes,
+            preparation: HeapRelocationPreparation::Sorting(RelocationSort::new(entries.len())),
+            packed_bytes: 0,
             entry: 0,
             entry_at: 0,
             copied_tail: 0,
@@ -661,6 +736,176 @@ mod tests {
                     .is_empty()
             );
             storage.release_snapshot(99);
+        });
+    }
+
+    fn add_preparation_rows(storage: &mut Storage, table: usize) {
+        for rowid in 2..=64 {
+            let source = storage
+                .heap
+                .append_row(&[Datum::Int4(rowid as i32), Datum::Text("kept")])
+                .unwrap();
+            storage.tables[table]
+                .rows
+                .insert(rowid, RowState::committed_only_at(source, 7))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn sliced_heap_preparation_reads_and_late_writes_progress_between_sort_turns() {
+        let (mut storage, table, original) = fixture();
+        let other = storage
+            .create_table(make_def(
+                "during_preparation",
+                &[("id", ColType::Int4, false), ("note", ColType::Text, true)],
+            ))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| add_preparation_rows(&mut storage, table));
+        let retained = storage.heap.get(original).unwrap();
+        let mut workspace = workspace(128);
+        crate::mem::guard::forbid_alloc(|| {
+            workspace.begin(&storage).unwrap();
+            assert!(!workspace.step(&storage, NonZeroUsize::MIN).unwrap());
+            assert!(matches!(
+                workspace.progress.as_ref().unwrap().preparation,
+                HeapRelocationPreparation::Sorting(_)
+            ));
+            assert!(storage.row_versions.test_write().is_ok());
+            assert!(matches!(
+                storage.heap.test_exclusive_write(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            assert!(storage.heap.test_append_locks_available());
+        });
+        let undo = std::thread::scope(|scope| {
+            let storage = &storage;
+            scope
+                .spawn(move || {
+                    crate::mem::guard::forbid_alloc(|| {
+                        assert_row(storage, table, 1, 0, 7, 10, "old");
+                        let image = storage
+                            .heap
+                            .append_row_image(&[Datum::Int4(91), Datum::Text("late")])
+                            .unwrap();
+                        storage
+                            .write_pending_image_untracked(other, 1, 77, 1, Some(image))
+                            .unwrap()
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            let mut finished = false;
+            for _ in 0..4096 {
+                if workspace
+                    .step(&storage, NonZeroUsize::new(5).unwrap())
+                    .unwrap()
+                {
+                    finished = true;
+                    break;
+                }
+                assert_row(&storage, table, 1, 0, 7, 10, "old");
+            }
+            assert!(finished, "preparation did not make bounded progress");
+            for rowid in 2..=64 {
+                assert_row(&storage, table, rowid, 0, 7, rowid as i32, "kept");
+            }
+            assert_row(&storage, other, 1, 77, u64::MAX, 91, "late");
+            let mut values = [Datum::Null; 2];
+            rowenc::decode(&retained, &[ColType::Int4, ColType::Text], &mut values).unwrap();
+            assert_eq!(values, [Datum::Int4(10), Datum::Text("old")]);
+            storage.restore_pending(other, 1, 77, undo);
+        });
+    }
+
+    #[test]
+    fn sliced_heap_preparation_cancellation_releases_sorting_buffers() {
+        let (mut storage, table, original) = fixture();
+        crate::mem::guard::forbid_alloc(|| add_preparation_rows(&mut storage, table));
+        let retained = storage.heap.get(original).unwrap();
+        let mut first = workspace(128);
+        let mut second = workspace(128);
+        crate::mem::guard::forbid_alloc(|| {
+            first.begin(&storage).unwrap();
+            assert!(!first.step(&storage, NonZeroUsize::MIN).unwrap());
+            assert!(matches!(
+                first.progress.as_ref().unwrap().preparation,
+                HeapRelocationPreparation::Sorting(_)
+            ));
+            drop(first);
+            second.begin(&storage).unwrap();
+            while !second
+                .step(&storage, NonZeroUsize::new(7).unwrap())
+                .unwrap()
+            {}
+            assert!(!second.active());
+            assert_row(&storage, table, 1, 0, 7, 10, "old");
+            let mut values = [Datum::Null; 2];
+            rowenc::decode(&retained, &[ColType::Int4, ColType::Text], &mut values).unwrap();
+            assert_eq!(values, [Datum::Int4(10), Datum::Text("old")]);
+        });
+    }
+
+    #[test]
+    fn sliced_heap_preparation_overlap_across_zero_entries_releases_and_retries() {
+        let (mut storage, table, original) = fixture();
+        let retained = storage.heap.get(original).unwrap();
+        let mut workspace = workspace(8);
+        crate::mem::guard::forbid_alloc(|| {
+            for (rowid, offset, len) in [(2, 1, 0), (3, 2, 1)] {
+                storage.tables[table]
+                    .rows
+                    .insert(
+                        rowid,
+                        RowState::committed_only_at(
+                            RowLoc {
+                                offset: original.offset + offset,
+                                len,
+                                generation: original.generation,
+                            },
+                            7,
+                        ),
+                    )
+                    .unwrap();
+            }
+            workspace.begin(&storage).unwrap();
+            let mut error = None;
+            for _ in 0..128 {
+                match workspace.step(&storage, NonZeroUsize::MIN) {
+                    Err(found) => {
+                        error = Some(found);
+                        break;
+                    }
+                    Ok(false) => {}
+                    Ok(true) => panic!("overlapping rows were published"),
+                }
+            }
+            let error = error.expect("overlap validation did not finish");
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
+            assert_eq!(
+                error.message.as_str(),
+                "heap compaction contains overlapping row locations"
+            );
+            assert!(!workspace.active());
+            assert_eq!(location(&storage, table, 1, 0), original);
+            assert_row(&storage, table, 1, 0, 7, 10, "old");
+            for rowid in [2, 3] {
+                storage.tables[table]
+                    .rows
+                    .insert(rowid, RowState::committed_only_at(original, 7))
+                    .unwrap();
+            }
+            workspace.begin(&storage).unwrap();
+            while !workspace.step(&storage, NonZeroUsize::MIN).unwrap() {}
+            assert_eq!(storage.heap.used(), original.len as usize);
+            for rowid in [1, 2, 3] {
+                assert_row(&storage, table, rowid, 0, 7, 10, "old");
+            }
+            let mut values = [Datum::Null; 2];
+            rowenc::decode(&retained, &[ColType::Int4, ColType::Text], &mut values).unwrap();
+            assert_eq!(values, [Datum::Int4(10), Datum::Text("old")]);
         });
     }
 
@@ -986,7 +1231,7 @@ mod tests {
             );
             drop(job);
             assert_eq!(location(&storage, table, 1, 0), original);
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             assert!(storage.row_versions.test_write().is_ok());
             let image = storage
                 .heap

@@ -133,7 +133,11 @@ impl<K: Hash + Eq, V> FixedMap<K, V> {
     /// Removes a key, restoring the probe invariant by backward-shifting
     /// any displaced entries into the hole.
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        let mut hole = self.find(key)?;
+        let slot = self.find(key)?;
+        Some(self.remove_at_slot(slot))
+    }
+
+    fn remove_at_slot(&mut self, mut hole: usize) -> V {
         let (_, removed) = self.slots[hole].take().unwrap();
         self.len -= 1;
 
@@ -157,7 +161,31 @@ impl<K: Hash + Eq, V> FixedMap<K, V> {
                 hole = probe;
             }
         }
-        Some(removed)
+        removed
+    }
+
+    /// Visits each entry once, removing those rejected without allocating.
+    pub fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) {
+        // An empty boundary keeps backward shifts from crossing the already
+        // visited prefix, including when a collision chain wraps around.
+        let empty = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .expect("fixed map load is at most one half");
+        let mut slot = (empty + 1) & self.mask;
+        let mut visited_slots = 0;
+        while visited_slots < self.slots.len() {
+            if let Some((key, value)) = self.slots[slot].as_mut()
+                && !keep(key, value)
+            {
+                self.remove_at_slot(slot);
+                // A shifted entry at this slot has not been visited yet.
+                continue;
+            }
+            slot = (slot + 1) & self.mask;
+            visited_slots += 1;
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -300,6 +328,76 @@ mod tests {
                 }
             }
             assert!(m.is_empty());
+        }
+    }
+
+    #[test]
+    fn heap_eviction_retain_visits_wrapped_collisions_once_without_allocating() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct RetainKey {
+            identity: u64,
+            bucket: u64,
+        }
+
+        impl Hash for RetainKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.bucket.hash(state);
+            }
+        }
+
+        const CAPACITY: usize = 512;
+        for count in [0, 1, CAPACITY - 1, CAPACITY] {
+            for pattern in 0..5 {
+                let mut budget = Budget::new(1 << 20);
+                let mut map: FixedMap<RetainKey, u64> =
+                    FixedMap::new(&mut budget, "retain collisions", CAPACITY).unwrap();
+                let bucket = (0..10_000)
+                    .find(|&bucket| {
+                        map.home(&RetainKey {
+                            identity: 0,
+                            bucket,
+                        }) > map.backing_slot_count() - CAPACITY
+                    })
+                    .unwrap();
+                let key = |identity| RetainKey { identity, bucket };
+                let mut visits = [0u8; CAPACITY];
+                crate::mem::guard::forbid_alloc(|| {
+                    for index in 0..count {
+                        map.insert(key(index as u64), index as u64).unwrap();
+                    }
+                    if count == CAPACITY {
+                        assert!(map.home(&key(0)) + count > map.backing_slot_count());
+                    }
+                    let keep = |key: usize| match pattern {
+                        0 => false,
+                        1 => true,
+                        2 => key % 2 == 0,
+                        3 => key == 0,
+                        _ => key + 1 == count,
+                    };
+                    map.retain(|key, value| {
+                        let index = key.identity as usize;
+                        visits[index] += 1;
+                        *value += 1000;
+                        keep(index)
+                    });
+                    assert!(visits[..count].iter().all(|&visits| visits == 1));
+                    assert!(visits[count..].iter().all(|&visits| visits == 0));
+                    let mut retained = 0;
+                    for index in 0..count {
+                        let expected = keep(index).then_some(index as u64 + 1000);
+                        assert_eq!(map.get(&key(index as u64)).copied(), expected);
+                        retained += usize::from(expected.is_some());
+                    }
+                    assert_eq!(map.len(), retained);
+                    map.retain(|_, _| false);
+                    assert!(map.is_empty());
+                    for index in 0..count {
+                        map.insert(key(index as u64), index as u64).unwrap();
+                    }
+                    assert_eq!(map.len(), count);
+                });
+            }
         }
     }
 

@@ -748,9 +748,9 @@ reused table identities and stale heap locations. Heap addresses and relocation
 generations describe caches, not durable row identity. Retained byte copies
 use statement memory.
 
-Heap relocation reserves the existing spare buffer, captures resident locations,
-then sorts and copies privately in bounded turns. Only capture and the final
-remap own the shared row-version metadata. A write prepared before capture
+Heap relocation reserves the existing spare buffer and captures resident locations.
+Sorting, source validation, destination assignment and copying then run privately
+in bounded turns. Only capture and the final remap own the shared row-version metadata. A write prepared before capture
 moves its unpublished input into the append tail; writes after capture already
 use that tail. Relocation copies later appends before publishing. If the tail
 advances again, publication requests another copy turn without changing row
@@ -758,7 +758,7 @@ locations. Current rows, history, pending versions and aliases are remapped by
 their old location rather than reusable allocator slots.
 
 For example, one connection can retain an old order while another updates a
-different order during copying. Both still read their own selected bytes after
+different order between sorting or copying turns. Both still read their own selected bytes after
 the buffer switch. Table retirement clears its rows through version ownership;
 a replaced slot's new rows survive publication. A held table definition does
 not keep copying or unrelated publication waiting.
@@ -772,8 +772,15 @@ callers can still compact an unretained active buffer in place when an older
 reader retains the other buffer. Shared callers always use the private copy
 path.
 
-Ordinary automatic checkpoint cleanup copies at most 64 KiB of heap bytes per
-cleanup step. The server advances one step between messages or while idle,
+Ordinary automatic checkpoint cleanup shares 65,536 work units across preparation
+and copying in each step. A sorting unit starts one heap-sort root, extracts one
+entry, or sifts one level (at most two key comparisons and one swap). Validation
+and destination assignment charge one unit per captured location. Copying charges
+one unit per byte or skipped alias/zero-length entry, so a step copies at most
+64 KiB. Validation retains the prior nonempty location across turns; an overlap
+returns XX000, "heap compaction contains overlapping row locations", before
+publishing, even when zero-length entries occur between the overlapping rows.
+The server advances one step between messages or while idle,
 including while an unrelated object download is waiting. For example, a slow
 invoice download does not prevent the server from reclaiming unused row memory.
 After local cleanup finishes, the reactor waits for download readiness rather
@@ -788,14 +795,21 @@ existing 85% critical heap threshold, automatic checkpointing also finishes
 publication and cleanup before dispatch resumes, preserving headroom for the
 next write. This pressure path can still delay connections.
 
-The startup relocation workspace owns its scratch and private copy controls
-across turns. Moving the engine does not invalidate them; cancellation or a copy
-error releases the reservation. Using a workspace with a different storage
+Evicting redundant saved-row metadata evaluates each map entry once, without
+rescanning earlier entries after every 512 removals. Pending changes, retained
+history, heap rows, deletion markers and unpublished saved rows stay resident.
+The walk handles collision chains that wrap around the fixed map without
+allocating or weakening lookup correctness. It still completes in one server turn.
+
+The startup relocation workspace owns its scratch, preparation state and copy
+controls across turns; their exact sizes are charged at startup. Moving the
+engine does not invalidate them. Cancellation or a preparation/copy error
+releases the reservation. Using a workspace with a different storage
 instance returns XX000, "heap relocation belongs to another storage instance",
 without publishing either instance. Journal cleanup runs once for the published
 prefix; writes after it keep their journal suffix for recovery. Heap capture,
-sorting, final remapping, eviction, and other maintenance still run within server
-turns. Checkpoint publication, merges, and temporary spilling still wait for
+final remapping, eviction and other maintenance still finish as whole operations
+within server turns. Checkpoint publication, merges, and temporary spilling still wait for
 pending durable-block downloads. Fixed execution workers and independent storage
 publication remain unfinished.
 

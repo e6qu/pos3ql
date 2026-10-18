@@ -47,15 +47,17 @@ impl TypeReferenceMove {
     fn matches(self, ctype: ColType, identity: Option<UserTypeName>) -> bool {
         match self.kind {
             TypeReferenceKind::Domain => identity == Some(self.prior),
+            // Journal declarations retain names before startup resolves slots.
+            // An explicit unresolved slot is valid only with the exact prior name.
             TypeReferenceKind::Enum => {
                 identity == Some(self.prior)
                     && matches!(ctype, ColType::Enum(slot) | ColType::Array(ArrElem::Enum(slot))
-                        if usize::from(slot) == self.slot)
+                        if usize::from(slot) == self.slot || slot == ColType::ENUM_SLOT_UNRESOLVED)
             }
             TypeReferenceKind::Composite => {
                 identity == Some(self.prior)
                     && matches!(ctype, ColType::Composite(slot) | ColType::Array(ArrElem::Composite(slot))
-                        if usize::from(slot) == self.slot)
+                        if usize::from(slot) == self.slot || slot == ColType::COMPOSITE_SLOT_UNRESOLVED)
             }
         }
     }
@@ -773,11 +775,35 @@ mod tests {
             (TypeReferenceKind::Enum, ColType::Enum(0)),
             (TypeReferenceKind::Enum, ColType::Array(ArrElem::Enum(0))),
             (
+                TypeReferenceKind::Enum,
+                ColType::Enum(ColType::ENUM_SLOT_UNRESOLVED),
+            ),
+            (
+                TypeReferenceKind::Enum,
+                ColType::Array(ArrElem::Enum(ColType::ENUM_SLOT_UNRESOLVED)),
+            ),
+            (TypeReferenceKind::Composite, ColType::Composite(0)),
+            (
+                TypeReferenceKind::Composite,
+                ColType::Array(ArrElem::Composite(0)),
+            ),
+            (
+                TypeReferenceKind::Composite,
+                ColType::Composite(ColType::COMPOSITE_SLOT_UNRESOLVED),
+            ),
+            (
+                TypeReferenceKind::Composite,
+                ColType::Array(ArrElem::Composite(ColType::COMPOSITE_SLOT_UNRESOLVED)),
+            ),
+            (
                 TypeReferenceKind::Domain,
                 ColType::Array(ArrElem::domain(0, ColType::Enum(0)).unwrap()),
             ),
         ] {
             let movement = TypeReferenceMove::new(DatabaseOid::POSTGRES, kind, 0, prior, current);
+            let mut declared = None;
+            assert!(!movement.rewrite(ctype, &mut declared));
+            assert_eq!(declared, None);
             let mut declared = Some(outer);
             assert!(!movement.rewrite(ctype, &mut declared));
             assert_eq!(declared, Some(outer));
@@ -793,6 +819,20 @@ mod tests {
             movement.rewrite_domain(ctype, &mut parent, &mut base);
             assert_eq!(parent, Some(outer));
             assert_eq!(base, None);
+        }
+        for (kind, ctype) in [
+            (TypeReferenceKind::Enum, ColType::Enum(1)),
+            (TypeReferenceKind::Enum, ColType::Array(ArrElem::Enum(1))),
+            (TypeReferenceKind::Composite, ColType::Composite(1)),
+            (
+                TypeReferenceKind::Composite,
+                ColType::Array(ArrElem::Composite(1)),
+            ),
+        ] {
+            let movement = TypeReferenceMove::new(DatabaseOid::POSTGRES, kind, 0, prior, current);
+            let mut declared = Some(prior);
+            assert!(!movement.rewrite(ctype, &mut declared));
+            assert_eq!(declared, Some(prior));
         }
     }
 }

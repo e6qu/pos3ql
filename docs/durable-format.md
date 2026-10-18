@@ -202,6 +202,11 @@ valid. ANALYZE recreates these cached summaries. New summaries use journal kind 
 journal kinds 149–154 or manifest v15. Kind 153 applies to ordinary row writes
 too, so the upgrade is required before resuming writes, even without enum DDL.
 
+Journal routine type codes leave catalog slots unresolved until startup has
+replayed all definitions. Enum and composite name moves update those declarations
+by their exact saved name as well; a missing name or a different resolved slot
+cannot select a type. Startup then binds the moved name to its current slot.
+
 ### Composite type name changes
 
 Renaming a composite type or moving it to another schema writes journal kind

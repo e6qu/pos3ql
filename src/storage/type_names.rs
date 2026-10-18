@@ -262,7 +262,20 @@ mod tests {
     fn rollback(storage: &mut Storage, slot: NamedTypeSlot) {
         match slot {
             NamedTypeSlot::Domain(slot) => storage.rollback_domain_alter(slot, None),
-            NamedTypeSlot::Enum(slot) => storage.rollback_enum_alter(slot, None),
+            NamedTypeSlot::Enum(slot) => {
+                let undo = {
+                    let catalog = storage.type_catalog.lock().unwrap();
+                    let definition = catalog.enums[slot];
+                    let pending = definition.pending_definition.unwrap();
+                    super::super::EnumAlterUndo {
+                        created_at: definition.created_at,
+                        transaction: pending.txid,
+                        version: pending.version,
+                        prior: None,
+                    }
+                };
+                storage.rollback_enum_alter(slot, undo);
+            }
             NamedTypeSlot::Composite(slot) => storage.rollback_composite_alter(slot, None),
         }
     }

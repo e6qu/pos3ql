@@ -311,7 +311,7 @@ mod tests {
     use super::*;
     use crate::storage::SqlName;
     use crate::storage::tests::{test_budget, test_config, test_database_definition};
-    use crate::storage::{DatabaseOid, EnumSpec, Storage};
+    use crate::storage::{DatabaseOid, EnumMemberPublication, EnumSpec, Storage};
 
     fn storage(enum_capacity: usize) -> Storage {
         let mut config = test_config();
@@ -338,10 +338,10 @@ mod tests {
     }
 
     fn alter(
-        storage: &mut Storage,
+        storage: &Storage,
         slot: usize,
         members: &[EnumMember],
-    ) -> Result<Option<super::super::PendingEnumDefinition>, SqlError> {
+    ) -> Result<super::super::EnumAlterUndo, SqlError> {
         storage.stage_enum_alter(
             slot,
             SqlName::parse("public").unwrap(),
@@ -499,12 +499,7 @@ mod tests {
             let selected = before.clone();
             let mut labels = before.members();
             drop(before);
-            alter(
-                &mut storage,
-                slot,
-                &[member("new", 1.0), member("paid", 2.0)],
-            )
-            .unwrap();
+            alter(&storage, slot, &[member("new", 1.0), member("paid", 2.0)]).unwrap();
             storage.commit_enum_alter(slot, 77);
             assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
             assert_eq!(selected.members().len(), 1);
@@ -541,19 +536,17 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let slot = create(&mut storage, "state");
             let before = storage.enum_for(slot, 0);
-            alter(
-                &mut storage,
-                slot,
-                &[member("new", 1.0), member("paid", 2.0)],
-            )
-            .unwrap();
-            storage.commit_enum_alter(slot, 77);
+            alter(&storage, slot, &[member("new", 1.0), member("paid", 2.0)]).unwrap();
+            assert_eq!(
+                storage.commit_enum_members(slot, 77),
+                EnumMemberPublication::Complete
+            );
             let members = [
                 member("new", 1.0),
                 member("paid", 2.0),
                 member("shipped", 3.0),
             ];
-            let error = alter(&mut storage, slot, &members).unwrap_err();
+            let error = alter(&storage, slot, &members).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(
                 error.message.as_str(),
@@ -561,13 +554,13 @@ mod tests {
             );
             assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
             drop(before);
-            let prior = alter(&mut storage, slot, &members).unwrap();
+            let prior = alter(&storage, slot, &members).unwrap();
             let pending = storage.enum_for(slot, 77);
             storage.rollback_enum_alter(slot, prior);
             assert_eq!(pending.sort_of("shipped"), Some(3.0));
-            assert!(alter(&mut storage, slot, &members).is_err());
+            assert!(alter(&storage, slot, &members).is_err());
             drop(pending);
-            let prior = alter(&mut storage, slot, &members).unwrap();
+            let prior = alter(&storage, slot, &members).unwrap();
             storage.rollback_enum_alter(slot, prior);
             assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
         });
@@ -582,6 +575,214 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(labels.next().unwrap().label.as_str(), "new");
             assert!(labels.next().is_none());
+        });
+    }
+
+    #[test]
+    fn shared_enum_publication_active_table_reader_and_unrelated_write_progress() {
+        use crate::sql::types::{ColType, Datum};
+        use crate::storage::UserTypeName;
+        use crate::storage::tests::make_def;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let mut storage = storage(1);
+        let slot = create(&mut storage, "state");
+        let identity = UserTypeName {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("state").unwrap(),
+        };
+        let mut definition = make_def(
+            "enum_reader",
+            &[("state", ColType::Enum(slot as u16), false)],
+        );
+        definition.columns[0].user_type = Some(identity);
+        let table = storage.create_table(definition).unwrap();
+        let unrelated = storage
+            .create_table(make_def("unrelated", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        let ready = AtomicBool::new(false);
+        let published = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let storage = &storage;
+            let ready = &ready;
+            let published = &published;
+            let reader = scope.spawn(move || {
+                crate::mem::guard::forbid_alloc(|| {
+                    let definition = storage.table_def(table, 0);
+                    let selected = storage.enum_for(slot, 0);
+                    ready.store(true, Ordering::Release);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !published.load(Ordering::Acquire) && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    assert!(
+                        published.load(Ordering::Acquire),
+                        "member publication waited for an active reader"
+                    );
+                    assert_eq!(definition.columns()[0].user_type, Some(identity));
+                    assert_eq!(selected.sort_of("new"), Some(1.0));
+                    assert_eq!(selected.sort_of("renamed"), None);
+                    assert_eq!(storage.enum_for(slot, 0).sort_of("renamed"), Some(1.0));
+                });
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                ready.load(Ordering::Acquire),
+                "reader did not select its definitions"
+            );
+            crate::mem::guard::forbid_alloc(|| {
+                alter(storage, slot, &[member("renamed", 1.0)]).unwrap();
+                assert_eq!(
+                    storage.commit_enum_members(slot, 77),
+                    EnumMemberPublication::Complete
+                );
+                let location = storage.heap.append_row(&[Datum::Int4(42)]).unwrap();
+                storage
+                    .write_pending(unrelated, 1, 91, 1, Some(location))
+                    .unwrap();
+                let row = storage.resident_row_state(unrelated, 1).unwrap().unwrap();
+                assert_eq!(row.pending_last().unwrap().txid, 91);
+            });
+            published.store(true, Ordering::Release);
+            reader.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn shared_enum_publication_identity_move_preserves_pending_state_and_references() {
+        use crate::sql::types::ColType;
+        use crate::storage::UserTypeName;
+        use crate::storage::tests::make_def;
+
+        let mut storage = storage(1);
+        let slot = create(&mut storage, "state");
+        let before = UserTypeName {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("state").unwrap(),
+        };
+        let after = UserTypeName {
+            schema: before.schema,
+            name: SqlName::parse("moved").unwrap(),
+        };
+        let mut definition = make_def(
+            "enum_reference",
+            &[("state", ColType::Enum(slot as u16), false)],
+        );
+        definition.columns[0].user_type = Some(before);
+        let table = storage.create_table(definition).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .stage_enum_alter(
+                    slot,
+                    after.schema,
+                    after.name,
+                    &[member("new", 1.0), member("paid", 2.0)],
+                    77,
+                )
+                .unwrap();
+            let selected = storage.enum_for(slot, 77);
+            assert_eq!(
+                storage.commit_enum_members(slot, 77),
+                EnumMemberPublication::IdentityMoveRequired
+            );
+            assert_eq!(storage.enum_for(slot, 0).name, before.name);
+            assert_eq!(storage.enum_for(slot, 0).members().len(), 1);
+            assert_eq!(storage.enum_for(slot, 77).name, after.name);
+            assert_eq!(storage.enum_for(slot, 77).members().len(), 2);
+            assert_eq!(selected.sort_of("paid"), Some(2.0));
+            assert_eq!(
+                storage.table_def(table, 0).columns()[0].user_type,
+                Some(before)
+            );
+            assert_eq!(
+                storage.commit_enum_members(slot, 88),
+                EnumMemberPublication::Complete
+            );
+            assert_eq!(storage.enum_for(slot, 77).name, after.name);
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            storage.commit_enum_alter(slot, 77);
+            assert_eq!(storage.enum_for(slot, 0).name, after.name);
+            assert_eq!(storage.enum_for(slot, 0).members().len(), 2);
+            assert_eq!(
+                storage.table_def(table, 0).columns()[0].user_type,
+                Some(after)
+            );
+            assert_eq!(
+                storage
+                    .declared_column_type(&storage.table_def(table, 0).columns()[0], 0)
+                    .unwrap()
+                    .catalog_oid(),
+                crate::sql::types::oid::enum_oid(slot as u16)
+            );
+        });
+    }
+
+    #[test]
+    fn shared_enum_publication_stale_undo_cannot_erase_later_edits_or_reused_types() {
+        let mut storage = storage(1);
+        let slot = create(&mut storage, "state");
+        let old = crate::mem::guard::forbid_alloc(|| {
+            let old = alter(&storage, slot, &[member("first", 1.0)]).unwrap();
+            storage.rollback_enum_alter(slot, old);
+            let later = alter(&storage, slot, &[member("second", 1.0)]).unwrap();
+            storage.rollback_enum_alter(slot, old);
+            assert_eq!(storage.enum_for(slot, 77).sort_of("second"), Some(1.0));
+            storage.rollback_enum_alter(slot, later);
+            let other = storage
+                .stage_enum_alter(
+                    slot,
+                    SqlName::parse("public").unwrap(),
+                    SqlName::parse("state").unwrap(),
+                    &[member("other", 1.0)],
+                    88,
+                )
+                .unwrap();
+            storage.rollback_enum_alter(slot, old);
+            assert_eq!(storage.enum_for(slot, 88).sort_of("other"), Some(1.0));
+            storage.rollback_enum_alter(slot, other);
+            old
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage.drop_enum("public", "state", 77).unwrap(),
+                Some(slot)
+            );
+            storage.commit_enum_drop(slot);
+            let replacement = create(&mut storage, "state");
+            assert_eq!(replacement, slot);
+            let later = alter(&storage, replacement, &[member("replacement", 1.0)]).unwrap();
+            storage.rollback_enum_alter(replacement, old);
+            assert_eq!(
+                storage.enum_for(replacement, 77).sort_of("replacement"),
+                Some(1.0)
+            );
+            storage.rollback_enum_alter(replacement, later);
+            assert_eq!(storage.enum_for(replacement, 0).sort_of("new"), Some(1.0));
+        });
+    }
+
+    #[test]
+    fn shared_enum_publication_generation_exhaustion_preserves_images_and_undo() {
+        let mut storage = storage(1);
+        let slot = create(&mut storage, "state");
+        let before = storage.enum_for(slot, 0);
+        let previous = storage.replace_catalog_sequence_for_test(u64::MAX);
+        crate::mem::guard::forbid_alloc(|| {
+            let error = alter(&storage, slot, &[member("changed", 1.0)]).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.enum_for(slot, 77).sort_of("new"), Some(1.0));
+            assert_eq!(before.sort_of("new"), Some(1.0));
+        });
+        storage.replace_catalog_sequence_for_test(previous);
+        crate::mem::guard::forbid_alloc(|| {
+            let undo = alter(&storage, slot, &[member("changed", 1.0)]).unwrap();
+            storage.rollback_enum_alter(slot, undo);
+            assert_eq!(storage.enum_for(slot, 0).sort_of("new"), Some(1.0));
         });
     }
 
@@ -611,11 +812,7 @@ mod tests {
                 });
             });
             let result = crate::mem::guard::forbid_alloc(|| {
-                alter(
-                    &mut storage,
-                    slot,
-                    &[member("new", 1.0), member("paid", 2.0)],
-                )?;
+                alter(&storage, slot, &[member("new", 1.0), member("paid", 2.0)])?;
                 storage.commit_enum_alter(slot, 77);
                 Ok::<(), SqlError>(())
             });
@@ -625,7 +822,7 @@ mod tests {
         });
         crate::mem::guard::forbid_alloc(|| {
             let prior = alter(
-                &mut storage,
+                &storage,
                 slot,
                 &[
                     member("new", 1.0),

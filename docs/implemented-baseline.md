@@ -365,9 +365,9 @@ The reference walk uses each table's existing lifecycle and definition guards.
 An unrelated definition can stay open for reading while a type move inspects it.
 Waiting for a matching definition holds no shared catalog or definition allocator;
 all pending images receive the new type name before their owner can roll back.
-No startup pool or memory reservation is added. Complete type commits still
-require exclusive storage access; coordinating their publication and enabling
-SQL workers remain planned work.
+The reference walk adds no startup pool. Complete type-name changes and other
+type publication still require exclusive storage access; coordinating them and
+enabling SQL workers remain planned work.
 Type comments move within the same database. Composite type renames journal only the name
 change, preserving current field references during replay. The
 [format guide](durable-format.md#composite-type-name-changes) gives the upgrade
@@ -927,13 +927,23 @@ removed while a selected reader still owns it. For example, a reader that
 selected the status labels `new` and `paid` keeps those labels while an ALTER
 adds `shipped`; another lookup sees the new definition.
 
+Enum label edits stage, publish and roll back through shared storage access.
+An active storage reader can retain both its table definition and selected labels
+while a label-only update completes. A pending type-name or schema move is routed
+to exclusive publication before any definition or reference is changed.
+Undo records identify the transaction, the specific creation of the type, and
+its pending revision number. An older undo cannot release a newer edit's label
+buffer, including after a slot is reused. Revision numbers use the existing
+checked catalog counter, and all storage is still reserved at startup.
+Server statements still execute serially.
+
 Committed definitions, pending changes and retained readers share the existing
 startup label buffers. A separate image remains reserved for replay.
 Image counters and controls are charged at startup. Exhaustion returns 54000,
 "enum member-image pool is exhausted", without changing the published
 definition. Release old readers or increase the startup catalog reservations
 before retrying. Replay can reuse an unretained image in place; it reserves a
-different image when readers retain the old one. Type commits remain exclusive.
+different image when readers retain the old one. Other type publication remains exclusive.
 
 Transaction-wide catalog and durable publication, concurrent cache/object I/O
 and maintenance, remaining table rewrites, and execution workers are still open.

@@ -321,7 +321,17 @@ pub(crate) fn resolve<'a>(
                 .ok()
                 .and_then(|member| definition.members().nth(member))
                 .ok_or_else(corrupt)?;
-            write!(output, "{} ", SqlString(member.label.as_str()))
+            let explicit_cast = tokens
+                .get(index + 1)
+                .is_some_and(|next| matches!(next.token, Tok::Op("::") | Tok::Ident("as")));
+            write!(output, "{}", SqlString(member.label.as_str()))
+                .map_err(|_| crate::sql::query::arena_full_pub())?;
+            if !explicit_cast {
+                write!(output, "::{}", name.as_str())
+                    .map_err(|_| crate::sql::query::arena_full_pub())?;
+            }
+            output
+                .write_char(' ')
                 .map_err(|_| crate::sql::query::arena_full_pub())?;
         } else if gap == "/*p3a*/" {
             let Tok::Str(text) = token.token else {
@@ -332,7 +342,17 @@ pub(crate) fn resolve<'a>(
             let text = arena
                 .alloc_str_display(value)
                 .map_err(|_| crate::sql::query::arena_full_pub())?;
-            write!(output, "{} ", SqlString(text))
+            let explicit_cast = tokens
+                .get(index + 1)
+                .is_some_and(|next| matches!(next.token, Tok::Op("::") | Tok::Ident("as")));
+            write!(output, "{}", SqlString(text))
+                .map_err(|_| crate::sql::query::arena_full_pub())?;
+            if !explicit_cast {
+                write!(output, "::{}[]", name.as_str())
+                    .map_err(|_| crate::sql::query::arena_full_pub())?;
+            }
+            output
+                .write_char(' ')
                 .map_err(|_| crate::sql::query::arena_full_pub())?;
         } else if let Some(width) = gap
             .strip_prefix("/*p3t:")

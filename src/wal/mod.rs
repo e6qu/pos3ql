@@ -7292,7 +7292,7 @@ fn decode_op_inner<'a>(
             }
             let has_toast = stored_boolean(*payload.get(at)?)?;
             at += 1;
-            let kind = match *payload.get(at)? {
+            let table_kind = match *payload.get(at)? {
                 0 => crate::storage::TableKind::Local,
                 1 => crate::storage::TableKind::Foreign,
                 _ => return None,
@@ -7340,7 +7340,7 @@ fn decode_op_inner<'a>(
                 columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
                 n_columns: n_cols,
                 has_toast,
-                kind,
+                kind: table_kind,
                 persistence,
                 on_commit,
                 tablespace,

@@ -85879,6 +85879,8 @@ fn enum_value_identity_domain_defaults_follow_members_after_type_moves_and_wal()
          ALTER TYPE default_state SET SCHEMA defaults_moved;
          CREATE TABLE default_after (state default_value, states default_batch,
              echo_state defaults_moved.default_state DEFAULT default_echo('old'));
+         CREATE FUNCTION default_echo(text) RETURNS defaults_moved.default_state
+             LANGUAGE SQL VOLATILE AS 'SELECT ''old''::defaults_moved.default_state';
          INSERT INTO default_before DEFAULT VALUES;
          INSERT INTO default_after DEFAULT VALUES;
          INSERT INTO default_view DEFAULT VALUES",

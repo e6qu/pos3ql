@@ -389,6 +389,7 @@ mod tests {
                         EnumSpec {
                             members: &[EnumMember {
                                 label: SqlName::parse("ready").unwrap(),
+                                legacy_label: None,
                                 sort: 1.0,
                             }],
                         },

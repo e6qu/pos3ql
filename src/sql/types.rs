@@ -4757,6 +4757,7 @@ pub enum Datum<'a> {
     /// and [`compare_datums`](super::eval::operators::compare_datums) stays pure.
     Enum {
         slot: u16,
+        member: Option<u32>,
         sort: f64,
         label: &'a str,
     },

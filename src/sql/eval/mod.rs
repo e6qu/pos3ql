@@ -952,6 +952,22 @@ pub trait CatalogAccess {
             "text-search catalog access is unavailable"
         ))
     }
+    fn materialize_enum<'a>(
+        &self,
+        value: Datum<'a>,
+        _arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "enum catalog access is unavailable: {}",
+            value
+        ))
+    }
+
+    fn enum_member_index(&self, _slot: u16, _label: &str) -> Result<Option<u32>, SqlError> {
+        Ok(None)
+    }
+
     /// Materializes a durable named-composite row value into its catalog field
     /// layout. The default is a loud capability error: raw composite text is
     /// never treated as an anonymous record.
@@ -2194,11 +2210,12 @@ pub fn eval_full<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    materialize_acl_value(
+    let value = materialize_acl_value(
         eval_full_inner(expression, arena, params, row, hooks)?,
         hooks,
         arena,
-    )
+    )?;
+    materialize_enum_values(value, hooks.catalog, arena)
 }
 
 fn eval_full_inner<'a>(
@@ -5862,6 +5879,42 @@ pub fn record_star_expand<'a>(
     }
 }
 
+pub(crate) fn materialize_enum_values<'a>(
+    value: Datum<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let Some(catalog) = catalog else {
+        return Ok(value);
+    };
+    match value {
+        Datum::Enum { .. } => catalog.materialize_enum(value, arena),
+        Datum::Array { element, raw } if matches!(element.to_coltype(), ColType::Enum(_)) => {
+            let mut changed = false;
+            for value in super::array::elements(raw, element) {
+                changed |= catalog.materialize_enum(value, arena)? != value;
+            }
+            if !changed {
+                return Ok(value);
+            }
+            let shape = super::array::shape(raw).expect("array datum invariant");
+            let items = super::array::alloc_items(arena, shape.element_count())?;
+            for (output, value) in items.iter_mut().zip(super::array::elements(raw, element)) {
+                *output = if value.is_null() {
+                    value
+                } else {
+                    catalog.materialize_enum(value, arena)?
+                };
+            }
+            Ok(Datum::Array {
+                element,
+                raw: super::array::build_shaped(items, shape, arena)?,
+            })
+        }
+        value => Ok(value),
+    }
+}
+
 /// Storage rows carry named composites as canonical text. Evaluation exposes
 /// the catalog-defined structural value before operators, grouping, joins, or
 /// set operations can observe it, so a text representation never becomes a
@@ -7486,6 +7539,7 @@ fn coerce_enum_literal<'a>(
         };
         Ok(Datum::Enum {
             slot,
+            member: cat.enum_member_index(slot, label)?,
             sort,
             label: arena.alloc_str(label).map_err(|_| arena_full())?,
         })

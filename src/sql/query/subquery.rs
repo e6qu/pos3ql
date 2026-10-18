@@ -2190,6 +2190,7 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         // output (an empty/all-NULL set produces no rows).
         ColType::Enum(slot) => Datum::Enum {
             slot,
+            member: None,
             sort: 0.0,
             label: "",
         },

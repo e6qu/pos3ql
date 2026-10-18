@@ -11,6 +11,7 @@ pub mod copy;
 pub mod cursor;
 pub mod datetime;
 pub mod encoding;
+mod enum_values;
 pub mod eval;
 pub(crate) mod event_trigger;
 pub mod exec;
@@ -1100,6 +1101,16 @@ pub(crate) fn explained_root_rows(statement: &Stmt<'_>, emitted_rows: u64) -> u6
 }
 
 fn statement_changes_schema(statement: &Stmt<'_>) -> bool {
+    if matches!(
+        statement,
+        Stmt::AlterType {
+            action: ast::AlterTypeAction::AddValue { .. }
+                | ast::AlterTypeAction::RenameValue { .. },
+            ..
+        }
+    ) {
+        return false;
+    }
     matches!(
         statement,
         Stmt::AlterDomain { .. }
@@ -21330,8 +21341,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::RestoreEnum {
             payload,
             wide_count,
+            stable_members,
         } => {
-            crate::wal::apply_enum_payload(storage, payload, wide_count)?;
+            crate::wal::apply_enum_payload(storage, payload, wide_count, stable_members)?;
         }
         WalOp::CreateComposite {
             slot,

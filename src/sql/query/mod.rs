@@ -2257,6 +2257,22 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     ) -> Result<Option<&'a str>, SqlError> {
         super::catalog::tablespace_location_by_oid(self.storage, self.txid, oid, arena)
     }
+    fn materialize_enum<'a>(
+        &self,
+        value: Datum<'a>,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        super::enum_values::resolve(value, self.storage, self.txid, arena)
+    }
+
+    fn enum_member_index(&self, slot: u16, label: &str) -> Result<Option<u32>, SqlError> {
+        let definition = self.storage.enum_for(usize::from(slot), self.txid);
+        Ok(definition
+            .members()
+            .position(|member| member.label.as_str() == label)
+            .map(|index| index as u32))
+    }
+
     fn materialize_composite<'a>(
         &self,
         slot: u16,
@@ -3773,9 +3789,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let values = arena
             .alloc_slice_with(def.members().len(), |_| Datum::Null)
             .map_err(|_| arena_full())?;
-        for (value, member) in values.iter_mut().zip(def.members()) {
+        for (index, (value, member)) in values.iter_mut().zip(def.members()).enumerate() {
             *value = Datum::Enum {
                 slot,
+                member: Some(index as u32),
                 sort: member.sort,
                 label: arena
                     .alloc_str(member.label.as_str())
@@ -7805,6 +7822,7 @@ fn materialize_composite_outputs<'a>(
         return Ok(());
     };
     for value in values {
+        *value = super::eval::materialize_enum_values(*value, Some(catalog), arena)?;
         *value = match *value {
             Datum::CompositeText {
                 slot,

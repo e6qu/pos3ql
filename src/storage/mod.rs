@@ -752,6 +752,7 @@ pub enum OwnedDatum {
     Macaddr8([u8; 8]),
     Enum {
         slot: u16,
+        member: Option<u32>,
         sort: f64,
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
@@ -936,7 +937,12 @@ impl OwnedDatum {
             Datum::Cidr(n) => Self::Cidr(*n),
             Datum::Macaddr(b) => Self::Macaddr(*b),
             Datum::Macaddr8(b) => Self::Macaddr8(*b),
-            Datum::Enum { slot, sort, label } => {
+            Datum::Enum {
+                slot,
+                member,
+                sort,
+                label,
+            } => {
                 if label.len() > MAX_DEFAULT_TEXT {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -948,6 +954,7 @@ impl OwnedDatum {
                 bytes[..label.len()].copy_from_slice(label.as_bytes());
                 Self::Enum {
                     slot: *slot,
+                    member: *member,
                     sort: *sort,
                     len: label.len() as u8,
                     bytes,
@@ -1137,11 +1144,13 @@ impl OwnedDatum {
             Self::Macaddr8(b) => Datum::Macaddr8(*b),
             Self::Enum {
                 slot,
+                member,
                 sort,
                 len,
                 bytes,
             } => Datum::Enum {
                 slot: *slot,
+                member: *member,
                 sort: *sort,
                 label: core::str::from_utf8(&bytes[..*len as usize])
                     .expect("stored from valid UTF-8"),
@@ -9280,12 +9289,15 @@ pub(crate) const MAX_COMPOSITE_FIELDS: usize = MAX_RELATION_COLUMNS;
 #[derive(Debug, Clone, Copy)]
 pub struct EnumMember {
     pub label: SqlName,
+    /// The label used by legacy rows before stable member identities.
+    pub legacy_label: Option<SqlName>,
     pub sort: f64,
 }
 
 impl EnumMember {
     pub(crate) const EMPTY: Self = EnumMember {
         label: SqlName::EMPTY,
+        legacy_label: None,
         sort: 0.0,
     };
 }
@@ -33638,6 +33650,26 @@ impl Storage {
         self.mark_value_bindings_rebuild_at(table_index, dirty_lsn);
     }
 
+    /// Old enum generations hashed labels. Retire them explicitly when loading
+    /// a legacy root; their replacement hashes are independent of label edits.
+    pub(crate) fn retire_legacy_enum_indexes(&mut self) {
+        let dirty_lsn = self.lsn().saturating_add(1);
+        for table in self.tables.iter() {
+            let mut publication = table.publication();
+            for enforcer in publication.enforcers.iter_mut().flatten() {
+                if enforcer.key_types[..enforcer.n_cols]
+                    .iter()
+                    .any(|ctype| matches!(ctype, ColType::Enum(_)))
+                {
+                    enforcer.durable = None;
+                    enforcer.durable_dirty = true;
+                    enforcer.durable_rebuild = true;
+                    enforcer.durable_dirty_lsn = dirty_lsn;
+                }
+            }
+        }
+    }
+
     pub(crate) fn mark_value_bindings_changed_at(&mut self, table_index: usize, dirty_lsn: u64) {
         let n_enforcers = self.tables[table_index].enforcer_count();
         for enforcer in self.tables[table_index].publication().enforcers[..n_enforcers]
@@ -56570,6 +56602,7 @@ mod tests {
                     enumeration.ddl_state = CatalogDdlState::Present;
                     let member = EnumMember {
                         label: SqlName::parse(label.as_str()).unwrap(),
+                        legacy_label: None,
                         sort: worker as f64 + 1.0,
                     };
                     let image = EnumImageReservation::write(&storage.enum_member_images, &[member])

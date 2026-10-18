@@ -42105,6 +42105,7 @@ fn build_enum_spec<'a>(
         }
         members[i] = crate::storage::EnumMember {
             label: SqlName::parse(label)?,
+            legacy_label: None,
             sort: (i + 1) as f64,
         };
     }
@@ -44978,7 +44979,7 @@ pub fn alter_type(
             for (target, source) in altered.iter_mut().zip(current.members()) {
                 *target = source;
             }
-            let (sort, renumbered) = match compute_add_value_sort(
+            let (sort, _renumbered) = match compute_add_value_sort(
                 &mut altered[..current.members().len()],
                 before.as_deref(),
                 after.as_deref(),
@@ -44992,6 +44993,7 @@ pub fn alter_type(
             };
             altered[current.members().len()] = crate::storage::EnumMember {
                 label: new_label,
+                legacy_label: None,
                 sort,
             };
             let prior = match storage.stage_enum_alter(
@@ -45005,13 +45007,6 @@ pub fn alter_type(
                 Err(error) => return sql_fail(error),
             };
             if let Err(error) = storage.mark_enum_label_uncommitted(slot, new_label, txn.txid) {
-                storage.rollback_enum_alter(slot, prior);
-                return sql_fail(error);
-            }
-            if renumbered
-                && let Err(error) =
-                    rewrite_enum_values(storage, txn, slot as u16, None, altered, arena)
-            {
                 storage.rollback_enum_alter(slot, prior);
                 return sql_fail(error);
             }
@@ -45221,17 +45216,6 @@ pub fn alter_type(
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(e) = rewrite_enum_values(
-                storage,
-                txn,
-                slot as u16,
-                Some((from, renamed.as_str())),
-                altered,
-                arena,
-            ) {
-                storage.rollback_enum_alter(slot, prior);
-                return sql_fail(e);
-            }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage_reserved(
                 txn.txid,
@@ -46779,156 +46763,6 @@ fn write_identifier<const N: usize>(output: &mut crate::util::StackStr<N>, ident
         let _ = output.write_char(character);
     }
     let _ = output.write_char('"');
-}
-
-/// Rewrites the inline label and sort key carried by every stored value of one
-/// enum. PostgreSQL stores enum ordering in a float4 and occasionally
-/// renumbers a densely split range; scalar columns and arrays must move with
-/// that catalog change. Ordinary transaction-pending row writes preserve
-/// rollback and savepoint semantics and rebuild affected index entries.
-fn rewrite_enum_values(
-    storage: &mut Storage,
-    txn: &mut TxnState,
-    enum_slot: u16,
-    rename: Option<(&str, &str)>,
-    members: &[crate::storage::EnumMember],
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    for table_index in 0..storage.table_count() {
-        if !storage.table(table_index).visible_to(txn.txid) {
-            continue;
-        }
-        let def = *storage.table_def(table_index, txn.txid);
-        let mut affected = [false; MAX_COLUMNS];
-        let mut any = false;
-        for (column_index, column) in def.columns().iter().enumerate() {
-            let hit = matches!(column.ctype, ColType::Enum(slot) if slot == enum_slot)
-                || matches!(
-                    column.ctype,
-                    ColType::Array(element)
-                        if matches!(element.to_coltype(), ColType::Enum(slot) if slot == enum_slot)
-                );
-            affected[column_index] = hit;
-            any |= hit;
-        }
-        if !any {
-            continue;
-        }
-        let count = storage.visible_row_count(table_index, txn.txid)?;
-        let source = storage.table_row_snapshot(table_index, Some(arena))?;
-        let rows = arena
-            .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "enum alteration exceeds the statement arena"
-                )
-            })?;
-        let mut n = 0;
-        storage.for_each_row_state(table_index, &mut |rowid, state| {
-            if let Some(home) = storage.visible_row_home(table_index, rowid, state, txn.txid)? {
-                rows[n] = Some(source.retain(rowid, &home)?);
-                n += 1;
-            }
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?;
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        def.schema(&mut schema);
-        for entry in rows[..n].iter().copied().flatten() {
-            let rowid = entry.rowid();
-            let bytes = storage.row_bytes(table_index, rowid, entry.read()?, arena)?;
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
-            let mut changed = false;
-            for column_index in 0..def.n_columns {
-                if !affected[column_index] {
-                    continue;
-                }
-                match values[column_index] {
-                    Datum::Enum { slot, sort, label } if slot == enum_slot => {
-                        let target_label = rename
-                            .filter(|(from, _)| label == *from)
-                            .map_or(label, |(_, to)| to);
-                        let target_sort = members
-                            .iter()
-                            .find(|member| member.label.as_str() == target_label)
-                            .map(|member| member.sort)
-                            .expect("stored enum label remains in altered definition");
-                        if target_label == label && target_sort == sort {
-                            continue;
-                        }
-                        values[column_index] = Datum::Enum {
-                            slot,
-                            sort: target_sort,
-                            label: arena.alloc_str(target_label).map_err(|_| {
-                                sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "enum alteration exceeds the statement arena"
-                                )
-                            })?,
-                        };
-                        changed = true;
-                    }
-                    Datum::Array { element, raw } => {
-                        let shape = crate::sql::array::shape(raw).expect("array datum invariant");
-                        let count = crate::sql::array::len(raw);
-                        let items = crate::sql::array::alloc_items(arena, count)?;
-                        let mut array_changed = false;
-                        for (item, value) in items
-                            .iter_mut()
-                            .zip(crate::sql::array::elements(raw, element))
-                        {
-                            *item = value;
-                            if let Datum::Enum { slot, sort, label } = *item
-                                && slot == enum_slot
-                            {
-                                let target_label = rename
-                                    .filter(|(from, _)| label == *from)
-                                    .map_or(label, |(_, to)| to);
-                                let target_sort = members
-                                    .iter()
-                                    .find(|member| member.label.as_str() == target_label)
-                                    .map(|member| member.sort)
-                                    .expect("stored enum label remains in altered definition");
-                                if target_label == label && target_sort == sort {
-                                    continue;
-                                }
-                                *item = Datum::Enum {
-                                    slot,
-                                    sort: target_sort,
-                                    label: arena.alloc_str(target_label).map_err(|_| {
-                                        sql_err!(
-                                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                            "enum alteration exceeds the statement arena"
-                                        )
-                                    })?,
-                                };
-                                array_changed = true;
-                            }
-                        }
-                        if array_changed {
-                            values[column_index] = Datum::Array {
-                                element,
-                                raw: crate::sql::array::build_shaped(items, shape, arena)?,
-                            };
-                            changed = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if changed {
-                store_row(
-                    storage,
-                    txn,
-                    table_index,
-                    Some(rowid),
-                    &values[..def.n_columns],
-                )?;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Computes PostgreSQL's float4 enum sort key. Repeated insertions into one gap
@@ -54610,7 +54444,8 @@ fn decode_binary_array<'a>(
                 };
                 Datum::CompositeText {
                     slot,
-                    physical_fields: storage.composite_for(slot as usize, txid).n_fields as u16,
+                    physical_fields: (storage.composite_for(slot as usize, txid).n_fields as u16)
+                        | COMPOSITE_MEMBER_IDENTITIES,
                     text: arena.alloc_str_display(value).map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -55577,7 +55412,7 @@ where
     'arena: 'values,
 {
     if let Some(default) = column.default.constant() {
-        return Ok(default.as_datum());
+        return super::enum_values::resolve(default.as_datum(), storage, txid, arena);
     }
     let Some(expression) = expression else {
         return Ok(Datum::Null);
@@ -55679,7 +55514,10 @@ where
         None => (column.default, table_expression),
     };
     if let Some(constant) = default.constant() {
-        return detach_routine_datum(constant.as_datum(), arena);
+        return detach_routine_datum(
+            super::enum_values::resolve(constant.as_datum(), storage, txid, arena)?,
+            arena,
+        );
     }
     let Some(expression) = expression else {
         return Ok(Datum::Null);
@@ -69438,7 +69276,8 @@ pub(crate) fn coerce<'a>(
         let text = composite_storage_text(typed, slot, storage, txid, arena)?;
         return Ok(Datum::CompositeText {
             slot,
-            physical_fields: storage.composite_for(slot as usize, txid).n_fields as u16,
+            physical_fields: (storage.composite_for(slot as usize, txid).n_fields as u16)
+                | COMPOSITE_MEMBER_IDENTITIES,
             text,
         });
     }
@@ -69523,6 +69362,163 @@ pub(crate) fn coerce_routine_argument<'a>(
     }
 }
 
+const COMPOSITE_MEMBER_IDENTITIES: u16 = 0x8000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompositeEncoding {
+    Input,
+    Legacy,
+    Members,
+}
+
+/// Text remains the record container; enum leaves use stable member ordinals.
+fn composite_persistent_value<'a>(
+    value: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    Ok(match value {
+        Datum::Enum { .. } => {
+            let Datum::Enum {
+                member: Some(member),
+                ..
+            } = super::enum_values::resolve(value, storage, txid, arena)?
+            else {
+                unreachable!()
+            };
+            Datum::Text(
+                arena
+                    .alloc_str_display(member)
+                    .map_err(|_| super::query::arena_full_pub())?,
+            )
+        }
+        Datum::Composite { slot, .. } => {
+            Datum::Text(composite_storage_text(value, slot, storage, txid, arena)?)
+        }
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => {
+            let value =
+                decode_stored_composite_text(text, slot, physical_fields, storage, txid, arena)?;
+            Datum::Text(composite_storage_text(value, slot, storage, txid, arena)?)
+        }
+        Datum::Array { element, raw } => {
+            let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+            let items = crate::sql::array::alloc_items(arena, shape.element_count())?;
+            for (out, value) in items
+                .iter_mut()
+                .zip(crate::sql::array::elements(raw, element))
+            {
+                let value = composite_persistent_value(value, storage, txid, arena)?;
+                *out = if value.is_null() {
+                    value
+                } else {
+                    Datum::Text(
+                        arena
+                            .alloc_str_display(value)
+                            .map_err(|_| super::query::arena_full_pub())?,
+                    )
+                };
+            }
+            Datum::Text(crate::sql::array::format_shaped(items, shape, arena)?)
+        }
+        value => value,
+    })
+}
+
+fn decode_composite_stored_field<'a>(
+    value: Datum<'a>,
+    ctype: ColType,
+    encoding: CompositeEncoding,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if value.is_null() {
+        return Ok(value);
+    }
+    let Datum::Text(text) = value else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored composite field is not text"
+        ));
+    };
+    match ctype {
+        ColType::Enum(slot) => {
+            let member = if encoding == CompositeEncoding::Members {
+                Some(text.parse::<u32>().map_err(|_| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "invalid stored enum member identity"
+                    )
+                })?)
+            } else {
+                None
+            };
+            super::enum_values::resolve(
+                Datum::Enum {
+                    slot,
+                    member,
+                    sort: 0.0,
+                    label: text,
+                },
+                storage,
+                txid,
+                arena,
+            )
+        }
+        ColType::Composite(slot) => decode_stored_composite_text(
+            text,
+            slot,
+            crate::storage::MAX_COMPOSITE_FIELDS as u16
+                | if encoding == CompositeEncoding::Members {
+                    COMPOSITE_MEMBER_IDENTITIES
+                } else {
+                    0
+                },
+            storage,
+            txid,
+            arena,
+        ),
+        ColType::Array(element) => {
+            let Datum::Array { raw, .. } = cast_to(
+                value,
+                ColType::Array(crate::sql::types::ArrElem::Text),
+                arena,
+            )?
+            else {
+                unreachable!()
+            };
+            let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+            let items = crate::sql::array::alloc_items(arena, shape.element_count())?;
+            for (out, value) in items.iter_mut().zip(crate::sql::array::elements(
+                raw,
+                crate::sql::types::ArrElem::Text,
+            )) {
+                *out = decode_composite_stored_field(
+                    value,
+                    element.to_coltype(),
+                    encoding,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+                if matches!(out, Datum::Composite { .. }) {
+                    *out = coerce_user_type_array_element(*out, element, storage, txid, arena)?;
+                }
+            }
+            Ok(Datum::Array {
+                element,
+                raw: crate::sql::array::build_shaped(items, shape, arena)?,
+            })
+        }
+        _ => cast_to(value, ctype, arena),
+    }
+}
+
 /// Renders a composite in stable physical-attribute order for persistence.
 /// Runtime composites expose active fields only; this boundary reinstates
 /// dropped slots as NULL so a later attribute change cannot shift old data.
@@ -69564,6 +69560,7 @@ fn composite_storage_text<'a>(
             )
         })?;
         *out = *source;
+        out.value = composite_persistent_value(out.value, storage, txid, arena)?;
         active_index += 1;
     }
     if active_index != active.len() {
@@ -69595,13 +69592,13 @@ pub(crate) fn coerce_composite_value<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    coerce_composite_value_inner(value, slot, false, storage, txid, arena)
+    coerce_composite_value_inner(value, slot, CompositeEncoding::Input, storage, txid, arena)
 }
 
 fn coerce_composite_value_inner<'a>(
     value: Datum<'a>,
     slot: u16,
-    nested_stored_layout: bool,
+    encoding: CompositeEncoding,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
@@ -69687,18 +69684,17 @@ fn coerce_composite_value_inner<'a>(
             crate::storage::DeclaredColumnType::Builtin { oid }
             | crate::storage::DeclaredColumnType::UserDefined { oid, .. } => oid,
         };
-        out.value = match (nested_stored_layout, field.ctype, input[index].value) {
-            (true, ColType::Composite(nested_slot), Datum::Text(text)) => {
-                decode_stored_composite_text(
-                    text,
-                    nested_slot,
-                    crate::storage::MAX_COMPOSITE_FIELDS as u16,
-                    storage,
-                    txid,
-                    arena,
-                )?
-            }
-            _ => coerce(input[index].value, &column, storage, txid, arena)?,
+        out.value = if encoding == CompositeEncoding::Input {
+            coerce(input[index].value, &column, storage, txid, arena)?
+        } else {
+            decode_composite_stored_field(
+                input[index].value,
+                field.ctype,
+                encoding,
+                storage,
+                txid,
+                arena,
+            )?
         };
         if field.not_null && matches!(out.value, Datum::Null) {
             return Err(sql_err!(
@@ -69753,6 +69749,15 @@ fn decode_composite_text_inner<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    let encoding = match stored_physical_fields {
+        None => CompositeEncoding::Input,
+        Some(count) if count & usize::from(COMPOSITE_MEMBER_IDENTITIES) != 0 => {
+            CompositeEncoding::Members
+        }
+        Some(_) => CompositeEncoding::Legacy,
+    };
+    let stored_physical_fields =
+        stored_physical_fields.map(|count| count & !usize::from(COMPOSITE_MEMBER_IDENTITIES));
     let body = text
         .strip_prefix('(')
         .and_then(|body| body.strip_suffix(')'))
@@ -69902,14 +69907,7 @@ fn decode_composite_text_inner<'a>(
             Datum::Text(raw)
         };
     }
-    coerce_composite_value_inner(
-        Datum::Record(values),
-        slot,
-        stored_physical_fields.is_some(),
-        storage,
-        txid,
-        arena,
-    )
+    coerce_composite_value_inner(Datum::Record(values), slot, encoding, storage, txid, arena)
 }
 
 /// Coerces an array to a user-defined element type. Its raw element payloads
@@ -69994,7 +69992,8 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                 value @ Datum::CompositeText { .. } => value,
                 value @ Datum::Composite { .. } => Datum::CompositeText {
                     slot,
-                    physical_fields: storage.composite_for(slot as usize, txid).n_fields as u16,
+                    physical_fields: (storage.composite_for(slot as usize, txid).n_fields as u16)
+                        | COMPOSITE_MEMBER_IDENTITIES,
                     text: composite_storage_text(value, slot, storage, txid, arena)?,
                 },
                 _ => unreachable!("composite coercion returns a composite datum"),
@@ -70017,6 +70016,13 @@ pub(crate) fn coerce_enum_value<'a>(
     if v.is_null() {
         return Ok(Datum::Null);
     }
+    if matches!(v, Datum::Enum { slot: actual, .. } if actual == slot) {
+        let resolved = super::enum_values::resolve(v, storage, txid, arena)?;
+        if let Datum::Enum { label, .. } = resolved {
+            ensure_enum_value_is_safe(storage, slot, label, txid)?;
+        }
+        return Ok(resolved);
+    }
     let def = storage.enum_for(slot as usize, txid);
     let label = match v {
         Datum::Enum { label, .. } | Datum::Text(label) => label,
@@ -70029,7 +70035,10 @@ pub(crate) fn coerce_enum_value<'a>(
             ));
         }
     };
-    let Some(sort) = def.sort_of(label) else {
+    let Some(member) = def
+        .members()
+        .position(|member| member.label.as_str() == label)
+    else {
         return Err(sql_err!(
             sqlstate::INVALID_TEXT_REPRESENTATION,
             "invalid input value for enum {}: \"{}\"",
@@ -70040,7 +70049,12 @@ pub(crate) fn coerce_enum_value<'a>(
     ensure_enum_value_is_safe(storage, slot, label, txid)?;
     Ok(Datum::Enum {
         slot,
-        sort,
+        member: Some(member as u32),
+        sort: def
+            .members()
+            .nth(member)
+            .expect("selected enum member")
+            .sort,
         label: arena
             .alloc_str(label)
             .map_err(|_| super::query::arena_full_pub())?,

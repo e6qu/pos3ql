@@ -174,16 +174,18 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
 enum ManifestFormat {
     V13 = 0,
     V14 = 1,
+    V15 = 2,
 }
 
 impl ManifestFormat {
-    const CURRENT: Self = Self::V14;
-    const SUPPORTED: [Self; Self::CURRENT as usize + 1] = [Self::V13, Self::V14];
+    const CURRENT: Self = Self::V15;
+    const SUPPORTED: [Self; Self::CURRENT as usize + 1] = [Self::V13, Self::V14, Self::V15];
 
     const fn header(self) -> &'static str {
         match self {
             Self::V13 => "pos3ql-manifest-v13",
             Self::V14 => "pos3ql-manifest-v14",
+            Self::V15 => "pos3ql-manifest-v15",
         }
     }
 
@@ -196,7 +198,7 @@ impl ManifestFormat {
     }
 
     const fn has_value_index_identity(self) -> bool {
-        matches!(self, Self::V14)
+        matches!(self, Self::V14 | Self::V15)
     }
 }
 
@@ -6427,8 +6429,26 @@ impl Checkpointer {
                     for member in members.iter_mut() {
                         let label = hexstr(words.next(), "enm label missing")?;
                         let sort_bits: u64 = parse_field(words.next(), "enm sort")?;
+                        let label = sql_name(&label)?;
+                        let legacy_label = if manifest_format == ManifestFormat::V15 {
+                            match words.next() {
+                                Some("-") => None,
+                                Some(encoded) => Some(sql_name(&hexstr(
+                                    Some(encoded),
+                                    "enm legacy label missing",
+                                )?)?),
+                                None => {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "enm legacy label missing",
+                                    ));
+                                }
+                            }
+                        } else {
+                            Some(label)
+                        };
                         *member = crate::storage::EnumMember {
-                            label: sql_name(&label)?,
+                            label,
+                            legacy_label,
                             sort: f64::from_bits(sort_bits),
                         };
                     }
@@ -7704,6 +7724,9 @@ impl Checkpointer {
                     ))
                 })?;
         }
+        if manifest_format != ManifestFormat::V15 {
+            storage.retire_legacy_enum_indexes();
+        }
         for (manifest_index, statistics) in table_statistics {
             let slot = slot_of.get(manifest_index).copied().flatten().ok_or(
                 CheckpointSetupError::Corrupt("statistics reference unknown table"),
@@ -8630,6 +8653,14 @@ impl Checkpointer {
                 hex(&mut self.manifest_buf, m.label.as_str()).map_err(|_| manifest_full())?;
                 write!(&mut self.manifest_buf, " {}", m.sort.to_bits())
                     .map_err(|_| manifest_full())?;
+                if self.manifest_write_format == ManifestFormat::V15 {
+                    write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
+                    match m.legacy_label {
+                        Some(label) => hex(&mut self.manifest_buf, label.as_str())
+                            .map_err(|_| manifest_full())?,
+                        None => write!(&mut self.manifest_buf, "-").map_err(|_| manifest_full())?,
+                    }
+                }
             }
             writeln!(&mut self.manifest_buf).map_err(|_| manifest_full())?;
         }
@@ -18117,10 +18148,14 @@ mod stored_dependency_tests {
         );
         assert_eq!(
             ManifestFormat::parse(Some("pos3ql-manifest-v14")).unwrap(),
-            ManifestFormat::CURRENT
+            ManifestFormat::V14
         );
         assert!(ManifestFormat::parse(Some("pos3ql-manifest-v12")).is_err());
-        assert!(ManifestFormat::parse(Some("pos3ql-manifest-v15")).is_err());
+        assert_eq!(
+            ManifestFormat::parse(Some("pos3ql-manifest-v15")).unwrap(),
+            ManifestFormat::CURRENT
+        );
+        assert!(ManifestFormat::parse(Some("pos3ql-manifest-v16")).is_err());
         assert!(ManifestFormat::parse(None).is_err());
     }
 

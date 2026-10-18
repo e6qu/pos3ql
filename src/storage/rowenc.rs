@@ -79,7 +79,9 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Numeric(nm) => 7 + nm.digits.len(),
             // sort key (8-byte f64) + 4-byte label length + label bytes. The
             // slot is not stored: it comes from the column's schema entry.
-            Datum::Enum { label, .. } => 12 + label.len(),
+            Datum::Enum { member, label, .. } => {
+                12 + usize::from(member.is_some()) * 4 + label.len()
+            }
         };
     }
     n
@@ -300,11 +302,23 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[7..7 + nm.digits.len()].copy_from_slice(nm.digits);
                 take = 7 + nm.digits.len();
             }
-            Datum::Enum { sort, label, .. } => {
+            Datum::Enum {
+                member,
+                sort,
+                label,
+                ..
+            } => {
                 rest[..8].copy_from_slice(&sort.to_le_bytes());
-                rest[8..12].copy_from_slice(&(label.len() as u32).to_le_bytes());
-                rest[12..12 + label.len()].copy_from_slice(label.as_bytes());
-                take = 12 + label.len();
+                let flags = if member.is_some() { 1u32 << 31 } else { 0 };
+                rest[8..12].copy_from_slice(&((label.len() as u32) | flags).to_le_bytes());
+                let prefix = if let Some(member) = member {
+                    rest[12..16].copy_from_slice(&member.to_le_bytes());
+                    16
+                } else {
+                    12
+                };
+                rest[prefix..prefix + label.len()].copy_from_slice(label.as_bytes());
+                take = prefix + label.len();
             }
             Datum::Null => unreachable!(),
         }
@@ -423,7 +437,8 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Regdictionary
         | ColType::Regcollation => {
             let length = bytes.get(8..12).ok_or_else(corrupt)?;
-            Some(12 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+            let flags = u32::from_le_bytes(length.try_into().unwrap());
+            Some(12 + usize::from(flags & 0x8000_0000 != 0) * 4 + (flags & 0x7fff_ffff) as usize)
         }
         ColType::Array(_) | ColType::Bit { .. } => {
             let length = bytes.get(..4).ok_or_else(corrupt)?;
@@ -435,7 +450,8 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         }
         ColType::Enum(_) => {
             let length = bytes.get(8..12).ok_or_else(corrupt)?;
-            Some(12 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+            let flags = u32::from_le_bytes(length.try_into().unwrap());
+            Some(12 + usize::from(flags & 0x8000_0000 != 0) * 4 + (flags & 0x7fff_ffff) as usize)
         }
         ColType::Int2Vector | ColType::OidVector => {
             let length = bytes.get(..4).ok_or_else(corrupt)?;
@@ -928,12 +944,25 @@ pub(crate) fn decode<'a>(
                 let sort = f64::from_le_bytes(b.try_into().unwrap());
                 at += 8;
                 let lb = bytes.get(at..at + 4).ok_or_else(corrupt)?;
-                let len = u32::from_le_bytes(lb.try_into().unwrap()) as usize;
+                let flags = u32::from_le_bytes(lb.try_into().unwrap());
+                let len = (flags & 0x7fff_ffff) as usize;
                 at += 4;
+                let member = if flags & 0x8000_0000 != 0 {
+                    let identity = bytes.get(at..at + 4).ok_or_else(corrupt)?;
+                    at += 4;
+                    Some(u32::from_le_bytes(identity.try_into().unwrap()))
+                } else {
+                    None
+                };
                 let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
                 at += len;
                 let label = core::str::from_utf8(raw).map_err(|_| corrupt())?;
-                out[i] = Datum::Enum { slot, sort, label };
+                out[i] = Datum::Enum {
+                    slot,
+                    member,
+                    sort,
+                    label,
+                };
             }
             ColType::Composite(slot) => {
                 let (physical_fields, consumed) =

@@ -553,6 +553,10 @@ pub fn compare_datums_collated(
     left: &Datum<'_>,
     right: &Datum<'_>,
 ) -> Result<core::cmp::Ordering, SqlError> {
+    if matches!((left, right), (Datum::Enum { .. }, Datum::Enum { .. })) {
+        return Ok(super::super::enum_values::sort(*left, storage, 0)?
+            .total_cmp(&super::super::enum_values::sort(*right, storage, 0)?));
+    }
     let (left, right) = match (left, right) {
         (Datum::Text(left), Datum::Text(right)) => (*left, *right),
         (Datum::Bpchar(left), Datum::Bpchar(right)) => {
@@ -811,12 +815,11 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[30]);
             hasher.write(b);
         }
-        // Enum values are equal iff the same member; the label uniquely
-        // identifies a member within a type, and cross-type comparison is
-        // rejected at plan time, so hashing by label is consistent with `=`.
-        Datum::Enum { label, .. } => {
+        // Labels and sort positions can change independently of stored row
+        // bytes. A type-constant hash cannot exclude an equal historical key;
+        // the catalog-aware comparator verifies each collision.
+        Datum::Enum { .. } => {
             hasher.write(&[31]);
-            hasher.write(label.as_bytes());
         }
     }
 }

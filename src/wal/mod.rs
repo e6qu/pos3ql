@@ -144,6 +144,7 @@ wal_record_kinds! {
 /// Enum label counts widened from one byte to the startup-configured capacity.
 /// Kind 23 remains decodable so existing journals retain their durable meaning.
     KIND_CREATE_ENUM_V2 = 147;
+    KIND_CREATE_ENUM_V3 = 149;
     KIND_SET_PUBLICATION_OWNER = 43;
     KIND_RENAME_PUBLICATION = 44;
     KIND_CREATE_ROUTINE = 45;
@@ -724,6 +725,7 @@ pub(crate) fn apply_enum_payload(
     storage: &mut crate::storage::Storage,
     payload: &[u8],
     wide_count: bool,
+    stable_members: bool,
 ) -> Result<(), SqlError> {
     let mut at = 0usize;
     let take_name = |at: &mut usize| -> Result<&str, SqlError> {
@@ -768,7 +770,34 @@ pub(crate) fn apply_enum_payload(
                 })?,
         );
         at += 8;
-        *member = crate::storage::EnumMember { label, sort };
+        let legacy_label = if stable_members {
+            match *payload
+                .get(at)
+                .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload"))?
+            {
+                0 => {
+                    at += 1;
+                    None
+                }
+                1 => {
+                    at += 1;
+                    Some(crate::storage::SqlName::parse(take_name(&mut at)?)?)
+                }
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "invalid enum journal payload"
+                    ));
+                }
+            }
+        } else {
+            Some(label)
+        };
+        *member = crate::storage::EnumMember {
+            label,
+            legacy_label,
+            sort,
+        };
     }
     if at != payload.len() {
         return Err(sql_err!(
@@ -1389,6 +1418,7 @@ pub(crate) enum WalOp<'a> {
     RestoreEnum {
         payload: &'a [u8],
         wide_count: bool,
+        stable_members: bool,
     },
     DropEnum {
         schema: &'a str,
@@ -2515,10 +2545,18 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropDomain { .. } => KIND_DROP_DOMAIN,
         WalOp::CreateEnum { .. }
         | WalOp::RestoreEnum {
-            wide_count: true, ..
+            stable_members: true,
+            ..
+        } => KIND_CREATE_ENUM_V3,
+        WalOp::RestoreEnum {
+            wide_count: true,
+            stable_members: false,
+            ..
         } => KIND_CREATE_ENUM_V2,
         WalOp::RestoreEnum {
-            wide_count: false, ..
+            wide_count: false,
+            stable_members: false,
+            ..
         } => KIND_CREATE_ENUM,
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
         WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
@@ -3304,7 +3342,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => {
             let mut n = 1 + name.len() + 1 + schema.len() + 4;
             for m in *members {
-                n += 1 + m.label.as_str().len() + 8;
+                n += 1
+                    + m.label.as_str().len()
+                    + 8
+                    + 1
+                    + m.legacy_label.map_or(0, |label| 1 + label.as_str().len());
             }
             n
         }
@@ -5361,6 +5403,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&count.to_le_bytes());
             for m in *members {
                 ok &= name_bytes(buffer, m.label.as_str()) && buffer.append(&m.sort.to_le_bytes());
+                ok &= buffer.append(&[u8::from(m.legacy_label.is_some())]);
+                if let Some(label) = m.legacy_label {
+                    ok &= name_bytes(buffer, label.as_str());
+                }
             }
             ok
         }
@@ -9375,12 +9421,13 @@ fn decode_op_inner<'a>(
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropDomain { schema, name })
         }),
-        KIND_CREATE_ENUM | KIND_CREATE_ENUM_V2 => decode_large_op(|| {
+        KIND_CREATE_ENUM | KIND_CREATE_ENUM_V2 | KIND_CREATE_ENUM_V3 => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             SqlName::parse(name).ok()?;
             SqlName::parse(schema).ok()?;
-            let wide_count = kind == KIND_CREATE_ENUM_V2;
+            let stable_members = kind == KIND_CREATE_ENUM_V3;
+            let wide_count = kind != KIND_CREATE_ENUM;
             let n_members = if wide_count {
                 let count = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
                 at += 4;
@@ -9395,10 +9442,23 @@ fn decode_op_inner<'a>(
                 SqlName::parse(label).ok()?;
                 let _sort = f64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
                 at += 8;
+                if stable_members {
+                    match *payload.get(at)? {
+                        0 => {
+                            at += 1;
+                        }
+                        1 => {
+                            at += 1;
+                            SqlName::parse(take_name(&mut at)?).ok()?;
+                        }
+                        _ => return None,
+                    }
+                }
             }
             (at == payload.len()).then_some(WalOp::RestoreEnum {
                 payload,
                 wide_count,
+                stable_members,
             })
         }),
         KIND_DROP_ENUM => decode_large_op(|| {
@@ -11004,7 +11064,9 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Macaddr(_)) => 6,
         Some(OwnedDatum::Macaddr8(_)) => 8,
         // slot(2) + sort(8) + len(1) + label bytes.
-        Some(OwnedDatum::Enum { len, .. }) => 11 + *len as usize,
+        Some(OwnedDatum::Enum { len, member, .. }) => {
+            11 + usize::from(member.is_some()) * 4 + *len as usize
+        }
         Some(OwnedDatum::Json { len, .. }) | Some(OwnedDatum::Bit { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Array { len, .. }) => 7 + *len as usize,
@@ -11356,16 +11418,23 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
         }
         Some(OwnedDatum::Enum {
             slot,
+            member,
             sort,
             len,
             bytes,
         }) => {
-            out[0] = 12;
+            out[0] = if member.is_some() { 42 } else { 12 };
             out[1..3].copy_from_slice(&slot.to_le_bytes());
             out[3..11].copy_from_slice(&sort.to_le_bytes());
-            out[11] = *len;
-            out[12..12 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            12 + *len as usize
+            let prefix = if let Some(member) = member {
+                out[11..15].copy_from_slice(&member.to_le_bytes());
+                15
+            } else {
+                11
+            };
+            out[prefix] = *len;
+            out[prefix + 1..prefix + 1 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            prefix + 1 + *len as usize
         }
         Some(OwnedDatum::Json { jsonb, len, bytes }) => {
             out[0] = 20;
@@ -11610,11 +11679,19 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             *at += 8;
             Some(OwnedDatum::Macaddr8(b.try_into().unwrap()))
         }
-        12 => {
+        12 | 42 => {
             let slot = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().unwrap());
             let sort = f64::from_le_bytes(payload.get(*at + 2..*at + 10)?.try_into().unwrap());
-            let len = *payload.get(*at + 10)? as usize;
-            *at += 11;
+            *at += 10;
+            let member = if tag == 42 {
+                let member = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+                *at += 4;
+                Some(member)
+            } else {
+                None
+            };
+            let len = *payload.get(*at)? as usize;
+            *at += 1;
             if len > crate::storage::MAX_DEFAULT_TEXT {
                 return None;
             }
@@ -11625,6 +11702,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             bytes[..len].copy_from_slice(raw);
             Some(OwnedDatum::Enum {
                 slot,
+                member,
                 sort,
                 len: len as u8,
                 bytes,
@@ -12616,10 +12694,12 @@ mod tests {
         let members = [
             crate::storage::EnumMember {
                 label: crate::storage::SqlName::parse("first").unwrap(),
+                legacy_label: None,
                 sort: 1.0,
             },
             crate::storage::EnumMember {
                 label: crate::storage::SqlName::parse("second").unwrap(),
+                legacy_label: None,
                 sort: 2.0,
             },
         ];
@@ -12631,13 +12711,13 @@ mod tests {
         let mut bytes = [0; 4096];
         let payload = encode_catalog_operation(&operation, &mut bytes);
         assert!(matches!(
-            decode_op(KIND_CREATE_ENUM_V2, payload),
+            decode_op(KIND_CREATE_ENUM_V3, payload),
             Some(WalOp::RestoreEnum {
                 wide_count: true,
                 ..
             })
         ));
-        assert!(decode_op(KIND_CREATE_ENUM_V2, &payload[..payload.len() - 1]).is_none());
+        assert!(decode_op(KIND_CREATE_ENUM_V3, &payload[..payload.len() - 1]).is_none());
 
         let mut legacy = [0; 256];
         let mut at = 0;

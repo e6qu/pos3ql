@@ -86,7 +86,6 @@ use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
-use crate::mem::fixed_map::FixedMap;
 use crate::mem::fixed_vec::FixedVec;
 use crate::mem::value_index::{ValueIndexLease, ValueIndexPool};
 use crate::pg::replication_client::{ConnectionInfo, ConnectionInfoError};

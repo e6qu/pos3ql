@@ -206,19 +206,6 @@ impl<K: Hash + Eq, V> FixedMap<K, V> {
             .filter_map(|slot| slot.as_ref().map(|(k, v)| (k, v)))
     }
 
-    /// The fixed backing-slot count. A caller may retain a slot offset while
-    /// the map is unchanged and resume a bounded walk without revisiting
-    /// earlier entries.
-    pub(crate) fn backing_slot_count(&self) -> usize {
-        self.slots.len()
-    }
-
-    pub(crate) fn entry_at_slot(&self, slot: usize) -> Option<(&K, &V)> {
-        self.slots
-            .get(slot)
-            .and_then(|entry| entry.as_ref().map(|(key, value)| (key, value)))
-    }
-
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
         self.slots
             .iter_mut()
@@ -356,7 +343,7 @@ mod tests {
                         map.home(&RetainKey {
                             identity: 0,
                             bucket,
-                        }) > map.backing_slot_count() - CAPACITY
+                        }) > map.slots.len() - CAPACITY
                     })
                     .unwrap();
                 let key = |identity| RetainKey { identity, bucket };
@@ -366,7 +353,7 @@ mod tests {
                         map.insert(key(index as u64), index as u64).unwrap();
                     }
                     if count == CAPACITY {
-                        assert!(map.home(&key(0)) + count > map.backing_slot_count());
+                        assert!(map.home(&key(0)) + count > map.slots.len());
                     }
                     let keep = |key: usize| match pattern {
                         0 => false,

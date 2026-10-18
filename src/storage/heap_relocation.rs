@@ -1,6 +1,7 @@
 //! Bounded heap preparation and copying; row versions coordinate publication.
 
 use core::num::NonZeroUsize;
+use core::ops::{Deref, DerefMut};
 
 mod sort;
 use sort::RelocationSort;
@@ -19,13 +20,16 @@ pub(crate) struct HeapRelocationEntry {
 
 // All row-map locations are included until retirement clears them. Avoid
 // acquiring definitions after shared version ownership.
-fn visit_heap_locations(
-    tables: &[Table],
+fn visit_heap_locations<Rows>(
+    maps: impl IntoIterator<Item = Rows>,
     versions: &RowVersionState,
     mut visit: impl FnMut(RowLoc) -> Result<(), SqlError>,
-) -> Result<(), SqlError> {
-    for table in tables {
-        for (_, state) in table.rows.iter() {
+) -> Result<(), SqlError>
+where
+    Rows: Deref<Target = FixedMap<u64, RowState>>,
+{
+    for rows in maps {
+        for (_, state) in rows.iter() {
             if let Some(RowHome::Heap(location)) = state.committed {
                 visit(location)?;
             }
@@ -61,8 +65,23 @@ impl<'scratch> RelocationPlan<'scratch> {
         versions: &RowVersionState,
         entries: &'scratch mut FixedVec<HeapRelocationEntry>,
     ) -> Result<Self, SqlError> {
+        Self::capture_rows(
+            tables.iter().map(|table| table.rows.read()),
+            versions,
+            entries,
+        )
+    }
+
+    fn capture_rows<Rows>(
+        maps: impl IntoIterator<Item = Rows>,
+        versions: &RowVersionState,
+        entries: &'scratch mut FixedVec<HeapRelocationEntry>,
+    ) -> Result<Self, SqlError>
+    where
+        Rows: Deref<Target = FixedMap<u64, RowState>>,
+    {
         entries.clear();
-        visit_heap_locations(tables, versions, |source| {
+        visit_heap_locations(maps, versions, |source| {
             entries
                 .push(HeapRelocationEntry {
                     source,
@@ -162,7 +181,25 @@ impl<'scratch> RelocationPlan<'scratch> {
         generation: u64,
         tail: Option<(usize, usize)>,
     ) -> Result<(), SqlError> {
-        visit_heap_locations(tables, versions, |source| {
+        self.preflight_rows(
+            tables.iter().map(|table| table.rows.read()),
+            versions,
+            generation,
+            tail,
+        )
+    }
+
+    fn preflight_rows<Rows>(
+        &self,
+        maps: impl IntoIterator<Item = Rows>,
+        versions: &RowVersionState,
+        generation: u64,
+        tail: Option<(usize, usize)>,
+    ) -> Result<(), SqlError>
+    where
+        Rows: Deref<Target = FixedMap<u64, RowState>>,
+    {
+        visit_heap_locations(maps, versions, |source| {
             self.relocated(source, generation, tail).map(|_| ())
         })
     }
@@ -174,12 +211,28 @@ impl<'scratch> RelocationPlan<'scratch> {
         generation: u64,
         tail: Option<(usize, usize)>,
     ) {
+        self.apply_rows(
+            tables.iter().map(|table| table.rows.write()),
+            versions,
+            generation,
+            tail,
+        );
+    }
+
+    fn apply_rows<Rows>(
+        &self,
+        maps: impl IntoIterator<Item = Rows>,
+        versions: &mut RowVersionState,
+        generation: u64,
+        tail: Option<(usize, usize)>,
+    ) where
+        Rows: DerefMut<Target = FixedMap<u64, RowState>>,
+    {
         let relocate = |location| {
             self.relocated(location, generation, tail)
                 .expect("preflighted heap row")
         };
-        for table in tables {
-            let mut rows = table.rows.write();
+        for mut rows in maps {
             for (_, state) in rows.iter_mut() {
                 if let Some(RowHome::Heap(location)) = state.committed {
                     state.committed = Some(RowHome::Heap(relocate(location)));
@@ -364,16 +417,19 @@ impl HeapRelocationProgress {
             entries,
             packed_bytes: self.packed_bytes,
         };
-        {
-            let mut versions = storage.row_versions.write();
-            let tail = Some((self.copy.frontier(), self.copied_tail));
-            self.copy
-                .try_publish(self.packed_bytes, self.copied_tail, |generation| {
-                    plan.preflight(&storage.tables, &versions, generation, tail)?;
-                    plan.apply(&storage.tables, &mut versions, generation, tail);
-                    Ok(())
-                })
-        }
+        storage.heap_row_ownership.with_row_maps(
+            &storage.row_versions,
+            storage.tables.iter().map(|table| &table.rows),
+            |versions, rows| {
+                let tail = Some((self.copy.frontier(), self.copied_tail));
+                self.copy
+                    .try_publish(self.packed_bytes, self.copied_tail, |generation| {
+                        plan.preflight_rows(rows.iter(), versions, generation, tail)?;
+                        plan.apply_rows(rows.iter_mut(), versions, generation, tail);
+                        Ok(())
+                    })
+            },
+        )
     }
 }
 
@@ -513,12 +569,15 @@ impl Storage {
         &self,
         entries: &mut FixedVec<HeapRelocationEntry>,
     ) -> Result<HeapRelocationProgress, SqlError> {
-        let copy = {
-            let versions = self.row_versions.write();
-            let copy = self.heap.begin_copy()?;
-            RelocationPlan::capture(&self.tables, &versions, entries)?;
-            copy
-        };
+        let copy = self.heap_row_ownership.with_row_maps(
+            &self.row_versions,
+            self.tables.iter().map(|table| &table.rows),
+            |versions, rows| {
+                let copy = self.heap.begin_copy()?;
+                RelocationPlan::capture_rows(rows.iter(), versions, entries)?;
+                Ok(copy)
+            },
+        )?;
         Ok(HeapRelocationProgress {
             copy,
             preparation: HeapRelocationPreparation::Sorting(RelocationSort::new(entries.len())),

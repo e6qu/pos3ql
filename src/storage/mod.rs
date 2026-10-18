@@ -32,9 +32,11 @@ mod row_heap;
 #[cfg(test)]
 pub(crate) use heap_relocation::HeapRelocationEntry;
 pub(crate) use heap_relocation::HeapRelocationWorkspace;
+mod row_cleanup;
 mod row_identities;
 mod row_images;
 mod row_map;
+mod row_ownership;
 mod row_publication;
 mod row_reads;
 mod row_scans;
@@ -13710,6 +13712,7 @@ pub struct Storage {
     row_versions: RowVersionPools,
     row_walks: std::sync::Arc<RowWalkPool>,
     snapshot_reclamation: SnapshotReclamation,
+    heap_row_ownership: row_ownership::HeapRowOwnership,
     query_roots: std::sync::Arc<QueryRootPool>,
     spill_roots: std::sync::Arc<SpillRootRegistry>,
     large_objects: std::sync::Mutex<LargeObjectCatalog>,
@@ -15086,8 +15089,12 @@ impl Storage {
     /// each turn so an unrelated relation can use the shared version pools.
     fn retire_table_row_batch(&self, slot: usize, cursor: &mut usize) -> bool {
         const WORK_PER_TURN: usize = 64;
-        let mut versions = self.row_versions.write();
-        let mut rows = self.tables[slot].rows.write();
+        let (mut versions, mut rows) = row_ownership::acquire(|| {
+            Ok((
+                self.row_versions.try_write_for_batch()?,
+                self.tables[slot].rows.try_write_for_batch()?,
+            ))
+        });
         for _ in 0..WORK_PER_TURN {
             if *cursor == rows.backing_slot_count() {
                 debug_assert!(rows.is_empty());
@@ -17864,6 +17871,7 @@ impl Storage {
             + RowVersionPools::metadata_budget_bytes(config)
             + Self::retained_row_walk_budget_bytes(config)
             + SnapshotReclamation::budget_bytes(config)
+            + row_ownership::HeapRowOwnership::budget_bytes(config)
             + SpillRootRegistry::budget_bytes(config)
             + QueryRootPool::budget_bytes(config)
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
@@ -17995,6 +18003,7 @@ impl Storage {
         let row_versions = RowVersionPools::new(config, budget)?;
         let row_walks = RowWalkPool::new(config, budget)?;
         let snapshot_reclamation = SnapshotReclamation::new(config, budget)?;
+        let heap_row_ownership = row_ownership::HeapRowOwnership::new(config, budget)?;
         let spill_roots = SpillRootRegistry::new(config, budget)?;
         let query_roots = QueryRootPool::new(config, budget)?;
         let pending_table_defs =
@@ -18741,6 +18750,7 @@ impl Storage {
             row_versions,
             row_walks,
             snapshot_reclamation,
+            heap_row_ownership,
             spill_roots,
             query_roots,
             large_objects: std::sync::Mutex::new(LargeObjectCatalog {
@@ -30539,17 +30549,25 @@ impl Storage {
     ) -> Result<Option<RowRead<'static>>, SqlError> {
         let table_slot = target.table();
         let table = &self.tables[table_slot];
-        let definition = table.definition.read();
+        let (definition, publication, generations, versions, rows) = row_ownership::acquire(|| {
+            Ok((
+                table.definition.try_read_for_batch()?,
+                row_ownership::try_mutex(&table.publication, "table publication lock poisoned")?,
+                table.spill_generations.try_read_for_batch()?,
+                self.row_versions.try_read_for_batch()?,
+                table.rows.try_read_for_batch()?,
+            ))
+        });
         target.validate(definition.identity.created_at)?;
-        let publication = table.publication();
-        let generations = table.spill_generations();
         let image = spill_generations::SpillGenerationImage::capture(
             &definition,
             publication.generation,
             table_slot,
             u64::MAX,
         );
-        RowReadView::point_with(&self.row_versions, &table.rows, rowid, |state, captured| {
+        let state = rows.get(&rowid).copied();
+        drop(rows);
+        RowReadView::capture_with(&self.row_versions, &versions, state, |state, captured| {
             let heap = captured
                 .has_heap(state)
                 .then(|| self.heap.retain_allocation());
@@ -30635,8 +30653,12 @@ impl Storage {
     /// Cache probes need only this verdict while their saved block is borrowed;
     /// copy no row bytes or root owners and release metadata guards immediately.
     pub(crate) fn row_has_own_pending(&self, table_slot: usize, rowid: u64, txid: u32) -> bool {
-        let versions = self.row_versions.read();
-        let rows = self.tables[table_slot].rows.read();
+        let (versions, rows) = row_ownership::acquire(|| {
+            Ok((
+                self.row_versions.try_read_for_batch()?,
+                self.tables[table_slot].rows.try_read_for_batch()?,
+            ))
+        });
         rows.get(&rowid).is_some_and(|&state| {
             RowRead::borrowed(state, &versions)
                 .pending_last()
@@ -31169,53 +31191,6 @@ impl Storage {
         }
     }
 
-    /// Evicts only row versions covered by an installed checkpoint boundary.
-    /// Later writes keep their heap bytes until another checkpoint saves them.
-    pub fn evict_committed(&mut self) {
-        for i in 0..self.tables.len() {
-            if {
-                let definition = self.tables[i].definition();
-                definition.persistence
-            } != RelationPersistence::Temporary
-            {
-                self.evict_committed_table(i);
-            }
-        }
-    }
-
-    /// Marks committed heap rows of one freshly-spilled table as local SST
-    /// residents. Temporary spill uses this narrower form because a durable
-    /// table may have changed since its last manifest publication.
-    pub(crate) fn evict_committed_table(&mut self, slot: usize) {
-        if !self.tables[slot].live() || self.tables[slot].spill_generations().is_empty() {
-            return;
-        }
-        let table = &mut self.tables[slot];
-        let generations = table.spill_generations.read();
-        let table_generation = table.generation();
-        for (_, state) in table.rows.iter_mut() {
-            if let Some(RowHome::Heap(loc)) = state.committed {
-                let Some(sst) = generations.eviction_member(state.committed_lsn, table_generation)
-                else {
-                    continue;
-                };
-                state.committed = Some(RowHome::Spilled {
-                    len: loc.len,
-                    sst,
-                    commit_lsn: state.committed_lsn,
-                });
-            }
-        }
-    }
-
-    pub(crate) fn release_table_histories(&mut self, slot: usize) {
-        let row_versions = self.row_versions.exclusive();
-        let (tables, versions) = (&mut self.tables, &mut row_versions.committed_row_versions);
-        for (_, state) in tables[slot].rows.iter_mut() {
-            prune_committed_history(versions, &mut state.history, None);
-        }
-    }
-
     pub(crate) fn clear_table_dirty_through(&mut self, slot: usize, generation: u64) {
         let table = &mut self.tables[slot];
         let mut publication = table.publication();
@@ -31376,35 +31351,6 @@ impl Storage {
             .spill_generations
             .write()
             .replace(len, handles)
-    }
-
-    /// Clears a table's shadowing deletion markers only after the manifest
-    /// referencing their SST tombstones has published. A failed publication
-    /// keeps the markers, so its retry cannot lose a delete.
-    pub(crate) fn clear_tombstones(&mut self, slot: usize) {
-        let table = &mut self.tables[slot];
-        // The installed SSTs now carry (or moot) every deletion, so the row
-        // overlay markers are done shadowing older generations.
-        loop {
-            let mut batch = [0u64; 512];
-            let mut n = 0usize;
-            for (rowid, state) in table.rows.iter() {
-                if state.committed.is_none() && state.history.is_empty() && state.pending.is_none()
-                {
-                    batch[n] = rowid;
-                    n += 1;
-                    if n == batch.len() {
-                        break;
-                    }
-                }
-            }
-            if n == 0 {
-                return;
-            }
-            for &rowid in &batch[..n] {
-                table.rows.remove(&rowid);
-            }
-        }
     }
 
     pub fn table_count(&self) -> usize {
@@ -31855,19 +31801,6 @@ impl Storage {
         self.with_row_bytes(table_index, rowid, committed, compare)
     }
 
-    /// Drops map entries the spill lists reproduce exactly — committed,
-    /// spilled, no pending change. A `Spilled` entry's member is the list's
-    /// newest mention of its rowid (installs are the only thing that moves
-    /// one, and they run at publish), so the merged walk and the point
-    /// probe synthesize the identical state after the entry is gone. This
-    /// is what unbinds a table's row count from `table_rows`: the map holds
-    /// the working set, the bucket holds the rest.
-    pub fn evict_redundant_entries(&self, slot: usize) {
-        if !self.tables[slot].spill_generations().is_empty() {
-            Self::evict_redundant_rows(&mut self.tables[slot].rows.write());
-        }
-    }
-
     /// Whether any live table's overlay is at least half full — the map's
     /// analogue of heap pressure. Rows are counted against entries, not
     /// bytes: a table of tiny rows fills its map long before its heap.
@@ -31903,41 +31836,6 @@ impl Storage {
                     .iter()
                     .any(|(_, state)| state.history.len().saturating_add(2) >= maximum)
         })
-    }
-
-    /// Release saved history while preserving versions newer than each
-    /// table's installed object roots, even when cleanup follows later writes.
-    pub fn release_durable_histories(&mut self) {
-        let row_versions = self.row_versions.exclusive();
-        let (tables, versions) = (&mut self.tables, &mut row_versions.committed_row_versions);
-        for table in tables.iter_mut().filter(|table| {
-            table.live() && {
-                let definition = table.definition();
-                definition.persistence
-            } != RelationPersistence::Temporary
-        }) {
-            let Some(through_lsn) = table.spill_generations().published_through() else {
-                continue;
-            };
-            for (_, state) in table.rows.iter_mut() {
-                release_committed_history_through(versions, &mut state.history, through_lsn);
-            }
-        }
-    }
-
-    /// The map-occupancy pass after a publish: any table whose overlay is
-    /// half full sheds its redundant entries.
-    pub fn evict_entries(&mut self) {
-        for i in 0..self.tables.len() {
-            let table = &self.tables[i];
-            if !table.live()
-                || table.spill_generations().is_empty()
-                || table.rows.len() * 100 < table.rows.capacity() * 50
-            {
-                continue;
-            }
-            self.evict_redundant_entries(i);
-        }
     }
 
     /// Removes a committed row outright (journal replay of a DELETE), retaining
@@ -32060,14 +31958,25 @@ impl Storage {
             0
         };
 
-        let snapshots = self.snapshot_state();
+        let (snapshots, mut publication, generations, mut versions, mut rows) =
+            row_ownership::acquire(|| {
+                Ok((
+                    row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")?,
+                    row_ownership::try_mutex(
+                        &table.publication,
+                        "table publication lock poisoned",
+                    )?,
+                    table.spill_generations.try_read_for_batch()?,
+                    self.row_versions.try_write_for_batch()?,
+                    table.rows.try_write_for_batch()?,
+                ))
+            });
         if rewritten && snapshots.retains_for(txid) {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "table rewrite publication conflicts with an active snapshot"
             ));
         }
-        let mut publication = table.publication();
         let n_enforcers = publication.n_enforcers;
         let generation = publication.generation.checked_add(1).ok_or_else(|| {
             sql_err!(
@@ -32075,8 +31984,6 @@ impl Storage {
                 "table publication generation exhausted"
             )
         })?;
-        let mut versions = self.row_versions.write();
-        let mut rows = table.rows.write();
         let state = rows.get_mut(&rowid).ok_or_else(|| {
             sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
@@ -32154,10 +32061,7 @@ impl Storage {
         state.committed_lsn = commit_lsn;
         state.checkpoint_change_lsn = commit_lsn;
         clear_pending_versions(&mut versions.pending_row_versions, &mut state.pending);
-        if state.committed.is_none()
-            && table.spill_generations().is_empty()
-            && state.history.is_empty()
-        {
+        if state.committed.is_none() && generations.is_empty() && state.history.is_empty() {
             rows.remove(&rowid);
         }
         publication.generation = generation;

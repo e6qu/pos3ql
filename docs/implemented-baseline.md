@@ -157,11 +157,13 @@ its current location if reclamation moved it. Current row versions within the
 same table remain visible to authoritative walks. History deletion holds the
 registry and shared version guards for at most 64 captured row identities at a
 time. One brief row-map read copies each table's identities before its batches
-begin. It rechecks current readers before each batch. Capturing the next
-table's identities holds neither the registry nor the shared version pool while
-waiting for its row map. New statement admission coalesces cleanup already in
-progress and leaves later release notifications pending for the next attempt.
-A new report admitted between cleanup batches still keeps the versions it needs.
+begin. It rechecks current readers after every wait and before each batch.
+Acquisition releases earlier snapshot, version and table guards before waiting
+for a contended lock. Reads, pending writes, undo, commit and cleanup use the
+same rule. A retry acquires a fresh coherent set; data changes and callbacks
+run only after acquisition succeeds. New statement admission coalesces cleanup
+already in progress and leaves later release notifications pending for the next
+attempt. A new report admitted between cleanup batches keeps the versions it needs.
 
 **User example:** finishing a report can reclaim its old order versions without
 keeping an unrelated customer update waiting for every table to be visited.
@@ -750,7 +752,11 @@ use statement memory.
 
 Heap relocation reserves the existing spare buffer and captures resident locations.
 Sorting, source validation, destination assignment and copying then run privately
-in bounded turns. Only capture and the final remap own the shared row-version metadata. A write prepared before capture
+in bounded turns. Capture and final remapping acquire the shared version owner
+and every row map before reading or changing locations. A busy map releases the
+already acquired maps and version owner before waiting. Preflight and application
+use that same complete set, so publication cannot stop midway to acquire a map.
+A write prepared before capture
 moves its unpublished input into the append tail; writes after capture already
 use that tail. Relocation copies later appends before publishing. If the tail
 advances again, publication requests another copy turn without changing row
@@ -763,9 +769,14 @@ the buffer switch. Table retirement clears its rows through version ownership;
 a replaced slot's new rows survive publication. A held table definition does
 not keep copying or unrelated publication waiting.
 
-The two heap buffers and coordination controls are charged at startup. The
-existing relocation scratch now stores typed source/destination entries.
-Exhaustion returns 54000: "heap compaction scratch overflow", "row heap relocation
+The two heap buffers and coordination controls are charged at startup.
+Relocation scratch stores typed source/destination entries. A separate mutex and
+arena reserve one optional row-map write guard per physical table slot
+(`max_tables + 1`), plus alignment. Sizing and construction charge the exact
+guard and control sizes. Scoped owners release every guard on contention or
+error; the arena resets before reuse. An undersized workspace returns 54000,
+"heap row-map ownership workspace exhausted", without running publication.
+Exhaustion also returns 54000: "heap compaction scratch overflow", "row heap relocation
 buffers are retained by readers", or "row heap relocation is already active".
 Cancellation releases the private buffer and capture boundary. Exclusive
 callers can still compact an unretained active buffer in place when an older
@@ -795,11 +806,24 @@ existing 85% critical heap threshold, automatic checkpointing also finishes
 publication and cleanup before dispatch resumes, preserving headroom for the
 next write. This pressure path can still delay connections.
 
-Evicting redundant saved-row metadata evaluates each map entry once, without
-rescanning earlier entries after every 512 removals. Pending changes, retained
-history, heap rows, deletion markers and unpublished saved rows stay resident.
-The walk handles collision chains that wrap around the fixed map without
-allocating or weakening lookup correctness. It still completes in one server turn.
+Post-checkpoint history release and row eviction use shared storage access.
+Each table's definition, installed files, version pool and row map are protected
+where needed; waiting releases earlier owners. Durable history release preserves
+versions newer than the installed boundary. Local history pruning checks current
+readers under the same registry owner used for admission, including for temporary
+tables. Temporary eviction still requires the exact captured table generation.
+
+Removing redundant saved-row metadata and already published deletion markers
+evaluates each map entry once, including collision chains that wrap around.
+Pending changes and retained history stay resident. Ordinary eviction also keeps
+heap rows, deletion markers and unpublished saved rows; deletion-marker cleanup
+still requires exclusive storage during publication. These walks complete within
+one server turn.
+
+**User example:** cleanup can release an order's old metadata while a report
+keeps its already selected total of 10, another transaction saves a total of 20,
+and an unrelated table accepts a write. These storage ownership rules do not
+enable parallel SQL statement execution.
 
 The startup relocation workspace owns its scratch, preparation state and copy
 controls across turns; their exact sizes are charged at startup. Moving the

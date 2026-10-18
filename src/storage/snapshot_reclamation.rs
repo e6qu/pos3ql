@@ -34,6 +34,17 @@ impl SnapshotReclamation {
     }
 }
 
+struct SnapshotRowOwners<'storage> {
+    snapshots: std::sync::MutexGuard<'storage, super::SnapshotState>,
+    generations:
+        std::sync::RwLockReadGuard<'storage, super::spill_generations::SpillGenerationList>,
+    versions: std::sync::RwLockWriteGuard<'storage, super::row_versions::RowVersionState>,
+    rows: std::sync::RwLockWriteGuard<
+        'storage,
+        crate::mem::fixed_map::FixedMap<u64, super::RowState>,
+    >,
+}
+
 impl Storage {
     pub(super) fn prune_snapshot_versions(&self) {
         // Serialize only cleanup scratch. Callers release the registry before
@@ -81,13 +92,29 @@ impl Storage {
         rowids.clear();
     }
 
+    fn try_snapshot_row_owners(
+        &self,
+        table: usize,
+    ) -> Result<SnapshotRowOwners<'_>, super::row_ownership::LockWait<'_>> {
+        Ok(SnapshotRowOwners {
+            snapshots: super::row_ownership::try_mutex(
+                &self.snapshots,
+                "snapshot state lock poisoned",
+            )?,
+            generations: self.tables[table].spill_generations.try_read_for_batch()?,
+            versions: self.row_versions.try_write_for_batch()?,
+            rows: self.tables[table].rows.try_write_for_batch()?,
+        })
+    }
+
     fn prune_snapshot_row_batch(&self, table: usize, rowids: &[u64]) {
-        // Match capture ordering: generations precede version and map guards.
-        // Recheck retention each batch; it may change while the guards release.
-        let snapshots = self.snapshot_state();
-        let generations = self.tables[table].spill_generations();
-        let mut versions = self.row_versions.write();
-        let mut rows = self.tables[table].rows.write();
+        // Recheck retention after every wait and between bounded row batches.
+        let SnapshotRowOwners {
+            snapshots,
+            generations,
+            mut versions,
+            mut rows,
+        } = super::row_ownership::acquire(|| self.try_snapshot_row_owners(table));
         let oldest = snapshots.oldest();
         for rowid in rowids {
             let Some(state) = rows.get_mut(rowid) else {
@@ -136,6 +163,62 @@ mod tests {
             .unwrap();
         storage.set_lsn(7);
         (storage, first, second)
+    }
+
+    #[test]
+    fn row_lock_owners_snapshot_cleanup_releases_globals_on_a_busy_row_map() {
+        let (storage, first, second) = fixture();
+        crate::mem::guard::forbid_alloc(|| {
+            storage.register_snapshot(99, 7).unwrap();
+            let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
+            storage
+                .write_pending_image_untracked(first, 1, 8, 1, Some(image))
+                .unwrap();
+            storage.commit_row(first, 1, 8, 9).unwrap();
+            storage.observe_lsn(9);
+            let selected = storage.resident_row_state(first, 1).unwrap().unwrap();
+            let retained = storage
+                .visible_row_home_at(first, 1, selected, 99, SNAPSHOT_ALL, 7)
+                .unwrap()
+                .unwrap();
+
+            let held = storage.tables[first].rows.write();
+            assert_eq!(held.get(&1).unwrap().history.len(), 1);
+            // Force the pruning stage itself to contend, after it attempted
+            // registry and version ownership, rather than blocking capture.
+            let wait = storage.try_snapshot_row_owners(first).err().unwrap();
+            assert!(storage.snapshots.try_lock().is_ok());
+            assert!(storage.row_versions.test_write().is_ok());
+
+            let image = storage.heap.append_row_image(&[Datum::Int4(30)]).unwrap();
+            let undo = storage
+                .write_pending_image_untracked(second, 1, 10, 1, Some(image))
+                .unwrap();
+            storage.restore_pending(second, 1, 10, undo);
+            assert!(storage.tables[second].rows.is_empty());
+            drop(wait);
+            drop(held);
+
+            storage.prune_snapshot_row_batch(first, &[1]);
+            assert_eq!(storage.tables[first].rows.get(&1).unwrap().history.len(), 1);
+            storage.release_snapshot(99);
+            assert!(
+                storage.tables[first]
+                    .rows
+                    .get(&1)
+                    .unwrap()
+                    .history
+                    .is_empty()
+            );
+            storage
+                .with_row_bytes(first, 1, retained, |bytes| {
+                    let mut values = [Datum::Null];
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                    assert_eq!(values[0], Datum::Int4(1));
+                    Ok(())
+                })
+                .unwrap();
+        });
     }
 
     #[test]

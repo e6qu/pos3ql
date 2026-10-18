@@ -336,13 +336,22 @@ impl Storage {
             track_statistics,
         } = prepared;
         let table = target.table;
-        let snapshots = self.snapshot_state();
-        let definition = match self.tables[table].definition.try_read() {
-            Ok(definition) => definition,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Ok(PendingPublication::DefinitionBusy);
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => panic!("table definition lock poisoned"),
+        let owners = super::row_ownership::acquire(|| {
+            let snapshots =
+                super::row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")?;
+            let definition = match self.tables[table].definition.try_read() {
+                Ok(definition) => definition,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("table definition lock poisoned")
+                }
+            };
+            let versions = self.row_versions.try_write_for_batch()?;
+            let rows = self.tables[table].rows.try_write_for_batch()?;
+            Ok(Some((snapshots, definition, versions, rows)))
+        });
+        let Some((snapshots, definition, mut versions, mut rows)) = owners else {
+            return Ok(PendingPublication::DefinitionBusy);
         };
         target.validate(definition.identity, change.txid)?;
         if let Some(owner) = definition
@@ -360,9 +369,8 @@ impl Storage {
         // Retention selection and history pruning share registry ownership.
         // A newly registered reader cannot appear between those operations.
         let oldest = snapshots.oldest();
-        // Match reader lock ordering. Never perform byte or object reads while
-        // owning these locks; statistics failure is undone before release.
-        let mut versions = self.row_versions.write();
+        // Never perform byte or object reads while owning publication guards;
+        // statistics failure is undone before releasing the selected version.
         // The owned bytes remain pinned until publication releases its owners.
         // Never put an old allocation's location into the current row maps.
         if image
@@ -371,7 +379,6 @@ impl Storage {
         {
             return Ok(PendingPublication::Retry);
         }
-        let mut rows = self.tables[table].rows.write();
         let current = rows.get(&rowid).copied();
         if let Some(owner) = current.and_then(|state| {
             pending_last(&versions.pending_row_versions, state.pending)
@@ -448,8 +455,12 @@ impl Storage {
 
     /// Undo checks and removes one exact head under the same publication locks.
     pub fn restore_pending(&self, table: usize, rowid: u64, txid: u32, undo: PendingWriteUndo) {
-        let mut versions = self.row_versions.write();
-        let mut rows = self.tables[table].rows.write();
+        let (mut versions, mut rows) = super::row_ownership::acquire(|| {
+            Ok((
+                self.row_versions.try_write_for_batch()?,
+                self.tables[table].rows.try_write_for_batch()?,
+            ))
+        });
         Self::restore_pending_locked(&mut versions, &mut rows, rowid, txid, undo);
     }
 

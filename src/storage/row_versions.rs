@@ -98,12 +98,21 @@ impl RowVersionPools {
         })
     }
 
-    pub(super) fn read(&self) -> RwLockReadGuard<'_, RowVersionState> {
-        self.state.read().expect("row-version pool lock poisoned")
+    pub(super) fn try_read_for_batch(
+        &self,
+    ) -> Result<RwLockReadGuard<'_, RowVersionState>, super::row_ownership::LockWait<'_>> {
+        super::row_ownership::try_read(&self.state, "row-version pool lock poisoned")
     }
 
-    pub(super) fn write(&self) -> RwLockWriteGuard<'_, RowVersionState> {
-        self.state.write().expect("row-version pool lock poisoned")
+    pub(super) fn try_write_for_batch(
+        &self,
+    ) -> Result<RwLockWriteGuard<'_, RowVersionState>, super::row_ownership::LockWait<'_>> {
+        super::row_ownership::try_write(&self.state, "row-version pool lock poisoned")
+    }
+
+    #[cfg(test)]
+    pub(super) fn read(&self) -> RwLockReadGuard<'_, RowVersionState> {
+        self.state.read().expect("row-version pool lock poisoned")
     }
 
     #[cfg(test)]

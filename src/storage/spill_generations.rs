@@ -253,6 +253,12 @@ impl SpillGenerationRoster {
         })
     }
 
+    pub(super) fn try_read_for_batch(
+        &self,
+    ) -> Result<RwLockReadGuard<'_, SpillGenerationList>, super::row_ownership::LockWait<'_>> {
+        super::row_ownership::try_read(&self.state, "table SST generation lock poisoned")
+    }
+
     pub(super) fn read(&self) -> RwLockReadGuard<'_, SpillGenerationList> {
         self.state
             .read()

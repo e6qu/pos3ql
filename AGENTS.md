@@ -10,7 +10,8 @@ Leave every file better than you found it. Fix every bug you encounter, includin
 ## Engineering rules
 
 - Match vanilla PostgreSQL strictly at SQL and wire boundaries. Reject unsupported client-visible behavior loudly; never accept and ignore it.
-- Do not use silent fallbacks. Retries and backoff are not fallbacks.
+- Do not use silent fallbacks or add needless wrappers. Prefer explicit settings and arguments to hidden choices or implicit defaults. Retries and backoff must preserve the requested behavior.
+- Backward compatibility with earlier pos3ql versions is not required. Preserve PostgreSQL compatibility and reject unsupported stored formats explicitly.
 - Fix bug classes structurally: use types, parse boundaries, and choke points that make invalid states unrepresentable.
 - Runtime memory is fixed at startup. No post-startup heap allocation, growing pools, or allocating sorts. Exhaustion is a named error. Runtime dependencies are `libc` and the isolated, budgeted rustls object-store TLS component.
 - Object storage is the durable tier. RAM and disk are caches. Do not add provider-specific behavior above the provider-neutral storage contract.

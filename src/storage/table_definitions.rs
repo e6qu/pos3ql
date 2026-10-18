@@ -101,6 +101,12 @@ impl TableDefinition {
             .candidate(scope, database, schema, name)
     }
 
+    pub(super) fn try_read_for_batch(
+        &self,
+    ) -> Result<RwLockReadGuard<'_, DefinitionState>, super::row_ownership::LockWait<'_>> {
+        super::row_ownership::try_read(&self.state, "table definition lock poisoned")
+    }
+
     pub(super) fn read(&self) -> RwLockReadGuard<'_, DefinitionState> {
         self.state.read().expect("table definition lock poisoned")
     }

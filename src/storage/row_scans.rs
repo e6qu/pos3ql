@@ -108,13 +108,21 @@ impl Storage {
         crate::sql::query::check_timeout()?;
         let (source, records, generation) = {
             let table = &self.tables[table_slot];
-            let definition = table.definition.read();
-            let publication = table.publication();
-            let generations = table.spill_generations();
-            // Version ownership precedes the row map, matching pending writes.
-            // These guards end before saved-file lookup or any visitor runs.
-            let versions = self.row_versions.read();
-            let rows = table.rows.read();
+            // A contended table releases every earlier owner before waiting.
+            // No byte lookup or visitor runs during acquisition.
+            let (definition, publication, generations, versions, rows) =
+                super::row_ownership::acquire(|| {
+                    Ok((
+                        table.definition.try_read_for_batch()?,
+                        super::row_ownership::try_mutex(
+                            &table.publication,
+                            "table publication lock poisoned",
+                        )?,
+                        table.spill_generations.try_read_for_batch()?,
+                        self.row_versions.try_read_for_batch()?,
+                        table.rows.try_read_for_batch()?,
+                    ))
+                });
             let image = SpillGenerationImage::capture(
                 &definition,
                 publication.generation,

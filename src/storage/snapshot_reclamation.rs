@@ -605,6 +605,14 @@ mod tests {
             assert!(storage.snapshot_reclamation.workspace.lock().unwrap().retry);
             assert!(!storage.snapshot_state().statement_reclamation_pending);
             storage.prune_released_statement_snapshots();
+            assert_eq!(storage.tables[first].rows.get(&1).unwrap().history.len(), 1);
+            let workspace = storage.snapshot_reclamation.workspace.lock().unwrap();
+            assert!(!workspace.retry);
+            assert!(workspace.rowids.is_empty());
+            drop(workspace);
+            drop(reader);
+            assert!(storage.snapshot_state().statement_reclamation_pending);
+            storage.prune_released_statement_snapshots();
             assert!(
                 storage.tables[first]
                     .rows
@@ -613,10 +621,7 @@ mod tests {
                     .history
                     .is_empty()
             );
-            let workspace = storage.snapshot_reclamation.workspace.lock().unwrap();
-            assert!(!workspace.retry);
-            assert!(workspace.rowids.is_empty());
-            drop(workspace);
+            assert!(!storage.snapshot_state().statement_reclamation_pending);
             storage
                 .with_row_bytes(first, 1, image, |bytes| {
                     let mut values = [Datum::Null];
@@ -625,7 +630,6 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            drop(reader);
         });
     }
 

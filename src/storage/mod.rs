@@ -336,10 +336,10 @@ impl PublicationFilters {
     }
 }
 
-/// Durable per-object definition lists that still use the manifest v14 inline
-/// shape carry at most this many items. Constraint positions also determine
-/// stable catalog and trigger OIDs, so changing this stride requires a durable
-/// format and OID migration. Wider DDL is rejected before catalog mutation.
+/// Inline durable definition lists carry at most this many items. Constraint
+/// positions also determine catalog and trigger OIDs; changing this stride
+/// requires checking identity ranges and the durable representation.
+/// Wider DDL is rejected before catalog mutation.
 pub(crate) const MAX_DEFINITION_ITEMS: usize = 64;
 /// Nested row-state walk cursors (spill-merge recursion during DML) lease
 /// from this startup-sized pool.
@@ -33560,25 +33560,6 @@ impl Storage {
     pub(crate) fn mark_value_bindings_dirty(&mut self, table_index: usize) {
         let dirty_lsn = self.lsn().saturating_add(1);
         self.mark_value_bindings_rebuild_at(table_index, dirty_lsn);
-    }
-
-    /// Old enum generations hashed labels. Retire them explicitly when loading
-    /// a legacy root; their replacement hashes are independent of label edits.
-    pub(crate) fn retire_legacy_enum_indexes(&mut self) {
-        let dirty_lsn = self.lsn().saturating_add(1);
-        for table in self.tables.iter() {
-            let mut publication = table.publication();
-            for enforcer in publication.enforcers.iter_mut().flatten() {
-                if enforcer.key_types[..enforcer.n_cols].iter().any(|ctype| {
-                    matches!(ctype, ColType::Enum(_)) || matches!(ctype, ColType::Array(element) if matches!(element.to_coltype(), ColType::Enum(_)))
-                }) {
-                    enforcer.durable = None;
-                    enforcer.durable_dirty = true;
-                    enforcer.durable_rebuild = true;
-                    enforcer.durable_dirty_lsn = dirty_lsn;
-                }
-            }
-        }
     }
 
     pub(crate) fn mark_value_bindings_changed_at(&mut self, table_index: usize, dirty_lsn: u64) {

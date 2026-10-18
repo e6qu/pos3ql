@@ -22,6 +22,9 @@ clear errors. Memory reservations must not grow after startup to rescue a query.
 Use explicit settings and arguments for consequential choices; avoid needless
 wrappers and fallbacks. Earlier pos3ql versions are not compatibility targets.
 PostgreSQL SQL and wire behavior remain compatibility requirements.
+Checkpoint recovery uses one current manifest grammar and requires explicit
+identity and allocator metadata. Invalid roots fail before restoration or
+publication; recovery remains covered from empty caches.
 
 ## Where we are
 

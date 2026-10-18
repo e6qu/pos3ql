@@ -66,6 +66,7 @@ mod ephemeral;
 mod memory;
 mod navigation;
 mod object;
+mod shared;
 mod sst;
 mod tiered;
 mod value;
@@ -81,6 +82,7 @@ pub(crate) use ephemeral::EphemeralBlockStore;
 #[cfg(test)]
 pub(crate) use memory::MemoryBlockStore;
 pub(crate) use object::OwnedObjectStore;
+pub(crate) use shared::SharedBlockStore;
 pub(crate) use sst::copy_pax_v2_row_from_extents;
 pub(crate) use sst::{
     DataBlockLookahead, DataBlockRef, PaxLayout, RowSstFormat, SstCursor, SstHandle, SstIndexLeaf,

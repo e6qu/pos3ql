@@ -74,6 +74,9 @@ through changes and replacement. Reservations and history limits are fixed at
 startup. Table creation, uncommitted table edits, name lookup and changes to type
 references use ownership for each selected table. Waiting for one definition
 keeps shared allocators and catalogs available for unrelated storage work.
+Domain, enum and composite creation and moves share one name-reservation check,
+including transaction waits and journal replay. This does not yet coordinate
+publication of a complete type change and all its references.
 Selected enum definitions retain their label images through alteration,
 rollback, drop, slot reuse, replay and database retirement. Readers and
 iterators keep the fixed label buffers alive independently of storage; type commits
@@ -127,8 +130,12 @@ replacing a suspended reader's socket, bytes or error. A write that needs an
 uncached block still waits synchronously and can download the same block again.
 A paused report keeps the same data view, start time and timeout until it
 finishes; resuming does not start a fresh statement.
-Its selected saved row files stay protected after a scan, nested call or
-statement arena is released; their owners follow the statement through waits.
+Its selected saved row and index files stay protected after a scan, nested call
+or statement arena is released; their owners follow the statement through waits.
+An index's saved files are protected before its published reference can change.
+Index callbacks release the block-store lock before calling nested reads.
+Index eligibility uses that table's binding changes and saved generations;
+an unrelated commit does not switch a paused lookup to a different access path.
 Index and selected-column read buffers retain completed data across waits;
 their verified identities do not depend on shared-cache residency.
 Checkpoint publication and object merges still wait for downloads to finish.
@@ -143,7 +150,8 @@ journal batches remain available until their publication retry completes.
 - Coordinate requests for the same missing block, allow bounded parallel reads
   and prefetch, and release requests correctly on cancellation.
 - Build checkpoint and merge output separately, then publish the new object
-  references in a short, consistent update.
+  references in a short, consistent update. Keep the existing pending-download
+  gate until publication and deletion use the retained row and index owners.
 - Share limited resources fairly among reads, durable commits, and maintenance.
   Delete old objects only after readers and backups release them.
 

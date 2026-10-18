@@ -85,6 +85,9 @@ original predecessor, so the published head ends only at a validated whole
 transaction.
 
 Every process creates a random 128-bit writer incarnation at startup. It first
+reads and validates both mutable root envelopes, including required manifest
+metadata, in its startup buffers. Invalid formats fail before changing the
+writer fence, so they cannot displace the existing writer. It then
 CAS-publishes a transitioning `pos3ql-writer-fence-v1` record, conditionally
 rewrites both mutable roots with its process token, and then CASes the fence to
 active. Missing roots receive token-bearing empty identities. Existing
@@ -97,8 +100,9 @@ then advances both root ETags before it can become active. The final active CAS
 is the ownership-transfer point; a failed or starved transition grants no new
 owner. Thus a request begun before promotion either lands and is preserved by
 the successor's rewrite, or arrives later with a stale ETag and fails.
-An interrupted transition is taken over and completed by the next
-startup.
+Both roots are read again during fencing, so commits arriving after preflight
+are preserved. Once a valid promotion starts, an interrupted transition is taken
+over and completed by the next startup.
 
 Commit-head v1 readers accept both legacy 64-bit writer labels and current
 128-bit process tokens. A prefix without `writer-fence` is promoted in place.

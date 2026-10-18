@@ -14810,6 +14810,13 @@ fn promote_writer(
     manifest: &mut FixedBuf,
     head: &mut FixedBuf,
 ) -> Result<WriterFence, CheckpointSetupError> {
+    // Reject incompatible or malformed root records before displacing a writer.
+    // Publication re-reads them after fencing so intervening commits are preserved.
+    let _ = read_mutable_root(client, MutableRoot::Manifest, manifest)?;
+    retag_manifest_root(manifest, token)?;
+    let _ = read_mutable_root(client, MutableRoot::CommitHead, head)?;
+    retag_commit_head_root(head, token)?;
+
     let current = match client.get(WRITER_FENCE_KEY, None) {
         Ok(result) => {
             parse_writer_fence(client.body_bytes()).map_err(CheckpointSetupError::Corrupt)?;
@@ -14828,14 +14835,8 @@ fn promote_writer(
         .map_or(Precondition::IfNoneMatchAny, Precondition::IfMatch);
     let transition_etag = put_fence_record(client, transition.as_str().as_bytes(), condition)?;
 
-    fence_mutable_root(client, MANIFEST_KEY, manifest, token, MutableRoot::Manifest)?;
-    fence_mutable_root(
-        client,
-        COMMIT_HEAD_KEY,
-        head,
-        token,
-        MutableRoot::CommitHead,
-    )?;
+    fence_mutable_root(client, MutableRoot::Manifest, manifest, token)?;
+    fence_mutable_root(client, MutableRoot::CommitHead, head, token)?;
 
     let active = writer_fence_record("active", token);
     let etag = put_fence_record(
@@ -14902,6 +14903,15 @@ fn assert_writer_fence(
 enum MutableRoot {
     Manifest,
     CommitHead,
+}
+
+impl MutableRoot {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Manifest => MANIFEST_KEY,
+            Self::CommitHead => COMMIT_HEAD_KEY,
+        }
+    }
 }
 
 fn root_writer(root: MutableRoot, bytes: &[u8]) -> Option<WriterToken> {
@@ -14976,13 +14986,13 @@ fn retag_commit_head_root(
 
 fn fence_mutable_root(
     client: &mut ObjectStore,
-    key: &str,
+    root: MutableRoot,
     scratch: &mut FixedBuf,
     token: WriterToken,
-    root: MutableRoot,
 ) -> Result<EntityTag, CheckpointSetupError> {
+    let key = root.key();
     for _ in 0..16 {
-        let current = read_mutable_root(client, key, scratch)?;
+        let current = read_mutable_root(client, root, scratch)?;
         match root {
             MutableRoot::Manifest => retag_manifest_root(scratch, token)?,
             MutableRoot::CommitHead => retag_commit_head_root(scratch, token)?,
@@ -14993,7 +15003,7 @@ fn fence_mutable_root(
         match client.put(key, scratch.readable(), condition) {
             Ok(etag) => return Ok(etag),
             Err(error) => {
-                let refreshed = read_mutable_root(client, key, scratch)?;
+                let refreshed = read_mutable_root(client, root, scratch)?;
                 if let Some(etag) = refreshed
                     && root_writer(root, scratch.readable()) == Some(token)
                 {
@@ -15018,9 +15028,10 @@ fn fence_mutable_root(
 
 fn read_mutable_root(
     client: &mut ObjectStore,
-    key: &str,
+    root: MutableRoot,
     out: &mut FixedBuf,
 ) -> Result<Option<EntityTag>, CheckpointSetupError> {
+    let key = root.key();
     out.clear();
     let window = client.response_capacity();
     if window == 0 {
@@ -15055,6 +15066,12 @@ fn read_mutable_root(
                 etag = Some(result.etag);
             }
             Err(ObjectError::Status { code: 416, .. }) if etag.is_some() => break,
+            Err(ObjectError::Status { code: 416, .. }) => {
+                return Err(CheckpointSetupError::Corrupt(match root {
+                    MutableRoot::Manifest => "manifest root is empty",
+                    MutableRoot::CommitHead => "commit-head root is empty",
+                }));
+            }
             Err(error) if error.is_not_found() && etag.is_none() => return Ok(None),
             Err(error) => {
                 return Err(CheckpointSetupError::ObjectStore(format!(
@@ -15063,7 +15080,12 @@ fn read_mutable_root(
             }
         }
         let bytes = client.body_bytes();
-        if bytes.is_empty() || !out.append(bytes) {
+        if bytes.is_empty() {
+            return Err(CheckpointSetupError::ObjectStore(format!(
+                "read {key} for writer promotion: empty successful range response"
+            )));
+        }
+        if !out.append(bytes) {
             return Err(CheckpointSetupError::ObjectStore(format!(
                 "{key} exceeds its configured root buffer ({})",
                 out.capacity()

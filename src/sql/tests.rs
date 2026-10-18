@@ -75899,21 +75899,21 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
     );
-    let roots = ["commit-head", "writer-fence"].map(|key| {
+    let roots = [
+        crate::checkpoint::MANIFEST_KEY,
+        "commit-head",
+        "writer-fence",
+    ]
+    .map(|key| {
         let full_key = format!("{}{key}", config.object_store_prefix);
         let bytes = namespace.borrow().object_bytes(&full_key).unwrap().to_vec();
-        (full_key, bytes)
+        (key, bytes)
     });
     let object_count = namespace.borrow().object_count();
-    drop(engine);
-
-    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut candidate = config.clone();
+    candidate.data_dir = format!("{}-candidate", config.data_dir);
     let mut client_budget = Budget::new(2 << 20);
     let mut client = crate::object_store::Client::new(&config, &mut client_budget).unwrap();
-    let mut etag = client
-        .get(crate::checkpoint::MANIFEST_KEY, None)
-        .unwrap()
-        .etag;
     let (_, body) = core::str::from_utf8(&current)
         .unwrap()
         .split_once('\n')
@@ -75963,18 +75963,44 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         format!("{current_text}lsn 0\n"),
         "trailing manifest records",
     ));
-    for (rejected, expected) in rejected_roots {
-        etag = client
+    let mut rejected_records = rejected_roots
+        .into_iter()
+        .map(|(body, message)| (crate::checkpoint::MANIFEST_KEY, body, message))
+        .collect::<Vec<_>>();
+    rejected_records.extend([
+        (
+            crate::checkpoint::MANIFEST_KEY,
+            String::new(),
+            "manifest root is empty",
+        ),
+        (
+            "commit-head",
+            "pos3ql-commit-head-v99\nend\n".to_string(),
+            "bad commit-head header",
+        ),
+        ("commit-head", String::new(), "commit-head root is empty"),
+        (
+            "writer-fence",
+            "pos3ql-writer-fence-v99\nend\n".to_string(),
+            "bad writer fence header",
+        ),
+    ]);
+    for (key, rejected, expected) in rejected_records {
+        let etag = client.get(key, None).unwrap().etag;
+        let changed = client
             .put(
-                crate::checkpoint::MANIFEST_KEY,
+                key,
                 rejected.as_bytes(),
                 crate::object_store::Precondition::IfMatch(&etag),
             )
             .unwrap();
-        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
-        let error = Engine::new(&config, &mut budget)
+        if std::path::Path::new(&candidate.data_dir).exists() {
+            std::fs::remove_dir_all(&candidate.data_dir).unwrap();
+        }
+        let mut budget = test_engine_budget(&candidate, test_engine_budget_bytes(1 << 28));
+        let error = Engine::new(&candidate, &mut budget)
             .err()
-            .expect("unsupported manifest must reject startup");
+            .expect("invalid saved root must reject startup");
         assert!(
             matches!(
                 error,
@@ -75982,25 +76008,44 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
                     message
                 )) if message == expected
             ),
-            "{error:?}"
+            "{key}: {error:?}"
         );
-        let saved = namespace.borrow();
-        assert_eq!(saved.object_bytes(&manifest_key), Some(rejected.as_bytes()));
-        assert_eq!(saved.object_count(), object_count);
-        for (key, bytes) in &roots {
-            assert_eq!(saved.object_bytes(key), Some(bytes.as_slice()));
+        {
+            let saved = namespace.borrow();
+            assert_eq!(saved.object_count(), object_count);
+            for (saved_key, bytes) in &roots {
+                let full_key = format!("{}{saved_key}", config.object_store_prefix);
+                let expected_bytes = if *saved_key == key {
+                    rejected.as_bytes()
+                } else {
+                    bytes.as_slice()
+                };
+                assert_eq!(
+                    saved.object_bytes(&full_key),
+                    Some(expected_bytes),
+                    "rejected {key} must not rewrite {saved_key}"
+                );
+            }
         }
+        let original = &roots
+            .iter()
+            .find(|(saved_key, _)| *saved_key == key)
+            .unwrap()
+            .1;
+        client
+            .put(
+                key,
+                original,
+                crate::object_store::Precondition::IfMatch(&changed),
+            )
+            .unwrap();
+        engine.verify_writer_ownership().unwrap();
     }
-    client
-        .put(
-            crate::checkpoint::MANIFEST_KEY,
-            &current,
-            crate::object_store::Precondition::IfMatch(&etag),
-        )
-        .unwrap();
     drop(client);
-    if std::path::Path::new(&config.data_dir).exists() {
-        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    if std::path::Path::new(&candidate.data_dir).exists() {
+        std::fs::remove_dir_all(&candidate.data_dir).unwrap();
     }
 
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));

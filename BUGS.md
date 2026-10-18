@@ -8,7 +8,8 @@ No externally blocked defects are currently recorded. Remaining work, including
 complete type publication, bounded heap capture/remapping and cleanup walks,
 checkpoint coordination, object deletion and execution workers, belongs in PLAN.md.
 Completed contracts, accepted storage formats and explicit type limits belong
-in their owning technical guides. Unsupported older pos3ql versions are not defects.
+in their owning technical guides. Startup format errors must preserve existing
+writer ownership. Unsupported older pos3ql versions are not defects.
 
 For a new entry, include a reproducer, affected boundary, observed behavior,
 and the specific blocker that prevents a fix. Remove it when repaired; preserve

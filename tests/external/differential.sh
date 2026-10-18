@@ -460,7 +460,7 @@ if [[ -x "$ROOT_VENV/bin/python" ]]; then
     cat "$WORK/binary-param.out"
   fi
   if "$ROOT_VENV/bin/python" "$EXT/type_database_isolation_diff.py" \
-       --pg "$PG_PORT" --p3 "$P3_PORT" > "$WORK/type-database-isolation.out" 2>&1; then
+       --pg "$PG_PORT" --p3 "$P3_PORT" 2>&1 | tee "$WORK/type-database-isolation.out"; then
     ok "database-local type references and enum catalog snapshots"
     cat "$WORK/type-database-isolation.out"
   else

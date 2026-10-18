@@ -8653,7 +8653,7 @@ impl Checkpointer {
                 hex(&mut self.manifest_buf, m.label.as_str()).map_err(|_| manifest_full())?;
                 write!(&mut self.manifest_buf, " {}", m.sort.to_bits())
                     .map_err(|_| manifest_full())?;
-                if self.manifest_write_format == ManifestFormat::V15 {
+                if manifest_format == ManifestFormat::V15 {
                     write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
                     match m.legacy_label {
                         Some(label) => hex(&mut self.manifest_buf, label.as_str())

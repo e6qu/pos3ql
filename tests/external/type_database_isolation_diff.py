@@ -63,8 +63,9 @@ def exercise(host, port, user):
 
 def exercise_enum_snapshot(host, port, user):
     """Catalog label changes must not depend on a row's transaction version."""
-    settings = dict(host=host, port=port, user=user, autocommit=True)
+    settings = dict(host=host, port=port, user=user, autocommit=True, connect_timeout=5)
     name = "enum_catalog_snapshot"
+    print(f"Enum snapshot setup on port {port}", flush=True)
     with psycopg.connect(**settings, dbname="postgres") as admin:
         admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(name)))
         admin.execute(sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(sql.Identifier(name)))
@@ -79,10 +80,12 @@ def exercise_enum_snapshot(host, port, user):
                         "CREATE TABLE orders (id integer PRIMARY KEY, state status); "
                         "INSERT INTO orders VALUES (1, 'old')",
                     )
+                    print(f"Enum snapshot rename on port {port}", flush=True)
                     execute(reader, "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM orders")
                     execute(writer, "ALTER TYPE status RENAME VALUE 'old' TO 'new'")
                     renamed = execute(reader, "SELECT state::text FROM orders WHERE id = 1")
                     execute(reader, "ROLLBACK")
+                    print(f"Enum snapshot renumbering on port {port}", flush=True)
                     execute(writer, "CREATE TYPE ordered_status AS ENUM ('low', 'high'); "
                             "CREATE TABLE ordered_orders (id integer PRIMARY KEY, state ordered_status); "
                             "INSERT INTO ordered_orders VALUES (1, 'high')")
@@ -108,10 +111,12 @@ def main():
     parser.add_argument("--p3", type=int, required=True)
     parser.add_argument("--user", default="postgres")
     args = parser.parse_args()
+    print("Checking PostgreSQL database-local type moves", flush=True)
     reference = exercise(args.host, args.pg, args.user), exercise_enum_snapshot(
         args.host, args.pg, args.user
     )
     print("PostgreSQL enum catalog snapshot results:", reference[1], flush=True)
+    print("Checking pos3ql database-local type moves", flush=True)
     actual = exercise(args.host, args.p3, args.user), exercise_enum_snapshot(
         args.host, args.p3, args.user
     )

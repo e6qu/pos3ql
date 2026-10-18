@@ -1,4 +1,4 @@
-name: Nested enum verification
+name: Enum value verification
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
           key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - run: cargo clean -p pos3ql
-      - run: python3 tools/test_command.py cargo test --locked --lib enum_nested_values_ -- --test-threads=1
+      - run: python3 tools/test_command.py cargo test --locked --lib enum_value_identity_ -- --test-threads=1
 
   postgresql:
     runs-on: ubuntu-latest
@@ -62,5 +62,5 @@ jobs:
           POS3QL_REFERENCE_PG_PORT: "5432"
           POS3QL_REFERENCE_PSQL: psql
           POS3QL_DIFF_CORPUS_SHARD: "174-of-209"
-          POS3QL_DIFF_AUXILIARY: none
+          POS3QL_DIFF_AUXILIARY: types
         run: bash tests/external/differential.sh

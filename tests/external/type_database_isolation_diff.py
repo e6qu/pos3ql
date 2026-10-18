@@ -61,6 +61,46 @@ def exercise(host, port, user):
                 admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(name)))
 
 
+def exercise_enum_snapshot(host, port, user):
+    """Catalog label changes must not depend on a row's transaction version."""
+    settings = dict(host=host, port=port, user=user, autocommit=True)
+    name = "enum_catalog_snapshot"
+    with psycopg.connect(**settings, dbname="postgres") as admin:
+        admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(name)))
+        admin.execute(sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(sql.Identifier(name)))
+        try:
+            with psycopg.connect(**settings, dbname=name) as writer:
+                with psycopg.connect(**settings, dbname=name) as reader:
+                    execute(writer, "SET statement_timeout = '5s'")
+                    execute(reader, "SET statement_timeout = '5s'")
+                    execute(
+                        writer,
+                        "CREATE TYPE status AS ENUM ('old', 'ready'); "
+                        "CREATE TABLE orders (id integer PRIMARY KEY, state status); "
+                        "INSERT INTO orders VALUES (1, 'old')",
+                    )
+                    execute(reader, "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM orders")
+                    execute(writer, "ALTER TYPE status RENAME VALUE 'old' TO 'new'")
+                    renamed = execute(reader, "SELECT state::text FROM orders WHERE id = 1")
+                    execute(reader, "ROLLBACK")
+                    execute(writer, "CREATE TYPE ordered_status AS ENUM ('low', 'high'); "
+                            "CREATE TABLE ordered_orders (id integer PRIMARY KEY, state ordered_status); "
+                            "INSERT INTO ordered_orders VALUES (1, 'high')")
+                    execute(reader, "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM ordered_orders")
+                    for index in range(30):
+                        execute(writer, f"ALTER TYPE ordered_status ADD VALUE 'middle_{index}' BEFORE 'high'")
+                    renumbered = execute(
+                        reader,
+                        "SELECT state::text, state = 'high'::ordered_status, "
+                        "state > 'middle_29'::ordered_status "
+                        "FROM ordered_orders WHERE id = 1",
+                    )
+                    execute(reader, "ROLLBACK")
+                    return renamed, renumbered
+        finally:
+            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(name)))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -68,8 +108,13 @@ def main():
     parser.add_argument("--p3", type=int, required=True)
     parser.add_argument("--user", default="postgres")
     args = parser.parse_args()
-    reference = exercise(args.host, args.pg, args.user)
-    actual = exercise(args.host, args.p3, args.user)
+    reference = exercise(args.host, args.pg, args.user), exercise_enum_snapshot(
+        args.host, args.pg, args.user
+    )
+    print("PostgreSQL enum catalog snapshot results:", reference[1], flush=True)
+    actual = exercise(args.host, args.p3, args.user), exercise_enum_snapshot(
+        args.host, args.p3, args.user
+    )
     assert actual == reference, (actual, reference)
     print("PASS: database-local type moves, rollback, columns, signatures and comments")
 

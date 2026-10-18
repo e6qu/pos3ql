@@ -51829,7 +51829,42 @@ fn enums_order_and_enforce() {
 }
 
 #[test]
-fn enum_nested_values_rename_updates_composite_fields_and_arrays() {
+fn enum_value_identity_old_snapshot_uses_renamed_catalog_label() {
+    let config = test_config("enum-old-snapshot-label");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    writer.success(
+        &mut engine,
+        "CREATE TYPE enum_snapshot_state AS ENUM ('old', 'ready'); \
+         CREATE TABLE enum_snapshot_orders (id integer PRIMARY KEY, state enum_snapshot_state); \
+         INSERT INTO enum_snapshot_orders VALUES (1, 'old')",
+        true,
+    );
+    reader.success(
+        &mut engine,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM enum_snapshot_orders",
+        true,
+    );
+    writer.success(
+        &mut engine,
+        "ALTER TYPE enum_snapshot_state RENAME VALUE 'old' TO 'new'",
+        true,
+    );
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "SELECT state::text FROM enum_snapshot_orders WHERE id = 1",
+            true,
+        )),
+        ["new"]
+    );
+    reader.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
+fn enum_value_identity_rename_updates_composite_fields_and_arrays() {
     let config = test_config("enum-nested-values");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -51851,6 +51886,117 @@ fn enum_nested_values_rename_updates_composite_fields_and_arrays() {
             true,
         )),
         ["new|new|old"]
+    );
+}
+
+#[test]
+fn enum_value_identity_old_snapshot_uses_current_order_after_renumbering() {
+    let config = test_config("enum-old-snapshot-order");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    writer.success(
+        &mut engine,
+        "CREATE TYPE enum_identity_order AS ENUM ('low', 'high'); \
+         CREATE TABLE enum_identity_ordered_rows (id integer PRIMARY KEY, state enum_identity_order); \
+         INSERT INTO enum_identity_ordered_rows VALUES (1, 'high')",
+        true,
+    );
+    reader.success(
+        &mut engine,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT id FROM enum_identity_ordered_rows",
+        true,
+    );
+    for index in 0..30 {
+        writer.success(
+            &mut engine,
+            &format!("ALTER TYPE enum_identity_order ADD VALUE 'middle_{index}' BEFORE 'high'"),
+            true,
+        );
+    }
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "SELECT state::text, state = 'high'::enum_identity_order, \
+             state > 'middle_29'::enum_identity_order \
+             FROM enum_identity_ordered_rows WHERE id = 1",
+            true,
+        )),
+        ["high|t|t"]
+    );
+    reader.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
+fn enum_value_identity_stored_default_follows_member_rename() {
+    let config = test_config("enum-identity-default");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TYPE enum_identity_state AS ENUM ('old', 'ready'); \
+         CREATE TABLE enum_identity_defaults (state enum_identity_state DEFAULT 'old'); \
+         ALTER TYPE enum_identity_state RENAME VALUE 'old' TO 'new'; \
+         INSERT INTO enum_identity_defaults DEFAULT VALUES",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT state::text FROM enum_identity_defaults",
+            true,
+        )),
+        ["new"]
+    );
+}
+
+#[test]
+fn enum_value_identity_stored_view_follows_member_rename() {
+    let config = test_config("enum-identity-view");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TYPE enum_identity_state AS ENUM ('old', 'ready'); \
+         CREATE VIEW enum_identity_view AS SELECT 'old'::enum_identity_state AS state; \
+         ALTER TYPE enum_identity_state RENAME VALUE 'old' TO 'new'",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT state::text FROM enum_identity_view",
+            true,
+        )),
+        ["new"]
+    );
+}
+
+#[test]
+fn enum_value_identity_domain_check_follows_member_rename() {
+    let config = test_config("enum-identity-domain");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TYPE enum_identity_state AS ENUM ('old', 'ready'); \
+         CREATE DOMAIN enum_identity_domain AS enum_identity_state CHECK (VALUE = 'old'); \
+         CREATE TABLE enum_identity_domains (state enum_identity_domain); \
+         ALTER TYPE enum_identity_state RENAME VALUE 'old' TO 'new'; \
+         INSERT INTO enum_identity_domains VALUES ('new')",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT state::text FROM enum_identity_domains",
+            true,
+        )),
+        ["new"]
     );
 }
 

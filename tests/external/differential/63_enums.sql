@@ -149,6 +149,24 @@ DROP TABLE enum_nested_orders;
 DROP TYPE enum_nested_detail;
 DROP TYPE enum_nested_state;
 
+-- Stored typed constants keep the same member when its label changes.
+CREATE TYPE enum_identity_state AS ENUM ('old', 'ready');
+CREATE TABLE enum_identity_defaults (state enum_identity_state DEFAULT 'old');
+CREATE VIEW enum_identity_view AS SELECT 'old'::enum_identity_state AS state;
+CREATE DOMAIN enum_identity_domain AS enum_identity_state CHECK (VALUE = 'old');
+CREATE TABLE enum_identity_domains (state enum_identity_domain);
+ALTER TYPE enum_identity_state RENAME VALUE 'old' TO 'new';
+INSERT INTO enum_identity_defaults DEFAULT VALUES;
+INSERT INTO enum_identity_domains VALUES ('new');
+SELECT state::text FROM enum_identity_defaults;
+SELECT state::text FROM enum_identity_view;
+SELECT state::text FROM enum_identity_domains;
+DROP TABLE enum_identity_defaults;
+DROP TABLE enum_identity_domains;
+DROP VIEW enum_identity_view;
+DROP DOMAIN enum_identity_domain;
+DROP TYPE enum_identity_state;
+
 -- The type namespace is shared by enums, domains, and named composites.
 CREATE TYPE enum_composite_name AS (id integer);
 ALTER TYPE feeling RENAME TO enum_composite_name;

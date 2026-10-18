@@ -20,8 +20,6 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v13` | yes | no | The next successful checkpoint publishes v15. |
-| Checkpoint manifest | `pos3ql-manifest-v14` | yes | no | The next successful checkpoint publishes v15. |
 | Checkpoint manifest | `pos3ql-manifest-v15` | yes | yes | Current enum member identities and legacy label bindings. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -87,6 +85,9 @@ original predecessor, so the published head ends only at a validated whole
 transaction.
 
 Every process creates a random 128-bit writer incarnation at startup. It first
+reads and validates both mutable root envelopes, including required manifest
+metadata, in its startup buffers. Invalid formats fail before changing the
+writer fence, so they cannot displace the existing writer. It then
 CAS-publishes a transitioning `pos3ql-writer-fence-v1` record, conditionally
 rewrites both mutable roots with its process token, and then CASes the fence to
 active. Missing roots receive token-bearing empty identities. Existing
@@ -99,17 +100,18 @@ then advances both root ETags before it can become active. The final active CAS
 is the ownership-transfer point; a failed or starved transition grants no new
 owner. Thus a request begun before promotion either lands and is preserved by
 the successor's rewrite, or arrives later with a stale ETag and fails.
-An interrupted transition is taken over and completed by the next
-startup.
+Both roots are read again during fencing, so commits arriving after preflight
+are preserved. Once a valid promotion starts, an interrupted transition is taken
+over and completed by the next startup.
 
 Commit-head v1 readers accept both legacy 64-bit writer labels and current
 128-bit process tokens. A prefix without `writer-fence` is promoted in place.
-Its manifest and commit head gain the new writer identity; their referenced
-database state is preserved, but the root bytes and ETags change. Binaries that
-predate writer fencing must be stopped before this first promotion and must not
-subsequently open the prefix, because they do not participate in the fence.
-The current manifest writer line is 16 bytes wider than its legacy form and is
-charged to the existing `checkpoint_manifest_bytes` reservation. The mutable
+Promotion replaces the manifest's validated 32-digit hexadecimal writer identity
+with one of the same width and updates the commit head. Database references
+are preserved while the root bytes and ETags change. A missing manifest writer
+is an error; promotion does not insert one.
+
+The manifest writer line is charged to `checkpoint_manifest_bytes`. The mutable
 root promotion scratch adds one fixed 128-byte startup allocation; publication
 does not allocate after the runtime memory freeze.
 
@@ -132,16 +134,16 @@ counts. Readers retain the preceding publication, trigger, routine, composite,
 and view kinds. Stored-query dependencies use marker `0xfe` for the complete
 column set and retain the `0xff` and legacy readers. Table statistics use the
 v4 marker 253 for 16-bit counts and ordinals while retaining v3 marker 254.
-Manifest v14 keeps its text grammar: sparse column sets parse old one-word
-values, and wide composite fields stream into the configured manifest buffer.
+The current manifest text represents sparse column sets and streams wide
+composite fields into the configured manifest buffer.
 
-Manifest v14 also fixes table constraints at 64 entries per modeled kind and
+Table constraints are fixed at 64 entries per modeled kind and
 domain checks at 64 entries. Their journal counts are unsigned bytes, while
 their positions use a 64-entry stride in synthesized `pg_constraint` and
 referential-trigger OIDs. The 65th entry is rejected with SQLSTATE `54000`
 before catalog mutation. Raising this boundary would renumber durable catalog
-identities, so it requires an explicit format and OID migration rather than a
-constant change.
+identities, so it requires an explicit format identity and a review of catalog
+OID ranges rather than only changing the constant.
 
 ### Enum member identities
 
@@ -260,11 +262,24 @@ required: obsolete readers may be removed without building an offline migration.
 Do not retain a decoder or introduce a conversion fallback solely to support
 an older pos3ql version.
 
-The current implementation still accepts manifests v13 and v14 and row
-generations v2 and v3; new manifests use v15 and new row generations use v4.
-This inventory describes that code without making old formats a future requirement.
-A test compares the executable reader and writer declarations with the matrix,
-so removing an identity requires changing both declarations and tests.
+The only accepted checkpoint manifest is v15. Startup, backup retention, and
+writer promotion share one allocation-free metadata parser. It requires one
+log position, next row identity, latest transaction identity, large-object
+allocator record, nonzero 32-digit hexadecimal writer identity and final
+terminator. Missing, repeated, malformed or trailing metadata fails explicitly,
+before catalog restoration or root publication. Promotion never inserts a
+missing writer identity.
+
+There is no old-manifest writer, mode selector, or conversion that retires enum
+indexes during recovery. Current enum identities and index references are
+restored directly. For example, a saved enum value still reads as its renamed
+label after loss of local caches; changing or removing its saved manifest
+identity stops startup without overwriting that root.
+
+The row readers still accept v2, v3, and v4 as listed above; this manifest change
+does not remove their codecs. A test compares the executable reader and writer
+declarations with the matrix, so changing an identity requires changing both
+declarations and tests.
 
 Recovery within the current version must remain correct: reachable objects,
 prepared transactions, and backup roots written by that version must be readable.

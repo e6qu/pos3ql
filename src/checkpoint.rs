@@ -167,39 +167,138 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-/// Manifest readers are deliberately explicit. A supported legacy manifest is
-/// rewritten as the current format by the next successful checkpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-enum ManifestFormat {
-    V13 = 0,
-    V14 = 1,
-    V15 = 2,
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v15";
+
+struct ManifestMetadata {
+    lsn: u64,
+    next_rowid: u64,
+    latest_transaction_id: u64,
+    next_large_object_oid: Option<crate::sql::ast::LargeObjectId>,
+    writer: WriterToken,
+    writer_range: (usize, usize),
 }
 
-impl ManifestFormat {
-    const CURRENT: Self = Self::V15;
-    const SUPPORTED: [Self; Self::CURRENT as usize + 1] = [Self::V13, Self::V14, Self::V15];
-
-    const fn header(self) -> &'static str {
-        match self {
-            Self::V13 => "pos3ql-manifest-v13",
-            Self::V14 => "pos3ql-manifest-v14",
-            Self::V15 => "pos3ql-manifest-v15",
+fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str> {
+    let (header, body) = text.split_once('\n').ok_or("unsupported manifest format")?;
+    if header != MANIFEST_HEADER {
+        return Err("unsupported manifest format");
+    }
+    let mut lsn = None;
+    let mut next_rowid = None;
+    let mut latest_transaction_id = None;
+    let mut next_large_object_oid = None;
+    let mut writer = None;
+    let mut writer_range = None;
+    let mut ended = false;
+    let mut offset = header.len() + 1;
+    for line in body.split_inclusive('\n') {
+        if ended {
+            return Err("trailing manifest records");
         }
+        let content = line
+            .strip_suffix('\n')
+            .ok_or("manifest has no final terminator")?;
+        let mut words = content.split(' ');
+        let metadata = match words.next() {
+            Some("lsn") => {
+                if lsn.is_some() {
+                    return Err("duplicate manifest LSN");
+                }
+                lsn = Some(
+                    words
+                        .next()
+                        .and_then(|word| word.parse().ok())
+                        .ok_or("bad manifest LSN")?,
+                );
+                true
+            }
+            Some("next_rowid") => {
+                if next_rowid.is_some() {
+                    return Err("duplicate row identity allocator");
+                }
+                next_rowid = Some(
+                    words
+                        .next()
+                        .and_then(|word| word.parse().ok())
+                        .ok_or("invalid row identity allocator")?,
+                );
+                true
+            }
+            Some("latest_transaction_id") => {
+                if latest_transaction_id.is_some() {
+                    return Err("duplicate transaction identity allocator");
+                }
+                latest_transaction_id = Some(
+                    words
+                        .next()
+                        .and_then(|word| word.parse().ok())
+                        .ok_or("invalid transaction identity allocator")?,
+                );
+                true
+            }
+            Some("next_lo_oid") => {
+                if next_large_object_oid.is_some() {
+                    return Err("duplicate large-object allocator");
+                }
+                let value = words.next().ok_or("large-object allocator missing")?;
+                let oid = if value == "-" {
+                    None
+                } else {
+                    Some(
+                        value
+                            .parse::<u32>()
+                            .ok()
+                            .and_then(crate::sql::ast::LargeObjectId::parse)
+                            .ok_or("invalid large-object allocator")?,
+                    )
+                };
+                next_large_object_oid = Some(oid);
+                true
+            }
+            Some("writer") => {
+                if writer.is_some() {
+                    return Err("manifest has an invalid writer identity");
+                }
+                let word = words
+                    .next()
+                    .filter(|word| {
+                        word.len() == 32 && word.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    .ok_or("manifest has an invalid writer identity")?;
+                writer = Some(
+                    u128::from_str_radix(word, 16)
+                        .ok()
+                        .filter(|token| *token != 0)
+                        .map(WriterToken)
+                        .ok_or("manifest has an invalid writer identity")?,
+                );
+                writer_range = Some((offset, offset + content.len()));
+                true
+            }
+            Some("end") => {
+                ended = true;
+                true
+            }
+            _ => false,
+        };
+        if metadata && words.next().is_some() {
+            return Err("trailing manifest metadata fields");
+        }
+        offset += line.len();
     }
-
-    fn parse(header: Option<&str>) -> Result<Self, CheckpointSetupError> {
-        Self::SUPPORTED
-            .iter()
-            .copied()
-            .find(|format| Some(format.header()) == header)
-            .ok_or(CheckpointSetupError::Corrupt("bad manifest header"))
+    if !ended {
+        return Err("manifest has no final terminator");
     }
-
-    const fn has_value_index_identity(self) -> bool {
-        matches!(self, Self::V14 | Self::V15)
-    }
+    Ok(ManifestMetadata {
+        lsn: lsn.ok_or("manifest LSN missing")?,
+        next_rowid: next_rowid.ok_or("manifest lacks row identity allocator")?,
+        latest_transaction_id: latest_transaction_id
+            .ok_or("manifest lacks transaction identity allocator")?,
+        next_large_object_oid: next_large_object_oid
+            .ok_or("manifest lacks large-object allocator")?,
+        writer: writer.ok_or("manifest writer identity missing")?,
+        writer_range: writer_range.ok_or("manifest writer identity missing")?,
+    })
 }
 
 #[cfg(feature = "checkpoint-profile")]
@@ -1063,10 +1162,6 @@ pub(crate) struct Checkpointer {
     /// for a displaced process's write.
     writer_token: WriterToken,
     writer_fence_etag: Option<EntityTag>,
-    /// Legacy output exists only to qualify an actual old-format upgrade.
-    /// Production always writes [`ManifestFormat::CURRENT`].
-    #[cfg(test)]
-    manifest_write_format: ManifestFormat,
 }
 
 /// One beat's outcome: nothing to publish, a slice written, or the manifest
@@ -1878,14 +1973,7 @@ impl Checkpointer {
                 CheckpointSetupError::ObjectStore(format!("create writer token: {error}"))
             })?,
             writer_fence_etag: None,
-            #[cfg(test)]
-            manifest_write_format: ManifestFormat::CURRENT,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn write_v13_manifest_for_test(&mut self) {
-        self.manifest_write_format = ManifestFormat::V13;
     }
 
     #[cfg(test)]
@@ -2820,12 +2908,11 @@ impl Checkpointer {
         storage: &mut Storage,
         text: &str,
     ) -> Result<u64, CheckpointSetupError> {
-        let mut lines = text.lines();
-        let manifest_format = ManifestFormat::parse(lines.next())?;
-        let mut lsn = 0u64;
-        let mut next_rowid = 1u64;
-        let mut latest_transaction_id = None;
-        let mut saw_large_object_allocator = false;
+        let metadata = parse_manifest_metadata(text).map_err(CheckpointSetupError::Corrupt)?;
+        let lsn = metadata.lsn;
+        let next_rowid = metadata.next_rowid;
+        storage.restore_next_large_object_oid(metadata.next_large_object_oid);
+        let lines = text.lines().skip(1);
         let mut database_identities = Vec::with_capacity(storage.database_count());
         let mut system_setting_names = Vec::with_capacity(crate::storage::MAX_SYSTEM_SETTINGS);
         // manifest table index → live slot index
@@ -2857,20 +2944,7 @@ impl Checkpointer {
         for line in lines {
             let mut words = line.split(' ');
             match words.next() {
-                Some("lsn") => {
-                    lsn = parse_field(words.next(), "lsn")?;
-                }
-                Some("next_rowid") => {
-                    next_rowid = parse_field(words.next(), "next_rowid")?;
-                }
-                Some("latest_transaction_id") => {
-                    if latest_transaction_id.is_some() {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "duplicate transaction identity allocator",
-                        ));
-                    }
-                    latest_transaction_id =
-                        Some(parse_field(words.next(), "latest_transaction_id")?);
+                Some("lsn" | "next_rowid" | "latest_transaction_id" | "next_lo_oid" | "writer") => {
                 }
                 Some("transaction_status") => {
                     let transaction_id = parse_field(words.next(), "transaction_status")?;
@@ -2892,35 +2966,6 @@ impl Checkpointer {
                             "invalid retained transaction status",
                         ));
                     }
-                }
-                Some("next_lo_oid") => {
-                    if saw_large_object_allocator {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "duplicate large-object allocator",
-                        ));
-                    }
-                    let value = words.next().ok_or(CheckpointSetupError::Corrupt(
-                        "large-object allocator missing",
-                    ))?;
-                    let oid = if value == "-" {
-                        None
-                    } else {
-                        Some(
-                            crate::sql::ast::LargeObjectId::parse(value.parse::<u32>().map_err(
-                                |_| CheckpointSetupError::Corrupt("invalid large-object allocator"),
-                            )?)
-                            .ok_or(CheckpointSetupError::Corrupt(
-                                "invalid large-object allocator",
-                            ))?,
-                        )
-                    };
-                    if words.next().is_some() {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "trailing large-object allocator fields",
-                        ));
-                    }
-                    storage.restore_next_large_object_oid(oid);
-                    saw_large_object_allocator = true;
                 }
                 Some("dbctx") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
@@ -4534,16 +4579,12 @@ impl Checkpointer {
                         *column = parse_field(words.next(), "vix column")?;
                     }
                     let include_mask = parse_field(words.next(), "vix include mask")?;
-                    let index_created_at = if manifest_format.has_value_index_identity() {
-                        match words
-                            .next()
-                            .ok_or(CheckpointSetupError::Corrupt("vix index identity"))?
-                        {
-                            "-" => None,
-                            value => Some(parse_field(Some(value), "vix index identity")?),
-                        }
-                    } else {
-                        None
+                    let index_created_at = match words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("vix index identity"))?
+                    {
+                        "-" => None,
+                        value => Some(parse_field(Some(value), "vix index identity")?),
                     };
                     let roster = parse_block_id(
                         words
@@ -6430,21 +6471,17 @@ impl Checkpointer {
                         let label = hexstr(words.next(), "enm label missing")?;
                         let sort_bits: u64 = parse_field(words.next(), "enm sort")?;
                         let label = sql_name(&label)?;
-                        let legacy_label = if manifest_format == ManifestFormat::V15 {
-                            match words.next() {
-                                Some("-") => None,
-                                Some(encoded) => Some(sql_name(&hexstr(
-                                    Some(encoded),
+                        let legacy_label = match words.next() {
+                            Some("-") => None,
+                            Some(encoded) => Some(sql_name(&hexstr(
+                                Some(encoded),
+                                "enm legacy label missing",
+                            )?)?),
+                            None => {
+                                return Err(CheckpointSetupError::Corrupt(
                                     "enm legacy label missing",
-                                )?)?),
-                                None => {
-                                    return Err(CheckpointSetupError::Corrupt(
-                                        "enm legacy label missing",
-                                    ));
-                                }
+                                ));
                             }
-                        } else {
-                            Some(label)
                         };
                         *member = crate::storage::EnumMember {
                             label,
@@ -7625,9 +7662,6 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     saw_end = true;
                 }
-                // The process token is publication bookkeeping, not database
-                // state; the durable writer fence validates it separately.
-                Some("writer") => {}
                 Some("") | None => {}
                 Some(other) => {
                     return Err(CheckpointSetupError::ObjectStore(format!(
@@ -7639,12 +7673,6 @@ impl Checkpointer {
         if !saw_end {
             return Err(CheckpointSetupError::Corrupt("manifest truncated (no end)"));
         }
-        if !saw_large_object_allocator {
-            return Err(CheckpointSetupError::Corrupt(
-                "manifest lacks large-object allocator",
-            ));
-        }
-
         // Block SSTs load in list order. Versioned reads choose the greatest
         // admissible commit LSN across every member.
         bssts.sort_by_key(|(mindex, idx, ..)| (*mindex, *idx));
@@ -7786,9 +7814,6 @@ impl Checkpointer {
                 })?;
             if statistics.data.valid {
                 storage.install_extended_statistics_data(slot, statistics.data);
-                if manifest_format != ManifestFormat::V15 {
-                    storage.retire_legacy_extended_statistics_hash(slot);
-                }
             }
         }
         // Engine startup performs one catalog rebind after it has merged the
@@ -7799,15 +7824,10 @@ impl Checkpointer {
             .select_database(crate::storage::DatabaseOid::POSTGRES)
             .map_err(|_| CheckpointSetupError::Corrupt("postgres database is unavailable"))?;
         storage.set_lsn(lsn);
-        if manifest_format != ManifestFormat::V15 {
-            storage.retire_legacy_enum_indexes();
-        }
         if next_rowid > 0 {
             storage.observe_rowid(next_rowid - 1);
         }
-        if let Some(transaction_id) = latest_transaction_id {
-            storage.observe_transaction_identity(transaction_id);
-        }
+        storage.observe_transaction_identity(metadata.latest_transaction_id);
         self.manifest_lsn = lsn;
         Ok(lsn)
     }
@@ -8195,11 +8215,7 @@ impl Checkpointer {
         // Delta bookkeeping collects the new per-slot references into
         // pre-reserved scratch so this post-freeze path never allocates.
         self.manifest_buf.clear();
-        #[cfg(test)]
-        let manifest_format = self.manifest_write_format;
-        #[cfg(not(test))]
-        let manifest_format = ManifestFormat::CURRENT;
-        write_manifest(&mut self.manifest_buf, manifest_format.header())?;
+        write_manifest(&mut self.manifest_buf, MANIFEST_HEADER)?;
         write_manifest(&mut self.manifest_buf, format_args!("lsn {lsn}"))?;
         write_manifest(
             &mut self.manifest_buf,
@@ -8656,13 +8672,12 @@ impl Checkpointer {
                 hex(&mut self.manifest_buf, m.label.as_str()).map_err(|_| manifest_full())?;
                 write!(&mut self.manifest_buf, " {}", m.sort.to_bits())
                     .map_err(|_| manifest_full())?;
-                if manifest_format == ManifestFormat::V15 {
-                    write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
-                    match m.legacy_label {
-                        Some(label) => hex(&mut self.manifest_buf, label.as_str())
-                            .map_err(|_| manifest_full())?,
-                        None => write!(&mut self.manifest_buf, "-").map_err(|_| manifest_full())?,
+                write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
+                match m.legacy_label {
+                    Some(label) => {
+                        hex(&mut self.manifest_buf, label.as_str()).map_err(|_| manifest_full())?
                     }
+                    None => write!(&mut self.manifest_buf, "-").map_err(|_| manifest_full())?,
                 }
             }
             writeln!(&mut self.manifest_buf).map_err(|_| manifest_full())?;
@@ -9186,33 +9201,20 @@ impl Checkpointer {
                 }
                 let mut roster = [0u8; 64];
                 handle.roster.write_key(&mut roster);
-                if manifest_format.has_value_index_identity() {
-                    write_manifest(
-                        &mut self.manifest_buf,
-                        format_args!(
-                            "vix {slot} {n_columns} {}{include_mask} {} {} {} {}",
-                            column_text.as_str(),
-                            index_created_at.map_or_else(
-                                || StackStr::<32>::from_str("-"),
-                                |identity| stack_format!(32, "{identity}"),
-                            ),
-                            core::str::from_utf8(&roster).expect("hex"),
-                            handle.entries,
-                            handle.published_lsn,
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "vix {slot} {n_columns} {}{include_mask} {} {} {} {}",
+                        column_text.as_str(),
+                        index_created_at.map_or_else(
+                            || StackStr::<32>::from_str("-"),
+                            |identity| stack_format!(32, "{identity}"),
                         ),
-                    )?;
-                } else {
-                    write_manifest(
-                        &mut self.manifest_buf,
-                        format_args!(
-                            "vix {slot} {n_columns} {}{include_mask} {} {} {}",
-                            column_text.as_str(),
-                            core::str::from_utf8(&roster).expect("hex"),
-                            handle.entries,
-                            handle.published_lsn,
-                        ),
-                    )?;
-                }
+                        core::str::from_utf8(&roster).expect("hex"),
+                        handle.entries,
+                        handle.published_lsn,
+                    ),
+                )?;
             }
         }
         for (statistics_slot, statistics) in storage.checkpoint_extended_statistics() {
@@ -13567,18 +13569,7 @@ fn parse_dsst_handle<'a>(
 
 fn manifest_lsn(bytes: &[u8]) -> Result<u64, &'static str> {
     let text = core::str::from_utf8(bytes).map_err(|_| "manifest is not UTF-8")?;
-    let mut lines = text.lines();
-    ManifestFormat::parse(lines.next()).map_err(|_| "bad manifest header")?;
-    let mut found = None;
-    for line in lines {
-        if let Some(value) = line.strip_prefix("lsn ") {
-            if found.is_some() {
-                return Err("duplicate manifest LSN");
-            }
-            found = Some(value.parse().map_err(|_| "bad manifest LSN")?);
-        }
-    }
-    found.ok_or("manifest LSN missing")
+    Ok(parse_manifest_metadata(text)?.lsn)
 }
 
 fn manifest_commit_retention_floor(bytes: &[u8]) -> Result<u64, &'static str> {
@@ -13664,10 +13655,9 @@ fn retain_manifest_blocks(
 ) -> Result<(), SqlError> {
     let text = core::str::from_utf8(bytes)
         .map_err(|_| sql_err!(SQLSTATE_IO, "backup manifest is not UTF-8"))?;
-    let mut lines = text.lines();
-    let format = ManifestFormat::parse(lines.next())
-        .map_err(|_| sql_err!(SQLSTATE_IO, "backup manifest has an unknown format"))?;
-    for line in lines {
+    parse_manifest_metadata(text)
+        .map_err(|message| sql_err!(SQLSTATE_IO, "backup manifest: {message}"))?;
+    for line in text.lines().skip(1) {
         let mut words = line.split(' ');
         match words.next() {
             Some("dsst") => {
@@ -13730,11 +13720,9 @@ fn retain_manifest_blocks(
                 words
                     .next()
                     .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))?;
-                if format.has_value_index_identity() {
-                    words.next().ok_or_else(|| {
-                        sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix")
-                    })?;
-                }
+                words
+                    .next()
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))?;
                 let roster = words
                     .next()
                     .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))
@@ -14822,6 +14810,13 @@ fn promote_writer(
     manifest: &mut FixedBuf,
     head: &mut FixedBuf,
 ) -> Result<WriterFence, CheckpointSetupError> {
+    // Reject incompatible or malformed root records before displacing a writer.
+    // Publication re-reads them after fencing so intervening commits are preserved.
+    let _ = read_mutable_root(client, MutableRoot::Manifest, manifest)?;
+    retag_manifest_root(manifest, token)?;
+    let _ = read_mutable_root(client, MutableRoot::CommitHead, head)?;
+    retag_commit_head_root(head, token)?;
+
     let current = match client.get(WRITER_FENCE_KEY, None) {
         Ok(result) => {
             parse_writer_fence(client.body_bytes()).map_err(CheckpointSetupError::Corrupt)?;
@@ -14840,14 +14835,8 @@ fn promote_writer(
         .map_or(Precondition::IfNoneMatchAny, Precondition::IfMatch);
     let transition_etag = put_fence_record(client, transition.as_str().as_bytes(), condition)?;
 
-    fence_mutable_root(client, MANIFEST_KEY, manifest, token, MutableRoot::Manifest)?;
-    fence_mutable_root(
-        client,
-        COMMIT_HEAD_KEY,
-        head,
-        token,
-        MutableRoot::CommitHead,
-    )?;
+    fence_mutable_root(client, MutableRoot::Manifest, manifest, token)?;
+    fence_mutable_root(client, MutableRoot::CommitHead, head, token)?;
 
     let active = writer_fence_record("active", token);
     let etag = put_fence_record(
@@ -14916,22 +14905,13 @@ enum MutableRoot {
     CommitHead,
 }
 
-fn manifest_writer(bytes: &[u8]) -> Option<WriterToken> {
-    let text = core::str::from_utf8(bytes).ok()?;
-    let mut found = None;
-    for line in text.lines() {
-        let Some(word) = line.strip_prefix("writer ") else {
-            continue;
-        };
-        let token = u128::from_str_radix(word, 16)
-            .ok()
-            .filter(|token| *token != 0)
-            .map(WriterToken)?;
-        if found.replace(token).is_some() {
-            return None;
+impl MutableRoot {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Manifest => MANIFEST_KEY,
+            Self::CommitHead => COMMIT_HEAD_KEY,
         }
     }
-    found
 }
 
 fn root_writer(root: MutableRoot, bytes: &[u8]) -> Option<WriterToken> {
@@ -14940,7 +14920,10 @@ fn root_writer(root: MutableRoot, bytes: &[u8]) -> Option<WriterToken> {
             if bytes.starts_with(EMPTY_MANIFEST_HEADER.as_bytes()) {
                 empty_manifest_writer(bytes).ok().flatten()
             } else {
-                manifest_writer(bytes)
+                core::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|text| parse_manifest_metadata(text).ok())
+                    .map(|metadata| metadata.writer)
             }
         }
         MutableRoot::CommitHead => {
@@ -14951,37 +14934,6 @@ fn root_writer(root: MutableRoot, bytes: &[u8]) -> Option<WriterToken> {
             }
         }
     }
-}
-
-fn replace_buffer_range(
-    buffer: &mut FixedBuf,
-    start: usize,
-    end: usize,
-    replacement: &[u8],
-) -> Result<(), CheckpointSetupError> {
-    let old_len = buffer.len();
-    if start > end || end > old_len {
-        return Err(CheckpointSetupError::Corrupt(
-            "invalid mutable-root writer range",
-        ));
-    }
-    let removed = end - start;
-    if replacement.len() > removed {
-        let added = replacement.len() - removed;
-        if buffer.writable().len() < added {
-            return Err(CheckpointSetupError::Corrupt(
-                "mutable root lacks space for writer fencing",
-            ));
-        }
-        buffer.advance(added);
-        buffer.filled_mut().copy_within(end..old_len, end + added);
-    } else if replacement.len() < removed {
-        let reduced = removed - replacement.len();
-        buffer.filled_mut().copy_within(end..old_len, end - reduced);
-        buffer.truncate_to(old_len - reduced);
-    }
-    buffer.filled_mut()[start..start + replacement.len()].copy_from_slice(replacement);
-    Ok(())
 }
 
 fn retag_manifest_root(
@@ -15003,43 +14955,11 @@ fn retag_manifest_root(
 
     let text = core::str::from_utf8(manifest.readable())
         .map_err(|_| CheckpointSetupError::Corrupt("manifest is not UTF-8"))?;
-    ManifestFormat::parse(text.lines().next())?;
-    if !text.ends_with("end\n") {
-        return Err(CheckpointSetupError::Corrupt(
-            "manifest has no final terminator",
-        ));
-    }
-    let mut writer_range = None;
-    let mut offset = 0usize;
-    for line in text.split_inclusive('\n') {
-        let content = line.strip_suffix('\n').unwrap_or(line);
-        if let Some(word) = content.strip_prefix("writer ") {
-            if writer_range.is_some()
-                || word.len() != 32
-                || u128::from_str_radix(word, 16)
-                    .ok()
-                    .filter(|v| *v != 0)
-                    .is_none()
-            {
-                return Err(CheckpointSetupError::Corrupt(
-                    "manifest has an invalid writer identity",
-                ));
-            }
-            writer_range = Some((offset, offset + content.len()));
-        }
-        offset += line.len();
-    }
+    let metadata = parse_manifest_metadata(text).map_err(CheckpointSetupError::Corrupt)?;
+    let (start, end) = metadata.writer_range;
     let writer = stack_format!(48, "writer {:032x}", token.0);
-    match writer_range {
-        Some((start, end)) => {
-            replace_buffer_range(manifest, start, end, writer.as_str().as_bytes())
-        }
-        None => {
-            let line = stack_format!(48, "writer {:032x}\n", token.0);
-            let end = manifest.len() - b"end\n".len();
-            replace_buffer_range(manifest, end, end, line.as_str().as_bytes())
-        }
-    }
+    manifest.filled_mut()[start..end].copy_from_slice(writer.as_str().as_bytes());
+    Ok(())
 }
 
 fn retag_commit_head_root(
@@ -15066,13 +14986,13 @@ fn retag_commit_head_root(
 
 fn fence_mutable_root(
     client: &mut ObjectStore,
-    key: &str,
+    root: MutableRoot,
     scratch: &mut FixedBuf,
     token: WriterToken,
-    root: MutableRoot,
 ) -> Result<EntityTag, CheckpointSetupError> {
+    let key = root.key();
     for _ in 0..16 {
-        let current = read_mutable_root(client, key, scratch)?;
+        let current = read_mutable_root(client, root, scratch)?;
         match root {
             MutableRoot::Manifest => retag_manifest_root(scratch, token)?,
             MutableRoot::CommitHead => retag_commit_head_root(scratch, token)?,
@@ -15083,7 +15003,7 @@ fn fence_mutable_root(
         match client.put(key, scratch.readable(), condition) {
             Ok(etag) => return Ok(etag),
             Err(error) => {
-                let refreshed = read_mutable_root(client, key, scratch)?;
+                let refreshed = read_mutable_root(client, root, scratch)?;
                 if let Some(etag) = refreshed
                     && root_writer(root, scratch.readable()) == Some(token)
                 {
@@ -15108,9 +15028,10 @@ fn fence_mutable_root(
 
 fn read_mutable_root(
     client: &mut ObjectStore,
-    key: &str,
+    root: MutableRoot,
     out: &mut FixedBuf,
 ) -> Result<Option<EntityTag>, CheckpointSetupError> {
+    let key = root.key();
     out.clear();
     let window = client.response_capacity();
     if window == 0 {
@@ -15145,6 +15066,12 @@ fn read_mutable_root(
                 etag = Some(result.etag);
             }
             Err(ObjectError::Status { code: 416, .. }) if etag.is_some() => break,
+            Err(ObjectError::Status { code: 416, .. }) => {
+                return Err(CheckpointSetupError::Corrupt(match root {
+                    MutableRoot::Manifest => "manifest root is empty",
+                    MutableRoot::CommitHead => "commit-head root is empty",
+                }));
+            }
             Err(error) if error.is_not_found() && etag.is_none() => return Ok(None),
             Err(error) => {
                 return Err(CheckpointSetupError::ObjectStore(format!(
@@ -15153,7 +15080,12 @@ fn read_mutable_root(
             }
         }
         let bytes = client.body_bytes();
-        if bytes.is_empty() || !out.append(bytes) {
+        if bytes.is_empty() {
+            return Err(CheckpointSetupError::ObjectStore(format!(
+                "read {key} for writer promotion: empty successful range response"
+            )));
+        }
+        if !out.append(bytes) {
             return Err(CheckpointSetupError::ObjectStore(format!(
                 "{key} exceeds its configured root buffer ({})",
                 out.capacity()
@@ -17626,7 +17558,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v14\nvix 0 1 0 0 - {} 1 7\nend\n",
+            "pos3ql-manifest-v15\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -17987,7 +17919,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v14\nlsn 0\n");
+                    let mut manifest = String::from("pos3ql-manifest-v15\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -18013,7 +17945,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v14\nlsn 0\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\nend\n"),
+                        "pos3ql-manifest-v15\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -18022,7 +17954,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v14\nlsn 0\nptx 10 1 2 0 5 706f737467726573 6669727374\nptx {transaction_id} 1 2 0 5 706f737467726573 {gid}\nend\n");
+                    let manifest = format!("pos3ql-manifest-v15\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 706f737467726573 6669727374\nptx {transaction_id} 1 2 0 5 706f737467726573 {gid}\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -18144,31 +18076,113 @@ mod stored_dependency_tests {
     }
 
     #[test]
-    fn manifest_reader_accepts_only_declared_versions() {
-        assert_eq!(
-            ManifestFormat::parse(Some("pos3ql-manifest-v13")).unwrap(),
-            ManifestFormat::V13
-        );
-        assert_eq!(
-            ManifestFormat::parse(Some("pos3ql-manifest-v14")).unwrap(),
-            ManifestFormat::V14
-        );
-        assert!(ManifestFormat::parse(Some("pos3ql-manifest-v12")).is_err());
-        assert_eq!(
-            ManifestFormat::parse(Some("pos3ql-manifest-v15")).unwrap(),
-            ManifestFormat::CURRENT
-        );
-        assert!(ManifestFormat::parse(Some("pos3ql-manifest-v16")).is_err());
-        assert!(ManifestFormat::parse(None).is_err());
+    fn current_manifest_metadata_rejects_missing_duplicate_and_old_fields() {
+        use core::fmt::Write as _;
+        crate::mem::guard::forbid_alloc(|| {
+            let current = stack_format!(
+                512,
+                "{MANIFEST_HEADER}\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter {:032x}\nend\n",
+                1u128
+            );
+            let parsed = parse_manifest_metadata(current.as_str()).unwrap();
+            assert_eq!(parsed.lsn, 7);
+            assert_eq!(parsed.next_rowid, 2);
+            assert_eq!(parsed.latest_transaction_id, 1);
+            assert_eq!(parsed.next_large_object_oid, None);
+            assert_eq!(parsed.writer, WriterToken(1));
+            assert_eq!(
+                &current.as_str()[parsed.writer_range.0..parsed.writer_range.1],
+                "writer 00000000000000000000000000000001"
+            );
+            let (_, body) = current.as_str().split_once('\n').unwrap();
+            for header in [
+                "",
+                "pos3ql-manifest-v12",
+                "pos3ql-manifest-v13",
+                "pos3ql-manifest-v14",
+                "pos3ql-manifest-v16",
+                "pos3ql-manifest-v15 trailing",
+            ] {
+                let rejected = stack_format!(512, "{header}\n{body}");
+                assert!(matches!(
+                    parse_manifest_metadata(rejected.as_str()),
+                    Err("unsupported manifest format")
+                ));
+                assert_eq!(
+                    manifest_commit_retention_floor(rejected.as_str().as_bytes()),
+                    Err("unsupported manifest format")
+                );
+            }
+            assert!(matches!(
+                parse_manifest_metadata(""),
+                Err("unsupported manifest format")
+            ));
+            for (field, missing, duplicate) in [
+                ("lsn ", "manifest LSN missing", "duplicate manifest LSN"),
+                (
+                    "next_rowid ",
+                    "manifest lacks row identity allocator",
+                    "duplicate row identity allocator",
+                ),
+                (
+                    "latest_transaction_id ",
+                    "manifest lacks transaction identity allocator",
+                    "duplicate transaction identity allocator",
+                ),
+                (
+                    "next_lo_oid ",
+                    "manifest lacks large-object allocator",
+                    "duplicate large-object allocator",
+                ),
+                (
+                    "writer ",
+                    "manifest writer identity missing",
+                    "manifest has an invalid writer identity",
+                ),
+            ] {
+                let mut rejected = StackStr::<512>::new();
+                for line in current.as_str().split_inclusive('\n') {
+                    if !line.starts_with(field) {
+                        rejected.write_str(line).unwrap();
+                    }
+                }
+                assert!(
+                    matches!(parse_manifest_metadata(rejected.as_str()), Err(message) if message == missing)
+                );
+                assert_eq!(
+                    manifest_commit_retention_floor(rejected.as_str().as_bytes()),
+                    Err(missing)
+                );
+                let line = current
+                    .as_str()
+                    .split_inclusive('\n')
+                    .find(|line| line.starts_with(field))
+                    .unwrap();
+                let prefix = current.as_str().strip_suffix("end\n").unwrap();
+                let repeated = stack_format!(512, "{prefix}{line}end\n");
+                assert!(
+                    matches!(parse_manifest_metadata(repeated.as_str()), Err(message) if message == duplicate)
+                );
+            }
+            let prefix = current.as_str().strip_suffix("end\n").unwrap();
+            for rejected in [
+                stack_format!(512, "{prefix}"),
+                stack_format!(512, "{current}lsn 8\n"),
+                stack_format!(512, "{prefix}end extra\n"),
+            ] {
+                assert!(parse_manifest_metadata(rejected.as_str()).is_err());
+                assert!(manifest_commit_retention_floor(rejected.as_str().as_bytes()).is_err());
+            }
+        });
     }
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v14\nlsn 100\nptx 7 41 50 0 5 706f737467726573 78\nrslot 736c6f74 60 70 0\nend\n";
+        let manifest = b"pos3ql-manifest-v15\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 706f737467726573 78\nrslot 736c6f74 60 70 0\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v14\nlsn 100\nrslot 736c6f74 60 70 0\nend\n";
+        let slot_only = b"pos3ql-manifest-v15\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -18184,22 +18198,13 @@ mod stored_dependency_tests {
             .filter(|line| line.starts_with("| Published row SST |"))
             .collect::<Vec<_>>();
 
-        assert_eq!(manifest_rows.len(), ManifestFormat::SUPPORTED.len());
-        for format in ManifestFormat::SUPPORTED {
-            let writable = if format == ManifestFormat::CURRENT {
-                "yes"
-            } else {
-                "no"
-            };
-            let prefix = format!(
-                "| Checkpoint manifest | `{}` | yes | {writable} |",
-                format.header()
-            );
-            assert!(
-                manifest_rows.iter().any(|row| row.starts_with(&prefix)),
-                "durable format matrix lacks {prefix}"
-            );
-        }
+        assert_eq!(manifest_rows.len(), 1);
+        assert!(
+            manifest_rows[0].starts_with(&format!(
+                "| Checkpoint manifest | `{MANIFEST_HEADER}` | yes | yes |"
+            )),
+            "durable format matrix must name the current manifest reader and writer"
+        );
 
         assert_eq!(row_sst_rows.len(), RowSstFormat::SUPPORTED.len());
         for format in RowSstFormat::SUPPORTED {
@@ -18390,20 +18395,46 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v14\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nend\n",
+                b"pos3ql-manifest-v15\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();
         assert_ne!(manifest.readable(), before);
-        assert_eq!(manifest_writer(manifest.readable()), Some(replacement));
+        let metadata =
+            parse_manifest_metadata(core::str::from_utf8(manifest.readable()).unwrap()).unwrap();
+        assert_eq!(metadata.writer, replacement);
 
-        let mut legacy = FixedBuf::new(&mut budget, "legacy manifest", 1024).unwrap();
-        legacy
-            .append(
-                b"pos3ql-manifest-v13\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nend\n",
-            );
-        retag_manifest_root(&mut legacy, replacement).unwrap();
-        assert_eq!(manifest_writer(legacy.readable()), Some(replacement));
+        for header in [
+            "pos3ql-manifest-v13",
+            "pos3ql-manifest-v14",
+            "pos3ql-manifest-v16",
+        ] {
+            let mut rejected = FixedBuf::new(&mut budget, "rejected manifest", 256).unwrap();
+            rejected.append(format!("{header}\nlsn 7\nend\n").as_bytes());
+            let before = rejected.readable().to_vec();
+            assert!(matches!(
+                retag_manifest_root(&mut rejected, replacement),
+                Err(CheckpointSetupError::Corrupt("unsupported manifest format"))
+            ));
+            assert_eq!(rejected.readable(), before);
+        }
+
+        let mut missing = FixedBuf::new(&mut budget, "missing manifest writer", 256).unwrap();
+        for line in core::str::from_utf8(&before).unwrap().split_inclusive('\n') {
+            if !line.starts_with("writer ") {
+                assert!(missing.append(line.as_bytes()));
+            }
+        }
+        let unchanged = missing.readable().to_vec();
+        let error =
+            crate::mem::guard::forbid_alloc(|| retag_manifest_root(&mut missing, replacement));
+        assert!(matches!(
+            error,
+            Err(CheckpointSetupError::Corrupt(
+                "manifest writer identity missing"
+            ))
+        ));
+        assert_eq!(missing.readable(), unchanged);
 
         let mut head = FixedBuf::new(&mut budget, "commit head", 128).unwrap();
         head.append(

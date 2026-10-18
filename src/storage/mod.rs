@@ -34747,99 +34747,16 @@ impl Storage {
     /// across restart; scalar enums and enum/domain arrays therefore never
     /// trust the slot encoded in the table definition.
     fn bind_user_type_columns_to(&self, def: &mut TableDef, txid: u32) -> Result<(), SqlError> {
-        for i in 0..def.n_columns {
-            let col = &def.columns[i];
-            match col.ctype {
-                ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)) => {
-                    let UserTypeName { schema, name } = col.user_type.ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "reloaded enum column has no type identity"
-                        )
-                    })?;
-                    let slot = self
-                        .enum_slot(schema.as_str(), name.as_str(), txid)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::UNDEFINED_OBJECT,
-                                "enum type \"{}.{}\" for a reloaded column does not exist",
-                                schema.as_str(),
-                                name.as_str()
-                            )
-                        })?;
-                    def.columns[i].ctype = if matches!(col.ctype, ColType::Array(_)) {
-                        ColType::Array(ArrElem::Enum(slot as u16))
-                    } else {
-                        ColType::Enum(slot as u16)
-                    };
-                }
-                ColType::Array(ArrElem::Domain { .. }) => {
-                    let UserTypeName { schema, name } = col.user_type.ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "reloaded domain-array column has no type identity"
-                        )
-                    })?;
-                    let slot = self
-                        .domain_slot(schema.as_str(), name.as_str(), txid)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::UNDEFINED_OBJECT,
-                                "domain type \"{}.{}\" for a reloaded column does not exist",
-                                schema.as_str(),
-                                name.as_str()
-                            )
-                        })?;
-                    let domain = self.domain(slot);
-                    let element = ArrElem::domain(slot as u16, domain.base).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "arrays of domain {} require a scalar base type",
-                            name.as_str()
-                        )
-                    })?;
-                    def.columns[i].ctype = ColType::Array(element);
-                }
-                _ if col.user_type.is_some_and(|identity| {
-                    self.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                        .is_some()
-                }) =>
-                {
-                    let identity = col.user_type.expect("domain identity checked above");
-                    let slot = self
-                        .domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                        .expect("domain identity checked above");
-                    // Scalar domains execute as their base representation, but
-                    // their durable identity is the domain.  Resolve it before
-                    // the `Composite`/`Enum` cases below so a domain named
-                    // independently from its composite base cannot be
-                    // mistaken for that base during replay.
-                    def.columns[i].ctype = self.domain(slot).base;
-                }
-                ColType::Composite(_) | ColType::Array(ArrElem::Composite(_)) => {
-                    let UserTypeName { schema, name } = col.user_type.ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "reloaded composite column has no type identity"
-                        )
-                    })?;
-                    let slot = self
-                        .composite_slot(schema.as_str(), name.as_str(), txid)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::UNDEFINED_OBJECT,
-                                "composite type \"{}.{}\" for a reloaded column does not exist",
-                                schema.as_str(),
-                                name.as_str()
-                            )
-                        })?;
-                    def.columns[i].ctype = if matches!(col.ctype, ColType::Array(_)) {
-                        ColType::Array(ArrElem::Composite(slot as u16))
-                    } else {
-                        ColType::Composite(slot as u16)
-                    };
-                }
-                _ => {}
+        for column in def.columns.iter_mut().take(def.n_columns) {
+            if let Some(identity) = column.user_type {
+                column.ctype = self.rebind_declared_user_type(column.ctype, identity, txid)?;
+            } else if matches!(column.ctype, ColType::Enum(_) | ColType::Composite(_))
+                || matches!(column.ctype, ColType::Array(element) if element.user_type_slot().is_some())
+            {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "reloaded user-defined column has no type identity"
+                ));
             }
         }
         Ok(())
@@ -39123,52 +39040,10 @@ impl Storage {
             txid: u32,
         ) -> Result<ColType, SqlError> {
             if polymorphic_type(ctype, Some(identity)).is_some() {
-                return Ok(ctype);
+                Ok(ctype)
+            } else {
+                storage.rebind_declared_user_type(ctype, identity, txid)
             }
-            if let Some(slot) =
-                storage.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-            {
-                let domain = storage.domain_for(slot, txid);
-                return match ctype {
-                    ColType::Array(_) => {
-                        crate::sql::types::ArrElem::domain(slot as u16, domain.base)
-                            .map(ColType::Array)
-                            .ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::PROTOCOL_VIOLATION,
-                                    "routine domain array has invalid element type"
-                                )
-                            })
-                    }
-                    _ => Ok(domain.base),
-                };
-            }
-            if let Some(slot) =
-                storage.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-            {
-                return Ok(match ctype {
-                    ColType::Array(_) => {
-                        ColType::Array(crate::sql::types::ArrElem::Enum(slot as u16))
-                    }
-                    _ => ColType::Enum(slot as u16),
-                });
-            }
-            if let Some(slot) =
-                storage.composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-            {
-                return Ok(match ctype {
-                    ColType::Array(_) => {
-                        ColType::Array(crate::sql::types::ArrElem::Composite(slot as u16))
-                    }
-                    _ => ColType::Composite(slot as u16),
-                });
-            }
-            Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "routine type \"{}.{}\" does not exist",
-                identity.schema.as_str(),
-                identity.name.as_str()
-            ))
         }
         for slot in 0..self.routine_count() {
             let mut routine = self.routine(slot);

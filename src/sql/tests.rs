@@ -85769,6 +85769,7 @@ fn enum_value_identity_domains_containing_domain_arrays_keep_their_declarations(
          CREATE DOMAIN kept_inner AS kept_state CHECK (VALUE::text <> 'high');
          CREATE DOMAIN kept_outer AS kept_inner[] CHECK (cardinality(VALUE) = 1);
          CREATE TABLE kept_rows(batch kept_outer, elements kept_inner[]);
+         CREATE FUNCTION kept_echo(kept_outer) RETURNS kept_outer LANGUAGE SQL AS 'SELECT $1';
          INSERT INTO kept_rows VALUES ('{old}', '{old}');
          ALTER DOMAIN kept_inner RENAME TO kept_inner_new;
          ALTER TYPE kept_state RENAME VALUE 'old' TO 'new';
@@ -85782,11 +85783,19 @@ fn enum_value_identity_domains_containing_domain_arrays_keep_their_declarations(
                 engine,
                 "SELECT pg_typeof(batch) = 'kept_outer'::regtype,
                  pg_typeof(elements) = 'kept_inner_new[]'::regtype,
+                 pg_typeof(kept_echo(batch)) = 'kept_outer'::regtype,
                  batch[1]::text, elements[1]::text FROM kept_rows",
                 true
             )),
-            ["t|t|new|new"]
+            ["t|t|t|new|new"]
         );
+        for sql in [
+            "CREATE TABLE kept_invalid(batch kept_outer[])",
+            "SELECT NULL::kept_outer[]",
+        ] {
+            let output = session.execute(engine, sql, true);
+            assert_eq!(error_sqlstates(&output).len(), 1, "{sql}: {output:?}");
+        }
         for sql in [
             "INSERT INTO kept_rows(batch) VALUES ('{new,new}')",
             "INSERT INTO kept_rows(batch) VALUES ('{high}')",

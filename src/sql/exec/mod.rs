@@ -42219,7 +42219,7 @@ fn build_composite_spec(
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
-                            "domain base type record cannot be an array element"
+                            "arrays of domains require a scalar base type"
                         )
                     })?,
                 )
@@ -53789,7 +53789,7 @@ pub(crate) fn resolve_parameter_input_type(
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "domain base type record cannot be an array element"
+                    "arrays of domains require a scalar base type"
                 )
             })?;
         return Ok(ParameterInputType::DomainArray(element));

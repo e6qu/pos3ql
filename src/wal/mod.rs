@@ -146,7 +146,7 @@ wal_record_kinds! {
     KIND_CREATE_ENUM_V2 = 147;
     KIND_CREATE_ENUM_V3 = 149;
     KIND_ANALYZE_EXTENDED_STATISTICS_V2 = 150;
-    KIND_CREATE_DOMAIN_BOUND = 151;
+    KIND_CREATE_DOMAIN_TYPED = 151;
     KIND_CREATE_VIEW_BOUND = 152;
     KIND_UPSERT_V2 = 153;
     KIND_SET_PUBLICATION_OWNER = 43;
@@ -261,6 +261,13 @@ fn access_class_has_oid(class: u8) -> bool {
 /// A domain's direct enum/composite base uses its durable catalog slot during
 /// replay. Names are catalog projections and can change after an older domain
 /// image was written.
+fn domain_needs_typed_journal(def: &crate::storage::DomainDef) -> bool {
+    def.checks()
+        .iter()
+        .any(|check| crate::sql::enum_values::checks::is_bound(check.expression.as_str()))
+        || (def.base_user_type.is_some() && matches!(def.base, ColType::Array(_)))
+}
+
 fn domain_base_slot(def: &crate::storage::DomainDef) -> u16 {
     match (def.base_user_type, def.base) {
         (Some(_), crate::sql::types::ColType::Enum(slot))
@@ -1415,7 +1422,7 @@ pub(crate) enum WalOp<'a> {
     CreateDomain(&'a crate::storage::DomainDef),
     /// The validated durable domain image, materialized only while applying it.
     RestoreDomain(&'a [u8]),
-    RestoreBoundDomain(&'a [u8]),
+    RestoreTypedDomain(&'a [u8]),
     DropDomain {
         schema: &'a str,
         name: &'a str,
@@ -2563,18 +2570,14 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::ResetUnloggedRelations => KIND_RESET_UNLOGGED_RELATIONS,
         WalOp::Comment { .. } => KIND_COMMENT,
         WalOp::CreateDomain(definition) => {
-            if definition
-                .checks()
-                .iter()
-                .any(|check| crate::sql::enum_values::checks::is_bound(check.expression.as_str()))
-            {
-                KIND_CREATE_DOMAIN_BOUND
+            if domain_needs_typed_journal(definition) {
+                KIND_CREATE_DOMAIN_TYPED
             } else {
                 KIND_CREATE_DOMAIN
             }
         }
         WalOp::RestoreDomain(_) => KIND_CREATE_DOMAIN,
-        WalOp::RestoreBoundDomain(_) => KIND_CREATE_DOMAIN_BOUND,
+        WalOp::RestoreTypedDomain(_) => KIND_CREATE_DOMAIN_TYPED,
         WalOp::DropDomain { .. } => KIND_DROP_DOMAIN,
         WalOp::CreateEnum { .. }
         | WalOp::RestoreEnum {
@@ -3368,7 +3371,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n
         }
         WalOp::RestoreDomain(payload)
-        | WalOp::RestoreBoundDomain(payload)
+        | WalOp::RestoreTypedDomain(payload)
         | WalOp::RestoreRoutine { payload, .. }
         | WalOp::RestoreForeignTable(payload)
         | WalOp::RestoreOperatorFamily(payload)
@@ -5423,7 +5426,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::RestoreDomain(payload)
-        | WalOp::RestoreBoundDomain(payload)
+        | WalOp::RestoreTypedDomain(payload)
         | WalOp::RestoreRoutine { payload, .. }
         | WalOp::RestoreForeignTable(payload)
         | WalOp::RestoreOperatorFamily(payload)
@@ -9338,7 +9341,7 @@ fn decode_op_inner<'a>(
                 text,
             })
         }),
-        KIND_CREATE_DOMAIN | KIND_CREATE_DOMAIN_BOUND => decode_large_op(|| {
+        KIND_CREATE_DOMAIN | KIND_CREATE_DOMAIN_TYPED => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let payload_version = *payload.get(at)?;
@@ -9476,18 +9479,15 @@ fn decode_op_inner<'a>(
                 ddl_state: crate::storage::CatalogDdlState::Absent,
             };
             if decoded_domain.is_none()
-                && (kind == KIND_CREATE_DOMAIN_BOUND)
-                    != definition.checks().iter().any(|check| {
-                        crate::sql::enum_values::checks::is_bound(check.expression.as_str())
-                    })
+                && (kind == KIND_CREATE_DOMAIN_TYPED) != domain_needs_typed_journal(&definition)
             {
                 return None;
             }
             if let Some(output) = decoded_domain {
                 *output = definition;
             }
-            Some(if kind == KIND_CREATE_DOMAIN_BOUND {
-                WalOp::RestoreBoundDomain(payload)
+            Some(if kind == KIND_CREATE_DOMAIN_TYPED {
+                WalOp::RestoreTypedDomain(payload)
             } else {
                 WalOp::RestoreDomain(payload)
             })
@@ -12866,7 +12866,7 @@ mod tests {
         let mut payload = FixedBuf::new(&mut budget, "enum journal versions", 16384).unwrap();
         let mut reencoded = FixedBuf::new(&mut budget, "enum journal replay", 16384).unwrap();
         let operations = [
-            (KIND_CREATE_DOMAIN_BOUND, WalOp::CreateDomain(&domain)),
+            (KIND_CREATE_DOMAIN_TYPED, WalOp::CreateDomain(&domain)),
             (
                 KIND_CREATE_VIEW_BOUND,
                 WalOp::CreateView {
@@ -12921,7 +12921,7 @@ mod tests {
                 assert!(reencoded.append(&[0]));
                 assert!(decode_op(*kind, reencoded.readable()).is_none());
                 match *kind {
-                    KIND_CREATE_DOMAIN_BOUND => {
+                    KIND_CREATE_DOMAIN_TYPED => {
                         assert!(decode_op(KIND_CREATE_DOMAIN, payload.readable()).is_none());
                         assert_eq!(
                             decode_domain_payload(payload.readable()).unwrap().checks()[0]
@@ -12949,6 +12949,37 @@ mod tests {
                 }
             }
         });
+        domain.n_checks = 0;
+        for element in [
+            crate::sql::types::ArrElem::Enum(7),
+            crate::sql::types::ArrElem::Composite(9),
+            crate::sql::types::ArrElem::domain(11, ColType::Enum(7)).unwrap(),
+        ] {
+            domain.base = ColType::Array(element);
+            let operation = WalOp::CreateDomain(&domain);
+            crate::mem::guard::forbid_alloc(|| {
+                payload.clear();
+                assert_eq!(op_kind(&operation), KIND_CREATE_DOMAIN_TYPED);
+                assert!(append_payload(&mut payload, &operation));
+                let decoded = decode_op(KIND_CREATE_DOMAIN_TYPED, payload.readable()).unwrap();
+                assert_eq!(op_kind(&decoded), KIND_CREATE_DOMAIN_TYPED);
+                assert!(decode_op(KIND_CREATE_DOMAIN, payload.readable()).is_none());
+                let definition = decode_domain_payload(payload.readable()).unwrap();
+                let ColType::Array(rebound) = definition.base else {
+                    panic!("expected array base");
+                };
+                assert_eq!(rebound.user_type_slot(), element.user_type_slot());
+                assert_eq!(definition.base_user_type, domain.base_user_type);
+                reencoded.clear();
+                assert!(append_payload(&mut reencoded, &decoded));
+                assert_eq!(payload.readable(), reencoded.readable());
+                for end in 0..payload.len() {
+                    assert!(
+                        decode_op(KIND_CREATE_DOMAIN_TYPED, &payload.readable()[..end]).is_none()
+                    );
+                }
+            });
+        }
     }
 
     #[test]

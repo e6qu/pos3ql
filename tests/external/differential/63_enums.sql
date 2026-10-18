@@ -294,6 +294,7 @@ CREATE TYPE kept_state AS ENUM ('old', 'high');
 CREATE DOMAIN kept_inner AS kept_state CHECK (VALUE::text <> 'high');
 CREATE DOMAIN kept_outer AS kept_inner[] CHECK (cardinality(VALUE) = 1);
 CREATE TABLE kept_rows(batch kept_outer, elements kept_inner[]);
+CREATE FUNCTION kept_echo(kept_outer) RETURNS kept_outer LANGUAGE SQL AS 'SELECT $1';
 INSERT INTO kept_rows VALUES ('{old}', '{old}');
 ALTER DOMAIN kept_inner RENAME TO kept_inner_new;
 ALTER TYPE kept_state RENAME VALUE 'old' TO 'new';
@@ -301,11 +302,13 @@ CREATE SCHEMA kept_moved;
 ALTER TYPE kept_state SET SCHEMA kept_moved;
 SELECT pg_typeof(batch) = 'kept_outer'::regtype,
        pg_typeof(elements) = 'kept_inner_new[]'::regtype,
+       pg_typeof(kept_echo(batch)) = 'kept_outer'::regtype,
        batch[1]::text, elements[1]::text FROM kept_rows;
 INSERT INTO kept_rows(batch) VALUES ('{new,new}');
 INSERT INTO kept_rows(batch) VALUES ('{high}');
 INSERT INTO kept_rows(elements) VALUES ('{high}');
 DROP TABLE kept_rows;
+DROP FUNCTION kept_echo(kept_outer);
 DROP DOMAIN kept_outer;
 DROP DOMAIN kept_inner_new;
 DROP TYPE kept_moved.kept_state;

@@ -78,8 +78,10 @@ Domain, enum and composite creation and moves share one name-reservation check,
 including transaction waits and journal replay. This does not yet coordinate
 publication of a complete type change and all its references.
 Enum values keep member identities separate from labels and sort positions,
-including nested records, arrays, defaults and captured view literals. Changing a
-label no longer rewrites table rows or waits for an older read transaction.
+including nested records, arrays, defaults, domain checks and captured view literals.
+Changing a label no longer rewrites table rows or waits for an older read transaction.
+Type binding retains a domain's own identity separately from its base value;
+table, record and routine recovery share the same declaration resolver.
 Selected enum definitions retain their fixed label images through alteration,
 rollback, drop, slot reuse, replay and database retirement. Publishing complete
 type changes and all their references still requires exclusive storage ownership.

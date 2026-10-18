@@ -20690,7 +20690,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.apply_sequence_advance(schema, name, last, is_called);
         }
         WalOp::ResetUnloggedRelations => storage.reset_unlogged_relations()?,
-        WalOp::RestoreDomain(payload) | WalOp::RestoreBoundDomain(payload) => {
+        WalOp::RestoreDomain(payload) | WalOp::RestoreTypedDomain(payload) => {
             let def = crate::wal::decode_domain_payload(payload).ok_or_else(|| {
                 sql_err!(
                     sqlstate::DATA_EXCEPTION,

@@ -180,7 +180,8 @@ Domain CHECK SQL against an enum or enum-array base uses `pos3ql-enum-check-v1`.
 text array of base member ordinals, and `/*p3t:N*/` binds N tokens of an explicit
 cast type name to the domain's selected base enum. Ordinary text is unbound.
 Rendering removes the grammar and resolves current labels and type names.
-Bound domain definitions use journal kind 151, and bound views use kind 152;
+Domain definitions with bound checks or named array bases use journal kind 151;
+bound views use kind 152;
 the previous domain and view kinds remain readable. This distinction also
 survives prepared-transaction re-encoding.
 

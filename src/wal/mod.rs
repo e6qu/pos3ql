@@ -148,6 +148,7 @@ wal_record_kinds! {
     KIND_ANALYZE_EXTENDED_STATISTICS_V2 = 150;
     KIND_CREATE_DOMAIN_BOUND = 151;
     KIND_CREATE_VIEW_BOUND = 152;
+    KIND_UPSERT_V2 = 153;
     KIND_SET_PUBLICATION_OWNER = 43;
     KIND_RENAME_PUBLICATION = 44;
     KIND_CREATE_ROUTINE = 45;
@@ -2476,7 +2477,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetForeignTable { .. } | WalOp::RestoreForeignTable(_) => KIND_SET_FOREIGN_TABLE,
         WalOp::CreateTable(_) | WalOp::RestoreTable(_) => KIND_CREATE,
         WalOp::DropTable { .. } => KIND_DROP,
-        WalOp::Upsert { .. } => KIND_UPSERT,
+        WalOp::Upsert { .. } => KIND_UPSERT_V2,
         WalOp::Delete { .. } => KIND_DELETE,
         WalOp::Truncate { .. } => KIND_TRUNCATE_WIDE,
         WalOp::LogicalMessage { .. } => KIND_LOGICAL_MESSAGE,
@@ -7633,7 +7634,7 @@ fn decode_op_inner<'a>(
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTable { schema, name })
         }),
-        KIND_UPSERT => decode_large_op(|| {
+        KIND_UPSERT | KIND_UPSERT_V2 => decode_large_op(|| {
             let table = take_name(&mut at)?;
             let rowid = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;

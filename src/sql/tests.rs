@@ -52370,6 +52370,52 @@ fn enum_value_identity_default_and_rows_cast_to_current_text_after_rename() {
 }
 
 #[test]
+fn enum_value_identity_domain_records_arrays_and_checks_survive_type_moves_and_wal() {
+    let config = test_config("enum-identity-domain-wal");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TYPE enum_guard_state AS ENUM ('old', 'ready', 'high');          CREATE DOMAIN enum_guard_value AS enum_guard_state CHECK (VALUE = ANY('{old,ready}'::enum_guard_state[]));          CREATE DOMAIN enum_guard_batch AS enum_guard_state[] CHECK (cardinality(VALUE) = 1 AND VALUE[1] = 'old');          CREATE TYPE enum_guard_detail AS (state enum_guard_value, note text);          CREATE TABLE enum_guard_rows (state enum_guard_value, batch enum_guard_batch, detail enum_guard_detail);          INSERT INTO enum_guard_rows VALUES ('old', '{old}', ROW('old', 'old')::enum_guard_detail);          ALTER TYPE enum_guard_state RENAME VALUE 'old' TO 'new';          ALTER TYPE enum_guard_state ADD VALUE 'old';          CREATE SCHEMA enum_guard_moved; ALTER TYPE enum_guard_state SET SCHEMA enum_guard_moved", true);
+    for sql in [
+        "INSERT INTO enum_guard_rows(state) VALUES ('high')",
+        "INSERT INTO enum_guard_rows(batch) VALUES ('{old}')",
+        "INSERT INTO enum_guard_rows(detail) VALUES (ROW('high', 'old')::enum_guard_detail)",
+    ] {
+        let output = session.execute(&mut engine, sql, true);
+        assert!(
+            String::from_utf8_lossy(&output).contains("23514"),
+            "{sql}: {output:?}"
+        );
+    }
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT state::text, batch[1]::text, (detail).state::text, (detail).note FROM enum_guard_rows", true)),
+        ["new|new|new|old"]);
+    engine.commit_wal().unwrap();
+    drop(session);
+    drop(engine);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "INSERT INTO enum_guard_rows VALUES ('new', '{new}', ROW('new', 'old')::enum_guard_detail)",
+        true,
+    );
+    let output = session.execute(
+        &mut engine,
+        "INSERT INTO enum_guard_rows VALUES ('high', '{new}', NULL)",
+        true,
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("23514"),
+        "{output:?}"
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT count(*) FROM enum_guard_rows WHERE state::text = 'new' AND batch[1]::text = 'new'", true)), ["2"]);
+}
+
+#[test]
 fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_recovery() {
     let mut config = test_config("owned-enum-rewrite");
     config.object_store_on = true;

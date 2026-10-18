@@ -19,6 +19,8 @@ pub(crate) const MAX_COLUMNS: usize = 1_664;
 /// PostgreSQL 18's stored-relation and named-composite attribute boundary
 /// (`MaxHeapAttributeNumber`).
 pub(crate) const MAX_RELATION_COLUMNS: usize = 1_600;
+/// Marks composite text whose enum leaves carry stable member ordinals.
+pub(crate) const COMPOSITE_MEMBER_IDENTITIES: u16 = 0x8000;
 
 pub(crate) fn encoded_len(values: &[Datum]) -> usize {
     let mut n = 2 + values.len().div_ceil(8);
@@ -437,8 +439,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Regdictionary
         | ColType::Regcollation => {
             let length = bytes.get(8..12).ok_or_else(corrupt)?;
-            let flags = u32::from_le_bytes(length.try_into().unwrap());
-            Some(12 + usize::from(flags & 0x8000_0000 != 0) * 4 + (flags & 0x7fff_ffff) as usize)
+            Some(12 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
         ColType::Array(_) | ColType::Bit { .. } => {
             let length = bytes.get(..4).ok_or_else(corrupt)?;
@@ -470,8 +471,9 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
             return Err(corrupt());
         }
         ColType::Composite(_) => {
-            let length = bytes.get(1..5).ok_or_else(corrupt)?;
-            Some(5 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+            let (_, prefix) = decode_physical_field_count(bytes).ok_or_else(corrupt)?;
+            let length = bytes.get(prefix..prefix + 4).ok_or_else(corrupt)?;
+            Some(prefix + 4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
     };
     let length = fixed.expect("all stored types have a length");
@@ -1008,16 +1010,80 @@ fn encode_physical_field_count(fields: u16, output: &mut [u8]) -> usize {
 
 fn decode_physical_field_count(input: &[u8]) -> Option<(u16, usize)> {
     let first = *input.first()?;
-    if first != u8::MAX {
-        Some((u16::from(first), 1))
+    let (fields, prefix) = if first != u8::MAX {
+        (u16::from(first), 1)
     } else {
-        Some((u16::from_le_bytes(input.get(1..3)?.try_into().ok()?), 3))
+        (u16::from_le_bytes(input.get(1..3)?.try_into().ok()?), 3)
+    };
+    if usize::from(fields & !COMPOSITE_MEMBER_IDENTITIES) > MAX_RELATION_COLUMNS {
+        return None;
     }
+    Some((fields, prefix))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enum_cells_and_composite_layouts_share_column_boundaries() {
+        for fields in [
+            0,
+            2,
+            254,
+            255,
+            1_600,
+            COMPOSITE_MEMBER_IDENTITIES | 2,
+            COMPOSITE_MEMBER_IDENTITIES | 1_600,
+        ] {
+            let count = usize::from(fields & !COMPOSITE_MEMBER_IDENTITIES);
+            let text = format!("({})", ",".repeat(count.saturating_sub(1)));
+            for member in [None, Some(7)] {
+                let values = [
+                    Datum::Enum {
+                        slot: 0,
+                        member,
+                        sort: 2.0,
+                        label: "old",
+                    },
+                    Datum::CompositeText {
+                        slot: 1,
+                        physical_fields: fields,
+                        text: &text,
+                    },
+                    Datum::Int4(42),
+                    Datum::Text("after"),
+                ];
+                let schema = [
+                    ColType::Enum(0),
+                    ColType::Composite(1),
+                    ColType::Int4,
+                    ColType::Text,
+                ];
+                let mut bytes = [0u8; 8_192];
+                let length = encoded_len(&values);
+                let mut payloads = [&[][..]; MAX_COLUMNS];
+                let mut nulls = [false; MAX_COLUMNS];
+                let mut decoded = [Datum::Null; 4];
+                crate::mem::guard::forbid_alloc(|| encode(&values, &mut bytes[..length]));
+                crate::mem::guard::forbid_alloc(|| {
+                    encoded_columns(&bytes[..length], &schema, &mut payloads, &mut nulls)?;
+                    decode(&bytes[..length], &schema, &mut decoded)
+                })
+                .unwrap();
+                assert_eq!(decoded, values);
+                assert_eq!(
+                    payloads[..4].iter().map(|cell| cell.len()).sum::<usize>(),
+                    length - 3
+                );
+            }
+        }
+        let mut reference = [0u8; 17];
+        reference[8..12].copy_from_slice(&0x8000_0001u32.to_le_bytes());
+        assert!(encoded_value_len(&reference, ColType::Regclass).is_err());
+        assert_eq!(encoded_value_len(&reference, ColType::Enum(0)).unwrap(), 17);
+        assert!(decode_physical_field_count(&[255, 255, 127]).is_none());
+    }
 
     #[test]
     fn roundtrip_all_types_and_nulls() {

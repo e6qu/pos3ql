@@ -25,7 +25,7 @@ pub(crate) fn bind<const N: usize>(
     legacy: bool,
     arena: &Arena,
 ) -> Result<StackStr<N>, SqlError> {
-    let ColType::Enum(slot) = base else {
+    let Some(slot) = enum_slot(base) else {
         return Ok(StackStr::from_str(source));
     };
     let definition = storage.enum_for(usize::from(slot), txid);
@@ -51,11 +51,13 @@ pub(crate) fn bind<const N: usize>(
     write_name(&mut name, definition.schema.as_str());
     let _ = name.write_char('.');
     write_name(&mut name, definition.name.as_str());
+    let context_type = crate::sql::catalog::user_type_name_text(storage, txid, base.oid(), arena)?
+        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "enum CHECK has no base type name"))?;
     let query = arena
         .alloc_str_display(format_args!(
             "SELECT {} FROM (VALUES (NULL::{})) AS __pos3ql_domain(value)",
             parameters.as_str(),
-            name.as_str()
+            context_type
         ))
         .map_err(|_| crate::sql::query::arena_full_pub())?;
     let select = crate::sql::parser::parse_query(query, arena)?;
@@ -192,7 +194,7 @@ pub(crate) fn resolve<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    let ColType::Enum(slot) = base else {
+    let Some(slot) = enum_slot(base) else {
         return arena
             .alloc_str(source)
             .map_err(|_| crate::sql::query::arena_full_pub());
@@ -285,4 +287,15 @@ fn corrupt() -> SqlError {
         sqlstate::INTERNAL_ERROR,
         "invalid stored enum CHECK binding"
     )
+}
+
+fn enum_slot(base: ColType) -> Option<u16> {
+    match base {
+        ColType::Enum(slot) => Some(slot),
+        ColType::Array(element) => match element.to_coltype() {
+            ColType::Enum(slot) => Some(slot),
+            _ => None,
+        },
+        _ => None,
+    }
 }

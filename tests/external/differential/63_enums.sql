@@ -244,3 +244,34 @@ DROP TYPE feeling;
 DROP TABLE composite_type_values;
 DROP TYPE composite_lifecycle_schema.composite_moved;
 DROP SCHEMA composite_lifecycle_schema;
+
+
+-- Captured constants, domain enforcement and plain text follow distinct meanings.
+CREATE TYPE enum_guard_state AS ENUM ('old', 'ready', 'high');
+CREATE DOMAIN enum_guard_value AS enum_guard_state CHECK (VALUE = ANY('{old,ready}'::enum_guard_state[]));
+CREATE DOMAIN enum_guard_batch AS enum_guard_state[] CHECK (cardinality(VALUE) = 1 AND VALUE[1] = 'old');
+CREATE TYPE enum_guard_detail AS (state enum_guard_value, note text);
+CREATE TABLE enum_guard_rows (id integer, state enum_guard_value, batch enum_guard_batch, detail enum_guard_detail);
+INSERT INTO enum_guard_rows VALUES (1, 'old', '{old}', ROW('old', 'old')::enum_guard_detail);
+CREATE VIEW enum_guard_view AS SELECT id, 'old'::enum_guard_state AS pinned, 'old' AS note FROM enum_guard_rows WHERE state = 'old';
+INSERT INTO enum_guard_rows(id, state) VALUES (2, 'high');
+INSERT INTO enum_guard_rows(id, detail) VALUES (2, ROW('high', 'old')::enum_guard_detail);
+ALTER TYPE enum_guard_state RENAME VALUE 'old' TO 'new';
+SELECT state::text, batch[1]::text, (detail).state::text, (detail).note FROM enum_guard_rows;
+SELECT id, pinned::text, note FROM enum_guard_view;
+INSERT INTO enum_guard_rows(id, state) VALUES (2, 'high');
+ALTER TYPE enum_guard_state ADD VALUE 'old';
+INSERT INTO enum_guard_rows(id, batch) VALUES (2, '{old}');
+CREATE SCHEMA enum_guard_moved;
+ALTER TYPE enum_guard_state SET SCHEMA enum_guard_moved;
+SELECT id, pinned::text, note FROM enum_guard_view;
+INSERT INTO enum_guard_rows(id, state, batch) VALUES (2, 'new', '{new}');
+SELECT id, state::text, batch[1]::text FROM enum_guard_rows ORDER BY id;
+SELECT position('p3c:' IN pg_get_constraintdef(oid)) = 0 FROM pg_constraint WHERE contypid = 'enum_guard_value'::regtype ORDER BY conname;
+DROP VIEW enum_guard_view;
+DROP TABLE enum_guard_rows;
+DROP TYPE enum_guard_detail;
+DROP DOMAIN enum_guard_batch;
+DROP DOMAIN enum_guard_value;
+DROP TYPE enum_guard_moved.enum_guard_state;
+DROP SCHEMA enum_guard_moved;

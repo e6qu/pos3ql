@@ -163,6 +163,10 @@ ordinals. The remaining bits retain the physical attribute count. The marker
 covers nested records and arrays; ordinary text fields retain their original text.
 Frozen enum defaults use journal/default tag 42 for a member identity; tag 12
 remains readable.
+New row writes use journal kind 153, which permits both explicitly tagged member
+cells and legacy cells. The preceding row kind remains readable. Even before
+the next checkpoint, an older recovery candidate must reject the new row kind
+instead of installing opaque bytes it cannot decode.
 
 Bound view SQL uses the non-SQL prefix `pos3ql-bound-query-v1`, followed by
 tokenized SQL. Before each typed enum literal, `/*p3e:D:M*/` records dependency
@@ -171,7 +175,7 @@ bindings. Readers resolve these positions through the captured dependencies and
 remove the internal grammar before parsing or displaying SQL. Unknown grammar
 versions and invalid bindings are errors.
 
-Domain CHECK SQL against an enum base uses `pos3ql-enum-check-v1`. Its
+Domain CHECK SQL against an enum or enum-array base uses `pos3ql-enum-check-v1`. Its
 `/*p3c:M*/` literal bindings refer to base member M; `/*p3a*/` introduces a
 text array of base member ordinals, and `/*p3t:N*/` binds N tokens of an explicit
 cast type name to the domain's selected base enum. Ordinary text is unbound.

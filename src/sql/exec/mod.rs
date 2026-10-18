@@ -69332,6 +69332,11 @@ pub(crate) fn coerce<'a>(
         let typed = match v {
             Datum::Null => return Ok(Datum::Null),
             value @ Datum::Composite { slot: actual, .. } if actual == slot => value,
+            Datum::CompositeText {
+                slot: actual,
+                physical_fields: 0,
+                text,
+            } if actual == slot => decode_composite_text(text, slot, storage, txid, arena)?,
             value @ Datum::CompositeText { slot: actual, .. } if actual == slot => {
                 return Ok(value);
             }
@@ -69434,7 +69439,7 @@ pub(crate) fn coerce_routine_argument<'a>(
     }
 }
 
-const COMPOSITE_MEMBER_IDENTITIES: u16 = 0x8000;
+const COMPOSITE_MEMBER_IDENTITIES: u16 = crate::storage::rowenc::COMPOSITE_MEMBER_IDENTITIES;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CompositeEncoding {

@@ -760,12 +760,6 @@ mod tests {
             );
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
     #[test]
     fn enum_value_identity_type_moves_preserve_outer_domains() {
         let identity = |name| UserTypeName {

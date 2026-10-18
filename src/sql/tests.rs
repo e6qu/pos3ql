@@ -85724,6 +85724,11 @@ fn enum_value_identity_domain_comparisons_require_base_enum_casts() {
         "SELECT NULL::enum_operator_domain = 'old'",
         "SELECT 'old'::enum_operator_domain = 'old'",
         "SELECT state < 'ready' FROM enum_operator_rows",
+        "SELECT state IN ('old') FROM enum_operator_rows",
+        "SELECT state = ANY(ARRAY['old'::enum_operator_state]) FROM enum_operator_rows",
+        "SELECT state BETWEEN 'old' AND 'ready' FROM enum_operator_rows",
+        "SELECT state IS DISTINCT FROM 'old' FROM enum_operator_rows",
+        "SELECT CASE state WHEN 'old' THEN 1 END FROM enum_operator_rows",
     ] {
         let output = session.execute(&mut engine, sql, true);
         assert!(
@@ -85746,4 +85751,56 @@ fn enum_value_identity_domain_comparisons_require_base_enum_casts() {
             "{sql}: {output:?}"
         );
     }
+}
+
+#[test]
+fn enum_value_identity_domains_containing_domain_arrays_keep_their_declarations() {
+    let config = test_config("enum-domain-array-declarations");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TYPE kept_state AS ENUM ('old', 'high');
+         CREATE DOMAIN kept_inner AS kept_state CHECK (VALUE::text <> 'high');
+         CREATE DOMAIN kept_outer AS kept_inner[] CHECK (cardinality(VALUE) = 1);
+         CREATE TABLE kept_rows(batch kept_outer, elements kept_inner[]);
+         INSERT INTO kept_rows VALUES ('{old}', '{old}');
+         ALTER DOMAIN kept_inner RENAME TO kept_inner_new;
+         ALTER TYPE kept_state RENAME VALUE 'old' TO 'new';
+         CREATE SCHEMA kept_moved;
+         ALTER TYPE kept_state SET SCHEMA kept_moved",
+        true,
+    );
+    let assert_declarations = |session: &mut ConfiguredTransactionSession, engine: &mut Engine| {
+        assert_eq!(
+            data_rows(&session.success(
+                engine,
+                "SELECT pg_typeof(batch) = 'kept_outer'::regtype,
+                 pg_typeof(elements) = 'kept_inner_new[]'::regtype,
+                 batch[1]::text, elements[1]::text FROM kept_rows",
+                true
+            )),
+            ["t|t|new|new"]
+        );
+        for sql in [
+            "INSERT INTO kept_rows(batch) VALUES ('{new,new}')",
+            "INSERT INTO kept_rows(batch) VALUES ('{high}')",
+            "INSERT INTO kept_rows(elements) VALUES ('{high}')",
+        ] {
+            let output = session.execute(engine, sql, true);
+            assert!(
+                String::from_utf8_lossy(&output).contains("23514"),
+                "{sql}: {output:?}"
+            );
+        }
+    };
+    assert_declarations(&mut session, &mut engine);
+    engine.commit_wal().unwrap();
+    drop(session);
+    drop(engine);
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_declarations(&mut session, &mut engine);
 }

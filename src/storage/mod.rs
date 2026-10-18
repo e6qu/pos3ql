@@ -38427,6 +38427,18 @@ impl Storage {
     ) -> Result<DeclaredColumnType, SqlError> {
         use crate::sql::types::oid;
 
+        // A scalar domain may contain an array of another domain. Its base
+        // element's slot is not the identity of the column declaration.
+        if let Some(UserTypeName { schema, name }) = column.user_type
+            && let Some(slot) = self.domain_identity_slot(schema.as_str(), name.as_str(), txid)
+            && matches!(self.domain_for(slot, txid).base, ColType::Array(_))
+        {
+            return Ok(DeclaredColumnType::UserDefined {
+                oid: oid::domain_oid(slot as u16),
+                schema,
+                name,
+            });
+        }
         match column.ctype {
             ColType::Array(ArrElem::Domain { slot, .. }) => {
                 let UserTypeName { schema, name } = column.user_type.ok_or_else(|| {
@@ -38963,15 +38975,19 @@ impl Storage {
         {
             let domain = self.domain_for(slot, txid);
             return match ctype {
-                ColType::Array(ArrElem::Domain { .. }) => ArrElem::domain(slot as u16, domain.base)
-                    .map(ColType::Array)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "arrays of domain {} require a scalar base type",
-                            identity.name.as_str()
-                        )
-                    }),
+                ColType::Array(ArrElem::Domain { .. })
+                    if !matches!(domain.base, ColType::Array(_)) =>
+                {
+                    ArrElem::domain(slot as u16, domain.base)
+                        .map(ColType::Array)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "arrays of domain {} require a scalar base type",
+                                identity.name.as_str()
+                            )
+                        })
+                }
                 _ => Ok(domain.base),
             };
         }
@@ -42324,11 +42340,18 @@ impl Storage {
                 .domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
                 .is_some()
             {
-                return Some(if matches!(ctype, ColType::Array(ArrElem::Domain { .. })) {
-                    self.user_type_identity_oid(identity, true, txid)?
-                } else {
-                    scalar
-                });
+                return Some(
+                    if matches!(ctype, ColType::Array(ArrElem::Domain { .. }))
+                        && !matches!(
+                            self.domain_base_type_for_oid(scalar, txid),
+                            Some(ColType::Array(_))
+                        )
+                    {
+                        self.user_type_identity_oid(identity, true, txid)?
+                    } else {
+                        scalar
+                    },
+                );
             }
         }
         match ctype {

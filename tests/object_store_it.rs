@@ -153,8 +153,8 @@ fn run_sql(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> String {
     };
     let mut guc = pos3ql::sql::guc::GucState::new();
     let mut resp = Responder::new(&mut buf);
-    engine
-        .execute_simple(
+    pos3ql::mem::guard::forbid_alloc(|| {
+        engine.execute_simple(
             sql_text,
             &arena,
             &mut txn,
@@ -164,7 +164,24 @@ fn run_sql(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> String {
             &mut resp,
             1,
         )
-        .unwrap();
+    })
+    .unwrap();
+    let mut frames = buf.readable();
+    while !frames.is_empty() {
+        assert!(frames.len() >= 5, "truncated response for {sql_text}");
+        let length = u32::from_be_bytes(frames[1..5].try_into().unwrap()) as usize;
+        assert!(
+            length >= 4 && length < frames.len(),
+            "invalid response for {sql_text}"
+        );
+        assert_ne!(
+            frames[0],
+            b'E',
+            "{sql_text}: {}",
+            String::from_utf8_lossy(&frames[5..length + 1])
+        );
+        frames = &frames[length + 1..];
+    }
     String::from_utf8_lossy(buf.readable()).to_string()
 }
 
@@ -293,8 +310,46 @@ fn checkpoint_and_cold_start_from_bucket() {
             &mut budget,
             "CREATE VIEW cheap AS SELECT name FROM inventory WHERE qty < 250",
         );
+        run_sql(
+            &mut e,
+            &mut budget,
+            "CREATE TYPE saved_state AS ENUM ('old', 'ready', 'high');
+             CREATE TYPE saved_detail AS (state saved_state, note text);
+             CREATE TABLE saved_enum_rows(id integer PRIMARY KEY, state saved_state UNIQUE,
+                 detail saved_detail, states saved_state[]);
+             INSERT INTO saved_enum_rows VALUES
+                 (1, 'old', ROW('old', 'old')::saved_detail, '{old}'),
+                 (2, 'high', ROW('high', 'high')::saved_detail, '{high}');
+             CREATE VIEW saved_enum_view AS SELECT 'old'::saved_state AS pinned
+                 FROM saved_enum_rows WHERE state = 'old'",
+        );
         let out = run_sql(&mut e, &mut budget, "CHECKPOINT");
         assert!(out.contains("CHECKPOINT"), "{out}");
+        run_sql(
+            &mut e,
+            &mut budget,
+            "ALTER TYPE saved_state RENAME VALUE 'old' TO 'new'",
+        );
+        for member in 0..30 {
+            run_sql(
+                &mut e,
+                &mut budget,
+                &format!("ALTER TYPE saved_state ADD VALUE 'middle_{member}' BEFORE 'high'"),
+            );
+        }
+        run_sql(
+            &mut e,
+            &mut budget,
+            "ALTER TYPE saved_state ADD VALUE 'old';
+             INSERT INTO saved_enum_rows VALUES
+                 (3, 'old', ROW('old', 'old')::saved_detail, '{old}')",
+        );
+        let view = run_sql(
+            &mut e,
+            &mut budget,
+            "SELECT pinned::text FROM saved_enum_view",
+        );
+        assert!(view.contains("new") && !view.contains("old"), "{view}");
         // Tail after the checkpoint, covered only by the local WAL.
         run_sql(
             &mut e,
@@ -316,6 +371,12 @@ fn checkpoint_and_cold_start_from_bucket() {
         assert!(out.contains("bolt") && out.contains("150"), "{out}");
         assert!(out.contains("screw"), "tail insert lost: {out}");
         assert!(!out.contains("nut"), "tail delete lost: {out}");
+        let view = run_sql(
+            &mut e,
+            &mut budget,
+            "SELECT pinned::text FROM saved_enum_view",
+        );
+        assert!(view.contains("new") && !view.contains("old"), "{view}");
         // Checkpoint everything so the bucket alone carries full state.
         run_sql(&mut e, &mut budget, "CHECKPOINT");
     }
@@ -343,6 +404,26 @@ fn checkpoint_and_cold_start_from_bucket() {
             !vout.contains("washer") && !vout.contains("screw"),
             "view filter wrong: {vout}"
         );
+        let view = run_sql(
+            &mut e,
+            &mut budget,
+            "SELECT pinned::text FROM saved_enum_view",
+        );
+        assert!(view.contains("new") && !view.contains("old"), "{view}");
+        let nested = run_sql(
+            &mut e,
+            &mut budget,
+            "SELECT state::text || ':' || (detail).state::text || ':' ||
+                 (detail).note || ':' || states[1]::text FROM saved_enum_rows WHERE id = 1",
+        );
+        assert!(nested.contains("new:new:old:new"), "{nested}");
+        let ordered = run_sql(
+            &mut e,
+            &mut budget,
+            "SELECT 'enum_high_retained' FROM saved_enum_rows WHERE state = 'high'::saved_state
+                 AND state > 'middle_29'::saved_state",
+        );
+        assert!(ordered.contains("enum_high_retained"), "{ordered}");
         // New writes on the cold-started node keep working, and rowids
         // continue past the replayed ones.
         run_sql(

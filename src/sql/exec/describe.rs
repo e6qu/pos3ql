@@ -3097,6 +3097,31 @@ pub(crate) fn routine_result_metadata(
     )
 }
 
+fn validate_declared_enum_comparison(
+    operator: crate::sql::ast::BinaryOp,
+    left_oid: i32,
+    right_oid: i32,
+    columns: &dyn ColTypeResolver,
+) -> Result<Option<StaticTypeMeta>, SqlError> {
+    if [left_oid, right_oid]
+        .iter()
+        .any(|oid| matches!(columns.domain_base_type(*oid), Some(ColType::Enum(_))))
+    {
+        if let Some(result) = operator
+            .operator_name()
+            .and_then(|name| columns.operator_result(name, left_oid, right_oid))
+        {
+            return Ok(Some(result));
+        }
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist for enum domain arguments: {}",
+            operator.operator_name().unwrap_or("?")
+        ));
+    }
+    Ok(None)
+}
+
 pub fn infer_type_res(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
@@ -3246,24 +3271,15 @@ pub fn infer_type_res(
             {
                 return Ok((result.type_oid, result.ctype.typlen()));
             }
-            if matches!(operator, Eq | NotEq | Lt | LtEq | Gt | GtEq) {
-                let left_declared = infer_routine_argument_oid(left, columns)?;
-                let right_declared = infer_routine_argument_oid(right, columns)?;
-                if [left_declared, right_declared]
-                    .iter()
-                    .any(|oid| matches!(columns.domain_base_type(*oid), Some(ColType::Enum(_))))
-                {
-                    if let Some(result) = operator.operator_name().and_then(|name| {
-                        columns.operator_result(name, left_declared, right_declared)
-                    }) {
-                        return Ok((result.type_oid, result.ctype.typlen()));
-                    }
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        "operator does not exist for enum domain arguments: {}",
-                        operator.operator_name().unwrap_or("?")
-                    ));
-                }
+            if matches!(operator, Eq | NotEq | Lt | LtEq | Gt | GtEq)
+                && let Some(result) = validate_declared_enum_comparison(
+                    *operator,
+                    infer_routine_argument_oid(left, columns)?,
+                    infer_routine_argument_oid(right, columns)?,
+                    columns,
+                )?
+            {
+                return Ok((result.type_oid, result.ctype.typlen()));
             }
             let is_bit = |o: i32| matches!(o, oid::BIT | oid::VARBIT);
             match operator {
@@ -3628,6 +3644,12 @@ pub fn infer_type_res(
         Expr::InList { operand, list, .. } => {
             let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
             for item in *list {
+                validate_declared_enum_comparison(
+                    crate::sql::ast::BinaryOp::Eq,
+                    infer_routine_argument_oid(operand, columns)?,
+                    infer_routine_argument_oid(item, columns)?,
+                    columns,
+                )?;
                 let right = coltype_of_oid(infer_type_res(item, columns)?.0);
                 if let (Some(left), Some(right)) = (left, right)
                     && !comparable(left, right)
@@ -3642,6 +3664,12 @@ pub fn infer_type_res(
         } => {
             let value = coltype_of_oid(infer_type_res(operand, columns)?.0);
             for bound in [*low, *high] {
+                validate_declared_enum_comparison(
+                    crate::sql::ast::BinaryOp::GtEq,
+                    infer_routine_argument_oid(operand, columns)?,
+                    infer_routine_argument_oid(bound, columns)?,
+                    columns,
+                )?;
                 let bound = coltype_of_oid(infer_type_res(bound, columns)?.0);
                 if let (Some(value), Some(bound)) = (value, bound)
                     && (!comparable(value, bound)
@@ -3663,11 +3691,28 @@ pub fn infer_type_res(
             if let Some(operand) = operand {
                 let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
                 for (when, _) in *whens {
+                    validate_declared_enum_comparison(
+                        crate::sql::ast::BinaryOp::Eq,
+                        infer_routine_argument_oid(operand, columns)?,
+                        infer_routine_argument_oid(when, columns)?,
+                        columns,
+                    )?;
                     let right = coltype_of_oid(infer_type_res(when, columns)?.0);
                     if let (Some(left), Some(right)) = (left, right)
                         && !comparable(left, right)
                     {
                         return Err(operator_undefined(left, "=", right));
+                    }
+                }
+            }
+            if operand.is_none() {
+                for (condition, _) in *whens {
+                    let condition_oid = infer_type_res(condition, columns)?.0;
+                    if !matches!(condition_oid, oid::BOOL | oid::UNKNOWN) {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "argument of CASE/WHEN must be type boolean"
+                        ));
                     }
                 }
             }
@@ -3718,6 +3763,18 @@ pub fn infer_type_res(
                     None
                 }
             });
+            let element_oid = coltype_of_oid(infer_type_res(array, columns)?.0)
+                .and_then(|ctype| match ctype {
+                    ColType::Array(element) => Some(element.element_oid()),
+                    _ => None,
+                })
+                .unwrap_or(oid::UNKNOWN);
+            validate_declared_enum_comparison(
+                *operator,
+                infer_routine_argument_oid(operand, columns)?,
+                element_oid,
+                columns,
+            )?;
             if let (Some(left), Some(right)) = (left, right) {
                 use crate::sql::ast::BinaryOp::{Eq, Gt, GtEq, Lt, LtEq, NotEq};
                 let invalid = match operator {

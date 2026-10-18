@@ -260,6 +260,11 @@ SELECT id FROM enum_guard_rows WHERE 'old' = state;
 SELECT NULL::enum_guard_value = 'old';
 SELECT 'old'::enum_guard_value = 'old';
 SELECT id FROM enum_guard_rows WHERE state < 'ready';
+SELECT state IN ('old') FROM enum_guard_rows;
+SELECT state = ANY(ARRAY['old'::enum_guard_state]) FROM enum_guard_rows;
+SELECT state BETWEEN 'old' AND 'ready' FROM enum_guard_rows;
+SELECT state IS DISTINCT FROM 'old' FROM enum_guard_rows;
+SELECT CASE state WHEN 'old' THEN 1 END FROM enum_guard_rows;
 CREATE VIEW enum_guard_view AS SELECT id, 'old'::enum_guard_state AS pinned, 'old' AS note FROM enum_guard_rows WHERE state::enum_guard_state = 'old'::enum_guard_state;
 INSERT INTO enum_guard_rows(id, state) VALUES (2, 'high');
 INSERT INTO enum_guard_rows(id, detail) VALUES (2, ROW('high', 'old')::enum_guard_detail);
@@ -282,3 +287,26 @@ DROP DOMAIN enum_guard_batch;
 DROP DOMAIN enum_guard_value;
 DROP TYPE enum_guard_moved.enum_guard_state;
 DROP SCHEMA enum_guard_moved;
+
+
+-- A domain containing a domain array remains a scalar declaration.
+CREATE TYPE kept_state AS ENUM ('old', 'high');
+CREATE DOMAIN kept_inner AS kept_state CHECK (VALUE::text <> 'high');
+CREATE DOMAIN kept_outer AS kept_inner[] CHECK (cardinality(VALUE) = 1);
+CREATE TABLE kept_rows(batch kept_outer, elements kept_inner[]);
+INSERT INTO kept_rows VALUES ('{old}', '{old}');
+ALTER DOMAIN kept_inner RENAME TO kept_inner_new;
+ALTER TYPE kept_state RENAME VALUE 'old' TO 'new';
+CREATE SCHEMA kept_moved;
+ALTER TYPE kept_state SET SCHEMA kept_moved;
+SELECT pg_typeof(batch) = 'kept_outer'::regtype,
+       pg_typeof(elements) = 'kept_inner_new[]'::regtype,
+       batch[1]::text, elements[1]::text FROM kept_rows;
+INSERT INTO kept_rows(batch) VALUES ('{new,new}');
+INSERT INTO kept_rows(batch) VALUES ('{high}');
+INSERT INTO kept_rows(elements) VALUES ('{high}');
+DROP TABLE kept_rows;
+DROP DOMAIN kept_outer;
+DROP DOMAIN kept_inner_new;
+DROP TYPE kept_moved.kept_state;
+DROP SCHEMA kept_moved;

@@ -417,9 +417,9 @@ impl HeapRelocationProgress {
             entries,
             packed_bytes: self.packed_bytes,
         };
-        storage.heap_row_ownership.with_all(
+        storage.heap_row_ownership.with_row_maps(
             &storage.row_versions,
-            &storage.tables,
+            storage.tables.iter().map(|table| &table.rows),
             |versions, rows| {
                 let tail = Some((self.copy.frontier(), self.copied_tail));
                 self.copy
@@ -569,9 +569,9 @@ impl Storage {
         &self,
         entries: &mut FixedVec<HeapRelocationEntry>,
     ) -> Result<HeapRelocationProgress, SqlError> {
-        let copy = self.heap_row_ownership.with_all(
+        let copy = self.heap_row_ownership.with_row_maps(
             &self.row_versions,
-            &self.tables,
+            self.tables.iter().map(|table| &table.rows),
             |versions, rows| {
                 let copy = self.heap.begin_copy()?;
                 RelocationPlan::capture_rows(rows.iter(), versions, entries)?;

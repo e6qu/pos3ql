@@ -190,7 +190,8 @@ PostgreSQL's on-disk page layout.
 - Monitoring fields for absent PostgreSQL subsystems use documented truthful
   empty/zero states; real modeled activity must not be accepted and ignored.
 - Smaller definition and XPath subsets remain documented scale/surface
-  differences. Incompatible format changes need a verified offline migration.
+  differences. Compatibility with earlier pos3ql versions is not required;
+  unsupported stored formats fail explicitly.
 - Regression schedule omissions must remain explicit and reviewable, rather
   than being hidden behind an expected-failure budget.
 

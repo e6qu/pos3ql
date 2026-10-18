@@ -1,14 +1,15 @@
 # Durable format compatibility
 
-Use this guide when upgrading a database that already has saved objects.
-New binaries must recognize those objects before reading them, and older
-binaries may not recognize newly written formats. The table below states the
-actual supported readers and writers.
+Use this guide to identify the formats the current binary reads and writes.
+Compatibility with earlier pos3ql versions is not required. Existing older
+readers are listed as implemented behavior, not a promise to retain them.
+No automatic upgrade, downgrade, or offline migration is promised.
 
-**User example:** a current server can open a checkpoint written in manifest
-v13 or v14 and write v15 at its next checkpoint. Do not assume you can then downgrade
-to a binary that cannot read v15. No incompatible offline migration is currently
-available, and unknown formats stop startup explicitly.
+**User example:** after an incompatible format change, a database saved by an
+older pos3ql binary may fail startup. Use a fresh object-store prefix or an
+explicitly verified logical export and restore between the chosen binaries.
+Never point a new database at an old prefix and assume its objects are disposable.
+Unknown formats stop startup explicitly.
 
 Object storage is the durable tier. Immutable objects may outlive the binary
 that wrote them, so every root and row SST carries a format identity that is
@@ -251,57 +252,36 @@ that predates kind 3 cannot recover a prepared transaction containing a view
 lock; resolve those transactions before downgrading. Old table, row, and
 advisory lock payloads remain readable without rewriting their records.
 
-## Compatible online changes
+## Reader changes
 
-A compatible format change must add a distinct identity and a reader before a
-writer can publish that identity. During the compatibility window:
+A format change declares its accepted reader identities and current writer
+identity together. Backward compatibility with earlier pos3ql versions is not
+required: obsolete readers may be removed without building an offline migration.
+Do not retain a decoder or introduce a conversion fallback solely to support
+an older pos3ql version.
 
-1. the reader accepts every declared old and current identity;
-2. new generations use only the current writer identity;
-3. one manifest may reference old and current immutable generations together;
-4. ordinary slicing and compaction replace old generations without a table-wide
-   rewrite; and
-5. retries retain the exact source and destination identities.
+The current implementation still accepts manifests v13 and v14 and row
+generations v2 and v3; new manifests use v15 and new row generations use v4.
+This inventory describes that code without making old formats a future requirement.
+A test compares the executable reader and writer declarations with the matrix,
+so removing an identity requires changing both declarations and tests.
 
-Manifests v13 and v14 follow the same rule: both are accepted at startup, while
-every new manifest is v15. Published v2 and v3 row generations can coexist with v4
-generations. New row slices and pair merges write v4 PAX; new deltas write v4
-packed rows. A clean older generation may remain reachable indefinitely, so
-online replacement does not by itself justify removing its reader.
-
-The reader and writer identities above are executable declarations. A test
-compares those declarations with this matrix, so adding or removing an identity
-requires updating both in the same change. The v13 compatibility path publishes
-an actual legacy manifest, destroys both local cache tiers, recovers its v4 row
-generation, publishes v15 after a later commit, destroys the caches again, and
-recovers both generations. This qualifies the stated online upgrade instead of
-only testing the header parser.
-
-## Incompatible and offline changes
-
-Reader support cannot be removed until an offline migration exists and proves
-that no live manifest reference uses the retired identity. Such a migration
-must operate with the database stopped, write new immutable objects, verify
-them through empty caches, and publish the replacement manifest with the same
-compare-and-swap ownership rule as a checkpoint. The old reachable objects
-remain intact until the replacement root is durable and verified.
-
-There is currently no incompatible durable-format migration and no format is
-eligible for reader removal. A future incompatible row representation must
-ship its migration procedure and recovery tests before its writer is enabled.
-Forward formats, malformed references, and manifests outside the matrix fail
-startup explicitly.
+Recovery within the current version must remain correct: reachable objects,
+prepared transactions, and backup roots written by that version must be readable.
+A checkpoint or retry may not discard objects still needed by current readers
+or backups. Unknown identities, malformed references, and manifests outside the
+matrix fail explicitly before their bytes are interpreted.
 
 ## Change checklist
 
 A durable-format change is complete only when it includes:
 
 - a new stable identity and one parse boundary for it;
-- mixed-generation reads and object-cold recovery;
+- reads of every declared format and object-cold recovery;
 - checkpoint retry and compare-and-swap publication coverage;
-- exact fixed-memory accounting for readers, writers, and migration scratch;
+- exact fixed-memory accounting for readers, writers, and any conversion scratch;
 - garbage retention for both the published root and in-progress output;
-- upgrade and downgrade behavior in this matrix; and
+- accepted and rejected identities in this matrix; and
 - a manifest-capacity assessment for any added reference bytes.
 
 ## Row identity exhaustion

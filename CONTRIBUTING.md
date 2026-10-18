@@ -39,7 +39,8 @@ without rewriting historical evidence.
 - Match vanilla PostgreSQL strictly at SQL, SQLSTATE, wire, and catalog inputs
   and outputs. Unsupported client-visible behavior must fail explicitly.
 - Fix repeated causes through types, input validation, and common update paths.
-  Do not accept and ignore behavior or introduce silent fallbacks.
+  Avoid needless wrappers and fallbacks. Make consequential settings and arguments
+  explicit; do not silently choose different behavior when a request fails.
 - Charge runtime buffers and pools exactly at startup. No growing collections,
   heap allocation, or allocating sorts after the runtime memory freeze.
   Exhaustion names the capacity. Object-store TLS is isolated and budgeted.
@@ -48,8 +49,10 @@ without rewriting historical evidence.
 - When changing concurrency, preserve which versions transactions see, lock
   order, durable success responses, safe retries, reader lifetimes, and bounded
   queues. The [glossary](docs/terminology.md) defines the technical terms.
-- A format change follows the [migration contract](docs/durable-format.md).
-  Preserve old readers and provenance until a verified migration permits removal.
+- Backward compatibility with earlier pos3ql versions is not required.
+  Keep the [format inventory](docs/durable-format.md) accurate and reject
+  unsupported identities before interpreting their bytes. Format changes must
+  preserve recovery of data written by the current version.
 
 The runtime dependency policy is the standard library, libc, and the isolated
 object-store TLS component and its dependencies. A new dependency requires an

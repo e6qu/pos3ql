@@ -19,6 +19,9 @@ that server should execute at the same time.
 The [compatibility guide](docs/postgresql-18-compatibility.md) defines supported
 behavior and features outside the design. Unsupported operations must return
 clear errors. Memory reservations must not grow after startup to rescue a query.
+Use explicit settings and arguments for consequential choices; avoid needless
+wrappers and fallbacks. Earlier pos3ql versions are not compatibility targets.
+PostgreSQL SQL and wire behavior remain compatibility requirements.
 
 ## Where we are
 
@@ -213,8 +216,10 @@ Keep accepted SQL widths, results, errors, catalogs, journal replay, checkpoints
 and empty-cache recovery correct in every step. The
 [capacity inventory](docs/postgresql-18-compatibility.md#capacity-boundaries)
 distinguishes PostgreSQL limits from smaller implementation limits and
-configurable startup reservations. A change to durable identities requires the
-[format migration procedure](docs/durable-format.md).
+configurable startup reservations. Durable-format changes must update the
+[format inventory and recovery checks](docs/durable-format.md); unsupported
+identities fail explicitly. Retaining old pos3ql readers or providing an upgrade
+migration is not a completion requirement.
 
 Keep test dependencies reproducible and verify their installation before running
 comparisons. Fix interrupted downloads with bounded retries and verified caches;

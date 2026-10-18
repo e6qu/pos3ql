@@ -3,9 +3,9 @@
 use core::mem::{align_of, size_of};
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
+use super::RowState;
 use super::row_map::RowMap;
 use super::row_versions::{RowVersionPools, RowVersionState};
-use super::{RowState, Table};
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
@@ -210,16 +210,7 @@ impl HeapRowOwnership {
         })
     }
 
-    pub(super) fn with_all<R>(
-        &self,
-        versions: &RowVersionPools,
-        tables: &[Table],
-        operation: impl FnOnce(&mut RowVersionState, &mut LockedRowMaps<'_, '_>) -> Result<R, SqlError>,
-    ) -> Result<R, SqlError> {
-        self.with_maps(versions, tables.iter().map(|table| &table.rows), operation)
-    }
-
-    fn with_maps<'storage, R>(
+    pub(super) fn with_row_maps<'storage, R>(
         &self,
         versions: &'storage RowVersionPools,
         maps: impl ExactSizeIterator<Item = &'storage RowMap> + Clone,
@@ -430,10 +421,14 @@ mod tests {
 
             storage
                 .heap_row_ownership
-                .with_all(&storage.row_versions, &storage.tables, |_, rows| {
-                    assert_eq!(rows.iter().count(), storage.tables.len());
-                    Ok(())
-                })
+                .with_row_maps(
+                    &storage.row_versions,
+                    storage.tables.iter().map(|table| &table.rows),
+                    |_, rows| {
+                        assert_eq!(rows.iter().count(), storage.tables.len());
+                        Ok(())
+                    },
+                )
                 .unwrap();
             assert!(storage.row_versions.test_write().is_ok());
             assert!(
@@ -502,7 +497,7 @@ mod tests {
             drop(held);
 
             let error: Result<(), SqlError> =
-                workspace.with_maps(&versions, maps.iter(), |_, rows| {
+                workspace.with_row_maps(&versions, maps.iter(), |_, rows| {
                     assert_eq!(rows.iter().count(), maps.len());
                     Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -514,7 +509,7 @@ mod tests {
             assert!(maps.iter().all(|rows| rows.test_write().is_ok()));
             let mut calls = 0;
             workspace
-                .with_maps(&versions, maps.iter(), |_, rows| {
+                .with_row_maps(&versions, maps.iter(), |_, rows| {
                     calls += 1;
                     assert_eq!(rows.iter().count(), maps.len());
                     Ok(())
@@ -522,7 +517,7 @@ mod tests {
                 .unwrap();
             assert_eq!(calls, 1);
 
-            let error: Result<(), SqlError> = tiny.with_maps(&versions, maps.iter(), |_, _| {
+            let error: Result<(), SqlError> = tiny.with_row_maps(&versions, maps.iter(), |_, _| {
                 panic!("exhausted scratch ran the operation")
             });
             let error = error.unwrap_err();

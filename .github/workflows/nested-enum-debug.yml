@@ -60,6 +60,27 @@ jobs:
       - uses: ./.github/actions/python-test-environment
         with:
           venv: target/external-venv
+      - name: Record PostgreSQL domain operator resolution
+        env:
+          PGHOST: 127.0.0.1
+          PGUSER: postgres
+        run: |
+          psql -X --set=VERBOSITY=sqlstate <<'SQL'
+          CREATE TYPE enum_operator_state AS ENUM ('old', 'ready');
+          CREATE DOMAIN enum_operator_domain AS enum_operator_state;
+          CREATE TABLE enum_operator_rows(state enum_operator_domain);
+          INSERT INTO enum_operator_rows VALUES ('old'),(NULL);
+          SELECT state = 'old' FROM enum_operator_rows;
+          SELECT 'old' = state FROM enum_operator_rows;
+          SELECT state = 'old'::enum_operator_state FROM enum_operator_rows;
+          SELECT state = 'old'::enum_operator_domain FROM enum_operator_rows;
+          SELECT NULL::enum_operator_domain = 'old';
+          SELECT 'old'::enum_operator_domain = 'old';
+          SELECT state < 'ready' FROM enum_operator_rows;
+          DROP TABLE enum_operator_rows;
+          DROP DOMAIN enum_operator_domain;
+          DROP TYPE enum_operator_state;
+          SQL
       - name: Compare nested enum mutations with PostgreSQL 18
         env:
           POS3QL_VENV: ${{ github.workspace }}/target/external-venv

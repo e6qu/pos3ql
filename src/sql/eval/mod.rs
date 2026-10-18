@@ -461,15 +461,18 @@ pub(crate) fn expression_type_identity<'a>(
     if let Expr::Column { qualifier, name } = expression
         && let Some(identity) = row.column_user_type(*qualifier, name)
     {
-        return catalog_user_type_oid(
-            identity,
-            matches!(
-                row.col_type(*qualifier, name),
-                Some(super::types::ColType::Array(_))
-            ),
-            hooks,
-        )
-        .map(ExpressionTypeIdentity::Known);
+        return hooks
+            .catalog
+            .and_then(|catalog| {
+                catalog.declared_user_type_oid(row.col_type(*qualifier, name)?, identity)
+            })
+            .map(ExpressionTypeIdentity::Known)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "evaluated user-defined column has no catalog identity"
+                )
+            });
     }
     if let Expr::Cast { type_name, .. } = expression {
         if let Some(ctype) = super::types::ColType::from_sql_name(type_name) {
@@ -1597,6 +1600,19 @@ pub trait CatalogAccess {
     }
     /// Resolves the exact OID of a visible user-defined scalar or array type.
     fn user_type_oid(&self, _type_name: &str) -> Option<i32> {
+        None
+    }
+    /// Resolves the declaration rather than inferring scalar/array identity
+    /// from its representation: a scalar domain may itself contain an array.
+    fn declared_user_type_oid(
+        &self,
+        ctype: ColType,
+        identity: crate::storage::UserTypeName,
+    ) -> Option<i32> {
+        self.user_type_identity_oid(identity, matches!(ctype, ColType::Array(_)))
+    }
+    /// The representation of a visible domain, excluding arrays of domains.
+    fn domain_base_type(&self, _type_oid: i32) -> Option<ColType> {
         None
     }
     /// Resolves a durable schema-qualified identity without reparsing it as

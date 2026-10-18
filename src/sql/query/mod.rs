@@ -3950,6 +3950,25 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::user_type_oid(self.storage, self.txid, type_name)
     }
 
+    fn declared_user_type_oid(
+        &self,
+        ctype: ColType,
+        identity: crate::storage::UserTypeName,
+    ) -> Option<i32> {
+        self.storage
+            .routine_type_oid(ctype, Some(identity), self.txid)
+    }
+
+    fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        let slot = usize::try_from(type_oid.checked_sub(super::types::oid::FIRST_DOMAIN)?).ok()?;
+        if slot >= self.storage.domain_count()
+            || !self.storage.domain_slot_visible_to(slot, self.txid)
+        {
+            return None;
+        }
+        Some(self.storage.domain_for(slot, self.txid).base)
+    }
+
     fn user_type_identity_oid(
         &self,
         identity: crate::storage::UserTypeName,

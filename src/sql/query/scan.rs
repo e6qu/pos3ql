@@ -15,7 +15,7 @@ use crate::sql::ast::{
 };
 use crate::sql::eval::{
     CatalogAccess, ColumnLookup, EvalHooks, SqlError, cast_to, compare_datums_collated, eval_full,
-    hash_key_collated, sqlstate,
+    hash_key_collated_catalog, sqlstate,
 };
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
@@ -3505,13 +3505,16 @@ fn indexed_candidates_for_plan<'a>(
         Ok(Match)
     };
     let compact_columns = core::array::from_fn::<u16, MAX_INDEX_COLS, _>(|index| index as u16);
-    let hash = (plan.exact && plan.method != crate::sql::ast::IndexAccessMethod::Brin).then(|| {
-        hash_key_collated(
-            &values[0][..plan.n_columns],
-            &compact_columns[..plan.n_columns],
-            &collations[..plan.n_columns],
-        )
-    });
+    let hash = (plan.exact && plan.method != crate::sql::ast::IndexAccessMethod::Brin)
+        .then(|| {
+            hash_key_collated_catalog(
+                storage,
+                &values[0][..plan.n_columns],
+                &compact_columns[..plan.n_columns],
+                &collations[..plan.n_columns],
+            )
+        })
+        .transpose()?;
     let retain_keys =
         ordered_plan.is_some() && storage.value_binding_durable_complete(slot, plan.binding);
     let knn_origin = if let Some(knn) = ordered_plan.and_then(|ordered| ordered.knn) {
@@ -5605,11 +5608,12 @@ fn scan_source_mode<'a>(
                         if n == entries.len() {
                             return Err(arena_full());
                         }
-                        let hash = hash_key_collated(
+                        let hash = hash_key_collated_catalog(
+                            storage,
                             &key_vals[..nkeys],
                             &hash_cols[..nkeys],
                             &key_collations[..nkeys],
-                        );
+                        )?;
                         let bucket = (hash as usize) & (buckets_len - 1);
                         entries[n] = HashEntry {
                             hash,
@@ -5697,11 +5701,12 @@ fn scan_source_mode<'a>(
                     if n == entries.len() {
                         return Err(arena_full());
                     }
-                    let hash = hash_key_collated(
+                    let hash = hash_key_collated_catalog(
+                        storage,
                         &key_vals[..nkeys],
                         &hash_cols[..nkeys],
                         &key_collations[..nkeys],
-                    );
+                    )?;
                     let bucket = (hash as usize) & (buckets_len - 1);
                     entries[n] = HashEntry {
                         hash,
@@ -5758,11 +5763,12 @@ fn scan_source_mode<'a>(
                         }
                         let mut matched_any = false;
                         if !any_null {
-                            let hash = hash_key_collated(
+                            let hash = hash_key_collated_catalog(
+                                storage,
                                 &key_vals[..nkeys],
                                 &hash_cols[..nkeys],
                                 &key_collations[..nkeys],
-                            );
+                            )?;
                             let mut index = buckets[(hash as usize) & (buckets_len - 1)];
                             while index != u32::MAX {
                                 let entry = &entries[index as usize];
@@ -5893,11 +5899,12 @@ fn scan_source_mode<'a>(
                 }
                 let mut matched_any = false;
                 if !any_null {
-                    let hash = hash_key_collated(
+                    let hash = hash_key_collated_catalog(
+                        storage,
                         &key_vals[..nkeys],
                         &hash_cols[..nkeys],
                         &key_collations[..nkeys],
-                    );
+                    )?;
                     let mut idx = buckets[(hash as usize) & (buckets_len - 1)];
                     while idx != u32::MAX {
                         let entry = &entries[idx as usize];

@@ -170,6 +170,9 @@ impl<'a> Lexer<'a> {
                     | b'?'
             )
         {
+            if self.text[self.at..].starts_with("/*") || self.text[self.at..].starts_with("--") {
+                break;
+            }
             self.at += 1;
         }
         let contains_pg_extension_character =
@@ -834,6 +837,16 @@ mod tests {
                 "Op(\"::\")",
                 "Op(\"||\")",
                 "Op(\"<=\")"
+            ]
+        );
+        assert_eq!(
+            lex_all("1=/*comment*/1+--line\n2"),
+            [
+                "Num(\"1\")",
+                "Op(\"=\")",
+                "Num(\"1\")",
+                "Op(\"+\")",
+                "Num(\"2\")"
             ]
         );
     }

@@ -258,6 +258,9 @@ pub struct Parser<'a> {
     arena: &'a Arena,
     /// Highest `$n` seen — the statement's parameter count.
     max_param: u32,
+    // Source positions of string tokens considered by stored enum inference.
+    // Grammar literals keep their syntax and leave their parameter slot unused.
+    string_parameters: &'a [usize],
     /// The `WINDOW name AS (...)` definitions of the SELECT being parsed, which
     /// `OVER name` resolves against. Scoped to that SELECT: the length is saved
     /// and truncated back around a nested one, since a subquery neither sees
@@ -305,11 +308,23 @@ pub fn parse_query<'a>(
     sql: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, super::eval::SqlError> {
+    parse_query_with_string_parameters(sql, arena, &[])
+}
+
+/// Analyze ordinary expression strings as parameters while preserving syntax
+/// that requires literal tokens, including JSON_TABLE paths and typed constants.
+/// Parameter positions are sorted source byte offsets; indices start at one.
+pub(crate) fn parse_query_with_string_parameters<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+    positions: &'a [usize],
+) -> Result<&'a Select<'a>, super::eval::SqlError> {
     let to_sql = |m: &str| super::eval::SqlError {
         sqlstate: super::eval::SqlState::known(super::eval::sqlstate::SYNTAX_ERROR),
         message: crate::stack_format!(192, "invalid query: {}", m),
     };
     let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
+    parser.string_parameters = positions;
     let sel = parser
         .query_select()
         .map_err(|e| to_sql(e.message.as_str()))?;
@@ -433,6 +448,7 @@ impl<'a> Parser<'a> {
             peek_at,
             arena,
             max_param: 0,
+            string_parameters: &[],
             windows: ArenaList::new(arena),
             warnings: ArenaList::new(arena),
             allow_into: false,
@@ -441,6 +457,23 @@ impl<'a> Parser<'a> {
             routine_parameters: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
             routine_name: None,
         })
+    }
+
+    fn string_expression(
+        &mut self,
+        value: &'a str,
+        source_at: usize,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        if let Ok(index) = self.string_parameters.binary_search(&source_at) {
+            let parameter = index
+                .checked_add(1)
+                .and_then(|index| u32::try_from(index).ok())
+                .ok_or_else(|| self.arena_full("too many stored string literals"))?;
+            self.max_param = self.max_param.max(parameter);
+            self.arena_expr(Expr::Param(parameter))
+        } else {
+            self.arena_expr(Expr::Str(value))
+        }
     }
 
     pub(crate) fn with_routine_parameters(
@@ -3069,7 +3102,10 @@ impl<'a> Parser<'a> {
     }
 
     fn json_table_path(&mut self) -> Result<&'a Expr<'a>, ParseError> {
-        let path = self.expression(0)?;
+        let parameters = core::mem::take(&mut self.string_parameters);
+        let path = self.expression(0);
+        self.string_parameters = parameters;
+        let path = path?;
         if !matches!(path, Expr::Str(_)) {
             return Err(self
                 .err_here("only string constants are supported in JSON_TABLE path specification"));

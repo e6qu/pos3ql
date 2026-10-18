@@ -502,7 +502,17 @@ pub(super) fn resolve_default(
             expression: store_default_text(default_text)?,
         });
     }
-    Ok(ColumnDefault::Expression(store_default_text(default_text)?))
+    let source = store_default_text(default_text)?;
+    Ok(ColumnDefault::Expression(
+        crate::sql::enum_values::checks::bind_default::<{ crate::storage::DEFAULT_EXPR_MAX }>(
+            source.as_str(),
+            ctype,
+            storage,
+            txid,
+            false,
+            arena,
+        )?,
+    ))
 }
 
 fn store_default_text(

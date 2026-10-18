@@ -33,6 +33,14 @@ commands and explicit architecture rejections. Curated differential queries,
 raw-wire/driver probes, and the vendored regression schedule are continuing
 ratchets. Unsupported clauses and type combinations must reject explicitly.
 
+Arrays of domains over built-in arrays are supported. For example, a domain
+`integer_vector` over `integer[]` can be used as `integer_vector[]`.
+Arrays of domains whose base is an array of user-defined values are rejected:
+the stored base code cannot retain that nested declaration. A scalar domain
+containing an array of scalar domains is supported.
+For example, `CREATE DOMAIN positive_ids AS positive_integer[]` is distinct
+from an unsupported `positive_ids[]` column.
+
 ## Physical access paths
 
 | Method | Object-native path |
@@ -98,6 +106,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Durable array count | 65,535 elements; exact slices or streaming traversal | Array text/binary, execution, persistence, and cold-recovery fixtures |
 | Durable constraint identity | 64 constraints per modeled table kind and 64 domain checks | Manifest v14 and 64-position catalog/trigger OID stride; SQLSTATE 54000 on the next item |
 | Other definition breadth | Documented 64-item constructs, including LIST bounds, inheritance parents, trigger arguments, and routine configuration entries | Shared parse/storage boundary; widening requires review of representation and identity |
+| Stored default expressions | 120 bytes, including enum member bindings and saved catalog display text | Existing startup reservation; SQLSTATE 54000 names an overfull default or bound enum expression before installation |
 | Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |
 | Durable object requests | `object_store_get_slots` read clients, one separate atomic block read/write client, and one metadata/WAL client | Each reserves `object_store_head_bytes` + `object_store_response_bytes`; read-slot controls and one 256 KiB block scratch buffer are also charged at startup, separately from cache tiers; atomic reads preserve pending reader requests but can wait synchronously or duplicate a GET |
 | Executing snapshot retention | 1,024 owned statement snapshot and selected row/index file owner slots per query workspace; separate transaction snapshots; checked 64-bit identities; independent `2 * max_value_indexes` retained index graphs | File ownership survives scan/arena release and statement waits; startup membership bits deduplicate aliases without using point-source slots; SQLSTATE 54000 before partial registration, file capture or identity reuse |
@@ -109,7 +118,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | DML output schema | Shared startup schema-image pool: table slots × (`max_catalog_versions_per_object` + 1) × `query_workspace_slots`; released after output analysis | SQLSTATE 54000 before partial description on exhaustion; descriptions avoid full schema copies in the statement arena |
 | Reader-history cleanup | One separate startup workspace with `max(table_rows, large_object_pages)` 64-bit row identities; at most 64 identities per shared-lock transition | Included in startup memory; does not consume query walk slots; current reader retention is rechecked for every batch |
 | Retained row identities | 64 internal walk slots per query workspace; each reserves the largest configured table, large-object page, or value-index row capacity | Owned startup slots survive map/table/Storage removal; SQLSTATE 54000 on slot or identity-buffer exhaustion |
-| Deferred row retention for sorted scans and enum rewrites | 32 bytes per optional row record on the release target, within the fixed statement arena; one shared source per table | Records borrow their original heap/file owner; statement or source exhaustion returns SQLSTATE 54000 |
+| Deferred row retention for sorted scans | 32 bytes per optional row record on the release target, within the fixed statement arena; one shared source per table | Records borrow their original heap/file owner; statement or source exhaustion returns SQLSTATE 54000 |
 | Sequential SQL resident scans | 32 bytes per resident overlay row, including deletions, in the fixed statement arena; saved rows continue streaming | Captured visible versions and original heap/files survive cleanup and table/Storage removal; SQLSTATE 54000 releases failed capture ownership |
 | Table COPY TO retention | 32 bytes per ordered output record on the release target, plus captured resident records and saved-file lists in the fixed statement arena | The named relation's original source releases on completion or error; SQLSTATE 54000 on exhaustion, without raising query limits |
 | Index validation retention | 32 bytes per resident overlay row plus saved-file lists in the fixed statement arena, reused between target tables; per-row expression scratch is recycled; saved rows stream | Ordinary, copied, and partition indexes include own changes and current committed rows; SQLSTATE 54000 releases failed creation and its pending catalog entries |
@@ -136,7 +145,8 @@ max_ddl_per_transaction)`. Committed definitions, pending changes and retained
 readers share those slots. Reader retention can exhaust this pool before a
 pending-definition limit is reached; `54000` names the enum member-image pool
 and preserves the published definition. Each image holds
-`max_enum_labels_per_type` labels. The image counters and controls are included
+`max_enum_labels_per_type` members, each with a current label, sort position and
+optional legacy label binding. Their actual structure sizes, counters and controls are included
 in the startup memory plan.
 `max_row_versions_per_row` bounds pending writes and committed snapshot versions;
 each write retains an immutable image, including writes in the same command.
@@ -170,7 +180,8 @@ PostgreSQL's on-disk page layout.
   prepare for the [remaining concurrency work](../PLAN.md#remaining-sequence).
 - PostgreSQL's cost model and exact EXPLAIN text are not compatibility complete.
   PostgreSQL parallel-query/JIT and planner/executor hooks do not exist.
-- Heap layout, heap-version `ctid`, HOT, physical vacuum internals, physical
+- Heap layout, heap-version `ctid`, transaction-header columns (`xmin`, `xmax`,
+  `cmin`, `cmax`), HOT, physical vacuum internals, physical
   XLOG/streaming replication, hot standby, and binary-WAL tools are non-goals.
   Object-native row identities are not exposed as invented heap addresses.
 - Logical copies are asynchronous independently durable databases; transparent

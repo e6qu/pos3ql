@@ -128,6 +128,45 @@ DROP TABLE rewrite_scalar;
 DROP TABLE rewrite_array;
 DROP TYPE rewrite_state;
 
+-- Enum labels inside composites and their arrays change with the type too;
+-- ordinary text with the same spelling stays unchanged.
+CREATE TYPE enum_nested_state AS ENUM ('old', 'ready');
+CREATE TYPE enum_nested_detail AS (state enum_nested_state, note text);
+CREATE TABLE enum_nested_orders (
+  id integer, detail enum_nested_detail, batch enum_nested_detail[]
+);
+INSERT INTO enum_nested_orders VALUES
+  (1, ROW('old', 'old')::enum_nested_detail,
+   ARRAY[ROW('old', 'old')::enum_nested_detail]);
+BEGIN;
+ALTER TYPE enum_nested_state RENAME VALUE 'old' TO 'new';
+SELECT (detail).state, (batch[1]).state, (detail).note FROM enum_nested_orders;
+ROLLBACK;
+SELECT (detail).state, (batch[1]).state, (detail).note FROM enum_nested_orders;
+ALTER TYPE enum_nested_state RENAME VALUE 'old' TO 'new';
+SELECT (detail).state, (batch[1]).state, (detail).note FROM enum_nested_orders;
+DROP TABLE enum_nested_orders;
+DROP TYPE enum_nested_detail;
+DROP TYPE enum_nested_state;
+
+-- Stored typed constants keep the same member when its label changes.
+CREATE TYPE enum_identity_state AS ENUM ('old', 'ready');
+CREATE TABLE enum_identity_defaults (state enum_identity_state DEFAULT 'old');
+CREATE VIEW enum_identity_view AS SELECT 'old'::enum_identity_state AS state;
+CREATE DOMAIN enum_identity_domain AS enum_identity_state CHECK (VALUE = 'old');
+CREATE TABLE enum_identity_domains (state enum_identity_domain);
+ALTER TYPE enum_identity_state RENAME VALUE 'old' TO 'new';
+INSERT INTO enum_identity_defaults DEFAULT VALUES;
+INSERT INTO enum_identity_domains VALUES ('new');
+SELECT state::text FROM enum_identity_defaults;
+SELECT state::text FROM enum_identity_view;
+SELECT state::text FROM enum_identity_domains;
+DROP TABLE enum_identity_defaults;
+DROP TABLE enum_identity_domains;
+DROP VIEW enum_identity_view;
+DROP DOMAIN enum_identity_domain;
+DROP TYPE enum_identity_state;
+
 -- The type namespace is shared by enums, domains, and named composites.
 CREATE TYPE enum_composite_name AS (id integer);
 ALTER TYPE feeling RENAME TO enum_composite_name;
@@ -205,3 +244,157 @@ DROP TYPE feeling;
 DROP TABLE composite_type_values;
 DROP TYPE composite_lifecycle_schema.composite_moved;
 DROP SCHEMA composite_lifecycle_schema;
+
+
+-- Captured constants, domain enforcement and plain text follow distinct meanings.
+CREATE TYPE enum_guard_state AS ENUM ('old', 'ready', 'high');
+CREATE DOMAIN enum_guard_value AS enum_guard_state CHECK (VALUE = ANY('{old,ready}'::enum_guard_state[]));
+CREATE DOMAIN enum_guard_batch AS enum_guard_state[] CHECK (cardinality(VALUE) = 1 AND VALUE[1] = 'old');
+CREATE TYPE enum_guard_detail AS (state enum_guard_value, note text);
+CREATE TABLE enum_guard_rows (id integer, state enum_guard_value, batch enum_guard_batch, detail enum_guard_detail);
+INSERT INTO enum_guard_rows VALUES (1, 'old', '{old}', ROW('old', 'old')::enum_guard_detail);
+SELECT id FROM enum_guard_rows WHERE state = 'old';
+SELECT id FROM enum_guard_rows WHERE state = 'old'::enum_guard_state;
+SELECT id FROM enum_guard_rows WHERE state = 'old'::enum_guard_value;
+SELECT id FROM enum_guard_rows WHERE 'old' = state;
+SELECT NULL::enum_guard_value = 'old';
+SELECT 'old'::enum_guard_value = 'old';
+SELECT id FROM enum_guard_rows WHERE state < 'ready';
+SELECT state IN ('old') FROM enum_guard_rows;
+SELECT state = ANY(ARRAY['old'::enum_guard_state]) FROM enum_guard_rows;
+SELECT state BETWEEN 'old' AND 'ready' FROM enum_guard_rows;
+SELECT state IS DISTINCT FROM 'old' FROM enum_guard_rows;
+SELECT CASE state WHEN 'old' THEN 1 END FROM enum_guard_rows;
+CREATE VIEW enum_guard_view AS SELECT id, 'old'::enum_guard_state AS pinned, 'old' AS note FROM enum_guard_rows WHERE state::enum_guard_state = 'old'::enum_guard_state;
+INSERT INTO enum_guard_rows(id, state) VALUES (2, 'high');
+INSERT INTO enum_guard_rows(id, detail) VALUES (2, ROW('high', 'old')::enum_guard_detail);
+ALTER TYPE enum_guard_state RENAME VALUE 'old' TO 'new';
+SELECT state::text, batch[1]::text, (detail).state::text, (detail).note FROM enum_guard_rows;
+SELECT id, pinned::text, note FROM enum_guard_view;
+INSERT INTO enum_guard_rows(id, state) VALUES (2, 'high');
+ALTER TYPE enum_guard_state ADD VALUE 'old';
+INSERT INTO enum_guard_rows(id, batch) VALUES (2, '{old}');
+CREATE SCHEMA enum_guard_moved;
+ALTER TYPE enum_guard_state SET SCHEMA enum_guard_moved;
+SELECT id, pinned::text, note FROM enum_guard_view;
+INSERT INTO enum_guard_rows(id, state, batch) VALUES (2, 'new', '{new}');
+SELECT id, state::text, batch[1]::text FROM enum_guard_rows ORDER BY id;
+SELECT position('p3c:' IN pg_get_constraintdef(oid)) = 0 FROM pg_constraint WHERE contypid = 'enum_guard_value'::regtype ORDER BY conname;
+DROP VIEW enum_guard_view;
+DROP TABLE enum_guard_rows;
+DROP TYPE enum_guard_detail;
+DROP DOMAIN enum_guard_batch;
+DROP DOMAIN enum_guard_value;
+DROP TYPE enum_guard_moved.enum_guard_state;
+DROP SCHEMA enum_guard_moved;
+
+
+-- A domain containing a domain array remains a scalar declaration.
+CREATE TYPE kept_state AS ENUM ('old', 'high');
+CREATE DOMAIN kept_inner AS kept_state CHECK (VALUE::text <> 'high');
+CREATE DOMAIN kept_outer AS kept_inner[] CHECK (cardinality(VALUE) = 1);
+CREATE TABLE kept_rows(batch kept_outer, elements kept_inner[]);
+CREATE FUNCTION kept_echo(kept_outer) RETURNS kept_outer LANGUAGE SQL AS 'SELECT $1';
+INSERT INTO kept_rows VALUES ('{old}', '{old}');
+ALTER DOMAIN kept_inner RENAME TO kept_inner_new;
+ALTER TYPE kept_state RENAME VALUE 'old' TO 'new';
+CREATE SCHEMA kept_moved;
+ALTER TYPE kept_state SET SCHEMA kept_moved;
+SELECT pg_typeof(batch) = 'kept_outer'::regtype,
+       pg_typeof(elements) = 'kept_inner_new[]'::regtype,
+       pg_typeof(kept_echo(batch)) = 'kept_outer'::regtype,
+       batch[1]::text, elements[1]::text FROM kept_rows;
+INSERT INTO kept_rows(batch) VALUES ('{new,new}');
+INSERT INTO kept_rows(batch) VALUES ('{high}');
+INSERT INTO kept_rows(elements) VALUES ('{high}');
+DROP TABLE kept_rows;
+DROP FUNCTION kept_echo(kept_outer);
+DROP DOMAIN kept_outer;
+DROP DOMAIN kept_inner_new;
+DROP TYPE kept_moved.kept_state;
+DROP SCHEMA kept_moved;
+
+
+-- Domain defaults keep typed members for existing and newly created columns.
+CREATE TYPE default_state AS ENUM ('old', 'ready');
+CREATE DOMAIN default_value AS default_state DEFAULT 'old'::default_state;
+CREATE DOMAIN default_batch AS default_state[] DEFAULT '{old}'::default_state[];
+CREATE SEQUENCE default_calls;
+CREATE FUNCTION default_echo(default_state) RETURNS default_state LANGUAGE SQL VOLATILE
+ AS 'SELECT $1 WHERE nextval(''default_calls'') > 0';
+CREATE DOMAIN default_dynamic AS default_state DEFAULT default_echo('ready');
+ALTER DOMAIN default_dynamic SET DEFAULT default_echo('old');
+CREATE TABLE default_before (state default_value, states default_batch,
+    echo_state default_state DEFAULT default_echo('old'), dynamic default_dynamic);
+CREATE VIEW default_view AS SELECT * FROM default_before;
+ALTER VIEW default_view ALTER COLUMN echo_state SET DEFAULT default_echo('old');
+ALTER TYPE default_state RENAME VALUE 'old' TO 'new';
+ALTER TYPE default_state ADD VALUE 'old';
+BEGIN;
+CREATE SCHEMA defaults_moved;
+ALTER TYPE default_state SET SCHEMA defaults_moved;
+SAVEPOINT retired_type_name;
+SELECT NULL::default_state;
+ROLLBACK TO retired_type_name;
+CREATE TABLE default_after (state default_value, states default_batch,
+    echo_state defaults_moved.default_state DEFAULT default_echo('old'), dynamic default_dynamic);
+CREATE FUNCTION default_echo(text) RETURNS defaults_moved.default_state
+    LANGUAGE SQL VOLATILE AS 'SELECT ''old''::defaults_moved.default_state';
+INSERT INTO default_before DEFAULT VALUES;
+INSERT INTO default_after DEFAULT VALUES;
+INSERT INTO default_view DEFAULT VALUES;
+COMMIT;
+SELECT state::text, states[1]::text, echo_state::text, dynamic::text FROM default_before;
+SELECT state::text, states[1]::text, echo_state::text, dynamic::text FROM default_after;
+SELECT last_value FROM default_calls;
+SELECT typname, typdefault FROM pg_type WHERE typname IN ('default_value','default_batch','default_dynamic') ORDER BY typname;
+SELECT typname, pg_get_expr(typdefaultbin, 0) FROM pg_type
+ WHERE typname IN ('default_value','default_batch','default_dynamic') ORDER BY typname;
+SELECT domain_name, domain_default FROM information_schema.domains
+ WHERE domain_name IN ('default_value','default_batch','default_dynamic') ORDER BY domain_name;
+DROP VIEW default_view;
+DROP TABLE default_before;
+DROP TABLE default_after;
+DROP DOMAIN default_dynamic;
+DROP DOMAIN default_value;
+DROP DOMAIN default_batch;
+DROP FUNCTION default_echo(defaults_moved.default_state);
+DROP FUNCTION default_echo(text);
+DROP SEQUENCE default_calls;
+DROP TYPE defaults_moved.default_state;
+DROP SCHEMA defaults_moved;
+
+
+CREATE TYPE "QuotedState" AS ENUM ('old', 'ready', '*/%é');
+CREATE DOMAIN "QuotedValue" AS "QuotedState" DEFAULT 'old'::"QuotedState";
+CREATE DOMAIN "QuotedOdd" AS "QuotedState" DEFAULT '*/%é'::"QuotedState";
+CREATE TABLE quoted_rows(value "QuotedValue", odd "QuotedOdd");
+ALTER TYPE "QuotedState" RENAME VALUE 'old' TO 'new';
+INSERT INTO quoted_rows DEFAULT VALUES;
+SELECT value::text, pg_typeof(value)::text, odd::text FROM quoted_rows;
+SELECT typdefault FROM pg_type WHERE typname IN ('QuotedValue','QuotedOdd') ORDER BY typname;
+DROP TABLE quoted_rows;
+DROP DOMAIN "QuotedValue";
+DROP DOMAIN "QuotedOdd";
+DROP TYPE "QuotedState";
+
+
+-- Grammar strings remain literals when a view also retains an enum member.
+BEGIN;
+CREATE TYPE grammar_state AS ENUM ('old', 'ready');
+CREATE VIEW grammar_values AS
+ WITH items AS (
+   SELECT item_id, 'old'::grammar_state AS nested FROM JSON_TABLE(
+     '[{"id":1}]', '$[*]' COLUMNS (item_id integer PATH '$.id')
+   ) AS extracted
+ )
+ SELECT DATE '2024-01-02' AS day, 'old'::grammar_state AS kept, nested, item_id,
+        TIMESTAMP(2) '2024-01-02 03:04:05.12345' AS stamp,
+        INTERVAL '1' DAY AS age, 'old'::text AS plain
+   FROM items;
+ALTER TYPE grammar_state RENAME VALUE 'old' TO 'new';
+COMMIT;
+ALTER TYPE grammar_state ADD VALUE 'old';
+SELECT kept::text, nested::text, item_id, day::text, stamp::text, age::text, plain FROM grammar_values;
+DROP VIEW grammar_values;
+DROP TYPE grammar_state;

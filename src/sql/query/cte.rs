@@ -4764,7 +4764,9 @@ fn subst_tableref<'a>(
             }
             crate::storage::ViewSecurity::Invoker => context.authorization_role,
         };
-        let query = context.storage.snapshot_view_query(slot, arena)?;
+        let query = context
+            .storage
+            .snapshot_view_query(slot, context.txid, arena)?;
         let view_sql = arena
             .alloc_str(query.sql.as_str())
             .map_err(|_| arena_full())?;
@@ -5031,6 +5033,48 @@ fn subst_frame_bound<'a>(
     })
 }
 
+fn stored_type_reference(
+    type_name: &str,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+) -> Option<(crate::storage::DependencyClass, u16, bool)> {
+    let (bare, array) = type_name
+        .strip_suffix("[]")
+        .map_or((type_name, false), |bare| (bare, true));
+    let (referenced_schema, referenced_name) = bare.split_once('.').unwrap_or(("", bare));
+    dependencies
+        .entries()
+        .iter()
+        .find(|dependency| {
+            matches!(
+                dependency.class,
+                crate::storage::DependencyClass::Domain
+                    | crate::storage::DependencyClass::Enum
+                    | crate::storage::DependencyClass::Composite
+            ) && dependency.referenced_schema.as_str() == referenced_schema
+                && dependency.referenced_name.as_str() == referenced_name
+        })
+        .map(|dependency| (dependency.class, dependency.slot, array))
+}
+
+/// Resolved dependency slots retain the identity of the original SQL spelling,
+/// even when its old name has since been reused by another type.
+pub(crate) fn captured_type_oid(
+    type_name: &str,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+) -> Option<i32> {
+    use crate::sql::types::oid;
+    let (class, slot, array) = stored_type_reference(type_name, dependencies)?;
+    Some(match (class, array) {
+        (crate::storage::DependencyClass::Domain, false) => oid::domain_oid(slot),
+        (crate::storage::DependencyClass::Domain, true) => oid::domain_array_oid(slot),
+        (crate::storage::DependencyClass::Enum, false) => oid::enum_oid(slot),
+        (crate::storage::DependencyClass::Enum, true) => oid::enum_array_oid(slot),
+        (crate::storage::DependencyClass::Composite, false) => oid::composite_oid(slot),
+        (crate::storage::DependencyClass::Composite, true) => oid::composite_array_oid(slot),
+        _ => unreachable!("stored type reference selects only named types"),
+    })
+}
+
 fn rewrite_stored_type_name<'a>(
     type_name: &'a str,
     context: Subst<'_, 'a, '_, '_>,
@@ -5039,38 +5083,20 @@ fn rewrite_stored_type_name<'a>(
     let Some(dependencies) = context.dependencies else {
         return Ok(type_name);
     };
-    let (bare, array) = type_name
-        .strip_suffix("[]")
-        .map_or((type_name, false), |bare| (bare, true));
-    let (referenced_schema, referenced_name) = bare.split_once('.').unwrap_or(("", bare));
-    let Some(dependency) = dependencies.entries().iter().find(|dependency| {
-        matches!(
-            dependency.class,
-            crate::storage::DependencyClass::Domain
-                | crate::storage::DependencyClass::Enum
-                | crate::storage::DependencyClass::Composite
-        ) && dependency.referenced_schema.as_str() == referenced_schema
-            && dependency.referenced_name.as_str() == referenced_name
-    }) else {
+    let Some((class, slot, array)) = stored_type_reference(type_name, dependencies) else {
         return Ok(type_name);
     };
-    let (schema, name) = match dependency.class {
+    let (schema, name) = match class {
         crate::storage::DependencyClass::Domain => {
-            let definition = context
-                .storage
-                .domain_for(dependency.slot as usize, context.txid);
+            let definition = context.storage.domain_for(slot as usize, context.txid);
             (definition.schema, definition.name)
         }
         crate::storage::DependencyClass::Enum => {
-            let definition = context
-                .storage
-                .enum_for(dependency.slot as usize, context.txid);
+            let definition = context.storage.enum_for(slot as usize, context.txid);
             (definition.schema, definition.name)
         }
         crate::storage::DependencyClass::Composite => {
-            let definition = context
-                .storage
-                .composite_for(dependency.slot as usize, context.txid);
+            let definition = context.storage.composite_for(slot as usize, context.txid);
             (definition.schema, definition.name)
         }
         _ => unreachable!("stored type-name rewriting records only type dependencies"),

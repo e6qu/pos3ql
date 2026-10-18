@@ -13607,7 +13607,10 @@ pub fn view_def_text<'a>(
     for (slot, _) in storage.views_visible_to(txid) {
         if view_oid(slot) == oid {
             return arena
-                .alloc_str_display(format_args!("{};", storage.view_sql(slot).as_str()))
+                .alloc_str_display(format_args!(
+                    "{};",
+                    storage.snapshot_view_query(slot, txid, arena)?.sql.as_str()
+                ))
                 .map(Some)
                 .map_err(|_| arena_full());
         }
@@ -14337,12 +14340,13 @@ pub fn user_type_name_text<'a>(
                 (oid - type_oid::FIRST_DOMAIN) as usize
             })
     };
-    let mut rendered = StackStr::<140>::new();
+    let mut rendered = StackStr::<260>::new();
     use core::fmt::Write as _;
     if !unqualified_visible {
-        let _ = write!(rendered, "{}.", schema.as_str());
+        write_identifier(&mut rendered, schema.as_str());
+        let _ = rendered.write_char('.');
     }
-    let _ = rendered.write_str(name.as_str());
+    write_identifier(&mut rendered, name.as_str());
     if array {
         let _ = rendered.write_str("[]");
     }
@@ -15043,7 +15047,14 @@ pub fn constraint_def_text<'a>(
             }
             let mut rendered = StackStr::<1024>::new();
             use core::fmt::Write as _;
-            let _ = write!(rendered, "CHECK (({}))", check.expression.as_str());
+            let expression = super::enum_values::checks::resolve(
+                check.expression.as_str(),
+                domain.base,
+                storage,
+                txid,
+                arena,
+            )?;
+            let _ = write!(rendered, "CHECK (({}))", expression);
             append_constraint_attributes(
                 &mut rendered,
                 crate::storage::ConstraintTiming::NotDeferrable,
@@ -15863,7 +15874,7 @@ pub(crate) fn describe_view<'a>(
             (candidate.schema == view.schema && candidate.name == view.name).then_some(slot)
         })
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "view does not exist"))?;
-    let query = storage.snapshot_view_query(slot, arena)?;
+    let query = storage.snapshot_view_query(slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
     let dependencies = query.dependencies;
     let source = arena
@@ -15913,7 +15924,7 @@ fn describe_stored_view<'a>(
     out: &mut [super::types::ColDesc<'a>],
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let query = storage.snapshot_view_query(slot, arena)?;
+    let query = storage.snapshot_view_query(slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
     let dependencies = query.dependencies;
     let source = arena
@@ -22008,7 +22019,14 @@ fn pg_attrdef<'a>(
         let table = storage.table_def(slot, txid);
         let relid = table_oid(storage, slot);
         for (ci, c) in table.columns().iter().enumerate() {
-            let Some(text_expr) = c.default.expression() else {
+            let Some(text_expr) = super::enum_values::default_expression(
+                &c.default,
+                Some(c.ctype),
+                storage,
+                txid,
+                arena,
+            )?
+            else {
                 continue;
             };
             if n == out.len() {
@@ -22019,7 +22037,7 @@ fn pg_attrdef<'a>(
                     Datum::Oid((relid * 100 + ci as i32 + 1) as u32), // synthetic adbin oid
                     Datum::Oid(relid as u32),
                     Datum::Int2(ci as i16 + 1),
-                    text(text_expr.as_str(), arena)?,
+                    Datum::Text(text_expr),
                     Datum::Oid(2604),
                 ],
                 arena,
@@ -22029,11 +22047,35 @@ fn pg_attrdef<'a>(
     }
     for (slot, view) in storage.views_visible_to(txid) {
         let columns = view.columns_for(txid);
-        for (column, default) in (0..columns.len()).filter_map(|index| {
-            columns
-                .default_at_ref(index)
-                .and_then(|default| default.expression().map(|expression| (index, expression)))
-        }) {
+        let has_expression_default = (0..columns.len()).any(|index| {
+            columns.default_at_ref(index).is_some_and(|default| {
+                default.constant().is_none() && default.expression().is_some()
+            })
+        });
+        let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+        let described = if has_expression_default {
+            describe_view(storage, txid, &view, arena, &mut descriptions)?
+        } else {
+            0
+        };
+        for (column, description) in descriptions.iter().enumerate().take(columns.len()) {
+            let Some(default) = columns.default_at_ref(column) else {
+                continue;
+            };
+            let Some(default) = super::enum_values::default_expression(
+                default,
+                if column < described {
+                    Some(view_column_catalog_type(storage, txid, description.type_oid)?.0)
+                } else {
+                    None
+                },
+                storage,
+                txid,
+                arena,
+            )?
+            else {
+                continue;
+            };
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attrdef"));
             }
@@ -22043,7 +22085,7 @@ fn pg_attrdef<'a>(
                     Datum::Oid((relid * 100 + column as i32 + 1) as u32),
                     Datum::Oid(relid as u32),
                     Datum::Int2(column as i16 + 1),
-                    text(default.as_str(), arena)?,
+                    Datum::Text(default),
                     Datum::Oid(2604),
                 ],
                 arena,
@@ -28680,7 +28722,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bool(d.not_null),
                 match &d.default_expr {
                     Some(e) => text(
-                        arena.alloc_str(e.as_str()).map_err(|_| arena_full())?,
+                        super::enum_values::checks::default_display(e.as_str(), arena)?,
                         arena,
                     )?,
                     None => Datum::Null,
@@ -28705,7 +28747,19 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )),
                 Datum::Bool(true),
                 text(type_storage(d.base), arena)?,
-                Datum::Null,
+                match &d.default_expr {
+                    Some(expression) => text(
+                        super::enum_values::checks::describe_default(
+                            expression.as_str(),
+                            d.base,
+                            storage,
+                            txid,
+                            arena,
+                        )?,
+                        arena,
+                    )?,
+                    None => Datum::Null,
+                },
             ],
             arena,
         )?;
@@ -30219,7 +30273,10 @@ fn pg_views<'a>(
                     txid,
                     arena,
                 )?,
-                text(storage.view_sql(slot).as_str(), arena)?,
+                text(
+                    storage.snapshot_view_query(slot, txid, arena)?.sql.as_str(),
+                    arena,
+                )?,
             ],
             arena,
         )?;
@@ -31139,7 +31196,7 @@ fn info_views<'a>(
     let out = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (index, (_, view)) in storage.views_visible_to(txid).enumerate() {
+    for (index, (slot, view)) in storage.views_visible_to(txid).enumerate() {
         let is_updatable = super::query::view_is_auto_updatable(
             storage,
             view.schema_for(txid).as_str(),
@@ -31153,7 +31210,10 @@ fn info_views<'a>(
                 text("postgres", arena)?,
                 text(view.schema_for(txid).as_str(), arena)?,
                 text(view.name_for(txid).as_str(), arena)?,
-                text(storage.view_sql_for(&view).as_str(), arena)?,
+                text(
+                    storage.snapshot_view_query(slot, txid, arena)?.sql.as_str(),
+                    arena,
+                )?,
                 text(
                     match view.check_option_for(txid) {
                         None => "NONE",
@@ -31588,9 +31648,17 @@ fn info_column_row<'a>(
             StackStr::from_str(column.ctype.catalog_name()),
         )
     };
-    let default = (!column.default.is_generated())
-        .then(|| column.default.expression())
-        .flatten();
+    let default = if column.default.is_generated() {
+        None
+    } else {
+        super::enum_values::default_expression(
+            &column.default,
+            Some(column.ctype),
+            storage,
+            txid,
+            arena,
+        )?
+    };
     let generated = column.default.is_generated();
     let generated_expression = generated.then(|| column.default.expression()).flatten();
     let nullable =
@@ -31632,7 +31700,7 @@ fn info_column_row<'a>(
         .map(|sequence| stack_format!(32, "{}", sequence.min_value));
     let identity_cycle = identity_sequence.as_ref().map(|sequence| sequence.cycle);
     let default_datum = match default {
-        Some(value) => text(value.as_str(), arena)?,
+        Some(value) => Datum::Text(value),
         None => Datum::Null,
     };
     let domain_catalog = match domain {
@@ -32983,7 +33051,10 @@ fn info_domains<'a>(
             ),
         };
         let default = match domain.default_expr {
-            Some(value) => text(value.as_str(), arena)?,
+            Some(value) => text(
+                super::enum_values::checks::default_display(value.as_str(), arena)?,
+                arena,
+            )?,
             None => Datum::Null,
         };
         output[count] = row(
@@ -33161,7 +33232,14 @@ fn info_check_constraints<'a>(
             continue;
         }
         for check in domain.checks() {
-            let clause = stack_format!(1024, "({})", check.expression.as_str());
+            let expression = super::enum_values::checks::resolve(
+                check.expression.as_str(),
+                domain.base,
+                storage,
+                txid,
+                arena,
+            )?;
+            let clause = stack_format!(1024, "({})", expression);
             append(domain.schema.as_str(), check.name.as_str(), clause.as_str())?;
         }
         if domain.not_null {

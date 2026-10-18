@@ -90,8 +90,10 @@ SELECT udt_schema, udt_name, domain_name
 BEGIN;
 ALTER DOMAIN dom_def SET DEFAULT 77;
 SELECT typdefault FROM pg_type WHERE typname = 'dom_def';
+SELECT pg_get_expr(typdefaultbin, 0) FROM pg_type WHERE typname = 'dom_def';
 ROLLBACK;
 SELECT typdefault FROM pg_type WHERE typname = 'dom_def';
+SELECT pg_get_expr(typdefaultbin, 0) FROM pg_type WHERE typname = 'dom_def';
 ALTER DOMAIN dom_def SET DEFAULT 99;
 -- Persistent schemas reject record and its array pseudo-type at the DDL
 -- boundary; domains use PostgreSQL's distinct base-type diagnostic.
@@ -103,6 +105,7 @@ CREATE TABLE dom_t2 (x dom_def);
 INSERT INTO dom_t2 DEFAULT VALUES;
 SELECT x FROM dom_t2;
 ALTER DOMAIN dom_def DROP DEFAULT;
+SELECT typdefault, pg_get_expr(typdefaultbin, 0) FROM pg_type WHERE typname = 'dom_def';
 -- ADD a CHECK every existing row already satisfies (so no re-validation
 -- failure), then enforce it on a new insert.
 ALTER DOMAIN dom_pos ADD CONSTRAINT lt50 CHECK (VALUE < 50);
@@ -231,3 +234,19 @@ DROP DOMAIN dom_not_valid;
 DROP DOMAIN dom_moved_schema.dom_moved;
 DROP SCHEMA dom_moved_schema;
 DROP ROLE dom_move_owner;
+
+
+-- A domain may be an array element even when its base is a built-in array.
+CREATE DOMAIN integer_vector AS integer[];
+CREATE TABLE array_domain_values (items integer_vector[]);
+CREATE FUNCTION vector_echo(integer_vector[]) RETURNS integer_vector[]
+ LANGUAGE SQL IMMUTABLE AS 'SELECT $1';
+INSERT INTO array_domain_values VALUES (ARRAY[ARRAY[3, 4]::integer_vector]);
+SELECT pg_typeof(items)::text, pg_typeof(items[1])::text,
+       vector_echo(items)::text FROM array_domain_values;
+ALTER DOMAIN integer_vector RENAME TO kept_vector;
+SELECT pg_typeof(items)::text, pg_typeof(items[1])::text,
+       vector_echo(items)::text FROM array_domain_values;
+DROP FUNCTION vector_echo(kept_vector[]);
+DROP TABLE array_domain_values;
+DROP DOMAIN kept_vector;

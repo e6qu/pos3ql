@@ -516,7 +516,7 @@ fn extended_statistics_selectivity<'a>(
             ordered[position] = values[source];
         }
         if statistics.kinds.mcv() {
-            let hash = crate::sql::eval::hash_key(&ordered[..count], &indices[..count]);
+            let hash = crate::sql::eval::hash_key_identified(&ordered[..count], &indices[..count])?;
             if let Some(entry) = data.mcv[..usize::from(data.n_mcv)]
                 .iter()
                 .find(|entry| entry.hash == hash)

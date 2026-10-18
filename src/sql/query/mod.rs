@@ -63,6 +63,7 @@ pub(crate) use cte::{bind_dml_materialized_relations, bind_materialized_relation
 pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;
+pub(crate) use cte::captured_type_oid;
 mod dependencies;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::{
@@ -2257,6 +2258,29 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     ) -> Result<Option<&'a str>, SqlError> {
         super::catalog::tablespace_location_by_oid(self.storage, self.txid, oid, arena)
     }
+    fn materialize_enum<'a>(
+        &self,
+        value: Datum<'a>,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        super::enum_values::resolve(value, self.storage, self.txid, arena)
+    }
+
+    fn enum_member_identity(
+        &self,
+        slot: u16,
+        label: &str,
+    ) -> Result<Option<super::types::EnumMemberId>, SqlError> {
+        let definition = self.storage.enum_for(usize::from(slot), self.txid);
+        Ok(definition
+            .members()
+            .position(|member| member.label.as_str() == label)
+            .map(|index| {
+                super::types::EnumMemberId::from_ordinal(index as u32)
+                    .expect("validated enum member ordinal")
+            }))
+    }
+
     fn materialize_composite<'a>(
         &self,
         slot: u16,
@@ -3773,9 +3797,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let values = arena
             .alloc_slice_with(def.members().len(), |_| Datum::Null)
             .map_err(|_| arena_full())?;
-        for (value, member) in values.iter_mut().zip(def.members()) {
+        for (index, (value, member)) in values.iter_mut().zip(def.members()).enumerate() {
             *value = Datum::Enum {
                 slot,
+                member: Some(
+                    crate::sql::types::EnumMemberId::from_ordinal(index as u32)
+                        .expect("validated enum member ordinal"),
+                ),
                 sort: member.sort,
                 label: arena
                     .alloc_str(member.label.as_str())
@@ -3921,6 +3949,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn user_type_oid(&self, type_name: &str) -> Option<i32> {
         super::catalog::user_type_oid(self.storage, self.txid, type_name)
+    }
+
+    fn declared_user_type_oid(
+        &self,
+        ctype: ColType,
+        identity: crate::storage::UserTypeName,
+    ) -> Option<i32> {
+        self.storage
+            .routine_type_oid(ctype, Some(identity), self.txid)
+    }
+
+    fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }
 
     fn user_type_identity_oid(
@@ -4750,7 +4791,7 @@ pub fn resolve_view_for_dml<'a>(
     let check_option = storage.view(view_slot).check_option_for(txid);
     // The body re-resolves under the view creator's search path.
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let query = storage.snapshot_view_query(view_slot, arena)?;
+    let query = storage.snapshot_view_query(view_slot, txid, arena)?;
     let view_path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
     // Copy the definition into the arena so the parsed AST no longer borrows
     // storage (the caller then takes a mutable storage borrow to run the DML).
@@ -7805,6 +7846,7 @@ fn materialize_composite_outputs<'a>(
         return Ok(());
     };
     for value in values {
+        *value = super::eval::materialize_enum_values(*value, Some(catalog), arena)?;
         *value = match *value {
             Datum::CompositeText {
                 slot,
@@ -9015,6 +9057,10 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
             type_mod,
             collation: scope.output_collation(entry),
         })
+    }
+
+    fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }
 
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {

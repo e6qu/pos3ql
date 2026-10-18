@@ -354,6 +354,7 @@ mod tests {
     fn member(label: &str, sort: f64) -> EnumMember {
         EnumMember {
             label: SqlName::parse(label).unwrap(),
+            legacy_label: None,
             sort,
         }
     }

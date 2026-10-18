@@ -36,6 +36,7 @@ pub use operators::{
     hash_key_collated,
 };
 use operators::{compare_text_collated, logic, range_mismatch, unary};
+pub(crate) use operators::{hash_key_catalog, hash_key_collated_catalog, hash_key_identified};
 
 /// DETAIL/HINT lines for the next emitted error or notice. `SqlError` is
 /// constructed at ~60 sites and stays two fields; the rare errors that carry
@@ -460,15 +461,18 @@ pub(crate) fn expression_type_identity<'a>(
     if let Expr::Column { qualifier, name } = expression
         && let Some(identity) = row.column_user_type(*qualifier, name)
     {
-        return catalog_user_type_oid(
-            identity,
-            matches!(
-                row.col_type(*qualifier, name),
-                Some(super::types::ColType::Array(_))
-            ),
-            hooks,
-        )
-        .map(ExpressionTypeIdentity::Known);
+        return hooks
+            .catalog
+            .and_then(|catalog| {
+                catalog.declared_user_type_oid(row.col_type(*qualifier, name)?, identity)
+            })
+            .map(ExpressionTypeIdentity::Known)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "evaluated user-defined column has no catalog identity"
+                )
+            });
     }
     if let Expr::Cast { type_name, .. } = expression {
         if let Some(ctype) = super::types::ColType::from_sql_name(type_name) {
@@ -609,6 +613,11 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
                 name
             )
         })
+    }
+
+    fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        self.catalog
+            .and_then(|catalog| catalog.domain_base_type(type_oid))
     }
 
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {
@@ -952,6 +961,26 @@ pub trait CatalogAccess {
             "text-search catalog access is unavailable"
         ))
     }
+    fn materialize_enum<'a>(
+        &self,
+        value: Datum<'a>,
+        _arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "enum catalog access is unavailable: {}",
+            value
+        ))
+    }
+
+    fn enum_member_identity(
+        &self,
+        _slot: u16,
+        _label: &str,
+    ) -> Result<Option<super::types::EnumMemberId>, SqlError> {
+        Ok(None)
+    }
+
     /// Materializes a durable named-composite row value into its catalog field
     /// layout. The default is a loud capability error: raw composite text is
     /// never treated as an anonymous record.
@@ -1578,6 +1607,19 @@ pub trait CatalogAccess {
     fn user_type_oid(&self, _type_name: &str) -> Option<i32> {
         None
     }
+    /// Resolves the declaration rather than inferring scalar/array identity
+    /// from its representation: a scalar domain may itself contain an array.
+    fn declared_user_type_oid(
+        &self,
+        ctype: ColType,
+        identity: crate::storage::UserTypeName,
+    ) -> Option<i32> {
+        self.user_type_identity_oid(identity, matches!(ctype, ColType::Array(_)))
+    }
+    /// The representation of a visible domain, excluding arrays of domains.
+    fn domain_base_type(&self, _type_oid: i32) -> Option<ColType> {
+        None
+    }
     /// Resolves a durable schema-qualified identity without reparsing it as
     /// SQL text.
     fn user_type_identity_oid(
@@ -1996,6 +2038,38 @@ struct BinaryExpression<'expression, 'a> {
     search_catalog: bool,
 }
 
+fn validate_enum_operator_types<'a>(
+    operator: BinaryOp,
+    left: &Expr<'a>,
+    right: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let Some(catalog) = hooks.catalog else {
+        return Ok(());
+    };
+    let left_type = expression_type_identity(left, row, hooks)?.record_field_oid();
+    let right_type = expression_type_identity(right, row, hooks)?.record_field_oid();
+    // PostgreSQL's anyenum operators require an enum declaration. A domain's
+    // enum representation is insufficient, even when both operands have it.
+    if [left_type, right_type]
+        .iter()
+        .any(|oid| matches!(catalog.domain_base_type(*oid), Some(ColType::Enum(_))))
+    {
+        let left_name = catalog.type_name(left_type, arena)?.unwrap_or("unknown");
+        let right_name = catalog.type_name(right_type, arena)?.unwrap_or("unknown");
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} {} {}",
+            left_name,
+            operator.operator_name().unwrap_or("?"),
+            right_name
+        ));
+    }
+    Ok(())
+}
+
 fn eval_binary_expression<'a>(
     expression: BinaryExpression<'_, 'a>,
     arena: &'a Arena,
@@ -2041,6 +2115,9 @@ fn eval_binary_expression<'a>(
         if let Some(value) = catalog.call_operator(name, l, r, left_oid, right_oid, arena)? {
             return Ok(value);
         }
+    }
+    if comparison_collation.is_some() {
+        validate_enum_operator_types(operator, left, right, row, hooks, arena)?;
     }
     if operator == BinaryOp::Concat
         && let Some(value) = array_null_concat(l, r, left, right, row, arena)?
@@ -2194,11 +2271,12 @@ pub fn eval_full<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    materialize_acl_value(
+    let value = materialize_acl_value(
         eval_full_inner(expression, arena, params, row, hooks)?,
         hooks,
         arena,
-    )
+    )?;
+    materialize_enum_values(value, hooks.catalog, arena)
 }
 
 fn eval_full_inner<'a>(
@@ -5862,6 +5940,42 @@ pub fn record_star_expand<'a>(
     }
 }
 
+pub(crate) fn materialize_enum_values<'a>(
+    value: Datum<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let Some(catalog) = catalog else {
+        return Ok(value);
+    };
+    match value {
+        Datum::Enum { .. } => catalog.materialize_enum(value, arena),
+        Datum::Array { element, raw } if matches!(element.to_coltype(), ColType::Enum(_)) => {
+            let mut changed = false;
+            for value in super::array::elements(raw, element) {
+                changed |= catalog.materialize_enum(value, arena)? != value;
+            }
+            if !changed {
+                return Ok(value);
+            }
+            let shape = super::array::shape(raw).expect("array datum invariant");
+            let items = super::array::alloc_items(arena, shape.element_count())?;
+            for (output, value) in items.iter_mut().zip(super::array::elements(raw, element)) {
+                *output = if value.is_null() {
+                    value
+                } else {
+                    catalog.materialize_enum(value, arena)?
+                };
+            }
+            Ok(Datum::Array {
+                element,
+                raw: super::array::build_shaped(items, shape, arena)?,
+            })
+        }
+        value => Ok(value),
+    }
+}
+
 /// Storage rows carry named composites as canonical text. Evaluation exposes
 /// the catalog-defined structural value before operators, grouping, joins, or
 /// set operations can observe it, so a text representation never becomes a
@@ -5902,7 +6016,32 @@ pub(crate) fn materialize_composite_text_output<'a>(
             slot,
             physical_fields,
             text,
-        } => catalog.materialize_composite(slot, physical_fields, text, arena),
+        } => materialize_composite_text_output(
+            catalog.materialize_composite(slot, physical_fields, text, arena)?,
+            catalog,
+            arena,
+        ),
+        Datum::Composite { slot, fields } => {
+            let output = arena.alloc_slice_copy(fields).map_err(|_| arena_full())?;
+            for field in output.iter_mut() {
+                field.value = materialize_composite_text_output(field.value, catalog, arena)?;
+            }
+            Ok(Datum::Composite {
+                slot,
+                fields: output,
+            })
+        }
+        Datum::Record(fields) => {
+            let output = arena.alloc_slice_copy(fields).map_err(|_| arena_full())?;
+            for field in output.iter_mut() {
+                field.value = materialize_composite_text_output(field.value, catalog, arena)?;
+            }
+            Ok(Datum::Record(output))
+        }
+        Datum::Enum { .. } => catalog.materialize_enum(value, arena),
+        Datum::Array { element, .. } if matches!(element.to_coltype(), ColType::Enum(_)) => {
+            materialize_enum_values(value, Some(catalog), arena)
+        }
         Datum::Array { element, raw } if matches!(element.to_coltype(), ColType::Composite(_)) => {
             let shape = super::array::shape(raw).expect("array datum invariant");
             let items = super::array::alloc_items(arena, shape.element_count())?;
@@ -5912,8 +6051,12 @@ pub(crate) fn materialize_composite_text_output<'a>(
                         slot,
                         physical_fields,
                         text,
-                    } => catalog.materialize_composite(slot, physical_fields, text, arena)?,
-                    value => value,
+                    } => materialize_composite_text_output(
+                        catalog.materialize_composite(slot, physical_fields, text, arena)?,
+                        catalog,
+                        arena,
+                    )?,
+                    value => materialize_composite_text_output(value, catalog, arena)?,
                 };
             }
             Ok(Datum::Text(super::array::format_shaped(
@@ -7486,6 +7629,7 @@ fn coerce_enum_literal<'a>(
         };
         Ok(Datum::Enum {
             slot,
+            member: cat.enum_member_identity(slot, label)?,
             sort,
             label: arena.alloc_str(label).map_err(|_| arena_full())?,
         })

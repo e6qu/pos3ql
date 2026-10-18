@@ -46,20 +46,18 @@ impl TypeReferenceMove {
 
     fn matches(self, ctype: ColType, identity: Option<UserTypeName>) -> bool {
         match self.kind {
-            TypeReferenceKind::Domain => {
-                identity == Some(self.prior)
-                    || matches!(ctype, ColType::Array(ArrElem::Domain { slot, .. })
-                        if usize::from(slot) == self.slot)
-            }
+            TypeReferenceKind::Domain => identity == Some(self.prior),
+            // Journal declarations retain names before startup resolves slots.
+            // An explicit unresolved slot is valid only with the exact prior name.
             TypeReferenceKind::Enum => {
-                identity.is_some()
+                identity == Some(self.prior)
                     && matches!(ctype, ColType::Enum(slot) | ColType::Array(ArrElem::Enum(slot))
-                        if usize::from(slot) == self.slot)
+                        if usize::from(slot) == self.slot || slot == ColType::ENUM_SLOT_UNRESOLVED)
             }
             TypeReferenceKind::Composite => {
                 identity == Some(self.prior)
                     && matches!(ctype, ColType::Composite(slot) | ColType::Array(ArrElem::Composite(slot))
-                        if usize::from(slot) == self.slot)
+                        if usize::from(slot) == self.slot || slot == ColType::COMPOSITE_SLOT_UNRESOLVED)
             }
         }
     }
@@ -96,6 +94,9 @@ impl TypeReferenceMove {
         if matches!(self.kind, TypeReferenceKind::Domain) {
             if *parent == Some(self.prior) {
                 *parent = Some(self.current);
+            }
+            if parent.is_none() {
+                self.rewrite(base, user_type);
             }
         } else {
             self.rewrite(base, user_type);
@@ -389,6 +390,7 @@ mod tests {
                         EnumSpec {
                             members: &[EnumMember {
                                 label: SqlName::parse("ready").unwrap(),
+                                legacy_label: None,
                                 sort: 1.0,
                             }],
                         },
@@ -758,6 +760,79 @@ mod tests {
                     .user_type
                     .is_none()
             );
+        }
+    }
+    #[test]
+    fn enum_value_identity_type_moves_preserve_outer_domains() {
+        let identity = |name| UserTypeName {
+            schema: super::super::SqlName::parse("public").unwrap(),
+            name: super::super::SqlName::parse(name).unwrap(),
+        };
+        let prior = identity("prior");
+        let current = identity("current");
+        let outer = identity("outer");
+        for (kind, ctype) in [
+            (TypeReferenceKind::Enum, ColType::Enum(0)),
+            (TypeReferenceKind::Enum, ColType::Array(ArrElem::Enum(0))),
+            (
+                TypeReferenceKind::Enum,
+                ColType::Enum(ColType::ENUM_SLOT_UNRESOLVED),
+            ),
+            (
+                TypeReferenceKind::Enum,
+                ColType::Array(ArrElem::Enum(ColType::ENUM_SLOT_UNRESOLVED)),
+            ),
+            (TypeReferenceKind::Composite, ColType::Composite(0)),
+            (
+                TypeReferenceKind::Composite,
+                ColType::Array(ArrElem::Composite(0)),
+            ),
+            (
+                TypeReferenceKind::Composite,
+                ColType::Composite(ColType::COMPOSITE_SLOT_UNRESOLVED),
+            ),
+            (
+                TypeReferenceKind::Composite,
+                ColType::Array(ArrElem::Composite(ColType::COMPOSITE_SLOT_UNRESOLVED)),
+            ),
+            (
+                TypeReferenceKind::Domain,
+                ColType::Array(ArrElem::domain(0, ColType::Enum(0)).unwrap()),
+            ),
+        ] {
+            let movement = TypeReferenceMove::new(DatabaseOid::POSTGRES, kind, 0, prior, current);
+            let mut declared = None;
+            assert!(!movement.rewrite(ctype, &mut declared));
+            assert_eq!(declared, None);
+            let mut declared = Some(outer);
+            assert!(!movement.rewrite(ctype, &mut declared));
+            assert_eq!(declared, Some(outer));
+            declared = Some(prior);
+            assert!(movement.rewrite(ctype, &mut declared));
+            assert_eq!(declared, Some(current));
+            let mut parent = None;
+            let mut base = Some(prior);
+            movement.rewrite_domain(ctype, &mut parent, &mut base);
+            assert_eq!(base, Some(current));
+            parent = Some(outer);
+            base = None;
+            movement.rewrite_domain(ctype, &mut parent, &mut base);
+            assert_eq!(parent, Some(outer));
+            assert_eq!(base, None);
+        }
+        for (kind, ctype) in [
+            (TypeReferenceKind::Enum, ColType::Enum(1)),
+            (TypeReferenceKind::Enum, ColType::Array(ArrElem::Enum(1))),
+            (TypeReferenceKind::Composite, ColType::Composite(1)),
+            (
+                TypeReferenceKind::Composite,
+                ColType::Array(ArrElem::Composite(1)),
+            ),
+        ] {
+            let movement = TypeReferenceMove::new(DatabaseOid::POSTGRES, kind, 0, prior, current);
+            let mut declared = Some(prior);
+            assert!(!movement.rewrite(ctype, &mut declared));
+            assert_eq!(declared, Some(prior));
         }
     }
 }

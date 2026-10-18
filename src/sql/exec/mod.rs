@@ -5286,7 +5286,12 @@ where
             .iter()
             .any(|(_, expression)| matches!(expression, Expr::DefaultMarker))
         {
-            Some(parse_defaults(logical_definition, arena)?)
+            Some(parse_defaults(
+                logical_definition,
+                arena,
+                storage,
+                txn.txid,
+            )?)
         } else {
             None
         };
@@ -28452,8 +28457,8 @@ pub(crate) fn resolve_routine_type(
         let ctype = if array {
             ColType::Array(ArrElem::domain(slot as u16, domain.base).ok_or_else(|| {
                 sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "type \"{}\" cannot be an array element",
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "type \"{}\" cannot be a stored array element",
                     written
                 )
             })?)
@@ -36004,7 +36009,7 @@ pub fn create_view(
             Err(error) => return sql_fail(error),
         }
     };
-    let dependencies = match super::query::stored_query_dependencies(
+    let mut dependencies = match super::query::stored_query_dependencies(
         buffer.as_str(),
         storage,
         txn.txid,
@@ -36143,6 +36148,19 @@ pub fn create_view(
             "search_path is too long to store with a view"
         ));
     }
+    buffer = match super::enum_values::bind_query(
+        buffer.as_str(),
+        storage,
+        txn.txid,
+        path,
+        &mut dependencies,
+        false,
+        arena,
+    ) {
+        Ok(bound) => bound,
+        Err(error) => return sql_fail(error),
+    };
+    let durable_sql = buffer;
     match storage.create_view(
         schema,
         sqlname,
@@ -36215,7 +36233,7 @@ pub fn create_view(
                         schema: schema.as_str(),
                         name: name.name,
                         columns: crate::wal::WalViewColumns::Captured(&columns),
-                        sql,
+                        sql: durable_sql.as_str(),
                         path: raw_path,
                         security_invoker: matches!(security, super::ast::ViewSecurity::Invoker),
                         security_barrier: match security_barrier {
@@ -36852,7 +36870,7 @@ fn rewrite_view_column_dependents(
         }
 
         let view = storage.view(view_slot);
-        let query = storage.snapshot_view_query(view_slot, arena)?;
+        let query = storage.snapshot_view_query(view_slot, txn.txid, arena)?;
         let view_sql = query.sql;
         let rewritten = rewrite_relation_column_identifiers(view_sql.as_str(), rename, arena)?;
         if rewritten == view_sql {
@@ -37856,7 +37874,7 @@ pub fn comment(
                         relation.name
                     ));
                 };
-                let query = match storage.snapshot_view_query(slot, arena) {
+                let query = match storage.snapshot_view_query(slot, txn.txid, arena) {
                     Ok(query) => query,
                     Err(error) => return sql_fail(error),
                 };
@@ -40646,67 +40664,27 @@ fn build_domain_spec(
             base_type
         ));
     }
-    let (base_domain, base_user_type, base, inherited_default) =
-        if let Some(base) = ColType::from_sql_name(base_type) {
-            (None, None, base, None)
-        } else if let Some(parent) = storage.find_domain(base_type, txid) {
-            (
-                Some(crate::storage::UserTypeName {
-                    schema: parent.schema,
-                    name: parent.name,
-                }),
-                None,
-                parent.base,
-                parent.default_expr,
-            )
-        } else if let Some(enum_slot) = storage.resolve_enum_slot(base_type, txid) {
-            let enumeration = storage.enum_for(enum_slot, txid);
-            (
-                None,
-                Some(crate::storage::UserTypeName {
-                    schema: enumeration.schema,
-                    name: enumeration.name,
-                }),
-                ColType::Enum(enum_slot as u16),
-                None,
-            )
-        } else if let Some(composite_slot) = storage.resolve_composite_slot(base_type, txid) {
-            let composite = storage.composite_for(composite_slot, txid);
-            (
-                None,
-                Some(crate::storage::UserTypeName {
-                    schema: composite.schema,
-                    name: composite.name,
-                }),
-                ColType::Composite(composite_slot as u16),
-                None,
-            )
-        } else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                base_type
-            ));
-        };
-    if ColType::from_sql_name(base_type).is_none() {
+    let resolved = resolve_routine_type(storage, txid, base_type)?;
+    let (base_domain, base_user_type, inherited_default) =
         if let Some(parent) = storage.find_domain(base_type, txid) {
-            storage.require_type_usage(parent.schema.as_str(), parent.name.as_str(), txid)?;
-        } else if let Some(enum_slot) = storage.resolve_enum_slot(base_type, txid) {
-            let enumeration = storage.enum_for(enum_slot, txid);
-            storage.require_type_usage(
-                enumeration.schema.as_str(),
-                enumeration.name.as_str(),
-                txid,
-            )?;
-        } else if let Some(composite_slot) = storage.resolve_composite_slot(base_type, txid) {
-            let composite = storage.composite_for(composite_slot, txid);
-            storage.require_type_usage(composite.schema.as_str(), composite.name.as_str(), txid)?;
-        }
-    }
+            (resolved.user_type, None, parent.default_expr)
+        } else {
+            (None, resolved.user_type, None)
+        };
+    let base = resolved.ctype;
     let default_expr = match default_text {
         Some(t) => {
             validate_domain_expr(t, false, arena)?;
-            Some(domain_text::<{ crate::storage::DEFAULT_EXPR_MAX }>(t)?)
+            Some(super::enum_values::checks::bind_default::<
+                { crate::storage::DEFAULT_EXPR_MAX },
+            >(
+                domain_text::<{ crate::storage::DEFAULT_EXPR_MAX }>(t)?.as_str(),
+                base,
+                storage,
+                txid,
+                false,
+                arena,
+            )?)
         }
         // PostgreSQL copies a parent domain's default at CREATE time: a later
         // ALTER of the parent default does not change the child.
@@ -40737,7 +40715,14 @@ fn build_domain_spec(
         }
         checks[n] = crate::storage::CheckConstraint {
             name,
-            expression: domain_text::<{ crate::storage::CHECK_SQL_MAX }>(c.expression)?,
+            expression: super::enum_values::checks::bind::<{ crate::storage::CHECK_SQL_MAX }>(
+                domain_text::<{ crate::storage::CHECK_SQL_MAX }>(c.expression)?.as_str(),
+                base,
+                storage,
+                txid,
+                false,
+                arena,
+            )?,
             validation: match c.validation {
                 crate::sql::ast::ConstraintValidation::EnforcedValidated => {
                     crate::storage::ConstraintValidation::EnforcedValidated
@@ -41691,7 +41676,16 @@ pub fn alter_domain(
             if let Err(e) = validate_domain_expr(text, false, arena) {
                 return sql_fail(e);
             }
-            match domain_text::<{ crate::storage::DEFAULT_EXPR_MAX }>(text) {
+            match domain_text::<{ crate::storage::DEFAULT_EXPR_MAX }>(text).and_then(|text| {
+                super::enum_values::checks::bind_default::<{ crate::storage::DEFAULT_EXPR_MAX }>(
+                    text.as_str(),
+                    spec.base,
+                    storage,
+                    txn.txid,
+                    false,
+                    arena,
+                )
+            }) {
                 Ok(t) => spec.default_expr = Some(t),
                 Err(e) => return sql_fail(e),
             }
@@ -41735,11 +41729,22 @@ pub fn alter_domain(
                     name.name
                 ));
             }
-            let expression =
-                match domain_text::<{ crate::storage::CHECK_SQL_MAX }>(check.expression) {
-                    Ok(t) => t,
-                    Err(e) => return sql_fail(e),
-                };
+            let expression = match domain_text::<{ crate::storage::CHECK_SQL_MAX }>(
+                check.expression,
+            )
+            .and_then(|source| {
+                super::enum_values::checks::bind(
+                    source.as_str(),
+                    spec.base,
+                    storage,
+                    txn.txid,
+                    false,
+                    arena,
+                )
+            }) {
+                Ok(t) => t,
+                Err(e) => return sql_fail(e),
+            };
             spec.checks[spec.n_checks] = crate::storage::CheckConstraint {
                 name: cname,
                 expression,
@@ -42105,6 +42110,7 @@ fn build_enum_spec<'a>(
         }
         members[i] = crate::storage::EnumMember {
             label: SqlName::parse(label)?,
+            legacy_label: None,
             sort: (i + 1) as f64,
         };
     }
@@ -42230,7 +42236,7 @@ fn build_composite_spec(
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
-                            "domain base type record cannot be an array element"
+                            "arrays of domains require a supported element base type"
                         )
                     })?,
                 )
@@ -44978,7 +44984,7 @@ pub fn alter_type(
             for (target, source) in altered.iter_mut().zip(current.members()) {
                 *target = source;
             }
-            let (sort, renumbered) = match compute_add_value_sort(
+            let (sort, _renumbered) = match compute_add_value_sort(
                 &mut altered[..current.members().len()],
                 before.as_deref(),
                 after.as_deref(),
@@ -44992,6 +44998,7 @@ pub fn alter_type(
             };
             altered[current.members().len()] = crate::storage::EnumMember {
                 label: new_label,
+                legacy_label: None,
                 sort,
             };
             let prior = match storage.stage_enum_alter(
@@ -45005,13 +45012,6 @@ pub fn alter_type(
                 Err(error) => return sql_fail(error),
             };
             if let Err(error) = storage.mark_enum_label_uncommitted(slot, new_label, txn.txid) {
-                storage.rollback_enum_alter(slot, prior);
-                return sql_fail(error);
-            }
-            if renumbered
-                && let Err(error) =
-                    rewrite_enum_values(storage, txn, slot as u16, None, altered, arena)
-            {
                 storage.rollback_enum_alter(slot, prior);
                 return sql_fail(error);
             }
@@ -45221,17 +45221,6 @@ pub fn alter_type(
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(e) = rewrite_enum_values(
-                storage,
-                txn,
-                slot as u16,
-                Some((from, renamed.as_str())),
-                altered,
-                arena,
-            ) {
-                storage.rollback_enum_alter(slot, prior);
-                return sql_fail(e);
-            }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage_reserved(
                 txn.txid,
@@ -46316,7 +46305,7 @@ fn rewrite_composite_dependent_views(
             continue;
         }
         let view = storage.view(view_slot);
-        let query = storage.snapshot_view_query(view_slot, arena)?;
+        let query = storage.snapshot_view_query(view_slot, txn.txid, arena)?;
         let view_sql = query.sql;
         let creation_path = query.creation_path;
         let user = super::eval::funcs::system::session_user_owned();
@@ -46779,156 +46768,6 @@ fn write_identifier<const N: usize>(output: &mut crate::util::StackStr<N>, ident
         let _ = output.write_char(character);
     }
     let _ = output.write_char('"');
-}
-
-/// Rewrites the inline label and sort key carried by every stored value of one
-/// enum. PostgreSQL stores enum ordering in a float4 and occasionally
-/// renumbers a densely split range; scalar columns and arrays must move with
-/// that catalog change. Ordinary transaction-pending row writes preserve
-/// rollback and savepoint semantics and rebuild affected index entries.
-fn rewrite_enum_values(
-    storage: &mut Storage,
-    txn: &mut TxnState,
-    enum_slot: u16,
-    rename: Option<(&str, &str)>,
-    members: &[crate::storage::EnumMember],
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    for table_index in 0..storage.table_count() {
-        if !storage.table(table_index).visible_to(txn.txid) {
-            continue;
-        }
-        let def = *storage.table_def(table_index, txn.txid);
-        let mut affected = [false; MAX_COLUMNS];
-        let mut any = false;
-        for (column_index, column) in def.columns().iter().enumerate() {
-            let hit = matches!(column.ctype, ColType::Enum(slot) if slot == enum_slot)
-                || matches!(
-                    column.ctype,
-                    ColType::Array(element)
-                        if matches!(element.to_coltype(), ColType::Enum(slot) if slot == enum_slot)
-                );
-            affected[column_index] = hit;
-            any |= hit;
-        }
-        if !any {
-            continue;
-        }
-        let count = storage.visible_row_count(table_index, txn.txid)?;
-        let source = storage.table_row_snapshot(table_index, Some(arena))?;
-        let rows = arena
-            .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "enum alteration exceeds the statement arena"
-                )
-            })?;
-        let mut n = 0;
-        storage.for_each_row_state(table_index, &mut |rowid, state| {
-            if let Some(home) = storage.visible_row_home(table_index, rowid, state, txn.txid)? {
-                rows[n] = Some(source.retain(rowid, &home)?);
-                n += 1;
-            }
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?;
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        def.schema(&mut schema);
-        for entry in rows[..n].iter().copied().flatten() {
-            let rowid = entry.rowid();
-            let bytes = storage.row_bytes(table_index, rowid, entry.read()?, arena)?;
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, &schema[..def.n_columns], &mut values)?;
-            let mut changed = false;
-            for column_index in 0..def.n_columns {
-                if !affected[column_index] {
-                    continue;
-                }
-                match values[column_index] {
-                    Datum::Enum { slot, sort, label } if slot == enum_slot => {
-                        let target_label = rename
-                            .filter(|(from, _)| label == *from)
-                            .map_or(label, |(_, to)| to);
-                        let target_sort = members
-                            .iter()
-                            .find(|member| member.label.as_str() == target_label)
-                            .map(|member| member.sort)
-                            .expect("stored enum label remains in altered definition");
-                        if target_label == label && target_sort == sort {
-                            continue;
-                        }
-                        values[column_index] = Datum::Enum {
-                            slot,
-                            sort: target_sort,
-                            label: arena.alloc_str(target_label).map_err(|_| {
-                                sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "enum alteration exceeds the statement arena"
-                                )
-                            })?,
-                        };
-                        changed = true;
-                    }
-                    Datum::Array { element, raw } => {
-                        let shape = crate::sql::array::shape(raw).expect("array datum invariant");
-                        let count = crate::sql::array::len(raw);
-                        let items = crate::sql::array::alloc_items(arena, count)?;
-                        let mut array_changed = false;
-                        for (item, value) in items
-                            .iter_mut()
-                            .zip(crate::sql::array::elements(raw, element))
-                        {
-                            *item = value;
-                            if let Datum::Enum { slot, sort, label } = *item
-                                && slot == enum_slot
-                            {
-                                let target_label = rename
-                                    .filter(|(from, _)| label == *from)
-                                    .map_or(label, |(_, to)| to);
-                                let target_sort = members
-                                    .iter()
-                                    .find(|member| member.label.as_str() == target_label)
-                                    .map(|member| member.sort)
-                                    .expect("stored enum label remains in altered definition");
-                                if target_label == label && target_sort == sort {
-                                    continue;
-                                }
-                                *item = Datum::Enum {
-                                    slot,
-                                    sort: target_sort,
-                                    label: arena.alloc_str(target_label).map_err(|_| {
-                                        sql_err!(
-                                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                            "enum alteration exceeds the statement arena"
-                                        )
-                                    })?,
-                                };
-                                array_changed = true;
-                            }
-                        }
-                        if array_changed {
-                            values[column_index] = Datum::Array {
-                                element,
-                                raw: crate::sql::array::build_shaped(items, shape, arena)?,
-                            };
-                            changed = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if changed {
-                store_row(
-                    storage,
-                    txn,
-                    table_index,
-                    Some(rowid),
-                    &values[..def.n_columns],
-                )?;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Computes PostgreSQL's float4 enum sort key. Repeated insertions into one gap
@@ -47849,10 +47688,15 @@ pub(crate) fn analyze_extended_statistics(
                     );
                     add_distinct(
                         &mut key_registers[key],
-                        crate::sql::eval::hash_key(values, &indices[key..key + 1]),
+                        crate::sql::eval::hash_key_catalog(
+                            storage,
+                            values,
+                            &indices[key..key + 1],
+                        )?,
                     );
                 }
-                let full_hash = crate::sql::eval::hash_key(values, &indices[..n_keys]);
+                let full_hash =
+                    crate::sql::eval::hash_key_catalog(storage, values, &indices[..n_keys])?;
                 if all_non_null {
                     non_null_rows = non_null_rows.saturating_add(1);
                     add_distinct(&mut full_registers, full_hash);
@@ -47865,7 +47709,10 @@ pub(crate) fn analyze_extended_statistics(
                                 continue;
                             }
                             let pair = [determinant as u16, dependent as u16];
-                            add_distinct(registers, crate::sql::eval::hash_key(values, &pair));
+                            add_distinct(
+                                registers,
+                                crate::sql::eval::hash_key_catalog(storage, values, &pair)?,
+                            );
                         }
                     }
                 }
@@ -47940,7 +47787,8 @@ pub(crate) fn analyze_extended_statistics(
                 None,
                 None,
                 &mut |values| {
-                    let hash = crate::sql::eval::hash_key(values, &indices[..n_keys]);
+                    let hash =
+                        crate::sql::eval::hash_key_catalog(storage, values, &indices[..n_keys])?;
                     let mut rendered_keys = [None; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
                     for (rendered, value) in
                         rendered_keys[..n_keys].iter_mut().zip(&values[..n_keys])
@@ -52621,7 +52469,7 @@ pub(crate) fn copy_row(
         ));
     }
     let checks = parse_checks(def, arena)?;
-    let default_exprs = parse_defaults(def, arena)?;
+    let default_exprs = parse_defaults(def, arena, storage, txn.txid)?;
     let generated_exprs = parse_generated(def, arena)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
     let mut explicit = [false; MAX_COLUMNS];
@@ -52733,7 +52581,7 @@ pub(crate) fn copy_row_binary(
         ));
     }
     let checks = parse_checks(def, arena)?;
-    let default_exprs = parse_defaults(def, arena)?;
+    let default_exprs = parse_defaults(def, arena, storage, txn.txid)?;
     let generated_exprs = parse_generated(def, arena)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
     let mut explicit = [false; MAX_COLUMNS];
@@ -53031,7 +52879,7 @@ pub(crate) fn apply_replication_insert(
     for &local in binding.remote_to_local() {
         explicit[local] = true;
     }
-    let defaults = parse_defaults(&definition, arena)?;
+    let defaults = parse_defaults(&definition, arena, storage, txn.txid)?;
     fill_omitted_defaults(
         storage,
         txn.txid,
@@ -53958,7 +53806,7 @@ pub(crate) fn resolve_parameter_input_type(
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "domain base type record cannot be an array element"
+                    "arrays of domains require a supported element base type"
                 )
             })?;
         return Ok(ParameterInputType::DomainArray(element));
@@ -54610,7 +54458,8 @@ fn decode_binary_array<'a>(
                 };
                 Datum::CompositeText {
                     slot,
-                    physical_fields: storage.composite_for(slot as usize, txid).n_fields as u16,
+                    physical_fields: (storage.composite_for(slot as usize, txid).n_fields as u16)
+                        | COMPOSITE_MEMBER_IDENTITIES,
                     text: arena.alloc_str_display(value).map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -55577,7 +55426,7 @@ where
     'arena: 'values,
 {
     if let Some(default) = column.default.constant() {
-        return Ok(default.as_datum());
+        return super::enum_values::materialize(default.as_datum(), storage, txid, arena);
     }
     let Some(expression) = expression else {
         return Ok(Datum::Null);
@@ -55599,6 +55448,8 @@ fn parse_view_defaults<'a>(
     view: Option<ViewCheck<'_>>,
     definition: &TableDef,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<constraints::ParsedDefaults<'a>, SqlError> {
     let mut parsed = [None; MAX_COLUMNS];
     let Some(view) = view else {
@@ -55629,12 +55480,13 @@ fn parse_view_defaults<'a>(
                 "view default target is absent from its base relation"
             ));
         };
-        let source = arena.alloc_str(source.as_str()).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "view default expression exceeds the statement arena"
-            )
-        })?;
+        let source = super::enum_values::checks::resolve_default(
+            source.as_str(),
+            definition.columns[base_index].ctype,
+            storage,
+            txid,
+            arena,
+        )?;
         parsed[base_index] = Some(crate::sql::parser::parse_expr(source, arena)?);
     }
     Ok(parsed)
@@ -55679,7 +55531,10 @@ where
         None => (column.default, table_expression),
     };
     if let Some(constant) = default.constant() {
-        return detach_routine_datum(constant.as_datum(), arena);
+        return detach_routine_datum(
+            super::enum_values::materialize(constant.as_datum(), storage, txid, arena)?,
+            arena,
+        );
     }
     let Some(expression) = expression else {
         return Ok(Datum::Null);
@@ -57074,7 +56929,7 @@ pub(crate) fn merge<'a>(
         Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
-    let defaults = match parse_defaults(def, arena) {
+    let defaults = match parse_defaults(def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -58144,7 +57999,7 @@ fn merge_insert<'a>(
                 continue;
             }
             if let Some(d) = col.default.constant() {
-                row[i] = d.as_datum();
+                row[i] = super::enum_values::materialize(d.as_datum(), storage, txn.txid, arena)?;
             } else if let Some(expr) = defaults[i] {
                 let v = super::eval::eval_full(
                     expr,
@@ -58684,7 +58539,7 @@ pub(crate) fn view_trigger_definition(
     let view = storage.view(view_slot);
     let mut columns = [ColDesc::new("", 0, 0); MAX_COLUMNS];
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let query = storage.snapshot_view_query(view_slot, arena)?;
+    let query = storage.snapshot_view_query(view_slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
     let dependencies = query.dependencies;
     let source = arena
@@ -59346,7 +59201,7 @@ fn materialize_view_rows<'a>(
     capacity: usize,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let query = storage.snapshot_view_query(view_slot, arena)?;
+    let query = storage.snapshot_view_query(view_slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
     let source = arena
         .alloc_str(query.sql.as_str())
@@ -59865,14 +59720,15 @@ where
                 (&*rows, count)
             };
 
-        let default_exprs = match parse_defaults(def, arena) {
+        let default_exprs = match parse_defaults(def, arena, storage, txn.txid) {
             Ok(d) => d,
             Err(e) => return sql_fail(e),
         };
-        let view_default_exprs = match parse_view_defaults(view_check, def, arena) {
-            Ok(d) => d,
-            Err(e) => return sql_fail(e),
-        };
+        let view_default_exprs =
+            match parse_view_defaults(view_check, def, arena, storage, txn.txid) {
+                Ok(d) => d,
+                Err(e) => return sql_fail(e),
+            };
         let generated_exprs = match parse_generated(def, arena) {
             Ok(g) => g,
             Err(e) => return sql_fail(e),
@@ -60072,11 +59928,11 @@ where
 
     // Non-constant DEFAULT expressions (now(), nextval(...), …) and GENERATED
     // expressions, re-parsed once and evaluated per row below.
-    let default_exprs = match parse_defaults(def, arena) {
+    let default_exprs = match parse_defaults(def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
-    let view_default_exprs = match parse_view_defaults(view_check, def, arena) {
+    let view_default_exprs = match parse_view_defaults(view_check, def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -60892,7 +60748,7 @@ pub(crate) fn update<'a>(
             ));
         }
     }
-    let defaults = match parse_defaults(def, arena) {
+    let defaults = match parse_defaults(def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -66939,9 +66795,15 @@ fn alter_table_relation(
                 // merely catalog text. Rebind it with the row representation
                 // so a later INSERT cannot encode the former type's bytes.
                 if let Some(default) = new_def.columns[i].default.constant().copied() {
-                    let value = match cast_to(default.as_datum(), target, arena)
-                        .and_then(|value| apply_typmod(value, target, *type_mod, arena))
-                        .and_then(|value| crate::storage::OwnedDatum::from_datum(&value))
+                    let value = match super::enum_values::materialize(
+                        default.as_datum(),
+                        storage,
+                        txn.txid,
+                        arena,
+                    )
+                    .and_then(|value| cast_to(value, target, arena))
+                    .and_then(|value| apply_typmod(value, target, *type_mod, arena))
+                    .and_then(|value| crate::storage::OwnedDatum::from_datum(&value))
                     {
                         Ok(value) => value,
                         Err(error) => return sql_fail(error),
@@ -67409,7 +67271,7 @@ fn alter_table_relation(
     // Non-constant DEFAULTs of columns added by this ALTER: each existing row is
     // backfilled by evaluating the default, so a `nextval` default consumes a
     // value per existing row, exactly as PostgreSQL rewrites the table.
-    let new_defaults = match parse_defaults(&new_def, arena) {
+    let new_defaults = match parse_defaults(&new_def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -67460,15 +67322,33 @@ fn alter_table_relation(
                                         values: &old_values[..def.n_columns],
                                         alias: None,
                                     };
-                                    match eval(expr, arena, crate::sql::eval::NO_PARAMS, &ctx) {
+                                    let catalog =
+                                        super::query::storage_catalog(storage, arena, txn.txid);
+                                    let hooks = super::eval::EvalHooks {
+                                        catalog: Some(&catalog),
+                                        ..super::eval::NO_HOOKS
+                                    };
+                                    match super::eval::eval_full(
+                                        expr,
+                                        arena,
+                                        crate::sql::eval::NO_PARAMS,
+                                        &ctx,
+                                        &hooks,
+                                    ) {
                                         Ok(v) => v,
                                         Err(e) => return sql_fail(e),
                                     }
                                 }
                                 None => old_values[orig],
                             };
-                            match cast_to(cast_source, target, arena)
-                                .and_then(|v| apply_typmod(v, target, type_mod, arena))
+                            match super::enum_values::materialize(
+                                cast_source,
+                                storage,
+                                txn.txid,
+                                arena,
+                            )
+                            .and_then(|value| cast_to(value, target, arena))
+                            .and_then(|v| apply_typmod(v, target, type_mod, arena))
                             {
                                 Ok(v) => v,
                                 Err(e) => return sql_fail(e),
@@ -67476,7 +67356,15 @@ fn alter_table_relation(
                         }
                         ColSource::FillDefault(fi) => {
                             if let Some(d) = new_def.columns[fi].default.constant() {
-                                d.as_datum()
+                                match super::enum_values::materialize(
+                                    d.as_datum(),
+                                    storage,
+                                    txn.txid,
+                                    arena,
+                                ) {
+                                    Ok(value) => value,
+                                    Err(error) => return sql_fail(error),
+                                }
                             } else if let Some(expr) = new_defaults[fi] {
                                 // Evaluate the non-constant default for this row
                                 // (advancing a `nextval` default once per row),
@@ -69422,6 +69310,11 @@ pub(crate) fn coerce<'a>(
         let typed = match v {
             Datum::Null => return Ok(Datum::Null),
             value @ Datum::Composite { slot: actual, .. } if actual == slot => value,
+            Datum::CompositeText {
+                slot: actual,
+                physical_fields: 0,
+                text,
+            } if actual == slot => decode_composite_text(text, slot, storage, txid, arena)?,
             value @ Datum::CompositeText { slot: actual, .. } if actual == slot => {
                 return Ok(value);
             }
@@ -69438,7 +69331,8 @@ pub(crate) fn coerce<'a>(
         let text = composite_storage_text(typed, slot, storage, txid, arena)?;
         return Ok(Datum::CompositeText {
             slot,
-            physical_fields: storage.composite_for(slot as usize, txid).n_fields as u16,
+            physical_fields: (storage.composite_for(slot as usize, txid).n_fields as u16)
+                | COMPOSITE_MEMBER_IDENTITIES,
             text,
         });
     }
@@ -69523,6 +69417,217 @@ pub(crate) fn coerce_routine_argument<'a>(
     }
 }
 
+const COMPOSITE_MEMBER_IDENTITIES: u16 = crate::storage::rowenc::COMPOSITE_MEMBER_IDENTITIES;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompositeEncoding {
+    Input,
+    Legacy,
+    Members,
+}
+
+/// Text remains the record container; enum leaves use stable member ordinals.
+fn composite_persistent_value<'a>(
+    value: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    Ok(match value {
+        Datum::Enum { .. } => {
+            let Datum::Enum {
+                member: Some(member),
+                ..
+            } = super::enum_values::resolve(value, storage, txid, arena)?
+            else {
+                unreachable!()
+            };
+            Datum::Text(
+                arena
+                    .alloc_str_display(member)
+                    .map_err(|_| super::query::arena_full_pub())?,
+            )
+        }
+        Datum::Composite { slot, .. } => {
+            Datum::Text(composite_storage_text(value, slot, storage, txid, arena)?)
+        }
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => {
+            let value =
+                decode_stored_composite_text(text, slot, physical_fields, storage, txid, arena)?;
+            Datum::Text(composite_storage_text(value, slot, storage, txid, arena)?)
+        }
+        Datum::Array { element, raw } => {
+            let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+            let items = crate::sql::array::alloc_items(arena, shape.element_count())?;
+            for (out, value) in items
+                .iter_mut()
+                .zip(crate::sql::array::elements(raw, element))
+            {
+                let value = composite_persistent_value(value, storage, txid, arena)?;
+                *out = if value.is_null() {
+                    value
+                } else {
+                    Datum::Text(
+                        arena
+                            .alloc_str_display(value)
+                            .map_err(|_| super::query::arena_full_pub())?,
+                    )
+                };
+            }
+            Datum::Text(crate::sql::array::format_shaped(items, shape, arena)?)
+        }
+        value => value,
+    })
+}
+
+fn decode_composite_stored_field<'a>(
+    value: Datum<'a>,
+    ctype: ColType,
+    encoding: CompositeEncoding,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if value.is_null() {
+        return Ok(value);
+    }
+    let Datum::Text(text) = value else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored composite field is not text"
+        ));
+    };
+    match ctype {
+        ColType::Enum(slot) => {
+            let member = if encoding == CompositeEncoding::Members {
+                Some(
+                    text.parse::<u32>()
+                        .ok()
+                        .and_then(crate::sql::types::EnumMemberId::from_ordinal)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "invalid stored enum member identity"
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            super::enum_values::resolve(
+                Datum::Enum {
+                    slot,
+                    member,
+                    sort: 0.0,
+                    label: text,
+                },
+                storage,
+                txid,
+                arena,
+            )
+        }
+        ColType::Composite(slot) => decode_stored_composite_text(
+            text,
+            slot,
+            crate::storage::MAX_COMPOSITE_FIELDS as u16
+                | if encoding == CompositeEncoding::Members {
+                    COMPOSITE_MEMBER_IDENTITIES
+                } else {
+                    0
+                },
+            storage,
+            txid,
+            arena,
+        ),
+        ColType::Array(element) => {
+            let Datum::Array { raw, .. } = cast_to(
+                value,
+                ColType::Array(crate::sql::types::ArrElem::Text),
+                arena,
+            )?
+            else {
+                unreachable!()
+            };
+            let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+            let items = crate::sql::array::alloc_items(arena, shape.element_count())?;
+            for (out, value) in items.iter_mut().zip(crate::sql::array::elements(
+                raw,
+                crate::sql::types::ArrElem::Text,
+            )) {
+                *out = decode_composite_stored_field(
+                    value,
+                    element.to_coltype(),
+                    encoding,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+                if matches!(out, Datum::Composite { .. }) {
+                    *out = coerce_user_type_array_element(*out, element, storage, txid, arena)?;
+                }
+            }
+            Ok(Datum::Array {
+                element,
+                raw: crate::sql::array::build_shaped(items, shape, arena)?,
+            })
+        }
+        _ => cast_to(value, ctype, arena),
+    }
+}
+
+pub(crate) fn enum_array_member_text<'a>(
+    value: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let Datum::Text(text) = composite_persistent_value(value, storage, txid, arena)? else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "enum array has no member text"
+        ));
+    };
+    Ok(text)
+}
+
+pub(crate) fn enum_array_from_legacy_labels<'a>(
+    text: &'a str,
+    slot: u16,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    decode_composite_stored_field(
+        Datum::Text(text),
+        ColType::Array(crate::sql::types::ArrElem::Enum(slot)),
+        CompositeEncoding::Legacy,
+        storage,
+        txid,
+        arena,
+    )
+}
+
+pub(crate) fn enum_array_from_members<'a>(
+    text: &'a str,
+    slot: u16,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    decode_composite_stored_field(
+        Datum::Text(text),
+        ColType::Array(crate::sql::types::ArrElem::Enum(slot)),
+        CompositeEncoding::Members,
+        storage,
+        txid,
+        arena,
+    )
+}
+
 /// Renders a composite in stable physical-attribute order for persistence.
 /// Runtime composites expose active fields only; this boundary reinstates
 /// dropped slots as NULL so a later attribute change cannot shift old data.
@@ -69564,6 +69669,7 @@ fn composite_storage_text<'a>(
             )
         })?;
         *out = *source;
+        out.value = composite_persistent_value(out.value, storage, txid, arena)?;
         active_index += 1;
     }
     if active_index != active.len() {
@@ -69595,13 +69701,13 @@ pub(crate) fn coerce_composite_value<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    coerce_composite_value_inner(value, slot, false, storage, txid, arena)
+    coerce_composite_value_inner(value, slot, CompositeEncoding::Input, storage, txid, arena)
 }
 
 fn coerce_composite_value_inner<'a>(
     value: Datum<'a>,
     slot: u16,
-    nested_stored_layout: bool,
+    encoding: CompositeEncoding,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
@@ -69687,18 +69793,28 @@ fn coerce_composite_value_inner<'a>(
             crate::storage::DeclaredColumnType::Builtin { oid }
             | crate::storage::DeclaredColumnType::UserDefined { oid, .. } => oid,
         };
-        out.value = match (nested_stored_layout, field.ctype, input[index].value) {
-            (true, ColType::Composite(nested_slot), Datum::Text(text)) => {
-                decode_stored_composite_text(
-                    text,
-                    nested_slot,
-                    crate::storage::MAX_COMPOSITE_FIELDS as u16,
+        out.value = if encoding == CompositeEncoding::Input {
+            let value = coerce(input[index].value, &column, storage, txid, arena)?;
+            match constraints::column_domain_slot(storage, &column, txid) {
+                Some(domain) => constraints::coerce_domain_value(
                     storage,
+                    domain,
+                    value,
                     txid,
                     arena,
-                )?
+                    crate::sql::eval::NO_PARAMS,
+                )?,
+                None => value,
             }
-            _ => coerce(input[index].value, &column, storage, txid, arena)?,
+        } else {
+            decode_composite_stored_field(
+                input[index].value,
+                field.ctype,
+                encoding,
+                storage,
+                txid,
+                arena,
+            )?
         };
         if field.not_null && matches!(out.value, Datum::Null) {
             return Err(sql_err!(
@@ -69753,6 +69869,15 @@ fn decode_composite_text_inner<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    let encoding = match stored_physical_fields {
+        None => CompositeEncoding::Input,
+        Some(count) if count & usize::from(COMPOSITE_MEMBER_IDENTITIES) != 0 => {
+            CompositeEncoding::Members
+        }
+        Some(_) => CompositeEncoding::Legacy,
+    };
+    let stored_physical_fields =
+        stored_physical_fields.map(|count| count & !usize::from(COMPOSITE_MEMBER_IDENTITIES));
     let body = text
         .strip_prefix('(')
         .and_then(|body| body.strip_suffix(')'))
@@ -69902,14 +70027,7 @@ fn decode_composite_text_inner<'a>(
             Datum::Text(raw)
         };
     }
-    coerce_composite_value_inner(
-        Datum::Record(values),
-        slot,
-        stored_physical_fields.is_some(),
-        storage,
-        txid,
-        arena,
-    )
+    coerce_composite_value_inner(Datum::Record(values), slot, encoding, storage, txid, arena)
 }
 
 /// Coerces an array to a user-defined element type. Its raw element payloads
@@ -69991,10 +70109,12 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                 value => coerce_composite_value(value, slot, storage, txid, arena)?,
             };
             match composite {
+                Datum::Null => Datum::Null,
                 value @ Datum::CompositeText { .. } => value,
                 value @ Datum::Composite { .. } => Datum::CompositeText {
                     slot,
-                    physical_fields: storage.composite_for(slot as usize, txid).n_fields as u16,
+                    physical_fields: (storage.composite_for(slot as usize, txid).n_fields as u16)
+                        | COMPOSITE_MEMBER_IDENTITIES,
                     text: composite_storage_text(value, slot, storage, txid, arena)?,
                 },
                 _ => unreachable!("composite coercion returns a composite datum"),
@@ -70017,6 +70137,13 @@ pub(crate) fn coerce_enum_value<'a>(
     if v.is_null() {
         return Ok(Datum::Null);
     }
+    if matches!(v, Datum::Enum { slot: actual, .. } if actual == slot) {
+        let resolved = super::enum_values::resolve(v, storage, txid, arena)?;
+        if let Datum::Enum { label, .. } = resolved {
+            ensure_enum_value_is_safe(storage, slot, label, txid)?;
+        }
+        return Ok(resolved);
+    }
     let def = storage.enum_for(slot as usize, txid);
     let label = match v {
         Datum::Enum { label, .. } | Datum::Text(label) => label,
@@ -70029,7 +70156,10 @@ pub(crate) fn coerce_enum_value<'a>(
             ));
         }
     };
-    let Some(sort) = def.sort_of(label) else {
+    let Some(member) = def
+        .members()
+        .position(|member| member.label.as_str() == label)
+    else {
         return Err(sql_err!(
             sqlstate::INVALID_TEXT_REPRESENTATION,
             "invalid input value for enum {}: \"{}\"",
@@ -70040,7 +70170,15 @@ pub(crate) fn coerce_enum_value<'a>(
     ensure_enum_value_is_safe(storage, slot, label, txid)?;
     Ok(Datum::Enum {
         slot,
-        sort,
+        member: Some(
+            crate::sql::types::EnumMemberId::from_ordinal(member as u32)
+                .expect("validated enum member ordinal"),
+        ),
+        sort: def
+            .members()
+            .nth(member)
+            .expect("selected enum member")
+            .sort,
         label: arena
             .alloc_str(label)
             .map_err(|_| super::query::arena_full_pub())?,

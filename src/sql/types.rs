@@ -3818,8 +3818,7 @@ impl ArrElem {
                 base_user_slot,
                 ..
             } => {
-                match ColType::from_code(base_code)
-                    .expect("domain array carries a valid scalar base code")
+                match ColType::from_code(base_code).expect("domain array carries a valid base code")
                 {
                     ColType::Enum(_) => ColType::Enum(base_user_slot),
                     ColType::Composite(_) => ColType::Composite(base_user_slot),
@@ -4068,7 +4067,11 @@ impl ArrElem {
 
     /// Rebuilds a domain-array element identity from the domain catalog.
     pub fn domain(slot: u16, base: ColType) -> Option<Self> {
-        if matches!(base, ColType::Record) {
+        // Built-in array bases retain their complete element in the base code.
+        // Nested user-type slots are not represented by that code.
+        if matches!(base, ColType::Record)
+            || matches!(base, ColType::Array(element) if element.user_type_slot().is_some())
+        {
             return None;
         }
         let base_user_slot = match base {
@@ -4588,6 +4591,34 @@ impl<'a> AclItem<'a> {
     }
 }
 
+/// A stable catalog member ordinal, encoded with a niche for legacy values.
+/// No valid u32 member count can contain ordinal u32::MAX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct EnumMemberId(core::num::NonZeroU32);
+
+impl EnumMemberId {
+    pub const fn from_ordinal(ordinal: u32) -> Option<Self> {
+        match ordinal.checked_add(1) {
+            Some(value) => match core::num::NonZeroU32::new(value) {
+                Some(value) => Some(Self(value)),
+                None => None,
+            },
+            None => None,
+        }
+    }
+
+    pub const fn ordinal(self) -> u32 {
+        self.0.get() - 1
+    }
+}
+
+impl core::fmt::Display for EnumMemberId {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self.ordinal(), output)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Datum<'a> {
     Null,
@@ -4749,14 +4780,12 @@ pub enum Datum<'a> {
         physical_fields: u16,
         text: &'a str,
     },
-    /// A user-defined enum value. `slot` identifies the enum type (for OID /
-    /// `pg_typeof`); `sort` is the member's sort key, by which enum values
-    /// order (PostgreSQL orders by `enumsortorder`, not label text); `label`
-    /// is the member's text, used for output and equality. All three are
-    /// carried inline so a value is self-describing — decode needs no catalog
-    /// and [`compare_datums`](super::eval::operators::compare_datums) stays pure.
+    /// A user-defined enum member. Durable identity is independent of its
+    /// cached label and sort position; catalog-aware materialization refreshes
+    /// both before SQL evaluation. None identifies a legacy label-bound value.
     Enum {
         slot: u16,
+        member: Option<EnumMemberId>,
         sort: f64,
         label: &'a str,
     },

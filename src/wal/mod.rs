@@ -144,6 +144,12 @@ wal_record_kinds! {
 /// Enum label counts widened from one byte to the startup-configured capacity.
 /// Kind 23 remains decodable so existing journals retain their durable meaning.
     KIND_CREATE_ENUM_V2 = 147;
+    KIND_CREATE_ENUM_V3 = 149;
+    KIND_ANALYZE_EXTENDED_STATISTICS_V2 = 150;
+    KIND_CREATE_DOMAIN_TYPED = 151;
+    KIND_CREATE_VIEW_BOUND = 152;
+    KIND_UPSERT_V2 = 153;
+    KIND_CREATE_TYPED = 154;
     KIND_SET_PUBLICATION_OWNER = 43;
     KIND_RENAME_PUBLICATION = 44;
     KIND_CREATE_ROUTINE = 45;
@@ -253,6 +259,25 @@ fn access_class_has_oid(class: u8) -> bool {
         || class == crate::storage::AccessClass::LargeObject as u8
 }
 
+fn table_needs_typed_journal(def: &TableDef) -> bool {
+    def.columns().iter().any(|column| {
+        column
+            .default
+            .expression()
+            .is_some_and(|source| crate::sql::enum_values::checks::is_bound(source.as_str()))
+    })
+}
+
+fn domain_needs_typed_journal(def: &crate::storage::DomainDef) -> bool {
+    def.default_expr
+        .is_some_and(|source| crate::sql::enum_values::checks::is_bound(source.as_str()))
+        || def
+            .checks()
+            .iter()
+            .any(|check| crate::sql::enum_values::checks::is_bound(check.expression.as_str()))
+        || (def.base_user_type.is_some() && matches!(def.base, ColType::Array(_)))
+}
+
 /// A domain's direct enum/composite base uses its durable catalog slot during
 /// replay. Names are catalog projections and can change after an older domain
 /// image was written.
@@ -260,6 +285,9 @@ fn domain_base_slot(def: &crate::storage::DomainDef) -> u16 {
     match (def.base_user_type, def.base) {
         (Some(_), crate::sql::types::ColType::Enum(slot))
         | (Some(_), crate::sql::types::ColType::Composite(slot)) => slot,
+        (Some(_), crate::sql::types::ColType::Array(element)) => {
+            element.user_type_slot().unwrap_or(NO_DOMAIN_BASE_SLOT)
+        }
         (None, _) => NO_DOMAIN_BASE_SLOT,
         (Some(_), _) => NO_DOMAIN_BASE_SLOT,
     }
@@ -569,9 +597,14 @@ impl WalExtendedStatisticsKey<'_> {
 pub(crate) enum WalExtendedStatisticsData<'a> {
     Captured(&'a ExtendedStatisticsData),
     Encoded(&'a [u8]),
+    LegacyEnumHashes(&'a [u8]),
 }
 
 impl WalExtendedStatisticsData<'_> {
+    pub(crate) fn has_legacy_enum_hashes(self) -> bool {
+        matches!(self, Self::LegacyEnumHashes(_))
+    }
+
     fn encoded_len(self) -> usize {
         match self {
             Self::Captured(data) => {
@@ -586,7 +619,7 @@ impl WalExtendedStatisticsData<'_> {
                     + 4
                     + usize::from(data.n_mcv) * 8
             }
-            Self::Encoded(bytes) => bytes.len(),
+            Self::Encoded(bytes) | Self::LegacyEnumHashes(bytes) => bytes.len(),
         }
     }
 
@@ -621,19 +654,21 @@ impl WalExtendedStatisticsData<'_> {
                 }
                 ok
             }
-            Self::Encoded(bytes) => buffer.append(bytes),
+            Self::Encoded(bytes) | Self::LegacyEnumHashes(bytes) => buffer.append(bytes),
         }
     }
 
     pub(crate) fn materialize(self) -> Result<ExtendedStatisticsData, SqlError> {
         match self {
             Self::Captured(data) => Ok(*data),
-            Self::Encoded(bytes) => decode_extended_statistics_data(bytes).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "corrupt extended statistics in journal"
-                )
-            }),
+            Self::Encoded(bytes) | Self::LegacyEnumHashes(bytes) => {
+                decode_extended_statistics_data(bytes).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "corrupt extended statistics in journal"
+                    )
+                })
+            }
         }
     }
 }
@@ -724,6 +759,7 @@ pub(crate) fn apply_enum_payload(
     storage: &mut crate::storage::Storage,
     payload: &[u8],
     wide_count: bool,
+    stable_members: bool,
 ) -> Result<(), SqlError> {
     let mut at = 0usize;
     let take_name = |at: &mut usize| -> Result<&str, SqlError> {
@@ -768,7 +804,34 @@ pub(crate) fn apply_enum_payload(
                 })?,
         );
         at += 8;
-        *member = crate::storage::EnumMember { label, sort };
+        let legacy_label = if stable_members {
+            match *payload
+                .get(at)
+                .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload"))?
+            {
+                0 => {
+                    at += 1;
+                    None
+                }
+                1 => {
+                    at += 1;
+                    Some(crate::storage::SqlName::parse(take_name(&mut at)?)?)
+                }
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "invalid enum journal payload"
+                    ));
+                }
+            }
+        } else {
+            Some(label)
+        };
+        *member = crate::storage::EnumMember {
+            label,
+            legacy_label,
+            sort,
+        };
     }
     if at != payload.len() {
         return Err(sql_err!(
@@ -830,6 +893,7 @@ pub(crate) enum WalOp<'a> {
     /// it into its bounded stack scratch only at the table-application choke
     /// point, rather than inflating every decoded WAL operation.
     RestoreTable(&'a [u8]),
+    RestoreTypedTable(&'a [u8]),
     /// Begins ALTER TABLE's in-place definition/row rewrite. The immediately
     /// following CreateTable record supplies the final definition; this marker
     /// carries the old identity and composed column ordinals without inflating
@@ -1372,6 +1436,7 @@ pub(crate) enum WalOp<'a> {
     CreateDomain(&'a crate::storage::DomainDef),
     /// The validated durable domain image, materialized only while applying it.
     RestoreDomain(&'a [u8]),
+    RestoreTypedDomain(&'a [u8]),
     DropDomain {
         schema: &'a str,
         name: &'a str,
@@ -1389,6 +1454,7 @@ pub(crate) enum WalOp<'a> {
     RestoreEnum {
         payload: &'a [u8],
         wide_count: bool,
+        stable_members: bool,
     },
     DropEnum {
         schema: &'a str,
@@ -2433,13 +2499,27 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetForeignServer { .. } => KIND_SET_FOREIGN_SERVER,
         WalOp::SetUserMapping { .. } => KIND_SET_USER_MAPPING,
         WalOp::SetForeignTable { .. } | WalOp::RestoreForeignTable(_) => KIND_SET_FOREIGN_TABLE,
-        WalOp::CreateTable(_) | WalOp::RestoreTable(_) => KIND_CREATE,
+        WalOp::CreateTable(definition) => {
+            if table_needs_typed_journal(definition) {
+                KIND_CREATE_TYPED
+            } else {
+                KIND_CREATE
+            }
+        }
+        WalOp::RestoreTable(_) => KIND_CREATE,
+        WalOp::RestoreTypedTable(_) => KIND_CREATE_TYPED,
         WalOp::DropTable { .. } => KIND_DROP,
-        WalOp::Upsert { .. } => KIND_UPSERT,
+        WalOp::Upsert { .. } => KIND_UPSERT_V2,
         WalOp::Delete { .. } => KIND_DELETE,
         WalOp::Truncate { .. } => KIND_TRUNCATE_WIDE,
         WalOp::LogicalMessage { .. } => KIND_LOGICAL_MESSAGE,
-        WalOp::CreateView { .. } => KIND_CREATE_VIEW_V2,
+        WalOp::CreateView { sql, .. } => {
+            if crate::sql::enum_values::is_bound_query(sql) {
+                KIND_CREATE_VIEW_BOUND
+            } else {
+                KIND_CREATE_VIEW_V2
+            }
+        }
         WalOp::DropView { .. } => KIND_DROP_VIEW,
         WalOp::SetViewOptions { .. } => KIND_SET_VIEW_OPTIONS,
         WalOp::SetViewColumns { .. } => KIND_SET_VIEW_COLUMNS_V2,
@@ -2511,14 +2591,30 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SequenceAdvance { .. } => KIND_SEQUENCE_ADVANCE,
         WalOp::ResetUnloggedRelations => KIND_RESET_UNLOGGED_RELATIONS,
         WalOp::Comment { .. } => KIND_COMMENT,
-        WalOp::CreateDomain(_) | WalOp::RestoreDomain(_) => KIND_CREATE_DOMAIN,
+        WalOp::CreateDomain(definition) => {
+            if domain_needs_typed_journal(definition) {
+                KIND_CREATE_DOMAIN_TYPED
+            } else {
+                KIND_CREATE_DOMAIN
+            }
+        }
+        WalOp::RestoreDomain(_) => KIND_CREATE_DOMAIN,
+        WalOp::RestoreTypedDomain(_) => KIND_CREATE_DOMAIN_TYPED,
         WalOp::DropDomain { .. } => KIND_DROP_DOMAIN,
         WalOp::CreateEnum { .. }
         | WalOp::RestoreEnum {
-            wide_count: true, ..
+            stable_members: true,
+            ..
+        } => KIND_CREATE_ENUM_V3,
+        WalOp::RestoreEnum {
+            wide_count: true,
+            stable_members: false,
+            ..
         } => KIND_CREATE_ENUM_V2,
         WalOp::RestoreEnum {
-            wide_count: false, ..
+            wide_count: false,
+            stable_members: false,
+            ..
         } => KIND_CREATE_ENUM,
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
         WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
@@ -2564,7 +2660,13 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::Analyze { .. } => KIND_ANALYZE,
         WalOp::SetExtendedStatistics { .. } => KIND_SET_EXTENDED_STATISTICS,
         WalOp::DropExtendedStatistics { .. } => KIND_DROP_EXTENDED_STATISTICS,
-        WalOp::AnalyzeExtendedStatistics { .. } => KIND_ANALYZE_EXTENDED_STATISTICS,
+        WalOp::AnalyzeExtendedStatistics { statistics, .. } => {
+            if statistics.has_legacy_enum_hashes() {
+                KIND_ANALYZE_EXTENDED_STATISTICS
+            } else {
+                KIND_ANALYZE_EXTENDED_STATISTICS_V2
+            }
+        }
         WalOp::UpsertRole { .. } => KIND_UPSERT_ROLE,
         WalOp::DropRole { .. } => KIND_DROP_ROLE,
         WalOp::RenameRole { .. } => KIND_RENAME_ROLE,
@@ -2662,7 +2764,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                         .sum::<usize>()
             })
         }
-        WalOp::RestoreTable(payload) => payload.len(),
+        WalOp::RestoreTable(payload) | WalOp::RestoreTypedTable(payload) => payload.len(),
         WalOp::CreateTable(def) => {
             let mut n = 1 + 1 + def.name.as_str().len() + 2 + 4 + 2;
             n += match def.access_method {
@@ -3291,6 +3393,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n
         }
         WalOp::RestoreDomain(payload)
+        | WalOp::RestoreTypedDomain(payload)
         | WalOp::RestoreRoutine { payload, .. }
         | WalOp::RestoreForeignTable(payload)
         | WalOp::RestoreOperatorFamily(payload)
@@ -3304,7 +3407,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => {
             let mut n = 1 + name.len() + 1 + schema.len() + 4;
             for m in *members {
-                n += 1 + m.label.as_str().len() + 8;
+                n += 1
+                    + m.label.as_str().len()
+                    + 8
+                    + 1
+                    + m.legacy_label.map_or(0, |label| 1 + label.as_str().len());
             }
             n
         }
@@ -4281,7 +4388,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
-        WalOp::RestoreTable(payload) => buffer.append(payload),
+        WalOp::RestoreTable(payload) | WalOp::RestoreTypedTable(payload) => buffer.append(payload),
         WalOp::CreateTable(def) => {
             let mut ok = buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
                 && name_bytes(buffer, def.name.as_str());
@@ -5341,6 +5448,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::RestoreDomain(payload)
+        | WalOp::RestoreTypedDomain(payload)
         | WalOp::RestoreRoutine { payload, .. }
         | WalOp::RestoreForeignTable(payload)
         | WalOp::RestoreOperatorFamily(payload)
@@ -5361,6 +5469,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&count.to_le_bytes());
             for m in *members {
                 ok &= name_bytes(buffer, m.label.as_str()) && buffer.append(&m.sort.to_le_bytes());
+                ok &= buffer.append(&[u8::from(m.legacy_label.is_some())]);
+                if let Some(label) = m.legacy_label {
+                    ok &= name_bytes(buffer, label.as_str());
+                }
             }
             ok
         }
@@ -7166,7 +7278,7 @@ fn decode_op_inner<'a>(
             }
             Some(WalOp::RestoreForeignTable(payload))
         }),
-        KIND_CREATE => decode_large_op(|| {
+        KIND_CREATE | KIND_CREATE_TYPED => decode_large_op(|| {
             let table_version = payload.get(at).copied()?;
             if !matches!(table_version, 3 | TABLE_DEF_PAYLOAD_VERSION) {
                 return None;
@@ -7180,7 +7292,7 @@ fn decode_op_inner<'a>(
             }
             let has_toast = stored_boolean(*payload.get(at)?)?;
             at += 1;
-            let kind = match *payload.get(at)? {
+            let table_kind = match *payload.get(at)? {
                 0 => crate::storage::TableKind::Local,
                 1 => crate::storage::TableKind::Foreign,
                 _ => return None,
@@ -7228,7 +7340,7 @@ fn decode_op_inner<'a>(
                 columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
                 n_columns: n_cols,
                 has_toast,
-                kind,
+                kind: table_kind,
                 persistence,
                 on_commit,
                 tablespace,
@@ -7519,10 +7631,19 @@ fn decode_op_inner<'a>(
             if at != payload.len() {
                 return None;
             }
+            if decoded_table.is_none()
+                && (kind == KIND_CREATE_TYPED) != table_needs_typed_journal(&def)
+            {
+                return None;
+            }
             if let Some(output) = decoded_table {
                 *output = def;
             }
-            Some(WalOp::RestoreTable(payload))
+            Some(if kind == KIND_CREATE_TYPED {
+                WalOp::RestoreTypedTable(payload)
+            } else {
+                WalOp::RestoreTable(payload)
+            })
         }),
         KIND_REWRITE_TABLE => decode_large_op(|| {
             let previous_schema = take_name(&mut at)?;
@@ -7550,7 +7671,7 @@ fn decode_op_inner<'a>(
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTable { schema, name })
         }),
-        KIND_UPSERT => decode_large_op(|| {
+        KIND_UPSERT | KIND_UPSERT_V2 => decode_large_op(|| {
             let table = take_name(&mut at)?;
             let rowid = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
@@ -7686,8 +7807,8 @@ fn decode_op_inner<'a>(
                 content,
             })
         }),
-        KIND_CREATE_VIEW | KIND_CREATE_VIEW_V2 => decode_large_op(|| {
-            let wide_columns = kind == KIND_CREATE_VIEW_V2;
+        KIND_CREATE_VIEW | KIND_CREATE_VIEW_V2 | KIND_CREATE_VIEW_BOUND => decode_large_op(|| {
+            let wide_columns = kind != KIND_CREATE_VIEW;
             let name = take_name(&mut at)?;
             let columns_start = at;
             let column_count = if wide_columns {
@@ -7721,6 +7842,9 @@ fn decode_op_inner<'a>(
             let raw = payload.get(at..at + sql_len)?;
             at += sql_len;
             let sql = core::str::from_utf8(raw).ok()?;
+            if (kind == KIND_CREATE_VIEW_BOUND) != crate::sql::enum_values::is_bound_query(sql) {
+                return None;
+            }
             let schema = take_name(&mut at)?;
             let path_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
             at += 2;
@@ -9248,7 +9372,7 @@ fn decode_op_inner<'a>(
                 text,
             })
         }),
-        KIND_CREATE_DOMAIN => decode_large_op(|| {
+        KIND_CREATE_DOMAIN | KIND_CREATE_DOMAIN_TYPED => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let payload_version = *payload.get(at)?;
@@ -9300,6 +9424,26 @@ fn decode_op_inner<'a>(
                     if slot != NO_DOMAIN_BASE_SLOT =>
                 {
                     crate::sql::types::ColType::Composite(slot)
+                }
+                (Some(_), ColType::Array(element), slot) if slot != NO_DOMAIN_BASE_SLOT => {
+                    ColType::Array(match element {
+                        crate::sql::types::ArrElem::Enum(_) => {
+                            crate::sql::types::ArrElem::Enum(slot)
+                        }
+                        crate::sql::types::ArrElem::Composite(_) => {
+                            crate::sql::types::ArrElem::Composite(slot)
+                        }
+                        crate::sql::types::ArrElem::Domain {
+                            base_code,
+                            base_user_slot,
+                            ..
+                        } => crate::sql::types::ArrElem::Domain {
+                            slot,
+                            base_code,
+                            base_user_slot,
+                        },
+                        _ => return None,
+                    })
                 }
                 (None, base, NO_DOMAIN_BASE_SLOT) => base,
                 _ => return None,
@@ -9365,22 +9509,32 @@ fn decode_op_inner<'a>(
                 pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Absent,
             };
+            if decoded_domain.is_none()
+                && (kind == KIND_CREATE_DOMAIN_TYPED) != domain_needs_typed_journal(&definition)
+            {
+                return None;
+            }
             if let Some(output) = decoded_domain {
                 *output = definition;
             }
-            Some(WalOp::RestoreDomain(payload))
+            Some(if kind == KIND_CREATE_DOMAIN_TYPED {
+                WalOp::RestoreTypedDomain(payload)
+            } else {
+                WalOp::RestoreDomain(payload)
+            })
         }),
         KIND_DROP_DOMAIN => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropDomain { schema, name })
         }),
-        KIND_CREATE_ENUM | KIND_CREATE_ENUM_V2 => decode_large_op(|| {
+        KIND_CREATE_ENUM | KIND_CREATE_ENUM_V2 | KIND_CREATE_ENUM_V3 => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             SqlName::parse(name).ok()?;
             SqlName::parse(schema).ok()?;
-            let wide_count = kind == KIND_CREATE_ENUM_V2;
+            let stable_members = kind == KIND_CREATE_ENUM_V3;
+            let wide_count = kind != KIND_CREATE_ENUM;
             let n_members = if wide_count {
                 let count = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
                 at += 4;
@@ -9395,10 +9549,23 @@ fn decode_op_inner<'a>(
                 SqlName::parse(label).ok()?;
                 let _sort = f64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
                 at += 8;
+                if stable_members {
+                    match *payload.get(at)? {
+                        0 => {
+                            at += 1;
+                        }
+                        1 => {
+                            at += 1;
+                            SqlName::parse(take_name(&mut at)?).ok()?;
+                        }
+                        _ => return None,
+                    }
+                }
             }
             (at == payload.len()).then_some(WalOp::RestoreEnum {
                 payload,
                 wide_count,
+                stable_members,
             })
         }),
         KIND_DROP_ENUM => decode_large_op(|| {
@@ -10653,17 +10820,28 @@ fn decode_op_inner<'a>(
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropExtendedStatistics { schema, name })
         }),
-        KIND_ANALYZE_EXTENDED_STATISTICS => decode_large_op(|| {
-            let schema = take_name(&mut at)?;
-            let name = take_name(&mut at)?;
-            let encoded = payload.get(at..)?;
-            decode_extended_statistics_data(encoded)?;
-            Some(WalOp::AnalyzeExtendedStatistics {
-                schema,
-                name,
-                statistics: WalExtendedStatisticsData::Encoded(encoded),
+        KIND_ANALYZE_EXTENDED_STATISTICS | KIND_ANALYZE_EXTENDED_STATISTICS_V2 => {
+            decode_large_op(|| {
+                let schema = take_name(&mut at)?;
+                let name = take_name(&mut at)?;
+                let encoded = payload.get(at..)?;
+                let decoded = decode_extended_statistics_data(encoded)?;
+                if kind == KIND_ANALYZE_EXTENDED_STATISTICS_V2
+                    && WalExtendedStatisticsData::Captured(&decoded).encoded_len() != encoded.len()
+                {
+                    return None;
+                }
+                Some(WalOp::AnalyzeExtendedStatistics {
+                    schema,
+                    name,
+                    statistics: if kind == KIND_ANALYZE_EXTENDED_STATISTICS {
+                        WalExtendedStatisticsData::LegacyEnumHashes(encoded)
+                    } else {
+                        WalExtendedStatisticsData::Encoded(encoded)
+                    },
+                })
             })
-        }),
+        }
         KIND_UPSERT_ROLE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let flags = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
@@ -11004,7 +11182,9 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Macaddr(_)) => 6,
         Some(OwnedDatum::Macaddr8(_)) => 8,
         // slot(2) + sort(8) + len(1) + label bytes.
-        Some(OwnedDatum::Enum { len, .. }) => 11 + *len as usize,
+        Some(OwnedDatum::Enum { len, member, .. }) => {
+            11 + usize::from(member.is_some()) * 4 + *len as usize
+        }
         Some(OwnedDatum::Json { len, .. }) | Some(OwnedDatum::Bit { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Array { len, .. }) => 7 + *len as usize,
@@ -11104,7 +11284,12 @@ fn append_view_default(buffer: &mut FixedBuf, default: crate::storage::ColumnDef
         }
         crate::storage::ColumnDefault::Expression(expression) => {
             let bytes = expression.as_str().as_bytes();
-            buffer.append(&[2])
+            let tag = if crate::sql::enum_values::checks::is_bound(expression.as_str()) {
+                3
+            } else {
+                2
+            };
+            buffer.append(&[tag])
                 && buffer.append(&(bytes.len() as u16).to_le_bytes())
                 && buffer.append(bytes)
         }
@@ -11135,7 +11320,13 @@ fn decode_view_default(payload: &[u8], at: &mut usize) -> Option<crate::storage:
             let value = decode_default(payload, at)??;
             crate::storage::ColumnDefault::from_parts(Some(value), Some(expression(at)?), false)
         }
-        2 => crate::storage::ColumnDefault::from_parts(None, Some(expression(at)?), false),
+        2 | 3 => {
+            let expression = expression(at)?;
+            if (tag == 3) != crate::sql::enum_values::checks::is_bound(expression.as_str()) {
+                return None;
+            }
+            crate::storage::ColumnDefault::from_parts(None, Some(expression), false)
+        }
         _ => None,
     }
 }
@@ -11148,7 +11339,7 @@ pub(crate) fn append_default(buffer: &mut FixedBuf, d: &Option<OwnedDatum>) -> b
 
 /// Largest encoded default: an enum's tag, identity, ordering key, length and
 /// bounded label. Array and ACL payloads carry less metadata.
-pub(crate) const MAX_DEFAULT_ENCODED: usize = 12 + crate::storage::MAX_DEFAULT_TEXT;
+pub(crate) const MAX_DEFAULT_ENCODED: usize = 16 + crate::storage::MAX_DEFAULT_TEXT;
 
 /// Stack encoding of a column default; returns the byte count.
 pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> usize {
@@ -11356,16 +11547,23 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
         }
         Some(OwnedDatum::Enum {
             slot,
+            member,
             sort,
             len,
             bytes,
         }) => {
-            out[0] = 12;
+            out[0] = if member.is_some() { 42 } else { 12 };
             out[1..3].copy_from_slice(&slot.to_le_bytes());
             out[3..11].copy_from_slice(&sort.to_le_bytes());
-            out[11] = *len;
-            out[12..12 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            12 + *len as usize
+            let prefix = if let Some(member) = member {
+                out[11..15].copy_from_slice(&member.ordinal().to_le_bytes());
+                15
+            } else {
+                11
+            };
+            out[prefix] = *len;
+            out[prefix + 1..prefix + 1 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            prefix + 1 + *len as usize
         }
         Some(OwnedDatum::Json { jsonb, len, bytes }) => {
             out[0] = 20;
@@ -11610,11 +11808,19 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             *at += 8;
             Some(OwnedDatum::Macaddr8(b.try_into().unwrap()))
         }
-        12 => {
+        12 | 42 => {
             let slot = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().unwrap());
             let sort = f64::from_le_bytes(payload.get(*at + 2..*at + 10)?.try_into().unwrap());
-            let len = *payload.get(*at + 10)? as usize;
-            *at += 11;
+            *at += 10;
+            let member = if tag == 42 {
+                let member = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+                *at += 4;
+                Some(crate::sql::types::EnumMemberId::from_ordinal(member)?)
+            } else {
+                None
+            };
+            let len = *payload.get(*at)? as usize;
+            *at += 1;
             if len > crate::storage::MAX_DEFAULT_TEXT {
                 return None;
             }
@@ -11625,6 +11831,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             bytes[..len].copy_from_slice(raw);
             Some(OwnedDatum::Enum {
                 slot,
+                member,
                 sort,
                 len: len as u8,
                 bytes,
@@ -12616,10 +12823,12 @@ mod tests {
         let members = [
             crate::storage::EnumMember {
                 label: crate::storage::SqlName::parse("first").unwrap(),
+                legacy_label: None,
                 sort: 1.0,
             },
             crate::storage::EnumMember {
                 label: crate::storage::SqlName::parse("second").unwrap(),
+                legacy_label: None,
                 sort: 2.0,
             },
         ];
@@ -12631,13 +12840,14 @@ mod tests {
         let mut bytes = [0; 4096];
         let payload = encode_catalog_operation(&operation, &mut bytes);
         assert!(matches!(
-            decode_op(KIND_CREATE_ENUM_V2, payload),
+            decode_op(KIND_CREATE_ENUM_V3, payload),
             Some(WalOp::RestoreEnum {
                 wide_count: true,
+                stable_members: true,
                 ..
             })
         ));
-        assert!(decode_op(KIND_CREATE_ENUM_V2, &payload[..payload.len() - 1]).is_none());
+        assert!(decode_op(KIND_CREATE_ENUM_V3, &payload[..payload.len() - 1]).is_none());
 
         let mut legacy = [0; 256];
         let mut at = 0;
@@ -12658,6 +12868,19 @@ mod tests {
             legacy[at..at + 8].copy_from_slice(&member.sort.to_le_bytes());
             at += 8;
         }
+        let prefix = 1 + "mood".len() + 1 + "public".len();
+        let mut wide = [0u8; 256];
+        wide[..prefix].copy_from_slice(&legacy[..prefix]);
+        wide[prefix..prefix + 4].copy_from_slice(&(members.len() as u32).to_le_bytes());
+        wide[prefix + 4..at + 3].copy_from_slice(&legacy[prefix + 1..at]);
+        assert!(matches!(
+            decode_op(KIND_CREATE_ENUM_V2, &wide[..at + 3]),
+            Some(WalOp::RestoreEnum {
+                wide_count: true,
+                stable_members: false,
+                ..
+            })
+        ));
         crate::mem::guard::forbid_alloc(|| {
             assert!(matches!(
                 decode_op(KIND_CREATE_ENUM, &legacy[..at]),
@@ -12666,6 +12889,220 @@ mod tests {
                     ..
                 })
             ));
+        });
+    }
+
+    #[test]
+    fn enum_value_identity_journal_versions_keep_source_and_hash_provenance() {
+        let mut domain = crate::storage::DomainDef::EMPTY;
+        domain.schema = SqlName::parse("public").unwrap();
+        domain.name = SqlName::parse("guarded_state").unwrap();
+        domain.base = ColType::Enum(0);
+        domain.base_user_type = Some(crate::storage::UserTypeName {
+            schema: domain.schema,
+            name: SqlName::parse("state").unwrap(),
+        });
+        domain.n_checks = 1;
+        domain.checks[0].name = SqlName::parse("allowed").unwrap();
+        domain.checks[0].expression =
+            StackStr::from_str("pos3ql-enum-check-v1\nVALUE = /*p3c:0*/'old'");
+        let columns = crate::storage::ViewColumns::from_names(&["state"])
+            .unwrap()
+            .with_default(
+                0,
+                crate::storage::ColumnDefault::Expression(StackStr::from_str(
+                    "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
+                )),
+            )
+            .unwrap();
+        let dependencies = crate::storage::StoredQueryDependencies::EMPTY;
+        let statistics = crate::storage::ExtendedStatisticsData::EMPTY;
+        let mut budget = Budget::new(32768);
+        let mut payload = FixedBuf::new(&mut budget, "enum journal versions", 16384).unwrap();
+        let mut reencoded = FixedBuf::new(&mut budget, "enum journal replay", 16384).unwrap();
+        let mut table = sample_def();
+        table.columns[0].ctype = ColType::Enum(0);
+        table.columns[0].user_type = domain.base_user_type;
+        table.columns[0].default = crate::storage::ColumnDefault::Expression(StackStr::from_str(
+            "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
+        ));
+        let operations = [
+            (KIND_CREATE_TYPED, WalOp::CreateTable(&table)),
+            (KIND_CREATE_DOMAIN_TYPED, WalOp::CreateDomain(&domain)),
+            (
+                KIND_CREATE_VIEW_BOUND,
+                WalOp::CreateView {
+                    schema: "public",
+                    name: "states",
+                    columns: WalViewColumns::Captured(&columns),
+                    sql: "pos3ql-bound-query-v1\nSELECT /*p3e:0:0*/'old'::state",
+                    path: "public",
+                    security_invoker: false,
+                    security_barrier: 0,
+                    check_option: 0,
+                    dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
+                },
+            ),
+            (
+                KIND_ANALYZE_EXTENDED_STATISTICS_V2,
+                WalOp::AnalyzeExtendedStatistics {
+                    schema: "public",
+                    name: "state_statistics",
+                    statistics: WalExtendedStatisticsData::Captured(&statistics),
+                },
+            ),
+            (
+                KIND_UPSERT_V2,
+                WalOp::Upsert {
+                    schema: "public",
+                    table: "states",
+                    rowid: 7,
+                    row: b"ROWBYTES",
+                    is_update: false,
+                    old_row: None,
+                    command_id: 3,
+                },
+            ),
+        ];
+        crate::mem::guard::forbid_alloc(|| {
+            for (kind, operation) in &operations {
+                payload.clear();
+                assert_eq!(op_kind(operation), *kind);
+                assert!(append_payload(&mut payload, operation));
+                let decoded = decode_op(*kind, payload.readable()).unwrap();
+                assert_eq!(op_kind(&decoded), *kind);
+                reencoded.clear();
+                assert!(append_payload(&mut reencoded, &decoded));
+                assert_eq!(payload.readable(), reencoded.readable());
+                for end in 0..payload.len() {
+                    assert!(
+                        decode_op(*kind, &payload.readable()[..end]).is_none(),
+                        "accepted truncated kind {kind} at {end}"
+                    );
+                }
+                assert!(reencoded.append(&[0]));
+                assert!(decode_op(*kind, reencoded.readable()).is_none());
+                match *kind {
+                    KIND_CREATE_TYPED => {
+                        assert!(decode_op(KIND_CREATE, payload.readable()).is_none());
+                        let decoded = decode_table_payload(payload.readable()).unwrap();
+                        assert_eq!(decoded.columns[0].default, table.columns[0].default);
+                    }
+                    KIND_CREATE_DOMAIN_TYPED => {
+                        assert!(decode_op(KIND_CREATE_DOMAIN, payload.readable()).is_none());
+                        assert_eq!(
+                            decode_domain_payload(payload.readable()).unwrap().checks()[0]
+                                .expression,
+                            domain.checks[0].expression
+                        );
+                    }
+                    KIND_CREATE_VIEW_BOUND => {
+                        assert!(decode_op(KIND_CREATE_VIEW_V2, payload.readable()).is_none());
+                        let WalOp::CreateView {
+                            columns: decoded_columns,
+                            ..
+                        } = decoded
+                        else {
+                            panic!("expected typed view");
+                        };
+                        assert_eq!(
+                            decoded_columns.materialize().unwrap().default_at(0),
+                            columns.default_at(0)
+                        );
+                    }
+                    KIND_ANALYZE_EXTENDED_STATISTICS_V2 => {
+                        let old = decode_op(KIND_ANALYZE_EXTENDED_STATISTICS, payload.readable())
+                            .unwrap();
+                        assert_eq!(op_kind(&old), KIND_ANALYZE_EXTENDED_STATISTICS);
+                        let WalOp::AnalyzeExtendedStatistics { statistics, .. } = old else {
+                            panic!("expected old statistics");
+                        };
+                        assert!(statistics.has_legacy_enum_hashes());
+                    }
+                    KIND_UPSERT_V2 => {
+                        let old = decode_op(KIND_UPSERT, payload.readable()).unwrap();
+                        assert_eq!(op_kind(&old), KIND_UPSERT_V2);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+        domain.n_checks = 0;
+        for element in [
+            crate::sql::types::ArrElem::Enum(7),
+            crate::sql::types::ArrElem::Composite(9),
+            crate::sql::types::ArrElem::domain(11, ColType::Enum(7)).unwrap(),
+        ] {
+            domain.base = ColType::Array(element);
+            let operation = WalOp::CreateDomain(&domain);
+            crate::mem::guard::forbid_alloc(|| {
+                payload.clear();
+                assert_eq!(op_kind(&operation), KIND_CREATE_DOMAIN_TYPED);
+                assert!(append_payload(&mut payload, &operation));
+                let decoded = decode_op(KIND_CREATE_DOMAIN_TYPED, payload.readable()).unwrap();
+                assert_eq!(op_kind(&decoded), KIND_CREATE_DOMAIN_TYPED);
+                assert!(decode_op(KIND_CREATE_DOMAIN, payload.readable()).is_none());
+                let definition = decode_domain_payload(payload.readable()).unwrap();
+                let ColType::Array(rebound) = definition.base else {
+                    panic!("expected array base");
+                };
+                assert_eq!(rebound.user_type_slot(), element.user_type_slot());
+                assert_eq!(definition.base_user_type, domain.base_user_type);
+                reencoded.clear();
+                assert!(append_payload(&mut reencoded, &decoded));
+                assert_eq!(payload.readable(), reencoded.readable());
+                for end in 0..payload.len() {
+                    assert!(
+                        decode_op(KIND_CREATE_DOMAIN_TYPED, &payload.readable()[..end]).is_none()
+                    );
+                }
+            });
+        }
+        domain.base = ColType::Enum(0);
+        domain.default_expr = Some(StackStr::from_str("pos3ql-enum-check-v1\n/*p3c:0*/'old'"));
+        crate::mem::guard::forbid_alloc(|| {
+            payload.clear();
+            let operation = WalOp::CreateDomain(&domain);
+            assert_eq!(op_kind(&operation), KIND_CREATE_DOMAIN_TYPED);
+            assert!(append_payload(&mut payload, &operation));
+            assert!(decode_op(KIND_CREATE_DOMAIN, payload.readable()).is_none());
+            let decoded = decode_domain_payload(payload.readable()).unwrap();
+            assert_eq!(decoded.default_expr, domain.default_expr);
+            payload.clear();
+            assert!(append_view_default(
+                &mut payload,
+                columns.default_at(0).unwrap()
+            ));
+            assert_eq!(payload.readable()[0], 3);
+            let mut at = 0;
+            assert_eq!(
+                decode_view_default(payload.readable(), &mut at),
+                columns.default_at(0)
+            );
+            assert_eq!(at, payload.len());
+            reencoded.clear();
+            assert!(reencoded.append(&[2]));
+            assert!(reencoded.append(&payload.readable()[1..]));
+            at = 0;
+            assert!(decode_view_default(reencoded.readable(), &mut at).is_none());
+        });
+        let widest = OwnedDatum::Enum {
+            slot: 0,
+            member: Some(crate::sql::types::EnumMemberId::from_ordinal(0).unwrap()),
+            sort: 1.0,
+            len: crate::storage::MAX_DEFAULT_TEXT as u8,
+            bytes: [b'x'; crate::storage::MAX_DEFAULT_TEXT],
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            payload.clear();
+            assert!(append_default(&mut payload, &Some(widest)));
+            assert_eq!(payload.len(), MAX_DEFAULT_ENCODED);
+            let mut at = 0;
+            assert_eq!(
+                decode_default(payload.readable(), &mut at),
+                Some(Some(widest))
+            );
+            assert_eq!(at, payload.len());
         });
     }
 

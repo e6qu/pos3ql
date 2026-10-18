@@ -459,6 +459,14 @@ if [[ -x "$ROOT_VENV/bin/python" ]]; then
     bad "binary parameter/result differential"
     cat "$WORK/binary-param.out"
   fi
+  if "$ROOT_VENV/bin/python" "$EXT/type_database_isolation_diff.py" \
+       --pg "$PG_PORT" --p3 "$P3_PORT" 2>&1 | tee "$WORK/type-database-isolation.out"; then
+    ok "database-local type references and enum catalog snapshots"
+    cat "$WORK/type-database-isolation.out"
+  else
+    bad "database-local type references and enum catalog snapshots"
+    cat "$WORK/type-database-isolation.out"
+  fi
   if "$ROOT_VENV/bin/python" "$EXT/type_fidelity_diff.py" \
        --pg "$PG_PORT" --p3 "$P3_PORT" > "$WORK/type-fidelity.out" 2>&1; then
     ok "accepted-type fidelity matrix ($(tail -1 "$WORK/type-fidelity.out"))"

@@ -77,10 +77,14 @@ keeps shared allocators and catalogs available for unrelated storage work.
 Domain, enum and composite creation and moves share one name-reservation check,
 including transaction waits and journal replay. This does not yet coordinate
 publication of a complete type change and all its references.
-Selected enum definitions retain their label images through alteration,
-rollback, drop, slot reuse, replay and database retirement. Readers and
-iterators keep the fixed label buffers alive independently of storage; type commits
-still require exclusive storage ownership.
+Enum values keep member identities separate from labels and sort positions,
+including nested records, arrays, defaults, domain checks and captured view literals.
+Changing a label no longer rewrites table rows or waits for an older read transaction.
+Type binding retains a domain's own identity separately from its base value;
+table, record and routine recovery share the same declaration resolver.
+Selected enum definitions retain their fixed label images through alteration,
+rollback, drop, slot reuse, replay and database retirement. Publishing complete
+type changes and all their references still requires exclusive storage ownership.
 SQL writes and replay retain row bytes from append through publication and
 retries. Table rewrites keep transformed images in the fixed statement arena,
 release owners after errors, and reject replaced heap buffers before publication.

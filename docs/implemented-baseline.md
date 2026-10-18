@@ -161,12 +161,19 @@ begin. It rechecks current readers after every wait and before each batch.
 Acquisition releases earlier snapshot, version and table guards before waiting
 for a contended lock. Reads, pending writes, undo, commit and cleanup use the
 same rule. A retry acquires a fresh coherent set; data changes and callbacks
-run only after acquisition succeeds. New statement admission coalesces cleanup
-already in progress and leaves later release notifications pending for the next
-attempt. A new report admitted between cleanup batches keeps the versions it needs.
+run only after acquisition succeeds. Statement admission explicitly uses
+nonblocking cleanup: a busy workspace, registry, row map, saved-file list or
+version pool leaves the work for retry. Busy tables do not prevent cleanup of
+available tables. One retry flag in the startup workspace preserves skipped
+work separately from releases arriving during the pass; a later admission tries
+again and rechecks current readers. Explicit transaction release still waits
+for its complete cleanup. These passes still visit whole tables; this change
+does not bound total cleanup CPU time. A new report admitted between batches
+keeps the versions it needs.
 
-**User example:** finishing a report can reclaim its old order versions without
-keeping an unrelated customer update waiting for every table to be visited.
+**User example:** starting a report does not wait for cleanup to acquire an
+unrelated table's row metadata. Once that owner releases it, a later statement
+retries cleanup; a report already reading old order values keeps those bytes.
 
 Pending table definitions retain their table and one reserved version slot.
 A reader releases the pool's allocation control before returning the definition;

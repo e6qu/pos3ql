@@ -40659,63 +40659,14 @@ fn build_domain_spec(
             base_type
         ));
     }
-    let (base_domain, base_user_type, base, inherited_default) =
-        if let Some(base) = ColType::from_sql_name(base_type) {
-            (None, None, base, None)
-        } else if let Some(parent) = storage.find_domain(base_type, txid) {
-            (
-                Some(crate::storage::UserTypeName {
-                    schema: parent.schema,
-                    name: parent.name,
-                }),
-                None,
-                parent.base,
-                parent.default_expr,
-            )
-        } else if let Some(enum_slot) = storage.resolve_enum_slot(base_type, txid) {
-            let enumeration = storage.enum_for(enum_slot, txid);
-            (
-                None,
-                Some(crate::storage::UserTypeName {
-                    schema: enumeration.schema,
-                    name: enumeration.name,
-                }),
-                ColType::Enum(enum_slot as u16),
-                None,
-            )
-        } else if let Some(composite_slot) = storage.resolve_composite_slot(base_type, txid) {
-            let composite = storage.composite_for(composite_slot, txid);
-            (
-                None,
-                Some(crate::storage::UserTypeName {
-                    schema: composite.schema,
-                    name: composite.name,
-                }),
-                ColType::Composite(composite_slot as u16),
-                None,
-            )
-        } else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                base_type
-            ));
-        };
-    if ColType::from_sql_name(base_type).is_none() {
+    let resolved = resolve_routine_type(storage, txid, base_type)?;
+    let (base_domain, base_user_type, inherited_default) =
         if let Some(parent) = storage.find_domain(base_type, txid) {
-            storage.require_type_usage(parent.schema.as_str(), parent.name.as_str(), txid)?;
-        } else if let Some(enum_slot) = storage.resolve_enum_slot(base_type, txid) {
-            let enumeration = storage.enum_for(enum_slot, txid);
-            storage.require_type_usage(
-                enumeration.schema.as_str(),
-                enumeration.name.as_str(),
-                txid,
-            )?;
-        } else if let Some(composite_slot) = storage.resolve_composite_slot(base_type, txid) {
-            let composite = storage.composite_for(composite_slot, txid);
-            storage.require_type_usage(composite.schema.as_str(), composite.name.as_str(), txid)?;
-        }
-    }
+            (resolved.user_type, None, parent.default_expr)
+        } else {
+            (None, resolved.user_type, None)
+        };
+    let base = resolved.ctype;
     let default_expr = match default_text {
         Some(t) => {
             validate_domain_expr(t, false, arena)?;
@@ -70187,7 +70138,10 @@ pub(crate) fn coerce_enum_value<'a>(
     ensure_enum_value_is_safe(storage, slot, label, txid)?;
     Ok(Datum::Enum {
         slot,
-        member: Some(member as u32),
+        member: Some(
+            crate::sql::types::EnumMemberId::from_ordinal(member as u32)
+                .expect("validated enum member ordinal"),
+        ),
         sort: def
             .members()
             .nth(member)

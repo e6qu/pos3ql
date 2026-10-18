@@ -97,6 +97,9 @@ impl TypeReferenceMove {
             if *parent == Some(self.prior) {
                 *parent = Some(self.current);
             }
+            if parent.is_none() {
+                self.rewrite(base, user_type);
+            }
         } else {
             self.rewrite(base, user_type);
         }

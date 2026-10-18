@@ -2265,12 +2265,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::enum_values::resolve(value, self.storage, self.txid, arena)
     }
 
-    fn enum_member_index(&self, slot: u16, label: &str) -> Result<Option<u32>, SqlError> {
+    fn enum_member_identity(
+        &self,
+        slot: u16,
+        label: &str,
+    ) -> Result<Option<super::types::EnumMemberId>, SqlError> {
         let definition = self.storage.enum_for(usize::from(slot), self.txid);
         Ok(definition
             .members()
             .position(|member| member.label.as_str() == label)
-            .map(|index| index as u32))
+            .map(|index| {
+                super::types::EnumMemberId::from_ordinal(index as u32)
+                    .expect("validated enum member ordinal")
+            }))
     }
 
     fn materialize_composite<'a>(
@@ -3792,7 +3799,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         for (index, (value, member)) in values.iter_mut().zip(def.members()).enumerate() {
             *value = Datum::Enum {
                 slot,
-                member: Some(index as u32),
+                member: Some(
+                    crate::sql::types::EnumMemberId::from_ordinal(index as u32)
+                        .expect("validated enum member ordinal"),
+                ),
                 sort: member.sort,
                 label: arena
                     .alloc_str(member.label.as_str())

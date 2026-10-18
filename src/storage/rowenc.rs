@@ -9,7 +9,7 @@
 //! into SSTs, so it is versioned by the column count against the schema.
 
 use crate::sql::eval::{SqlError, sqlstate};
-use crate::sql::types::{ColType, Datum};
+use crate::sql::types::{ColType, Datum, EnumMemberId};
 use crate::sql_err;
 
 /// PostgreSQL 18's transient tuple/target-list boundary
@@ -314,7 +314,7 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 let flags = if member.is_some() { 1u32 << 31 } else { 0 };
                 rest[8..12].copy_from_slice(&((label.len() as u32) | flags).to_le_bytes());
                 let prefix = if let Some(member) = member {
-                    rest[12..16].copy_from_slice(&member.to_le_bytes());
+                    rest[12..16].copy_from_slice(&member.ordinal().to_le_bytes());
                     16
                 } else {
                     12
@@ -952,7 +952,12 @@ pub(crate) fn decode<'a>(
                 let member = if flags & 0x8000_0000 != 0 {
                     let identity = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                     at += 4;
-                    Some(u32::from_le_bytes(identity.try_into().unwrap()))
+                    Some(
+                        EnumMemberId::from_ordinal(u32::from_le_bytes(
+                            identity.try_into().unwrap(),
+                        ))
+                        .ok_or_else(corrupt)?,
+                    )
                 } else {
                     None
                 };
@@ -1042,7 +1047,7 @@ mod tests {
                 let values = [
                     Datum::Enum {
                         slot: 0,
-                        member,
+                        member: member.map(|ordinal| EnumMemberId::from_ordinal(ordinal).unwrap()),
                         sort: 2.0,
                         label: "old",
                     },

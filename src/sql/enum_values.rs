@@ -37,7 +37,7 @@ pub(crate) fn resolve<'a>(
         return Err(corrupt());
     }
     let index = match member {
-        Some(index) => index as usize,
+        Some(index) => index.ordinal() as usize,
         None => definition
             .members()
             .position(|candidate| {
@@ -60,7 +60,10 @@ pub(crate) fn resolve<'a>(
     };
     Ok(Datum::Enum {
         slot,
-        member: Some(index as u32),
+        member: Some(
+            crate::sql::types::EnumMemberId::from_ordinal(index as u32)
+                .expect("validated enum member ordinal"),
+        ),
         sort: selected.sort,
         label: current_label,
     })
@@ -87,7 +90,7 @@ pub(crate) fn sort(value: Datum<'_>, storage: &Storage, txid: u32) -> Result<f64
     }
     let definition = storage.enum_for(usize::from(slot), txid);
     let member = match member {
-        Some(index) => definition.members().nth(index as usize),
+        Some(index) => definition.members().nth(index.ordinal() as usize),
         None => definition.members().find(|member| {
             member
                 .legacy_label

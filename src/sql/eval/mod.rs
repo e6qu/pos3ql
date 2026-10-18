@@ -965,7 +965,11 @@ pub trait CatalogAccess {
         ))
     }
 
-    fn enum_member_index(&self, _slot: u16, _label: &str) -> Result<Option<u32>, SqlError> {
+    fn enum_member_identity(
+        &self,
+        _slot: u16,
+        _label: &str,
+    ) -> Result<Option<super::types::EnumMemberId>, SqlError> {
         Ok(None)
     }
 
@@ -7569,7 +7573,7 @@ fn coerce_enum_literal<'a>(
         };
         Ok(Datum::Enum {
             slot,
-            member: cat.enum_member_index(slot, label)?,
+            member: cat.enum_member_identity(slot, label)?,
             sort,
             label: arena.alloc_str(label).map_err(|_| arena_full())?,
         })

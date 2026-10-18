@@ -11478,7 +11478,7 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[1..3].copy_from_slice(&slot.to_le_bytes());
             out[3..11].copy_from_slice(&sort.to_le_bytes());
             let prefix = if let Some(member) = member {
-                out[11..15].copy_from_slice(&member.to_le_bytes());
+                out[11..15].copy_from_slice(&member.ordinal().to_le_bytes());
                 15
             } else {
                 11
@@ -11737,7 +11737,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let member = if tag == 42 {
                 let member = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
                 *at += 4;
-                Some(member)
+                Some(crate::sql::types::EnumMemberId::from_ordinal(member)?)
             } else {
                 None
             };

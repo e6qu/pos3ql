@@ -540,7 +540,11 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[0] = 28;
             out[1..3].copy_from_slice(&slot.to_le_bytes());
             out[3..11].copy_from_slice(&sort.to_le_bytes());
-            out[11..15].copy_from_slice(&member.unwrap_or(u32::MAX).to_le_bytes());
+            out[11..15].copy_from_slice(
+                &member
+                    .map_or(u32::MAX, crate::sql::types::EnumMemberId::ordinal)
+                    .to_le_bytes(),
+            );
             out[15..19].copy_from_slice(&(label.len() as u32).to_le_bytes());
             out[19..19 + label.len()].copy_from_slice(label.as_bytes());
             19 + label.len()
@@ -952,7 +956,7 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             let slot = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
             let sort = f64::from_le_bytes(bytes[at + 2..at + 10].try_into().unwrap());
             let identity = u32::from_le_bytes(bytes[at + 10..at + 14].try_into().unwrap());
-            let member = (identity != u32::MAX).then_some(identity);
+            let member = crate::sql::types::EnumMemberId::from_ordinal(identity);
             let len = u32::from_le_bytes(bytes[at + 14..at + 18].try_into().unwrap()) as usize;
             let label = core::str::from_utf8(&bytes[at + 18..at + 18 + len])
                 .expect("projected enum label is valid UTF-8");

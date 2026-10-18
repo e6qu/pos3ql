@@ -682,7 +682,7 @@ fn hash_catalog(
         } = datum
         {
             let member = match member {
-                Some(member) => *member,
+                Some(member) => member.ordinal(),
                 None => super::super::enum_values::legacy_identity(*slot, label, storage)?,
             };
             hasher.write(&[31]);
@@ -712,7 +712,7 @@ pub(crate) fn hash_key_identified(values: &[Datum], columns: &[u16]) -> Option<u
             Datum::Enum { member, .. } => {
                 let member = member.as_ref()?;
                 hasher.write(&[31]);
-                hasher.write(&member.to_le_bytes());
+                hasher.write(&member.ordinal().to_le_bytes());
             }
             datum => hash_datum(datum, &mut hasher),
         }

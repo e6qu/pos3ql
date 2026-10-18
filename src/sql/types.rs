@@ -4588,6 +4588,34 @@ impl<'a> AclItem<'a> {
     }
 }
 
+/// A stable catalog member ordinal, encoded with a niche for legacy values.
+/// No valid u32 member count can contain ordinal u32::MAX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct EnumMemberId(core::num::NonZeroU32);
+
+impl EnumMemberId {
+    pub const fn from_ordinal(ordinal: u32) -> Option<Self> {
+        match ordinal.checked_add(1) {
+            Some(value) => match core::num::NonZeroU32::new(value) {
+                Some(value) => Some(Self(value)),
+                None => None,
+            },
+            None => None,
+        }
+    }
+
+    pub const fn ordinal(self) -> u32 {
+        self.0.get() - 1
+    }
+}
+
+impl core::fmt::Display for EnumMemberId {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self.ordinal(), output)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Datum<'a> {
     Null,
@@ -4754,7 +4782,7 @@ pub enum Datum<'a> {
     /// both before SQL evaluation. None identifies a legacy label-bound value.
     Enum {
         slot: u16,
-        member: Option<u32>,
+        member: Option<EnumMemberId>,
         sort: f64,
         label: &'a str,
     },

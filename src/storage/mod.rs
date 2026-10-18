@@ -752,7 +752,7 @@ pub enum OwnedDatum {
     Macaddr8([u8; 8]),
     Enum {
         slot: u16,
-        member: Option<u32>,
+        member: Option<crate::sql::types::EnumMemberId>,
         sort: f64,
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
@@ -38847,8 +38847,8 @@ impl Storage {
                     domains[parent_slot].definition_for(txid).base
                 } else if let Some(identity) = domain.base_user_type {
                     match domain.base {
-                        ColType::Enum(_) => ColType::Enum(
-                            enums
+                        ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)) => {
+                            let slot = enums
                                 .iter()
                                 .position(|candidate| {
                                     let candidate = candidate.definition_for(txid);
@@ -38864,10 +38864,14 @@ impl Storage {
                                         identity.schema.as_str(),
                                         identity.name.as_str()
                                     )
-                                })? as u16,
-                        ),
-                        ColType::Composite(_) => ColType::Composite(
-                            composites
+                                })? as u16;
+                            match domain.base {
+                                ColType::Array(_) => ColType::Array(ArrElem::Enum(slot)),
+                                _ => ColType::Enum(slot),
+                            }
+                        }
+                        ColType::Composite(_) | ColType::Array(ArrElem::Composite(_)) => {
+                            let slot = composites
                                 .iter()
                                 .position(|candidate| {
                                     let candidate = candidate.definition_for(txid);
@@ -38883,8 +38887,44 @@ impl Storage {
                                         identity.schema.as_str(),
                                         identity.name.as_str()
                                     )
-                                })? as u16,
-                        ),
+                                })? as u16;
+                            match domain.base {
+                                ColType::Array(_) => ColType::Array(ArrElem::Composite(slot)),
+                                _ => ColType::Composite(slot),
+                            }
+                        }
+                        ColType::Array(ArrElem::Domain { .. }) => {
+                            let element_slot = domains
+                                .iter()
+                                .position(|candidate| {
+                                    let candidate = candidate.definition_for(txid);
+                                    candidate.database == current_database
+                                        && candidate.visible_to(txid)
+                                        && candidate.schema == identity.schema
+                                        && candidate.name == identity.name
+                                })
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_OBJECT,
+                                        "domain array element does not exist"
+                                    )
+                                })?;
+                            if state[element_slot] == 0 {
+                                continue;
+                            }
+                            ColType::Array(
+                                ArrElem::domain(
+                                    element_slot as u16,
+                                    domains[element_slot].definition_for(txid).base,
+                                )
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::DATATYPE_MISMATCH,
+                                        "domain base cannot be an array element"
+                                    )
+                                })?,
+                            )
+                        }
                         _ => {
                             return Err(sql_err!(
                                 sqlstate::PROTOCOL_VIOLATION,
@@ -42278,6 +42318,19 @@ impl Storage {
             return Some(polymorphic.oid());
         }
 
+        if let Some(identity) = user_type {
+            let scalar = self.user_type_identity_oid(identity, false, txid)?;
+            if self
+                .domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                .is_some()
+            {
+                return Some(if matches!(ctype, ColType::Array(ArrElem::Domain { .. })) {
+                    self.user_type_identity_oid(identity, true, txid)?
+                } else {
+                    scalar
+                });
+            }
+        }
         match ctype {
             ColType::Enum(slot) => return Some(oid::enum_oid(slot)),
             ColType::Composite(slot) => return Some(oid::composite_oid(slot)),
@@ -42305,76 +42358,11 @@ impl Storage {
         mut result: RoutineResult,
         txid: u32,
     ) -> Result<RoutineResult, SqlError> {
-        use crate::sql::types::ArrElem;
-
-        let Some(identity) = result.user_type else {
-            return Ok(result);
-        };
-        result.ctype = match result.ctype {
-            ColType::Enum(_) => ColType::Enum(
-                self.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "persisted type \"{}.{}\" does not exist",
-                            identity.schema.as_str(),
-                            identity.name.as_str()
-                        )
-                    })? as u16,
-            ),
-            ColType::Composite(_) => ColType::Composite(
-                self.composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "persisted type \"{}.{}\" does not exist",
-                            identity.schema.as_str(),
-                            identity.name.as_str()
-                        )
-                    })? as u16,
-            ),
-            ColType::Array(ArrElem::Enum(_)) => ColType::Array(ArrElem::Enum(
-                self.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "persisted type \"{}.{}\" does not exist",
-                            identity.schema.as_str(),
-                            identity.name.as_str()
-                        )
-                    })? as u16,
-            )),
-            ColType::Array(ArrElem::Composite(_)) => ColType::Array(ArrElem::Composite(
-                self.composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "persisted type \"{}.{}\" does not exist",
-                            identity.schema.as_str(),
-                            identity.name.as_str()
-                        )
-                    })? as u16,
-            )),
-            ColType::Array(ArrElem::Domain {
-                base_code,
-                base_user_slot,
-                ..
-            }) => ColType::Array(ArrElem::Domain {
-                slot: self
-                    .domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "persisted type \"{}.{}\" does not exist",
-                            identity.schema.as_str(),
-                            identity.name.as_str()
-                        )
-                    })? as u16,
-                base_code,
-                base_user_slot,
-            }),
-            ctype => ctype,
-        };
+        if let Some(identity) = result.user_type
+            && polymorphic_type(result.ctype, result.user_type).is_none()
+        {
+            result.ctype = self.rebind_declared_user_type(result.ctype, identity, txid)?;
+        }
         Ok(result)
     }
 

@@ -253,7 +253,11 @@ CREATE DOMAIN enum_guard_batch AS enum_guard_state[] CHECK (cardinality(VALUE) =
 CREATE TYPE enum_guard_detail AS (state enum_guard_value, note text);
 CREATE TABLE enum_guard_rows (id integer, state enum_guard_value, batch enum_guard_batch, detail enum_guard_detail);
 INSERT INTO enum_guard_rows VALUES (1, 'old', '{old}', ROW('old', 'old')::enum_guard_detail);
-CREATE VIEW enum_guard_view AS SELECT id, 'old'::enum_guard_state AS pinned, 'old' AS note FROM enum_guard_rows WHERE state = 'old';
+SELECT id FROM enum_guard_rows WHERE state = 'old';
+SELECT id FROM enum_guard_rows WHERE state = 'old'::enum_guard_state;
+SELECT id FROM enum_guard_rows WHERE state = 'old'::enum_guard_value;
+SELECT id FROM enum_guard_rows WHERE 'old' = state;
+CREATE VIEW enum_guard_view AS SELECT id, 'old'::enum_guard_state AS pinned, 'old' AS note FROM enum_guard_rows WHERE state::enum_guard_state = 'old'::enum_guard_state;
 INSERT INTO enum_guard_rows(id, state) VALUES (2, 'high');
 INSERT INTO enum_guard_rows(id, detail) VALUES (2, ROW('high', 'old')::enum_guard_detail);
 ALTER TYPE enum_guard_state RENAME VALUE 'old' TO 'new';

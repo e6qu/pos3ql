@@ -52165,8 +52165,19 @@ fn enum_value_identity_saved_indexes_and_views_survive_empty_cache_recovery() {
     }
     assert_eq!(versions(&engine.storage), original_versions);
     assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT id, state::text, (detail).state::text, (detail).note FROM enum_saved_rows            WHERE state = 'new'::enum_saved_state;          SELECT id FROM enum_saved_rows WHERE state > 'middle_29'::enum_saved_state;          SELECT id, pinned::text FROM enum_saved_view", true)),
-        ["1|new|new|old", "2", "1|new"]);
+        "SELECT id, state::text, (detail).state::text, (detail).note FROM enum_saved_rows WHERE state = 'new'::enum_saved_state;
+         SELECT id FROM enum_saved_rows WHERE state > 'middle_29'::enum_saved_state", true)),
+        ["1|new|new|old", "2"]);
+    // SimClient owns heap-backed object fixtures. View spools write these fixtures;
+    // direct table operations above and below retain the runtime allocation guard.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id, pinned::text FROM enum_saved_view",
+            false
+        )),
+        ["1|new"]
+    );
     let duplicate = session.execute(
         &mut engine,
         "INSERT INTO enum_saved_rows VALUES (3, 'new', NULL)",
@@ -52181,8 +52192,16 @@ fn enum_value_identity_saved_indexes_and_views_survive_empty_cache_recovery() {
     let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
     assert_eq!(data_rows(&session.success(&mut cold,
-        "SELECT id, state::text, (detail).state::text, (detail).note FROM enum_saved_rows ORDER BY id;          SELECT id, pinned::text FROM enum_saved_view", true)),
-        ["1|new|new|old", "2|high|high|high", "1|new"]);
+        "SELECT id, state::text, (detail).state::text, (detail).note FROM enum_saved_rows ORDER BY id", true)),
+        ["1|new|new|old", "2|high|high|high"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut cold,
+            "SELECT id, pinned::text FROM enum_saved_view",
+            false
+        )),
+        ["1|new"]
+    );
     assert_eq!(versions(&cold.storage), original_versions);
     let duplicate = session.execute(
         &mut cold,
@@ -52196,7 +52215,7 @@ fn enum_value_identity_saved_indexes_and_views_survive_empty_cache_recovery() {
         data_rows(&session.success(
             &mut cold,
             "SELECT id, pinned::text FROM enum_saved_view",
-            true
+            false
         )),
         ["1|new"]
     );
@@ -52232,13 +52251,15 @@ fn enum_value_identity_hashes_are_selective_and_bind_legacy_labels() {
             0,
         )
         .unwrap() as u16;
-    let hash = |member, sort, label| {
+    let hash = |member: Option<u32>, sort, label| {
         crate::mem::guard::forbid_alloc(|| {
             crate::sql::eval::hash_key_catalog(
                 &engine.storage,
                 &[Datum::Enum {
                     slot,
-                    member,
+                    member: member.map(|ordinal| {
+                        crate::sql::types::EnumMemberId::from_ordinal(ordinal).unwrap()
+                    }),
                     sort,
                     label,
                 }],
@@ -52413,6 +52434,92 @@ fn enum_value_identity_domain_records_arrays_and_checks_survive_type_moves_and_w
     );
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT count(*) FROM enum_guard_rows WHERE state::text = 'new' AND batch[1]::text = 'new'", true)), ["2"]);
+}
+
+#[test]
+fn enum_value_identity_compact_ids_preserve_value_size() {
+    use crate::sql::types::EnumMemberId;
+    assert_eq!(core::mem::size_of::<Option<EnumMemberId>>(), 4);
+    assert_eq!(core::mem::size_of::<Datum<'_>>(), 32);
+    assert_eq!(EnumMemberId::from_ordinal(0).unwrap().ordinal(), 0);
+    assert_eq!(
+        EnumMemberId::from_ordinal(u32::MAX - 1).unwrap().ordinal(),
+        u32::MAX - 1
+    );
+    assert!(EnumMemberId::from_ordinal(u32::MAX).is_none());
+}
+
+#[test]
+fn enum_value_identity_private_markers_and_invalid_bindings_are_checked() {
+    let config = test_config("enum-identity-source-boundaries");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TYPE enum_private_state AS ENUM ('old', 'ready');          CREATE VIEW enum_private_view AS SELECT /*p3e:0:1*/'old'::enum_private_state AS state;          CREATE DOMAIN enum_private_domain AS enum_private_state CHECK (VALUE = /*p3c:1*/'old');          ALTER TYPE enum_private_state RENAME VALUE 'old' TO 'new'", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT state::text FROM enum_private_view; SELECT 'new'::enum_private_domain::text",
+            true
+        )),
+        ["new", "new"]
+    );
+    let arena = Arena::new(&mut budget, "invalid enum bindings", 1 << 20).unwrap();
+    let mut dependencies = engine
+        .storage
+        .empty_stored_query_dependencies(&arena)
+        .unwrap();
+    let path = engine.storage.compute_path("public", "postgres", 0);
+    for (source, state) in [
+        ("pos3ql-bound-query-v1\nSELECT /*p3e:99:0*/'old'", "XX000"),
+        ("pos3ql-bound-query-v99\nSELECT 1", "0A000"),
+    ] {
+        let error = crate::mem::guard::forbid_alloc(|| {
+            crate::sql::enum_values::resolve_query::<4096>(
+                source,
+                &engine.storage,
+                0,
+                path,
+                &mut dependencies,
+                &arena,
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, state);
+    }
+    let slot = engine
+        .storage
+        .enum_slot("public", "enum_private_state", 0)
+        .unwrap() as u16;
+    for (source, state) in [
+        ("pos3ql-enum-check-v1\nVALUE=/*p3c:9999*/'old'", "XX000"),
+        (
+            "pos3ql-enum-check-v1\nVALUE::/*p3t:9999*/enum_private_state IS NULL",
+            "XX000",
+        ),
+        ("pos3ql-enum-check-v99\nVALUE IS NULL", "0A000"),
+    ] {
+        let error = crate::mem::guard::forbid_alloc(|| {
+            crate::sql::enum_values::checks::resolve(
+                source,
+                ColType::Enum(slot),
+                &engine.storage,
+                0,
+                &arena,
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, state);
+    }
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT state::text FROM enum_private_view",
+            true
+        )),
+        ["new"]
+    );
 }
 
 #[test]
@@ -75764,7 +75871,7 @@ fn v13_manifest_upgrades_through_empty_cache_recovery_body() {
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v14\n")),
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v15\n")),
         "the first successful checkpoint must replace v13 with the current format"
     );
     drop(upgraded);

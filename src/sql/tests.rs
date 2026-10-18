@@ -85701,3 +85701,37 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 }
+
+#[test]
+fn enum_value_identity_domain_comparisons_require_base_enum_casts() {
+    let config = test_config("enum-domain-operator-types");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TYPE enum_operator_state AS ENUM ('old', 'ready');
+         CREATE DOMAIN enum_operator_domain AS enum_operator_state;
+         CREATE TABLE enum_operator_rows(state enum_operator_domain);
+         INSERT INTO enum_operator_rows VALUES ('old'), (NULL)",
+        true,
+    );
+    for sql in [
+        "SELECT state = 'old' FROM enum_operator_rows",
+        "SELECT 'old' = state FROM enum_operator_rows",
+        "SELECT state = 'old'::enum_operator_state FROM enum_operator_rows",
+        "SELECT state = 'old'::enum_operator_domain FROM enum_operator_rows",
+        "SELECT NULL::enum_operator_domain = 'old'",
+        "SELECT 'old'::enum_operator_domain = 'old'",
+        "SELECT state < 'ready' FROM enum_operator_rows",
+    ] {
+        let output = session.execute(&mut engine, sql, true);
+        assert!(
+            String::from_utf8_lossy(&output).contains("42883"),
+            "{sql}: {output:?}"
+        );
+    }
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT state::enum_operator_state = 'old' FROM enum_operator_rows WHERE state IS NOT NULL",
+        true)), ["t"]);
+}

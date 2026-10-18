@@ -9452,6 +9452,14 @@ fn decode_op_inner<'a>(
                 pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Absent,
             };
+            if decoded_domain.is_none()
+                && (kind == KIND_CREATE_DOMAIN_BOUND)
+                    != definition.checks().iter().any(|check| {
+                        crate::sql::enum_values::checks::is_bound(check.expression.as_str())
+                    })
+            {
+                return None;
+            }
             if let Some(output) = decoded_domain {
                 *output = definition;
             }
@@ -12811,6 +12819,112 @@ mod tests {
                     ..
                 })
             ));
+        });
+    }
+
+    #[test]
+    fn enum_value_identity_journal_versions_keep_source_and_hash_provenance() {
+        let mut domain = crate::storage::DomainDef::EMPTY;
+        domain.schema = SqlName::parse("public").unwrap();
+        domain.name = SqlName::parse("guarded_state").unwrap();
+        domain.base = ColType::Enum(0);
+        domain.base_user_type = Some(crate::storage::UserTypeName {
+            schema: domain.schema,
+            name: SqlName::parse("state").unwrap(),
+        });
+        domain.n_checks = 1;
+        domain.checks[0].name = SqlName::parse("allowed").unwrap();
+        domain.checks[0].expression =
+            StackStr::from_str("pos3ql-enum-check-v1\nVALUE = /*p3c:0*/'old'");
+        let columns = crate::storage::ViewColumns::from_names(&["state"]).unwrap();
+        let dependencies = crate::storage::StoredQueryDependencies::EMPTY;
+        let statistics = crate::storage::ExtendedStatisticsData::EMPTY;
+        let mut budget = Budget::new(32768);
+        let mut payload = FixedBuf::new(&mut budget, "enum journal versions", 16384).unwrap();
+        let mut reencoded = FixedBuf::new(&mut budget, "enum journal replay", 16384).unwrap();
+        let operations = [
+            (KIND_CREATE_DOMAIN_BOUND, WalOp::CreateDomain(&domain)),
+            (
+                KIND_CREATE_VIEW_BOUND,
+                WalOp::CreateView {
+                    schema: "public",
+                    name: "states",
+                    columns: WalViewColumns::Captured(&columns),
+                    sql: "pos3ql-bound-query-v1\nSELECT /*p3e:0:0*/'old'::state",
+                    path: "public",
+                    security_invoker: false,
+                    security_barrier: 0,
+                    check_option: 0,
+                    dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
+                },
+            ),
+            (
+                KIND_ANALYZE_EXTENDED_STATISTICS_V2,
+                WalOp::AnalyzeExtendedStatistics {
+                    schema: "public",
+                    name: "state_statistics",
+                    statistics: WalExtendedStatisticsData::Captured(&statistics),
+                },
+            ),
+            (
+                KIND_UPSERT_V2,
+                WalOp::Upsert {
+                    schema: "public",
+                    table: "states",
+                    rowid: 7,
+                    row: b"ROWBYTES",
+                    is_update: false,
+                    old_row: None,
+                    command_id: 3,
+                },
+            ),
+        ];
+        crate::mem::guard::forbid_alloc(|| {
+            for (kind, operation) in &operations {
+                payload.clear();
+                assert_eq!(op_kind(operation), *kind);
+                assert!(append_payload(&mut payload, operation));
+                let decoded = decode_op(*kind, payload.readable()).unwrap();
+                assert_eq!(op_kind(&decoded), *kind);
+                reencoded.clear();
+                assert!(append_payload(&mut reencoded, &decoded));
+                assert_eq!(payload.readable(), reencoded.readable());
+                for end in 0..payload.len() {
+                    assert!(
+                        decode_op(*kind, &payload.readable()[..end]).is_none(),
+                        "accepted truncated kind {kind} at {end}"
+                    );
+                }
+                assert!(reencoded.append(&[0]));
+                assert!(decode_op(*kind, reencoded.readable()).is_none());
+                match *kind {
+                    KIND_CREATE_DOMAIN_BOUND => {
+                        assert!(decode_op(KIND_CREATE_DOMAIN, payload.readable()).is_none());
+                        assert_eq!(
+                            decode_domain_payload(payload.readable()).unwrap().checks()[0]
+                                .expression,
+                            domain.checks[0].expression
+                        );
+                    }
+                    KIND_CREATE_VIEW_BOUND => {
+                        assert!(decode_op(KIND_CREATE_VIEW_V2, payload.readable()).is_none());
+                    }
+                    KIND_ANALYZE_EXTENDED_STATISTICS_V2 => {
+                        let old = decode_op(KIND_ANALYZE_EXTENDED_STATISTICS, payload.readable())
+                            .unwrap();
+                        assert_eq!(op_kind(&old), KIND_ANALYZE_EXTENDED_STATISTICS);
+                        let WalOp::AnalyzeExtendedStatistics { statistics, .. } = old else {
+                            panic!("expected old statistics");
+                        };
+                        assert!(statistics.has_legacy_enum_hashes());
+                    }
+                    KIND_UPSERT_V2 => {
+                        let old = decode_op(KIND_UPSERT, payload.readable()).unwrap();
+                        assert_eq!(op_kind(&old), KIND_UPSERT_V2);
+                    }
+                    _ => unreachable!(),
+                }
+            }
         });
     }
 

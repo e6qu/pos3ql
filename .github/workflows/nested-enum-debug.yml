@@ -77,6 +77,12 @@ jobs:
           SELECT NULL::enum_operator_domain = 'old';
           SELECT 'old'::enum_operator_domain = 'old';
           SELECT state < 'ready' FROM enum_operator_rows;
+          SELECT state IN ('old') FROM enum_operator_rows;
+          SELECT state = ANY(ARRAY['old'::enum_operator_state]) FROM enum_operator_rows;
+          SELECT state BETWEEN 'old' AND 'ready' FROM enum_operator_rows;
+          SELECT state IS DISTINCT FROM 'old' FROM enum_operator_rows;
+          SELECT CASE state WHEN 'old' THEN 1 END FROM enum_operator_rows;
+          SELECT state::enum_operator_state = 'old' FROM enum_operator_rows;
           DROP TABLE enum_operator_rows;
           DROP DOMAIN enum_operator_domain;
           DROP TYPE enum_operator_state;

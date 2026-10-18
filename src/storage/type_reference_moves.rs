@@ -46,13 +46,9 @@ impl TypeReferenceMove {
 
     fn matches(self, ctype: ColType, identity: Option<UserTypeName>) -> bool {
         match self.kind {
-            TypeReferenceKind::Domain => {
-                identity == Some(self.prior)
-                    || matches!(ctype, ColType::Array(ArrElem::Domain { slot, .. })
-                        if usize::from(slot) == self.slot)
-            }
+            TypeReferenceKind::Domain => identity == Some(self.prior),
             TypeReferenceKind::Enum => {
-                identity.is_some()
+                identity == Some(self.prior)
                     && matches!(ctype, ColType::Enum(slot) | ColType::Array(ArrElem::Enum(slot))
                         if usize::from(slot) == self.slot)
             }

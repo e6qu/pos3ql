@@ -69477,12 +69477,17 @@ fn decode_composite_stored_field<'a>(
     match ctype {
         ColType::Enum(slot) => {
             let member = if encoding == CompositeEncoding::Members {
-                Some(text.parse::<u32>().map_err(|_| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "invalid stored enum member identity"
-                    )
-                })?)
+                Some(
+                    text.parse::<u32>()
+                        .ok()
+                        .and_then(crate::sql::types::EnumMemberId::from_ordinal)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "invalid stored enum member identity"
+                            )
+                        })?,
+                )
             } else {
                 None
             };

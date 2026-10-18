@@ -2033,6 +2033,38 @@ struct BinaryExpression<'expression, 'a> {
     search_catalog: bool,
 }
 
+fn validate_enum_operator_types<'a>(
+    operator: BinaryOp,
+    left: &Expr<'a>,
+    right: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let Some(catalog) = hooks.catalog else {
+        return Ok(());
+    };
+    let left_type = expression_type_identity(left, row, hooks)?.record_field_oid();
+    let right_type = expression_type_identity(right, row, hooks)?.record_field_oid();
+    // PostgreSQL's anyenum operators require an enum declaration. A domain's
+    // enum representation is insufficient, even when both operands have it.
+    if [left_type, right_type]
+        .iter()
+        .any(|oid| matches!(catalog.domain_base_type(*oid), Some(ColType::Enum(_))))
+    {
+        let left_name = catalog.type_name(left_type, arena)?.unwrap_or("unknown");
+        let right_name = catalog.type_name(right_type, arena)?.unwrap_or("unknown");
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} {} {}",
+            left_name,
+            operator.operator_name().unwrap_or("?"),
+            right_name
+        ));
+    }
+    Ok(())
+}
+
 fn eval_binary_expression<'a>(
     expression: BinaryExpression<'_, 'a>,
     arena: &'a Arena,
@@ -2078,6 +2110,9 @@ fn eval_binary_expression<'a>(
         if let Some(value) = catalog.call_operator(name, l, r, left_oid, right_oid, arena)? {
             return Ok(value);
         }
+    }
+    if comparison_collation.is_some() {
+        validate_enum_operator_types(operator, left, right, row, hooks, arena)?;
     }
     if operator == BinaryOp::Concat
         && let Some(value) = array_null_concat(l, r, left, right, row, arena)?

@@ -468,6 +468,33 @@ impl RowHeap {
     }
 }
 
+#[derive(Default)]
+pub(super) struct RelocationValidation {
+    prior: Option<RowLoc>,
+}
+
+impl RelocationValidation {
+    fn validate(&mut self, state: &RowHeapState, location: RowLoc) -> Result<(), SqlError> {
+        state.validate(location)?;
+        if location.len == 0 {
+            return Ok(());
+        }
+        if let Some(previous) = self.prior {
+            if previous == location {
+                return Ok(());
+            }
+            if (location.offset as usize) < previous.offset as usize + previous.len as usize {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "heap compaction contains overlapping row locations"
+                ));
+            }
+        }
+        self.prior = Some(location);
+        Ok(())
+    }
+}
+
 /// Only the inactive, unretained buffer is mutable during a private copy.
 pub(super) struct HeapCopy {
     publication: Arc<RwLock<HeapPublication>>,
@@ -501,15 +528,13 @@ impl HeapCopy {
             .load(Ordering::Acquire)
     }
 
-    pub(super) fn validate_locations(
+    pub(super) fn validate_location(
         &self,
-        locations: impl Iterator<Item = RowLoc>,
+        validation: &mut RelocationValidation,
+        location: RowLoc,
     ) -> Result<(), SqlError> {
-        self.source
-            .state
-            .read()
-            .expect("row heap lock poisoned")
-            .validate_relocation(locations)
+        let state = self.source.state.read().expect("row heap lock poisoned");
+        validation.validate(&state, location)
     }
 
     pub(super) fn copy_bytes(
@@ -751,24 +776,9 @@ impl RowHeapState {
         &self,
         locations: impl Iterator<Item = RowLoc>,
     ) -> Result<(), SqlError> {
-        let mut prior: Option<RowLoc> = None;
+        let mut validation = RelocationValidation::default();
         for location in locations {
-            self.validate(location)?;
-            if location.len == 0 {
-                continue;
-            }
-            if let Some(previous) = prior {
-                if previous == location {
-                    continue;
-                }
-                if (location.offset as usize) < previous.offset as usize + previous.len as usize {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "heap compaction contains overlapping row locations"
-                    ));
-                }
-            }
-            prior = Some(location);
+            validation.validate(self, location)?;
         }
         Ok(())
     }
@@ -869,7 +879,7 @@ mod tests {
             heap.append_bytes(b"dead").unwrap();
             let old = heap.append_image(b"keep").unwrap();
             let mut copy = heap.begin_copy().unwrap();
-            copy.validate_locations(core::iter::once(old.location()))
+            copy.validate_location(&mut RelocationValidation::default(), old.location())
                 .unwrap();
             copy.copy_bytes(old.location(), 0, 0, 4).unwrap();
             let late = heap.append_image(b"next").unwrap();

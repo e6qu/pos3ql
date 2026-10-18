@@ -34,32 +34,19 @@ clear errors. Memory reservations must not grow after startup to rescue a query.
 make queries execute in parallel. Existing recovery tools and tests on one
 machine do not establish production availability or speed.
 
-## What recent work taught us
+## What the remaining work must preserve
 
-- A function used by a cast can still change sequence state. Planning must
-  respect its declared volatility, and a suspended function must not advance
-  the same sequence twice when execution resumes.
-- Protecting a reader's selected data and releasing it at the right time is
-  necessary before allowing concurrent writes. A running statement, a
-  transaction, and a streaming upload can keep data alive for different periods.
-- Comparing exports with PostgreSQL exposed a wrong assumption about child
-  tables. A table-form export reads only its named relation; the query form
-  selects a complete partition or inheritance tree.
-- A report and a uniqueness check can need different views of the same rows.
-  Keeping a report stable must not let an index miss a later committed duplicate. A new
-  table CHECK can inspect current rows while a STABLE SQL function inside that
-  check still sees the transaction's earlier data.
-- A safe storage layout needs to keep older versions until every reader and
-  backup has finished with them. Copying only today's logical rows is not
-  sufficient when an older transaction still needs historical object data.
-- A command can pass its SQL test because a second cleanup step repairs an
-  incomplete storage rollback. Before storage work runs independently, its
-  own rollback must restore everything it changed.
-- Testing multiple object-store implementations checks portability. Comparing
-  them on a shared machine does not establish their production speed or cost.
+- A paused operation keeps its selected data and its progress. Resuming must
+  preserve earlier validation and run each data-changing function only once.
+- A report may read older orders while a uniqueness or constraint check needs
+  current rows. Keep the correct view for each operation.
+- Readers and backups may still need older object versions. Each rollback and
+  publication must leave valid state before independent storage work resumes.
+- MinIO and SeaweedFS tests check portability. Performance claims need repeated
+  measurements on fixed hardware with independently operated object storage.
 
-These conclusions shape the sequence below. The [history index](docs/history/README.md)
-and linked PRs preserve the investigations; this file keeps only current work.
+The [history index](docs/history/README.md) and linked PRs preserve completed
+investigations; current behavior belongs in its owning technical guide.
 
 ## Remaining sequence
 
@@ -69,45 +56,30 @@ and linked PRs preserve the investigations; this file keeps only current work.
 appropriate to its transaction. Dropping or rebuilding a table must not leave
 an already running read following reused memory or deleted objects.
 
-Readers retain the rows, definitions, trigger inputs and index caches they need
-through changes and replacement. Reservations and history limits are fixed at
-startup. Table creation, uncommitted table edits, name lookup and changes to type
-references use ownership for each selected table. Waiting for one definition
-keeps shared allocators and catalogs available for unrelated storage work.
-Domain, enum and composite creation and moves share one name-reservation check,
-including transaction waits and journal replay. This does not yet coordinate
-publication of a complete type change and all its references.
-Enum values keep member identities separate from labels and sort positions,
-including nested records, arrays, defaults, domain checks and captured view literals.
-Changing a label no longer rewrites table rows or waits for an older read transaction.
-Type binding retains a domain's own identity separately from its base value;
-table, record and routine recovery share the same declaration resolver.
-Selected enum definitions retain their fixed label buffers through changes and recovery.
-Enum label edits use shared storage access for staging, publication and rollback;
-undo cannot erase a later edit or a replacement type. Complete type-name changes
-and their references still require coordinated publication before workers can run.
-SQL writes and replay retain row bytes from append through publication and
-retries. Table rewrites keep transformed images in the fixed statement arena,
-release owners after errors, and reject replaced heap buffers before publication.
-Heap relocation captures and publishes under row-version ownership while copying
-privately in bounded turns; unrelated storage reads and writes can progress
-during copying. Automatic checkpoint cleanup resumes copying between server
-turns, including while an unrelated object download waits. SQL reads and writes
-can execute between cleanup turns when their existing admission rules allow it. Explicit CHECKPOINT
-and the existing critical memory-pressure path still wait for cleanup.
-Eviction and history release keep later row versions in memory until the
-installed object roots cover them.
-Complete type commits and the remaining maintenance
-paths still require publication coordination. The
-[implementation guide](docs/implemented-baseline.md) owns completed contracts,
-user examples and exact capacity errors.
+Readers retain selected rows, definitions, trigger inputs and index caches
+through changes and replacement, within startup reservations. Per-table
+ownership covers creation, private edits, name lookup and type references.
+Enum values retain member identities through label changes, including inside
+records, arrays, defaults and views. Label edits use shared storage access;
+old undo records cannot erase later edits or replacement types.
+
+Row writes, replay and table rewrites retain the bytes they need. Automatic
+local cleanup sorts, validates, assigns destinations and copies rows in bounded
+turns, including while an unrelated object download waits. Ordinary queries can
+progress between turns. Capture and final remapping still hold shared version
+ownership for their complete operation; explicit CHECKPOINT and critical memory
+pressure still wait for cleanup.
+
+Complete type-name changes and remaining maintenance still need publication
+coordination. The [implementation guide](docs/implemented-baseline.md) owns
+completed contracts, user examples and exact capacity errors.
 
 Still to do:
 
 - Finish shared-state protection for engine-wide publication and remaining
   table rewrites and maintenance paths.
 - Move the remaining maintenance work off the statement path, including heap
-  capture, sorting, remapping, critical memory pressure, and fair retries when
+  capture, remapping, critical memory pressure, and fair retries when
   both buffers are retained.
   Complete rewrites must preserve historical object versions needed by readers.
 - Verify release after errors, rollback, and transaction end, and prevent

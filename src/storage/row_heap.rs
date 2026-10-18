@@ -426,8 +426,19 @@ impl RowHeap {
             .map(|state| state.get_mut().expect("row heap lock poisoned"))
     }
 
+    /// Appending may acquire the locks while initialized bytes remain retained.
     #[cfg(test)]
-    pub(super) fn test_write(
+    pub(super) fn test_append_locks_available(&self) -> bool {
+        self.publication.try_read().is_ok_and(|publication| {
+            self.buffers[usize::from(publication.second_active)]
+                .try_write()
+                .is_ok()
+        })
+    }
+
+    /// Exclusive buffer access requires every retained byte owner to be released.
+    #[cfg(test)]
+    pub(super) fn test_exclusive_write(
         &self,
     ) -> std::sync::TryLockResult<std::sync::RwLockWriteGuard<'_, RowHeapState>> {
         let publication = match self.publication.try_read() {
@@ -948,7 +959,7 @@ mod tests {
                     .relocation_frontier
                     .is_none()
             );
-            assert!(heap.test_write().is_ok());
+            assert!(heap.test_exclusive_write().is_ok());
         });
     }
 
@@ -1138,15 +1149,15 @@ mod tests {
         bytes.copy_from_slice(b"abcd");
         crate::mem::guard::forbid_alloc(|| {
             let read = heap.get(location).unwrap();
-            assert!(heap.test_write().is_err());
+            assert!(heap.test_exclusive_write().is_err());
             assert_eq!(&*read, b"abcd");
             assert_eq!(read.other(location).unwrap(), b"abcd");
             assert!(read.other(RowLoc::test(3, 2)).is_err());
             drop(read);
-            assert!(heap.test_write().is_ok());
+            assert!(heap.test_exclusive_write().is_ok());
             assert!(heap.get(RowLoc::test(u32::MAX, u32::MAX)).is_err());
             assert!(heap.get(RowLoc::test(4, 1)).is_err());
-            assert!(heap.test_write().is_ok());
+            assert!(heap.test_exclusive_write().is_ok());
             assert_eq!(heap.used(), 4);
             assert_eq!(heap.capacity(), 8);
         });
@@ -1258,7 +1269,7 @@ mod tests {
                 sqlstate::SERIALIZATION_FAILURE
             );
             drop(read);
-            assert!(heap.test_write().is_ok());
+            assert!(heap.test_exclusive_write().is_ok());
         });
     }
 
@@ -1313,7 +1324,7 @@ mod tests {
             start.wait();
             crate::mem::guard::forbid_alloc(|| {
                 let mut state = loop {
-                    if let Ok(state) = heap.test_write() {
+                    if let Ok(state) = heap.test_exclusive_write() {
                         break state;
                     }
                     std::thread::yield_now();
@@ -1327,7 +1338,7 @@ mod tests {
             });
         });
         assert!(heap.get(old).is_err());
-        assert!(heap.test_write().is_ok());
+        assert!(heap.test_exclusive_write().is_ok());
     }
 
     #[test]
@@ -1356,7 +1367,7 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 for epoch in 1u64..=500 {
                     loop {
-                        if let Ok(mut writer) = heap.test_write() {
+                        if let Ok(mut writer) = heap.test_exclusive_write() {
                             writer.buffer.get_mut()[..8].copy_from_slice(&epoch.to_le_bytes());
                             break;
                         }

@@ -772,7 +772,11 @@ mod tests {
                 HeapRelocationPreparation::Sorting(_)
             ));
             assert!(storage.row_versions.test_write().is_ok());
-            assert!(storage.heap.test_write().is_ok());
+            assert!(matches!(
+                storage.heap.test_exclusive_write(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            assert!(storage.heap.test_append_locks_available());
         });
         let undo = std::thread::scope(|scope| {
             let storage = &storage;
@@ -1227,7 +1231,7 @@ mod tests {
             );
             drop(job);
             assert_eq!(location(&storage, table, 1, 0), original);
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             assert!(storage.row_versions.test_write().is_ok());
             let image = storage
                 .heap

@@ -52410,7 +52410,7 @@ mod tests {
             assert_eq!(row.committed, Some(RowHome::Heap(location)));
             drop(row);
             assert!(storage.row_versions.test_write().is_ok());
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
         });
     }
 
@@ -52439,11 +52439,11 @@ mod tests {
             assert!(storage.row_versions.test_write().is_ok());
             assert!(storage.tables[table].rows.test_write().is_ok());
             assert!(
-                storage.heap.test_write().is_err(),
+                storage.heap.test_exclusive_write().is_err(),
                 "visible heap locations retain byte ownership"
             );
             assert_eq!(storage.row_bytes(table, 1, image, &arena).unwrap(), b"row!");
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             let image = storage
                 .visible_row_home_at(table, 1, row, 8, SNAPSHOT_ALL, 7)
@@ -52456,7 +52456,7 @@ mod tests {
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             let image = storage
                 .visible_row_home_at(table, 1, row, 8, SNAPSHOT_ALL, 7)
@@ -52465,7 +52465,7 @@ mod tests {
             let error = storage
                 .with_row_bytes(table, 1, image, |bytes| -> Result<(), SqlError> {
                     assert_eq!(bytes, b"row!");
-                    assert!(storage.heap.test_write().is_err());
+                    assert!(storage.heap.test_exclusive_write().is_err());
                     Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "callback exhausted"
@@ -52473,7 +52473,7 @@ mod tests {
                 })
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
         });
     }
 
@@ -52656,7 +52656,7 @@ mod tests {
             );
             storage.restore_pending(table, 1, 7, first);
             assert!(storage.resident_row_state(table, 1).unwrap().is_none());
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             assert!(storage.row_versions.test_write().is_ok());
         });
     }
@@ -52699,7 +52699,7 @@ mod tests {
                 .unwrap();
             let snapshot = image.snapshot();
             drop(image);
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             let (later, bytes) = storage.heap.append(4).unwrap();
             bytes.copy_from_slice(b"new!");
             push_pending_version(
@@ -52726,7 +52726,7 @@ mod tests {
                 storage.row_bytes(table, 1, snapshot, &arena).unwrap(),
                 b"old!"
             );
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             let row = storage.resident_row_state(table, 1).unwrap().unwrap();
             let current = storage
                 .visible_row_home_at(table, 1, row, 7, SNAPSHOT_ALL, 7)
@@ -52749,7 +52749,7 @@ mod tests {
                 sqlstate::SERIALIZATION_FAILURE
             );
             assert!(storage.row_versions.test_write().is_ok());
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
         });
     }
 
@@ -60904,7 +60904,7 @@ mod tests {
                         _ => sqlstate::INTERNAL_ERROR,
                     }
                 );
-                assert!(storage.heap.test_write().is_ok());
+                assert!(storage.heap.test_exclusive_write().is_ok());
                 storage.compact_heap(&mut scratch).unwrap();
             }
         });
@@ -60928,16 +60928,16 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             storage
                 .with_row_bytes(0, 1, RowHome::Heap(location), |bytes| {
-                    assert!(storage.heap.test_write().is_err());
+                    assert!(storage.heap.test_exclusive_write().is_err());
                     assert_eq!(bytes, b"keep");
                     Ok(())
                 })
                 .unwrap();
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             let retained = storage
                 .row_bytes(0, 1, RowHome::Heap(location), &arena)
                 .unwrap();
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             let error = storage
                 .row_bytes(0, 1, RowHome::Heap(location), &arena)
                 .unwrap_err();
@@ -60946,7 +60946,7 @@ mod tests {
                 error.message.as_str(),
                 "heap row images exceed the statement arena; raise work_arena_bytes"
             );
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             storage.compact_heap(&mut scratch).unwrap();
             assert_eq!(
                 storage.tables[0]
@@ -61117,7 +61117,7 @@ mod tests {
                         .unwrap();
                     assert_eq!(storage.row_bytes(0, 1, home, &arena).unwrap(), expected);
                 }
-                assert!(storage.heap.test_write().is_ok());
+                assert!(storage.heap.test_exclusive_write().is_ok());
                 assert!(storage.row_versions.test_write().is_ok());
                 // A second relocation changes the generation even when offsets
                 // are unchanged. Historical and pending images remain readable.
@@ -61200,7 +61200,7 @@ mod tests {
                 b"keep"
             );
             assert_eq!(&*storage.heap.get(replacement).unwrap(), b"next");
-            assert!(storage.heap.test_write().is_ok());
+            assert!(storage.heap.test_exclusive_write().is_ok());
             assert!(storage.row_versions.test_write().is_ok());
         });
     }

@@ -30933,7 +30933,7 @@ impl Storage {
         let mut widths = [0u64; MAX_COLUMNS];
         let mut non_nulls = [0u64; MAX_COLUMNS];
         let mut registers = [[0u8; REGISTERS]; MAX_COLUMNS];
-        let mut observe = |values: &[Datum], encoded_len: usize| {
+        let mut observe = |values: &[Datum], encoded_len: usize| -> Result<(), SqlError> {
             rows = rows.saturating_add(1);
             row_bytes = row_bytes.saturating_add(encoded_len as u64);
             for column in 0..n_columns {
@@ -30957,6 +30957,7 @@ impl Storage {
                     hash_key_catalog(self, values, &index)?,
                 );
             }
+            Ok(())
         };
         // Overlay rows carry every pending or newer committed image. Spilled
         // rows absent from that overlay stream below with their payload from
@@ -30967,7 +30968,7 @@ impl Storage {
             self.with_row_bytes(table_slot, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-                observe(&values[..n_columns], bytes.len());
+                observe(&values[..n_columns], bytes.len())?;
                 Ok(())
             })?;
             Ok(core::ops::ControlFlow::Continue(()))
@@ -30979,10 +30980,10 @@ impl Storage {
                     SpilledRowRepresentation::Encoded(bytes) => {
                         let mut values = [Datum::Null; MAX_COLUMNS];
                         rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-                        observe(&values[..n_columns], bytes.len());
+                        observe(&values[..n_columns], bytes.len())?;
                     }
                     SpilledRowRepresentation::Values(values) => {
-                        observe(values, rowenc::encoded_len(values));
+                        observe(values, rowenc::encoded_len(values))?;
                     }
                 }
             }
@@ -35245,16 +35246,6 @@ impl Storage {
         let rule = &catalog.rules[usize::from(catalog.views[slot].return_rule)];
         StackStr::from_str(
             rule.definition
-                .action_sql()
-                .next()
-                .expect("every view has one _RETURN action"),
-        )
-    }
-
-    pub(crate) fn view_sql_for(&self, view: &ViewDef) -> StackStr<VIEW_SQL_MAX> {
-        let definition = self.rule(usize::from(view.return_rule)).definition;
-        StackStr::from_str(
-            definition
                 .action_sql()
                 .next()
                 .expect("every view has one _RETURN action"),

@@ -15,8 +15,8 @@ pub(crate) fn resolve<'a>(
     let Datum::Enum {
         slot,
         member,
-        sort,
         label,
+        ..
     } = value
     else {
         return Ok(value);
@@ -56,7 +56,6 @@ pub(crate) fn resolve<'a>(
             )
         })?
     };
-    let _ = sort;
     Ok(Datum::Enum {
         slot,
         member: Some(index as u32),

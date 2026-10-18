@@ -62,7 +62,7 @@ impl ParameterInference<'_> {
                     return;
                 }
                 for (index, argument) in arguments.iter().copied().enumerate() {
-                    actual[index] = exec::infer_type_catalog(argument, None, &self.storage, txid)
+                    actual[index] = exec::infer_type_catalog(argument, None, self.storage, txid)
                         .map_or(types::oid::UNKNOWN, |inferred| inferred.0);
                 }
                 let qualified = match name.schema {
@@ -130,23 +130,24 @@ impl ParameterInference<'_> {
         }
 
         let scope = match select.from.as_ref() {
-            Some(from) => match query::QueryScope::resolve_schema(&self.storage, from, txid, arena)
-            {
-                Ok(scope) => Some(scope),
-                Err(_) => return,
-            },
+            Some(from) => {
+                match query::QueryScope::resolve_schema(self.storage, from, txid, arena) {
+                    Ok(scope) => Some(scope),
+                    Err(_) => return,
+                }
+            }
             None => None,
         };
         let resolver = scope.as_ref().map(|scope| query::CatalogScopeCols {
             scope,
             outer_scope: None,
-            storage: &self.storage,
+            storage: self.storage,
             txid,
         });
         let infer = |expression: &Expr<'a>| {
             let inferred = match &resolver {
                 Some(resolver) => exec::infer_type_res(expression, resolver),
-                None => exec::infer_type_catalog(expression, None, &self.storage, txid),
+                None => exec::infer_type_catalog(expression, None, self.storage, txid),
             }
             .ok()?
             .0;
@@ -258,7 +259,7 @@ impl ParameterInference<'_> {
             } => {
                 let type_oid = types::ColType::from_sql_name(type_name)
                     .map(types::ColType::oid)
-                    .or_else(|| catalog::user_type_oid(&self.storage, txid, type_name));
+                    .or_else(|| catalog::user_type_oid(self.storage, txid, type_name));
                 if let Some(type_oid) = type_oid {
                     assign(operand, type_oid, oids);
                 }

@@ -1,0 +1,66 @@
+name: Nested enum verification
+
+on:
+  push:
+    branches: [fix-nested-enum-values]
+
+concurrency:
+  group: nested-enum-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - run: python3 tools/test_command.py cargo test --locked --lib enum_nested_values_ -- --test-threads=1
+
+  postgresql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clean -p pos3ql
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: target/external-venv
+      - name: Compare nested enum mutations with PostgreSQL 18
+        env:
+          POS3QL_VENV: ${{ github.workspace }}/target/external-venv
+          POS3QL_REFERENCE_PG_HOST: 127.0.0.1
+          POS3QL_REFERENCE_PG_PORT: "5432"
+          POS3QL_REFERENCE_PSQL: psql
+          POS3QL_DIFF_CORPUS_SHARD: "174-of-209"
+          POS3QL_DIFF_AUXILIARY: none
+        run: bash tests/external/differential.sh

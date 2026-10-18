@@ -128,6 +128,27 @@ DROP TABLE rewrite_scalar;
 DROP TABLE rewrite_array;
 DROP TYPE rewrite_state;
 
+-- Enum labels inside composites and their arrays change with the type too;
+-- ordinary text with the same spelling stays unchanged.
+CREATE TYPE enum_nested_state AS ENUM ('old', 'ready');
+CREATE TYPE enum_nested_detail AS (state enum_nested_state, note text);
+CREATE TABLE enum_nested_orders (
+  id integer, detail enum_nested_detail, batch enum_nested_detail[]
+);
+INSERT INTO enum_nested_orders VALUES
+  (1, ROW('old', 'old')::enum_nested_detail,
+   ARRAY[ROW('old', 'old')::enum_nested_detail]);
+BEGIN;
+ALTER TYPE enum_nested_state RENAME VALUE 'old' TO 'new';
+SELECT (detail).state, (batch[1]).state, (detail).note FROM enum_nested_orders;
+ROLLBACK;
+SELECT (detail).state, (batch[1]).state, (detail).note FROM enum_nested_orders;
+ALTER TYPE enum_nested_state RENAME VALUE 'old' TO 'new';
+SELECT (detail).state, (batch[1]).state, (detail).note FROM enum_nested_orders;
+DROP TABLE enum_nested_orders;
+DROP TYPE enum_nested_detail;
+DROP TYPE enum_nested_state;
+
 -- The type namespace is shared by enums, domains, and named composites.
 CREATE TYPE enum_composite_name AS (id integer);
 ALTER TYPE feeling RENAME TO enum_composite_name;

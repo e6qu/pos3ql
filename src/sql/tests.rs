@@ -51829,6 +51829,32 @@ fn enums_order_and_enforce() {
 }
 
 #[test]
+fn enum_nested_values_rename_updates_composite_fields_and_arrays() {
+    let config = test_config("enum-nested-values");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TYPE enum_nested_state AS ENUM ('old', 'ready'); \
+         CREATE TYPE enum_nested_detail AS (state enum_nested_state, note text); \
+         CREATE TABLE enum_nested_orders (id integer, detail enum_nested_detail, batch enum_nested_detail[]); \
+         INSERT INTO enum_nested_orders VALUES \
+           (1, ROW('old', 'old')::enum_nested_detail, ARRAY[ROW('old', 'old')::enum_nested_detail]); \
+         ALTER TYPE enum_nested_state RENAME VALUE 'old' TO 'new'",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT (detail).state, (batch[1]).state, (detail).note FROM enum_nested_orders",
+            true,
+        )),
+        ["new|new|old"]
+    );
+}
+
+#[test]
 fn owned_enum_rewrite_sources_preserve_spilled_pending_and_array_rows_through_recovery() {
     let mut config = test_config("owned-enum-rewrite");
     config.object_store_on = true;

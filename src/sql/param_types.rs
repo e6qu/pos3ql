@@ -9,13 +9,41 @@ pub(crate) fn infer<'a>(
     arena: &'a Arena,
     oids: &mut [i32],
 ) {
-    let inference = ParameterInference { storage };
-    inference.infer_stmt_params(statement, txid, oids);
-    inference.infer_resolved_stmt_params(statement, txid, arena, oids);
+    infer_declared(storage, statement, txid, oids, None);
+    infer_resolved(storage, statement, txid, arena, oids);
+}
+
+pub(crate) fn infer_declared(
+    storage: &Storage,
+    statement: &Stmt<'_>,
+    txid: u32,
+    oids: &mut [i32],
+    captured_types: Option<&dyn Fn(&str) -> Option<i32>>,
+) {
+    ParameterInference {
+        storage,
+        captured_types,
+    }
+    .infer_stmt_params(statement, txid, oids);
+}
+
+pub(crate) fn infer_resolved<'a>(
+    storage: &'a Storage,
+    statement: &'a Stmt<'a>,
+    txid: u32,
+    arena: &'a Arena,
+    oids: &mut [i32],
+) {
+    ParameterInference {
+        storage,
+        captured_types: None,
+    }
+    .infer_resolved_stmt_params(statement, txid, arena, oids);
 }
 
 struct ParameterInference<'a> {
     storage: &'a Storage,
+    captured_types: Option<&'a dyn Fn(&str) -> Option<i32>>,
 }
 
 impl ParameterInference<'_> {
@@ -257,9 +285,7 @@ impl ParameterInference<'_> {
             Expr::Cast {
                 operand, type_name, ..
             } => {
-                let type_oid = types::ColType::from_sql_name(type_name)
-                    .map(types::ColType::oid)
-                    .or_else(|| catalog::user_type_oid(self.storage, txid, type_name));
+                let type_oid = self.cast_type_oid(type_name, txid);
                 if let Some(type_oid) = type_oid {
                     assign(operand, type_oid, oids);
                 }
@@ -416,7 +442,7 @@ impl ParameterInference<'_> {
                     self.infer_where_params(&u.table, w, txid, oids);
                 }
                 if let Some(from) = u.from {
-                    Self::infer_from_source_params(from, oids);
+                    self.infer_from_source_params(from, txid, oids);
                 }
             }
             Stmt::Delete(d) => {
@@ -424,7 +450,7 @@ impl ParameterInference<'_> {
                     self.infer_where_params(&d.table, w, txid, oids);
                 }
                 if let Some(using) = d.using {
-                    Self::infer_from_source_params(using, oids);
+                    self.infer_from_source_params(using, txid, oids);
                 }
             }
             Stmt::Merge(merge) => {
@@ -432,7 +458,8 @@ impl ParameterInference<'_> {
             }
             Stmt::Select(s) => {
                 self.infer_select_source_params(s, txid, oids);
-                if let (Some(from), Some(w)) = (&s.from, s.where_clause)
+                if self.captured_types.is_none()
+                    && let (Some(from), Some(w)) = (&s.from, s.where_clause)
                     && from.joins.is_empty()
                     && from.base.subquery.is_none()
                 {
@@ -442,21 +469,13 @@ impl ParameterInference<'_> {
                     };
                     self.infer_where_params(&table, w, txid, oids);
                 }
-                // A parameter explicitly cast in the select list — `$n::type`
-                // — takes that type, as PostgreSQL resolves an otherwise-unknown
-                // parameter from the cast wrapping it.
-                for item in s.items {
-                    if let ast::SelectItem::Expr { expression, .. } = item {
-                        Self::infer_cast_param(expression, oids);
-                    }
-                }
             }
             Stmt::SetQuery(query) => {
                 self.infer_set_tree_source_params(query.body, txid, oids);
                 for cte in query.with {
                     match cte.dml {
                         Some(dml) => self.infer_stmt_params(dml, txid, oids),
-                        None => self.infer_select_source_params(cte.query, txid, oids),
+                        None => self.infer_stmt_params(&Stmt::Select(*cte.query), txid, oids),
                     }
                 }
             }
@@ -465,8 +484,27 @@ impl ParameterInference<'_> {
     }
 
     fn infer_select_source_params(&self, select: &ast::Select<'_>, txid: u32, oids: &mut [i32]) {
+        // Explicit casts type their own input independently of FROM schemas.
+        for item in select.items {
+            if let ast::SelectItem::Expr { expression, .. }
+            | ast::SelectItem::RecordStar(expression) = item
+            {
+                self.infer_explicit_cast_params(expression, txid, oids);
+            }
+        }
+        for expression in select
+            .where_clause
+            .into_iter()
+            .chain(select.group_by.iter().copied())
+            .chain(select.having)
+            .chain(select.order_by.iter().map(|order| order.expression))
+            .chain(select.limit)
+            .chain(select.offset)
+        {
+            self.infer_explicit_cast_params(expression, txid, oids);
+        }
         if let Some(from) = select.from {
-            Self::infer_from_source_params(&from, oids);
+            self.infer_from_source_params(&from, txid, oids);
         }
         if let Some(tree) = select.set_body {
             self.infer_set_tree_source_params(tree, txid, oids);
@@ -474,15 +512,23 @@ impl ParameterInference<'_> {
         for cte in select.with {
             match cte.dml {
                 Some(dml) => self.infer_stmt_params(dml, txid, oids),
-                None => self.infer_select_source_params(cte.query, txid, oids),
+                None => self.infer_stmt_params(&Stmt::Select(*cte.query), txid, oids),
             }
         }
     }
 
-    fn infer_from_source_params(from: &ast::FromClause<'_>, oids: &mut [i32]) {
-        Self::infer_table_sample_params(&from.base, oids);
-        for join in from.joins {
-            Self::infer_table_sample_params(&join.table, oids);
+    fn infer_from_source_params(&self, from: &ast::FromClause<'_>, txid: u32, oids: &mut [i32]) {
+        for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+            Self::infer_table_sample_params(table, oids);
+            if let Some(select) = table.subquery {
+                self.infer_stmt_params(&Stmt::Select(*select), txid, oids);
+            }
+            for expression in table.func_args.unwrap_or(&[]) {
+                self.infer_explicit_cast_params(expression, txid, oids);
+            }
+        }
+        for expression in from.joins.iter().filter_map(|join| join.on) {
+            self.infer_explicit_cast_params(expression, txid, oids);
         }
     }
 
@@ -512,24 +558,36 @@ impl ParameterInference<'_> {
         }
     }
 
-    /// Types a parameter written as `$n::type` (possibly through further casts)
-    /// by the innermost cast wrapping it, as PostgreSQL resolves an otherwise-
-    /// unknown parameter from the cast.
-    fn infer_cast_param(expr: &Expr, oids: &mut [i32]) {
+    fn cast_type_oid(&self, name: &str, txid: u32) -> Option<i32> {
+        self.captured_types
+            .and_then(|resolve| resolve(name))
+            .or_else(|| types::ColType::from_sql_name(name).map(types::ColType::oid))
+            .or_else(|| catalog::user_type_oid(self.storage, txid, name))
+    }
+
+    /// The innermost explicit cast selects a parameter's input type, including
+    /// user-defined types whose declarations are still uncommitted.
+    fn infer_explicit_cast_params(&self, expression: &Expr, txid: u32, oids: &mut [i32]) {
         if let Expr::Cast {
             operand, type_name, ..
-        } = expr
+        } = expression
+            && let Expr::Param(index) = operand
+            && *index >= 1
+            && (*index as usize) <= oids.len()
+            && let Some(type_oid) = self.cast_type_oid(type_name, txid)
         {
-            if let Expr::Param(n) = operand {
-                if *n >= 1
-                    && (*n as usize) <= oids.len()
-                    && let Some(ct) = types::ColType::from_sql_name(type_name)
-                {
-                    oids[*n as usize - 1] = ct.oid();
-                }
-            } else {
-                Self::infer_cast_param(operand, oids);
-            }
+            oids[*index as usize - 1] = type_oid;
+        }
+        query::walk_children(expression, &mut |child| {
+            self.infer_explicit_cast_params(child, txid, oids);
+        });
+        if let Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::InSubquery { select, .. }
+        | Expr::QuantifiedSubquery { select, .. } = expression
+        {
+            self.infer_stmt_params(&Stmt::Select(**select), txid, oids);
         }
     }
 

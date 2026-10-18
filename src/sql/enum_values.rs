@@ -210,11 +210,19 @@ pub(crate) fn bind_query<const N: usize>(
         .alloc_str(source)
         .map_err(|_| super::query::arena_full_pub())?;
     let select = super::parser::parse_query_with_string_parameters(query_source, arena, positions)?;
-    let select =
-        super::query::expand_stored_query(select, storage, txid, path, dependencies.view(), arena)?;
     let oids = arena
         .alloc_slice_with(count, |_| super::types::oid::TEXT)
         .map_err(|_| super::query::arena_full_pub())?;
+    let captured_types = |name: &str| super::query::captured_type_oid(name, dependencies.view());
+    super::param_types::infer_declared(
+        storage,
+        &super::ast::Stmt::Select(*select),
+        txid,
+        oids,
+        Some(&captured_types),
+    );
+    let select =
+        super::query::expand_stored_query(select, storage, txid, path, dependencies.view(), arena)?;
     super::param_types::infer(
         storage,
         &super::ast::Stmt::Select(*select),

@@ -63,6 +63,7 @@ pub(crate) use cte::{bind_dml_materialized_relations, bind_materialized_relation
 pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;
+pub(crate) use cte::captured_type_oid;
 mod dependencies;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::{

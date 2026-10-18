@@ -86095,12 +86095,12 @@ fn enum_value_identity_views_preserve_grammar_literals_and_typed_constants() {
         CREATE TYPE grammar_state AS ENUM ('old', 'ready');
         CREATE VIEW grammar_values AS
             WITH items AS (
-                SELECT item_id FROM JSON_TABLE(
+                SELECT item_id, 'old'::grammar_state AS nested FROM JSON_TABLE(
                     '[{"id":1}]', '$[*]' COLUMNS (item_id integer PATH '$.id')
                 ) AS extracted
             )
             SELECT DATE '2024-01-02' AS day,
-                   'old'::grammar_state AS kept, item_id,
+                   'old'::grammar_state AS kept, nested, item_id,
                    TIMESTAMP(2) '2024-01-02 03:04:05.12345' AS stamp,
                    INTERVAL '1' DAY AS age, 'old'::text AS plain
               FROM items;
@@ -86113,9 +86113,9 @@ fn enum_value_identity_views_preserve_grammar_literals_and_typed_constants() {
         "ALTER TYPE grammar_state ADD VALUE 'old'",
         true,
     );
-    let query = "SELECT kept::text, item_id, day::text, stamp::text, age::text, plain
+    let query = "SELECT kept::text, nested::text, item_id, day::text, stamp::text, age::text, plain
                  FROM grammar_values";
-    let expected = ["new|1|2024-01-02|2024-01-02 03:04:05.12|1 day|old"];
+    let expected = ["new|new|1|2024-01-02|2024-01-02 03:04:05.12|1 day|old"];
     assert_eq!(
         data_rows(&session.success(&mut engine, query, true)),
         expected

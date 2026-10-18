@@ -173,6 +173,8 @@ tokenized SQL. Before each typed enum literal, `/*p3e:D:M*/` records dependency
 position D and member position M. The writer strips client comments before adding
 bindings. The parser analyzes ordinary value strings as parameters while
 preserving grammar literals, including JSON_TABLE paths and typed date constants.
+Explicit cast types are retained before CTE expansion can discard their original
+expressions; captured type dependencies remain authoritative after name reuse.
 Readers resolve the bound positions through the captured dependencies and remove
 the internal grammar before parsing or displaying SQL. Unknown grammar
 versions and invalid bindings are errors.

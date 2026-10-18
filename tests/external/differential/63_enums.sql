@@ -380,19 +380,21 @@ DROP TYPE "QuotedState";
 
 
 -- Grammar strings remain literals when a view also retains an enum member.
+BEGIN;
 CREATE TYPE grammar_state AS ENUM ('old', 'ready');
 CREATE VIEW grammar_values AS
  WITH items AS (
-   SELECT item_id FROM JSON_TABLE(
+   SELECT item_id, 'old'::grammar_state AS nested FROM JSON_TABLE(
      '[{"id":1}]', '$[*]' COLUMNS (item_id integer PATH '$.id')
    ) AS extracted
  )
- SELECT DATE '2024-01-02' AS day, 'old'::grammar_state AS kept, item_id,
+ SELECT DATE '2024-01-02' AS day, 'old'::grammar_state AS kept, nested, item_id,
         TIMESTAMP(2) '2024-01-02 03:04:05.12345' AS stamp,
         INTERVAL '1' DAY AS age, 'old'::text AS plain
    FROM items;
 ALTER TYPE grammar_state RENAME VALUE 'old' TO 'new';
+COMMIT;
 ALTER TYPE grammar_state ADD VALUE 'old';
-SELECT kept::text, item_id, day::text, stamp::text, age::text, plain FROM grammar_values;
+SELECT kept::text, nested::text, item_id, day::text, stamp::text, age::text, plain FROM grammar_values;
 DROP VIEW grammar_values;
 DROP TYPE grammar_state;

@@ -31,7 +31,7 @@ mod heap_relocation;
 mod row_heap;
 #[cfg(test)]
 pub(crate) use heap_relocation::HeapRelocationEntry;
-pub(crate) use heap_relocation::HeapRelocationWorkspace;
+pub(crate) use heap_relocation::{HeapRelocationMode, HeapRelocationStep, HeapRelocationWorkspace};
 mod row_cleanup;
 mod row_identities;
 mod row_images;
@@ -20359,13 +20359,10 @@ impl Storage {
                     .spill_generations
                     .write()
                     .copy_from(&self.tables[source_slot].spill_generations())?;
-                let row_count = self.tables[source_slot].rows.len();
-                for position in 0..row_count {
-                    let (rowid, mut state) = self.tables[source_slot]
-                        .rows
-                        .iter()
-                        .nth(position)
-                        .expect("row position remains stable while cloning another table");
+                let source_rows = self.tables[source_slot].rows.read();
+                let mut target_rows = self.tables[target_slot].rows.write();
+                for (&rowid, state) in source_rows.iter() {
+                    let mut state = *state;
                     if state.pending.len() != 0 {
                         return Err(sql_err!(
                             sqlstate::OBJECT_IN_USE,
@@ -20377,15 +20374,18 @@ impl Storage {
                     // committed image. Snapshot-retention chains belong only
                     // to transactions reading the source database.
                     state.history = CommittedHistory::empty();
-                    self.tables[target_slot]
-                        .rows
-                        .insert(rowid, state)
-                        .map_err(|_| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "template relation exceeds cloned row-map capacity"
-                            )
-                        })?;
+                    if let Some(RowHome::Heap(location)) = state.committed {
+                        let image = self.heap.get(location)?;
+                        state.committed = Some(RowHome::Heap(
+                            self.heap.retain_for_publication(&image)?.location(),
+                        ));
+                    }
+                    target_rows.insert(rowid, state).map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "template relation exceeds cloned row-map capacity"
+                        )
+                    })?;
                 }
             }
 

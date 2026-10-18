@@ -84836,8 +84836,15 @@ fn sliced_heap_cleanup_retained_buffers_fail_explicitly_and_resume_after_release
     let current = retain_row(&engine);
     crate::mem::guard::forbid_alloc(|| {
         engine.begin_post_publish_cleanup(lsn);
-        assert!(!engine.post_publish_cleanup_step(false).unwrap());
-        let error = engine.post_publish_cleanup_step(false).unwrap_err();
+        assert_eq!(
+            engine
+                .post_publish_cleanup_step(HeapRelocationMode::Background)
+                .unwrap(),
+            HeapRelocationStep::Advanced
+        );
+        let error = engine
+            .post_publish_cleanup_step(HeapRelocationMode::Background)
+            .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(
             error.message.as_str(),
@@ -85432,7 +85439,12 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         let pending_bytes = engine.wal.pending_batch_bytes();
         crate::mem::guard::forbid_alloc(|| {
             // Exercise the CPU-only turn used while an object GET owns I/O.
-            assert!(!engine.post_publish_cleanup_step(false).unwrap());
+            assert_eq!(
+                engine
+                    .post_publish_cleanup_step(HeapRelocationMode::Background)
+                    .unwrap(),
+                HeapRelocationStep::Advanced
+            );
             assert_eq!(engine.wal.pending_batch_bytes(), pending_bytes);
         });
         namespace.borrow_mut().faults.fail_from_op = None;
@@ -86472,5 +86484,238 @@ fn bounded_snapshot_history_progresses_while_unrelated_download_waits() {
                 assert_eq!(engine.checkpoint_beat(), CheckpointBeat::WaitingForReads);
             });
         },
+    );
+}
+
+#[test]
+fn sliced_heap_capture_queries_and_writes_run_between_one_slot_turns() {
+    use core::num::NonZeroUsize;
+    let (mut engine, budget, config) = sliced_cleanup_fixture("capture-query-turns", false);
+    let table = engine
+        .storage
+        .find_table("public", "cleanup_orders")
+        .unwrap();
+    let Some(RowHome::Heap(original)) = engine
+        .storage
+        .resident_rows(table)
+        .iter()
+        .next()
+        .unwrap()
+        .1
+        .committed
+    else {
+        panic!("fixture row is resident");
+    };
+    let retained = engine.storage.heap.get(original).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        engine
+            .compact_scratch
+            .begin(&engine.storage, HeapRelocationMode::Background)
+            .unwrap();
+        assert_eq!(
+            engine
+                .compact_scratch
+                .step(
+                    &engine.storage,
+                    NonZeroUsize::MIN,
+                    NonZeroUsize::MIN,
+                    HeapRelocationMode::Background,
+                )
+                .unwrap(),
+            HeapRelocationStep::Advanced
+        );
+    });
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*), sum(id) FROM cleanup_orders",
+            4 << 20
+        )),
+        ["80|3240"]
+    );
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "UPDATE cleanup_orders SET note = 'changed' WHERE id = 1; \
+         INSERT INTO cleanup_orders VALUES (81, 'late')",
+        4 << 20,
+    );
+    assert!(!message_types(&output).contains(&b'E'));
+    assert!(engine.compact_scratch.active());
+    crate::mem::guard::forbid_alloc(|| {
+        let bound = config.max_tables + config.table_rows + 32;
+        let mut finished = false;
+        for _ in 0..bound {
+            if engine
+                .compact_scratch
+                .step(
+                    &engine.storage,
+                    NonZeroUsize::MIN,
+                    NonZeroUsize::new(64 << 10).unwrap(),
+                    HeapRelocationMode::Background,
+                )
+                .unwrap()
+                == HeapRelocationStep::Complete
+            {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "fixture capture/copy did not finish");
+        let mut values = [Datum::Null; 2];
+        crate::storage::rowenc::decode(&retained, &[ColType::Int4, ColType::Text], &mut values)
+            .unwrap();
+        assert_eq!(values[0], Datum::Int4(1));
+        let Datum::Text(note) = values[1] else {
+            panic!("retained note changed type");
+        };
+        assert_eq!(note.len(), 8192);
+        assert!(note.as_bytes().iter().all(|byte| *byte == b'x'));
+    });
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT count(*), min(id), max(id) FROM cleanup_orders; \
+         SELECT note FROM cleanup_orders WHERE id IN (1, 81) ORDER BY id",
+            4 << 20
+        )),
+        ["81|1|81", "changed", "late"]
+    );
+}
+
+#[test]
+fn sliced_heap_capture_database_clone_behind_cursor_survives_source_removal() {
+    use core::num::NonZeroUsize;
+    let mut config = test_config("capture-database-clone");
+    config.object_store_on = false;
+    config.object_store_sim = false;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.max_tables = 4;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE TABLE capture_vacated(id integer)",
+        4 << 20,
+    );
+    assert!(!message_types(&output).contains(&b'E'));
+    let template = engine
+        .storage
+        .database_slot("template1", 0)
+        .map(|slot| engine.storage.database(slot).oid)
+        .unwrap();
+    engine.select_database(template).unwrap();
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE TABLE capture_orders(id integer, note text); \
+         INSERT INTO capture_orders VALUES (1, 'original')",
+        4 << 20,
+    );
+    assert!(!message_types(&output).contains(&b'E'));
+    let source = engine
+        .storage
+        .find_table("public", "capture_orders")
+        .unwrap();
+    assert_eq!(source, 1);
+    let Some(RowHome::Heap(original)) = engine
+        .storage
+        .resident_rows(source)
+        .iter()
+        .next()
+        .unwrap()
+        .1
+        .committed
+    else {
+        panic!("fixture source is resident");
+    };
+    let retained = engine.storage.heap.get(original).unwrap();
+    engine
+        .select_database(crate::storage::DatabaseOid::POSTGRES)
+        .unwrap();
+    let output = run_with_fixed_memory(&mut engine, &budget, "DROP TABLE capture_vacated", 4 << 20);
+    assert!(!message_types(&output).contains(&b'E'));
+    crate::mem::guard::forbid_alloc(|| {
+        engine
+            .compact_scratch
+            .begin(&engine.storage, HeapRelocationMode::Background)
+            .unwrap();
+        assert_eq!(
+            engine
+                .compact_scratch
+                .step(
+                    &engine.storage,
+                    NonZeroUsize::MIN,
+                    NonZeroUsize::MIN,
+                    HeapRelocationMode::Background,
+                )
+                .unwrap(),
+            HeapRelocationStep::Advanced
+        );
+    });
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "CREATE DATABASE capture_clone TEMPLATE template1",
+        4 << 20,
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let clone = engine
+        .storage
+        .database_slot("capture_clone", 0)
+        .map(|slot| engine.storage.database(slot).oid)
+        .unwrap();
+    engine.select_database(template).unwrap();
+    let output = run_with_fixed_memory(&mut engine, &budget, "DROP TABLE capture_orders", 4 << 20);
+    assert!(!message_types(&output).contains(&b'E'));
+    engine.select_database(clone).unwrap();
+    let cloned = engine
+        .storage
+        .find_table("public", "capture_orders")
+        .unwrap();
+    assert_eq!(
+        cloned, 0,
+        "clone must reuse the slot behind the capture cursor"
+    );
+    crate::mem::guard::forbid_alloc(|| {
+        let mut finished = false;
+        for _ in 0..config.max_tables + config.table_rows + 32 {
+            if engine
+                .compact_scratch
+                .step(
+                    &engine.storage,
+                    NonZeroUsize::MIN,
+                    NonZeroUsize::new(64 << 10).unwrap(),
+                    HeapRelocationMode::Background,
+                )
+                .unwrap()
+                == HeapRelocationStep::Complete
+            {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished);
+        let mut values = [Datum::Null; 2];
+        crate::storage::rowenc::decode(&retained, &[ColType::Int4, ColType::Text], &mut values)
+            .unwrap();
+        assert_eq!(values, [Datum::Int4(1), Datum::Text("original")]);
+    });
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "SELECT id, note FROM capture_orders",
+            4 << 20
+        )),
+        ["1|original"]
     );
 }

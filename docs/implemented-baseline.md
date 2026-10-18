@@ -767,21 +767,32 @@ reused table identities and stale heap locations. Heap addresses and relocation
 generations describe caches, not durable row identity. Retained byte copies
 use statement memory.
 
-Heap relocation reserves the existing spare buffer and captures resident locations.
+Heap relocation reserves the existing spare buffer and starts a fixed cursor;
+starting it does not sweep row metadata. Ordinary capture visits at most 64
+stable row slots per turn, including empty or deleted slots. An empty table
+costs one control visit. Each batch reads one table and its version chains,
+then releases both owners. A busy owner leaves the cursor unchanged and retries
+on the existing one-second schedule without changing storage readiness.
+The quota counts slots, not elapsed time: one row can have retained versions.
+
 Sorting, source validation, destination assignment and copying then run privately
-in bounded turns. Capture and final remapping acquire the shared version owner
-and every row map before reading or changing locations. A busy map releases the
-already acquired maps and version owner before waiting. Preflight and application
-use that same complete set, so publication cannot stop midway to acquire a map.
+in bounded turns. Final remapping still acquires the shared version owner and
+every row map. A busy map releases the already acquired maps and version owner
+before waiting. Preflight and application use that same complete set, so
+publication cannot stop midway to acquire a map.
 A write prepared before capture
 moves its unpublished input into the append tail; writes after capture already
-use that tail. Relocation copies later appends before publishing. If the tail
+use that tail. A database cloned into an already visited table slot also
+publishes heap references into the tail. Removing the source table cannot leave
+the clone pointing at an uncaptured location. Template rows are copied in one
+metadata pass rather than restarting the source walk for every row.
+Relocation copies later appends before publishing. If the tail
 advances again, publication requests another copy turn without changing row
 locations. Current rows, history, pending versions and aliases are remapped by
 their old location rather than reusable allocator slots.
 
 For example, one connection can retain an old order while another updates a
-different order between sorting or copying turns. Both still read their own selected bytes after
+different order between capture, sorting or copying turns. Both still read their own selected bytes after
 the buffer switch. Table retirement clears its rows through version ownership;
 a replaced slot's new rows survive publication. A held table definition does
 not keep copying or unrelated publication waiting.
@@ -800,7 +811,9 @@ callers can still compact an unretained active buffer in place when an older
 reader retains the other buffer. Shared callers always use the private copy
 path.
 
-Ordinary automatic checkpoint cleanup shares 65,536 work units across preparation
+The caller explicitly selects the row-slot quota, the preparation/copy quota,
+and whether to perform background work or finish synchronously. Ordinary
+automatic checkpoint cleanup shares 65,536 work units across preparation
 and copying in each step. A sorting unit starts one heap-sort root, extracts one
 entry, or sifts one level (at most two key comparisons and one swap). Validation
 and destination assignment charge one unit per captured location. Copying charges
@@ -848,8 +861,8 @@ engine does not invalidate them. Cancellation or a preparation/copy error
 releases the reservation. Using a workspace with a different storage
 instance returns XX000, "heap relocation belongs to another storage instance",
 without publishing either instance. Journal cleanup runs once for the published
-prefix; writes after it keep their journal suffix for recovery. Heap capture,
-final remapping, eviction and other maintenance still finish as whole operations
+prefix; writes after it keep their journal suffix for recovery. Final heap
+remapping, eviction and other maintenance still finish as whole operations
 within server turns. Checkpoint publication, merges, and temporary spilling still wait for
 pending durable-block downloads. Fixed execution workers and independent storage
 publication remain unfinished.

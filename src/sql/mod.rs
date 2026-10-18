@@ -71,7 +71,9 @@ use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
-use crate::storage::{ColumnMeta, ColumnSet, RowHome, SqlName, Storage};
+use crate::storage::{
+    ColumnMeta, ColumnSet, HeapRelocationMode, HeapRelocationStep, RowHome, SqlName, Storage,
+};
 use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
 std::thread_local! {
@@ -8386,18 +8388,21 @@ impl Engine {
 
     fn finish_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
         while self.post_publish_cleanup.is_some() {
-            self.post_publish_cleanup_step(true)?;
+            self.post_publish_cleanup_step(HeapRelocationMode::Finish)?;
         }
         Ok(())
     }
 
-    fn post_publish_cleanup_step(&mut self, exclusive: bool) -> Result<bool, SqlError> {
+    fn post_publish_cleanup_step(
+        &mut self,
+        mode: HeapRelocationMode,
+    ) -> Result<HeapRelocationStep, SqlError> {
         let cleanup = self
             .post_publish_cleanup
             .expect("post-publication cleanup has its published LSN");
         #[cfg(feature = "checkpoint-profile")]
         let local_profile = self.ckpt.as_ref().map(Checkpointer::profile_start);
-        let result = self.advance_post_publish_cleanup(cleanup, exclusive);
+        let result = self.advance_post_publish_cleanup(cleanup, mode);
         #[cfg(feature = "checkpoint-profile")]
         if let (Some(ckpt), Some((started, before))) = (self.ckpt.as_ref(), local_profile) {
             ckpt.profile_phase("local_cleanup", cleanup.lsn, started, before);
@@ -8408,21 +8413,22 @@ impl Engine {
     fn advance_post_publish_cleanup(
         &mut self,
         cleanup: PostPublishCleanup,
-        exclusive: bool,
-    ) -> Result<bool, SqlError> {
+        mode: HeapRelocationMode,
+    ) -> Result<HeapRelocationStep, SqlError> {
         let next = match cleanup.phase {
             PostPublishPhase::Prepare => {
                 self.prepare_post_publish_cleanup(cleanup.lsn);
                 PostPublishPhase::Compact
             }
             PostPublishPhase::Compact | PostPublishPhase::CompactAfterEviction => {
-                let finished = self.compact_scratch.compact_step(
+                match self.compact_scratch.compact_step(
                     &mut self.storage,
+                    core::num::NonZeroUsize::new(64).unwrap(),
                     core::num::NonZeroUsize::new(64 << 10).unwrap(),
-                    exclusive,
-                )?;
-                if !finished {
-                    return Ok(false);
+                    mode,
+                )? {
+                    HeapRelocationStep::Complete => {}
+                    pending => return Ok(pending),
                 }
                 match cleanup.phase {
                     PostPublishPhase::Compact => PostPublishPhase::Evict,
@@ -8443,14 +8449,14 @@ impl Engine {
             PostPublishPhase::Finish => {
                 self.storage.evict_entries();
                 self.post_publish_cleanup = None;
-                return Ok(true);
+                return Ok(HeapRelocationStep::Complete);
             }
         };
         self.post_publish_cleanup = Some(PostPublishCleanup {
             lsn: cleanup.lsn,
             phase: next,
         });
-        Ok(false)
+        Ok(HeapRelocationStep::Advanced)
     }
 
     fn retry_post_publish_cleanup(&mut self) -> Result<(), SqlError> {
@@ -8458,7 +8464,7 @@ impl Engine {
             if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
                 self.finish_post_publish_cleanup()?;
             } else {
-                self.post_publish_cleanup_step(false)?;
+                self.post_publish_cleanup_step(HeapRelocationMode::Background)?;
             }
         }
         Ok(())
@@ -8820,7 +8826,7 @@ impl Engine {
     }
 
     /// Snapshot cleanup visits at most 64 stable slots alongside a heap step.
-    /// Critical pressure, heap capture/remapping and other maintenance still
+    /// Critical pressure, heap remapping and other maintenance still
     /// have whole turns. Publication and merge wait for owned reads to finish.
     pub(crate) fn checkpoint_beat(&mut self) -> CheckpointBeat {
         let reads_pending = self.block_reads_pending();
@@ -8850,10 +8856,14 @@ impl Engine {
         if self.post_publish_cleanup.is_some() {
             let cleanup = if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
                 self.finish_post_publish_cleanup()
+                    .map(|()| HeapRelocationStep::Complete)
             } else {
-                self.post_publish_cleanup_step(false).map(|_| ())
+                self.post_publish_cleanup_step(HeapRelocationMode::Background)
             };
             return match cleanup {
+                Ok(HeapRelocationStep::WaitingForOwner) if !retried_upload => {
+                    CheckpointBeat::WaitingForOwner
+                }
                 Ok(_) => {
                     if retried_upload {
                         CheckpointBeat::Durable
@@ -8987,7 +8997,8 @@ impl Engine {
                 let cleanup = if critical {
                     self.finish_post_publish_cleanup()
                 } else {
-                    self.post_publish_cleanup_step(false).map(|_| ())
+                    self.post_publish_cleanup_step(HeapRelocationMode::Background)
+                        .map(|_| ())
                 };
                 if let Err(e) = cleanup {
                     let message = stack_format!(

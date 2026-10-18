@@ -82,9 +82,12 @@ they do not drain a table or copy all row identities. Busy owners retry without
 changing storage readiness. A startup cursor preserves partial work, skipped
 tables and new releases. Row publication maintains a pressure signal so testing
 history pressure also needs no whole-table scan. Synchronous history completion
-is an explicit internal choice. Heap capture, final remapping, post-checkpoint
-eviction and other cleanup walks still have whole turns; explicit CHECKPOINT
-and critical heap pressure still wait for cleanup.
+is an explicit internal choice. Heap capture also visits at most 64 stable
+row slots per ordinary turn, releases its owners between turns, and retries a
+busy table without waiting or changing storage readiness. Late writes and
+database clones publish new references after the capture boundary. Final heap
+remapping, post-checkpoint eviction and other cleanup walks still have whole
+turns; explicit CHECKPOINT and critical heap pressure still wait for cleanup.
 
 Complete type-name changes and remaining maintenance still need publication
 coordination. The [implementation guide](docs/implemented-baseline.md) owns
@@ -95,7 +98,7 @@ Still to do:
 - Finish shared-state protection for engine-wide publication and remaining
   table rewrites and maintenance paths.
 - Move the remaining maintenance work off the statement path, including heap
-  capture, remapping, critical memory pressure, and fair retries when
+  remapping, critical memory pressure, and fair retries when
   both buffers are retained.
   Complete rewrites must preserve historical object versions needed by readers.
 - Verify release after errors, rollback, and transaction end, and prevent

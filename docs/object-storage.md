@@ -107,6 +107,11 @@ retain explicit synchronous completion boundaries. They cannot replay their
 call stack after a commit. The concurrent path for ordinary client commits and
 streaming subscription apply uses the fixed commit queue.
 
+Saved query results are collected in one scan within the fixed statement arena.
+They do not run expressions a second time to discover the result size. For
+example, a saved query that calls a function to prepare a statement must prepare
+it once, even when another part of the query reads uncached data.
+
 ## Required S3-compatible subset
 
 | S3 operation | Required behavior |

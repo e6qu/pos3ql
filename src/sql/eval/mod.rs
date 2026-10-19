@@ -772,16 +772,6 @@ pub trait SequenceAccess {
     fn currval(&self, name: &str) -> Result<i64, SqlError>;
     fn lastval(&self) -> Result<i64, SqlError>;
     fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
-    fn dry_nextval(&self, name: &str) -> Result<i64, SqlError>;
-    fn dry_currval(&self, name: &str) -> Result<i64, SqlError>;
-    fn dry_lastval(&self) -> Result<i64, SqlError>;
-    fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError>;
-    /// Captures and restores the logical position when a bounded physical
-    /// executor pass repeats the same expression stream.
-    fn statement_cursor(&self) -> Option<usize> {
-        None
-    }
-    fn restore_statement_cursor(&self, _cursor: usize) {}
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
@@ -1156,10 +1146,6 @@ pub trait CatalogAccess {
     fn sequence_state_by_oid(&self, _oid: i32) -> Option<(i64, bool)> {
         None
     }
-    fn routine_invocation_cursor(&self) -> Option<usize> {
-        None
-    }
-    fn restore_routine_invocation_cursor(&self, _cursor: usize) {}
     /// Whether this OID names a relation visible to the current query.
     fn relation_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a type visible to the current query.

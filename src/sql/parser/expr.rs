@@ -1286,7 +1286,8 @@ impl<'a> Parser<'a> {
             }
         }
         let count_expr = self.arena_expr(Expr::Int(attributes as i64))?;
-        args.as_mut_slice()[1] = count_expr;
+        args.as_mut_slice()
+            .map_err(|_| self.arena_full("XML arguments exceed statement arena"))?[1] = count_expr;
         self.expect_op(")")?;
         self.xml_call("__xmlelement", args.as_slice())
     }

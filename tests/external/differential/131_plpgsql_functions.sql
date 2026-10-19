@@ -655,3 +655,48 @@ DEALLOCATE replay_effect_plan;
 DROP FUNCTION replay_effect_prepare();
 DROP SEQUENCE replay_effect_sequence;
 DROP TABLE replay_effect_rows;
+
+
+-- Saving and sorting query results evaluates each session change once.
+SET application_name = 'seed';
+WITH effect AS MATERIALIZED (
+  SELECT set_config('application_name', current_setting('application_name') || '-once', false) AS label
+)
+SELECT label, current_setting('application_name') FROM effect;
+SET application_name = 's';
+SELECT set_config('application_name', current_setting('application_name') || 'x', false) AS label
+FROM generate_series(1, 3) AS g(i) ORDER BY label;
+SELECT current_setting('application_name');
+RESET application_name;
+
+
+-- INSERT SELECT saves source rows once before writing the destination.
+CREATE TABLE saved_effect_rows(label text);
+SET application_name = 'i';
+INSERT INTO saved_effect_rows
+SELECT set_config('application_name', current_setting('application_name') || 'x', false)
+FROM generate_series(1, 3) AS g(i);
+SELECT label FROM saved_effect_rows ORDER BY label;
+SELECT current_setting('application_name');
+DROP TABLE saved_effect_rows;
+
+-- Scalar and record subqueries do not repeat projections or filters to size a result.
+SET application_name = 'g';
+SELECT 'gx' IN (
+  SELECT set_config('application_name', current_setting('application_name') || 'x', false)
+  FROM generate_series(1, 2) AS g(i) GROUP BY i
+);
+SELECT current_setting('application_name');
+SET application_name = 'r';
+SELECT ('rx', 1) IN (
+  SELECT set_config('application_name', current_setting('application_name') || 'x', false), i
+  FROM generate_series(1, 2) AS g(i)
+);
+SELECT current_setting('application_name');
+SET application_name = 'p';
+SELECT 'px' IN (
+  SELECT 'px' FROM generate_series(1, 2) AS g(i)
+  WHERE set_config('application_name', current_setting('application_name') || 'x', false) IS NOT NULL
+);
+SELECT current_setting('application_name');
+RESET application_name;

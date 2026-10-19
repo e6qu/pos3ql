@@ -88910,6 +88910,11 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
               EXECUTE 'INSERT INTO effect_rows VALUES (3) RETURNING value' INTO STRICT result_value;
               RETURN result_value;
             END $$;
+            CREATE FUNCTION effect_prepare_cte() RETURNS integer LANGUAGE plpgsql AS $$
+            BEGIN
+              EXECUTE 'PREPARE effect_cte_plan(integer) AS SELECT $1 + 1';
+              RETURN 1;
+            END $$;
         "#,
             false,
         );
@@ -89059,6 +89064,81 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         assert_eq!(
             data_rows(&session.success(&mut engine, "EXECUTE effect_plan(41)", true)),
             ["42"]
+        );
+
+        // A saved query must not invoke the routine once to count rows and
+        // again to encode them. Its result then drives a cold correlated read.
+        let cte_sql = "WITH effect AS MATERIALIZED (SELECT effect_prepare_cte() AS n) \\
+             SELECT n, (SELECT sum(value) FROM effect_rows WHERE value >= effect.n) \\
+             FROM effect";
+        if extended {
+            session.send.clear();
+            session.arena.reset();
+            let mut responder =
+                Responder::for_execute(&mut session.send, crate::pg::respond::ResultFmt::ALL_TEXT);
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| engine.execute_extended(
+                    cte_sql,
+                    &session.arena,
+                    &[],
+                    &[],
+                    &mut session.transaction,
+                    &mut session.pool,
+                    &mut session.cursors,
+                    &mut session.guc,
+                    &mut responder,
+                    session.connection_id,
+                    false,
+                ))
+                .unwrap(),
+                ExtendedExecutionStatus::Complete(true)
+            ));
+            crate::mem::guard::forbid_alloc(|| {
+                engine.commit_txn(&mut session.transaction, &session.guc)
+            })
+            .unwrap();
+            assert_eq!(data_rows(session.send.readable()), ["1|6"]);
+        } else {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, cte_sql, true)),
+                ["1|6"]
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "EXECUTE effect_cte_plan(41)", true)),
+            ["42"]
+        );
+
+        // Builtin session changes also run once, without routine replay state.
+        session.success(&mut engine, "SET application_name = 'seed'", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "WITH effect AS MATERIALIZED (SELECT set_config('application_name', \\
+                 current_setting('application_name') || '-once', false) AS label) \\
+                 SELECT label, current_setting('application_name') FROM effect",
+                true,
+            )),
+            ["seed-once|seed-once"]
+        );
+        session.success(&mut engine, "SET application_name = 's'", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT set_config('application_name', \\
+                 current_setting('application_name') || 'x', false) AS label \\
+                 FROM generate_series(1, 3) AS g(i) ORDER BY label",
+                true,
+            )),
+            ["sx", "sxx", "sxxx"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT current_setting('application_name')",
+                true
+            )),
+            ["sxxx"]
         );
 
         // Correlation makes the cold read depend on the already advanced sequence.

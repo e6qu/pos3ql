@@ -599,14 +599,6 @@ impl<'a> RoutineInvocationState<'a> {
         self.pending.set(None);
     }
 
-    pub(crate) fn cursor(&self) -> usize {
-        self.next.get()
-    }
-
-    pub(crate) fn restore_cursor(&self, cursor: usize) {
-        self.next.set(cursor);
-    }
-
     pub(crate) fn resolve<'query>(
         &self,
         slot: usize,
@@ -2875,20 +2867,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn sequence_state_by_oid(&self, oid: i32) -> Option<(i64, bool)> {
         super::catalog::sequence_state_by_oid(self.storage, oid, self.txid)
-    }
-
-    fn routine_invocation_cursor(&self) -> Option<usize> {
-        self.invocations
-            .map(RoutineInvocationState::cursor)
-            .or_else(|| active_routine_invocations().map(|(state, _)| state.cursor()))
-    }
-
-    fn restore_routine_invocation_cursor(&self, cursor: usize) {
-        if let Some(invocations) = self.invocations {
-            invocations.restore_cursor(cursor);
-        } else if let Some((invocations, _)) = active_routine_invocations() {
-            invocations.restore_cursor(cursor);
-        }
     }
 
     fn relation_is_visible(&self, oid: i32) -> Option<bool> {

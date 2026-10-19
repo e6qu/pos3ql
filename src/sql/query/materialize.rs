@@ -8,7 +8,7 @@
 //! order a result; an expensive select-list expression can also be postponed
 //! past the sort, so it is evaluated only for the rows that survive a LIMIT.
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, FromClause, Select, SelectItem};
 use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, SubqueryValues, eval_full, sqlstate};
@@ -755,24 +755,11 @@ pub(crate) fn materialized_rows<'a>(
         None
     };
 
-    let routine_cursor = hooks
-        .catalog
-        .and_then(crate::sql::eval::CatalogAccess::routine_invocation_cursor);
-    let sequence_cursor = hooks
-        .sequences
-        .and_then(crate::sql::eval::SequenceAccess::statement_cursor);
     let stored_width = width + n_keys + n_raw + n_identities;
-    // Pass 1: count and measure — and evaluate the projection and ORDER BY keys per row
-    // (discarding the values). PostgreSQL scans, filters, and projects in a
-    // single per-row pass below the Sort, so an early row's projection error
-    // surfaces before a later row's WHERE error. We materialize in two passes
-    // for a fixed-size allocation, so the count pass must reproduce that error
-    // timing rather than evaluate every WHERE before any projection. Postponed
-    // items are exactly the ones PostgreSQL does not evaluate below the Sort,
-    // so they are skipped here too.
-    let mut count = 0usize;
-    let mut encoded_bytes = 0usize;
-    let mut measure = |row: &JoinRow<'_, 'a, '_>| {
+    let mut rows = ArenaList::new_persistent(arena);
+    // Evaluate each projection once, in scan order. Encoded rows and their
+    // references survive the scan's per-row scratch rewinds in the arena tail.
+    let mut encode = |row: &JoinRow<'_, 'a, '_>| {
         for_each_materialized_projection(
             storage,
             scope,
@@ -809,10 +796,26 @@ pub(crate) fn materialized_rows<'a>(
                         index,
                     )
                 })?;
-                encoded_bytes = encoded_bytes
-                    .checked_add(row_bytes)
-                    .ok_or_else(arena_full)?;
-                count += 1;
+                let output = arena
+                    .alloc_persistent_slice_with(row_bytes, |_| 0u8)
+                    .map_err(|_| arena_full())?;
+                let len = crate::sql::exec::encode_projected_by_into(
+                    stored_width,
+                    |index| {
+                        materialized_value_at(
+                            scope,
+                            row,
+                            projected,
+                            keys,
+                            width,
+                            n_keys,
+                            identities_at,
+                            index,
+                        )
+                    },
+                    output,
+                )?;
+                rows.push(&output[..len]).map_err(|_| arena_full())?;
                 Ok(())
             },
         )?;
@@ -831,7 +834,7 @@ pub(crate) fn materialized_rows<'a>(
             outer,
             pax_columns,
             indexed,
-            &mut measure,
+            &mut encode,
         )?;
     } else {
         scan_source_recycling_with_pax_columns(
@@ -845,127 +848,10 @@ pub(crate) fn materialized_rows<'a>(
             hooks,
             outer,
             pax_columns,
-            &mut measure,
+            &mut encode,
         )?;
     }
-    let empty: &[u8] = &[];
-    let rows: &mut [&[u8]] = arena
-        .alloc_slice_with(count, |_| empty)
-        .map_err(|_| arena_full())?;
-    let encoded_rows = arena
-        .alloc_slice_with(encoded_bytes, |_| 0_u8)
-        .map_err(|_| arena_full())?;
-    let encoded_rows_ptr = encoded_rows.as_mut_ptr();
-    if let (Some(catalog), Some(cursor)) = (hooks.catalog, routine_cursor) {
-        catalog.restore_routine_invocation_cursor(cursor);
-    }
-    if let (Some(sequences), Some(cursor)) = (hooks.sequences, sequence_cursor) {
-        sequences.restore_statement_cursor(cursor);
-    }
-    // Pass 2: project + keys, encode into the persistent block measured above.
-    // The recycling scan can then release catalog rows and correlated-subquery
-    // scratch after each source row without releasing a materialized result.
-    {
-        let mut at = 0usize;
-        let mut encoded_at = 0usize;
-        let mut encode = |row: &JoinRow<'_, 'a, '_>| {
-            for_each_materialized_projection(
-                storage,
-                scope,
-                statement,
-                row,
-                txid,
-                arena,
-                params,
-                hooks,
-                correlated,
-                base,
-                where_correlated,
-                &order_exprs,
-                n_keys,
-                if any_postponed {
-                    Some(&postponed)
-                } else {
-                    None
-                },
-                has_srf,
-                outer,
-                &mut *merge_scalars,
-                &mut *merge_lists,
-                &mut |row, projected, keys| {
-                    debug_assert_eq!(projected.len(), width);
-                    let remaining = encoded_bytes
-                        .checked_sub(encoded_at)
-                        .ok_or_else(arena_full)?;
-                    // SAFETY: pass 1 measured this persistent block exactly.
-                    // Each callback receives the still-unwritten suffix, so
-                    // its mutable slice is disjoint from every stored row.
-                    let output = unsafe {
-                        core::slice::from_raw_parts_mut(encoded_rows_ptr.add(encoded_at), remaining)
-                    };
-                    let len = crate::sql::exec::encode_projected_by_into(
-                        stored_width,
-                        |index| {
-                            materialized_value_at(
-                                scope,
-                                row,
-                                projected,
-                                keys,
-                                width,
-                                n_keys,
-                                identities_at,
-                                index,
-                            )
-                        },
-                        output,
-                    )?;
-                    // SAFETY: encoding initialized this prefix of the
-                    // current disjoint suffix, and the arena owns the block
-                    // for 'a. Later callbacks only write after this slice.
-                    let encoded_row: &'a [u8] = unsafe {
-                        core::slice::from_raw_parts(encoded_rows_ptr.add(encoded_at), len)
-                    };
-                    rows[at] = encoded_row;
-                    encoded_at += len;
-                    at += 1;
-                    Ok(())
-                },
-            )?;
-            Ok(true)
-        };
-        if let Some(indexed) = ordered_candidates.as_ref() {
-            scan_source_recycling_with_indexed_candidates(
-                storage,
-                scope,
-                from,
-                txid,
-                where_in_scan,
-                arena,
-                params,
-                hooks,
-                outer,
-                pax_columns,
-                indexed,
-                &mut encode,
-            )?;
-        } else {
-            scan_source_recycling_with_pax_columns(
-                storage,
-                scope,
-                from,
-                txid,
-                where_in_scan,
-                arena,
-                params,
-                hooks,
-                outer,
-                pax_columns,
-                &mut encode,
-            )?;
-        }
-        debug_assert_eq!(at, count);
-        debug_assert_eq!(encoded_at, encoded_bytes);
-    }
+    let rows = rows.into_mut_slice().map_err(|_| arena_full())?;
 
     // Plain DISTINCT dedups on the visible prefix before the ORDER BY sort.
     // DISTINCT ON dedups on its keys *after* the sort (below), so the first

@@ -291,7 +291,11 @@ pub(crate) fn dispatch<'a>(
                         }
                     }
                 }
-                let text = range::canonicalize_multirange(comps.as_mut_slice(), kind, arena)?;
+                let text = range::canonicalize_multirange(
+                    comps.as_mut_slice().map_err(|_| arena_full())?,
+                    kind,
+                    arena,
+                )?;
                 Ok(Datum::Multirange { text, kind })
             }
             "multirange" => {

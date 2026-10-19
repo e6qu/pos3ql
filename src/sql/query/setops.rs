@@ -18,10 +18,8 @@ use crate::{sql_err, stack_format};
 
 use super::{
     Outcome, QueryScope, arena_full, describe_scope_items, expand_set_tree_exec, infer_scope_type,
-    select_into_rows, select_into_rows_recycling, sql_fail, sql_ok,
+    select_into_rows_recycling, sql_fail, sql_ok,
 };
-
-struct DrySequence<'a>(&'a dyn SequenceAccess);
 
 #[derive(Clone, Copy)]
 struct ExternalSetContext<'a> {
@@ -30,33 +28,6 @@ struct ExternalSetContext<'a> {
     arena: &'a Arena,
     params: &'a [Datum<'a>],
     sequences: Option<&'a dyn SequenceAccess>,
-}
-
-impl SequenceAccess for DrySequence<'_> {
-    fn nextval(&self, name: &str) -> Result<i64, SqlError> {
-        self.0.dry_nextval(name)
-    }
-    fn currval(&self, name: &str) -> Result<i64, SqlError> {
-        self.0.dry_currval(name)
-    }
-    fn lastval(&self) -> Result<i64, SqlError> {
-        self.0.dry_lastval()
-    }
-    fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
-        self.0.dry_setval(name, value, is_called)
-    }
-    fn dry_nextval(&self, name: &str) -> Result<i64, SqlError> {
-        self.0.dry_nextval(name)
-    }
-    fn dry_currval(&self, name: &str) -> Result<i64, SqlError> {
-        self.0.dry_currval(name)
-    }
-    fn dry_lastval(&self) -> Result<i64, SqlError> {
-        self.0.dry_lastval()
-    }
-    fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
-        self.0.dry_setval(name, value, is_called)
-    }
 }
 
 /// Executes a set-operation query (UNION / INTERSECT / EXCEPT). Each SELECT
@@ -1549,37 +1520,9 @@ fn eval_set_leaf<'a>(
     sequences: Option<&dyn SequenceAccess>,
     target: &[ColType],
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
-    // Pass 1: count the rows. Pass 2: coerce to the target types and encode.
-    let mut count = 0usize;
-    let dry_sequences = sequences.map(DrySequence);
-    let dry_mark = arena.mark();
-    select_into_rows(
-        storage,
-        txid,
-        s,
-        arena,
-        params,
-        None,
-        dry_sequences
-            .as_ref()
-            .map(|sequence| sequence as &dyn SequenceAccess),
-        &mut |_| {
-            count += 1;
-            Ok(())
-        },
-    )?;
-    // The count pass cannot retain datums and uses a non-mutating sequence
-    // adapter. Recycle its executor scopes and row scratch before the real
-    // pass; otherwise every set leaf permanently consumes the work arena
-    // twice, and recursive terms compound that cost per iteration.
-    unsafe { arena.rewind_to(dry_mark) };
-    let empty: &[u8] = &[];
-    let rows = arena
-        .alloc_slice_with(count, |_| empty)
-        .map_err(|_| arena_full())?;
+    let mut rows = ArenaList::new_persistent(arena);
     let n = target.len();
-    let mut at = 0usize;
-    select_into_rows(
+    select_into_rows_recycling(
         storage,
         txid,
         s,
@@ -1598,12 +1541,12 @@ fn eval_set_leaf<'a>(
             for c in 0..n {
                 coerced[c] = coerce_set_value(vals[c], target[c], arena)?;
             }
-            rows[at] = exec::encode_projected_pub(&coerced[..n], arena)?;
-            at += 1;
+            let encoded = exec::encode_projected_persistent_pub(&coerced[..n], arena)?;
+            rows.push(encoded).map_err(|_| arena_full())?;
             Ok(())
         },
     )?;
-    Ok(rows)
+    rows.into_mut_slice().map_err(|_| arena_full())
 }
 
 /// Combines two encoded-row multisets. Both inputs are sorted here (set ops are

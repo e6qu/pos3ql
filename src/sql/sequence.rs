@@ -38,14 +38,6 @@ impl<'a> SequenceReplayState<'a> {
         self.next.set(0);
     }
 
-    fn cursor(&self) -> usize {
-        self.next.get()
-    }
-
-    fn restore_cursor(&self, cursor: usize) {
-        self.next.set(cursor);
-    }
-
     fn invoke(&self, action: impl FnOnce() -> Result<i64, SqlError>) -> Result<i64, SqlError> {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
@@ -71,9 +63,8 @@ pub struct SeqEval<'a> {
     session: &'a SeqSession,
     txid: u32,
     /// A "dry" evaluator resolves names (so errors match) but never advances a
-    /// generator or touches session state. The INSERT ... SELECT counting pass
-    /// uses it so a `nextval` in the projection fires exactly once — in the
-    /// second, materializing pass — not twice.
+    /// generator or touches session state. Write validation uses it before
+    /// executing changes; query materialization evaluates live values once.
     dry: bool,
 }
 
@@ -238,8 +229,7 @@ impl SequenceAccess for SeqEval<'_> {
         self.require_any(slot, PrivilegeSet::UPDATE, None)?;
         let seq = self.storage.sequence_for(slot, self.txid);
         if self.dry {
-            // Validate the range (so the error surfaces in the counting pass too)
-            // without moving the generator.
+            // Validate the range without moving the generator.
             self.storage.check_sequence_value(slot, self.txid, value)?;
             return Ok(value);
         }
@@ -249,22 +239,6 @@ impl SequenceAccess for SeqEval<'_> {
         self.storage.assign_transaction_identity(self.txid);
         self.session.record_setval(slot, seq.created_at, value);
         Ok(result)
-    }
-
-    fn dry_nextval(&self, name: &str) -> Result<i64, SqlError> {
-        Self { dry: true, ..*self }.nextval(name)
-    }
-
-    fn dry_currval(&self, name: &str) -> Result<i64, SqlError> {
-        Self { dry: true, ..*self }.currval(name)
-    }
-
-    fn dry_lastval(&self) -> Result<i64, SqlError> {
-        Self { dry: true, ..*self }.lastval()
-    }
-
-    fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
-        Self { dry: true, ..*self }.setval(name, value, is_called)
     }
 }
 
@@ -281,24 +255,6 @@ impl SequenceAccess for ReplaySeqEval<'_, '_, '_> {
     fn setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
         self.state
             .invoke(|| self.base.setval(name, value, is_called))
-    }
-    fn dry_nextval(&self, name: &str) -> Result<i64, SqlError> {
-        self.base.dry_nextval(name)
-    }
-    fn dry_currval(&self, name: &str) -> Result<i64, SqlError> {
-        self.base.dry_currval(name)
-    }
-    fn dry_lastval(&self) -> Result<i64, SqlError> {
-        self.base.dry_lastval()
-    }
-    fn dry_setval(&self, name: &str, value: i64, is_called: bool) -> Result<i64, SqlError> {
-        self.base.dry_setval(name, value, is_called)
-    }
-    fn statement_cursor(&self) -> Option<usize> {
-        Some(self.state.cursor())
-    }
-    fn restore_statement_cursor(&self, cursor: usize) {
-        self.state.restore_cursor(cursor);
     }
 }
 

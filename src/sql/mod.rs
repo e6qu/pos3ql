@@ -4852,7 +4852,9 @@ impl Engine {
                             messages,
                             end_lsn,
                             command_id,
-                            logical_messages.as_mut_slice(),
+                            logical_messages
+                                .as_mut_slice()
+                                .map_err(|_| eval::arena_full())?,
                             responder,
                         )?;
                         emit_pending_truncates(
@@ -5045,7 +5047,9 @@ impl Engine {
                             messages,
                             end_lsn,
                             command_id,
-                            logical_messages.as_mut_slice(),
+                            logical_messages
+                                .as_mut_slice()
+                                .map_err(|_| eval::arena_full())?,
                             responder,
                         )?;
                         let Some(table_slot) = storage.find_table(schema, table) else {
@@ -5165,7 +5169,9 @@ impl Engine {
                 messages,
                 end_lsn,
                 u32::MAX,
-                logical_messages.as_mut_slice(),
+                logical_messages
+                    .as_mut_slice()
+                    .map_err(|_| eval::arena_full())?,
                 responder,
             )?;
             if !has_nontransactional_message {

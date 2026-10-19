@@ -59669,51 +59669,15 @@ where
                     },
                     None => sel,
                 };
-                let mut count = 0usize;
-                let invocation_cursor = super::query::active_routine_invocations()
-                    .map(|(invocations, _)| invocations.cursor());
-                {
-                    let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
-                    if let Err(e) = super::query::select_into_rows_recycling(
-                        storage,
-                        txn.txid,
-                        sel,
-                        arena,
-                        params,
-                        None,
-                        Some(&dry),
-                        &mut |_| {
-                            count += 1;
-                            Ok(())
-                        },
-                    ) {
-                        return sql_fail(e);
-                    }
-                }
-                if let Some((invocations, _)) = super::query::active_routine_invocations()
-                    && let Some(cursor) = invocation_cursor
-                {
-                    invocations.restore_cursor(cursor);
-                }
-                let empty: &[u8] = &[];
-                let rows: &mut [&[u8]] = match arena.alloc_slice_with(count, |_| empty) {
-                    Ok(rows) => rows,
-                    Err(_) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "INSERT ... SELECT result exceeds the statement arena"
-                        ));
-                    }
-                };
-                let mut at = 0usize;
+                let mut rows = crate::mem::arena::ArenaList::new_persistent(arena);
                 let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
-                    rows[at] = encode_projected_pub(vals, arena)?;
-                    at += 1;
+                    let encoded = encode_projected_persistent_pub(vals, arena)?;
+                    rows.push(encoded).map_err(|_| super::eval::arena_full())?;
                     Ok(())
                 };
                 {
                     let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                    if let Err(e) = super::query::select_into_rows(
+                    if let Err(e) = super::query::select_into_rows_recycling(
                         storage,
                         txn.txid,
                         sel,
@@ -59726,7 +59690,7 @@ where
                         return sql_fail(e);
                     }
                 }
-                (&*rows, count)
+                (rows.as_slice(), rows.len())
             };
 
         let default_exprs = match parse_defaults(def, arena, storage, txn.txid) {

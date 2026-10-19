@@ -42,8 +42,7 @@ already runs on several workers.
 The checks below define acceptance. Require CI, Differential, Drivers and coverage
 to pass on the final PR version, including PostgreSQL 18 comparisons, Miri and
 actual MinIO and SeaweedFS qualification. Focused runner passes are development
-evidence, not merge qualification. Remove the temporary focused workflow before
-final qualification. Do not increase timeouts to obtain a pass.
+evidence, not merge qualification. Do not increase timeouts to obtain a pass.
 
 ### Concurrent and batched reads
 
@@ -58,6 +57,9 @@ fetching the large notes column it did not request.
 - Issue a bounded batch of selected column or scan reads before waiting for the
   first response. Preserve validation, selected versions and completed work on
   resumption; never repeat a data-changing expression.
+- Save CTE, sorted, subquery and INSERT SELECT results in one scan; do not
+  evaluate expressions once to count rows and again to save them. For example,
+  saving a query that prepares a statement must prepare it exactly once.
 - Release shared cache and storage owners before waiting on network I/O.
 - Retain read-completion wakeups until queued responses have been released;
   a ready result must not leave a customer waiting for another socket event.

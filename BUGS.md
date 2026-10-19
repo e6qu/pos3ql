@@ -10,7 +10,8 @@ storage implementation and qualification work. Passing focused tests does not
 qualify an unfinished implementation for merging. Qualification includes compiled
 regressions, delayed-publication recovery, control-request fairness, credential permissions, descriptor reuse, merge retry
 layouts, retained read-completion wakeups, one-time function and sequence effects
-across cold reads, accurate build identities, and complete
+across cold reads and saved query results, immutable arena-list snapshots,
+accurate build identities, and complete
 workflows on the final head.
 
 For an entry, include a reproducer, affected boundary, observed behavior and

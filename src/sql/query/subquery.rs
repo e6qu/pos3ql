@@ -2416,8 +2416,7 @@ fn run_record_subquery<'a>(
             "subquery has too many columns"
         ));
     }
-    let invocation_cursor = super::active_routine_invocations().map(|(state, _)| state.cursor());
-    let mut count = 0usize;
+    let mut output = ArenaList::new(arena);
     select_into_rows(
         storage,
         txid,
@@ -2433,28 +2432,6 @@ fn run_record_subquery<'a>(
                     "subquery changed its projected column count"
                 ));
             }
-            count += 1;
-            Ok(())
-        },
-    )?;
-    let output = arena
-        .alloc_slice_with(count, |_| Datum::Null)
-        .map_err(|_| arena_full())?;
-    if let (Some(cursor), Some((state, _))) =
-        (invocation_cursor, super::active_routine_invocations())
-    {
-        state.restore_cursor(cursor);
-    }
-    let mut index = 0;
-    select_into_rows(
-        storage,
-        txid,
-        select,
-        arena,
-        params,
-        outer,
-        None,
-        &mut |values| {
             let mut fields = [RecordField {
                 name: "",
                 type_oid: 0,
@@ -2472,12 +2449,12 @@ fn run_record_subquery<'a>(
                 .map_err(|_| arena_full())?;
             let encoded =
                 crate::sql::exec::encode_projected_pub(&[Datum::Record(&*fields)], arena)?;
-            output[index] = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
-            index += 1;
+            let value = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
+            output.push(value).map_err(|_| arena_full())?;
             Ok(())
         },
     )?;
-    Ok((&*output, false, witness))
+    Ok((output.as_slice(), false, witness))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2578,31 +2555,7 @@ fn run_subquery<'a>(
         // Grouped/DISTINCT/windowed/SRF subquery: the row-source executor
         // already handles grouping, HAVING, DISTINCT, windows, and SRF
         // expansion; collect its single output column.
-        let invocation_cursor =
-            super::active_routine_invocations().map(|(state, _)| state.cursor());
-        let mut count = 0usize;
-        select_into_rows(
-            storage,
-            txid,
-            select,
-            arena,
-            params,
-            outer,
-            None,
-            &mut |_| {
-                count += 1;
-                Ok(())
-            },
-        )?;
-        let out = arena
-            .alloc_slice_with(count, |_| Datum::Null)
-            .map_err(|_| arena_full())?;
-        if let (Some(cursor), Some((state, _))) =
-            (invocation_cursor, super::active_routine_invocations())
-        {
-            state.restore_cursor(cursor);
-        }
-        let mut at = 0usize;
+        let mut out = ArenaList::new(arena);
         let mut any_null = false;
         select_into_rows(
             storage,
@@ -2623,9 +2576,9 @@ fn run_subquery<'a>(
                 // reader. Re-encode the scalar into the statement arena
                 // before retaining it in the subquery result.
                 let encoded = crate::sql::exec::encode_projected_pub(vals, arena)?;
-                out[at] = crate::sql::exec::decode_projected_pub(encoded, 0);
+                out.push(crate::sql::exec::decode_projected_pub(encoded, 0))
+                    .map_err(|_| arena_full())?;
                 any_null |= vals[0].is_null();
-                at += 1;
                 Ok(())
             },
         )?;
@@ -2642,7 +2595,7 @@ fn run_subquery<'a>(
             item,
             outer,
         )?;
-        return Ok((&*out, any_null, witness));
+        return Ok((out.as_slice(), any_null, witness));
     }
 
     // Inner subqueries first.
@@ -2855,36 +2808,8 @@ fn run_subquery<'a>(
         expression_count += 1;
     }
     let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
-    let invocation_cursor = super::active_routine_invocations().map(|(state, _)| state.cursor());
-    let mut count = 0usize;
-    scan_source_with_pax_columns(
-        storage,
-        &scope,
-        from,
-        txid,
-        select.where_clause,
-        arena,
-        params,
-        &hooks,
-        outer,
-        pax_columns,
-        &mut |_| {
-            count += 1;
-            Ok(true)
-        },
-    )?;
-    let vals = arena
-        .alloc_slice_with(count, |_| Datum::Null)
-        .map_err(|_| arena_full())?;
-    let keys = arena
-        .alloc_slice_with(count * n_keys, |_| Datum::Null)
-        .map_err(|_| arena_full())?;
-    if let (Some(cursor), Some((state, _))) =
-        (invocation_cursor, super::active_routine_invocations())
-    {
-        state.restore_cursor(cursor);
-    }
-    let mut at = 0usize;
+    let mut vals = ArenaList::new(arena);
+    let mut keys = ArenaList::new(arena);
     scan_source_with_pax_columns(
         storage,
         &scope,
@@ -2898,19 +2823,23 @@ fn run_subquery<'a>(
         pax_columns,
         &mut |row| {
             let chained_row = Chained { inner: row, outer };
-            vals[at] = eval_full(item, arena, params, &chained_row, &hooks)?;
-            for (k, o) in select.order_by.iter().enumerate() {
+            let value = eval_full(item, arena, params, &chained_row, &hooks)?;
+            vals.push(value).map_err(|_| arena_full())?;
+            for o in select.order_by.iter() {
                 // A positional `ORDER BY 1` sorts by the single output column.
                 let key = match o.expression {
-                    Expr::Int(_) => vals[at],
+                    Expr::Int(_) => value,
                     e => eval_full(e, arena, params, &chained_row, &hooks)?,
                 };
-                keys[at * n_keys + k] = key;
+                keys.push(key).map_err(|_| arena_full())?;
             }
-            at += 1;
             Ok(true)
         },
     )?;
+
+    let count = vals.len();
+    let vals = vals.as_slice();
+    let keys = keys.as_slice();
 
     // Stable insertion sort of row indices by the ORDER BY keys.
     let order = arena

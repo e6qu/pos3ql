@@ -3961,7 +3961,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         continue;
                     }
                     let slot = match statistics
-                        .as_slice()
+                        .borrowed_slice()
                         .iter()
                         .position(|candidate| candidate.word == word)
                     {
@@ -3977,7 +3977,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                             statistics.len() - 1
                         }
                     };
-                    let statistic = &mut statistics.as_mut_slice()[slot];
+                    let statistic = &mut statistics.as_mut_slice().map_err(|_| arena_full())?[slot];
                     statistic.documents = statistic.documents.saturating_add(1);
                     statistic.entries = statistic.entries.saturating_add(occurrences);
                 }
@@ -3986,6 +3986,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         )?;
         statistics
             .as_mut_slice()
+            .map_err(|_| arena_full())?
             .sort_unstable_by(|left, right| right.word.cmp(left.word));
         const EMPTY: &[u8] = &[];
         let rows = arena

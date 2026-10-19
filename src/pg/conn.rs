@@ -5817,9 +5817,16 @@ mod tests {
             config.max_tables = 8;
             config.table_rows = 64;
             config.max_connections = 4;
+            config.max_prepared = 2;
+            config.max_portals = 2;
+            config.txn_rows = 64;
+            config.max_ddl_per_transaction = 16;
+            config.max_savepoints_per_transaction = 4;
+            config.commit_queue_slots = 2;
             config.max_prepared_transactions = 1;
             config.wal_bytes = 1 << 20;
             config.wal_buffer_bytes = 1 << 16;
+            config.wal_upload_buffer_bytes = 1 << 16;
             config.object_store_on = true;
             config.object_store_sim = true;
             config.object_store_bucket = name;

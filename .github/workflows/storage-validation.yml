@@ -39,6 +39,7 @@ jobs:
         run: cargo clean -p pos3ql
 
       - name: Formatting and static guards
+        id: static
         run: |
           cargo fmt --check
           git diff --check
@@ -66,12 +67,16 @@ jobs:
           done
 
       - name: Lint production code
+        if: ${{ !cancelled() && steps.static.outcome == 'success' }}
         run: cargo clippy --lib --bins -- -D warnings
 
       - name: Build release executable
+        if: ${{ !cancelled() && steps.static.outcome == 'success' }}
+        id: build
         run: cargo build --release --locked
 
       - name: PostgreSQL 18 client for protocol checks
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           mkdir -p .ci-bin
           sed 's/^          //' > .ci-bin/psql <<'SH'
@@ -82,9 +87,11 @@ jobs:
           .ci-bin/psql --version
 
       - name: Python clients for protocol and durability checks
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         uses: ./.github/actions/python-test-environment
 
       - name: Raw protocol and object-store durability
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           POS3QL_VENV: ${{ github.workspace }}/venv
           POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
@@ -96,6 +103,7 @@ jobs:
           grep -q '^PASS:' "$RUNNER_TEMP/storage-protocol.log"
 
       - name: Release install and actual failover
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           tools/package-release.sh "$RUNNER_TEMP/dist"
           tools/test-release-package.sh "$RUNNER_TEMP"/dist/pos3ql-*.tar.gz

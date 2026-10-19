@@ -346,7 +346,7 @@ impl OwnedObjectStore {
             .owners
             .checked_add(1)
             .expect("atomic read owners are bounded by the execution stack");
-        self.read_mode = ObjectReadMode::Atomic;
+        self.disable_async_gets();
     }
 
     pub(crate) fn leave_atomic_reads(&mut self) {
@@ -355,12 +355,6 @@ impl OwnedObjectStore {
         if self.atomic_reads.owners == 0 {
             self.read_mode = self.atomic_reads.enclosing_mode;
         }
-    }
-
-    fn disable_async_gets(&mut self) {
-        // Atomic misses use the separate synchronous client. An existing
-        // reactor request keeps its socket, body, error and demand ownership.
-        self.read_mode = ObjectReadMode::Atomic;
     }
 
     fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
@@ -913,7 +907,9 @@ impl BlockStore for OwnedObjectStore {
     }
 
     fn disable_async_gets(&mut self) {
-        self.disable_async_gets();
+        // Atomic misses use the separate synchronous client. An existing
+        // reactor request keeps its socket, body, error and demand ownership.
+        self.read_mode = ObjectReadMode::Atomic;
     }
 
     fn async_gets_enabled(&self) -> bool {

@@ -31,6 +31,8 @@ now retain results for each waiting query. Table slices and paced merges now
 emit owned batches through separate physical upload clients. Selected table
 bytes survive later updates; replaced layouts cancel their captured output.
 Retained writers wait for every upload before continuing or exposing table files.
+Captured rows retain later deletion markers until the complete file list installs,
+so DELETE and TRUNCATE cannot resurrect rows during capture.
 Secondary indexes, manifest publication, remaining read progress and fairness,
 and complete failure/recovery evidence remain acceptance work in this same PR.
 

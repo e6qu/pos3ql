@@ -87738,3 +87738,85 @@ fn parallel_physical_table_handles_stay_private_until_uploads_complete() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
+
+#[test]
+fn parallel_physical_table_capture_releases_deletion_owners_on_failure_and_drop() {
+    for captured in [false, true] {
+        let mut config = test_config(&format!("physical-deletion-owner-{captured}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket =
+            format!("physical-deletion-owner-{captured}-{}", std::process::id());
+        config.max_tables = 4;
+        config.table_rows = 4;
+        config.checkpoint_write_entries = if captured { 4 } else { 1 };
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE deletion_owner(id integer); INSERT INTO deletion_owner VALUES(1),(2)",
+        );
+        assert!(error_sqlstates(&setup).is_empty());
+        let table = engine
+            .storage
+            .find_table("public", "deletion_owner")
+            .unwrap();
+        let capture = engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage);
+        if captured {
+            assert!(matches!(
+                capture.unwrap(),
+                crate::checkpoint::CheckpointStep::Working
+            ));
+        } else {
+            assert_eq!(
+                capture
+                    .err()
+                    .expect("bounded schedule must exhaust")
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+        }
+        let deleted = run_with(
+            &mut engine,
+            &mut budget,
+            "DELETE FROM deletion_owner WHERE id=1",
+        );
+        assert!(error_sqlstates(&deleted).is_empty());
+        assert_eq!(
+            engine.storage.table(table).rows.len(),
+            if captured { 2 } else { 1 },
+            "only an owned capture requires an unpublished deletion marker"
+        );
+        drop(engine.ckpt.take());
+        let deleted = run_with(
+            &mut engine,
+            &mut budget,
+            "DELETE FROM deletion_owner WHERE id=2",
+        );
+        assert!(error_sqlstates(&deleted).is_empty());
+        assert_eq!(
+            engine.storage.table(table).rows.len(),
+            usize::from(captured),
+            "dropping the unpublished checkpoint releases retention for later deletes"
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT count(*) FROM deletion_owner"
+            )),
+            ["0"]
+        );
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}

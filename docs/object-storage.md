@@ -46,6 +46,9 @@ qualification are in [the plan](../PLAN.md).
 
 Table output schedules at most the configured number of committed versions,
 processes at most 64 per CPU turn, and stops to drain each emitted batch.
+Deleting or truncating rows during capture retains deletion markers until the
+complete saved-file list installs. For example, deleting an order during its
+first checkpoint cannot make the order reappear after that checkpoint.
 Metadata capture and other atomic maintenance reads can still wait
 synchronously. Rows larger than one block use bounded overflow chains in the
 same generation; reading such a row requires its complete chain.

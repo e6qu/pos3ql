@@ -4,6 +4,12 @@ use super::row_ownership::{acquire, try_mutex};
 use super::*;
 
 impl Storage {
+    /// Retain before scanning row metadata. Row publication observes this owner
+    /// under the same row lock, so a deletion cannot disappear after capture.
+    pub(crate) fn retain_checkpoint_deletions(&self, slot: usize) -> std::sync::Arc<()> {
+        std::sync::Arc::clone(&self.tables[slot].checkpoint_deletions)
+    }
+
     /// Publication still owns storage exclusively until every saved-file list
     /// is installed; only then may unneeded deletion markers disappear.
     pub(crate) fn clear_tombstones(&mut self, slot: usize) {

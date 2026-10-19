@@ -2567,6 +2567,8 @@ pub struct Table {
     pub rows: RowMap,
     /// Changed since the last checkpoint (drives delta checkpoints).
     publication: std::sync::Mutex<TablePublication>,
+    /// Captured unpublished rows need deletion markers until their roots install.
+    checkpoint_deletions: std::sync::Arc<()>,
     /// Planner estimates, transaction-private column versions, and save markers.
     statistics: TableStatisticsOwner,
     /// Per-column sequence state for serial/identity columns: the last value
@@ -17873,6 +17875,7 @@ impl Storage {
             + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
             + 2 * config.collation_scratch_bytes
             + table_slot_capacity(config) * size_of::<Table>()
+            + table_slot_capacity(config) * 2 * size_of::<usize>()
             + config.max_tables * RowMap::budget_bytes(config.table_rows)
             + RowMap::budget_bytes(config.large_object_pages)
             + table_slot_capacity(config).saturating_mul(
@@ -18020,6 +18023,10 @@ impl Storage {
         let pending_table_defs =
             DefinitionVersions::new(budget, pending_table_definition_capacity(config))?;
         let pending_table_statistics = StatisticsVersions::new(config, budget)?;
+        budget.draw(
+            table_capacity * 2 * size_of::<usize>(),
+            "checkpoint deletion guard owners",
+        )?;
         for slot in 0..table_capacity {
             tables
                 .push(Table {
@@ -18046,6 +18053,7 @@ impl Storage {
                         enforcers: [const { None }; MAX_VALUE_ENFORCERS],
                         n_enforcers: 0,
                     }),
+                    checkpoint_deletions: std::sync::Arc::new(()),
                     statistics: TableStatisticsOwner::new(budget)?,
                     serial: std::sync::Mutex::new(TableSerialState::EMPTY),
                     spill_generations: SpillGenerationRoster::new(
@@ -31883,7 +31891,9 @@ impl Storage {
         rowid: u64,
         commit_lsn: u64,
     ) -> Result<(), SqlError> {
-        if self.tables[table_index].spill_generations().is_empty() {
+        if self.tables[table_index].spill_generations().is_empty()
+            && std::sync::Arc::strong_count(&self.tables[table_index].checkpoint_deletions) == 1
+        {
             if self.remove_row_state(table_index, rowid).is_some() {
                 self.mark_value_bindings_changed_at(table_index, commit_lsn);
                 self.tables[table_index].mark_dirty();
@@ -32104,7 +32114,11 @@ impl Storage {
         state.committed_lsn = commit_lsn;
         state.checkpoint_change_lsn = commit_lsn;
         clear_pending_versions(&mut versions.pending_row_versions, &mut state.pending);
-        if state.committed.is_none() && generations.is_empty() && state.history.is_empty() {
+        if state.committed.is_none()
+            && generations.is_empty()
+            && state.history.is_empty()
+            && std::sync::Arc::strong_count(&table.checkpoint_deletions) == 1
+        {
             rows.remove(&rowid);
         }
         publication.generation = generation;

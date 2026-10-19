@@ -635,10 +635,6 @@ struct CheckpointVersion {
     home: Option<RowHome>,
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Retained file ownership stays inline because runtime heap allocation is forbidden"
-)]
 enum TableSlicePhase {
     Clean,
     Write {
@@ -1184,6 +1180,7 @@ pub(crate) struct Checkpointer {
     sliced_lsn: Vec<u64>,
     sliced_layout: Vec<SliceLayout>,
     sliced_this_sweep: Vec<bool>,
+    checkpoint_deletions: Vec<Option<std::sync::Arc<()>>>,
     /// The slice writer (reset per table) and the merge writer, which holds
     /// a half-written SST across beats — the reason the writer owns its
     /// state instead of borrowing an arena.
@@ -1313,6 +1310,7 @@ impl Checkpointer {
                 + 2 * core::mem::size_of::<u64>()
                 + core::mem::size_of::<SliceLayout>()
                 + core::mem::size_of::<bool>()
+                + core::mem::size_of::<Option<std::sync::Arc<()>>>()
                 + core::mem::size_of::<Option<CompletedMerge>>()
                 + core::mem::size_of::<Option<(BlockId, BlockId)>>())
             + table_capacity
@@ -2066,6 +2064,7 @@ impl Checkpointer {
             sliced_lsn: vec![0; table_capacity],
             sliced_layout: vec![SliceLayout::EMPTY; table_capacity],
             sliced_this_sweep: vec![false; table_capacity],
+            checkpoint_deletions: (0..table_capacity).map(|_| None).collect(),
             slice_writer: SstWriter::new(),
             merge_writer: SstWriter::new(),
             merge_source_cursors: [None, None],
@@ -8458,6 +8457,9 @@ impl Checkpointer {
                 .iter_mut()
                 .for_each(|layout| *layout = SliceLayout::EMPTY);
             self.sliced_this_sweep.iter_mut().for_each(|s| *s = false);
+            self.checkpoint_deletions
+                .iter_mut()
+                .for_each(|guard| *guard = None);
             self.pending_installs.clear();
             self.pending_value_installs.clear();
             self.value_schedule_job = None;
@@ -11937,6 +11939,9 @@ impl Checkpointer {
             }
         }
         self.pending_installs.clear();
+        self.checkpoint_deletions
+            .iter_mut()
+            .for_each(|guard| *guard = None);
         for install in &self.pending_value_installs {
             storage.install_value_binding(
                 install.slot,
@@ -12051,6 +12056,7 @@ impl Checkpointer {
                 .expect("block store lock poisoned")
                 .io_stats(),
         );
+        let deletion_guard = storage.retain_checkpoint_deletions(slot);
         let source = storage.table_row_snapshot(slot, None)?;
         if !source.matches_table(slot, layout.created_at) {
             return Err(sql_err!(
@@ -12137,6 +12143,7 @@ impl Checkpointer {
                 .io_stats(),
             0,
         );
+        self.checkpoint_deletions[slot].get_or_insert(deletion_guard);
         self.table_job = Some(job);
         Ok(false)
     }

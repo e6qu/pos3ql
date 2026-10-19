@@ -89047,11 +89047,13 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
             ["42"]
         );
 
-        // The second expression reads durable rows after the sequence advances.
+        // Correlation makes the cold read depend on the already advanced sequence.
         assert_eq!(
             data_rows(&session.success(
                 &mut engine,
-                "SELECT nextval('effect_sequence') + (SELECT sum(value) FROM effect_rows)",
+                "WITH effect AS MATERIALIZED (SELECT nextval('effect_sequence') AS n) \
+                 SELECT n + (SELECT sum(value) FROM effect_rows WHERE value >= effect.n) \
+                 FROM effect",
                 true
             )),
             ["7"]

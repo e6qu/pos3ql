@@ -643,9 +643,13 @@ BEGIN
   RETURN 1;
 END
 $$;
-SELECT replay_effect_prepare(), (SELECT sum(value) FROM replay_effect_rows);
+WITH effect AS MATERIALIZED (SELECT replay_effect_prepare() AS n)
+SELECT n, (SELECT sum(value) FROM replay_effect_rows WHERE value >= effect.n)
+FROM effect;
 EXECUTE replay_effect_plan(41);
-SELECT nextval('replay_effect_sequence') + (SELECT sum(value) FROM replay_effect_rows);
+WITH effect AS MATERIALIZED (SELECT nextval('replay_effect_sequence') AS n)
+SELECT n + (SELECT sum(value) FROM replay_effect_rows WHERE value >= effect.n)
+FROM effect;
 SELECT currval('replay_effect_sequence');
 DEALLOCATE replay_effect_plan;
 DROP FUNCTION replay_effect_prepare();

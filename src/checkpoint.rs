@@ -1482,6 +1482,19 @@ impl Checkpointer {
             + MERGE_SOURCE_SCRATCH_BYTES
     }
 
+    fn reset_merge_writer(&mut self, storage: &Storage, slot: usize) -> Result<(), SqlError> {
+        self.merge_writer.reset();
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let definition = storage.table(slot).definition();
+        let columns = definition.schema(&mut schema);
+        self.merge_writer
+            .set_pax_schema(&schema[..columns])
+            .map_err(sst_to_sql)?;
+        self.merge_writer
+            .set_packed_fillfactor(definition.storage_options.fillfactor)
+            .map_err(sst_to_sql)
+    }
+
     /// One bounded step of the paced merge — the compaction work a beat may
     /// do between statements. Starting a job, advancing its schedule scan a
     /// few blocks, streaming a few output blocks, or finishing: each is one
@@ -1496,21 +1509,7 @@ impl Checkpointer {
         let Some(mut job) = self.merge_job.take() else {
             if let Some(job) = self.merge_candidate(storage) {
                 self.merge_scratch.clear();
-                self.merge_writer.reset();
-                let mut schema = [ColType::Bool; MAX_COLUMNS];
-                let columns = storage.table(job.slot).definition().schema(&mut schema);
-                self.merge_writer
-                    .set_pax_schema(&schema[..columns])
-                    .map_err(sst_to_sql)?;
-                self.merge_writer
-                    .set_packed_fillfactor(
-                        storage
-                            .table(job.slot)
-                            .definition()
-                            .storage_options
-                            .fillfactor,
-                    )
-                    .map_err(sst_to_sql)?;
+                self.reset_merge_writer(storage, job.slot)?;
                 self.merge_source_cursors = [
                     Some(SstVersionCursor::new(job.old0.handle)),
                     Some(SstVersionCursor::new(job.old1.handle)),
@@ -1560,7 +1559,7 @@ impl Checkpointer {
                 self.block_output
                     .discard(&mut self.block_uploads)
                     .map_err(upload_to_sql)?;
-                self.merge_writer.reset();
+                let reset = self.reset_merge_writer(storage, job.slot);
                 self.merge_scratch.clear();
                 self.merge_source_cursors = [
                     Some(SstVersionCursor::new(job.old0.handle)),
@@ -1574,6 +1573,7 @@ impl Checkpointer {
                 job.count = 0;
                 job.crc = Crc32c::new();
                 self.merge_job = Some(job);
+                reset?;
                 return Err(error);
             }
         };

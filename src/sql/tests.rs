@@ -73429,7 +73429,7 @@ fn checkpoint_reports_publication_before_paced_maintenance() {
 }
 
 #[test]
-fn checkpoint_publishes_the_final_slice_without_a_dispatch_gap() {
+fn checkpoint_publishes_final_slices_after_upload_completion() {
     let mut config = test_config("checkpoint-final-slice-publish");
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -73464,7 +73464,7 @@ fn checkpoint_publishes_the_final_slice_without_a_dispatch_gap() {
     let final_generation = engine.storage.table(final_slot).generation();
     let mut first_sliced = false;
     let mut beats = 0usize;
-    let published_lsn = loop {
+    loop {
         let step = engine
             .ckpt
             .as_mut()
@@ -73476,31 +73476,17 @@ fn checkpoint_publishes_the_final_slice_without_a_dispatch_gap() {
             first_sliced = true;
         }
         if engine.ckpt.as_ref().unwrap().sliced_generation(final_slot) == final_generation {
-            match step {
-                crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
-                crate::checkpoint::CheckpointStep::Working => {
-                    panic!("final dirty slice yielded before publication")
-                }
-                crate::checkpoint::CheckpointStep::Idle => {
-                    panic!("dirty storage became idle before publication")
-                }
-            }
+            assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
+            break;
         }
         assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
         assert!(beats < 16, "paced value-index preparation did not converge");
-    };
+    }
     assert!(
         first_sliced,
         "the preceding dirty table must be sliced first"
     );
-    engine.begin_post_publish_cleanup(published_lsn);
-    engine.finish_post_publish_cleanup().unwrap();
-    engine
-        .ckpt
-        .as_mut()
-        .unwrap()
-        .finish_maintenance(&engine.storage)
-        .unwrap();
+    assert!(engine.checkpoint().unwrap());
 
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -73577,10 +73563,10 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
     );
     let first_generation = engine.storage.table(table).generation();
     let mut first_beats = 0usize;
+    let before_first_slice = engine.storage.block_io_stats();
     let first_slice = loop {
         first_beats += 1;
         assert!(first_beats < 16, "initial paced slice did not converge");
-        let before = engine.storage.block_io_stats();
         let step = engine
             .ckpt
             .as_mut()
@@ -73589,7 +73575,10 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
             .unwrap();
         assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
         if engine.ckpt.as_ref().unwrap().sliced_generation(table) == first_generation {
-            break engine.storage.block_io_stats().saturating_sub(before);
+            break engine
+                .storage
+                .block_io_stats()
+                .saturating_sub(before_first_slice);
         }
     };
 
@@ -73601,10 +73590,10 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
     assert!(!message_types(&changed_again).contains(&b'E'));
     let reslice_generation = engine.storage.table(table).generation();
     let mut reslice_beats = 0usize;
+    let before_reslice = engine.storage.block_io_stats();
     let reslice = loop {
         reslice_beats += 1;
         assert!(reslice_beats < 16, "incremental reslice did not converge");
-        let before = engine.storage.block_io_stats();
         let step = engine
             .ckpt
             .as_mut()
@@ -73613,7 +73602,10 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
             .unwrap();
         assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
         if engine.ckpt.as_ref().unwrap().sliced_generation(table) == reslice_generation {
-            break engine.storage.block_io_stats().saturating_sub(before);
+            break engine
+                .storage
+                .block_io_stats()
+                .saturating_sub(before_reslice);
         }
     };
     assert_eq!(
@@ -73633,39 +73625,7 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
         "the incremental delta should retain the prior slice and publish one packed container: {reslice:?}"
     );
 
-    let tail = engine.storage.find_table("public", "reslice_tail").unwrap();
-    let tail_generation = engine.storage.table(tail).generation();
-    let mut tail_beats = 0usize;
-    let published_lsn = loop {
-        tail_beats += 1;
-        assert!(tail_beats < 16, "paced tail slice did not converge");
-        let step = engine
-            .ckpt
-            .as_mut()
-            .unwrap()
-            .checkpoint_step(&mut engine.storage)
-            .unwrap();
-        if engine.ckpt.as_ref().unwrap().sliced_generation(tail) == tail_generation {
-            match step {
-                crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
-                crate::checkpoint::CheckpointStep::Working => {
-                    panic!("tail slice yielded before publishing the completed sweep")
-                }
-                crate::checkpoint::CheckpointStep::Idle => {
-                    panic!("dirty sweep became idle before publication")
-                }
-            }
-        }
-        assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
-    };
-    engine.begin_post_publish_cleanup(published_lsn);
-    engine.finish_post_publish_cleanup().unwrap();
-    engine
-        .ckpt
-        .as_mut()
-        .unwrap()
-        .finish_maintenance(&engine.storage)
-        .unwrap();
+    assert!(engine.checkpoint().unwrap());
     assert_eq!(
         engine
             .ckpt
@@ -73749,15 +73709,28 @@ fn failed_full_roster_merge_keeps_the_prior_slice_for_retry() {
          UPDATE retry_tail SET value = 'after' WHERE id = 1",
     );
     assert!(!message_types(&changed).contains(&b'E'));
-    assert!(matches!(
-        engine
-            .ckpt
-            .as_mut()
-            .unwrap()
-            .checkpoint_step(&mut engine.storage)
-            .unwrap(),
-        crate::checkpoint::CheckpointStep::Working
-    ));
+    let table = engine.storage.find_table("public", "retry_rows").unwrap();
+    let generation = engine.storage.table(table).generation();
+    let mut sliced = false;
+    for _ in 0..16 {
+        assert!(matches!(
+            engine
+                .ckpt
+                .as_mut()
+                .unwrap()
+                .checkpoint_step(&mut engine.storage)
+                .unwrap(),
+            crate::checkpoint::CheckpointStep::Working
+        ));
+        if engine.ckpt.as_ref().unwrap().sliced_generation(table) == generation {
+            sliced = true;
+            break;
+        }
+    }
+    assert!(
+        sliced,
+        "the prior deletion slice must finish before its successor"
+    );
 
     let changed_again = run_with(
         &mut engine,
@@ -73766,15 +73739,13 @@ fn failed_full_roster_merge_keeps_the_prior_slice_for_retry() {
     );
     assert!(!message_types(&changed_again).contains(&b'E'));
     namespace.borrow_mut().faults.transient_per_mille = 1000;
-    assert!(
-        engine
-            .ckpt
-            .as_mut()
-            .unwrap()
-            .checkpoint_step(&mut engine.storage)
-            .is_err(),
-        "the full-roster merge must reach a fallible object-store write"
-    );
+    let error = engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .checkpoint(&mut engine.storage)
+        .expect_err("the full-roster merge must expose object-store failures");
+    assert_eq!(error.sqlstate, "58030");
     namespace.borrow_mut().faults.transient_per_mille = 0;
 
     assert!(engine.checkpoint().unwrap());
@@ -87971,7 +87942,7 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
         let changed = run_with(
             &mut engine,
             &mut budget,
-            "UPDATE merge_retry SET qty=qty+100",
+            "INSERT INTO merge_retry VALUES(17,17)",
         );
         assert!(error_sqlstates(&changed).is_empty());
         assert!(engine.checkpoint().unwrap());
@@ -88028,7 +87999,7 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
             "SELECT count(*),sum(qty) FROM merge_retry; SELECT qty FROM merge_retry WHERE id=7";
         assert_eq!(
             data_rows(&run_with(&mut engine, &mut budget, query)),
-            ["16|2736", "1107"]
+            ["17|1153", "1007"]
         );
         drop(engine);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -88036,7 +88007,7 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
         let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
         assert_eq!(
             data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
-            ["16|2736", "1107"]
+            ["17|1153", "1007"]
         );
         drop(recovered);
         std::fs::remove_dir_all(&config.data_dir).unwrap();

@@ -383,14 +383,21 @@ mod tests {
             transaction.stage_commit(10, CommitTarget::Ordinary, CommitBarrier::Journal);
             queue.stage(ticket, &mut transaction);
             let work = queue.take_work(ticket);
-            queue.finish_work(ticket, work, Err(sql_err!("08007", "recovery required")));
+            queue.finish_work(
+                ticket,
+                work,
+                Err(sql_err!(
+                    sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                    "recovery required"
+                )),
+            );
             for _ in 0..2 {
                 assert_eq!(
                     queue
                         .receipt(ticket, &mut transaction, &guc)
                         .unwrap_err()
                         .sqlstate,
-                    "08007"
+                    sqlstate::TRANSACTION_RESOLUTION_UNKNOWN
                 );
                 assert_eq!(transaction.staged_commit().unwrap().queue, Some(ticket));
             }

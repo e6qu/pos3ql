@@ -2525,7 +2525,10 @@ impl Engine {
                     sqlstate: error.sqlstate,
                     message: error.message,
                 });
-                return Err(sql_err!("08007", "commit outcome requires recovery"));
+                return Err(sql_err!(
+                    sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                    "commit outcome requires recovery"
+                ));
             }
             result
         } else {
@@ -6510,7 +6513,10 @@ impl Engine {
                 .expect("working commit queue")
                 .finish_work(ticket, work, result);
             if self.fatal_commit_failure.is_some() {
-                return Err(sql_err!("08007", "commit completion requires recovery"));
+                return Err(sql_err!(
+                    sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                    "commit completion requires recovery"
+                ));
             }
         }
         let frontier = self
@@ -7621,7 +7627,7 @@ impl Engine {
                 format_args!("transaction {} requires recovery", txn.txid),
             );
             self.fatal_commit_failure = Some(sql_err!(
-                "08007",
+                sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
                 "rollback requested after irreversible commit boundary"
             ));
             return;
@@ -7798,7 +7804,10 @@ impl Engine {
             checkpointer.advance_background_uploads(now);
         }
         if self.fatal_commit_failure.is_some() {
-            return Err(sql_err!("08007", "commit completion requires recovery"));
+            return Err(sql_err!(
+                sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                "commit completion requires recovery"
+            ));
         }
         self.wal.commit();
         if !self.wal_upload {
@@ -7936,7 +7945,10 @@ impl Engine {
             .as_ref()
             .is_some_and(Checkpointer::writer_was_fenced)
         {
-            return Err(sql_err!("40001", "writer was fenced by a newer process"));
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "writer was fenced by a newer process"
+            ));
         }
         Ok(())
     }
@@ -10141,7 +10153,7 @@ impl Engine {
             if let Err(mut e) = outcome {
                 if self.fatal_commit_failure.is_some() {
                     responder.error(
-                        "08007",
+                        sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
                         "commit completion requires recovery; connection must close",
                     )?;
                     return Ok(ExecutionStatus::Complete);
@@ -10424,7 +10436,7 @@ impl Engine {
             Err(mut e) => {
                 if self.fatal_commit_failure.is_some() {
                     responder.error(
-                        "08007",
+                        sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
                         "commit completion requires recovery; connection must close",
                     )?;
                     return Ok(ExtendedExecutionStatus::Complete(false));

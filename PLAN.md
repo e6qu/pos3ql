@@ -72,7 +72,7 @@ customer receives success before their change is recoverable.
   commit enters the journal. Flush an uncertain commit's terminal error before
   closing its connection.
 - Preserve writer fencing, retries, savepoints, prepared transactions and cold
-  recovery. Never turn an uncertain commit into a claim that it rolled back.
+  recovery. Restore the column layout when retrying a failed merge writer. Never turn an uncertain commit into a claim that it rolled back.
 - Retain COPY completion messages while durability is pending; resume without
   replaying row or statement triggers or consuming later client messages early.
 - Pause transaction boundaries instead of sending internal wait statuses. For

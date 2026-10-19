@@ -24,6 +24,7 @@ pub(crate) struct Ticket {
 
 #[derive(Clone, Copy)]
 pub(crate) enum Condition {
+    ContentAddressed,
     ImmutableCreate,
     PublishAbsent,
     PublishMatch(EntityTag),
@@ -32,6 +33,7 @@ pub(crate) enum Condition {
 impl Condition {
     fn borrowed(&self) -> Precondition<'_> {
         match self {
+            Self::ContentAddressed => Precondition::None,
             Self::ImmutableCreate | Self::PublishAbsent => Precondition::IfNoneMatchAny,
             Self::PublishMatch(etag) => Precondition::IfMatch(etag),
         }
@@ -93,43 +95,40 @@ pub(crate) struct Uploads {
 }
 
 impl Uploads {
-    pub(crate) fn budget_bytes(config: &Config) -> usize {
-        config.object_store_put_slots.saturating_mul(
+    pub(crate) fn budget_bytes(config: &Config, slot_count: usize, body_bytes: usize) -> usize {
+        slot_count.saturating_mul(
             size_of::<Slot>()
                 + size_of::<libc::pollfd>()
                 + Client::budget_bytes(config)
-                + config.wal_upload_buffer_bytes,
+                + body_bytes,
         )
     }
 
-    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, SetupError> {
-        if config.object_store_put_slots < 2 {
+    pub(crate) fn new(
+        config: &Config,
+        slot_count: usize,
+        body_bytes: usize,
+        budget: &mut Budget,
+    ) -> Result<Self, SetupError> {
+        if slot_count == 0 {
             return Err(SetupError::Capacity(
-                "object_store_put_slots must be at least 2",
+                "upload slot count must be greater than zero",
             ));
         }
-        if config.wal_upload_buffer_bytes == 0 {
+        if body_bytes == 0 {
             return Err(SetupError::Capacity(
-                "wal_upload_buffer_bytes must be greater than zero",
+                "upload body bytes must be greater than zero",
             ));
         }
-        let mut slots = FixedVec::new(
-            budget,
-            "object_store_put_slots",
-            config.object_store_put_slots,
-        )?;
-        for _ in 0..config.object_store_put_slots {
+        let mut slots = FixedVec::new(budget, "object upload slots", slot_count)?;
+        for _ in 0..slot_count {
             let slot = Slot {
                 client: {
                     let mut client = Client::new(config, budget)?;
                     client.enable_async_gets();
                     client
                 },
-                body: FixedBuf::new(
-                    budget,
-                    "object_store_upload_body",
-                    config.wal_upload_buffer_bytes,
-                )?,
+                body: FixedBuf::new(budget, "object_store_upload_body", body_bytes)?,
                 key: StackStr::new(),
                 condition: Condition::ImmutableCreate,
                 generation: 0,
@@ -143,11 +142,7 @@ impl Uploads {
         }
         Ok(Self {
             slots,
-            pollfds: FixedVec::new(
-                budget,
-                "object upload poll descriptors",
-                config.object_store_put_slots,
-            )?,
+            pollfds: FixedVec::new(budget, "object upload poll descriptors", slot_count)?,
         })
     }
 
@@ -251,7 +246,10 @@ impl Uploads {
                     match result {
                         Ok(etag) => slot.state = State::Complete(Ok(etag)),
                         Err(Error::WouldBlock) => {}
-                        Err(error) if error.is_precondition_failed() => {
+                        Err(error)
+                            if error.is_precondition_failed()
+                                && !matches!(slot.condition, Condition::ContentAddressed) =>
+                        {
                             slot.conditional_failure = Some(error);
                             // A lost create response can leave the object durable.
                             // Compare every byte, including length, before accepting it.
@@ -288,7 +286,9 @@ impl Uploads {
 
     fn comparison_failure(slot: &mut Slot) -> Error {
         match slot.condition {
-            Condition::ImmutableCreate => Error::Protocol("immutable object collision"),
+            Condition::ImmutableCreate | Condition::ContentAddressed => {
+                Error::Protocol("immutable object collision")
+            }
             Condition::PublishAbsent | Condition::PublishMatch(_) => slot
                 .conditional_failure
                 .take()
@@ -471,6 +471,18 @@ impl Uploads {
             .min()
     }
 
+    pub(crate) fn has_capacity(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| matches!(slot.state, State::Free))
+    }
+
+    pub(crate) fn has_completion(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| matches!(slot.state, State::Complete(_)))
+    }
+
     pub(crate) fn busy(&self) -> bool {
         self.slots
             .iter()
@@ -486,13 +498,13 @@ impl Uploads {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
 
-    fn config(port: u16) -> Config {
+    pub(crate) fn config(port: u16) -> Config {
         let mut config = Config::default_dev();
         config.object_store_on = true;
         config.object_store_endpoint = format!("127.0.0.1:{port}");
@@ -506,7 +518,7 @@ mod tests {
         config
     }
 
-    fn request(stream: &mut TcpStream) -> Vec<u8> {
+    pub(crate) fn request(stream: &mut TcpStream, condition: Precondition<'_>) -> Vec<u8> {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -522,7 +534,15 @@ mod tests {
         };
         let head = core::str::from_utf8(&bytes[..end]).unwrap();
         assert!(head.starts_with("PUT "));
-        assert!(head.contains("if-none-match: *\r\n"));
+        match condition {
+            Precondition::None => {
+                assert!(!head.contains("if-none-match:") && !head.contains("if-match:"))
+            }
+            Precondition::IfNoneMatchAny => assert!(head.contains("if-none-match: *\r\n")),
+            Precondition::IfMatch(etag) => {
+                assert!(head.contains(&format!("if-match: {}\r\n", etag.as_str())))
+            }
+        }
         assert!(head.contains("authorization: AWS4-HMAC-SHA256 "));
         let length: usize = head
             .lines()
@@ -538,7 +558,7 @@ mod tests {
         bytes[end..].to_vec()
     }
 
-    fn reply(stream: &mut TcpStream, etag: &str) {
+    pub(crate) fn reply(stream: &mut TcpStream, etag: &str) {
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -554,14 +574,30 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
             let (mut second, _) = listener.accept().unwrap();
-            assert_eq!(request(&mut first), vec![b'a'; 192 * 1024]);
-            assert_eq!(request(&mut second), vec![b'b'; 192 * 1024]);
+            assert_eq!(
+                request(&mut first, Precondition::IfNoneMatchAny),
+                vec![b'a'; 192 * 1024]
+            );
+            assert_eq!(
+                request(&mut second, Precondition::IfNoneMatchAny),
+                vec![b'b'; 192 * 1024]
+            );
             reply(&mut second, "second");
             held.recv_timeout(Duration::from_secs(5)).unwrap();
             reply(&mut first, "first");
         });
-        let mut budget = Budget::new(Uploads::budget_bytes(&config));
-        let mut uploads = Uploads::new(&config, &mut budget).unwrap();
+        let mut budget = Budget::new(Uploads::budget_bytes(
+            &config,
+            config.object_store_put_slots,
+            config.wal_upload_buffer_bytes,
+        ));
+        let mut uploads = Uploads::new(
+            &config,
+            config.object_store_put_slots,
+            config.wal_upload_buffer_bytes,
+            &mut budget,
+        )
+        .unwrap();
         assert_eq!(budget.remaining(), 0);
         let mut bytes = vec![b'a'; 192 * 1024];
         let first = uploads
@@ -615,8 +651,18 @@ mod tests {
     #[test]
     fn parallel_uploads_reject_capacity_without_stealing_an_owner() {
         let config = config(1);
-        let mut budget = Budget::new(Uploads::budget_bytes(&config));
-        let mut uploads = Uploads::new(&config, &mut budget).unwrap();
+        let mut budget = Budget::new(Uploads::budget_bytes(
+            &config,
+            config.object_store_put_slots,
+            config.wal_upload_buffer_bytes,
+        ));
+        let mut uploads = Uploads::new(
+            &config,
+            config.object_store_put_slots,
+            config.wal_upload_buffer_bytes,
+            &mut budget,
+        )
+        .unwrap();
         let body = vec![0; config.wal_upload_buffer_bytes + 1];
         let first = uploads
             .enqueue("held", b"held", Condition::ImmutableCreate)
@@ -638,8 +684,18 @@ mod tests {
     fn parallel_uploads_cancel_drops_the_socket_and_frees_its_generation() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let config = config(listener.local_addr().unwrap().port());
-        let mut budget = Budget::new(Uploads::budget_bytes(&config));
-        let mut uploads = Uploads::new(&config, &mut budget).unwrap();
+        let mut budget = Budget::new(Uploads::budget_bytes(
+            &config,
+            config.object_store_put_slots,
+            config.wal_upload_buffer_bytes,
+        ));
+        let mut uploads = Uploads::new(
+            &config,
+            config.object_store_put_slots,
+            config.wal_upload_buffer_bytes,
+            &mut budget,
+        )
+        .unwrap();
         let first = uploads
             .enqueue("uncertain", b"body", Condition::ImmutableCreate)
             .unwrap();
@@ -664,8 +720,18 @@ mod tests {
         config.object_store_sim = true;
         config.object_store_bucket = format!("verify-upload-{}", std::process::id());
         super::super::sim::drop_namespace(&config.object_store_bucket);
-        let mut budget = Budget::new(Uploads::budget_bytes(&config));
-        let mut uploads = Uploads::new(&config, &mut budget).unwrap();
+        let mut budget = Budget::new(Uploads::budget_bytes(
+            &config,
+            config.object_store_put_slots,
+            config.wal_upload_buffer_bytes,
+        ));
+        let mut uploads = Uploads::new(
+            &config,
+            config.object_store_put_slots,
+            config.wal_upload_buffer_bytes,
+            &mut budget,
+        )
+        .unwrap();
         for length in [0, 4095, 4096, 4097, 8192, 8193] {
             let key = format!("value-{length}");
             let bytes = vec![b'x'; length];
@@ -711,20 +777,29 @@ mod tests {
             let mut config = config(1);
             let expected = match invalid {
                 0 => {
-                    config.object_store_put_slots = 1;
-                    "object_store_put_slots must be at least 2"
+                    config.object_store_put_slots = 0;
+                    "upload slot count must be greater than zero"
                 }
                 1 => {
                     config.wal_upload_buffer_bytes = 0;
-                    "wal_upload_buffer_bytes must be greater than zero"
+                    "upload body bytes must be greater than zero"
                 }
                 _ => {
                     config.object_store_response_bytes = 0;
                     "object_store_response_bytes must be greater than zero"
                 }
             };
-            let mut budget = Budget::new(Uploads::budget_bytes(&config));
-            let error = match Uploads::new(&config, &mut budget) {
+            let mut budget = Budget::new(Uploads::budget_bytes(
+                &config,
+                config.object_store_put_slots,
+                config.wal_upload_buffer_bytes,
+            ));
+            let error = match Uploads::new(
+                &config,
+                config.object_store_put_slots,
+                config.wal_upload_buffer_bytes,
+                &mut budget,
+            ) {
                 Ok(_) => panic!("invalid upload capacity accepted"),
                 Err(error) => error,
             };

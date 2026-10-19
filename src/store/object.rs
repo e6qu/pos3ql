@@ -24,7 +24,7 @@ use super::{
 
 /// `<prefix><64 hex chars>`, written into a caller-provided buffer so that
 /// naming a block costs nothing.
-fn key_of<'k>(prefix: &str, id: &BlockId, out: &'k mut [u8; 128]) -> &'k str {
+pub(super) fn key_of<'k>(prefix: &str, id: &BlockId, out: &'k mut [u8; 128]) -> &'k str {
     let prefix = prefix.as_bytes();
     out[..prefix.len()].copy_from_slice(prefix);
     let mut hex = [0u8; 64];
@@ -573,6 +573,12 @@ impl OwnedObjectStore {
     }
 }
 
+impl OwnedObjectStore {
+    pub(crate) fn record_puts(&mut self, count: u64) {
+        self.stats.object_puts = self.stats.object_puts.saturating_add(count);
+    }
+}
+
 impl BlockStore for OwnedObjectStore {
     fn put(
         &mut self,
@@ -588,7 +594,7 @@ impl BlockStore for OwnedObjectStore {
             block_type,
             lsn,
         );
-        self.stats.object_puts = self.stats.object_puts.saturating_add(1);
+        self.record_puts(1);
         result
     }
 

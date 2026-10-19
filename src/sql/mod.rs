@@ -7793,6 +7793,9 @@ impl Engine {
         &mut self,
         now: std::time::Instant,
     ) -> Result<bool, SqlError> {
+        if let Some(checkpointer) = self.ckpt.as_mut() {
+            checkpointer.advance_block_uploads(now);
+        }
         if self.fatal_commit_failure.is_some() {
             return Err(sql_err!("08007", "commit completion requires recovery"));
         }
@@ -7888,19 +7891,23 @@ impl Engine {
     }
 
     pub(crate) fn next_publication_deadline(&self) -> Option<std::time::Instant> {
-        if let Some(retry_at) = self
+        let journal = self
             .inflight_publication
             .as_ref()
             .and_then(|pending| pending.retry_at)
-        {
-            Some(retry_at)
-        } else if self.inflight_publication.is_none() && self.wal.pending_batch_bytes() != 0 {
-            Some(std::time::Instant::now())
-        } else {
+            .or_else(|| {
+                (self.inflight_publication.is_none() && self.wal.pending_batch_bytes() != 0)
+                    .then(std::time::Instant::now)
+            });
+        [
+            journal,
             self.ckpt
                 .as_ref()
-                .and_then(Checkpointer::next_upload_deadline)
-        }
+                .and_then(Checkpointer::next_upload_deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub(crate) fn verify_writer_ownership(&mut self) -> Result<(), SqlError> {
@@ -9462,9 +9469,18 @@ impl Engine {
     /// Heap and history cleanup use no object client. Publication and merge
     /// work still wait for statement-owned block reads to finish.
     pub(crate) fn checkpoint_can_progress(&self) -> bool {
+        let output_ready = self.ckpt.as_ref().is_none_or(|checkpointer| {
+            checkpointer.physical_output_ready(std::time::Instant::now())
+        });
         self.post_publish_cleanup.is_some()
             || self.storage.history_cleanup_pending()
-            || (!self.block_reads_pending()
+            || (self
+                .ckpt
+                .as_ref()
+                .is_some_and(|checkpointer| checkpointer.physical_output_pending())
+                && output_ready)
+            || (output_ready
+                && !self.block_reads_pending()
                 && self.unpromoted_commits == 0
                 && !(self.commit_progress == CommitProgressMode::Reactor
                     && self.durable_retry_pending()))
@@ -9479,7 +9495,26 @@ impl Engine {
     /// Critical pressure, heap remapping and other maintenance still
     /// have whole turns. Publication and merge wait for owned reads to finish.
     pub(crate) fn checkpoint_beat(&mut self) -> CheckpointBeat {
+        if let Some(checkpointer) = self.ckpt.as_mut()
+            && checkpointer.physical_output_pending()
+            && checkpointer.physical_output_ready(std::time::Instant::now())
+        {
+            return match checkpointer.advance_physical_output() {
+                Ok(_) => CheckpointBeat::Advanced,
+                Err(error) => {
+                    crate::logging::error_args(
+                        "checkpoint_upload_failed",
+                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                    );
+                    CheckpointBeat::StorageFailure
+                }
+            };
+        }
         let reads_pending = self.block_reads_pending()
+            || self
+                .ckpt
+                .as_ref()
+                .is_some_and(Checkpointer::physical_output_pending)
             || self.unpromoted_commits != 0
             || (self.commit_progress == CommitProgressMode::Reactor
                 && self.durable_retry_pending());
@@ -22709,8 +22744,13 @@ pub(crate) fn test_engine_budget(config: &Config, base: usize) -> Budget {
             + Storage::row_heap_relocation_budget_bytes(config)
             + if config.object_store_on {
                 Checkpointer::workspace_budget_bytes(config)
+                    + Checkpointer::physical_output_budget_bytes(config)
                     + crate::store::BLOCK_SIZE
-                    + crate::object_store::upload::Uploads::budget_bytes(config)
+                    + crate::object_store::upload::Uploads::budget_bytes(
+                        config,
+                        config.object_store_put_slots,
+                        config.wal_upload_buffer_bytes,
+                    )
                     + if config.wal_upload {
                         commit::Queue::budget_bytes(config)
                     } else {

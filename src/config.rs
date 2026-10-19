@@ -321,6 +321,8 @@ pub struct Config {
     /// Independently connected upload slots. Each owns up to
     /// wal_upload_buffer_bytes of immutable request data until completion.
     pub object_store_put_slots: usize,
+    /// Physical-block upload clients, independent of journal publication.
+    pub object_store_block_put_slots: usize,
     /// Deadline after which a pending durable-block GET may use one spare
     /// fixed slot for a duplicate request. Zero disables hedging.
     pub object_store_hedge_after_ms: u64,
@@ -494,6 +496,7 @@ impl Config {
             object_store_response_bytes: 4 * MIB,
             object_store_get_slots: 4,
             object_store_put_slots: 4,
+            object_store_block_put_slots: 4,
             object_store_hedge_after_ms: 0,
             object_store_tls: false,
             object_store_tls_ca_file: String::new(),
@@ -1105,6 +1108,10 @@ impl Config {
                     config.object_store_put_slots =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize;
                 }
+                "object_store_block_put_slots" => {
+                    config.object_store_block_put_slots =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize;
+                }
                 "object_store_get_slots" => {
                     config.object_store_get_slots =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
@@ -1236,6 +1243,12 @@ impl Config {
                 return Err(ConfigError::at(
                     0,
                     "object_store_put_slots must be at least 2".to_string(),
+                ));
+            }
+            if config.object_store_block_put_slots == 0 {
+                return Err(ConfigError::at(
+                    0,
+                    "object_store_block_put_slots must be at least 1".to_string(),
                 ));
             }
             if config.object_store_get_slots == 0 {
@@ -2277,6 +2290,24 @@ sql_arena_bytes = 4096
         // The simulator mode is object storage too.
         let c = Config::parse("object_store = sim\n\ntransaction_mode = mvcc\n").unwrap();
         assert!(c.object_store_sim && c.wal_upload && c.wal_upload_sync);
+    }
+
+    #[test]
+    fn parallel_physical_upload_slots_are_explicit_and_nonzero() {
+        let config = Config::parse(
+            "transaction_mode = mvcc\nobject_store = sim\nobject_store_block_put_slots = 3\n",
+        )
+        .unwrap();
+        assert_eq!(config.object_store_block_put_slots, 3);
+        let error = Config::parse(
+            "transaction_mode = locking\nobject_store = sim\nobject_store_block_put_slots = 0\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("object_store_block_put_slots must be at least 1")
+        );
     }
 
     #[test]

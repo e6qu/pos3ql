@@ -427,9 +427,9 @@ impl SstWriter {
     /// Appends one row. Flushes the current data block first when the row would
     /// not fit, so every block but the last is filled as far as the next row
     /// allows.
-    pub(crate) fn append(
+    pub(crate) fn append<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         rowid: u64,
         row: &[u8],
     ) -> Result<(), SstError> {
@@ -437,9 +437,9 @@ impl SstWriter {
     }
 
     /// Appends one committed image under its durable LSN.
-    pub(crate) fn append_version(
+    pub(crate) fn append_version<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         key: SstKey,
         row: &[u8],
     ) -> Result<(), SstError> {
@@ -486,9 +486,9 @@ impl SstWriter {
     /// A row too large for one block: its tail is written as overflow blocks
     /// first (so their identities are known), then a head entry — alone in its
     /// own data block — carries the chain's identities and the leading chunk.
-    fn append_chained(
+    fn append_chained<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         key: SstKey,
         row: &[u8],
     ) -> Result<(), SstError> {
@@ -505,7 +505,7 @@ impl SstWriter {
         self.flush_data(store)?;
         let mut ids = [BlockId([0u8; 32]); MAX_CHAIN];
         for (i, chunk) in tail.chunks(MAX_PAYLOAD).enumerate() {
-            ids[i] = store.put(chunk, BlockType::SstData, 0)?;
+            ids[i] = store.write_block(chunk, BlockType::SstData, 0)?;
             self.record(ids[i])?;
         }
         let at = 0usize;
@@ -534,17 +534,17 @@ impl SstWriter {
     /// Appends a deletion marker for `rowid`. Ordered with the rows, sized
     /// like an empty entry.
     #[cfg(test)]
-    pub(crate) fn append_tombstone(
+    pub(crate) fn append_tombstone<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         rowid: u64,
     ) -> Result<(), SstError> {
         self.append_tombstone_version(store, SstKey::at(rowid, 0))
     }
 
-    pub(crate) fn append_tombstone_version(
+    pub(crate) fn append_tombstone_version<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         key: SstKey,
     ) -> Result<(), SstError> {
         if let Some(last) = self.last_key
@@ -601,9 +601,9 @@ impl SstWriter {
     /// Adds one unchanged PAX group to this SST by immutable reference.
     /// The descriptor and every column container join the new roster so the
     /// source SST may be collected immediately after publication.
-    pub(crate) fn append_reused_pax_group(
+    pub(crate) fn append_reused_pax_group<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
         reference: DataBlockRef,
         descriptor: &[u8],
     ) -> Result<usize, SstError> {
@@ -655,7 +655,10 @@ impl SstWriter {
         Ok(layout.rows())
     }
 
-    fn flush_data(&mut self, store: &mut dyn BlockStore) -> Result<(), SstError> {
+    fn flush_data<W: super::BlockWriter + ?Sized>(
+        &mut self,
+        store: &mut W,
+    ) -> Result<(), SstError> {
         if self.pending_len == 0 {
             return Ok(());
         }
@@ -681,7 +684,7 @@ impl SstWriter {
             )
             .map_err(|_| SstError::Encoding)?;
             if framed_len > self.packed.len() {
-                DataBlockRef::direct(store.put(
+                DataBlockRef::direct(store.write_block(
                     &self.encoding_buf[..length],
                     BlockType::SstDataPaxV2,
                     0,
@@ -711,7 +714,7 @@ impl SstWriter {
             let (id, framed_len) = super::encode(payload, packed_type, 0, &mut self.compress_buf)
                 .map_err(|_| SstError::Encoding)?;
             if framed_len > self.packed.len() {
-                DataBlockRef::direct(store.put(payload, packed_type, 0)?)
+                DataBlockRef::direct(store.write_block(payload, packed_type, 0)?)
             } else {
                 if self.packed_len + framed_len > self.packed.len() {
                     self.flush_packed(store)?;
@@ -730,12 +733,12 @@ impl SstWriter {
         } else {
             let raw = &self.pending[..self.pending_len];
             match super::lz4::compress(raw, &mut self.compress_buf[..raw.len()]) {
-                Some(n) if n < raw.len() => DataBlockRef::direct(store.put(
+                Some(n) if n < raw.len() => DataBlockRef::direct(store.write_block(
                     &self.compress_buf[..n],
                     BlockType::SstDataV2Lz4,
                     0,
                 )?),
-                _ => DataBlockRef::direct(store.put(raw, BlockType::SstDataV2, 0)?),
+                _ => DataBlockRef::direct(store.write_block(raw, BlockType::SstDataV2, 0)?),
             }
         };
         if let DataBlockRef::Direct(id) = reference {
@@ -748,11 +751,14 @@ impl SstWriter {
         Ok(())
     }
 
-    fn flush_packed(&mut self, store: &mut dyn BlockStore) -> Result<(), SstError> {
+    fn flush_packed<W: super::BlockWriter + ?Sized>(
+        &mut self,
+        store: &mut W,
+    ) -> Result<(), SstError> {
         if self.packed_len == 0 {
             return Ok(());
         }
-        let container = store.put(
+        let container = store.write_block(
             &self.packed[..self.packed_len],
             BlockType::SstPackedContainerV1,
             0,
@@ -773,7 +779,10 @@ impl SstWriter {
         Ok(())
     }
 
-    fn encode_pax_v2(&mut self, store: &mut dyn BlockStore) -> Result<usize, SstError> {
+    fn encode_pax_v2<W: super::BlockWriter + ?Sized>(
+        &mut self,
+        store: &mut W,
+    ) -> Result<usize, SstError> {
         // Descriptor frames already staged for earlier groups must receive an
         // immutable identity before this group's physical extents reuse the
         // same fixed packing buffer.
@@ -850,7 +859,7 @@ impl SstWriter {
             }
             let framed_len = super::HEADER_LEN + column_len;
             if framed_len > self.packed.len() {
-                let direct = store.put(
+                let direct = store.write_block(
                     &self.encoding_buf[..column_len],
                     BlockType::SstDataPaxColumnV1,
                     0,
@@ -959,11 +968,14 @@ impl SstWriter {
         Ok(total)
     }
 
-    fn flush_pax_columns(&mut self, store: &mut dyn BlockStore) -> Result<(), SstError> {
+    fn flush_pax_columns<W: super::BlockWriter + ?Sized>(
+        &mut self,
+        store: &mut W,
+    ) -> Result<(), SstError> {
         if self.packed_len == 0 {
             return Ok(());
         }
-        let container = store.put(
+        let container = store.write_block(
             &self.packed[..self.packed_len],
             BlockType::SstPackedContainerV1,
             0,
@@ -986,7 +998,10 @@ impl SstWriter {
 
     /// Writes the accumulated index entries as one leaf block (the classic
     /// count-prefixed layout) and records it for the root.
-    fn flush_index_leaf(&mut self, store: &mut dyn BlockStore) -> Result<(), SstError> {
+    fn flush_index_leaf<W: super::BlockWriter + ?Sized>(
+        &mut self,
+        store: &mut W,
+    ) -> Result<(), SstError> {
         if self.index_len == 0 {
             return Ok(());
         }
@@ -1011,7 +1026,7 @@ impl SstWriter {
                 packed_references,
             );
         }
-        let id = store.put(&self.compress_buf[..bytes], BlockType::SstIndexV2, 0)?;
+        let id = store.write_block(&self.compress_buf[..bytes], BlockType::SstIndexV2, 0)?;
         self.record(id)?;
         self.leaves[self.leaves_len] = (self.index[0].0, self.index_len as u32, id);
         self.leaves_len += 1;
@@ -1023,9 +1038,9 @@ impl SstWriter {
     /// Flushes the last data block and writes the index. Returns the index
     /// block's identity — the SST's root — or `None` when no rows were written,
     /// since an empty SST has no root to name.
-    pub(crate) fn finish(
+    pub(crate) fn finish<W: super::BlockWriter + ?Sized>(
         &mut self,
-        store: &mut dyn BlockStore,
+        store: &mut W,
     ) -> Result<Option<SstHandle>, SstError> {
         self.flush_data(store)?;
         self.flush_packed(store)?;
@@ -1039,7 +1054,7 @@ impl SstWriter {
             .iter()
             .position(|f| self.key_count * 10 <= f.len() * 8)
             .unwrap_or(self.filters.len() - 1);
-        let filter = store.put(&self.filters[tier], BlockType::SstFilter, 0)?;
+        let filter = store.write_block(&self.filters[tier], BlockType::SstFilter, 0)?;
         self.record(filter)?;
         // The index. One leaf's worth of entries makes the classic single
         // block; more make leaves under a root, so SST size is no longer
@@ -1068,7 +1083,7 @@ impl SstWriter {
                     packed_references,
                 );
             }
-            store.put(&buffer[..bytes], BlockType::SstIndexV2, 0)?
+            store.write_block(&buffer[..bytes], BlockType::SstIndexV2, 0)?
         } else {
             self.flush_index_leaf(store)?;
             let bytes = 8 + self.leaves_len * VERSIONED_ROOT_ENTRY;
@@ -1081,7 +1096,7 @@ impl SstWriter {
                 buffer[at + 16..at + 20].copy_from_slice(&count.to_le_bytes());
                 buffer[at + 20..at + VERSIONED_ROOT_ENTRY].copy_from_slice(&id.0);
             }
-            store.put(&buffer[..bytes], BlockType::SstIndexV2, 0)?
+            store.write_block(&buffer[..bytes], BlockType::SstIndexV2, 0)?
         };
         if self.roster_len == MAX_ROSTER {
             return Err(SstError::TooManyBlocks);
@@ -1097,7 +1112,7 @@ impl SstWriter {
         for (i, id) in self.roster[..self.roster_len].iter().enumerate() {
             buffer[i * 32..i * 32 + 32].copy_from_slice(&id.0);
         }
-        let roster = store.put(&buffer[..roster_bytes], BlockType::SstRoster, 0)?;
+        let roster = store.write_block(&buffer[..roster_bytes], BlockType::SstRoster, 0)?;
         Ok(Some(SstHandle {
             index,
             filter,

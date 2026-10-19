@@ -36,15 +36,23 @@ Those uploads can complete out of order. The commit-head update starts only
 after both succeed. Clients retain their transaction outcome until publication
 and ordered in-memory completion finish, including when the client disconnects.
 
+`object_store_block_put_slots` reserves separate clients for immutable row and
+index output. Paced table merges retain one operation's bytes while its uploads
+overlap; the new file handle stays private until every upload finishes. Table
+slices, secondary-index producers and manifest publication still need the
+remaining integration in [the plan](../PLAN.md).
+
+
 | Setting | Reservation or rejection |
 |---|---|
 | `object_store_get_slots` | Fixed read clients; at least 1 in object-store mode. |
-| `object_store_put_slots` | Fixed upload clients; at least 2 in object-store mode. |
-| `wal_upload_buffer_bytes` | Immutable body bytes per upload slot, plus the engine's captured log batch; must be at least `wal_buffer_bytes`. |
+| `object_store_put_slots` | Fixed journal upload clients; at least 2 in object-store mode. |
+| `object_store_block_put_slots` | Fixed physical-block upload clients; at least 1 in object-store mode. Each reserves one 256 KiB body. |
+| `wal_upload_buffer_bytes` | Immutable body bytes per journal upload slot, plus the engine's captured log batch; must be at least `wal_buffer_bytes`. |
 | `commit_queue_slots` | Complete transaction and session-context buffers retained through asynchronous publication; at least 1 in object-store mode. |
 
-The development fixture selects 4 read slots, 4 upload slots and 4 commit queue
-slots. Size their startup memory reservations explicitly for a deployment.
+The development fixture selects 4 read slots, 4 journal upload slots, 4 physical
+upload slots and 4 commit queue slots. Size their startup memory reservations explicitly for a deployment.
 An exhausted commit queue or log buffer returns SQLSTATE `54000`, naming
 `commit_queue_slots` or `wal_upload_buffer_bytes`. It never grows a pool.
 

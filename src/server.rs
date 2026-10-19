@@ -754,7 +754,9 @@ impl Server {
 
     fn upload_slots(config: &Config) -> usize {
         if config.object_store_on {
-            config.object_store_put_slots
+            config
+                .object_store_put_slots
+                .saturating_add(config.object_store_block_put_slots)
         } else {
             0
         }
@@ -846,7 +848,7 @@ impl Server {
                 "object request slots",
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "object_store_get_slots, object_store_put_slots and max_subscriptions exceed reactor token capacity",
+                    "object_store_get_slots, object_store_put_slots, object_store_block_put_slots and max_subscriptions exceed reactor token capacity",
                 ),
             ));
         }

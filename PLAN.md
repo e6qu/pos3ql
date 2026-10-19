@@ -27,8 +27,10 @@ in one PR. Do not merge a partial implementation.
 The current branch connects concurrent upload clients, ordered durable commit
 completion, selected-column read batches and explicit transaction modes. This
 implementation is still being validated. Shared read ownership and cancellation
-now retain results for each waiting query. Physical output batching and complete
-failure/recovery evidence remain acceptance work in this same PR.
+now retain results for each waiting query. Paced merges now emit owned batches
+through separate physical upload clients. Table slices, secondary indexes,
+manifest publication, fairness and complete failure/recovery evidence remain
+acceptance work in this same PR.
 
 ### Concurrent and batched reads
 

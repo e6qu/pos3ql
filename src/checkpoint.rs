@@ -697,6 +697,8 @@ enum MergePhase {
     Schedule { rank: u8, resume_lo: SstKey },
     /// Streaming scheduled entries into the merged SST from `cursor`.
     Write { cursor: usize },
+    /// The handle is private until its last output emission is durable.
+    Finish { merged: Option<PrevSst> },
 }
 
 /// A merge in flight across beats: which pair of which table's list, and
@@ -1055,9 +1057,20 @@ enum CommitPublication {
     },
 }
 
+// One append may flush a prior group and a maximum chained row; finish may
+// flush column frames, index levels, filter and roster. Index navigation adds
+// its fixed-depth frontier. This reserves one operation, independent of rows.
+const PHYSICAL_EMISSION_BYTES: usize = crate::store::MAX_ASSEMBLED
+    + 8 * crate::store::BLOCK_SIZE
+    + MAX_COLUMNS * (crate::store::HEADER_LEN + 8 + 7)
+    + ValueIndexWriter::budget_bytes();
+const PHYSICAL_EMISSION_OBJECTS: usize = MAX_COLUMNS + 32;
+
 pub(crate) struct Checkpointer {
     pub(crate) client: ObjectStore,
     uploads: crate::object_store::upload::Uploads,
+    block_uploads: crate::object_store::upload::Uploads,
+    block_output: crate::store::BlockWriteBatch,
     commit_publication: Option<CommitPublication>,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
     /// over content-addressed block objects — `block_cache_bytes` and
@@ -1278,12 +1291,28 @@ impl Checkpointer {
             + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
     }
 
+    pub(crate) fn physical_output_budget_bytes(config: &Config) -> usize {
+        crate::object_store::upload::Uploads::budget_bytes(
+            config,
+            config.object_store_block_put_slots,
+            crate::store::BLOCK_SIZE,
+        ) + crate::store::BlockWriteBatch::budget_bytes(
+            PHYSICAL_EMISSION_BYTES,
+            PHYSICAL_EMISSION_OBJECTS,
+        )
+    }
+
     pub(crate) fn budget_bytes(config: &Config) -> usize {
         let table_capacity = crate::storage::table_slot_capacity(config);
         // The metadata client is separate from the block write client, fixed
         // read pool and scratch. Cache tiers draw their own startup budget.
         ObjectStore::budget_bytes(config)
-            + crate::object_store::upload::Uploads::budget_bytes(config)
+            + crate::object_store::upload::Uploads::budget_bytes(
+                config,
+                config.object_store_put_slots,
+                config.wal_upload_buffer_bytes,
+            )
+            + Self::physical_output_budget_bytes(config)
             + OwnedObjectStore::budget_bytes(config)
             + Self::workspace_budget_bytes(config)
             + FixedMap::<BlockId, ()>::budget_bytes(config.checkpoint_live_blocks)
@@ -1354,6 +1383,10 @@ impl Checkpointer {
             .get(job.slot)
             .is_some_and(|list| pair_at(list, job.at) == Some((job.old0.handle, job.old1.handle)));
         if !valid {
+            self.block_output
+                .discard(&mut self.block_uploads)
+                .map_err(upload_to_sql)?;
+            self.merge_writer.reset();
             return Ok(());
         }
         #[cfg(feature = "checkpoint-profile")]
@@ -1361,6 +1394,7 @@ impl Checkpointer {
             match &job.phase {
                 MergePhase::Schedule { .. } => "row_merge_schedule",
                 MergePhase::Write { .. } => "row_merge_write",
+                MergePhase::Finish { .. } => "row_merge_finish",
             },
             checkpoint_profile_start(),
             self.blocks
@@ -1373,6 +1407,7 @@ impl Checkpointer {
                 self.merge_schedule_beat(&mut job, rank, resume_lo)?
             }
             MergePhase::Write { cursor } => self.merge_write_beat(&mut job, cursor)?,
+            MergePhase::Finish { merged } => MergeBeatOutcome::Finished(merged),
         };
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
@@ -1605,6 +1640,7 @@ impl Checkpointer {
     ) -> Result<MergeBeatOutcome, SqlError> {
         let blocks = &self.blocks;
         let writer = &mut self.merge_writer;
+        let output = &mut self.block_output;
         let scratch = &self.merge_scratch;
         let start_blocks = writer.roster_so_far().len();
         let start_reads = blocks
@@ -1615,7 +1651,8 @@ impl Checkpointer {
         let mut cursor = cursor;
         let mut processed = 0usize;
         while cursor < job.schedule_len {
-            if processed >= MERGE_BEAT_ENTRIES
+            if !output.is_empty()
+                || processed >= MERGE_BEAT_ENTRIES
                 || writer.roster_so_far().len() - start_blocks >= MERGE_WRITE_BEAT_BLOCKS
                 || (processed > 0
                     && blocks
@@ -1679,7 +1716,7 @@ impl Checkpointer {
                 if reusable && at == group.data_len() && entries > 0 {
                     let reused = writer
                         .append_reused_pax_group(
-                            &mut *blocks.lock().expect("block store lock poisoned"),
+                            output,
                             group.reference(),
                             &self.merge_source_raw[..group.raw_len()],
                         )
@@ -1742,10 +1779,7 @@ impl Checkpointer {
                     header[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
                     job.crc.update(&header);
                     writer
-                        .append_tombstone_version(
-                            &mut *blocks.lock().expect("block store lock poisoned"),
-                            key,
-                        )
+                        .append_tombstone_version(output, key)
                         .map_err(sst_to_sql)?;
                     job.count += 1;
                 }
@@ -1780,26 +1814,29 @@ impl Checkpointer {
             job.crc.update(&header);
             job.crc.update(&self.merge_row[..len]);
             writer
-                .append_version(
-                    &mut *blocks.lock().expect("block store lock poisoned"),
-                    key,
-                    &self.merge_row[..len],
-                )
+                .append_version(output, key, &self.merge_row[..len])
                 .map_err(sst_to_sql)?;
             job.count += 1;
+        }
+        if !output.is_empty() {
+            job.phase = MergePhase::Write { cursor };
+            return Ok(MergeBeatOutcome::Continue);
         }
         if job.count == 0 {
             return Ok(MergeBeatOutcome::Finished(None));
         }
         let handle = writer
-            .finish(&mut *blocks.lock().expect("block store lock poisoned"))
+            .finish(output)
             .map_err(sst_to_sql)?
             .ok_or_else(|| sql_err!(SQLSTATE_IO, "merge wrote rows but produced no SST"))?;
-        Ok(MergeBeatOutcome::Finished(Some(PrevSst {
-            handle,
-            count: job.count,
-            crc: job.crc.finish(),
-        })))
+        job.phase = MergePhase::Finish {
+            merged: Some(PrevSst {
+                handle,
+                count: job.count,
+                crc: job.crc.finish(),
+            }),
+        };
+        Ok(MergeBeatOutcome::Continue)
     }
 
     /// Builds both clients and every fixed cache/checkpoint buffer at startup.
@@ -1901,8 +1938,26 @@ impl Checkpointer {
         Ok(Self {
             client: ObjectStore::new(config, budget)
                 .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
-            uploads: crate::object_store::upload::Uploads::new(config, budget)
-                .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            uploads: crate::object_store::upload::Uploads::new(
+                config,
+                config.object_store_put_slots,
+                config.wal_upload_buffer_bytes,
+                budget,
+            )
+            .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            block_uploads: crate::object_store::upload::Uploads::new(
+                config,
+                config.object_store_block_put_slots,
+                crate::store::BLOCK_SIZE,
+                budget,
+            )
+            .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            block_output: crate::store::BlockWriteBatch::new(
+                budget,
+                PHYSICAL_EMISSION_BYTES,
+                PHYSICAL_EMISSION_OBJECTS,
+            )
+            .map_err(CheckpointSetupError::Budget)?,
             commit_publication: None,
             blocks,
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
@@ -2123,7 +2178,11 @@ impl Checkpointer {
     }
 
     pub(crate) fn object_io_busy(&self) -> bool {
-        self.block_reads_busy() || self.uploads.busy() || self.commit_publication.is_some()
+        self.block_reads_busy()
+            || self.uploads.busy()
+            || self.block_uploads.busy()
+            || !self.block_output.is_empty()
+            || self.commit_publication.is_some()
     }
 
     pub(crate) fn pending_block_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
@@ -2269,6 +2328,7 @@ impl Checkpointer {
             return Err(error);
         }
         self.uploads.replace_credentials(credentials);
+        self.block_uploads.replace_credentials(credentials);
         self.blocks
             .lock()
             .expect("block store lock poisoned")
@@ -2466,19 +2526,70 @@ impl Checkpointer {
     }
 
     pub(crate) fn upload_slots(&self) -> usize {
-        self.uploads.slots()
+        self.uploads.slots() + self.block_uploads.slots()
     }
 
     pub(crate) fn pending_upload_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
-        self.uploads.fd(slot)
+        if slot < self.uploads.slots() {
+            self.uploads.fd(slot)
+        } else {
+            self.block_uploads.fd(slot - self.uploads.slots())
+        }
     }
 
     pub(crate) fn pending_upload_wants_write(&self, slot: usize) -> bool {
-        self.uploads.wants_write(slot)
+        if slot < self.uploads.slots() {
+            self.uploads.wants_write(slot)
+        } else {
+            self.block_uploads.wants_write(slot - self.uploads.slots())
+        }
     }
 
     pub(crate) fn next_upload_deadline(&self) -> Option<std::time::Instant> {
-        self.uploads.next_deadline()
+        [
+            self.uploads.next_deadline(),
+            self.block_output.deadline(&self.block_uploads),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    pub(crate) fn advance_block_uploads(&mut self, now: std::time::Instant) {
+        self.block_uploads.advance(now);
+    }
+
+    pub(crate) fn physical_output_ready(&self, now: std::time::Instant) -> bool {
+        self.block_output.ready(&self.block_uploads, now)
+    }
+
+    pub(crate) fn physical_output_pending(&self) -> bool {
+        !self.block_output.is_empty()
+    }
+
+    pub(crate) fn advance_physical_output(&mut self) -> Result<bool, SqlError> {
+        self.drain_block_output()
+    }
+
+    fn drain_block_output(&mut self) -> Result<bool, SqlError> {
+        if self.block_output.is_empty() {
+            return Ok(true);
+        }
+        let before = self.block_output.object_puts();
+        let result = self
+            .block_output
+            .drain(&mut self.block_uploads, std::time::Instant::now());
+        let requests = self.block_output.object_puts().saturating_sub(before);
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .base_mut()
+            .record_puts(requests);
+        let complete = result.map_err(upload_to_sql)?;
+        if complete {
+            self.block_output.consume();
+        }
+        Ok(complete)
     }
 
     fn finish_immutable_upload(
@@ -8123,7 +8234,13 @@ impl Checkpointer {
         loop {
             match self.checkpoint_step(storage, sort_scratch)? {
                 CheckpointStep::Idle => return Ok(None),
-                CheckpointStep::Working => continue,
+                CheckpointStep::Working => {
+                    if !self.block_output.is_empty() {
+                        self.block_output
+                            .wait_ready(&mut self.block_uploads)
+                            .map_err(upload_to_sql)?;
+                    }
+                }
                 CheckpointStep::Published { lsn } => return Ok(Some(lsn)),
             }
         }
@@ -8188,6 +8305,17 @@ impl Checkpointer {
         sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<CheckpointStep, SqlError> {
         self.observe_retained_root_release(storage);
+        if !self.drain_block_output()? {
+            return Ok(CheckpointStep::Working);
+        }
+        if self
+            .merge_job
+            .as_ref()
+            .is_some_and(|job| matches!(job.phase, MergePhase::Finish { .. }))
+        {
+            self.merge_beat(storage)?;
+            return Ok(CheckpointStep::Working);
+        }
         if self.published_lsn_pending_maintenance.is_some() {
             if let Some(up_to_lsn) = self.commit_prune_through {
                 if self.prune_commit_batch(up_to_lsn)? {
@@ -13959,6 +14087,13 @@ fn sst_to_sql(e: crate::store::SstError) -> SqlError {
                 "block fetch in progress"
             )
         }
+        crate::store::SstError::Store(
+            crate::store::StoreError::WriteBatchBytesExhausted
+            | crate::store::StoreError::WriteBatchObjectsExhausted,
+        ) => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "physical output emission exceeds its startup reservation"
+        ),
         crate::store::SstError::Store(crate::store::StoreError::ReadOwnersExhausted) => {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -18717,4 +18852,57 @@ mod stored_dependency_tests {
             (42, Some(820_497_600_123_456), 0x00aa_bbcc, 0x0011_2233)
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_physical_emission_covers_maximum_chained_row_and_finish() {
+    let mut config = Config::default_dev();
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("physical-emission-bound-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let total = SstWriter::budget_bytes()
+        + crate::store::BlockWriteBatch::budget_bytes(
+            PHYSICAL_EMISSION_BYTES,
+            PHYSICAL_EMISSION_OBJECTS,
+        )
+        + crate::object_store::upload::Uploads::budget_bytes(&config, 1, crate::store::BLOCK_SIZE);
+    let mut budget = Budget::new(total);
+    budget
+        .draw(SstWriter::budget_bytes(), "physical emission test writer")
+        .unwrap();
+    let mut writer = SstWriter::new();
+    let mut output = crate::store::BlockWriteBatch::new(
+        &mut budget,
+        PHYSICAL_EMISSION_BYTES,
+        PHYSICAL_EMISSION_OBJECTS,
+    )
+    .unwrap();
+    let mut uploads = crate::object_store::upload::Uploads::new(
+        &config,
+        1,
+        crate::store::BLOCK_SIZE,
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(budget.used(), total);
+    let mut row = vec![0u8; crate::store::MAX_ASSEMBLED];
+    let mut random = 0x6a09e667f3bcc909u64;
+    for byte in &mut row {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        *byte = random as u8;
+    }
+    crate::mem::guard::forbid_alloc(|| {
+        writer.append(&mut output, 0, b"prior group").unwrap();
+        writer.append(&mut output, 1, &row).unwrap();
+        assert!(!output.is_empty());
+        output.discard(&mut uploads).unwrap();
+        assert!(writer.finish(&mut output).unwrap().is_some());
+        assert!(!output.is_empty());
+        output.discard(&mut uploads).unwrap();
+    });
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }

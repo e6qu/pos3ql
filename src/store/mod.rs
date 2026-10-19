@@ -90,6 +90,7 @@ mod shared;
 mod sst;
 mod tiered;
 mod value;
+mod write_batch;
 
 pub(crate) use navigation::{
     INTERVAL_KEY_BYTES, IntervalSummary, NavigationKind, NavigationSpec, NavigationSummary,
@@ -121,6 +122,7 @@ pub(crate) use value::{
     ValueIndexHandle, ValueIndexPosition, ValueIndexReader, ValueIndexStream, ValueIndexStreamStep,
     ValueIndexWriter, walk_value_roster,
 };
+pub(crate) use write_batch::BlockWriteBatch;
 
 use crate::wal::crc32c::crc32c;
 
@@ -336,6 +338,29 @@ pub(crate) fn decode(bytes: &[u8], verify_identity: bool) -> Result<Block<'_>, B
 /// Opaque identity of a consumer whose suspended operation owns read results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReadOwner(pub(crate) u128);
+
+/// Accepts immutable block bytes and returns their content identity. A batch
+/// writer owns those bytes until its caller completes the uploads; identities
+/// must not enter a published root before that completion.
+pub(crate) trait BlockWriter {
+    fn write_block(
+        &mut self,
+        payload: &[u8],
+        block_type: BlockType,
+        lsn: u64,
+    ) -> Result<BlockId, StoreError>;
+}
+
+impl<T: BlockStore + ?Sized> BlockWriter for T {
+    fn write_block(
+        &mut self,
+        payload: &[u8],
+        block_type: BlockType,
+        lsn: u64,
+    ) -> Result<BlockId, StoreError> {
+        BlockStore::put(self, payload, block_type, lsn)
+    }
+}
 
 /// Where blocks live. The seam the tiered cache, the local grid and the bucket
 /// all sit behind, so the layers above never learn which one answered.
@@ -607,6 +632,10 @@ pub(crate) enum StoreError {
     Corrupt(BlockError),
     /// The caller's buffer is too small for the block.
     BufferTooSmall,
+    /// An immutable output emission exceeded its startup byte reservation.
+    WriteBatchBytesExhausted,
+    /// An immutable output emission exceeded its startup object reservation.
+    WriteBatchObjectsExhausted,
     /// The backing store could not be reached or refused the operation.
     Unavailable,
     /// An object read exceeded its 30-second request deadline.

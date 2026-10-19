@@ -18,6 +18,19 @@ use crate::mem::guard;
 /// possible worker before freezing allocation.
 pub(crate) const CLIENT_SESSION_BYTES: usize = 128 * 1024;
 
+/// Keep TLS diagnostics out of heap-backed I/O errors after startup.
+pub(crate) fn protocol_error(
+    context: &'static str,
+    kind: std::io::ErrorKind,
+    error: rustls::Error,
+) -> std::io::Error {
+    guard::tls_scope(|| {
+        crate::logging::error_args(context, format_args!("{error}"));
+        drop(error);
+    });
+    std::io::Error::from(kind)
+}
+
 /// A client connection: plaintext, or TLS over the same socket.
 pub(crate) enum Transport {
     Plain(Option<TcpStream>),
@@ -91,10 +104,13 @@ impl Transport {
                 match session.conn.read_tls(&mut session.sock) {
                     Ok(0) => {}
                     Ok(_) => {
-                        session
-                            .conn
-                            .process_new_packets()
-                            .map_err(|error| std::io::Error::other(format!("tls: {error}")))?;
+                        session.conn.process_new_packets().map_err(|error| {
+                            protocol_error(
+                                "tls_client_records",
+                                std::io::ErrorKind::InvalidData,
+                                error,
+                            )
+                        })?;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
@@ -150,7 +166,13 @@ impl Transport {
     ) -> std::io::Result<Self> {
         let session =
             guard::tls_scope(|| rustls::ClientConnection::new(config.clone(), server_name.clone()))
-                .map_err(|e| std::io::Error::other(format!("tls session: {e}")))?;
+                .map_err(|error| {
+                    protocol_error(
+                        "tls_client_session",
+                        std::io::ErrorKind::InvalidInput,
+                        error,
+                    )
+                })?;
         Ok(Transport::Tls(Some(guard::tls_scope(|| {
             Box::new(rustls::StreamOwned::new(session, stream))
         }))))
@@ -245,4 +267,77 @@ pub(crate) fn build_context(host: &str, ca_file: &str) -> Result<TlsContext, Str
         config,
         server_name,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_object_tls_failed_and_shrinking_buffers_release_budget() {
+        const CHILD: &str = "POS3QL_TLS_ALLOCATOR_CASE";
+        const MARKER: &[u8] = b"TLS allocator budget recovered";
+        if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+            guard::set_tls_budget(u64::MAX);
+            guard::tls_scope(|| {
+                let impossible = (isize::MAX as usize) / 4;
+                let mut existing = Vec::<u8>::with_capacity(128);
+                assert!(existing.try_reserve_exact(impossible).is_err());
+                let mut empty = Vec::<u8>::new();
+                assert!(empty.try_reserve_exact(impossible).is_err());
+                let layout = std::alloc::Layout::from_size_align(impossible, 8).unwrap();
+                assert!(unsafe { std::alloc::alloc_zeroed(layout) }.is_null());
+            });
+            guard::set_tls_budget(256);
+            for _ in 0..32 {
+                guard::forbid_alloc(|| {
+                    guard::tls_scope(|| {
+                        let mut bytes = Vec::<u8>::with_capacity(128);
+                        bytes.resize(64, 0);
+                        bytes.shrink_to_fit();
+                        drop(std::hint::black_box(bytes));
+                    });
+                    let error =
+                        guard::tls_scope(|| rustls::Error::General("TLS-owned error".to_string()));
+                    let error =
+                        protocol_error("tls_budget_test", std::io::ErrorKind::InvalidData, error);
+                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                });
+            }
+            println!("TLS allocator budget recovered");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "object_store::tls::tests::parallel_object_tls_failed_and_shrinking_buffers_release_budget",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && output
+                    .stdout
+                    .windows(MARKER.len())
+                    .any(|part| part == MARKER),
+            "TLS budget subprocess failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn parallel_object_tls_client_setup_error_is_allocation_free() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut config = build_client_config("").unwrap().config;
+        Arc::get_mut(&mut config).unwrap().max_fragment_size = Some(1);
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let error = crate::mem::guard::forbid_alloc(|| Transport::tls(stream, &config, &name))
+            .err()
+            .expect("invalid record size must reject session setup");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }

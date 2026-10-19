@@ -48,6 +48,12 @@ slots. Size their startup memory reservations explicitly for a deployment.
 An exhausted commit queue or log buffer returns SQLSTATE `54000`, naming
 `commit_queue_slots` or `wal_upload_buffer_bytes`. It never grows a pool.
 
+TLS has a separate startup ceiling. `tls_pool_bytes` supplies the object-store
+base; startup adds 128 KiB for each of the two transports per subscription
+worker, plus 128 KiB per server connection when server TLS is enabled. Choose
+the base for the configured object-store request concurrency. These reservations
+are fixed before the server accepts connections.
+
 Nonblocking reads have a 30-second deadline. Each upload attempt has a
 30-second deadline, with at most three attempts for retryable failures and
 200 ms then 400 ms backoff. A failed conditional create compares the entire

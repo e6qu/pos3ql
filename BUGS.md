@@ -11,7 +11,9 @@ earlier capture-only head do not qualify that expanded scope. Qualification
 must cover the complete implementation on the final PR head, including delayed
 prepared-transaction responses after their slots have been released and reused,
 equal block payloads stored under different types, and failover rejection with
-complete terminal error delivery.
+complete terminal error delivery. TLS error paths must also remain allocation-free
+outside their isolated component. Its budget must be returned after failed
+allocations, buffer shrinking and owned-error cleanup.
 
 For an entry, include a reproducer, affected boundary, observed behavior and
 the specific blocker. Remove repaired entries; preserve provenance in their

@@ -330,9 +330,8 @@ pub struct Config {
     /// Extra PEM root certificates for object-store TLS (self-signed test
     /// endpoints); empty = the compiled-in Mozilla roots alone.
     pub object_store_tls_ca_file: String,
-    /// Byte budget for the isolated TLS component's allocations (the object
-    /// client; every configured outbound subscription worker; and, when
-    /// `tls_on`, every server-side session).
+    /// Base byte ceiling for object-store TLS. Startup adds headroom for
+    /// every subscription transport and, when enabled, server-side session.
     pub tls_pool_bytes: usize,
     /// Server-side TLS: answer the SSLRequest probe with `S` and negotiate TLS
     /// for the client connection. Requires `tls_cert_file` and `tls_key_file`.

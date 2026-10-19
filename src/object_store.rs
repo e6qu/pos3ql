@@ -427,7 +427,7 @@ impl From<http::S3SetupError> for SetupError {
 /// implements the internal semantic contract for deterministic tests.
 #[allow(
     clippy::large_enum_variant,
-    reason = "two long-lived instances per process; boxing buys nothing"
+    reason = "fixed startup client slots retain inline network state"
 )]
 pub(crate) enum Client {
     S3(S3Client),

@@ -13,8 +13,8 @@ use crate::sql::types::{Datum, RangeKind};
 use crate::sql_err;
 
 use super::super::{
-    ColumnLookup, EvalHooks, SqlError, arity_err, eval_full, range_mismatch, sqlstate, text_arg,
-    type_mismatch,
+    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, eval_full, range_mismatch, sqlstate,
+    text_arg, type_mismatch,
 };
 
 /// Handles the range/multirange family. Returns `None` if `name` is not one of

@@ -223,11 +223,12 @@ impl<'arena> DmlRowImages<'arena> {
             })
     }
 
-    fn finish(mut self) -> Self {
+    fn finish(mut self) -> Result<Self, SqlError> {
         self.rows
             .as_mut_slice()
+            .map_err(|_| arena_full())?
             .sort_unstable_by_key(|row| (row.table, row.rowid));
-        self
+        Ok(self)
     }
 
     pub(super) fn bytes(&self, table: usize, rowid: u64) -> Result<&'arena [u8], SqlError> {
@@ -68803,7 +68804,7 @@ pub(super) fn collect_matches<'a>(
             },
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
-        return Ok(images.finish());
+        return images.finish();
     }
     let indexed = if transition.is_none() && !storage.relation_has_descendants(table_index, txid) {
         super::query::dml_indexed_candidates(
@@ -68894,7 +68895,7 @@ pub(super) fn collect_matches<'a>(
     // map is hash-addressed, so restore the monotonic row identity assigned
     // when the heap image was first appended before locks and writes begin.
     scratch.sort_unstable_by_key(|row| row.sort_key());
-    Ok(images.finish())
+    images.finish()
 }
 
 /// Collects target rows that join at least one row of the extra `from` tables
@@ -68976,7 +68977,7 @@ fn collect_join_matches<'a>(
             },
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
-        return Ok(images.finish());
+        return images.finish();
     }
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
@@ -69055,7 +69056,7 @@ fn collect_join_matches<'a>(
             },
         )?;
     }
-    Ok(images.finish())
+    images.finish()
 }
 
 /// Trigger-program variant of `collect_join_matches`. Its transition source
@@ -69142,7 +69143,7 @@ fn collect_join_matches_with_transition<'a>(
             },
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
-        return Ok(images.finish());
+        return images.finish();
     }
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
@@ -69223,7 +69224,7 @@ fn collect_join_matches_with_transition<'a>(
             },
         )?;
     }
-    Ok(images.finish())
+    images.finish()
 }
 
 fn store_row(

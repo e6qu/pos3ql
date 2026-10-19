@@ -88934,8 +88934,10 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         let prefix = format!("/{}/", config.object_store_bucket);
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
+        let hold_response = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server_requests = Arc::clone(&requests);
+        let server_hold_response = Arc::clone(&hold_response);
         let server = std::thread::spawn(move || {
             while !server_stop.load(Ordering::Acquire) {
                 let mut stream = match listener.accept() {
@@ -88972,6 +88974,11 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
                     .expect("fixture block exists")
                     .to_vec();
                 server_requests.fetch_add(1, Ordering::Relaxed);
+                while server_hold_response.load(Ordering::Acquire)
+                    && !server_stop.load(Ordering::Acquire)
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 if let Some(range) = request.lines().find_map(|line| {
                     line.strip_prefix("Range: bytes=")
                         .or_else(|| line.strip_prefix("range: bytes="))
@@ -89075,11 +89082,13 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
 
         // Pure reads still start asynchronously after both success and error.
         let mut output = [0u8; crate::store::MAX_PAYLOAD];
+        hold_response.store(true, Ordering::Release);
         assert_eq!(
             crate::mem::guard::forbid_alloc(|| blocks.lock().unwrap().get(&roster, &mut output)),
             Err(crate::store::StoreError::NotReady)
         );
         assert!(engine.pending_block_read_fd(0).is_some());
+        hold_response.store(false, Ordering::Release);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !engine.advance_pending_block_read(0).unwrap() {
             assert!(
@@ -89097,4 +89106,21 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         server.join().unwrap();
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
+}
+
+#[test]
+fn version_reports_the_compiled_architecture_and_operating_system_without_allocation() {
+    let (mut engine, budget) = test_engine();
+    let output = run_with_fixed_memory(&mut engine, &budget, "SELECT version()", 1 << 20);
+    let rows = data_rows(&output);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].starts_with("PostgreSQL 18."));
+    let (_, target) = rows[0].split_once(" on ").unwrap();
+    assert!(target.starts_with(std::env::consts::ARCH));
+    let os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        std::env::consts::OS
+    };
+    assert!(target.contains(os));
 }

@@ -399,6 +399,11 @@ impl OwnedObjectStore {
         if let Some((started, bytes)) = completed {
             self.record_completed_read(started, bytes);
         }
+        if matches!(&result, Ok(true)) {
+            // A response barrier can postpone a waiter past this socket event.
+            // Keep the completed result runnable after its descriptor retires.
+            self.read_capacity_generation = self.read_capacity_generation.wrapping_add(1);
+        }
         result
     }
 
@@ -551,6 +556,7 @@ impl OwnedObjectStore {
                 slot.pending_error = Some(StoreError::ReadTimedOut);
                 slot.started_at = None;
                 completed = true;
+                self.read_capacity_generation = self.read_capacity_generation.wrapping_add(1);
             }
         }
         if self.admission == crate::object_store::RequestAdmission::Draining {
@@ -616,8 +622,13 @@ impl OwnedObjectStore {
             completed = true;
             self.record_completed_read(now, bytes);
         }
+        let hedge_completed =
+            hedge_bytes.is_some() || self.slots[destination_index].error_id.is_some();
+        if hedge_completed {
+            self.read_capacity_generation = self.read_capacity_generation.wrapping_add(1);
+        }
         self.stats.object_gets = self.stats.object_gets.saturating_add(1);
-        completed || self.slots[destination_index].error_id.is_some()
+        completed || hedge_completed
     }
 }
 
@@ -842,6 +853,7 @@ impl BlockStore for OwnedObjectStore {
         };
         if let Some(bytes) = completed {
             self.record_completed_read(started, bytes);
+            self.read_capacity_generation = self.read_capacity_generation.wrapping_add(1);
         }
         self.stats.object_gets = self.stats.object_gets.saturating_add(1);
         self.stats.object_prefetch_scheduled =
@@ -1072,6 +1084,7 @@ mod tests {
                 let (mut stream, _) = atomic_read_request(&listener);
                 atomic_read_response(&mut stream, &frame, packed, missing);
                 drop(stream);
+                let before_completion = store.read_capacity_generation();
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while !crate::mem::guard::forbid_alloc(|| store.advance_pending_read(0)).unwrap() {
                     assert!(Instant::now() < deadline, "shared response did not arrive");
@@ -1083,6 +1096,12 @@ mod tests {
                     Ok((payload.len(), BlockType::SstData))
                 };
                 crate::mem::guard::forbid_alloc(|| {
+                    // Both consumers can miss the first wakeup behind queued responses.
+                    // Neither a new socket event nor a timeout can wake them now.
+                    assert!(store.pending_read_fd(0).is_none());
+                    assert!(store.next_read_deadline().is_none());
+                    assert!(!OwnedObjectStore::slot_is_free(&store.slots[0]));
+                    assert_ne!(store.read_capacity_generation(), before_completion);
                     store.set_read_owner(Some(ReadOwner(1)));
                     assert_eq!(get(&mut store, &mut output), expected);
                     if !missing {
@@ -1101,7 +1120,10 @@ mod tests {
                         assert_eq!(&output[..payload.len()], payload);
                     }
                     assert!(OwnedObjectStore::slot_is_free(&store.slots[0]));
-                    assert_eq!(store.read_capacity_generation(), 1);
+                    assert_eq!(
+                        store.read_capacity_generation(),
+                        before_completion.wrapping_add(2)
+                    );
                 });
             }
         }
@@ -1230,7 +1252,7 @@ mod tests {
             assert_eq!(cache.io_stats().ram_hits, 1);
             assert_eq!(cache.io_stats().object_gets, 1);
             assert!(OwnedObjectStore::slot_is_free(&cache.inner_mut().slots[0]));
-            assert_eq!(cache.read_capacity_generation(), 1);
+            assert_eq!(cache.read_capacity_generation(), 2);
             assert_eq!(
                 cache.get(&BlockId::of(b"next uncached block"), &mut output),
                 Err(StoreError::NotReady)
@@ -1266,10 +1288,12 @@ mod tests {
                     store.next_read_deadline(),
                     Some(started + Duration::from_secs(30))
                 );
+                let before_timeout = store.read_capacity_generation();
                 assert!(!store.advance_read_deadlines(started + Duration::from_secs(29)));
                 assert!(store.advance_read_deadlines(started + Duration::from_secs(30)));
                 assert!(store.pending_read_fd(0).is_none());
                 assert!(store.next_read_deadline().is_none());
+                assert_ne!(store.read_capacity_generation(), before_timeout);
                 let result = if packed {
                     store.get_packed(&container, 0, 80, &id, &mut output, &mut [])
                 } else {

@@ -59,6 +59,8 @@ fetching the large notes column it did not request.
   first response. Preserve validation, selected versions and completed work on
   resumption; never repeat a data-changing expression.
 - Release shared cache and storage owners before waiting on network I/O.
+- Retain read-completion wakeups until queued responses have been released;
+  a ready result must not leave a customer waiting for another socket event.
 
 ### Concurrent and batched writes
 

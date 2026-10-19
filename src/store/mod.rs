@@ -420,7 +420,8 @@ pub(crate) trait BlockStore {
     /// Releases the current consumer when another tier has supplied the block.
     fn release_read(&mut self, _id: &BlockId) {}
 
-    /// Changes when a consumed or canceled response frees request capacity.
+    /// Changes when a read result arrives or consumption/cancellation frees capacity.
+    /// Retains a wakeup when a response barrier postpones a waiting connection.
     fn read_capacity_generation(&self) -> u64 {
         0
     }

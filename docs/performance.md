@@ -204,6 +204,10 @@ when Docker is used, `postgresql-server.json` and
 description, and container limits,
 the pos3ql startup log with its fixed memory plan, and a derived `report.md`.
 
+Failed benchmark runs retain server logs in the output's `server-logs/` directory,
+alongside workload errors and the host inventory. SQL `version()` reports the
+compilation target rather than a fixed host label.
+
 Both controls run the stock PostgreSQL 18 image with its ordinary local
 storage and database settings. The host-available control has no container CPU
 or memory limit. The resource-matched control limits Docker to the CPUs

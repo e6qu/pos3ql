@@ -44,6 +44,11 @@ cleanup() {
   fi
   release_test_ports
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
+    mkdir -p "$OUTPUT/server-logs"
+    for server_log in "$WORK"/*.log; do
+      [ -f "$server_log" ] || continue
+      cp -- "$server_log" "$OUTPUT/server-logs/"
+    done
     rm -rf -- "$WORK"
   fi
 }

@@ -848,13 +848,7 @@ impl SstWriter {
             if at != column_len {
                 return Err(SstError::Encoding);
             }
-            let (id, framed_len) = super::encode(
-                &self.encoding_buf[..column_len],
-                BlockType::SstDataPaxColumnV1,
-                0,
-                &mut self.compress_buf,
-            )
-            .map_err(|_| SstError::Encoding)?;
+            let framed_len = super::HEADER_LEN + column_len;
             if framed_len > self.packed.len() {
                 let direct = store.put(
                     &self.encoding_buf[..column_len],
@@ -865,6 +859,13 @@ impl SstWriter {
                 self.pax_refs[column] = DataBlockRef::direct(direct);
                 continue;
             }
+            let (id, framed_len) = super::encode(
+                &self.encoding_buf[..column_len],
+                BlockType::SstDataPaxColumnV1,
+                0,
+                &mut self.compress_buf,
+            )
+            .map_err(|_| SstError::Encoding)?;
             let aligned = self.packed_len.next_multiple_of(PAX_COLUMN_ALIGNMENT);
             if aligned + framed_len > self.packed.len() {
                 self.flush_pax_columns(store)?;

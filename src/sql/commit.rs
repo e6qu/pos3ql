@@ -47,7 +47,7 @@ pub(super) struct Queue {
 }
 
 impl Queue {
-    pub fn budget_bytes(config: &Config) -> usize {
+    pub(super) fn budget_bytes(config: &Config) -> usize {
         config.commit_queue_slots.saturating_mul(
             size_of::<Slot>()
                 + TxnState::budget_bytes_with_config(config)
@@ -56,7 +56,7 @@ impl Queue {
         )
     }
 
-    pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+    pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         let mut slots = FixedVec::new(budget, "commit_queue_slots", config.commit_queue_slots)?;
         for _ in 0..config.commit_queue_slots {
             slots
@@ -78,7 +78,7 @@ impl Queue {
         Ok(Self { slots })
     }
 
-    pub fn reserve(
+    pub(super) fn reserve(
         &mut self,
         guc: &GucState,
         identity: ExecutionIdentity,
@@ -123,7 +123,7 @@ impl Queue {
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "stale commit queue ticket"))
     }
 
-    pub fn cancel_reservation(&mut self, ticket: Ticket) {
+    pub(super) fn cancel_reservation(&mut self, ticket: Ticket) {
         let slot = self.slot(ticket).expect("reserved commit ticket");
         let Phase::Reserved(work) = core::mem::replace(&mut slot.phase, Phase::Working) else {
             panic!("only an unlogged reservation may be canceled");
@@ -131,7 +131,7 @@ impl Queue {
         slot.phase = Phase::Free(work);
     }
 
-    pub fn stage(&mut self, ticket: Ticket, transaction: &mut TxnState) {
+    pub(super) fn stage(&mut self, ticket: Ticket, transaction: &mut TxnState) {
         let slot = self.slot(ticket).expect("reserved commit ticket");
         let Phase::Reserved(mut work) = core::mem::replace(&mut slot.phase, Phase::Working) else {
             panic!("commit staging owns its reservation");
@@ -147,7 +147,7 @@ impl Queue {
         slot.phase = Phase::Staged(work);
     }
 
-    pub fn first_staged_lsn(&self) -> Option<u64> {
+    pub(super) fn first_staged_lsn(&self) -> Option<u64> {
         self.slots
             .iter()
             .filter_map(|slot| {
@@ -164,7 +164,7 @@ impl Queue {
             .min()
     }
 
-    pub fn next_ready(&self, durable_lsn: u64) -> Option<Ticket> {
+    pub(super) fn next_ready(&self, durable_lsn: u64) -> Option<Ticket> {
         self.slots
             .iter()
             .enumerate()
@@ -189,7 +189,7 @@ impl Queue {
             .map(|(_, ticket)| ticket)
     }
 
-    pub fn take_work(&mut self, ticket: Ticket) -> Work {
+    pub(super) fn take_work(&mut self, ticket: Ticket) -> Work {
         let slot = self.slot(ticket).expect("ready commit ticket");
         let Phase::Staged(work) = core::mem::replace(&mut slot.phase, Phase::Working) else {
             panic!("commit worker owns staged data");
@@ -197,13 +197,13 @@ impl Queue {
         work
     }
 
-    pub fn finish_work(&mut self, ticket: Ticket, work: Work, result: Result<(), SqlError>) {
+    pub(super) fn finish_work(&mut self, ticket: Ticket, work: Work, result: Result<(), SqlError>) {
         let slot = self.slot(ticket).expect("working commit ticket");
         assert!(matches!(slot.phase, Phase::Working));
         slot.phase = Phase::Ready { work, result };
     }
 
-    pub fn receipt(
+    pub(super) fn receipt(
         &mut self,
         ticket: Ticket,
         transaction: &mut TxnState,
@@ -269,7 +269,10 @@ mod tests {
         let mut budget = Budget::new(bytes);
         let mut queue = Queue::new(&config, &mut budget).unwrap();
         assert_eq!(budget.used(), bytes);
-        let mut caller_budget = Budget::new(1 << 20);
+        let mut caller_budget = Budget::new(
+            GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction)
+                + SeqSession::extra_budget_bytes(config.max_sequences),
+        );
         let guc = GucState::new_with_capacities(
             &mut caller_budget,
             config.max_sequences,
@@ -300,7 +303,12 @@ mod tests {
     #[test]
     fn parallel_commit_queue_promotes_in_log_order_and_retains_unclaimed_receipts() {
         let config = config();
-        let mut budget = Budget::new(Queue::budget_bytes(&config) + (2 << 20));
+        let mut budget = Budget::new(
+            Queue::budget_bytes(&config)
+                + 2 * TxnState::budget_bytes_with_config(&config)
+                + GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction)
+                + SeqSession::extra_budget_bytes(config.max_sequences),
+        );
         let mut queue = Queue::new(&config, &mut budget).unwrap();
         let guc = GucState::new_with_capacities(
             &mut budget,
@@ -352,7 +360,12 @@ mod tests {
     #[test]
     fn parallel_commit_queue_preserves_failed_completion_until_recovery() {
         let config = config();
-        let mut budget = Budget::new(Queue::budget_bytes(&config) + (1 << 20));
+        let mut budget = Budget::new(
+            Queue::budget_bytes(&config)
+                + TxnState::budget_bytes_with_config(&config)
+                + GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction)
+                + SeqSession::extra_budget_bytes(config.max_sequences),
+        );
         let mut queue = Queue::new(&config, &mut budget).unwrap();
         let guc = GucState::new_with_capacities(
             &mut budget,

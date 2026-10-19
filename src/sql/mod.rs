@@ -22554,7 +22554,14 @@ pub(crate) fn test_engine_budget(config: &Config, base: usize) -> Budget {
             + Storage::retained_row_metadata_budget_bytes(config)
             + Storage::row_heap_relocation_budget_bytes(config)
             + if config.object_store_on {
-                Checkpointer::workspace_budget_bytes(config) + crate::store::BLOCK_SIZE
+                Checkpointer::workspace_budget_bytes(config)
+                    + crate::store::BLOCK_SIZE
+                    + crate::object_store::upload::Uploads::budget_bytes(config)
+                    + if config.wal_upload {
+                        commit::Queue::budget_bytes(config)
+                    } else {
+                        0
+                    }
             } else {
                 0
             },

@@ -180,7 +180,7 @@ Similarly, familiar index names describe SQL behavior; they do not imply
 PostgreSQL's on-disk page layout.
 
 - Query execution is still serial. Workspace and catalog synchronization
-  prepare for the [remaining concurrency work](../PLAN.md#remaining-sequence).
+  prepare for the [remaining concurrency work](../PLAN.md#remaining-work-after-storage-io).
 - PostgreSQL's cost model and exact EXPLAIN text are not compatibility complete.
   PostgreSQL parallel-query/JIT and planner/executor hooks do not exist.
 - Heap layout, heap-version `ctid`, transaction-header columns (`xmin`, `xmax`,

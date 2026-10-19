@@ -26,8 +26,7 @@ in one PR. Do not merge a partial implementation.
 
 The current branch connects concurrent upload clients, ordered durable commit
 completion, selected-column read batches and explicit transaction modes. This
-implementation is still being validated. Initial runner compilation errors
-have fixes on this branch; they are not passing evidence. Physical output batching, read-request
+implementation is still being validated. Physical output batching, read-request
 cancellation and complete failure/recovery evidence remain acceptance work in
 this same PR.
 

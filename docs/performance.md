@@ -312,8 +312,9 @@ likewise carry their projected identifier and payload in the immutable index
 generation; their warm and cold performance gates reject an added Sort or a
 base-tuple fetch, while the cold-object correctness regression rejects
 complete-generation reads for finite limits. The
-ungrouped durable shape is two PUTs per transaction: an immutable journal
-object and a compare-and-swap commit-head update.
+ungrouped durable shape is three PUTs per transaction: immutable journal bytes,
+their descriptor, and a compare-and-swap commit-head update. The first two
+uploads can overlap; the commit head is published after both complete.
 
 Absolute timing is recorded but is not a hosted-runner gate. Stable regression
 thresholds require pinned hardware and an independently operated compatible
@@ -322,7 +323,7 @@ reported rather than required to be linear.
 
 ## Remaining qualification
 
-Execution remains serial. The [roadmap](../PLAN.md#remaining-sequence) defines
+Execution remains serial. The [roadmap](../PLAN.md#remaining-work-after-storage-io) defines
 the shared-state and worker prerequisites, representative deployment inputs,
 and required scaling, recovery, freshness, and failover evidence. Timing claims
 require repeated long runs on pinned hardware with independent object storage;

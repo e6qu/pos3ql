@@ -1748,7 +1748,7 @@ impl Conn {
 
         if self.copy.is_some() {
             let step = self.process_copy_message(engine, msg_type, total);
-            if !matches!(step, Step::Close) {
+            if !matches!(step, Step::Close | Step::Parked) {
                 self.recv.consume(total);
             }
             return step;
@@ -2600,6 +2600,7 @@ impl Conn {
             return Step::Parked;
         }
         self.copy_transition_scratch.clear();
+        self.finish_lock_wait();
         let failed = outcome.is_err();
         engine.finish_backend_statement(&self.txn, self.id);
         let mut responder = Responder::new(&mut self.send);
@@ -5560,6 +5561,180 @@ mod tests {
             drop(conn);
             drop(engine);
             std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn parallel_commit_copy_done_retains_its_frame_and_runs_triggers_once() {
+        fn message(conn: &mut Conn, engine: &mut Engine, kind: u8, payload: &[u8]) -> Step {
+            conn.send.clear();
+            assert!(conn.recv.append(&frontend(kind, payload)));
+            crate::mem::guard::forbid_alloc(|| conn.process_message(engine))
+        }
+        fn assert_rows(response: &[u8]) {
+            assert!(!has_backend_message(response, wire::MSG_ERROR_RESPONSE));
+            for expected in [
+                &b"D\0\0\0\x0c\0\x01\0\0\0\x0223"[..],
+                &b"D\0\0\0\x10\0\x02\0\0\0\x011\0\0\0\x012"[..],
+            ] {
+                assert!(
+                    response
+                        .windows(expected.len())
+                        .any(|bytes| bytes == expected),
+                    "{}",
+                    String::from_utf8_lossy(response)
+                );
+            }
+        }
+        const RESULTS: &[u8] = b"SELECT sum(id) FROM copy_pending; \
+            SELECT count(*), sum(n) FROM copy_pending_audit\0";
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            for binary in [false, true] {
+                let mode_name = match mode {
+                    crate::config::TransactionMode::Mvcc => "mvcc",
+                    crate::config::TransactionMode::Locking => "locking",
+                };
+                let name = format!("copy-done-{mode_name}-{binary}-{}", std::process::id());
+                let directory = std::env::temp_dir().join(&name);
+                let mut config = Config::default_dev();
+                config.transaction_mode = mode;
+                config.data_dir = directory.to_string_lossy().into_owned();
+                config.max_tables = 8;
+                config.table_rows = 64;
+                config.max_connections = 4;
+                config.wal_bytes = 1 << 20;
+                config.wal_buffer_bytes = 1 << 16;
+                config.wal_upload_buffer_bytes = 1 << 16;
+                config.object_store_on = true;
+                config.object_store_sim = true;
+                config.object_store_bucket = name;
+                config.wal_upload = true;
+                config.wal_upload_sync = true;
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+                let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut conn = Conn::new(&config, &mut budget).unwrap();
+                conn.phase = Phase::Ready;
+                assert!(matches!(
+                    message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_QUERY,
+                        b"CREATE TABLE copy_pending(id integer PRIMARY KEY); \
+                          CREATE TABLE copy_pending_audit(n bigint); \
+                          CREATE FUNCTION copy_pending_row() RETURNS trigger LANGUAGE plpgsql AS \
+                            'BEGIN NEW.id := NEW.id + 10; RETURN NEW; END'; \
+                          CREATE FUNCTION copy_pending_statement() RETURNS trigger LANGUAGE plpgsql AS \
+                            'BEGIN INSERT INTO copy_pending_audit SELECT count(*) FROM inserted_rows; RETURN NULL; END'; \
+                          CREATE TRIGGER copy_pending_row BEFORE INSERT ON copy_pending \
+                            FOR EACH ROW EXECUTE FUNCTION copy_pending_row(); \
+                          CREATE TRIGGER copy_pending_statement AFTER INSERT ON copy_pending \
+                            REFERENCING NEW TABLE AS inserted_rows \
+                            FOR EACH STATEMENT EXECUTE FUNCTION copy_pending_statement()\0",
+                    ),
+                    Step::Continue
+                ));
+                assert!(!has_backend_message(
+                    conn.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+                engine.commit_wal().unwrap();
+                engine.enable_async_durability();
+                assert!(matches!(
+                    message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_QUERY,
+                        if binary {
+                            b"COPY copy_pending FROM STDIN (FORMAT binary) WHERE id > 0\0"
+                        } else {
+                            b"COPY copy_pending FROM STDIN WHERE id > 0\0"
+                        },
+                    ),
+                    Step::Continue
+                ));
+                let mut data = Vec::new();
+                if binary {
+                    data.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+                    data.extend_from_slice(&[0; 8]);
+                    for id in [1i32, -1, 2] {
+                        data.extend_from_slice(&1i16.to_be_bytes());
+                        data.extend_from_slice(&4i32.to_be_bytes());
+                        data.extend_from_slice(&id.to_be_bytes());
+                    }
+                    data.extend_from_slice(&(-1i16).to_be_bytes());
+                } else {
+                    data.extend_from_slice(b"1\n-1\n2\n");
+                }
+                for chunk in data.chunks(3) {
+                    assert!(matches!(
+                        message(&mut conn, &mut engine, wire::FMSG_COPY_DATA, chunk),
+                        Step::Continue
+                    ));
+                }
+                assert_eq!(conn.copy.as_ref().unwrap().count, 2);
+                assert!(matches!(
+                    message(&mut conn, &mut engine, wire::FMSG_COPY_DONE, &[]),
+                    Step::Parked
+                ));
+                let done = frontend(wire::FMSG_COPY_DONE, &[]);
+                assert_eq!(conn.recv.readable(), done);
+                assert!(conn.send.is_empty());
+                assert!(conn.txn.staged_commit().is_some());
+                assert!(conn.recv.append(&frontend(wire::FMSG_QUERY, RESULTS)));
+                let queued_bytes = conn.recv.len();
+                let journal_lsn = engine.journal_lsn();
+                for _ in 0..2 {
+                    let pending = crate::mem::guard::forbid_alloc(|| {
+                        conn.retry_parked(&mut engine, 0, true).unwrap()
+                    });
+                    assert_eq!(pending.after, After::Continue);
+                    assert!(conn.parked);
+                    assert_eq!(conn.recv.len(), queued_bytes);
+                    assert!(conn.send.is_empty());
+                    assert_eq!(engine.journal_lsn(), journal_lsn);
+                }
+                // Simulator uploads allocate their remote fixture objects.
+                engine.commit_wal().unwrap();
+                let pending = crate::mem::guard::forbid_alloc(|| {
+                    conn.retry_parked(&mut engine, 0, true).unwrap()
+                });
+                assert_eq!(pending.after, After::Continue);
+                assert!(!conn.parked);
+                assert!(!conn.parked_for_io);
+                assert!(conn.recv.is_empty());
+                assert!(conn.copy.is_none());
+                assert!(conn.copy_transition_scratch.is_empty());
+                assert!(conn.txn.staged_commit().is_none());
+                assert_eq!(
+                    conn.send
+                        .readable()
+                        .windows(7)
+                        .filter(|bytes| *bytes == b"COPY 2\0")
+                        .count(),
+                    1
+                );
+                assert_rows(conn.send.readable());
+                drop(conn);
+                drop(engine);
+                std::fs::remove_dir_all(&directory).unwrap();
+                let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut conn = Conn::new(&config, &mut budget).unwrap();
+                conn.phase = Phase::Ready;
+                assert!(matches!(
+                    message(&mut conn, &mut engine, wire::FMSG_QUERY, RESULTS),
+                    Step::Continue
+                ));
+                assert_rows(conn.send.readable());
+                drop(conn);
+                drop(engine);
+                std::fs::remove_dir_all(directory).unwrap();
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            }
         }
     }
 

@@ -62,6 +62,8 @@ customer receives success before their change is recoverable.
   closing its connection.
 - Preserve writer fencing, retries, savepoints, prepared transactions and cold
   recovery. Never turn an uncertain commit into a claim that it rolled back.
+- Retain COPY completion messages while durability is pending; resume without
+  replaying row or statement triggers or consuming later client messages early.
 - Keep reads, durable commits and maintenance from starving one another.
 
 ### Physical layout

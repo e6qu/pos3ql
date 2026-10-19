@@ -9308,6 +9308,7 @@ impl Engine {
         inserted: &exec::CopyTransitionRows,
         finish: CopyFinishMode,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         if txn.staged_commit().is_some() {
             return self.complete_staged_commit(txn, guc);
         }
@@ -9318,7 +9319,6 @@ impl Engine {
         } else {
             exec::TriggerQueueBoundary::Statement
         };
-        let _atomic_reads = self.atomic_block_read_scope();
         self.work.reset();
         let result = Self::copy_finish_with_scratch(
             &mut self.storage,

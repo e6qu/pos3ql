@@ -448,10 +448,10 @@ impl SstWriter {
         {
             return Err(SstError::KeyOutOfOrder);
         }
-        let entry = VERSIONED_ENTRY_HEADER + row.len();
-        if self.pax_enabled && entry > MAX_PAYLOAD {
-            return Err(SstError::Encoding);
+        if row.len() > MAX_ASSEMBLED {
+            return Err(SstError::RowTooLarge);
         }
+        let entry = VERSIONED_ENTRY_HEADER + row.len();
         if entry > MAX_PAYLOAD {
             return self.append_chained(store, key, row);
         }
@@ -528,7 +528,9 @@ impl SstWriter {
             bloom::insert(filter, key.rowid);
         }
         self.key_count += 1;
-        self.flush_data(store)
+        self.reserve_index_slot(store)?;
+        let reference = self.write_direct_data(store)?;
+        self.finish_data_block(key, reference)
     }
 
     /// Appends a deletion marker for `rowid`. Ordered with the rows, sized
@@ -662,12 +664,7 @@ impl SstWriter {
         if self.pending_len == 0 {
             return Ok(());
         }
-        if self.index_len == MAX_DATA_BLOCKS {
-            // One index leaf is full; start another. The finish decides
-            // whether a root is needed over them.
-            self.flush_packed(store)?;
-            self.flush_index_leaf(store)?;
-        }
+        self.reserve_index_slot(store)?;
         let first = self
             .pending_first
             .expect("a non-empty block has a first key");
@@ -731,16 +728,46 @@ impl SstWriter {
                 }
             }
         } else {
-            let raw = &self.pending[..self.pending_len];
-            match super::lz4::compress(raw, &mut self.compress_buf[..raw.len()]) {
-                Some(n) if n < raw.len() => DataBlockRef::direct(store.write_block(
-                    &self.compress_buf[..n],
-                    BlockType::SstDataV2Lz4,
-                    0,
-                )?),
-                _ => DataBlockRef::direct(store.write_block(raw, BlockType::SstDataV2, 0)?),
-            }
+            self.write_direct_data(store)?
         };
+        self.finish_data_block(first, reference)
+    }
+
+    fn reserve_index_slot<W: super::BlockWriter + ?Sized>(
+        &mut self,
+        store: &mut W,
+    ) -> Result<(), SstError> {
+        if self.index_len == MAX_DATA_BLOCKS {
+            self.flush_packed(store)?;
+            self.flush_index_leaf(store)?;
+        }
+        Ok(())
+    }
+
+    fn write_direct_data<W: super::BlockWriter + ?Sized>(
+        &mut self,
+        store: &mut W,
+    ) -> Result<DataBlockRef, SstError> {
+        let raw = &self.pending[..self.pending_len];
+        match super::lz4::compress(raw, &mut self.compress_buf[..raw.len()]) {
+            Some(length) if length < raw.len() => Ok(DataBlockRef::direct(store.write_block(
+                &self.compress_buf[..length],
+                BlockType::SstDataV2Lz4,
+                0,
+            )?)),
+            _ => Ok(DataBlockRef::direct(store.write_block(
+                raw,
+                BlockType::SstDataV2,
+                0,
+            )?)),
+        }
+    }
+
+    fn finish_data_block(
+        &mut self,
+        first: SstKey,
+        reference: DataBlockRef,
+    ) -> Result<(), SstError> {
         if let DataBlockRef::Direct(id) = reference {
             self.record(id)?;
         }

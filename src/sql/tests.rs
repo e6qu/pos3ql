@@ -60282,7 +60282,7 @@ fn configured_table_capacity_survives_checkpoint_retry_and_object_cold_recovery(
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .is_err()
     );
     namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
@@ -71784,7 +71784,7 @@ fn checkpoint_value_source_resumes_inside_a_spilled_pax_block() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap();
         let beat = engine.storage.block_io_stats().saturating_sub(before);
         if value_beat {
@@ -71904,7 +71904,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -71928,7 +71928,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
                 .ckpt
                 .as_mut()
                 .unwrap()
-                .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+                .checkpoint_step(&mut engine.storage)
                 .unwrap(),
             crate::checkpoint::CheckpointStep::Working
         ));
@@ -71945,7 +71945,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -71972,7 +71972,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -71985,7 +71985,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -72008,7 +72008,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -72021,7 +72021,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -72038,7 +72038,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
                 .ckpt
                 .as_mut()
                 .unwrap()
-                .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+                .checkpoint_step(&mut engine.storage)
                 .unwrap(),
             crate::checkpoint::CheckpointStep::Working
         ));
@@ -72051,7 +72051,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .is_err(),
         "the retained writer must surface an object-store failure"
     );
@@ -72077,7 +72077,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap();
         let beat = engine.storage.block_io_stats().saturating_sub(before);
         if writer_beat {
@@ -72140,7 +72140,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
                 .ckpt
                 .as_mut()
                 .unwrap()
-                .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+                .checkpoint_step(&mut engine.storage)
                 .unwrap(),
             crate::checkpoint::CheckpointStep::Working
         ));
@@ -72298,7 +72298,7 @@ fn checkpoint_value_index_merges_changed_rows_with_cold_navigation_base() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap();
         let active_after = engine.ckpt.as_ref().unwrap().value_index_job_active();
         let beat = engine.storage.block_io_stats().saturating_sub(before);
@@ -72787,7 +72787,7 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -72808,7 +72808,7 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
                 .ckpt
                 .as_mut()
                 .unwrap()
-                .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+                .checkpoint_step(&mut engine.storage)
                 .unwrap();
             assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
             engine
@@ -72831,7 +72831,7 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -73202,7 +73202,7 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap()
         {
             crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
@@ -73250,7 +73250,7 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap();
         maintenance_lists += namespace.borrow().list_count - lists_before;
         let after = obsolete_objects(&mut engine);
@@ -73384,7 +73384,7 @@ fn checkpoint_reports_publication_before_paced_maintenance() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap();
         match step {
             crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
@@ -73468,7 +73468,7 @@ fn checkpoint_publishes_the_final_slice_without_a_dispatch_gap() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap();
         beats += 1;
         if engine.ckpt.as_ref().unwrap().sliced_generation(first) == first_generation {
@@ -73584,7 +73584,7 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap();
         assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
         if engine.ckpt.as_ref().unwrap().sliced_generation(table) == first_generation {
@@ -73608,7 +73608,7 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap();
         assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
         if engine.ckpt.as_ref().unwrap().sliced_generation(table) == reslice_generation {
@@ -73642,7 +73642,7 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap();
         if engine.ckpt.as_ref().unwrap().sliced_generation(tail) == tail_generation {
             match step {
@@ -73753,7 +73753,7 @@ fn failed_full_roster_merge_keeps_the_prior_slice_for_retry() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap(),
         crate::checkpoint::CheckpointStep::Working
     ));
@@ -73770,7 +73770,7 @@ fn failed_full_roster_merge_keeps_the_prior_slice_for_retry() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .is_err(),
         "the full-roster merge must reach a fallible object-store write"
     );
@@ -73959,7 +73959,7 @@ fn dirty_full_roster_merges_across_bounded_checkpoint_beats() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap();
         let beat = engine.storage.block_io_stats().saturating_sub(before);
         assert!(
@@ -74111,7 +74111,7 @@ fn row_merge_reuses_unchanged_wide_pax_groups_across_beats() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap();
         let beat = engine.storage.block_io_stats().saturating_sub(before_beat);
         max_beat_gets = max_beat_gets.max(beat.object_gets);
@@ -74829,7 +74829,7 @@ fn published_checkpoint_maintenance_retries_without_fencing_reads() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap()
         {
             crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
@@ -84963,7 +84963,7 @@ fn sliced_heap_cleanup_preserves_journal_suffix_and_empty_cache_recovery() {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap()
         {
             crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
@@ -85433,7 +85433,7 @@ fn publish_cleanup_fixture(engine: &mut Engine) -> u64 {
             .ckpt
             .as_mut()
             .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .checkpoint_step(&mut engine.storage)
             .unwrap()
         {
             crate::checkpoint::CheckpointStep::Published { lsn } => return lsn,
@@ -87370,4 +87370,290 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
+}
+
+#[test]
+fn parallel_physical_table_slices_preserve_interleaved_changes_in_both_modes() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let label = match mode {
+            crate::config::TransactionMode::Mvcc => "mvcc",
+            crate::config::TransactionMode::Locking => "locking",
+        };
+        let mut config = test_config(&format!("physical-table-slice-{label}"));
+        config.transaction_mode = mode;
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket = format!("physical-table-slice-{label}-{}", std::process::id());
+        config.max_tables = 8;
+        config.table_rows = 256;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE physical_rows(id integer, qty integer); \
+             INSERT INTO physical_rows SELECT id, id FROM generate_series(1,192) id",
+        );
+        assert!(
+            error_sqlstates(&setup).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                engine
+                    .ckpt
+                    .as_mut()
+                    .unwrap()
+                    .checkpoint_step(&mut engine.storage)
+                    .unwrap(),
+                crate::checkpoint::CheckpointStep::Working
+            ));
+        }
+        assert!(engine.ckpt.as_ref().unwrap().retained_output_pending());
+        let changes = run_with(
+            &mut engine,
+            &mut budget,
+            "UPDATE physical_rows SET qty = qty + 100 WHERE id = 150; \
+             DELETE FROM physical_rows WHERE id = 151; \
+             INSERT INTO physical_rows VALUES(193,1930)",
+        );
+        assert!(
+            error_sqlstates(&changes).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&changes)
+        );
+        assert!(engine.checkpoint().unwrap());
+        let table = engine
+            .storage
+            .find_table("public", "physical_rows")
+            .unwrap();
+        assert_eq!(
+            engine
+                .ckpt
+                .as_ref()
+                .unwrap()
+                .published_spill_generation_count(table),
+            2,
+            "a later change appends a delta rather than rewriting the captured generation"
+        );
+        let query = "SELECT count(*), sum(qty) FROM physical_rows; \
+                     SELECT qty FROM physical_rows WHERE id = 150; \
+                     SELECT count(*) FROM physical_rows WHERE id = 151; \
+                     SELECT qty FROM physical_rows WHERE id = 193";
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, query)),
+            ["192|20407", "250", "0", "1930"]
+        );
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+            ["192|20407", "250", "0", "1930"]
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+fn parallel_physical_table_slices_discard_replaced_encodings_and_keep_truncation() {
+    for change in 0..3 {
+        let mut config = test_config(&format!("physical-table-replacement-{change}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket =
+            format!("physical-table-replacement-{change}-{}", std::process::id());
+        config.max_tables = 8;
+        config.table_rows = 256;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE replaced_output(id integer, qty integer); \
+             INSERT INTO replaced_output SELECT id, id FROM generate_series(1,192) id",
+        );
+        assert!(error_sqlstates(&setup).is_empty());
+        assert!(matches!(
+            engine
+                .ckpt
+                .as_mut()
+                .unwrap()
+                .checkpoint_step(&mut engine.storage)
+                .unwrap(),
+            crate::checkpoint::CheckpointStep::Working
+        ));
+        assert!(engine.ckpt.as_ref().unwrap().retained_output_pending());
+        let sql = match change {
+            0 => "ALTER TABLE replaced_output ALTER COLUMN qty TYPE integer USING qty + 1000",
+            1 => {
+                "DROP TABLE replaced_output; CREATE TABLE replaced_output(id integer, qty integer); \
+                  INSERT INTO replaced_output VALUES(7,777)"
+            }
+            _ => "TRUNCATE replaced_output; INSERT INTO replaced_output VALUES(7,777)",
+        };
+        let changed = run_with(&mut engine, &mut budget, sql);
+        assert!(
+            error_sqlstates(&changed).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&changed)
+        );
+        assert!(engine.checkpoint().unwrap());
+        let table = engine
+            .storage
+            .find_table("public", "replaced_output")
+            .unwrap();
+        if change < 2 {
+            assert_eq!(
+                engine
+                    .ckpt
+                    .as_ref()
+                    .unwrap()
+                    .published_spill_generation_count(table),
+                1,
+                "replacement discards the old capture instead of appending incompatible data"
+            );
+        }
+        let expected = if change == 0 { "192|210528" } else { "1|777" };
+        let query = "SELECT count(*), sum(qty) FROM replaced_output";
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, query)),
+            [expected]
+        );
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+            [expected]
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+fn parallel_physical_table_write_capacity_names_the_limit_before_publication() {
+    let mut config = test_config("physical-table-write-capacity");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("physical-table-write-capacity-{}", std::process::id());
+    config.max_tables = 4;
+    config.table_rows = 8;
+    config.checkpoint_write_entries = 1;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE output_capacity(id integer); INSERT INTO output_capacity VALUES(1),(2)",
+    );
+    assert!(error_sqlstates(&setup).is_empty());
+    let error = match engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .checkpoint_step(&mut engine.storage)
+    {
+        Err(error) => error,
+        Ok(_) => panic!("overfull checkpoint version schedule was accepted"),
+    };
+    assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    assert!(
+        error
+            .message
+            .as_str()
+            .contains("checkpoint_write_entries exhausted (1)"),
+        "{error:?}"
+    );
+    assert!(!engine.ckpt.as_ref().unwrap().retained_output_pending());
+    let table = engine
+        .storage
+        .find_table("public", "output_capacity")
+        .unwrap();
+    assert_eq!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_spill_generation_count(table),
+        0
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM output_capacity"
+        )),
+        ["2"]
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn parallel_physical_columnar_generations_preserve_overflow_rows_on_cold_recovery() {
+    let mut config = test_config("physical-columnar-overflow");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("physical-columnar-overflow-{}", std::process::id());
+    config.max_tables = 4;
+    config.table_rows = 8;
+    config.memtable_bytes = 8 << 20;
+    config.sql_arena_bytes = 4 << 20;
+    config.work_arena_bytes = 4 << 20;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE overflow_output(id integer, payload text); \
+         INSERT INTO overflow_output VALUES(1,repeat('x',524288)),(2,'short')",
+    );
+    assert!(
+        error_sqlstates(&setup).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    let query = "SELECT id, length(payload), left(payload,1) FROM overflow_output ORDER BY id";
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, query)),
+        ["1|524288|x", "2|5|s"]
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+        ["1|524288|x", "2|5|s"]
+    );
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }

@@ -159,7 +159,7 @@ unsafe impl<'source, 'arena> Sync for OrderedRowSource<'source, 'arena> where
 }
 
 impl<'arena> TableRowSnapshot<'arena> {
-    pub(super) fn matches_table(&self, slot: usize, created_at: u64) -> bool {
+    pub(crate) fn matches_table(&self, slot: usize, created_at: u64) -> bool {
         self.table_slot == slot && self.created_at == created_at
     }
 
@@ -177,6 +177,40 @@ impl<'arena> TableRowSnapshot<'arena> {
             roots: CapturedSpillRoots::capture(storage, image, generations, arena)?,
             pool: Arc::clone(&storage.query_roots),
         })
+    }
+
+    /// Reads a scheduled committed version from this capture's files, even
+    /// after the live heap or table slot has been replaced.
+    pub(crate) fn with_physical_row_bytes<R>(
+        &self,
+        rowid: u64,
+        home: RowHome,
+        read: impl FnOnce(&[u8]) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        match home {
+            RowHome::Heap(location) => {
+                let heap = self.heap.as_ref().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "checkpoint capture has no heap source"
+                    )
+                })?;
+                read(heap.other(location)?)
+            }
+            RowHome::Spilled {
+                len,
+                sst,
+                commit_lsn,
+            } => {
+                let roots = self.roots.owned_source_in(&self.pool)?.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "checkpoint capture has no saved-file source"
+                    )
+                })?;
+                SpilledRowRead::new(roots, rowid, len, sst, commit_lsn)?.with_bytes(read)
+            }
+        }
     }
 
     pub(crate) fn retain<'source>(

@@ -27,10 +27,11 @@ in one PR. Do not merge a partial implementation.
 The current branch connects concurrent upload clients, ordered durable commit
 completion, selected-column read batches and explicit transaction modes. This
 implementation is still being validated. Shared read ownership and cancellation
-now retain results for each waiting query. Paced merges now emit owned batches
-through separate physical upload clients. Table slices, secondary indexes,
-manifest publication, fairness and complete failure/recovery evidence remain
-acceptance work in this same PR.
+now retain results for each waiting query. Table slices and paced merges now
+emit owned batches through separate physical upload clients. Selected table
+bytes survive later updates; replaced layouts cancel their captured output.
+Secondary indexes, manifest publication, remaining read progress and fairness,
+and complete failure/recovery evidence remain acceptance work in this same PR.
 
 ### Concurrent and batched reads
 
@@ -74,6 +75,8 @@ customer receives success before their change is recoverable.
   whether each waiting command started inside a transaction block; retries must
   keep the original restrictions, statement identity, clock and deadline.
 - Keep reads, durable commits and maintenance from starving one another.
+- Permit credential reload between attempts while immutable output bytes remain
+  retained; only live requests own the credentials used to sign them.
 
 ### Physical layout
 

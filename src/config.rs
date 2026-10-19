@@ -293,6 +293,8 @@ pub struct Config {
     pub checkpoint_delete_objects_per_beat: usize,
     /// Physical row-version entries retained while one SST pair is merged.
     pub checkpoint_merge_entries: usize,
+    /// Committed versions scheduled by one retained table checkpoint writer.
+    pub checkpoint_write_entries: usize,
     /// S3-compatible data-plane authority (`host:port`).
     pub object_store_endpoint: String,
     /// Bucket containing this database's durable objects.
@@ -483,6 +485,7 @@ impl Config {
             checkpoint_garbage_batch_objects: 4096,
             checkpoint_delete_objects_per_beat: 16,
             checkpoint_merge_entries: 512 * 1024,
+            checkpoint_write_entries: 64 * 1024,
             object_store_endpoint: "127.0.0.1:9000".to_string(),
             object_store_bucket: "pos3ql".to_string(),
             object_store_prefix: String::new(),
@@ -1052,6 +1055,10 @@ impl Config {
                     config.checkpoint_delete_objects_per_beat =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
+                "checkpoint_write_entries" => {
+                    config.checkpoint_write_entries =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize;
+                }
                 "checkpoint_merge_entries" => {
                     config.checkpoint_merge_entries =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
@@ -1401,6 +1408,7 @@ impl Config {
                 config.checkpoint_delete_objects_per_beat,
             ),
             ("checkpoint_merge_entries", config.checkpoint_merge_entries),
+            ("checkpoint_write_entries", config.checkpoint_write_entries),
         ] {
             if value == 0 {
                 return Err(ConfigError::at(
@@ -2074,6 +2082,7 @@ checkpoint_live_blocks = 8000
 checkpoint_garbage_batch_objects = 3
 checkpoint_delete_objects_per_beat = 2
 checkpoint_merge_entries = 9000
+checkpoint_write_entries = 9001
 sql_arena_bytes = 4096
 ";
         let c = Config::parse(&format!("{text}\ntransaction_mode = mvcc\n")).unwrap();
@@ -2115,6 +2124,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.checkpoint_garbage_batch_objects, 3);
         assert_eq!(c.checkpoint_delete_objects_per_beat, 2);
         assert_eq!(c.checkpoint_merge_entries, 9000);
+        assert_eq!(c.checkpoint_write_entries, 9001);
         assert_eq!(c.sql_arena_bytes, 4096);
         // Untouched keys keep defaults.
         assert_eq!(c.block_cache_bytes, Config::default_dev().block_cache_bytes);
@@ -2201,6 +2211,7 @@ sql_arena_bytes = 4096
             "checkpoint_garbage_batch_objects",
             "checkpoint_delete_objects_per_beat",
             "checkpoint_merge_entries",
+            "checkpoint_write_entries",
         ] {
             let error =
                 Config::parse(&format!("{name} = 0\n\ntransaction_mode = mvcc\n")).unwrap_err();

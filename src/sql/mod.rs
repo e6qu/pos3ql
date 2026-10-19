@@ -8930,7 +8930,7 @@ impl Engine {
         // state machine cannot be rewound as a client statement can.
         let checkpoint = {
             let _atomic_reads = ckpt.atomic_block_read_scope();
-            ckpt.checkpoint(&mut self.storage, &mut self.scratch)
+            ckpt.checkpoint(&mut self.storage)
         };
         match checkpoint? {
             Some(lsn) => {
@@ -9481,6 +9481,12 @@ impl Engine {
                 && output_ready)
             || (output_ready
                 && !self.block_reads_pending()
+                && self
+                    .ckpt
+                    .as_ref()
+                    .is_some_and(Checkpointer::retained_output_pending))
+            || (output_ready
+                && !self.block_reads_pending()
                 && self.unpromoted_commits == 0
                 && !(self.commit_progress == CommitProgressMode::Reactor
                     && self.durable_retry_pending()))
@@ -9504,6 +9510,34 @@ impl Engine {
                 Err(error) => {
                     crate::logging::error_args(
                         "checkpoint_upload_failed",
+                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                    );
+                    CheckpointBeat::StorageFailure
+                }
+            };
+        }
+        let journal_pending = self.unpromoted_commits != 0
+            || (self.commit_progress == CommitProgressMode::Reactor
+                && self.durable_retry_pending());
+        if journal_pending
+            && self.post_publish_cleanup.is_none()
+            && !self.block_reads_pending()
+            && let Some(checkpointer) = self.ckpt.as_mut()
+            && checkpointer.retained_output_pending()
+        {
+            if self.storage.history_cleanup_pending() {
+                let _ = self
+                    .storage
+                    .advance_history_cleanup(core::num::NonZeroUsize::new(64).unwrap());
+            }
+            let atomic_reads = checkpointer.atomic_block_read_scope();
+            let result = checkpointer.advance_retained_output(&self.storage);
+            drop(atomic_reads);
+            return match result {
+                Ok(()) => CheckpointBeat::Advanced,
+                Err(error) => {
+                    crate::logging::error_args(
+                        "checkpoint_output_failed",
                         format_args!("{}: {}", error.sqlstate, error.message.as_str()),
                     );
                     CheckpointBeat::StorageFailure
@@ -9667,14 +9701,13 @@ impl Engine {
         let critical = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85;
         let remote_maintenance_was_pending = ckpt.published_maintenance_pending();
         let checkpoint = if critical {
-            ckpt.checkpoint(&mut self.storage, &mut self.scratch)
-                .map(|published| {
-                    published.map_or(CheckpointStep::Idle, |lsn| CheckpointStep::Published {
-                        lsn,
-                    })
+            ckpt.checkpoint(&mut self.storage).map(|published| {
+                published.map_or(CheckpointStep::Idle, |lsn| CheckpointStep::Published {
+                    lsn,
                 })
+            })
         } else {
-            ckpt.checkpoint_step(&mut self.storage, &mut self.scratch)
+            ckpt.checkpoint_step(&mut self.storage)
         };
         drop(atomic_reads);
         let remote_maintenance_finished =

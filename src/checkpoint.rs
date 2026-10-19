@@ -476,14 +476,18 @@ enum SlotInstall {
 /// earlier immutable delta only when every generation uses the same decoder.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SliceLayout {
-    column_types: [u8; MAX_COLUMNS],
+    created_at: u64,
+    rewrite_generation: u64,
+    column_types: [ColType; MAX_COLUMNS],
     n_columns: u16,
     fillfactor: u8,
 }
 
 impl SliceLayout {
     const EMPTY: Self = Self {
-        column_types: [0; MAX_COLUMNS],
+        created_at: 0,
+        rewrite_generation: 0,
+        column_types: [ColType::Bool; MAX_COLUMNS],
         n_columns: 0,
         fillfactor: 0,
     };
@@ -491,10 +495,12 @@ impl SliceLayout {
     fn from_storage(storage: &Storage, slot: usize) -> Self {
         let definition = &*storage.table(slot).definition();
         let mut layout = Self::EMPTY;
+        layout.created_at = storage.table(slot).created_at();
+        layout.rewrite_generation = storage.table(slot).rewrite_generation();
         layout.n_columns = definition.n_columns as u16;
         layout.fillfactor = definition.storage_options.fillfactor.unwrap_or(0);
         for (target, column) in layout.column_types.iter_mut().zip(definition.columns()) {
-            *target = column.ctype.code();
+            *target = column.ctype;
         }
         layout
     }
@@ -622,6 +628,39 @@ type LoadedValueIndex = (
     crate::storage::ColumnSet,
     ValueIndexHandle,
 );
+
+#[derive(Clone, Copy)]
+struct CheckpointVersion {
+    key: SstKey,
+    home: Option<RowHome>,
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Retained file ownership stays inline because runtime heap allocation is forbidden"
+)]
+enum TableSlicePhase {
+    Clean,
+    Write {
+        source: crate::storage::TableRowSnapshot<'static>,
+        position: usize,
+    },
+    Finish(Option<SstHandle>),
+}
+
+struct TableSliceJob {
+    slot: usize,
+    layout: SliceLayout,
+    generation: u64,
+    through_lsn: u64,
+    reuse_slice: bool,
+    delta: bool,
+    count: u64,
+    crc: Crc32c,
+    installs: [Option<SlotInstall>; 2],
+    install_count: usize,
+    phase: TableSlicePhase,
+}
 
 /// A prior checkpoint's SST reference for one table slot.
 #[derive(Clone, Copy)]
@@ -1071,6 +1110,8 @@ pub(crate) struct Checkpointer {
     uploads: crate::object_store::upload::Uploads,
     block_uploads: crate::object_store::upload::Uploads,
     block_output: crate::store::BlockWriteBatch,
+    table_output: FixedVec<CheckpointVersion>,
+    table_job: Option<TableSliceJob>,
     commit_publication: Option<CommitPublication>,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
     /// over content-addressed block objects — `block_cache_bytes` and
@@ -1299,7 +1340,9 @@ impl Checkpointer {
         ) + crate::store::BlockWriteBatch::budget_bytes(
             PHYSICAL_EMISSION_BYTES,
             PHYSICAL_EMISSION_OBJECTS,
-        )
+        ) + config
+            .checkpoint_write_entries
+            .saturating_mul(core::mem::size_of::<CheckpointVersion>())
     }
 
     pub(crate) fn budget_bytes(config: &Config) -> usize {
@@ -1958,6 +2001,13 @@ impl Checkpointer {
                 PHYSICAL_EMISSION_OBJECTS,
             )
             .map_err(CheckpointSetupError::Budget)?,
+            table_output: FixedVec::new(
+                budget,
+                "checkpoint write entries",
+                config.checkpoint_write_entries,
+            )
+            .map_err(CheckpointSetupError::Budget)?,
+            table_job: None,
             commit_publication: None,
             blocks,
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
@@ -2181,7 +2231,6 @@ impl Checkpointer {
         self.block_reads_busy()
             || self.uploads.busy()
             || self.block_uploads.busy()
-            || !self.block_output.is_empty()
             || self.commit_publication.is_some()
     }
 
@@ -2569,6 +2618,27 @@ impl Checkpointer {
 
     pub(crate) fn advance_physical_output(&mut self) -> Result<bool, SqlError> {
         self.drain_block_output()
+    }
+
+    pub(crate) fn retained_output_pending(&self) -> bool {
+        self.table_job.is_some() || self.merge_job.is_some()
+    }
+
+    /// Already-captured inputs can progress behind later journal uploads.
+    /// This path never starts a sweep or publishes a manifest.
+    pub(crate) fn advance_retained_output(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        assert!(
+            self.block_output.is_empty(),
+            "previous emission must be durable"
+        );
+        assert!(self.retained_output_pending(), "retained physical producer");
+        if self.table_job.is_some() && !(self.merge_turn && self.merge_job.is_some()) {
+            self.merge_turn = true;
+            self.advance_table_slice(storage)
+        } else {
+            self.merge_turn = false;
+            self.merge_beat(storage)
+        }
     }
 
     fn drain_block_output(&mut self) -> Result<bool, SqlError> {
@@ -8226,13 +8296,9 @@ impl Checkpointer {
     /// heap, and overlay transition before another statement runs. Remote
     /// garbage maintenance remains pending and is either paced by later beats
     /// or drained explicitly by [`Self::finish_maintenance`].
-    pub(crate) fn checkpoint(
-        &mut self,
-        storage: &mut Storage,
-        sort_scratch: &mut FixedVec<(u64, RowHome)>,
-    ) -> Result<Option<u64>, SqlError> {
+    pub(crate) fn checkpoint(&mut self, storage: &mut Storage) -> Result<Option<u64>, SqlError> {
         loop {
-            match self.checkpoint_step(storage, sort_scratch)? {
+            match self.checkpoint_step(storage)? {
                 CheckpointStep::Idle => return Ok(None),
                 CheckpointStep::Working => {
                     if !self.block_output.is_empty() {
@@ -8302,12 +8368,15 @@ impl Checkpointer {
     pub(crate) fn checkpoint_step(
         &mut self,
         storage: &mut Storage,
-        sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<CheckpointStep, SqlError> {
-        self.observe_retained_root_release(storage);
         if !self.drain_block_output()? {
             return Ok(CheckpointStep::Working);
         }
+        if self.table_job.is_some() {
+            self.advance_retained_output(storage)?;
+            return Ok(CheckpointStep::Working);
+        }
+        self.observe_retained_root_release(storage);
         if self
             .merge_job
             .as_ref()
@@ -8418,12 +8487,9 @@ impl Checkpointer {
             if !self.needs_slice(storage, slot) {
                 continue;
             }
-            let generation = storage.table(slot).generation();
-            self.build_table_list(storage, sort_scratch, slot)?;
-            self.sliced_generation[slot] = generation;
-            self.sliced_lsn[slot] = storage.lsn();
-            self.sliced_layout[slot] = SliceLayout::from_storage(storage, slot);
-            self.sliced_this_sweep[slot] = true;
+            if !self.begin_table_slice(storage, slot)? {
+                return Ok(CheckpointStep::Working);
+            }
             wrote_slice = true;
             break;
         }
@@ -11908,12 +11974,7 @@ impl Checkpointer {
     /// the earlier immutable delta and appends only versions committed after
     /// its captured LSN. Relation replacements rebuild without a reusable
     /// published base; filled generation rosters are merged before this beat.
-    fn build_table_list(
-        &mut self,
-        storage: &mut Storage,
-        sort_scratch: &mut FixedVec<(u64, RowHome)>,
-        slot: usize,
-    ) -> Result<(), SqlError> {
+    fn begin_table_slice(&mut self, storage: &Storage, slot: usize) -> Result<bool, SqlError> {
         let layout = SliceLayout::from_storage(storage, slot);
         let reuse_slice = self.sliced_this_sweep[slot]
             && self.sliced_layout[slot] == layout
@@ -11924,9 +11985,6 @@ impl Checkpointer {
         } else {
             self.slice_scratch.copy_from(&self.prev_ssts[slot]);
         }
-        // A completed paced merge is part of this publish's base before a
-        // dirty table decides whether its new versions fit as a delta. A
-        // retained slice already incorporated this merge.
         let completed = (!reuse_slice).then(|| {
             self.merge_done[slot].as_ref().and_then(|done| {
                 (pair_at(&self.slice_scratch, done.at)
@@ -11934,34 +11992,26 @@ impl Checkpointer {
                 .then_some((done.at, done.merged))
             })
         });
-        let mut staged_installs = [None; 2];
-        let mut staged_install_count = 0usize;
+        let mut installs = [None; 2];
+        let mut install_count = 0;
         if let Some((at, merged)) = completed.flatten() {
             self.slice_scratch.replace_pair(at, merged);
-            staged_installs[staged_install_count] = Some(SlotInstall::MergePair {
+            installs[install_count] = Some(SlotInstall::MergePair {
                 at,
                 handle: merged.map(|prior| prior.handle),
             });
-            staged_install_count += 1;
+            install_count += 1;
         }
-        // A clean table carries its whole SST list forward untouched.
         let clean = !storage.table(slot).dirty() && self.slice_scratch.n > 0;
-        // A dirty table with spilled SSTs and room flushes a *delta* from the
-        // committed row identities retained in the overlay since the last
-        // checkpoint. Otherwise it rewrites fully. The overlay is already
-        // startup-sized by `table_rows`, so there is no second row-id limit.
         let delta = !clean
             && storage.table(slot).dirty()
             && self.slice_scratch.n > 0
             && self.slice_scratch.n < self.slice_scratch.capacity();
-        let changed_row_after_lsn = delta.then_some(if reuse_slice {
+        let changed_after = delta.then_some(if reuse_slice {
             self.sliced_lsn[slot]
         } else {
             self.manifest_lsn
         });
-
-        // A logical full scan does not enumerate historical object versions.
-        // Filled rosters must use the version-preserving paced merge first.
         if storage.has_active_snapshots()
             && !clean
             && !storage.table(slot).spill_generations().is_empty()
@@ -11973,231 +12023,312 @@ impl Checkpointer {
                 storage.table(slot).definition().name.as_str()
             ));
         }
-
+        let mut job = TableSliceJob {
+            slot,
+            layout,
+            generation: storage.table(slot).generation(),
+            through_lsn: storage.lsn(),
+            reuse_slice,
+            delta,
+            count: 0,
+            crc: Crc32c::new(),
+            installs,
+            install_count,
+            phase: TableSlicePhase::Clean,
+        };
+        if clean {
+            self.complete_table_slice(storage, job)?;
+            return Ok(true);
+        }
         #[cfg(feature = "checkpoint-profile")]
-        let row_started = checkpoint_profile_start();
-        #[cfg(feature = "checkpoint-profile")]
-        let row_before = self
-            .blocks
-            .lock()
-            .expect("block store lock poisoned")
-            .io_stats();
-        if !clean {
-            // Collect rowids; each rowid expands to its current image plus
-            // every snapshot-retained committed version. The scratch remains
-            // one entry per row even when object capacity holds a long chain.
-            sort_scratch.clear();
-            let mut collect = |rowid, state: crate::storage::RowRead<'_>| {
-                use core::ops::ControlFlow;
-                let has_version = state.committed.is_some()
-                    || state.committed_lsn != 0
-                    || !state.history.is_empty();
-                if !has_version {
-                    return Ok(ControlFlow::Continue(()));
+        let profile = (
+            checkpoint_profile_start(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
+        );
+        let source = storage.table_row_snapshot(slot, None)?;
+        if !source.matches_table(slot, layout.created_at) {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table identity changed during checkpoint capture"
+            ));
+        }
+        self.table_output.clear();
+        let entries = &mut self.table_output;
+        let mut collect = |rowid, state: crate::storage::RowRead<'_>| {
+            use core::ops::ControlFlow;
+            if changed_after.is_some_and(|floor| state.checkpoint_change_lsn <= floor) {
+                return Ok(ControlFlow::Continue(()));
+            }
+            let mut version = |lsn, home, current| -> Result<(), SqlError> {
+                if slice_after_lsn.is_some_and(|floor| lsn <= floor)
+                    || (delta && !current && matches!(home, Some(RowHome::Spilled { .. })))
+                {
+                    return Ok(());
                 }
-                if changed_row_after_lsn.is_some_and(|floor| state.checkpoint_change_lsn <= floor) {
-                    return Ok(ControlFlow::Continue(()));
-                }
-                let marker = state
-                    .committed
-                    .or_else(|| {
-                        (0..state.history.len()).find_map(|index| state.history_get(index)?.home)
+                entries
+                    .push(CheckpointVersion {
+                        key: SstKey::at(rowid, lsn),
+                        home,
                     })
-                    .unwrap_or(RowHome::Heap(crate::storage::RowLoc::EMPTY));
-                sort_scratch.push((rowid, marker)).map_err(|e| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "checkpoint scratch: {}",
-                        e
-                    )
-                })?;
-                Ok(ControlFlow::Continue(()))
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "checkpoint_write_entries exhausted ({})",
+                            entries.capacity()
+                        )
+                    })
             };
-            // Unpublished row identities remain in the fixed-capacity overlay
-            // even when their bytes spill. Delta discovery therefore avoids a
-            // complete walk of the immutable table; full rewrites still need
-            // that complete logical stream.
-            if delta {
-                let _ = storage.for_each_resident_row_state(slot, &mut collect)?;
-            } else {
-                storage.for_each_row_state(slot, &mut collect)?;
+            if state.committed.is_some() || state.committed_lsn != 0 {
+                version(state.committed_lsn, state.committed, true)?;
             }
-            sort_scratch
-                .as_mut_slice()
-                .sort_unstable_by_key(|(rowid, _)| *rowid);
-
-            // Versions are already grouped in `(rowid, commit_lsn DESC)`
-            // order. Write and checksum the same logical stream in one pass,
-            // avoiding a second round of provider-neutral reads for spilled
-            // images during a full rewrite.
-            self.sst_arena.reset();
-            self.slice_writer.reset();
-            let mut schema = [ColType::Bool; MAX_COLUMNS];
-            let columns = storage.table(slot).definition().schema(&mut schema);
-            if delta {
-                self.slice_writer.set_packed_rows().map_err(sst_to_sql)?;
-            } else {
-                self.slice_writer
-                    .set_pax_schema(&schema[..columns])
-                    .map_err(sst_to_sql)?;
+            for index in 0..state.history.len() {
+                if let Some(prior) = state.history_get(index) {
+                    version(prior.lsn, prior.home, false)?;
+                }
             }
+            Ok(ControlFlow::Continue(()))
+        };
+        if delta {
+            let _ = storage.for_each_resident_row_state(slot, &mut collect)?;
+        } else {
+            storage.for_each_row_state(slot, &mut collect)?;
+        }
+        self.table_output
+            .as_mut_slice()
+            .sort_unstable_by_key(|entry| entry.key);
+        self.slice_writer.reset();
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let columns = storage.table(slot).definition().schema(&mut schema);
+        if delta {
+            self.slice_writer.set_packed_rows().map_err(sst_to_sql)?;
+        } else {
             self.slice_writer
-                .set_packed_fillfactor(storage.table(slot).definition().storage_options.fillfactor)
+                .set_pax_schema(&schema[..columns])
                 .map_err(sst_to_sql)?;
-            let writer = &mut self.slice_writer;
-            let blocks = &self.blocks;
-            let mut count = 0u64;
-            let mut crc = Crc32c::new();
-            for &(rowid, _) in sort_scratch.iter() {
-                let Some(state) = storage.row_state(slot, rowid)? else {
-                    continue;
-                };
-                let mut append_version = |commit_lsn: u64,
-                                          home: Option<RowHome>,
-                                          current: bool|
-                 -> Result<(), SqlError> {
-                    // Ordinary deltas repeat resident Heap and tombstone
-                    // history so pair-merge pruning can retain a pinned
-                    // snapshot. Spilled history is already in the base.
-                    // A reslice appends only work newer than its prior
-                    // immutable slice.
-                    if slice_after_lsn.is_some_and(|floor| commit_lsn <= floor)
-                        || (delta
-                            && !current
-                            && home.is_some_and(|location| {
-                                matches!(location, RowHome::Spilled { .. })
-                            }))
-                    {
-                        return Ok(());
-                    }
-                    let key = SstKey::at(rowid, commit_lsn);
-                    let mut header = [0u8; VERSIONED_SST_ENTRY_HEADER];
-                    header[0..8].copy_from_slice(&rowid.to_le_bytes());
-                    header[8..16].copy_from_slice(&commit_lsn.to_le_bytes());
-                    header[16..20].copy_from_slice(
-                        &home
-                            .map_or(u32::MAX, |location| match location {
-                                RowHome::Heap(row) => row.len,
-                                RowHome::Spilled { len, .. } => len,
-                            })
-                            .to_le_bytes(),
-                    );
-                    crc.update(&header);
-                    if let Some(location) = home {
-                        storage.with_row_bytes(slot, rowid, location, |row| {
-                            crc.update(row);
-                            writer
-                                .append_version(
-                                    &mut *blocks.lock().expect("block store lock poisoned"),
-                                    key,
-                                    row,
-                                )
-                                .map_err(sst_to_sql)
-                        })?
-                    } else {
-                        writer
-                            .append_tombstone_version(
-                                &mut *blocks.lock().expect("block store lock poisoned"),
-                                key,
-                            )
-                            .map_err(sst_to_sql)?
-                    }
-                    count += 1;
-                    Ok(())
-                };
-                if state.committed.is_some() || state.committed_lsn != 0 {
-                    append_version(state.committed_lsn, state.committed, true)?;
-                }
-                for index in 0..state.history.len() {
-                    if let Some(version) = state.history_get(index) {
-                        append_version(version.lsn, version.home, false)?;
-                    }
-                }
-            }
-            let crc = crc.finish();
-            let handle = writer
-                .finish(&mut *blocks.lock().expect("block store lock poisoned"))
-                .map_err(sst_to_sql)?;
+        }
+        self.slice_writer
+            .set_packed_fillfactor(storage.table(slot).definition().storage_options.fillfactor)
+            .map_err(sst_to_sql)?;
+        job.phase = TableSlicePhase::Write {
+            source,
+            position: 0,
+        };
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            if job.delta {
+                "row_sst_delta"
+            } else {
+                "row_sst_full"
+            },
+            job.through_lsn,
+            Some(job.slot),
+            profile.0,
+            profile.1,
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
+            0,
+        );
+        self.table_job = Some(job);
+        Ok(false)
+    }
 
-            // Storage is not touched yet: the list installs (and the
-            // entry remap a collapse implies) apply only after the
-            // manifest CAS lands, so a failed publish leaves memory
-            // consistent with the still-current manifest.
-            match (delta, handle) {
-                (true, Some(h)) => {
-                    if !self.slice_scratch.push(PrevSst {
-                        handle: h,
-                        count,
-                        crc,
-                    }) {
-                        return Err(sql_err!(SQLSTATE_IO, "delta flush into a full spill list"));
-                    }
-                    staged_installs[staged_install_count] = Some(SlotInstall::Append {
-                        handle: h,
-                        through_lsn: storage.lsn(),
-                    });
-                    staged_install_count += 1;
-                }
-                (true, None) => {
-                    // Dirty but nothing new to flush (e.g. the change was
-                    // rolled back): the list stands.
-                }
-                (false, Some(h)) => {
-                    staged_installs[staged_install_count] = Some(SlotInstall::Replace {
-                        handle: Some(h),
-                        through_lsn: storage.lsn(),
-                    });
-                    staged_install_count += 1;
-                    self.slice_scratch.clear();
-                    push_slot_list(
-                        &mut self.slice_scratch,
-                        PrevSst {
-                            handle: h,
-                            count,
-                            crc,
-                        },
-                    )?;
-                }
-                (false, None) => {
-                    staged_installs[staged_install_count] = Some(SlotInstall::Replace {
-                        handle: None,
-                        through_lsn: storage.lsn(),
-                    });
-                    staged_install_count += 1;
-                    self.slice_scratch.clear();
-                }
-            }
+    fn table_slice_matches(storage: &Storage, job: &TableSliceJob) -> bool {
+        job.slot < storage.physical_table_count()
+            && storage.table(job.slot).live()
+            && SliceLayout::from_storage(storage, job.slot) == job.layout
+    }
+
+    fn advance_table_slice(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        let mut job = self.table_job.take().expect("scheduled table output");
+        if !Self::table_slice_matches(storage, &job) {
+            self.block_output
+                .discard(&mut self.block_uploads)
+                .map_err(upload_to_sql)?;
+            self.table_output.clear();
+            self.slice_writer.reset();
+            return Ok(());
+        }
+        if matches!(
+            job.phase,
+            TableSlicePhase::Finish(_) | TableSlicePhase::Clean
+        ) {
+            return self.complete_table_slice(storage, job);
         }
         #[cfg(feature = "checkpoint-profile")]
-        if !clean {
-            profile_checkpoint_phase(
-                if delta {
-                    "row_sst_delta"
+        let profile = (
+            if job.delta {
+                "row_sst_delta"
+            } else {
+                "row_sst_full"
+            },
+            job.through_lsn,
+            job.slot,
+            checkpoint_profile_start(),
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
+        );
+        let mut writer_failed = false;
+        let result = (|| -> Result<(), SqlError> {
+            let TableSlicePhase::Write { source, position } = &mut job.phase else {
+                unreachable!("checked table output phase");
+            };
+            let mut processed = 0;
+            while *position < self.table_output.len()
+                && processed < 64
+                && self.block_output.is_empty()
+            {
+                let entry = self.table_output[*position];
+                let mut header = [0u8; VERSIONED_SST_ENTRY_HEADER];
+                header[..8].copy_from_slice(&entry.key.rowid.to_le_bytes());
+                header[8..16].copy_from_slice(&entry.key.commit_lsn.to_le_bytes());
+                header[16..20].copy_from_slice(
+                    &entry
+                        .home
+                        .map_or(u32::MAX, |home| match home {
+                            RowHome::Heap(location) => location.len,
+                            RowHome::Spilled { len, .. } => len,
+                        })
+                        .to_le_bytes(),
+                );
+                let appended = if let Some(home) = entry.home {
+                    source.with_physical_row_bytes(entry.key.rowid, home, |row| {
+                        let appended = self.slice_writer.append_version(
+                            &mut self.block_output,
+                            entry.key,
+                            row,
+                        );
+                        if appended.is_ok() {
+                            job.crc.update(&header);
+                            job.crc.update(row);
+                        }
+                        Ok(appended)
+                    })?
                 } else {
-                    "row_sst_full"
-                },
-                storage.lsn(),
-                Some(slot),
-                row_started,
-                row_before,
-                self.blocks
-                    .lock()
-                    .expect("block store lock poisoned")
-                    .io_stats(),
-                0,
-            );
+                    let appended = self
+                        .slice_writer
+                        .append_tombstone_version(&mut self.block_output, entry.key);
+                    if appended.is_ok() {
+                        job.crc.update(&header);
+                    }
+                    appended
+                };
+                if let Err(error) = appended {
+                    writer_failed = true;
+                    return Err(sst_to_sql(error));
+                }
+                job.count += 1;
+                *position += 1;
+                processed += 1;
+            }
+            if *position == self.table_output.len() && self.block_output.is_empty() {
+                match self.slice_writer.finish(&mut self.block_output) {
+                    Ok(handle) => job.phase = TableSlicePhase::Finish(handle),
+                    Err(error) => {
+                        writer_failed = true;
+                        return Err(sst_to_sql(error));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            profile.0,
+            profile.1,
+            Some(profile.2),
+            profile.3,
+            profile.4,
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .io_stats(),
+            0,
+        );
+        if writer_failed {
+            self.block_output
+                .discard(&mut self.block_uploads)
+                .map_err(upload_to_sql)?;
+            self.table_output.clear();
+            self.slice_writer.reset();
+        } else {
+            self.table_job = Some(job);
         }
-        if !reuse_slice {
-            self.pending_installs.retain(|(s, _)| *s != slot);
+        result
+    }
+
+    fn complete_table_slice(
+        &mut self,
+        storage: &Storage,
+        mut job: TableSliceJob,
+    ) -> Result<(), SqlError> {
+        if !Self::table_slice_matches(storage, &job) {
+            self.table_output.clear();
+            return Ok(());
         }
-        for install in staged_installs[..staged_install_count]
-            .iter()
-            .copied()
-            .flatten()
-        {
-            self.pending_installs.push((slot, install));
+        match job.phase {
+            TableSlicePhase::Finish(handle) => {
+                let crc = job.crc.finish();
+                match (job.delta, handle) {
+                    (true, Some(handle)) => {
+                        push_slot_list(
+                            &mut self.slice_scratch,
+                            PrevSst {
+                                handle,
+                                count: job.count,
+                                crc,
+                            },
+                        )?;
+                        job.installs[job.install_count] = Some(SlotInstall::Append {
+                            handle,
+                            through_lsn: job.through_lsn,
+                        });
+                        job.install_count += 1;
+                    }
+                    (true, None) => {}
+                    (false, handle) => {
+                        job.installs[job.install_count] = Some(SlotInstall::Replace {
+                            handle,
+                            through_lsn: job.through_lsn,
+                        });
+                        job.install_count += 1;
+                        self.slice_scratch.clear();
+                        if let Some(handle) = handle {
+                            push_slot_list(
+                                &mut self.slice_scratch,
+                                PrevSst {
+                                    handle,
+                                    count: job.count,
+                                    crc,
+                                },
+                            )?;
+                        }
+                    }
+                }
+            }
+            TableSlicePhase::Clean => {}
+            TableSlicePhase::Write { .. } => {
+                unreachable!("table output must finish before installation")
+            }
         }
-        self.prev_scratch[slot].copy_from(&self.slice_scratch);
+        if !job.reuse_slice {
+            self.pending_installs.retain(|(slot, _)| *slot != job.slot);
+        }
+        for install in job.installs[..job.install_count].iter().copied().flatten() {
+            self.pending_installs.push((job.slot, install));
+        }
+        self.prev_scratch[job.slot].copy_from(&self.slice_scratch);
+        self.sliced_generation[job.slot] = job.generation;
+        self.sliced_lsn[job.slot] = job.through_lsn;
+        self.sliced_layout[job.slot] = job.layout;
+        self.sliced_this_sweep[job.slot] = true;
+        self.table_output.clear();
         Ok(())
     }
 
@@ -18407,6 +18538,13 @@ mod stored_dependency_tests {
         delete_pacing.checkpoint_delete_objects_per_beat += 1;
         assert_eq!(Checkpointer::budget_bytes(&delete_pacing), base_bytes);
 
+        let mut writes = base.clone();
+        writes.checkpoint_write_entries += 1;
+        assert_eq!(
+            Checkpointer::budget_bytes(&writes) - base_bytes,
+            core::mem::size_of::<CheckpointVersion>()
+        );
+
         let mut merge = base;
         merge.checkpoint_merge_entries += 1;
         assert_eq!(
@@ -18859,9 +18997,11 @@ mod stored_dependency_tests {
 fn parallel_physical_emission_covers_maximum_chained_row_and_finish() {
     let mut config = Config::default_dev();
     config.object_store_on = true;
-    config.object_store_sim = true;
+    config.object_store_sim = false;
+    config.object_store_endpoint = "127.0.0.1:1".to_string();
+    config.object_store_access_key = "access".to_string();
+    config.object_store_secret_key = "secret".to_string();
     config.object_store_bucket = format!("physical-emission-bound-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let total = SstWriter::budget_bytes()
         + crate::store::BlockWriteBatch::budget_bytes(
             PHYSICAL_EMISSION_BYTES,
@@ -18904,5 +19044,51 @@ fn parallel_physical_emission_covers_maximum_chained_row_and_finish() {
         assert!(!output.is_empty());
         output.discard(&mut uploads).unwrap();
     });
-    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_physical_credential_rotation_waits_for_requests_not_retained_bytes() {
+    use crate::store::BlockWriter;
+    let mut config = Config::default_dev();
+    config.object_store_on = true;
+    config.object_store_sim = false;
+    config.object_store_endpoint = "127.0.0.1:1".to_string();
+    config.object_store_access_key = "access".to_string();
+    config.object_store_secret_key = "secret".to_string();
+    config.object_store_bucket = format!("physical-credential-owner-{}", std::process::id());
+    config.data_dir = std::env::temp_dir()
+        .join(&config.object_store_bucket)
+        .to_string_lossy()
+        .into_owned();
+    config.max_tables = 2;
+    config.table_rows = 4;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
+    let mut checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
+    assert_eq!(budget.used(), Checkpointer::budget_bytes(&config));
+    crate::mem::guard::forbid_alloc(|| {
+        checkpoint
+            .block_output
+            .write_block(b"retained", crate::store::BlockType::SstData, 0)
+            .unwrap();
+        assert!(!checkpoint.block_output.is_empty());
+        assert!(
+            !checkpoint.object_io_busy(),
+            "retained output must allow credential reload between attempts"
+        );
+        assert!(!checkpoint.drain_block_output().unwrap());
+        assert!(
+            checkpoint.object_io_busy(),
+            "queued PUT owns its current request credentials"
+        );
+        checkpoint
+            .block_output
+            .discard(&mut checkpoint.block_uploads)
+            .unwrap();
+        assert!(!checkpoint.object_io_busy());
+    });
+    drop(checkpoint);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

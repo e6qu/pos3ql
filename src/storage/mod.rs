@@ -2553,6 +2553,8 @@ impl TableSerialState {
 struct TablePublication {
     dirty: bool,
     generation: u64,
+    /// Last committed replacement of row encodings, independent of row updates.
+    rewrite_generation: u64,
     /// A complete candidate list and its count publish together.
     enforcers: [Option<Enforcer>; MAX_VALUE_ENFORCERS],
     n_enforcers: usize,
@@ -3893,6 +3895,10 @@ impl Table {
     pub(crate) fn generation(&self) -> u64 {
         self.publication().generation
     }
+    pub(crate) fn rewrite_generation(&self) -> u64 {
+        self.publication().rewrite_generation
+    }
+
     pub(crate) fn dirty(&self) -> bool {
         self.publication().dirty
     }
@@ -18036,6 +18042,7 @@ impl Storage {
                     publication: std::sync::Mutex::new(TablePublication {
                         dirty: false,
                         generation: 1,
+                        rewrite_generation: 0,
                         enforcers: [const { None }; MAX_VALUE_ENFORCERS],
                         n_enforcers: 0,
                     }),
@@ -34663,6 +34670,13 @@ impl Storage {
     pub fn finish_table_def_commit(&mut self, index: usize, rewrote_rows: bool) {
         if rewrote_rows {
             self.set_spill_list(index, &[]);
+            let mut publication = self.tables[index].publication();
+            publication.generation = publication
+                .generation
+                .checked_add(1)
+                .expect("table publication generation exhausted");
+            publication.rewrite_generation = publication.generation;
+            publication.dirty = true;
         }
     }
 

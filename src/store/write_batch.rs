@@ -203,22 +203,29 @@ impl BlockWriter for BlockWriteBatch {
         lsn: u64,
     ) -> Result<BlockId, StoreError> {
         assert!(!self.sealed, "one immutable writer emission at a time");
-        let id = BlockId::for_block(block_type, payload);
-        if self.blocks.iter().any(|block| block.id == id) {
-            return Ok(id);
-        }
-        if self.blocks.len() == self.blocks.capacity() {
-            return Err(StoreError::WriteBatchObjectsExhausted);
-        }
         let length = HEADER_LEN
             .checked_add(payload.len())
             .ok_or(StoreError::WriteBatchBytesExhausted)?;
-        if length > self.bytes.capacity() - self.bytes.len() {
-            return Err(StoreError::WriteBatchBytesExhausted);
+        let limit = if self.blocks.len() == self.blocks.capacity() {
+            Some(StoreError::WriteBatchObjectsExhausted)
+        } else if length > self.bytes.capacity() - self.bytes.len() {
+            Some(StoreError::WriteBatchBytesExhausted)
+        } else {
+            None
+        };
+        if let Some(error) = limit {
+            let id = BlockId::for_block(block_type, payload);
+            return if self.blocks.iter().any(|block| block.id == id) {
+                Ok(id)
+            } else {
+                Err(error)
+            };
         }
         let offset = self.bytes.len();
-        let (encoded_id, encoded) = super::encode(payload, block_type, lsn, self.bytes.writable())?;
-        assert_eq!(encoded_id, id);
+        let (id, encoded) = super::encode(payload, block_type, lsn, self.bytes.writable())?;
+        if self.blocks.iter().any(|block| block.id == id) {
+            return Ok(id);
+        }
         self.bytes.advance(encoded);
         self.blocks
             .push(PendingBlock {

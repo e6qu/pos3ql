@@ -66,7 +66,8 @@ jobs:
             statement_files_suspended_sql_releases_on_completion_error_cancel_and_rollback \
             dirty_full_roster_merges_across_bounded_checkpoint_beats \
             row_merge_reuses_unchanged_wide_pax_groups_across_beats \
-            checkpoint_merge_capacity_exhausts_loudly_for_a_pinned_full_list
+            checkpoint_merge_capacity_exhausts_loudly_for_a_pinned_full_list \
+            checkpoint_maintenance_capacities_are_exactly_budgeted
           do
             cargo test --lib --release --locked "$filter" -- --test-threads=1
           done

@@ -37,10 +37,18 @@ after both succeed. Clients retain their transaction outcome until publication
 and ordered in-memory completion finish, including when the client disconnects.
 
 `object_store_block_put_slots` reserves separate clients for immutable row and
-index output. Paced table merges retain one operation's bytes while its uploads
-overlap; the new file handle stays private until every upload finishes. Table
-slices, secondary-index producers and manifest publication still need the
-remaining integration in [the plan](../PLAN.md).
+index output. Table slices and paced merges retain one operation's bytes while
+its uploads overlap; the new file handle stays private until every upload
+finishes. Table slices retain their selected bytes while later changes append
+another generation. Replacing a table or rewriting its row encodings discards
+the old capture. Secondary-index producers, manifest publication and remaining
+qualification are in [the plan](../PLAN.md).
+
+Table output schedules at most the configured number of committed versions,
+processes at most 64 per CPU turn, and stops to drain each emitted batch.
+Metadata capture and other atomic maintenance reads can still wait
+synchronously. Rows larger than one block use bounded overflow chains in the
+same generation; reading such a row requires its complete chain.
 
 
 | Setting | Reservation or rejection |
@@ -49,6 +57,7 @@ remaining integration in [the plan](../PLAN.md).
 | `object_store_put_slots` | Fixed journal upload clients; at least 2 in object-store mode. |
 | `object_store_block_put_slots` | Fixed physical-block upload clients; at least 1 in object-store mode. Each reserves one 256 KiB body. |
 | `wal_upload_buffer_bytes` | Immutable body bytes per journal upload slot, plus the engine's captured log batch; must be at least `wal_buffer_bytes`. |
+| `checkpoint_write_entries` | Committed versions retained by one table output schedule; SQLSTATE 54000 names exhaustion before publication. |
 | `commit_queue_slots` | Complete transaction and session-context buffers retained through asynchronous publication; at least 1 in object-store mode. |
 
 The development fixture selects 4 read slots, 4 journal upload slots, 4 physical

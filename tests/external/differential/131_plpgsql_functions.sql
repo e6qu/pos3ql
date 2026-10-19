@@ -632,3 +632,22 @@ DROP ROLE plpgsql_dynamic_admin_owner;
 DROP ROLE plpgsql_function_caller;
 DROP ROLE plpgsql_function_denied;
 DROP ROLE plpgsql_function_owner;
+
+-- A read after a function returns must not repeat its session effects.
+CREATE TABLE replay_effect_rows(value integer PRIMARY KEY);
+INSERT INTO replay_effect_rows VALUES (10), (20);
+CREATE SEQUENCE replay_effect_sequence;
+CREATE FUNCTION replay_effect_prepare() RETURNS integer LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'PREPARE replay_effect_plan(integer) AS SELECT $1 + 1';
+  RETURN 1;
+END
+$$;
+SELECT replay_effect_prepare(), (SELECT sum(value) FROM replay_effect_rows);
+EXECUTE replay_effect_plan(41);
+SELECT nextval('replay_effect_sequence') + (SELECT sum(value) FROM replay_effect_rows);
+SELECT currval('replay_effect_sequence');
+DEALLOCATE replay_effect_plan;
+DROP FUNCTION replay_effect_prepare();
+DROP SEQUENCE replay_effect_sequence;
+DROP TABLE replay_effect_rows;

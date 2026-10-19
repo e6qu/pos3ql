@@ -12433,6 +12433,7 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        query::protect_statement_effects();
         if let Some(oid) = pending.intrinsic_oid {
             let arguments = match arena.alloc_slice_with(pending.argument_count, |_| Datum::Null) {
                 Ok(arguments) => arguments,
@@ -14585,6 +14586,14 @@ impl Engine {
         } else {
             None
         };
+        let effect_reads = if reset_workspace {
+            self.ckpt
+                .as_ref()
+                .map(Checkpointer::deferred_atomic_block_read_scope)
+        } else {
+            None
+        };
+        let _read_effects = query::enter_statement_read_effect_scope(effect_reads.as_ref());
         let _configuration_reload_scope = ConfigurationReloadScope::new(self, guc);
         let _guc_eval_scope = guc::enter_eval_scope(guc, txn);
         // Reclaim the shared execution arena from the previous top-level

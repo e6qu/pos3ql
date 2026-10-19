@@ -4351,6 +4351,10 @@ fn call<'a>(
         args
     };
     let name = regex_srf_name.unwrap_or(written_name);
+    let effect_name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    if super::ast::is_volatile_function(effect_name) {
+        super::query::protect_statement_effects();
+    }
     if name.eq_ignore_ascii_case("parse_ident") && argument_names.iter().any(Option::is_some) {
         if args.len() != 2 || star || variadic {
             return Err(undefined_function(name, args, row));

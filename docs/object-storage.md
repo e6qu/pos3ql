@@ -29,6 +29,10 @@ upload waits; success for either order waits for its own durable log position.
 scan starts a bounded batch of missing columns before waiting, retaining
 completed extents across resumption. Atomic operations use a separate block
 client and can still wait synchronously; SQL CPU execution remains serial.
+A SELECT uses that client from its first routine or state-changing expression
+until the statement finishes, including reads after a routine returns. For
+example, a function can prepare a query and then read an uncached invoice
+without preparing the same query twice. Pure reads keep their concurrent path.
 
 `object_store_put_slots` reserves upload clients and immutable request bodies.
 A log batch has two independent objects: transaction bytes and a descriptor.

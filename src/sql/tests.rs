@@ -88860,3 +88860,239 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
+
+#[test]
+fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once() {
+    use crate::store::BlockStore;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    for extended in [false, true] {
+        let mut config = test_config(if extended {
+            "effects-cold-extended"
+        } else {
+            "effects-cold-simple"
+        });
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket = format!(
+            "{}-{}",
+            if extended {
+                "effects-extended"
+            } else {
+                "effects-simple"
+            },
+            std::process::id()
+        );
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        config.max_tables = 4;
+        config.table_rows = 16;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            r#"
+            CREATE TABLE effect_rows(value integer PRIMARY KEY);
+            INSERT INTO effect_rows VALUES (1), (2);
+            CREATE SEQUENCE effect_sequence;
+            CREATE FUNCTION effect_prepare() RETURNS integer LANGUAGE plpgsql AS $$
+            DECLARE result_value integer;
+            BEGIN
+              EXECUTE 'PREPARE effect_plan(integer) AS SELECT $1 + 1';
+              EXECUTE 'EXECUTE effect_plan(41)' INTO STRICT result_value;
+              EXECUTE 'INSERT INTO effect_rows VALUES (3) RETURNING value' INTO STRICT result_value;
+              RETURN result_value;
+            END $$;
+        "#,
+            false,
+        );
+        assert!(engine.checkpoint().unwrap());
+        let table = engine.storage.find_table("public", "effect_rows").unwrap();
+        let roster = engine
+            .storage
+            .table(table)
+            .spill_generations()
+            .handle(0)
+            .unwrap()
+            .roster;
+        engine.storage.evict_committed_table(table);
+        engine.storage.evict_redundant_entries(table);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        config.object_store_sim = false;
+        config.object_store_endpoint = listener.local_addr().unwrap().to_string();
+        config.object_store_access_key = "test-access".to_string();
+        config.object_store_secret_key = "test-secret".to_string();
+        let prefix = format!("/{}/", config.object_store_bucket);
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_stop = Arc::clone(&stop);
+        let server_requests = Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            while !server_stop.load(Ordering::Acquire) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accept object read: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0u8; 8192];
+                let mut received = 0;
+                while !request[..received]
+                    .windows(4)
+                    .any(|bytes| bytes == b"\r\n\r\n")
+                {
+                    let n = stream.read(&mut request[received..]).unwrap();
+                    assert!(n != 0 && received + n < request.len());
+                    received += n;
+                }
+                let request = std::str::from_utf8(&request[..received]).unwrap();
+                let mut words = request.split_whitespace();
+                assert_eq!(words.next(), Some("GET"));
+                let key = words.next().unwrap().strip_prefix(&prefix).unwrap();
+                let body = namespace
+                    .borrow()
+                    .object_bytes(key)
+                    .expect("fixture block exists")
+                    .to_vec();
+                server_requests.fetch_add(1, Ordering::Relaxed);
+                if let Some(range) = request.lines().find_map(|line| {
+                    line.strip_prefix("Range: bytes=")
+                        .or_else(|| line.strip_prefix("range: bytes="))
+                }) {
+                    let (first, last) = range.split_once('-').unwrap();
+                    let first: usize = first.parse().unwrap();
+                    let last: usize = last.parse().unwrap();
+                    let selected = &body[first..=last];
+                    write!(stream, "HTTP/1.1 206 Partial Content\r\nETag: \"effect-read\"\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\nConnection: close\r\n\r\n", selected.len(), body.len()).unwrap();
+                    stream.write_all(selected).unwrap();
+                } else {
+                    write!(stream, "HTTP/1.1 200 OK\r\nETag: \"effect-read\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+            }
+        });
+        let checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
+        let blocks = checkpoint.block_stack();
+        let reader = crate::storage::SpillReader::new(
+            &mut budget,
+            config.max_spill_generations_per_table,
+            Some(Arc::clone(&blocks)),
+            engine
+                .temporary_spiller
+                .as_ref()
+                .map(TemporarySpiller::block_store),
+        )
+        .unwrap();
+        engine.storage.attach_spill(reader);
+        engine.ckpt = Some(checkpoint);
+        engine.enable_async_block_reads();
+
+        if extended {
+            session.send.clear();
+            session.arena.reset();
+            let mut responder =
+                Responder::for_execute(&mut session.send, crate::pg::respond::ResultFmt::ALL_TEXT);
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| engine.execute_extended(
+                    "SELECT effect_prepare()",
+                    &session.arena,
+                    &[],
+                    &[],
+                    &mut session.transaction,
+                    &mut session.pool,
+                    &mut session.cursors,
+                    &mut session.guc,
+                    &mut responder,
+                    session.connection_id,
+                    false,
+                ))
+                .unwrap(),
+                ExtendedExecutionStatus::Complete(true)
+            ));
+            crate::mem::guard::forbid_alloc(|| {
+                engine.commit_txn(&mut session.transaction, &session.guc)
+            })
+            .unwrap();
+            assert_eq!(data_rows(session.send.readable()), ["3"]);
+        } else {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SELECT effect_prepare()", true)),
+                ["3"]
+            );
+        }
+        assert!(
+            requests.load(Ordering::Relaxed) > 0,
+            "the routine must read uncached durable data"
+        );
+        assert!(blocks.lock().unwrap().async_gets_enabled());
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "EXECUTE effect_plan(41)", true)),
+            ["42"]
+        );
+
+        // The second expression reads durable rows after the sequence advances.
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT nextval('effect_sequence') + (SELECT sum(value) FROM effect_rows)",
+                true
+            )),
+            ["7"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT currval('effect_sequence')", true)),
+            ["1"]
+        );
+        assert!(blocks.lock().unwrap().async_gets_enabled());
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "SELECT nextval('effect_sequence') / 0",
+                true
+            )),
+            ["22012"]
+        );
+        assert!(blocks.lock().unwrap().async_gets_enabled());
+
+        // Pure reads still start asynchronously after both success and error.
+        let mut output = [0u8; crate::store::MAX_PAYLOAD];
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| blocks.lock().unwrap().get(&roster, &mut output)),
+            Err(crate::store::StoreError::NotReady)
+        );
+        assert!(engine.pending_block_read_fd(0).is_some());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !engine.advance_pending_block_read(0).unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pure read did not complete"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            crate::mem::guard::forbid_alloc(|| blocks.lock().unwrap().get(&roster, &mut output))
+                .is_ok()
+        );
+        drop((session, engine, blocks));
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}

@@ -160,6 +160,11 @@ enum ObjectReadMode {
     Restartable,
 }
 
+struct AtomicReadScopes {
+    owners: usize,
+    enclosing_mode: ObjectReadMode,
+}
+
 /// The namespace store that owns its client and scratch — the long-lived form a
 /// cache stack sits over, where a borrowed client would tangle lifetimes.
 pub(crate) struct OwnedObjectStore {
@@ -169,6 +174,7 @@ pub(crate) struct OwnedObjectStore {
     scratch: Vec<u8>,
     stats: BlockIoStats,
     read_mode: ObjectReadMode,
+    atomic_reads: AtomicReadScopes,
     admission: crate::object_store::RequestAdmission,
     hedge_after: Option<Duration>,
     read_owner: Option<ReadOwner>,
@@ -199,6 +205,7 @@ impl OwnedObjectStore {
                     + Self::owner_capacity(config) * core::mem::size_of::<ReadOwner>(),
             ))
             .saturating_add(super::BLOCK_SIZE)
+            .saturating_add(core::mem::size_of::<AtomicReadScopes>())
     }
 
     fn owner_capacity(config: &crate::config::Config) -> usize {
@@ -253,6 +260,12 @@ impl OwnedObjectStore {
         budget
             .draw(super::BLOCK_SIZE, "object_store_block_scratch")
             .map_err(crate::object_store::SetupError::Budget)?;
+        budget
+            .draw(
+                core::mem::size_of::<AtomicReadScopes>(),
+                "atomic read owners",
+            )
+            .map_err(crate::object_store::SetupError::Budget)?;
         Ok(Self {
             atomic_client,
             slots,
@@ -260,6 +273,10 @@ impl OwnedObjectStore {
             scratch: vec![0u8; super::BLOCK_SIZE],
             stats: BlockIoStats::default(),
             read_mode: ObjectReadMode::Atomic,
+            atomic_reads: AtomicReadScopes {
+                owners: 0,
+                enclosing_mode: ObjectReadMode::Atomic,
+            },
             admission: crate::object_store::RequestAdmission::Open,
             read_owner: None,
             read_capacity_generation: 0,
@@ -289,7 +306,9 @@ impl OwnedObjectStore {
         for slot in self.slots.as_mut_slice() {
             slot.client.enable_async_gets();
         }
-        self.read_mode = ObjectReadMode::Restartable;
+        if self.atomic_reads.owners == 0 {
+            self.read_mode = ObjectReadMode::Restartable;
+        }
     }
 
     fn finish_read(
@@ -316,6 +335,26 @@ impl OwnedObjectStore {
             .stats
             .object_read_micros
             .saturating_add(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+    }
+
+    pub(crate) fn enter_atomic_reads(&mut self) {
+        if self.atomic_reads.owners == 0 {
+            self.atomic_reads.enclosing_mode = self.read_mode;
+        }
+        self.atomic_reads.owners = self
+            .atomic_reads
+            .owners
+            .checked_add(1)
+            .expect("atomic read owners are bounded by the execution stack");
+        self.read_mode = ObjectReadMode::Atomic;
+    }
+
+    pub(crate) fn leave_atomic_reads(&mut self) {
+        assert!(self.atomic_reads.owners != 0, "atomic read owner underflow");
+        self.atomic_reads.owners -= 1;
+        if self.atomic_reads.owners == 0 {
+            self.read_mode = self.atomic_reads.enclosing_mode;
+        }
     }
 
     fn disable_async_gets(&mut self) {

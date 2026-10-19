@@ -30,7 +30,11 @@ updates, deletions and analysis. SQL CHECKPOINT, readiness checks and credential
 validation yield while network requests wait.
 
 **Scope limit:** data-changing execution uses a separate synchronous read client
-where restarting could repeat effects. Metadata capture and some maintenance
+where restarting could repeat effects. A SELECT switches to that client when
+a routine or expression starts changing state, and keeps it through the rest of
+the statement. For example, a function that prepares a query must not prepare it
+again because a later invoice download waits. Pure reads retain concurrent I/O.
+Metadata capture and some maintenance
 reads also remain synchronous. SQL still executes on one CPU worker. The current
 PR must not imply that every database operation is nonblocking or that CPU work
 already runs on several workers.

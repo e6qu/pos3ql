@@ -541,6 +541,49 @@ pub(crate) fn active_routine_invocations<'a>() -> Option<(&'a RoutineInvocationS
     })
 }
 
+thread_local! {
+    static ACTIVE_READ_EFFECTS: Cell<Option<core::ptr::NonNull<crate::checkpoint::AtomicBlockReadScope>>> = const { Cell::new(None) };
+}
+
+pub(crate) struct StatementReadEffectScope<'a> {
+    previous: Option<core::ptr::NonNull<crate::checkpoint::AtomicBlockReadScope>>,
+    _reads: Option<&'a crate::checkpoint::AtomicBlockReadScope>,
+}
+
+impl Drop for StatementReadEffectScope<'_> {
+    fn drop(&mut self) {
+        ACTIVE_READ_EFFECTS.with(|active| active.set(self.previous));
+    }
+}
+
+pub(crate) fn enter_statement_read_effect_scope(
+    reads: Option<&crate::checkpoint::AtomicBlockReadScope>,
+) -> StatementReadEffectScope<'_> {
+    let previous = ACTIVE_READ_EFFECTS.with(|active| {
+        let previous = active.get();
+        if let Some(reads) = reads {
+            active.set(Some(core::ptr::NonNull::from(reads)));
+        }
+        previous
+    });
+    StatementReadEffectScope {
+        previous,
+        _reads: reads,
+    }
+}
+
+/// A statement can yield before its first effect. After an effect starts,
+/// remaining reads use the atomic client until that whole statement ends.
+pub(crate) fn protect_statement_effects() {
+    ACTIVE_READ_EFFECTS.with(|active| {
+        if let Some(reads) = active.get() {
+            // The scope's borrow pins this stack value through every nested
+            // executor call; dropping the scope restores the enclosing pointer.
+            unsafe { reads.as_ref() }.activate();
+        }
+    });
+}
+
 impl<'a> RoutineInvocationState<'a> {
     pub(crate) fn new(arena: &'a Arena) -> Self {
         Self {

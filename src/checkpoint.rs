@@ -1082,16 +1082,29 @@ enum CommitPruneProgress {
 #[must_use]
 pub(crate) struct AtomicBlockReadScope {
     blocks: std::sync::Arc<std::sync::Mutex<TieredStore<OwnedObjectStore>>>,
-    restartable: bool,
+    active: core::cell::Cell<bool>,
+}
+
+impl AtomicBlockReadScope {
+    pub(crate) fn activate(&self) {
+        if !self.active.replace(true) {
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .base_mut()
+                .enter_atomic_reads();
+        }
+    }
 }
 
 impl Drop for AtomicBlockReadScope {
     fn drop(&mut self) {
-        let mut blocks = self.blocks.lock().expect("block store lock poisoned");
-        if self.restartable {
-            blocks.enable_async_gets();
-        } else {
-            blocks.disable_async_gets();
+        if self.active.get() {
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .base_mut()
+                .leave_atomic_reads();
         }
     }
 }
@@ -2329,16 +2342,15 @@ impl Checkpointer {
     }
 
     pub(crate) fn atomic_block_read_scope(&self) -> AtomicBlockReadScope {
-        let blocks = std::sync::Arc::clone(&self.blocks);
-        let restartable = {
-            let mut blocks = blocks.lock().expect("block store lock poisoned");
-            let restartable = blocks.async_gets_enabled();
-            blocks.disable_async_gets();
-            restartable
-        };
+        let scope = self.deferred_atomic_block_read_scope();
+        scope.activate();
+        scope
+    }
+
+    pub(crate) fn deferred_atomic_block_read_scope(&self) -> AtomicBlockReadScope {
         AtomicBlockReadScope {
-            blocks,
-            restartable,
+            blocks: std::sync::Arc::clone(&self.blocks),
+            active: core::cell::Cell::new(false),
         }
     }
 
@@ -18998,6 +19010,47 @@ mod stored_dependency_tests {
             assert_eq!(fail(), Err(()));
             assert!(!blocks.lock().unwrap().async_gets_enabled());
             drop(outer);
+            assert!(blocks.lock().unwrap().async_gets_enabled());
+        });
+        drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn atomic_block_reads_deferred_effect_outlives_an_inner_atomic_operation() {
+        let (mut checkpointer, config) = atomic_scope_fixture("atomic-scope-deferred");
+        checkpointer.enable_async_block_reads();
+        let blocks = checkpointer.block_stack();
+        crate::mem::guard::forbid_alloc(|| {
+            let statement = checkpointer.deferred_atomic_block_read_scope();
+            assert!(blocks.lock().unwrap().async_gets_enabled());
+            let inner = checkpointer.atomic_block_read_scope();
+            statement.activate();
+            statement.activate();
+            drop(inner);
+            assert!(!blocks.lock().unwrap().async_gets_enabled());
+            checkpointer.enable_async_block_reads();
+            assert!(!blocks.lock().unwrap().async_gets_enabled());
+            drop(statement);
+            assert!(blocks.lock().unwrap().async_gets_enabled());
+        });
+        drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn atomic_block_reads_inactive_statement_keeps_async_and_owners_can_drop_out_of_order() {
+        let (mut checkpointer, config) = atomic_scope_fixture("atomic-scope-order");
+        checkpointer.enable_async_block_reads();
+        let blocks = checkpointer.block_stack();
+        crate::mem::guard::forbid_alloc(|| {
+            drop(checkpointer.deferred_atomic_block_read_scope());
+            assert!(blocks.lock().unwrap().async_gets_enabled());
+            let first = checkpointer.atomic_block_read_scope();
+            let second = checkpointer.atomic_block_read_scope();
+            drop(first);
+            assert!(!blocks.lock().unwrap().async_gets_enabled());
+            drop(second);
             assert!(blocks.lock().unwrap().async_gets_enabled());
         });
         drop(checkpointer);

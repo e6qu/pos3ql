@@ -276,6 +276,7 @@ pub struct TxnState {
     snapshot_taken: bool,
     transaction_start: Option<i64>,
     suspended_statement: Option<SuspendedStatement>,
+    pub(super) checkpoint_request: Option<crate::checkpoint::CheckpointRequest>,
     /// Current statement identity. Snapshot K sees own writes with identifiers
     /// below K. Nested SQL temporarily uses a separately issued identity.
     command_id: u32,
@@ -975,6 +976,7 @@ impl TxnState {
             snapshot_taken: false,
             transaction_start: None,
             suspended_statement: None,
+            checkpoint_request: None,
             command_id: 1,
             command_counter: 1,
             trigger_depth: 0,
@@ -1309,6 +1311,7 @@ impl TxnState {
 
     pub(crate) fn release_suspended_statement(&mut self) {
         self.suspended_statement = None;
+        self.checkpoint_request = None;
     }
 
     pub fn begin_command(&mut self) -> Result<(), SqlError> {
@@ -2488,6 +2491,7 @@ impl TxnState {
         self.snapshot_taken = false;
         self.transaction_start = None;
         self.suspended_statement = None;
+        self.checkpoint_request = None;
         self.touched.clear();
         self.truncates.clear();
         self.truncate_wal_tables.clear();

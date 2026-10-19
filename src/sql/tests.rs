@@ -88574,3 +88574,287 @@ fn parallel_physical_manifest_install_failure_resumes_without_republishing_or_re
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
+
+#[test]
+fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_writes() {
+    let mut config = test_config("checkpoint-request-receipts");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("checkpoint-request-receipts-{}", std::process::id());
+    config.max_tables = 4;
+    config.table_rows = 16;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "CREATE TABLE requested_checkpoint(id integer); INSERT INTO requested_checkpoint VALUES(1)"
+    )).is_empty());
+    engine.enable_async_durability();
+    let mut request_budget = Budget::new(budget.remaining());
+    let mut first = TxnState::new(&mut request_budget, 16).unwrap();
+    let mut second = TxnState::new(&mut request_budget, 16).unwrap();
+    let mut later = TxnState::new(&mut request_budget, 16).unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut request_budget, "checkpoint receipts", 1 << 16).unwrap();
+    for txn in [&mut first, &mut second] {
+        let error = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_checkpoint_statement(txn, &mut Responder::new(&mut send))
+        })
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::INTERNAL_IO_WAIT);
+    }
+    assert!(
+        send.readable().is_empty(),
+        "a pending command has no success response"
+    );
+    assert!(engine.checkpoint_work_pending());
+    for _ in 0..128 {
+        if engine.ckpt.as_ref().unwrap().manifest_publication_pending() {
+            break;
+        }
+        engine
+            .advance_wal_publication(std::time::Instant::now())
+            .unwrap();
+        assert!(!engine.checkpoint_beat().failed());
+    }
+    assert!(engine.ckpt.as_ref().unwrap().manifest_publication_pending());
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO requested_checkpoint VALUES(2); SELECT count(*) FROM requested_checkpoint",
+    );
+    assert!(
+        error_sqlstates(&changed).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
+    assert_eq!(data_rows(&changed), ["2"]);
+    assert_eq!(
+        engine
+            .execute_checkpoint_statement(&mut later, &mut Responder::new(&mut send),)
+            .unwrap()
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::INTERNAL_IO_WAIT
+    );
+    let mut published = false;
+    for _ in 0..128 {
+        engine
+            .advance_wal_publication(std::time::Instant::now())
+            .unwrap();
+        if engine.checkpoint_beat() == CheckpointBeat::Durable {
+            published = true;
+            break;
+        }
+    }
+    assert!(published);
+    for txn in [&mut first, &mut second] {
+        crate::mem::guard::forbid_alloc(|| {
+            engine.execute_checkpoint_statement(txn, &mut Responder::new(&mut send))
+        })
+        .unwrap()
+        .unwrap();
+        assert!(txn.checkpoint_request.is_none());
+    }
+    assert_eq!(
+        engine
+            .execute_checkpoint_statement(&mut later, &mut Responder::new(&mut send),)
+            .unwrap()
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::INTERNAL_IO_WAIT,
+        "a later request cannot acknowledge an earlier metadata capture"
+    );
+    let mut finished = false;
+    for _ in 0..512 {
+        engine
+            .advance_wal_publication(std::time::Instant::now())
+            .unwrap();
+        assert!(!engine.checkpoint_beat().failed());
+        if engine
+            .execute_checkpoint_statement(&mut later, &mut Responder::new(&mut send))
+            .unwrap()
+            .is_ok()
+        {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished);
+    assert!(later.checkpoint_request.is_none());
+    assert_eq!(
+        message_types(send.readable())
+            .iter()
+            .filter(|&&tag| tag == b'C')
+            .count(),
+        3
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT count(*) FROM requested_checkpoint"
+        )),
+        ["2"]
+    );
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled_requests() {
+    let mut config = test_config("checkpoint-request-errors");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("checkpoint-request-errors-{}", std::process::id());
+    config.max_tables = 4;
+    config.table_rows = 16;
+    config.value_index_rows = 16;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 275);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget,
+        "CREATE TABLE failed_checkpoint(id integer PRIMARY KEY); INSERT INTO failed_checkpoint VALUES(1)"
+    )).is_empty());
+    assert!(engine.checkpoint().unwrap());
+    engine.enable_async_durability();
+    let mut request_budget = Budget::new(budget.remaining());
+    let mut first = TxnState::new(&mut request_budget, 16).unwrap();
+    let mut second = TxnState::new(&mut request_budget, 16).unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut request_budget, "checkpoint errors", 1 << 16).unwrap();
+    let mut earlier = TxnState::new(&mut request_budget, 16).unwrap();
+    assert_eq!(
+        engine
+            .execute_checkpoint_statement(&mut earlier, &mut Responder::new(&mut send),)
+            .unwrap()
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::INTERNAL_IO_WAIT
+    );
+    let mut saved = false;
+    for _ in 0..128 {
+        engine
+            .advance_wal_publication(std::time::Instant::now())
+            .unwrap();
+        if engine.checkpoint_beat() == CheckpointBeat::Durable {
+            saved = true;
+            break;
+        }
+    }
+    assert!(saved);
+    engine.finish_post_publish_cleanup().unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .finish_maintenance(&engine.storage)
+        .unwrap();
+    assert!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO failed_checkpoint VALUES(2)"
+        ))
+        .is_empty()
+    );
+    for txn in [&mut first, &mut second] {
+        assert_eq!(
+            engine
+                .execute_checkpoint_statement(txn, &mut Responder::new(&mut send),)
+                .unwrap()
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_IO_WAIT
+        );
+    }
+    namespace.borrow_mut().faults.transient_per_mille = 1000;
+    assert_eq!(
+        engine.checkpoint_beat(),
+        CheckpointBeat::StorageFailure,
+        "reading the prior index roster must report its storage failure"
+    );
+    for txn in [&mut first, &mut second] {
+        let error = engine
+            .execute_checkpoint_statement(txn, &mut Responder::new(&mut send))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.sqlstate, "58030");
+        assert!(!error.message.as_str().is_empty());
+        assert!(txn.checkpoint_request.is_none());
+    }
+    assert!(
+        send.readable().is_empty(),
+        "a failed checkpoint cannot send success"
+    );
+    engine
+        .execute_checkpoint_statement(&mut earlier, &mut Responder::new(&mut send))
+        .unwrap()
+        .unwrap();
+    assert!(
+        earlier.checkpoint_request.is_none(),
+        "a later failure cannot change an already completed save"
+    );
+    send.clear();
+    namespace.borrow_mut().faults.transient_per_mille = 0;
+    assert_eq!(
+        engine
+            .execute_checkpoint_statement(&mut first, &mut Responder::new(&mut send),)
+            .unwrap()
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::INTERNAL_IO_WAIT,
+        "a new command must not receive the previous command's error"
+    );
+    first.release_suspended_statement();
+    assert!(
+        first.checkpoint_request.is_none(),
+        "cancellation releases the command receipt"
+    );
+    assert_eq!(
+        engine
+            .execute_checkpoint_statement(&mut second, &mut Responder::new(&mut send),)
+            .unwrap()
+            .unwrap_err()
+            .sqlstate,
+        sqlstate::INTERNAL_IO_WAIT
+    );
+    let mut completed = false;
+    for _ in 0..256 {
+        engine
+            .advance_wal_publication(std::time::Instant::now())
+            .unwrap();
+        assert!(!engine.checkpoint_beat().failed());
+        if engine
+            .execute_checkpoint_statement(&mut second, &mut Responder::new(&mut send))
+            .unwrap()
+            .is_ok()
+        {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "one cancelled request cannot discard another request's work"
+    );
+    assert_eq!(message_types(send.readable()), [b'C']);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}

@@ -1353,6 +1353,16 @@ impl Server {
                 let beat = self.engine.checkpoint_beat();
                 checkpoint_schedule.observe(beat, Instant::now(), &mut self.durability_ready);
                 self.durability_ready &= !self.engine.publication_failed();
+                if matches!(
+                    beat,
+                    CheckpointBeat::Durable
+                        | CheckpointBeat::DurableWithLocalFailure
+                        | CheckpointBeat::LocalFailure
+                        | CheckpointBeat::StorageFailure
+                ) {
+                    self.wake_io_waiters();
+                    self.finish_response_batch(publication_error.as_ref());
+                }
             }
         }
         self.shutdown();
@@ -2841,8 +2851,8 @@ impl Server {
         self.wake_waiters(false);
     }
 
-    /// Retries statements parked on an object read only after that read has
-    /// completed. Readable client sockets do not make a pending object GET
+    /// Retries statements after object reads, commit publication or a
+    /// requested checkpoint completes. Readable client sockets do not make a pending object GET
     /// complete, so combining this with lock wakeups would spin the reactor.
     fn wake_io_waiters(&mut self) {
         self.wake_waiters(true);

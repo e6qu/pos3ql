@@ -45,11 +45,16 @@ the old capture. Index sort runs and final index handles remain private until
 their uploads finish; changed index inputs cancel abandoned uploads without
 waiting for socket readiness. Merge source failures restart the same immutable
 pair with cleared output and checksum state.
-A separate startup-reserved client and metadata buffer upload the manifest, the metadata naming
-the saved files. Its exact bytes survive retries, including a lost response.
+A separate startup-reserved client and metadata buffer upload the manifest,
+the metadata naming the saved files. Its exact bytes survive retries, including a lost response.
 Completion installs matching table and index identities and preserves newer
 changes. Cleanup keeps every file named by that saved manifest, even when a
-later table rewrite has stopped using its indexes. Remaining qualification is in [the plan](../PLAN.md).
+later table rewrite has stopped using its indexes.
+
+An explicit SQL CHECKPOINT waits for its requested save while other connections
+continue working. Later writes do not extend an earlier command indefinitely;
+failures reach the commands waiting for that save. Remaining qualification is in
+[the plan](../PLAN.md).
 
 Table output schedules at most the configured number of committed versions,
 processes at most 64 per CPU turn, and stops to drain each emitted batch.

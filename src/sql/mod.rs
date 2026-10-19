@@ -472,10 +472,10 @@ pub struct Engine {
     wal: Wal,
     ckpt: Option<Checkpointer>,
     temporary_spiller: Option<TemporarySpiller>,
-    /// A published manifest whose local bookkeeping still needs to finish.
-    /// Keeping this state makes publication and its cleanup one retriable
-    /// completion protocol instead of reporting success after the manifest.
+    /// A durable, installed manifest whose heap and journal cleanup remains.
+    /// Cleanup retries preserve the publication's captured log boundary.
     post_publish_cleanup: Option<PostPublishCleanup>,
+    checkpoint_failure: Option<(u64, SqlError)>,
     /// A COPY FROM STDIN the last statement started: the connection takes
     /// it, switches into copy-in mode, and feeds data lines back through
     /// [`Engine::copy_row_line`] until CopyDone.
@@ -3808,6 +3808,7 @@ impl Engine {
             ckpt,
             temporary_spiller,
             post_publish_cleanup: None,
+            checkpoint_failure: None,
             pending_copy: None,
             wal_upload: config.wal_upload && config.object_store_on,
             commit_progress: CommitProgressMode::Inline,
@@ -7954,9 +7955,9 @@ impl Engine {
     }
 
     /// Snapshots to object storage, then truncates the journal and compacts
-    /// the heap. The atomic form — drives the sliced checkpoint's beats to
-    /// completion in one call, for the explicit `CHECKPOINT` statement and
-    /// shutdown. `Ok(false)` = nothing to do.
+    /// the heap. The atomic form drives checkpoint beats to completion for
+    /// embedders and shutdown. Reactor SQL commands retain a request instead.
+    /// `Ok(false)` = nothing to do.
     pub fn checkpoint_enabled(&self) -> bool {
         self.ckpt.is_some()
     }
@@ -8222,8 +8223,41 @@ impl Engine {
 
     pub(crate) fn execute_checkpoint_statement(
         &mut self,
+        txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if self.commit_progress == CommitProgressMode::Reactor
+            && let Some(checkpointer) = self.ckpt.as_mut()
+        {
+            let request = match txn.checkpoint_request {
+                Some(request) => request,
+                None => match checkpointer.request_checkpoint() {
+                    Ok(request) => {
+                        txn.checkpoint_request = Some(request);
+                        request
+                    }
+                    Err(error) => return Ok(Err(error)),
+                },
+            };
+            if !checkpointer.checkpoint_request_satisfied(request) {
+                if let Some((epoch, error)) = &self.checkpoint_failure
+                    && *epoch >= request.epoch()
+                {
+                    txn.checkpoint_request = None;
+                    return Ok(Err(SqlError {
+                        sqlstate: error.sqlstate,
+                        message: error.message,
+                    }));
+                }
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_IO_WAIT,
+                    "checkpoint publication is pending"
+                )));
+            }
+            txn.checkpoint_request = None;
+            responder.command_complete("CHECKPOINT")?;
+            return Ok(Ok(()));
+        }
         match self.checkpoint() {
             Ok(_) => {
                 responder.command_complete("CHECKPOINT")?;
@@ -9507,6 +9541,18 @@ impl Engine {
     /// Snapshot cleanup visits at most 64 stable slots alongside a heap step.
     /// Critical pressure, heap remapping and other maintenance still
     /// have whole turns. Publication and merge wait for owned reads to finish.
+    fn remember_checkpoint_failure(&mut self, error: &SqlError) {
+        if let Some(checkpointer) = self.ckpt.as_ref() {
+            self.checkpoint_failure = Some((
+                checkpointer.requested_checkpoint_epoch(),
+                SqlError {
+                    sqlstate: error.sqlstate,
+                    message: error.message,
+                },
+            ));
+        }
+    }
+
     pub(crate) fn checkpoint_beat(&mut self) -> CheckpointBeat {
         if let Some(checkpointer) = self.ckpt.as_mut()
             && checkpointer.manifest_publication_pending()
@@ -9535,7 +9581,9 @@ impl Engine {
                         "checkpoint_manifest_failed",
                         format_args!("{}: {}", error.sqlstate, error.message.as_str()),
                     );
-                    if checkpointer.manifest_installing() {
+                    let durable = checkpointer.manifest_installing();
+                    self.remember_checkpoint_failure(&error);
+                    if durable {
                         CheckpointBeat::DurableWithLocalFailure
                     } else {
                         CheckpointBeat::StorageFailure
@@ -9551,6 +9599,7 @@ impl Engine {
             return match checkpointer.advance_physical_output(&self.storage) {
                 Ok(_) => CheckpointBeat::Advanced,
                 Err(error) => {
+                    self.remember_checkpoint_failure(&error);
                     crate::logging::error_args(
                         "checkpoint_upload_failed",
                         format_args!("{}: {}", error.sqlstate, error.message.as_str()),
@@ -9579,6 +9628,7 @@ impl Engine {
             return match result {
                 Ok(()) => CheckpointBeat::Advanced,
                 Err(error) => {
+                    self.remember_checkpoint_failure(&error);
                     crate::logging::error_args(
                         "checkpoint_output_failed",
                         format_args!("{}: {}", error.sqlstate, error.message.as_str()),
@@ -9603,6 +9653,7 @@ impl Engine {
         // With an owned GET, only already-published local cleanup may advance.
         let retried_upload = !reads_pending && self.durable_retry_pending();
         if !reads_pending && let Err(error) = self.retry_pending_wal_upload() {
+            self.remember_checkpoint_failure(&error);
             let message = stack_format!(
                 512,
                 "auto-checkpoint failed ({}): {}\n",
@@ -9637,6 +9688,7 @@ impl Engine {
                     }
                 }
                 Err(e) => {
+                    self.remember_checkpoint_failure(&e);
                     let message = stack_format!(
                         512,
                         "post-checkpoint bookkeeping failed ({}): {}\n",
@@ -9680,6 +9732,7 @@ impl Engine {
             && let Some(slot) = match spiller.spill_step(&mut self.storage, &mut self.scratch) {
                 Ok(slot) => slot,
                 Err(error) => {
+                    self.remember_checkpoint_failure(&error);
                     let message = stack_format!(
                         512,
                         "temporary spill failed ({}): {}\n",
@@ -9765,6 +9818,7 @@ impl Engine {
                         .map(|_| ())
                 };
                 if let Err(e) = cleanup {
+                    self.remember_checkpoint_failure(&e);
                     let message = stack_format!(
                         512,
                         "post-checkpoint bookkeeping failed ({}): {}\n",
@@ -9791,6 +9845,7 @@ impl Engine {
                 }
             }
             Err(e) => {
+                self.remember_checkpoint_failure(&e);
                 let message = stack_format!(
                     512,
                     "auto-checkpoint failed ({}): {}\n",
@@ -16857,7 +16912,7 @@ impl Engine {
                     Ok(Ok(()))
                 }
             }
-            Stmt::Checkpoint => self.execute_checkpoint_statement(responder),
+            Stmt::Checkpoint => self.execute_checkpoint_statement(txn, responder),
             // VACUUM reclaims space; in this LSM that is a checkpoint (flush +
             // compaction, pruning superseded versions and tombstones). The
             // options and per-table targets are parsed; a checkpoint compacts

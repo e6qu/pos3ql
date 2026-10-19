@@ -41,7 +41,9 @@ Manifest upload now retains its exact metadata bytes and conditional request whi
 other work runs. Its completion installs only matching table and index identities;
 later writes stay dirty. Cleanup retains every file named by the saved metadata,
 including indexes retired by a later table rewrite. Explicit index repair rebuilds from table data without
-reading the retired index. These changes still require runner qualification.
+reading the retired index. Explicit CHECKPOINT requests also retain their own completion receipts while
+network work yields; later requests require a later metadata capture. These
+changes still require runner qualification.
 Remaining read progress, fairness and complete failure/recovery evidence remain
 acceptance work in this same PR.
 

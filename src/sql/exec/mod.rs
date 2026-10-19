@@ -22861,7 +22861,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         Err(error) => Ok(Err(error)),
                     }
                 }
-                Stmt::Checkpoint => engine.execute_checkpoint_statement(responder),
+                Stmt::Checkpoint => engine.execute_checkpoint_statement(txn, responder),
                 Stmt::Vacuum { targets, options } => {
                     engine.execute_vacuum_statement(targets, *options, txn, responder)
                 }

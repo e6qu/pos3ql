@@ -1107,6 +1107,15 @@ enum CommitPublication {
 
 pub(crate) const MANIFEST_UPLOAD_SLOTS: usize = 1;
 
+#[derive(Clone, Copy)]
+pub(crate) struct CheckpointRequest(core::num::NonZeroU64);
+
+impl CheckpointRequest {
+    pub(crate) fn epoch(self) -> u64 {
+        self.0.get()
+    }
+}
+
 enum ManifestPublication {
     Uploading {
         lsn: u64,
@@ -1139,6 +1148,9 @@ pub(crate) struct Checkpointer {
     block_uploads: crate::object_store::upload::Uploads,
     manifest_uploads: crate::object_store::upload::Uploads,
     manifest_publication: Option<ManifestPublication>,
+    requested_checkpoint_epoch: u64,
+    captured_checkpoint_epoch: u64,
+    published_checkpoint_epoch: u64,
     block_output: crate::store::BlockWriteBatch,
     index_output_owner: Option<IndexOutputOwner>,
     table_output: FixedVec<CheckpointVersion>,
@@ -2071,6 +2083,9 @@ impl Checkpointer {
             )
             .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
             manifest_publication: None,
+            requested_checkpoint_epoch: 0,
+            captured_checkpoint_epoch: 0,
+            published_checkpoint_epoch: 0,
             block_output: crate::store::BlockWriteBatch::new(
                 budget,
                 PHYSICAL_EMISSION_BYTES,
@@ -8445,7 +8460,7 @@ impl Checkpointer {
     /// Whether a sweep is mid-flight — once true, every beat advances it
     /// until the manifest publishes, trigger conditions or not.
     pub(crate) fn sweep_active(&self) -> bool {
-        self.sweeping
+        self.sweeping || self.requested_checkpoint_epoch > self.published_checkpoint_epoch
     }
 
     fn observe_retained_root_release(&mut self, storage: &Storage) {
@@ -8565,7 +8580,7 @@ impl Checkpointer {
         // sweep due even at an unchanged lsn: its install needs a publish.
         let merge_due = self.merge_job.is_some() || self.merge_candidate(storage).is_some();
         let value_index_due = self.value_index_schedule_pending(storage);
-        let sweep_due = self.sweeping
+        let sweep_due = self.sweep_active()
             || storage.lsn() != self.manifest_lsn
             || !self.manifest_present
             || self.merge_done.iter().any(Option::is_some)
@@ -12019,8 +12034,32 @@ impl Checkpointer {
             )?;
         }
         write_manifest(&mut self.manifest_output, "end")?;
+        self.captured_checkpoint_epoch = self.requested_checkpoint_epoch;
 
         Ok(())
+    }
+
+    pub(crate) fn request_checkpoint(&mut self) -> Result<CheckpointRequest, SqlError> {
+        let epoch = self
+            .requested_checkpoint_epoch
+            .checked_add(1)
+            .and_then(core::num::NonZeroU64::new)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "checkpoint request identities exhausted"
+                )
+            })?;
+        self.requested_checkpoint_epoch = epoch.get();
+        Ok(CheckpointRequest(epoch))
+    }
+
+    pub(crate) fn requested_checkpoint_epoch(&self) -> u64 {
+        self.requested_checkpoint_epoch
+    }
+
+    pub(crate) fn checkpoint_request_satisfied(&self, request: CheckpointRequest) -> bool {
+        self.published_checkpoint_epoch >= request.epoch()
     }
 
     pub(crate) fn manifest_installing(&self) -> bool {
@@ -12238,6 +12277,7 @@ impl Checkpointer {
                     self.pending_value_installs.clear();
                     self.merge_done.fill(None);
                     self.sweeping = false;
+                    self.published_checkpoint_epoch = self.captured_checkpoint_epoch;
                     self.manifest_publication = None;
                     self.published_lsn_pending_maintenance = Some(lsn);
                     self.legacy_garbage_pending = true;

@@ -5736,6 +5736,192 @@ mod tests {
     }
 
     #[test]
+    fn parallel_checkpoint_protocol_parks_resumes_and_cancels_without_replaying_commands() {
+        for (extended, cancel) in [(false, false), (true, false), (false, true)] {
+            let name = format!(
+                "checkpoint-protocol-{extended}-{cancel}-{}",
+                std::process::id()
+            );
+            let directory = std::env::temp_dir().join(&name);
+            let mut config = Config::default_dev();
+            config.data_dir = directory.to_string_lossy().into_owned();
+            config.max_tables = 4;
+            config.table_rows = 16;
+            config.max_connections = 2;
+            config.max_prepared = 2;
+            config.max_portals = 2;
+            config.txn_rows = 16;
+            config.max_ddl_per_transaction = 16;
+            config.max_savepoints_per_transaction = 4;
+            config.commit_queue_slots = 2;
+            config.max_value_indexes = 2;
+            config.value_index_rows = 16;
+            config.max_prepared_transactions = 1;
+            config.wal_bytes = 1 << 20;
+            config.wal_buffer_bytes = 1 << 16;
+            config.wal_upload_buffer_bytes = 1 << 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.object_store_bucket = name;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut conn = Conn::new(&config, &mut budget).unwrap();
+            let mut other = Conn::new(&config, &mut budget).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let other_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let role = engine.role_login("postgres").unwrap().slot;
+            for (connection, id) in [(&mut conn, 73), (&mut other, 74)] {
+                let (server, _) = listener.accept().unwrap();
+                server.set_nonblocking(true).unwrap();
+                connection.open(server, id);
+                connection.phase = Phase::Ready;
+                engine
+                    .register_backend(
+                        id,
+                        crate::storage::DatabaseOid::POSTGRES,
+                        role,
+                        "",
+                        None,
+                        -1,
+                        connection.backend_start,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            engine.enable_async_durability();
+            if extended {
+                conn.recv
+                    .append(&frontend(wire::FMSG_PARSE, b"\0CHECKPOINT\0\0\0"));
+                conn.recv
+                    .append(&frontend(wire::FMSG_BIND, b"\0\0\0\0\0\0\0\0"));
+                conn.recv
+                    .append(&frontend(wire::FMSG_EXECUTE, b"\0\0\0\0\0"));
+                conn.recv.append(&frontend(wire::FMSG_SYNC, &[]));
+                conn.recv
+                    .append(&frontend(wire::FMSG_QUERY, b"SELECT 17\0"));
+            } else {
+                conn.recv
+                    .append(&frontend(wire::FMSG_QUERY, b"CHECKPOINT; SELECT 17\0"));
+            }
+            let mut parked = false;
+            for _ in 0..4 {
+                match crate::mem::guard::forbid_alloc(|| conn.process_message(&mut engine)) {
+                    Step::Continue => {}
+                    Step::Parked => {
+                        parked = true;
+                        break;
+                    }
+                    _ => panic!("CHECKPOINT must park before completion"),
+                }
+            }
+            assert!(parked && conn.parked);
+            assert!(!has_backend_message(
+                conn.send.readable(),
+                wire::MSG_COMMAND_COMPLETE
+            ));
+            assert!(!has_backend_message(
+                conn.send.readable(),
+                wire::MSG_ERROR_RESPONSE
+            ));
+            let pending = crate::mem::guard::forbid_alloc(|| {
+                conn.retry_parked(&mut engine, 0, true).unwrap()
+            });
+            assert_eq!(pending.after, After::Continue);
+            assert!(conn.parked, "an early wakeup must retain the same request");
+            other
+                .recv
+                .append(&frontend(wire::FMSG_QUERY, b"SELECT 23\0"));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| other.process_message(&mut engine)),
+                Step::Continue
+            ));
+            assert!(
+                has_backend_message(other.send.readable(), wire::MSG_DATA_ROW),
+                "another connection can query while CHECKPOINT waits"
+            );
+            if cancel {
+                assert!(crate::mem::guard::forbid_alloc(
+                    || conn.cancel_parked(&mut engine)
+                ));
+                assert!(!conn.parked && conn.recv.is_empty());
+                assert!(
+                    conn.send
+                        .readable()
+                        .windows(5)
+                        .any(|bytes| bytes == b"57014")
+                );
+                assert!(
+                    !conn
+                        .send
+                        .readable()
+                        .windows(11)
+                        .any(|bytes| bytes == b"CHECKPOINT\0")
+                );
+                conn.send.clear();
+                conn.recv
+                    .append(&frontend(wire::FMSG_QUERY, b"SELECT 17\0"));
+                assert!(matches!(
+                    crate::mem::guard::forbid_alloc(|| conn.process_message(&mut engine)),
+                    Step::Continue
+                ));
+            } else {
+                let mut saved = false;
+                for _ in 0..128 {
+                    engine
+                        .advance_wal_publication(std::time::Instant::now())
+                        .unwrap();
+                    if engine.checkpoint_beat() == crate::sql::CheckpointBeat::Durable {
+                        saved = true;
+                        break;
+                    }
+                }
+                assert!(saved);
+                let pending = crate::mem::guard::forbid_alloc(|| {
+                    conn.retry_parked(&mut engine, 0, true).unwrap()
+                });
+                assert_eq!(pending.after, After::Continue);
+                assert!(!conn.parked && conn.recv.is_empty());
+                assert_eq!(
+                    conn.send
+                        .readable()
+                        .windows(11)
+                        .filter(|bytes| *bytes == b"CHECKPOINT\0")
+                        .count(),
+                    1,
+                    "resume completes the original command exactly once"
+                );
+            }
+            assert!(
+                conn.send
+                    .readable()
+                    .windows(13)
+                    .any(|bytes| bytes == b"D\0\0\0\x0c\0\x01\0\0\0\x0217")
+            );
+            assert!(!has_backend_message(
+                conn.send.readable(),
+                wire::MSG_ERROR_RESPONSE
+            ));
+            assert!(engine.fatal_commit_failure().is_none());
+            engine.drop_connection(73);
+            engine.drop_connection(74);
+            drop(conn);
+            drop(other);
+            drop(client);
+            drop(other_client);
+            drop(engine);
+            std::fs::remove_dir_all(directory).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+
+    #[test]
     fn parallel_commit_prepared_protocol_keeps_the_connection_after_resolution() {
         fn request(conn: &mut Conn, engine: &mut Engine, input: &[u8]) -> Vec<u8> {
             conn.send.clear();

@@ -82,29 +82,7 @@ impl BlockWriteBatch {
             return Ok(());
         }
         if let Some(deadline) = self.retry_at {
-            let millis = deadline
-                .saturating_duration_since(now)
-                .as_millis()
-                .saturating_add(1);
-            let result = unsafe {
-                libc::poll(
-                    core::ptr::null_mut(),
-                    0,
-                    millis.min(i32::MAX as u128) as i32,
-                )
-            };
-            if result < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    return Ok(());
-                }
-                return Err(UploadError::Request(crate::object_store::Error::Io {
-                    context: "physical upload retry wait",
-                    kind: error.kind(),
-                    detail: crate::util::StackStr::new(),
-                }));
-            }
-            Ok(())
+            uploads.wait_until(deadline).map_err(UploadError::Request)
         } else {
             uploads.wait_ready().map_err(UploadError::Request)
         }

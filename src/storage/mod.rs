@@ -13,6 +13,7 @@ pub(crate) use log_positions::ReservedLogPosition;
 mod enum_images;
 mod enum_publication;
 pub(crate) use enum_publication::{EnumAlterUndo, EnumMemberPublication};
+pub(crate) use statistics::CheckpointStatistics;
 mod table_creation;
 mod table_definitions;
 mod table_edits;
@@ -2548,6 +2549,11 @@ impl TableSerialState {
         self.dirty = true;
         self.staged_by = None;
     }
+}
+
+pub(crate) enum ValueIndexInstallation {
+    Recovery,
+    Checkpoint { dirty_lsn: u64 },
 }
 
 struct TablePublication {
@@ -31789,21 +31795,6 @@ impl Storage {
         Ok(None)
     }
 
-    /// Clears only table images captured by a published checkpoint.
-    pub fn clear_dirty_through(&mut self, generations: &[u64]) {
-        for (slot, t) in self.tables.iter_mut().enumerate() {
-            let mut publication = t.publication();
-            if generations.get(slot).copied() == Some(publication.generation) {
-                publication.dirty = false;
-                for (_, state) in t.rows.write().iter_mut() {
-                    state.checkpoint_change_lsn = 0;
-                }
-            }
-            drop(publication);
-            t.statistics.clear_dirty();
-        }
-    }
-
     /// Compares canonical physical column payloads without allocating or
     /// decoding variable-width values. The comparison happens on the
     /// fallible, pre-commit write path: commit itself must never discover that
@@ -33697,6 +33688,7 @@ impl Storage {
         index_created_at: Option<u64>,
         include_mask: ColumnSet,
         handle: Option<crate::store::ValueIndexHandle>,
+        installation: ValueIndexInstallation,
     ) -> Result<(), SqlError> {
         let n_enforcers = self.tables[table_index].enforcer_count();
         let mut publication = self.tables[table_index].publication();
@@ -33715,8 +33707,16 @@ impl Storage {
             ));
         };
         enforcer.durable = handle;
-        enforcer.durable_dirty = false;
-        enforcer.durable_rebuild = false;
+        let captured_current = match installation {
+            ValueIndexInstallation::Recovery => true,
+            ValueIndexInstallation::Checkpoint { dirty_lsn } => {
+                enforcer.durable_dirty_lsn == dirty_lsn
+            }
+        };
+        if captured_current {
+            enforcer.durable_dirty = false;
+            enforcer.durable_rebuild = false;
+        }
         Ok(())
     }
 
@@ -60000,7 +60000,7 @@ mod tests {
             .rows
             .insert(1, RowState::committed_only_at(RowLoc::test(0, 4), 42));
         storage.table_mut(slot).mark_dirty();
-        storage.clear_dirty_through(&[captured]);
+        storage.clear_table_dirty_through(slot, captured);
         assert!(storage.table(slot).dirty());
         assert_eq!(
             storage.tables[slot]
@@ -60011,7 +60011,7 @@ mod tests {
             42
         );
         let current = storage.table(slot).generation();
-        storage.clear_dirty_through(&[current]);
+        storage.clear_table_dirty_through(slot, current);
         assert!(!storage.table(slot).dirty());
         assert_eq!(
             storage.tables[slot]

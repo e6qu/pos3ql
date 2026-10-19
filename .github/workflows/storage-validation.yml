@@ -52,6 +52,7 @@ jobs:
         run: |
           set -eu
           for filter in \
+            row_lock_owners_tombstone_cleanup_keeps_live_pending_and_historical_states \
             parallel_ \
             sliced_heap_capture_ \
             explicit_locking_mode_ \

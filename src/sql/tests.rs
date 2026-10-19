@@ -87868,14 +87868,16 @@ fn parallel_physical_index_files_wait_for_uploads_and_recover_without_caches() {
             let before = engine.storage.block_io_stats();
             match checkpointer.checkpoint_step(&mut engine.storage).unwrap() {
                 crate::checkpoint::CheckpointStep::Working => {
-                    for binding in 0..engine.storage.value_binding_count(table) {
-                        assert!(
-                            engine
-                                .storage
-                                .value_binding_handle(table, binding)
-                                .is_none(),
-                            "a pending checkpoint cannot install any index root"
-                        );
+                    if !checkpointer.manifest_installing() {
+                        for binding in 0..engine.storage.value_binding_count(table) {
+                            assert!(
+                                engine
+                                    .storage
+                                    .value_binding_handle(table, binding)
+                                    .is_none(),
+                                "a pending checkpoint cannot install any index root"
+                            );
+                        }
                     }
                 }
                 crate::checkpoint::CheckpointStep::Published { lsn } => {
@@ -88132,4 +88134,436 @@ fn parallel_physical_index_changes_cancel_unready_uploads_in_both_modes() {
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
+}
+
+#[test]
+fn parallel_physical_manifest_completion_preserves_later_rows_and_indexes() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let label = match mode {
+            crate::config::TransactionMode::Mvcc => "mvcc",
+            crate::config::TransactionMode::Locking => "locking",
+        };
+        let mut config = test_config(&format!("manifest-late-rows-{label}"));
+        config.transaction_mode = mode;
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("manifest-late-rows-{label}-{}", std::process::id());
+        config.max_tables = 4;
+        config.table_rows = 16;
+        config.value_index_rows = 16;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 271);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        assert!(
+            error_sqlstates(&run_with(
+                &mut engine,
+                &mut budget,
+                "CREATE TABLE manifest_rows(id integer PRIMARY KEY, code text); \
+             INSERT INTO manifest_rows VALUES(1,'one'),(2,'two'); \
+             CREATE INDEX manifest_rows_code ON manifest_rows(code)"
+            ))
+            .is_empty()
+        );
+        let table = engine
+            .storage
+            .find_table("public", "manifest_rows")
+            .unwrap();
+        for _ in 0..128 {
+            let checkpoint = engine.ckpt.as_mut().unwrap();
+            if checkpoint.manifest_publication_pending() {
+                break;
+            }
+            assert!(matches!(
+                checkpoint.checkpoint_step(&mut engine.storage).unwrap(),
+                crate::checkpoint::CheckpointStep::Working
+            ));
+        }
+        assert!(engine.ckpt.as_ref().unwrap().manifest_publication_pending());
+        let saved_lsn = engine.storage.lsn();
+        assert!(
+            error_sqlstates(&run_with(
+                &mut engine,
+                &mut budget,
+                "UPDATE manifest_rows SET code='new' WHERE id=1; \
+             DELETE FROM manifest_rows WHERE id=2; \
+             INSERT INTO manifest_rows VALUES(3,'three')"
+            ))
+            .is_empty()
+        );
+        namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
+        let mut completed = false;
+        for _ in 0..128 {
+            engine
+                .advance_wal_publication(std::time::Instant::now())
+                .unwrap();
+            let progress = if engine.ckpt.as_ref().unwrap().manifest_installing() {
+                crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat())
+            } else {
+                engine.checkpoint_beat()
+            };
+            match progress {
+                CheckpointBeat::Durable => {
+                    completed = true;
+                    break;
+                }
+                CheckpointBeat::Advanced | CheckpointBeat::WaitingForReads => {}
+                other => panic!("delayed manifest failed: {other:?}"),
+            }
+        }
+        namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
+        assert!(
+            completed,
+            "ambiguous root upload must be adopted without rebuilding it"
+        );
+        assert!(engine.storage.lsn() > saved_lsn);
+        assert!(
+            engine.storage.table(table).dirty(),
+            "later rows remain unsaved"
+        );
+        assert!(
+            (0..engine.storage.value_binding_count(table))
+                .any(|binding| engine.storage.value_binding_needs_publish(table, binding))
+        );
+        engine.finish_post_publish_cleanup().unwrap();
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .finish_maintenance(&engine.storage)
+            .unwrap();
+        let query = "SELECT id,code FROM manifest_rows ORDER BY id; \
+                     SELECT count(*) FROM manifest_rows WHERE code='two'; \
+                     SELECT id FROM manifest_rows WHERE code='new'";
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, query)),
+            ["1|new", "3|three", "0", "1"]
+        );
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+            ["1|new", "3|three", "0", "1"]
+        );
+        assert!(recovered.checkpoint().unwrap());
+        drop(recovered);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+fn parallel_physical_manifest_completion_skips_rewritten_and_replaced_tables() {
+    for replacement in [false, true] {
+        let mut config = test_config(&format!("manifest-new-layout-{replacement}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket =
+            format!("manifest-new-layout-{replacement}-{}", std::process::id());
+        config.max_tables = 4;
+        config.table_rows = 16;
+        config.value_index_rows = 16;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        assert!(
+            error_sqlstates(&run_with(
+                &mut engine,
+                &mut budget,
+                "CREATE TABLE manifest_layout(id integer PRIMARY KEY, code text); \
+             INSERT INTO manifest_layout VALUES(1,'one'),(2,'two')"
+            ))
+            .is_empty()
+        );
+        for _ in 0..128 {
+            let checkpoint = engine.ckpt.as_mut().unwrap();
+            if checkpoint.manifest_publication_pending() {
+                break;
+            }
+            assert!(matches!(
+                checkpoint.checkpoint_step(&mut engine.storage).unwrap(),
+                crate::checkpoint::CheckpointStep::Working
+            ));
+        }
+        assert!(engine.ckpt.as_ref().unwrap().manifest_publication_pending());
+        let change = if replacement {
+            "DROP TABLE manifest_layout; \
+             CREATE TABLE manifest_layout(id integer PRIMARY KEY, code text); \
+             INSERT INTO manifest_layout VALUES(11,'one!'),(12,'two!')"
+        } else {
+            "ALTER TABLE manifest_layout ALTER COLUMN id TYPE integer USING id+10; \
+             UPDATE manifest_layout SET code=code||'!'"
+        };
+        let changed = run_with(&mut engine, &mut budget, change);
+        assert!(
+            error_sqlstates(&changed).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&changed)
+        );
+        let mut completed = false;
+        for _ in 0..128 {
+            engine
+                .advance_wal_publication(std::time::Instant::now())
+                .unwrap();
+            let progress = if engine.ckpt.as_ref().unwrap().manifest_installing() {
+                crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat())
+            } else {
+                engine.checkpoint_beat()
+            };
+            match progress {
+                CheckpointBeat::Durable => {
+                    completed = true;
+                    break;
+                }
+                CheckpointBeat::Advanced | CheckpointBeat::WaitingForReads => {}
+                other => panic!("delayed layout publication failed: {other:?}"),
+            }
+        }
+        assert!(completed);
+        engine.finish_post_publish_cleanup().unwrap();
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .finish_maintenance(&engine.storage)
+            .unwrap();
+        let query = "SELECT id,code FROM manifest_layout ORDER BY id";
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, query)),
+            ["11|one!", "12|two!"]
+        );
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+            ["11|one!", "12|two!"]
+        );
+        assert!(recovered.checkpoint().unwrap());
+        drop(recovered);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+fn parallel_physical_explicit_reindex_does_not_read_the_retired_corrupt_roster() {
+    use crate::store::BlockStore;
+    let mut config = test_config("reindex-corrupt-roster");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("reindex-corrupt-roster-{}", std::process::id());
+    config.max_tables = 4;
+    config.table_rows = 16;
+    config.value_index_rows = 16;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE repair_roster(id integer PRIMARY KEY); \
+         INSERT INTO repair_roster VALUES(1),(2)"
+        ))
+        .is_empty()
+    );
+    let table = engine
+        .storage
+        .find_table("public", "repair_roster")
+        .unwrap();
+    let roster = engine
+        .ckpt
+        .as_ref()
+        .unwrap()
+        .block_stack()
+        .lock()
+        .unwrap()
+        .put(
+            b"invalid roster",
+            crate::store::BlockType::ValueIndexRoster,
+            engine.storage.lsn(),
+        )
+        .unwrap();
+    engine
+        .storage
+        .install_value_binding(
+            table,
+            &[0],
+            None,
+            crate::storage::ColumnSet::EMPTY,
+            Some(crate::store::ValueIndexHandle {
+                roster,
+                entries: 2,
+                published_lsn: engine.storage.lsn(),
+            }),
+            crate::storage::ValueIndexInstallation::Recovery,
+        )
+        .unwrap();
+    assert!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "REINDEX TABLE repair_roster"
+        ))
+        .is_empty()
+    );
+    assert!(engine.storage.value_binding_requires_rebuild(table, 0));
+    assert!(
+        engine.checkpoint().unwrap(),
+        "repair must read table data, never the broken old roster"
+    );
+    assert!(!engine.storage.value_binding_needs_publish(table, 0));
+    let query = "SELECT id FROM repair_roster WHERE id=2; SELECT count(*) FROM repair_roster";
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, query)),
+        ["2", "2"]
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+        ["2", "2"]
+    );
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn parallel_physical_manifest_install_failure_resumes_without_republishing_or_reappending() {
+    let mut config = test_config("manifest-install-retry");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("manifest-install-retry-{}", std::process::id());
+    config.max_tables = 4;
+    config.table_rows = 16;
+    config.max_spill_generations_per_table = 2;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE manifest_first(id integer); CREATE TABLE manifest_second(id integer); \
+         INSERT INTO manifest_first VALUES(1); INSERT INTO manifest_second VALUES(2)"
+        ))
+        .is_empty()
+    );
+    assert!(engine.checkpoint().unwrap());
+    let first = engine
+        .storage
+        .find_table("public", "manifest_first")
+        .unwrap();
+    let second = engine
+        .storage
+        .find_table("public", "manifest_second")
+        .unwrap();
+    assert!(first < second);
+    let old_second = engine
+        .storage
+        .table(second)
+        .spill_generations()
+        .handle(0)
+        .unwrap();
+    assert!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "UPDATE manifest_first SET id=id+10; UPDATE manifest_second SET id=id+10"
+        ))
+        .is_empty()
+    );
+    for _ in 0..128 {
+        let checkpoint = engine.ckpt.as_mut().unwrap();
+        if checkpoint.manifest_publication_pending() {
+            break;
+        }
+        assert!(matches!(
+            checkpoint.checkpoint_step(&mut engine.storage).unwrap(),
+            crate::checkpoint::CheckpointStep::Working
+        ));
+    }
+    assert!(engine.ckpt.as_ref().unwrap().manifest_publication_pending());
+    // Occupy the second roster's last slot after capture to inject a local
+    // capacity failure after the first table has installed successfully.
+    engine
+        .storage
+        .append_spill_through(second, old_second, 0)
+        .unwrap();
+    let mut failure = None;
+    for _ in 0..128 {
+        match engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage)
+        {
+            Ok(crate::checkpoint::CheckpointStep::Working) => {}
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+            _ => panic!("fixture must fail its second local installation"),
+        }
+    }
+    assert_eq!(
+        failure.expect("full local roster must fail").sqlstate,
+        sqlstate::PROGRAM_LIMIT_EXCEEDED
+    );
+    assert!(engine.ckpt.as_ref().unwrap().manifest_installing());
+    assert_eq!(engine.storage.spill_generation_count(first), 2);
+    let roots = engine.ckpt.as_ref().unwrap().root_etags_for_test();
+    engine.storage.set_spill_list(second, &[old_second]);
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        engine.ckpt.as_ref().unwrap().root_etags_for_test(),
+        roots,
+        "retry local installation without publishing the durable root again"
+    );
+    assert_eq!(
+        engine.storage.spill_generation_count(first),
+        2,
+        "retry cannot append the first table's delta twice"
+    );
+    assert_eq!(engine.storage.spill_generation_count(second), 2);
+    let query = "SELECT id FROM manifest_first; SELECT id FROM manifest_second";
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, query)),
+        ["11", "12"]
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+        ["11", "12"]
+    );
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }

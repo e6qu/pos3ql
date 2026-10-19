@@ -363,6 +363,13 @@ impl Uploads {
     }
 
     pub(crate) fn wait_ready(&mut self) -> Result<(), Error> {
+        let deadline = self
+            .next_deadline()
+            .ok_or(Error::Protocol("no pending upload to wait for"))?;
+        self.wait_until(deadline)
+    }
+
+    pub(crate) fn wait_until(&mut self, deadline: Instant) -> Result<(), Error> {
         self.pollfds.clear();
         for slot in self.slots.iter() {
             if let Some(fd) = slot.client.pending_fd() {
@@ -380,9 +387,6 @@ impl Uploads {
                     .expect("one descriptor per upload slot");
             }
         }
-        let deadline = self
-            .next_deadline()
-            .ok_or(Error::Protocol("no pending upload to wait for"))?;
         let timeout = deadline
             .saturating_duration_since(Instant::now())
             .as_nanos()

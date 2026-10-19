@@ -992,7 +992,7 @@ impl TemporarySpiller {
             }
             (false, None) => storage.set_spill_list(slot, &[]),
         }
-        storage.clear_tombstones(slot);
+        storage.clear_tombstones(slot, storage.lsn());
         storage.clear_table_dirty_through(slot, generation);
         self.reclaim(storage)?;
         Ok(Some(slot))
@@ -1105,6 +1105,25 @@ enum CommitPublication {
     },
 }
 
+pub(crate) const MANIFEST_UPLOAD_SLOTS: usize = 1;
+
+enum ManifestPublication {
+    Uploading {
+        lsn: u64,
+        ticket: crate::object_store::upload::Ticket,
+    },
+    Retry {
+        lsn: u64,
+        at: std::time::Instant,
+    },
+    Installing {
+        lsn: u64,
+        row_position: usize,
+        value_position: usize,
+        cleanup_position: usize,
+    },
+}
+
 // One append may flush a prior group and a maximum chained row; finish may
 // flush column frames, index levels, filter and roster. Index navigation adds
 // its fixed-depth frontier. This reserves one operation, independent of rows.
@@ -1118,6 +1137,8 @@ pub(crate) struct Checkpointer {
     pub(crate) client: ObjectStore,
     uploads: crate::object_store::upload::Uploads,
     block_uploads: crate::object_store::upload::Uploads,
+    manifest_uploads: crate::object_store::upload::Uploads,
+    manifest_publication: Option<ManifestPublication>,
     block_output: crate::store::BlockWriteBatch,
     index_output_owner: Option<IndexOutputOwner>,
     table_output: FixedVec<CheckpointVersion>,
@@ -1195,6 +1216,7 @@ pub(crate) struct Checkpointer {
     sliced_layout: Vec<SliceLayout>,
     sliced_this_sweep: Vec<bool>,
     checkpoint_deletions: Vec<Option<std::sync::Arc<()>>>,
+    checkpoint_statistics: Vec<Option<crate::storage::CheckpointStatistics>>,
     /// The slice writer (reset per table) and the merge writer, which holds
     /// a half-written SST across beats — the reason the writer owns its
     /// state instead of borrowing an arena.
@@ -1323,6 +1345,7 @@ impl Checkpointer {
                 + core::mem::size_of::<SliceLayout>()
                 + core::mem::size_of::<bool>()
                 + core::mem::size_of::<Option<std::sync::Arc<()>>>()
+                + core::mem::size_of::<Option<crate::storage::CheckpointStatistics>>()
                 + core::mem::size_of::<Option<CompletedMerge>>()
                 + core::mem::size_of::<Option<(BlockId, BlockId)>>())
             + table_capacity
@@ -1340,6 +1363,14 @@ impl Checkpointer {
             + config.checkpoint_commit_batches * core::mem::size_of::<StackStr<64>>()
             + config.max_backups * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
             + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
+    }
+
+    pub(crate) fn manifest_output_budget_bytes(config: &Config) -> usize {
+        crate::object_store::upload::Uploads::budget_bytes(
+            config,
+            MANIFEST_UPLOAD_SLOTS,
+            config.checkpoint_manifest_bytes,
+        )
     }
 
     pub(crate) fn physical_output_budget_bytes(config: &Config) -> usize {
@@ -1366,6 +1397,7 @@ impl Checkpointer {
                 config.wal_upload_buffer_bytes,
             )
             + Self::physical_output_budget_bytes(config)
+            + Self::manifest_output_budget_bytes(config)
             + OwnedObjectStore::budget_bytes(config)
             + Self::workspace_budget_bytes(config)
             + FixedMap::<BlockId, ()>::budget_bytes(config.checkpoint_live_blocks)
@@ -2030,6 +2062,14 @@ impl Checkpointer {
                 budget,
             )
             .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            manifest_uploads: crate::object_store::upload::Uploads::new(
+                config,
+                MANIFEST_UPLOAD_SLOTS,
+                config.checkpoint_manifest_bytes,
+                budget,
+            )
+            .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
+            manifest_publication: None,
             block_output: crate::store::BlockWriteBatch::new(
                 budget,
                 PHYSICAL_EMISSION_BYTES,
@@ -2103,6 +2143,7 @@ impl Checkpointer {
             sliced_layout: vec![SliceLayout::EMPTY; table_capacity],
             sliced_this_sweep: vec![false; table_capacity],
             checkpoint_deletions: (0..table_capacity).map(|_| None).collect(),
+            checkpoint_statistics: (0..table_capacity).map(|_| None).collect(),
             slice_writer: SstWriter::new(),
             merge_writer: SstWriter::new(),
             merge_source_cursors: [None, None],
@@ -2272,6 +2313,7 @@ impl Checkpointer {
         self.block_reads_busy()
             || self.uploads.busy()
             || self.block_uploads.busy()
+            || self.manifest_uploads.busy()
             || self.commit_publication.is_some()
     }
 
@@ -2419,6 +2461,7 @@ impl Checkpointer {
         }
         self.uploads.replace_credentials(credentials);
         self.block_uploads.replace_credentials(credentials);
+        self.manifest_uploads.replace_credentials(credentials);
         self.blocks
             .lock()
             .expect("block store lock poisoned")
@@ -2616,22 +2659,28 @@ impl Checkpointer {
     }
 
     pub(crate) fn upload_slots(&self) -> usize {
-        self.uploads.slots() + self.block_uploads.slots()
+        self.uploads.slots() + self.block_uploads.slots() + self.manifest_uploads.slots()
     }
 
     pub(crate) fn pending_upload_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
         if slot < self.uploads.slots() {
             self.uploads.fd(slot)
-        } else {
+        } else if slot < self.uploads.slots() + self.block_uploads.slots() {
             self.block_uploads.fd(slot - self.uploads.slots())
+        } else {
+            self.manifest_uploads
+                .fd(slot - self.uploads.slots() - self.block_uploads.slots())
         }
     }
 
     pub(crate) fn pending_upload_wants_write(&self, slot: usize) -> bool {
         if slot < self.uploads.slots() {
             self.uploads.wants_write(slot)
-        } else {
+        } else if slot < self.uploads.slots() + self.block_uploads.slots() {
             self.block_uploads.wants_write(slot - self.uploads.slots())
+        } else {
+            self.manifest_uploads
+                .wants_write(slot - self.uploads.slots() - self.block_uploads.slots())
         }
     }
 
@@ -2639,14 +2688,21 @@ impl Checkpointer {
         [
             self.uploads.next_deadline(),
             self.block_output.deadline(&self.block_uploads),
+            self.manifest_uploads.next_deadline(),
+            match self.manifest_publication {
+                Some(ManifestPublication::Retry { at, .. }) => Some(at),
+                Some(ManifestPublication::Installing { .. }) => Some(std::time::Instant::now()),
+                _ => None,
+            },
         ]
         .into_iter()
         .flatten()
         .min()
     }
 
-    pub(crate) fn advance_block_uploads(&mut self, now: std::time::Instant) {
+    pub(crate) fn advance_background_uploads(&mut self, now: std::time::Instant) {
         self.block_uploads.advance(now);
+        self.manifest_uploads.advance(now);
     }
 
     pub(crate) fn physical_output_ready(&self, now: std::time::Instant) -> bool {
@@ -8192,6 +8248,7 @@ impl Checkpointer {
                     index_created_at,
                     include_mask,
                     Some(handle),
+                    crate::storage::ValueIndexInstallation::Recovery,
                 )
                 .map_err(|error| {
                     CheckpointSetupError::ObjectStore(format!(
@@ -8369,7 +8426,9 @@ impl Checkpointer {
             match self.checkpoint_step(storage)? {
                 CheckpointStep::Idle => return Ok(None),
                 CheckpointStep::Working => {
-                    if !self.block_output.is_empty() {
+                    if self.manifest_publication_pending() {
+                        self.wait_manifest_publication()?;
+                    } else if !self.block_output.is_empty() {
                         self.block_output
                             .wait_ready(&mut self.block_uploads)
                             .map_err(upload_to_sql)?;
@@ -8425,8 +8484,8 @@ impl Checkpointer {
     /// checkpoint no longer stalls every connection for its whole duration;
     /// consistency holds because a table that changes after its slice
     /// ([`Table::mark_dirty`] bumps its generation) is re-sliced before the
-    /// publish, and the publish itself runs only in a beat where no table has
-    /// an outdated slice.
+    /// publish. Root serialization captures only current slices; its upload
+    /// and local installation retain that captured identity across later beats.
     ///
     /// A failed beat (an object-store error) leaves the sweep state where it
     /// stands; the next beat retries the same work — block writes are
@@ -8437,6 +8496,9 @@ impl Checkpointer {
         &mut self,
         storage: &mut Storage,
     ) -> Result<CheckpointStep, SqlError> {
+        if self.manifest_publication_pending() {
+            return self.advance_manifest_publication(storage);
+        }
         if !self.advance_physical_output(storage)? {
             return Ok(CheckpointStep::Working);
         }
@@ -8585,7 +8647,7 @@ impl Checkpointer {
             .lock()
             .expect("block store lock poisoned")
             .io_stats();
-        let published = self.publish(storage, lsn);
+        let published = self.prepare_manifest(storage, lsn);
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
             "manifest",
@@ -8600,9 +8662,8 @@ impl Checkpointer {
             0,
         );
         published?;
-        storage.clear_dirty_through(&self.sliced_generation);
-        self.sweeping = false;
-        Ok(CheckpointStep::Published { lsn })
+        self.queue_manifest_upload(lsn)?;
+        Ok(CheckpointStep::Working)
     }
 
     /// For a live relation, storage's installed handles and `prev_ssts` name
@@ -8673,11 +8734,21 @@ impl Checkpointer {
     }
 
     /// Assembles and publishes the manifest from the sweep's recorded
-    /// per-table lists, then installs the new spill state and sweeps
-    /// garbage. Runs only when no table has an outdated slice.
-    fn publish(&mut self, storage: &mut Storage, lsn: u64) -> Result<(), SqlError> {
+    /// per-table lists. The retained bytes stay unchanged until publication
+    /// resolves. Runs only when no table has an outdated slice.
+    fn prepare_manifest(&mut self, storage: &Storage, lsn: u64) -> Result<(), SqlError> {
+        if self.writer_fenced {
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
         // Delta bookkeeping collects the new per-slot references into
         // pre-reserved scratch so this post-freeze path never allocates.
+        for (slot, receipt) in self.checkpoint_statistics.iter_mut().enumerate() {
+            *receipt = Some(storage.capture_checkpoint_statistics(slot));
+            self.sliced_layout[slot] = SliceLayout::from_storage(storage, slot);
+        }
         self.manifest_buf.clear();
         write_manifest(&mut self.manifest_buf, MANIFEST_HEADER)?;
         write_manifest(&mut self.manifest_buf, format_args!("lsn {lsn}"))?;
@@ -11916,128 +11987,233 @@ impl Checkpointer {
         }
         write_manifest(&mut self.manifest_buf, "end")?;
 
-        // Promotion bumps both root ETags before activating the successor.
-        // A conflict is retried only after the process proves it still owns
-        // the writer fence.
-        let precondition = match &self.manifest_etag {
-            Some(etag) => Precondition::IfMatch(etag),
-            None => Precondition::IfNoneMatchAny,
+        Ok(())
+    }
+
+    pub(crate) fn manifest_installing(&self) -> bool {
+        matches!(
+            self.manifest_publication,
+            Some(ManifestPublication::Installing { .. })
+        )
+    }
+
+    pub(crate) fn manifest_publication_pending(&self) -> bool {
+        self.manifest_publication.is_some()
+    }
+
+    pub(crate) fn manifest_publication_ready(&self, now: std::time::Instant) -> bool {
+        match self.manifest_publication {
+            Some(ManifestPublication::Uploading { .. }) => self.manifest_uploads.has_completion(),
+            Some(ManifestPublication::Retry { at, .. }) => at <= now,
+            Some(ManifestPublication::Installing { .. }) => true,
+            None => false,
+        }
+    }
+
+    fn queue_manifest_upload(&mut self, lsn: u64) -> Result<(), SqlError> {
+        if self.writer_fenced {
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
+        self.manifest_publication = Some(ManifestPublication::Retry {
+            lsn,
+            at: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        });
+        let condition = match self.manifest_etag {
+            Some(etag) => crate::object_store::upload::Condition::PublishMatch(etag),
+            None => crate::object_store::upload::Condition::PublishAbsent,
         };
-        let etag = match self
-            .client
-            .put(MANIFEST_KEY, self.manifest_buf.readable(), precondition)
-        {
-            Ok(etag) => etag,
-            Err(e) if e.is_precondition_failed() => {
-                // A previous attempt's PUT may have landed with its response
-                // lost (the ambiguous failure): the bucket then holds a
-                // manifest of ours under an etag this process never learned
-                // — possibly an *older* one of ours, if state advanced since
-                // that attempt, so byte comparison cannot recognize it. The
-                // writer line can: our identity means our own write — adopt
-                // its etag and republish the current state over it. Any
-                // other identity is a genuine second writer, which stays a
-                // loud error rather than a clobber.
-                self.assert_writer()?;
-                let refreshed = self
-                    .client
-                    .get(MANIFEST_KEY, None)
-                    .map_err(object_store_to_sql)?;
-                let ours = {
-                    let body = self.client.body_bytes();
-                    let expect = crate::stack_format!(48, "writer {:032x}", self.writer_token.0);
-                    core::str::from_utf8(body)
-                        .ok()
-                        .is_some_and(|text| text.lines().any(|l| l == expect.as_str()))
-                };
-                if !ours {
-                    return Err(sql_err!(
-                        SQLSTATE_CAS,
-                        "manifest compare-and-swap failed after writer fencing"
-                    ));
-                }
-                self.client
-                    .put(
-                        MANIFEST_KEY,
-                        self.manifest_buf.readable(),
-                        Precondition::IfMatch(&refreshed.etag),
-                    )
-                    .map_err(object_store_to_sql)?
-            }
-            Err(e) => return Err(object_store_to_sql(e)),
-        };
-        self.manifest_etag = Some(etag);
-        self.manifest_present = true;
-        self.manifest_lsn = lsn;
-        std::mem::swap(&mut self.prev_ssts, &mut self.prev_scratch);
-        // The manifest is durable: install the new spill lists (a collapse
-        // remaps the table's spilled entries to slot 0) and forget the
-        // flushed tombstones. A failed CAS above reaches none of this, so a
-        // retry recomputes against unchanged state and the orphaned blocks
-        // are swept as garbage.
-        for &(slot, install) in &self.pending_installs {
-            match install {
-                SlotInstall::Append {
-                    handle,
-                    through_lsn,
-                } => {
-                    storage.append_spill_through(slot, handle, through_lsn)?;
-                }
-                SlotInstall::Replace {
-                    handle,
-                    through_lsn,
-                } => {
-                    if let Some(handle) = handle {
-                        storage.collapse_spill_through(slot, handle, through_lsn)?;
-                    } else {
-                        storage.set_spill_list(slot, &[]);
+        let ticket = self
+            .manifest_uploads
+            .enqueue(MANIFEST_KEY, self.manifest_buf.readable(), condition)
+            .map_err(upload_to_sql)?;
+        self.manifest_publication = Some(ManifestPublication::Uploading { lsn, ticket });
+        Ok(())
+    }
+
+    fn wait_manifest_publication(&mut self) -> Result<(), SqlError> {
+        if self.manifest_publication_ready(std::time::Instant::now()) {
+            return Ok(());
+        }
+        match self.manifest_publication {
+            Some(ManifestPublication::Uploading { .. }) => self
+                .manifest_uploads
+                .wait_ready()
+                .map_err(object_store_to_sql),
+            Some(ManifestPublication::Retry { at, .. }) => self
+                .manifest_uploads
+                .wait_until(at)
+                .map_err(object_store_to_sql),
+            Some(ManifestPublication::Installing { .. }) | None => Ok(()),
+        }
+    }
+
+    fn captured_table_current(&self, storage: &Storage, slot: usize) -> bool {
+        slot < storage.physical_table_count()
+            && storage.table(slot).live()
+            && self.sliced_layout[slot] == SliceLayout::from_storage(storage, slot)
+    }
+
+    /// Once the conditional root is durable, each local installation advances
+    /// exactly once. Errors retain the next uninstalled item, never the old CAS.
+    pub(crate) fn advance_manifest_publication(
+        &mut self,
+        storage: &mut Storage,
+    ) -> Result<CheckpointStep, SqlError> {
+        let publication = self
+            .manifest_publication
+            .take()
+            .expect("retained manifest publication");
+        match publication {
+            ManifestPublication::Uploading { lsn, ticket } => {
+                self.manifest_uploads.advance(std::time::Instant::now());
+                match self.manifest_uploads.take(ticket) {
+                    Ok(Some(etag)) => {
+                        self.manifest_etag = Some(etag);
+                        self.manifest_present = true;
+                        self.manifest_lsn = lsn;
+                        std::mem::swap(&mut self.prev_ssts, &mut self.prev_scratch);
+                        self.manifest_publication = Some(ManifestPublication::Installing {
+                            lsn,
+                            row_position: 0,
+                            value_position: 0,
+                            cleanup_position: 0,
+                        });
+                    }
+                    Ok(None) => {
+                        self.manifest_publication =
+                            Some(ManifestPublication::Uploading { lsn, ticket });
+                    }
+                    Err(crate::object_store::upload::UploadError::Request(error))
+                        if error.is_precondition_failed() =>
+                    {
+                        self.writer_fenced = true;
+                        return Err(sql_err!(
+                            SQLSTATE_CAS,
+                            "manifest root changed; writer was fenced"
+                        ));
+                    }
+                    Err(error) => {
+                        self.manifest_publication = Some(ManifestPublication::Retry {
+                            lsn,
+                            at: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                        });
+                        return Err(upload_to_sql(error));
                     }
                 }
-                SlotInstall::MergePair { at, handle } => storage.merge_spill_pair(slot, at, handle),
+            }
+            ManifestPublication::Retry { lsn, at } => {
+                if at > std::time::Instant::now() {
+                    self.manifest_publication = Some(ManifestPublication::Retry { lsn, at });
+                } else {
+                    self.queue_manifest_upload(lsn)?;
+                }
+            }
+            ManifestPublication::Installing {
+                lsn,
+                row_position,
+                value_position,
+                cleanup_position,
+            } => {
+                self.manifest_publication = Some(ManifestPublication::Installing {
+                    lsn,
+                    row_position,
+                    value_position,
+                    cleanup_position,
+                });
+                if row_position < self.pending_installs.len() {
+                    let (slot, install) = self.pending_installs[row_position];
+                    if self.captured_table_current(storage, slot) {
+                        match install {
+                            SlotInstall::Append {
+                                handle,
+                                through_lsn,
+                            } => storage.append_spill_through(slot, handle, through_lsn)?,
+                            SlotInstall::Replace {
+                                handle: Some(handle),
+                                through_lsn,
+                            } => storage.collapse_spill_through(slot, handle, through_lsn)?,
+                            SlotInstall::Replace { handle: None, .. } => {
+                                storage.set_spill_list(slot, &[])
+                            }
+                            SlotInstall::MergePair { at, handle } => {
+                                storage.merge_spill_pair(slot, at, handle)
+                            }
+                        }
+                    }
+                    self.manifest_publication = Some(ManifestPublication::Installing {
+                        lsn,
+                        row_position: row_position + 1,
+                        value_position,
+                        cleanup_position,
+                    });
+                } else if value_position < self.pending_value_installs.len() {
+                    let install = self.pending_value_installs[value_position];
+                    if self.captured_table_current(storage, install.slot)
+                        && (0..storage.value_binding_count(install.slot)).any(|binding| {
+                            Self::value_install_matches_binding(
+                                storage,
+                                &install,
+                                install.slot,
+                                binding,
+                            )
+                        })
+                    {
+                        storage.install_value_binding(
+                            install.slot,
+                            &install.columns[..install.n_columns],
+                            install.index_created_at,
+                            install.include_mask,
+                            install.handle,
+                            crate::storage::ValueIndexInstallation::Checkpoint {
+                                dirty_lsn: install.dirty_lsn,
+                            },
+                        )?;
+                    }
+                    self.manifest_publication = Some(ManifestPublication::Installing {
+                        lsn,
+                        row_position,
+                        value_position: value_position + 1,
+                        cleanup_position,
+                    });
+                } else if cleanup_position < self.checkpoint_deletions.len() {
+                    let end = (cleanup_position + 64).min(self.checkpoint_deletions.len());
+                    for slot in cleanup_position..end {
+                        if self.captured_table_current(storage, slot) {
+                            if self.sliced_this_sweep[slot] {
+                                storage.clear_tombstones(slot, self.sliced_lsn[slot]);
+                            }
+                            storage.clear_table_dirty_through(slot, self.sliced_generation[slot]);
+                            if let Some(receipt) = self.checkpoint_statistics[slot].take() {
+                                receipt.acknowledge(storage);
+                            }
+                        } else {
+                            self.checkpoint_statistics[slot] = None;
+                        }
+                        self.checkpoint_deletions[slot] = None;
+                    }
+                    self.manifest_publication = Some(ManifestPublication::Installing {
+                        lsn,
+                        row_position,
+                        value_position,
+                        cleanup_position: end,
+                    });
+                } else {
+                    self.pending_installs.clear();
+                    self.pending_value_installs.clear();
+                    self.merge_done.fill(None);
+                    self.sweeping = false;
+                    self.manifest_publication = None;
+                    self.published_lsn_pending_maintenance = Some(lsn);
+                    self.legacy_garbage_pending = true;
+                    self.block_garbage_pending = true;
+                    return Ok(CheckpointStep::Published { lsn });
+                }
             }
         }
-        // A resliced table may install several ordered deltas. Deletion
-        // markers must shadow every earlier member until the complete list is
-        // installed, then the published SSTs make them redundant.
-        for slot in 0..storage.physical_table_count() {
-            if self.sliced_this_sweep.get(slot).copied().unwrap_or(false) {
-                storage.clear_tombstones(slot);
-            }
-        }
-        self.pending_installs.clear();
-        self.checkpoint_deletions
-            .iter_mut()
-            .for_each(|guard| *guard = None);
-        for install in &self.pending_value_installs {
-            storage.install_value_binding(
-                install.slot,
-                &install.columns[..install.n_columns],
-                install.index_created_at,
-                install.include_mask,
-                install.handle,
-            )?;
-        }
-        self.pending_value_installs.clear();
-        // Completed merges are consumed with the installs — whether each one
-        // composed in or a collapse superseded it, this publish settled its
-        // fate either way.
-        self.merge_done.fill(None);
-        // The sweep is complete the instant the installs land: everything
-        // after the CAS is cleanup of the superseded generation. Marking it
-        // here (not in the caller) is load-bearing — a failure below must
-        // not leave the sweep active, because the swap above repurposed
-        // `prev_scratch`, and a retried publish reading it would CAS a
-        // manifest whose lsn claims state its lists do not carry, silently
-        // shadowing every local WAL record the lsn covers.
-        self.sweeping = false;
-
-        // A successful checkpoint includes both publication and maintenance.
-        // Keep the LSN until bounded sweeps finish so the next beat resumes
-        // cleanup instead of falsely reporting completion.
-        self.published_lsn_pending_maintenance = Some(lsn);
-        self.legacy_garbage_pending = true;
-        self.block_garbage_pending = true;
-        Ok(())
+        Ok(CheckpointStep::Working)
     }
 
     /// One beat's work for one table: computes its new SST list — carrying,
@@ -12507,7 +12683,7 @@ impl Checkpointer {
         self.roster_scratch.clear();
         self.value_changed_rowids.clear();
         let result = (|| {
-            if let Some(previous) = storage.value_binding_handle(slot, binding) {
+            if let Some(previous) = base {
                 let known = &mut self.roster_scratch;
                 let complete = crate::store::walk_value_roster(
                     &mut *self.blocks.lock().expect("block store lock poisoned"),
@@ -18112,6 +18288,7 @@ mod stored_dependency_tests {
                 None,
                 crate::storage::ColumnSet::EMPTY,
                 Some(old),
+                crate::storage::ValueIndexInstallation::Recovery,
             )
             .unwrap();
         let first = storage.retain_statement_snapshot(71, |_| 7).unwrap();
@@ -18134,6 +18311,7 @@ mod stored_dependency_tests {
                 None,
                 crate::storage::ColumnSet::EMPTY,
                 Some(new),
+                crate::storage::ValueIndexInstallation::Recovery,
             )
             .unwrap();
         let manifest = format!(
@@ -18192,6 +18370,7 @@ mod stored_dependency_tests {
                 None,
                 crate::storage::ColumnSet::EMPTY,
                 Some(live),
+                crate::storage::ValueIndexInstallation::Recovery,
             )
             .unwrap();
         let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
@@ -18223,6 +18402,7 @@ mod stored_dependency_tests {
                     roster: corrupt,
                     ..live
                 }),
+                crate::storage::ValueIndexInstallation::Recovery,
             )
             .unwrap();
         let error = checkpoint

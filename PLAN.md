@@ -35,8 +35,14 @@ Captured rows retain later deletion markers until the complete file list install
 so DELETE and TRUNCATE cannot resurrect rows during capture.
 Secondary-index data, navigation blocks and external sort runs now use the same
 owned output path. Source read failures retain the merge pair for a coherent retry.
-Manifest publication, remaining read progress and fairness,
-and complete failure/recovery evidence remain acceptance work in this same PR.
+Checkpoint cleanup acknowledges only captured deletions and statistics; later
+analysis and transaction-private statistics keep their pending work.
+Manifest upload now retains its exact metadata bytes and conditional request while
+other work runs. Its completion installs only matching table and index identities;
+later writes stay dirty. Explicit index repair rebuilds from table data without
+reading the retired index. These changes still require runner qualification.
+Remaining read progress, fairness and complete failure/recovery evidence remain
+acceptance work in this same PR.
 
 ### Concurrent and batched reads
 

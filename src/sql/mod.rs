@@ -7191,10 +7191,10 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         if txn.staged_commit().is_some() {
             return self.complete_staged_commit(txn, guc);
         }
-        let _atomic_reads = self.atomic_block_read_scope();
         if let Err(error) = self.fire_constraint_trigger_boundary(
             txn,
             guc,
@@ -7206,6 +7206,27 @@ impl Engine {
             return Err(error);
         }
         self.commit_txn(txn, guc)
+    }
+
+    fn commit_partition_detach_phase(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        arena: &Arena,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        let result = if txn.staged_commit().is_some() {
+            self.finish_staged_transaction(txn, guc)
+        } else {
+            self.commit_txn_with_triggers(txn, guc, arena, responder)
+        };
+        if matches!(&result, Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
+            && txn.staged_commit().is_some()
+        {
+            // Consume this phase's receipt before executing its continuation.
+            txn.begin_concurrent_partition_detach();
+        }
+        result
     }
 
     fn refresh_prepared_transaction_catalog(&self) -> Result<(), SqlError> {
@@ -9750,6 +9771,20 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
         self.bind_query_connection(conn_id);
+        if txn.concurrent_partition_detach_pending()
+            && txn.staged_commit().is_some()
+            && let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder)
+        {
+            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                return Ok(ExecutionStatus::Blocked {
+                    completed_statements: resume_statement,
+                    output_mark: responder.buffer.mark(),
+                    io_wait: true,
+                });
+            }
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExecutionStatus::Complete);
+        }
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -9849,6 +9884,13 @@ impl Engine {
                 && txn.mode == TxnMode::Implicit
                 && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
             {
+                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                    return Ok(ExecutionStatus::Blocked {
+                        completed_statements: statement_index,
+                        output_mark: responder.buffer.mark(),
+                        io_wait: true,
+                    });
+                }
                 responder.error(error.sqlstate, error.message.as_str())?;
                 return Ok(ExecutionStatus::Complete);
             }
@@ -9944,7 +9986,15 @@ impl Engine {
                 return Ok(ExecutionStatus::Complete);
             }
             if txn.take_concurrent_partition_detach() {
-                if let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder) {
+                if let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder) {
+                    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some()
+                    {
+                        return Ok(ExecutionStatus::Blocked {
+                            completed_statements: statement_index,
+                            output_mark,
+                            io_wait: true,
+                        });
+                    }
                     responder.error(error.sqlstate, error.message.as_str())?;
                     return Ok(ExecutionStatus::Complete);
                 }
@@ -10033,6 +10083,16 @@ impl Engine {
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         let _parameter_types = exec::enter_bound_parameter_types(parameter_type_oids);
         self.bind_query_connection(conn_id);
+        if txn.concurrent_partition_detach_pending()
+            && txn.staged_commit().is_some()
+            && let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder)
+        {
+            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                return Ok(ExtendedExecutionStatus::Blocked { io_wait: true });
+            }
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExtendedExecutionStatus::Complete(false));
+        }
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -10138,7 +10198,14 @@ impl Engine {
         match outcome {
             Ok(()) => {
                 if txn.take_concurrent_partition_detach() {
-                    if let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder) {
+                    if let Err(error) =
+                        self.commit_partition_detach_phase(txn, guc, arena, responder)
+                    {
+                        if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                            && txn.staged_commit().is_some()
+                        {
+                            return Ok(ExtendedExecutionStatus::Blocked { io_wait: true });
+                        }
                         responder.error(error.sqlstate, error.message.as_str())?;
                         return Ok(ExtendedExecutionStatus::Complete(false));
                     }

@@ -87069,3 +87069,293 @@ fn parallel_commit_prepared_receipts_survive_slot_release_and_reuse() {
         );
     }
 }
+
+#[test]
+fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
+    fn resume(
+        engine: &mut Engine,
+        session: &mut ConfiguredTransactionSession,
+        skip: usize,
+    ) -> ExecutionStatus {
+        session.arena.reset();
+        crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                "INSERT INTO boundary_orders VALUES (nextval('boundary_seq')); \
+                 BEGIN; INSERT INTO boundary_orders VALUES (nextval('boundary_seq')); \
+                 ROLLBACK; SELECT count(*), sum(id) FROM boundary_orders; \
+                 SELECT currval('boundary_seq')",
+                skip,
+                &session.arena,
+                &mut session.transaction,
+                &mut session.pool,
+                &mut session.cursors,
+                &mut session.guc,
+                &mut Responder::new(&mut session.send),
+                session.connection_id,
+                false,
+            )
+        })
+        .unwrap()
+    }
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let label = match mode {
+            crate::config::TransactionMode::Mvcc => "mvcc",
+            crate::config::TransactionMode::Locking => "locking",
+        };
+        let mut config = test_config(&format!("begin-boundary-{label}"));
+        config.transaction_mode = mode;
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.max_ddl_per_transaction = 4;
+        config.txn_rows = 8;
+        config.table_rows = 8;
+        config.work_arena_bytes = 4 << 20;
+        config.object_store_bucket = format!("begin-boundary-{label}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(128 << 20));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
+        session.success(
+            &mut engine,
+            "CREATE SEQUENCE boundary_seq; CREATE TABLE boundary_orders(id bigint)",
+            false,
+        );
+        session.send.clear();
+        engine.enable_async_durability();
+        let mut status = resume(&mut engine, &mut session, 0);
+        assert!(matches!(
+            status,
+            ExecutionStatus::Blocked {
+                completed_statements: 1,
+                io_wait: true,
+                ..
+            }
+        ));
+        assert!(error_sqlstates(session.send.readable()).is_empty());
+        assert_eq!(message_types(session.send.readable()), [b'C']);
+        let prefix = session.send.readable().to_vec();
+        let lsn = engine.journal_lsn();
+        for _ in 0..2 {
+            status = resume(&mut engine, &mut session, 1);
+            assert!(matches!(
+                status,
+                ExecutionStatus::Blocked {
+                    completed_statements: 1,
+                    io_wait: true,
+                    ..
+                }
+            ));
+            assert_eq!(session.send.readable(), prefix);
+            assert_eq!(engine.journal_lsn(), lsn);
+        }
+        let mut complete = false;
+        for _ in 0..8 {
+            let skip = match status {
+                ExecutionStatus::Complete => {
+                    complete = true;
+                    break;
+                }
+                ExecutionStatus::Blocked {
+                    completed_statements,
+                    output_mark,
+                    io_wait,
+                } => {
+                    assert!(io_wait);
+                    assert_eq!(session.send.len(), output_mark);
+                    assert!(session.transaction.staged_commit().is_some());
+                    completed_statements
+                }
+            };
+            // The simulator owns growing remote fixture objects.
+            engine.commit_wal().unwrap();
+            status = resume(&mut engine, &mut session, skip);
+        }
+        assert!(complete, "transaction boundaries did not finish");
+        assert!(error_sqlstates(session.send.readable()).is_empty());
+        assert!(session.send.readable().starts_with(&prefix));
+        assert_eq!(data_rows(session.send.readable()), ["1|1", "2"]);
+        assert_eq!(
+            message_types(session.send.readable())
+                .iter()
+                .filter(|kind| **kind == b'C')
+                .count(),
+            6
+        );
+        assert!(!session.transaction.is_active());
+        drop(session);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
+    fn resume(
+        engine: &mut Engine,
+        session: &mut ConfiguredTransactionSession,
+        extended: bool,
+        skip: usize,
+    ) -> ExecutionStatus {
+        const SQL: &str =
+            "ALTER TABLE detach_batch_parent DETACH PARTITION detach_batch_child CONCURRENTLY";
+        session.arena.reset();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut responder = Responder::new(&mut session.send);
+            if extended {
+                match engine
+                    .execute_extended(
+                        SQL,
+                        &session.arena,
+                        &[],
+                        &[],
+                        &mut session.transaction,
+                        &mut session.pool,
+                        &mut session.cursors,
+                        &mut session.guc,
+                        &mut responder,
+                        session.connection_id,
+                        false,
+                    )
+                    .unwrap()
+                {
+                    ExtendedExecutionStatus::Complete(_) => ExecutionStatus::Complete,
+                    ExtendedExecutionStatus::Blocked { io_wait } => ExecutionStatus::Blocked {
+                        completed_statements: 0,
+                        output_mark: responder.buffer.mark(),
+                        io_wait,
+                    },
+                }
+            } else {
+                engine
+                    .execute_simple_from(
+                        SQL,
+                        skip,
+                        &session.arena,
+                        &mut session.transaction,
+                        &mut session.pool,
+                        &mut session.cursors,
+                        &mut session.guc,
+                        &mut responder,
+                        session.connection_id,
+                        false,
+                    )
+                    .unwrap()
+            }
+        })
+    }
+    for extended in [false, true] {
+        let mut config = test_config(&format!("detach-phase-receipt-{extended}"));
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.max_ddl_per_transaction = 8;
+        config.txn_rows = 8;
+        config.table_rows = 8;
+        config.work_arena_bytes = 4 << 20;
+        config.object_store_bucket =
+            format!("detach-phase-receipt-{extended}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(192 << 20));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut reader =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
+        let mut detacher =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(22);
+        reader.success(
+            &mut engine,
+            "CREATE TABLE detach_batch_parent(id integer) PARTITION BY RANGE(id); \
+             CREATE TABLE detach_batch_child PARTITION OF detach_batch_parent \
+               FOR VALUES FROM (0) TO (10); INSERT INTO detach_batch_parent VALUES (4)",
+            false,
+        );
+        reader.success(
+            &mut engine,
+            "BEGIN; SELECT id FROM detach_batch_parent",
+            true,
+        );
+        let child = engine
+            .storage
+            .find_visible("public", "detach_batch_child", 0)
+            .unwrap();
+        engine.enable_async_durability();
+        for _ in 0..2 {
+            assert!(matches!(
+                resume(&mut engine, &mut detacher, extended, 0),
+                ExecutionStatus::Blocked { io_wait: true, .. }
+            ));
+            assert!(detacher.transaction.concurrent_partition_detach_pending());
+            assert!(detacher.transaction.staged_commit().is_some());
+            assert!(detacher.send.is_empty());
+        }
+        engine.commit_wal().unwrap();
+        assert!(matches!(
+            engine.storage.table_def(child, 0).partition.attachment,
+            Some(crate::storage::PartitionAttachment {
+                state: crate::storage::PartitionAttachmentState::DetachPending,
+                ..
+            })
+        ));
+        assert!(matches!(
+            resume(&mut engine, &mut detacher, extended, 0),
+            ExecutionStatus::Blocked { io_wait: false, .. }
+        ));
+        assert!(detacher.transaction.staged_commit().is_none());
+        assert!(!detacher.transaction.concurrent_partition_detach_pending());
+        assert!(detacher.send.is_empty());
+        reader.success(&mut engine, "COMMIT", true);
+        let status = resume(&mut engine, &mut detacher, extended, 0);
+        if extended {
+            assert_eq!(status, ExecutionStatus::Complete);
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(
+                    || engine.commit_txn(&mut detacher.transaction, &detacher.guc)
+                )
+                .unwrap_err()
+                .sqlstate,
+                sqlstate::INTERNAL_IO_WAIT
+            );
+        } else {
+            assert!(matches!(
+                status,
+                ExecutionStatus::Blocked {
+                    completed_statements: 1,
+                    io_wait: true,
+                    ..
+                }
+            ));
+        }
+        engine.commit_wal().unwrap();
+        if extended {
+            crate::mem::guard::forbid_alloc(|| {
+                engine.finish_staged_transaction(&mut detacher.transaction, &detacher.guc)
+            })
+            .unwrap();
+        } else {
+            assert_eq!(
+                resume(&mut engine, &mut detacher, false, 1),
+                ExecutionStatus::Complete
+            );
+        }
+        assert!(error_sqlstates(detacher.send.readable()).is_empty());
+        assert_eq!(message_types(detacher.send.readable()), [b'C']);
+        assert!(
+            engine
+                .storage
+                .table_def(child, 0)
+                .partition
+                .attachment
+                .is_none()
+        );
+        drop((reader, detacher, engine));
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}

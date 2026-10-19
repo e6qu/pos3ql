@@ -15,7 +15,8 @@ complete terminal error delivery. TLS error paths must also remain allocation-fr
 outside their isolated component. Its budget must be returned after failed
 allocations, buffer shrinking and owned-error cleanup. COPY must retain its finishing
 message while durability is pending, run triggers once, and preserve later
-client messages through acknowledgement and empty-cache recovery. Release-build checks
+client messages through acknowledgement and empty-cache recovery. Internal wait statuses must not
+reach SQL clients at BEGIN or concurrent partition-detach boundaries. Release-build checks
 must retain the allocation calls rather than allowing optimization to remove them.
 
 For an entry, include a reproducer, affected boundary, observed behavior and

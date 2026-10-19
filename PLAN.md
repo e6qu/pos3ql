@@ -64,6 +64,9 @@ customer receives success before their change is recoverable.
   recovery. Never turn an uncertain commit into a claim that it rolled back.
 - Retain COPY completion messages while durability is pending; resume without
   replaying row or statement triggers or consuming later client messages early.
+- Pause transaction boundaries instead of sending internal wait statuses. For
+  example, `INSERT ...; BEGIN; ...; ROLLBACK` commits the first insert once;
+  concurrent partition detach consumes each phase's receipt before continuing.
 - Keep reads, durable commits and maintenance from starving one another.
 
 ### Physical layout
